@@ -16,6 +16,7 @@ API); the one SDK contract we lock — that our datacenter list is always a supe
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 import types
@@ -25,6 +26,25 @@ import pytest
 from flash.spec import GpuSpec, JobSpec, TrainSpec
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+
+
+def _oversized_model_info():
+    """A synthetic catalog entry too large for the shared cache.
+
+    Sized off WEIGHT_CACHE_VOLUME_GB so it stays oversized if the volume grows again — the real
+    catalog now fits entirely, so the size gate needs a stand-in to stay covered.
+    """
+    from flash import runner
+    from flash.catalog import ModelInfo
+
+    return ModelInfo(
+        id="test/oversized",
+        display_name="oversized",
+        params="huge",
+        algos=("sft",),
+        min_vram_gb=80,
+        params_b=float(runner.WEIGHT_CACHE_VOLUME_GB),  # peak = 4x params_b GB >> the volume
+    )
 
 
 def _vol_spec(name="flash-weights", gb=100, **gpu):
@@ -518,7 +538,7 @@ def test_assign_weight_cache_attaches_to_catalog_run():
 
     out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r", model_policy="catalog"))
     assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME == "flash-weights"
-    assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB == 100
+    assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB
 
 
 def test_assign_weight_cache_default_policy_attaches():
@@ -604,13 +624,14 @@ def test_assign_weight_cache_does_not_override_existing():
 
 
 def test_assign_weight_cache_skips_oversized_catalog_model():
-    # SIZE GATE: the 35B MoE's ~70 GB checkpoint (peak ~140 GB with Xet temp) can't fit the fixed
-    # 100 GB shared cache. Attaching it would redirect HF_HOME onto the undersized mount and overflow
-    # mid-download — so the run is left cache-less and downloads to the (200 GB) container disk.
+    # SIZE GATE: a model whose peak download footprint exceeds the shared cache must NOT be
+    # attached — that would redirect the base-model download onto an undersized mount and overflow
+    # mid-download. It is left cache-less and downloads to the container disk instead. Every model
+    # in the current catalog fits (see test_every_catalog_model_fits_the_weight_cache), so the gate
+    # is exercised with a synthetic oversized entry rather than a real one.
     from flash import runner
-    from flash.catalog import MODELS
 
-    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    info = _oversized_model_info()
     out = runner._assign_weight_cache_volume(
         JobSpec(model=info.id, run_id="r", model_policy="catalog"), info
     )
@@ -619,12 +640,12 @@ def test_assign_weight_cache_skips_oversized_catalog_model():
 
 def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_model():
     # SIZE GATE re-applies to a pre-set SHARED-cache name: a programmatic/stale catalog spec that
-    # already pinned ``flash-weights`` for the 35B MoE must NOT bypass the gate via the "honor an
-    # existing volume" no-op and redirect HF_HOME onto the undersized mount. It's stripped cache-less.
+    # already pinned ``flash-weights`` for an oversized model must NOT bypass the gate via the
+    # "honor an existing volume" no-op and redirect the download onto the undersized mount. It is
+    # stripped cache-less.
     from flash import runner
-    from flash.catalog import MODELS
 
-    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    info = _oversized_model_info()
     spec = JobSpec.from_dict(
         {
             "model": info.id,
@@ -701,17 +722,23 @@ def test_assign_weight_cache_attaches_fitting_catalog_model():
 
 def test_fits_weight_cache_is_size_based():
     from flash import runner
+
+    # Oversized models are still excluded: the gate is a size check, not "always true".
+    assert not runner._fits_weight_cache(_oversized_model_info())
+
+
+def test_every_catalog_model_fits_the_weight_cache():
+    # The largest models have the slowest cold downloads, so they are exactly the ones the cache
+    # must cover. WEIGHT_CACHE_VOLUME_GB must stay >= the peak footprint of the biggest catalog
+    # entry; if a larger model is added, grow the volume rather than silently skipping its cache.
+    from flash import runner
     from flash.catalog import MODELS
 
-    assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-27B"])
-    assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-35B-A3B"])
-    for mid in (
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-        "Qwen/Qwen3.5-4B",
-        "Qwen/Qwen3.5-9B",
-    ):
-        assert runner._fits_weight_cache(MODELS[mid]), mid
+    for mid, info in MODELS.items():
+        assert runner._fits_weight_cache(info), (
+            f"{mid} ({info.params_b}B) no longer fits the "
+            f"{runner.WEIGHT_CACHE_VOLUME_GB} GB weight cache"
+        )
 
 
 def test_submit_job_assigns_weight_cache(monkeypatch):
@@ -734,7 +761,7 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
         status = runner.submit_job(spec, dry_run=True)
     gpu = status.effective_preparation["worker_spec"]["gpu"]
     assert gpu["network_volume"] == "flash-weights"
-    assert gpu["network_volume_gb"] == 100
+    assert gpu["network_volume_gb"] == runner.WEIGHT_CACHE_VOLUME_GB
     # and it must NOT leak into the public spec
     assert "network_volume" not in status.spec["gpu"]
 
@@ -936,11 +963,10 @@ def test_catalog_model_ids_are_the_cache_fitting_catalog():
     # non-fitting model only overflows the fixed mount). Mirrors the submit path's _fits_weight_cache.
     assert ids == {mid for mid, info in MODELS.items() if _fits_weight_cache(info)}
     assert ids <= set(MODELS)
-    # oversized checkpoints must be excluded from the default warm set.
-    assert "Qwen/Qwen3.6-27B" in MODELS
-    assert "Qwen/Qwen3.6-27B" not in ids
-    assert "Qwen/Qwen3.6-35B-A3B" in MODELS
-    assert "Qwen/Qwen3.6-35B-A3B" not in ids
+    # The whole catalog fits the volume, so the large checkpoints — the ones with the
+    # slowest cold downloads — are warmed too.
+    assert "Qwen/Qwen3.6-27B" in ids
+    assert "Qwen/Qwen3.6-35B-A3B" in ids
 
 
 def test_preload_branch_passes_explicit_cache_dir(monkeypatch):
@@ -2267,3 +2293,517 @@ def test_cli_runpod_warm_gpu_falls_back_to_preload_default(monkeypatch):
     seen.clear()
     assert preload.main(["--datacenters", "US-CA-2", "--gpu", "H100"]) == 0
     assert seen["gpu"] == "H100"
+
+
+def _poll_env(monkeypatch, statuses, workers):
+    """Wire _poll_until_done's two API calls: job status sequence + a fixed worker-health dict."""
+    from flash.providers.runpod import preload
+
+    seq = list(statuses)
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "job_status",
+        lambda *a, **k: {"status": seq.pop(0) if seq else "IN_QUEUE"},
+    )
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": workers},
+    )
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: None)
+
+
+def test_poll_gives_up_when_datacenter_never_allocates_a_worker(monkeypatch):
+    """A DC with no GPU of the requested class must fail fast, not burn the whole timeout.
+
+    Regression: US-KS-2/US-MO-2/US-NC-2/US-NE-1/US-WA-1 stock no RTX 4090, so preload jobs there sat
+    queued with an all-zero worker set until the 5400s timeout and the DC stayed silently cold.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    _poll_env(
+        monkeypatch,
+        ["IN_QUEUE"] * 50,
+        {"initializing": 0, "ready": 0, "running": 0, "idle": 0},
+    )
+
+    def _advance(*_a, **_k):
+        clock["t"] += 60.0
+        return {"workers": {"initializing": 0, "ready": 0, "running": 0, "idle": 0}}
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _advance)
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    # gave up inside the grace window, nowhere near the 5400s timeout
+    assert clock["t"] < preload._NO_CAPACITY_GRACE_S + 120.0
+
+
+def test_poll_waits_when_a_worker_is_initializing(monkeypatch):
+    """An initializing worker proves capacity exists: a slow download must NOT be cut short."""
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    # advance the clock in sleep(), so time moves even after the health probe stops being called
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"initializing": 1, "ready": 0, "running": 0, "idle": 0}},
+    )
+    monkeypatch.setattr(preload, "decode_output", lambda o: {"preloaded": ["m"]})
+    # stays queued well past the no-capacity grace window, then completes
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "job_status",
+        lambda *a, **k: (
+            {"status": "COMPLETED", "output": "x"}
+            if clock["t"] > preload._NO_CAPACITY_GRACE_S * 2
+            else {"status": "IN_QUEUE"}
+        ),
+    )
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    assert out == {"preloaded": ["m"]}
+    assert clock["t"] > preload._NO_CAPACITY_GRACE_S  # proves it did not bail out early
+
+
+def test_poll_restarts_the_grace_window_after_a_requeue(monkeypatch):
+    """Leaving the queue must reset the starvation anchor, not let it age through the running spell.
+
+    Regression: the grace anchor survived an IN_PROGRESS interval, so a job that queued briefly, ran
+    for longer than the grace window, then got re-queued after an interruption would be declared
+    starved on its FIRST zero-worker reading -- and _preload_one_dc deletes the endpoint on that,
+    killing a DC that has real capacity and had already been allocated a worker.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    # queued once, allocated (so saw_worker stays False only because health reads zero), then
+    # re-queued long after the grace window would have elapsed, then completes.
+    statuses = ["IN_QUEUE", "IN_PROGRESS", "IN_QUEUE", "COMPLETED"]
+    seq = iter(statuses)
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "job_status",
+        lambda *a, **k: {"status": next(seq, "COMPLETED"), "output": "x"},
+    )
+    # health always reports zero workers: the ONLY thing standing between this job and deletion is
+    # the anchor being reset when the status left the queue.
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"initializing": 0, "ready": 0, "running": 0, "idle": 0}},
+    )
+    monkeypatch.setattr(preload, "decode_output", lambda o: {"preloaded": ["m"]})
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 30.0)  # one sleep outruns it
+
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    assert out == {"preloaded": ["m"]}
+    # the running interval alone exceeded the grace window, proving the anchor did not carry over
+    assert clock["t"] > preload._NO_CAPACITY_GRACE_S
+
+
+def test_poll_rechecks_health_after_a_requeue_loses_the_worker(monkeypatch):
+    """The worker latch is per queued interval: a requeue with no worker must still be caught.
+
+    Regression: saw_worker latched true forever on the first healthy reading, so a job that was
+    allocated a worker, started, was interrupted, and returned to IN_QUEUE with the worker gone
+    skipped every later health probe. The starvation window then never ran and the preload sat out
+    the full 5400s timeout instead of reporting the DC as out of capacity.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    # queued with a worker, runs, then is re-queued for good with the worker gone.
+    seq = iter(["IN_QUEUE", "IN_PROGRESS"])
+    monkeypatch.setattr(
+        preload.runpod_api, "job_status", lambda *a, **k: {"status": next(seq, "IN_QUEUE")}
+    )
+    # healthy on the first probe (latching the old bug), zero on every probe after the requeue
+    probes = {"n": 0}
+
+    def _health(*_a, **_k):
+        probes["n"] += 1
+        alive = 1 if probes["n"] == 1 else 0
+        return {"workers": {"initializing": alive, "ready": 0, "running": 0, "idle": 0}}
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 30.0)  # one sleep outruns it
+
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    # health was probed again AFTER the requeue rather than skipped by a stale latch
+    assert probes["n"] > 1
+
+
+def test_poll_rechecks_health_when_a_worker_vanishes_without_leaving_the_queue(monkeypatch):
+    """A worker that appears and then disappears while still IN_QUEUE must not latch the probe off.
+
+    Regression: the latch was only cleared on the transition out of IN_QUEUE, so a worker that was
+    briefly reported ``initializing`` and then reclaimed before the job ever started suppressed every
+    later health probe. The job never left the queue, so nothing reset the latch, the starvation
+    window never ran, and the preload burned the full 5400s timeout on a datacenter that had lost
+    the box -- leaving the region cold and the endpoint billing.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    # never leaves the queue: the status stream alone gives the poller no reason to re-probe
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    # one healthy reading, then the box is gone for good
+    probes = {"n": 0}
+
+    def _health(*_a, **_k):
+        probes["n"] += 1
+        alive = 1 if probes["n"] == 1 else 0
+        return {"workers": {"initializing": alive, "ready": 0, "running": 0, "idle": 0}}
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 30.0)  # one sleep outruns it
+
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    # the vanished worker was noticed instead of being masked by the latch
+    assert probes["n"] > 1
+    assert clock["t"] < 5400
+    # and it gave up in the grace window instead of burning the full timeout
+    assert clock["t"] < 5400
+
+
+def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
+    """Health is a hint: an API error must not be read as 'no capacity' and kill a live download.
+
+    None, not False -- the caller escalates a sustained False into NoCapacityError and deletes the
+    endpoint, so conflating "cannot tell" with "no workers" would kill healthy downloads.
+    """
+    from flash.providers.runpod import preload
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("health api down")
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _boom)
+    assert preload._has_worker("ep", "fp", 0.0) is None
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: None)
+    assert preload._has_worker("ep", "fp", 0.0) is None
+
+    monkeypatch.setattr(
+        preload.runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: {"workers": {}}
+    )
+    assert preload._has_worker("ep", "fp", 0.0) is False  # a real empty answer IS evidence
+
+
+def test_a_broken_worker_image_is_not_reported_as_a_starved_datacenter(monkeypatch):
+    """An unhealthy worker still means the datacenter gave us a box, so it refutes starvation.
+
+    Regression: _has_worker counted only initializing/ready/running/idle. A worker that RunPod
+    allocated and then marked unhealthy (jobs.py reads that as a failed image pull and retries on a
+    fresh endpoint) looked identical to an empty datacenter, so the grace timer fired NoCapacityError
+    and told the operator to pick a different GPU class -- which cannot fix a broken image.
+    """
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"ready": 0, "running": 0, "unhealthy": 1}},
+    )
+    assert preload._has_worker("ep", "fp", 0.0) is True
+
+    # and end to end: the queued job must time out, never be blamed on the datacenter
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    with pytest.raises(TimeoutError):  # NOT NoCapacityError
+        preload._poll_until_done("ep", "job", "fp", timeout_s=1, poll_interval_s=0.0)
+
+
+def test_a_throttled_worker_still_counts_as_no_capacity(monkeypatch):
+    """Throttled is the no-capacity signal itself, so it must NOT suppress the fail-fast path.
+
+    ``jobs.py`` classifies a sustained throttled worker as ``no_capacity`` and retries on the
+    next-best GPU. Counting it as an allocated box here would make a preload sit the full 5400s
+    timeout on a datacenter RunPod is never going to schedule -- the exact silent-cold-DC failure
+    this PR exists to remove.
+    """
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"ready": 0, "running": 0, "throttled": 1}},
+    )
+    assert preload._has_worker("ep", "fp", 0.0) is False
+
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=60, poll_interval_s=0.0)
+
+
+def test_unreadable_health_never_becomes_no_capacity(monkeypatch):
+    """A persistently failing health API must not masquerade as a starved datacenter.
+
+    Regression: with health unreadable, the grace timer used to fire NoCapacityError and the caller's
+    finally deleted the endpoint mid-download. The job here stays IN_QUEUE well past the grace window
+    and must simply time out instead.
+    """
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("health api down")),
+    )
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    with pytest.raises(TimeoutError):  # NOT NoCapacityError
+        preload._poll_until_done("ep", "job-1", "fp", timeout_s=1, poll_interval_s=0.0)
+
+
+def test_unreadable_health_does_not_age_the_grace_timer(monkeypatch):
+    """Grace must count an unbroken run of CONFIRMED zero-worker readings, not wall time since launch.
+
+    Regression: the timer started at launch, so an unreadable health API aged it silently and the very
+    first definite "no workers" after that fired NoCapacityError instantly -- deleting an endpoint whose
+    download may have been progressing the whole time.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    def _health(*_a, **_k):
+        clock["t"] += 60.0
+        # unreadable for well past the grace window, then a single definite zero-worker answer
+        if clock["t"] <= preload._NO_CAPACITY_GRACE_S * 2:
+            raise RuntimeError("health api down")
+        return {"workers": {"initializing": 0, "ready": 0, "running": 0, "idle": 0}}
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    # timeout leaves room for the unreadable stretch but NOT for a fresh full grace window after it
+    timeout_s = preload._NO_CAPACITY_GRACE_S * 2 + 120.0
+    with pytest.raises(TimeoutError):  # NOT NoCapacityError
+        preload._poll_until_done("ep", "job", "fp", timeout_s=timeout_s, poll_interval_s=1.0)
+
+
+def test_no_capacity_guard_only_runs_while_the_job_is_queued(monkeypatch):
+    """IN_PROGRESS proves a worker was allocated, so zero-worker health there is a reporting artifact.
+
+    Regression: the guard ran on every nonterminal status. A job already downloading on a worker could
+    be declared starved on a stale health reading, and _preload_one_dc would delete the endpoint
+    mid-download.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    monkeypatch.setattr(preload, "decode_output", lambda o: {"preloaded": ["m"]})
+    # health insists there are no workers for the whole run -- the status is what must be believed
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"initializing": 0, "ready": 0, "running": 0, "idle": 0}},
+    )
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "job_status",
+        lambda *a, **k: (
+            {"status": "COMPLETED", "output": "x"}
+            if clock["t"] > preload._NO_CAPACITY_GRACE_S * 2
+            else {"status": "IN_PROGRESS"}
+        ),
+    )
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    assert out == {"preloaded": ["m"]}
+    assert clock["t"] > preload._NO_CAPACITY_GRACE_S  # ran past grace without being killed
+
+
+def test_no_capacity_is_reported_distinctly_from_error(monkeypatch):
+    """A starved DC surfaces as status='no_capacity' so the summary can name it and the GPU class."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        preload,
+        "deploy_train_endpoint",
+        lambda *a, **k: ("ep-1", "name", "fp-1"),
+    )
+    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda *a, **k: "job-1")
+    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda *a, **k: True)
+
+    def _starved(*_a, **_k):
+        raise preload.NoCapacityError("never allocated")
+
+    monkeypatch.setattr(preload, "_poll_until_done", _starved)
+    res = preload._preload_one_dc("US-KS-2", ["m"], None, "RTX 4090", 60, 1.0)
+    assert res["status"] == "no_capacity"
+    assert res["gpu"] == "RTX 4090"
+    assert res["datacenter"] == "US-KS-2"
+
+
+def test_catalog_is_ordered_largest_first(monkeypatch):
+    """Largest-first makes a capacity failure surface first instead of 20 minutes in.
+
+    It is deliberately not the thing that makes the catalog fit -- see
+    ``test_volume_holds_whole_catalog_with_largest_model_in_transit`` for that invariant.
+    """
+    from flash.providers.runpod import preload
+
+    ids = preload.catalog_model_ids()
+    from flash.catalog import MODELS
+
+    sizes = [MODELS[m].params_b or 0.0 for m in ids]
+    assert sizes == sorted(sizes, reverse=True), (
+        f"catalog must be largest-first, got {list(zip(ids, sizes, strict=True))}"
+    )
+
+
+def test_volume_holds_whole_catalog_with_largest_model_in_transit():
+    """The volume must fit every model resident PLUS the largest one's download scratch.
+
+    Regression for a real 200 GB failure: the 35B died with "Disk quota exceeded" in every
+    datacenter. Download order does not save it -- the volume is persistent and nothing is
+    evicted, so the largest model always meets a volume already holding the rest.
+    """
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB, weight_cache_catalog_peak_gb
+
+    needed = weight_cache_catalog_peak_gb()
+    assert needed <= WEIGHT_CACHE_VOLUME_GB, (
+        f"catalog needs {needed:.1f} GB at peak but the volume is {WEIGHT_CACHE_VOLUME_GB} GB: "
+        "the largest model will fail with Disk quota exceeded on every datacenter"
+    )
+
+
+def test_preload_timeout_covers_a_fully_cold_whole_catalog_warm():
+    """The default budget must outlast downloading the ENTIRE catalog, not just one model.
+
+    Raising the volume to 250 GB is what puts the 27B and 35B into the default preload set, so the
+    worst case this default has to survive changed with it: a cold volume now pulls ~159 GB in one
+    job. Sized off a measured rate rather than a guess -- a real cold 35B pull moved 70 GB in ~870s.
+
+    A too-short budget is not a slow failure, it throws away everything downloaded so far, so this
+    asserts the default clears the measured worst case rather than merely approaching it.
+    """
+    from flash.catalog import MODELS
+    from flash.providers.runpod.preload import _PRELOAD_TIMEOUT_S
+    from flash.runner import _download_gb, _fits_weight_cache
+
+    measured_gb, measured_s = 70.0, 870.0  # observed cold 35B pull
+    rate_gb_s = measured_gb / measured_s
+    catalog_gb = sum(_download_gb(i) for i in MODELS.values() if _fits_weight_cache(i))
+    needed_s = catalog_gb / rate_gb_s
+
+    assert needed_s < _PRELOAD_TIMEOUT_S, (
+        f"a cold warm downloads {catalog_gb:.1f} GB, which needs ~{needed_s:.0f}s at the measured "
+        f"{rate_gb_s:.3f} GB/s, but the default budget is {_PRELOAD_TIMEOUT_S}s: the job is killed "
+        "mid-catalog and every byte already pulled is discarded"
+    )
+
+
+def test_every_preload_timeout_default_reads_the_shared_constant():
+    """No entry point may carry its own literal budget.
+
+    The bug this guards is partial: raising the constant while one call site keeps a stale literal
+    leaves that path timing out exactly as before, and it is the CLI default that operators hit.
+    """
+    import inspect
+    import re
+
+    from flash.providers.runpod import preload
+
+    defaults = {
+        name: inspect.signature(fn).parameters["timeout_s"].default
+        for name, fn in (("warm_weight_cache", preload.warm_weight_cache),
+                         ("warm_instances", preload.warm_instances))
+    }
+    stale = {k: v for k, v in defaults.items() if v != preload._PRELOAD_TIMEOUT_S}
+    assert not stale, f"these carry a literal instead of _PRELOAD_TIMEOUT_S: {stale}"
+
+    # The CLI parser is built inline in main(), so there is no parser object to query without
+    # running it. Read the source instead -- a numeric literal here is the operator-facing default
+    # and would keep timing out at the old budget however high the constant is raised.
+    cli = re.search(r'"--timeout-s".*?default=([^,)\s]+)', inspect.getsource(preload.main), re.S)
+    assert cli, "--timeout-s no longer declares a default; this test must be updated"
+    assert cli.group(1) == "_PRELOAD_TIMEOUT_S", (
+        f"--timeout-s defaults to {cli.group(1)} instead of _PRELOAD_TIMEOUT_S"
+    )
+
+
+def test_catalog_peak_counts_others_resident_not_just_the_largest():
+    """Pin the shape of the calculation, not just today's numbers.
+
+    The bug was sizing the largest model against an EMPTY volume. Peak must therefore exceed both
+    the largest model's own peak and the plain resident total.
+    """
+    from flash.catalog import MODELS
+    from flash.runner import _fits_weight_cache, weight_cache_catalog_peak_gb
+
+    sizes = sorted(
+        ((info.params_b or 0.0) * 2.0 for info in MODELS.values() if _fits_weight_cache(info)),
+        reverse=True,
+    )
+    resident_total = sum(sizes)
+    largest_alone_peak = 2.0 * sizes[0]
+    needed = weight_cache_catalog_peak_gb()
+
+    assert needed > largest_alone_peak, "peak ignores the models already on the volume"
+    assert needed > resident_total, "peak ignores the largest model's in-transit scratch"
+
+
+def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):
+    """'partial' alone is unactionable: the summary must name each failed model and its reason."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1", "m2"])
+    monkeypatch.setattr(preload, "weight_cache_datacenters", lambda: [])
+    monkeypatch.setattr(
+        preload,
+        "_preload_one_dc",
+        lambda dc, *a, **k: {
+            "datacenter": dc,
+            "status": "partial",
+            "result": {"preloaded": ["m1"], "failed": {"m2": "429 rate limited"}},
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        results = preload.warm_weight_cache(datacenters=["US-CA-2"], gpu="RTX 4090")
+
+    assert results[0]["status"] == "partial"
+    text = caplog.text
+    assert "m2" in text
+    assert "429 rate limited" in text
+    assert "US-CA-2" in text
+    # the model that succeeded is not noise in the failure summary
+    assert "m1 FAILED" not in text
+
+
+def test_ok_datacenter_logs_no_per_model_failures(monkeypatch, caplog):
+    """A fully warmed DC must not emit failure lines (the summary stays quiet when nothing is wrong)."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1"])
+    monkeypatch.setattr(preload, "weight_cache_datacenters", lambda: [])
+    monkeypatch.setattr(
+        preload,
+        "_preload_one_dc",
+        lambda dc, *a, **k: {
+            "datacenter": dc,
+            "status": "ok",
+            "result": {"preloaded": ["m1"], "failed": {}},
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        preload.warm_weight_cache(datacenters=["US-CA-2"], gpu="RTX 4090")
+
+    assert "FAILED" not in caplog.text
