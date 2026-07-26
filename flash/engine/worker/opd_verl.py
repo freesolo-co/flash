@@ -1398,7 +1398,7 @@ def run_opd_verl(spec=None) -> None:
         model_id=model_id,
         model_revision=model_revision,
         model_policy=getattr(spec, "model_policy", "catalog") if spec else "catalog",
-        gpu=(spec.gpu.exact_type or spec.gpu.type) if spec else None,
+        gpu=spec.gpu.type if spec else None,
     )
     structured_outputs = structured_validation.constraint
     model_vocab_size = structured_validation.model_vocab_size
@@ -1419,7 +1419,7 @@ def run_opd_verl(spec=None) -> None:
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
-        exact_type=spec.gpu.exact_type if spec else "",
+        exact_type=spec.gpu.type if spec else "",
     )
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
 

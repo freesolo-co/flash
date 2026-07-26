@@ -863,7 +863,7 @@ import sys
 from flash.engine.worker.perf.lifecycle import wait_for_gpu
 
 requested, exact = json.loads(sys.argv[1])
-wait_for_gpu(requested, exact_type=exact)
+wait_for_gpu(requested, gpu_type=exact)
 import torch
 print("FLASH_GPU_PROBE=" + json.dumps({
     "name": torch.cuda.get_device_name(0),
@@ -941,7 +941,7 @@ def run_sft_verl(spec=None) -> None:
     _w.heartbeat("sft_start", gpu=_w.gpu_diagnostics(include_torch=False))
     gpu_probe = _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
-        exact_type=spec.gpu.exact_type if spec else "",
+        exact_type=spec.gpu.type if spec else "",
     )
 
     model_id = spec.model if spec else RECIPE.hf_model_id
