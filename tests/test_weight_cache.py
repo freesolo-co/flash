@@ -2468,6 +2468,61 @@ def test_volume_holds_whole_catalog_with_largest_model_in_transit():
     )
 
 
+def test_preload_timeout_covers_a_fully_cold_whole_catalog_warm():
+    """The default budget must outlast downloading the ENTIRE catalog, not just one model.
+
+    Raising the volume to 250 GB is what puts the 27B and 35B into the default preload set, so the
+    worst case this default has to survive changed with it: a cold volume now pulls ~159 GB in one
+    job. Sized off a measured rate rather than a guess -- a real cold 35B pull moved 70 GB in ~870s.
+
+    A too-short budget is not a slow failure, it throws away everything downloaded so far, so this
+    asserts the default clears the measured worst case rather than merely approaching it.
+    """
+    from flash.catalog import MODELS
+    from flash.providers.runpod.preload import _PRELOAD_TIMEOUT_S
+    from flash.runner import _download_gb, _fits_weight_cache
+
+    measured_gb, measured_s = 70.0, 870.0  # observed cold 35B pull
+    rate_gb_s = measured_gb / measured_s
+    catalog_gb = sum(_download_gb(i) for i in MODELS.values() if _fits_weight_cache(i))
+    needed_s = catalog_gb / rate_gb_s
+
+    assert needed_s < _PRELOAD_TIMEOUT_S, (
+        f"a cold warm downloads {catalog_gb:.1f} GB, which needs ~{needed_s:.0f}s at the measured "
+        f"{rate_gb_s:.3f} GB/s, but the default budget is {_PRELOAD_TIMEOUT_S}s: the job is killed "
+        "mid-catalog and every byte already pulled is discarded"
+    )
+
+
+def test_every_preload_timeout_default_reads_the_shared_constant():
+    """No entry point may carry its own literal budget.
+
+    The bug this guards is partial: raising the constant while one call site keeps a stale literal
+    leaves that path timing out exactly as before, and it is the CLI default that operators hit.
+    """
+    import inspect
+    import re
+
+    from flash.providers.runpod import preload
+
+    defaults = {
+        name: inspect.signature(fn).parameters["timeout_s"].default
+        for name, fn in (("warm_weight_cache", preload.warm_weight_cache),
+                         ("warm_instances", preload.warm_instances))
+    }
+    stale = {k: v for k, v in defaults.items() if v != preload._PRELOAD_TIMEOUT_S}
+    assert not stale, f"these carry a literal instead of _PRELOAD_TIMEOUT_S: {stale}"
+
+    # The CLI parser is built inline in main(), so there is no parser object to query without
+    # running it. Read the source instead -- a numeric literal here is the operator-facing default
+    # and would keep timing out at the old budget however high the constant is raised.
+    cli = re.search(r'"--timeout-s".*?default=([^,)\s]+)', inspect.getsource(preload.main), re.S)
+    assert cli, "--timeout-s no longer declares a default; this test must be updated"
+    assert cli.group(1) == "_PRELOAD_TIMEOUT_S", (
+        f"--timeout-s defaults to {cli.group(1)} instead of _PRELOAD_TIMEOUT_S"
+    )
+
+
 def test_catalog_peak_counts_others_resident_not_just_the_largest():
     """Pin the shape of the calculation, not just today's numbers.
 

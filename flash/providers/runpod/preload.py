@@ -62,6 +62,14 @@ class NoCapacityError(RuntimeError):
     """A datacenter never allocated a worker, i.e. it cannot serve the requested GPU class."""
 
 
+# Per-DC job budget for a preload. A fully cold volume must download the WHOLE catalog, so this is
+# sized off the measured worst case rather than left at a round number: a real cold 35B pull ran
+# 70 GB in ~870s (~0.08 GB/s), which puts the full ~159 GB catalog near 2000s -- already past a
+# 1800s budget before any retry or slow-mirror variance. Cold warms are rare and a too-short budget
+# throws away everything downloaded so far, so the asymmetry favours the larger number.
+_PRELOAD_TIMEOUT_S = 5400
+
+
 def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool | None:
     """True once a worker exists in any state (initializing counts: capacity exists).
 
@@ -226,7 +234,7 @@ def warm_weight_cache(
     models: list[str] | None = None,
     datacenters: list[str] | None = None,
     gpu: str = _PRELOAD_GPU,
-    timeout_s: int = 1800,
+    timeout_s: int = _PRELOAD_TIMEOUT_S,
     max_workers: int = 4,
     poll_interval_s: float = 10.0,
     token: str | None = None,
@@ -458,7 +466,7 @@ def _warm_one_lambda_instance(lambda_jobs, candidate, models: list, gpu: str,
 
 
 def warm_instances(models: list | None = None, gpu: str | None = None,
-                   timeout_s: int = 1800, poll_interval_s: float = 20.0,
+                   timeout_s: int = _PRELOAD_TIMEOUT_S, poll_interval_s: float = 20.0,
                    max_workers: int = 4) -> list[dict]:
     """Warm Lambda caches: one download-only launch per region with capacity. Returns status per region."""
     models = models or catalog_model_ids()
@@ -533,7 +541,8 @@ def main(argv: list[str] | None = None) -> int:
              "either. Defaulting to None (not a sentinel string) lets you explicitly pick even the "
              "per-mode default GPU without it being mistaken for 'no override'.",
     )
-    ap.add_argument("--timeout-s", type=int, default=1800, help="per-DC job timeout")
+    ap.add_argument("--timeout-s", type=int, default=_PRELOAD_TIMEOUT_S,
+                    help="per-DC job timeout (default sized for a fully cold whole-catalog warm)")
     ap.add_argument(
         "--max-workers", type=int, default=4,
         help="datacenters warmed concurrently. Each one deploys a preload endpoint, so this MUST stay "
