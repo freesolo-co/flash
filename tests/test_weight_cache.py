@@ -1435,10 +1435,12 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
         spec=None,
         endpoint_kwargs=None,
         deadline_at=None,
+        cache_volumes=None,
     ):
         calls["gpu"] = gpu
         calls["suffix"] = name_suffix
         calls["endpoint_kwargs"] = endpoint_kwargs
+        calls["cache_volumes"] = cache_volumes
         return "ep-1", "name-1", _RUNPOD_FINGERPRINT
 
     submitted = {}
@@ -3695,55 +3697,45 @@ def test_warm_grows_the_volume_before_attaching_it(monkeypatch):
     Ordering is the whole point: reconciling after the attach leaves this run downloading into the
     under-sized mount it was supposed to fix.
     """
+    import inspect
+
     from flash import runner
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import jobs
 
-    order = []
-    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["k1", "k2"])
-    monkeypatch.setattr(
-        preload.runpod_api,
-        "grow_network_volumes_for_key",
-        lambda key, wanted, **kw: order.append(("grow", key, dict(wanted))) or {},
-    )
-    monkeypatch.setattr(
-        preload,
-        "deploy_train_endpoint",
-        lambda *a, **k: (order.append(("deploy",)), ("ep", "name", "fp"))[1],
-    )
-    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda *a, **k: "job-1")
-    monkeypatch.setattr(preload, "_poll_until_done", lambda *a, **k: {"preloaded": ["m1"]})
-    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda *a, **k: None)
+    # the grow must sit ahead of the create inside the same serialized attempt
+    src = inspect.getsource(jobs.deploy_train_endpoint)
+    assert src.index("grow_weight_cache_volumes(") < src.index("ep = Endpoint(**kwargs)")
 
-    out = preload._preload_one_dc("US-CA-2", ["m1"], None, "RTX 4090", 60, 0.0)
-
-    assert out["status"] == "ok"
-    assert [step[0] for step in order] == ["grow", "grow", "deploy"]
-    # every account in the pool is reconciled: the volume may belong to any of them
-    assert [step[1] for step in order[:2]] == ["k1", "k2"]
     # and it asks for the MANAGED size on this DC's real (per-DC) volume name
-    assert order[0][2] == {"flash-weights-us-ca-2": runner.WEIGHT_CACHE_VOLUME_GB}
+    asked = {}
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: asked.update(wanted) or {},
+    )
+    jobs.grow_weight_cache_volumes(
+        None, "k1", None, wanted={"flash-weights-us-ca-2": runner.WEIGHT_CACHE_VOLUME_GB}
+    )
+    assert asked == {"flash-weights-us-ca-2": runner.WEIGHT_CACHE_VOLUME_GB}
 
 
 def test_a_bad_account_key_never_blocks_a_warm(monkeypatch):
-    """Growing is best-effort: one failing account must not stop a healthy one from warming.
+    """Growing is best-effort: a failing grow must not stop the warm from deploying.
 
     A volume that cannot be grown still gets attached, which is no worse than not trying at all --
-    but a warm aborted over an expired key on an unrelated account warms nothing.
+    but a warm aborted over an expired key warms nothing.
     """
     from flash.providers import weight_cache_preload as preload
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import jobs
 
-    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["bad", "good"])
-    seen = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: (_ for _ in ()).throw(RuntimeError("401 unauthorized")),
+    )
+    # the grow raising must not propagate out of the helper the deploy calls
+    jobs.grow_weight_cache_volumes(None, "bad", None, wanted={"flash-weights-us-ca-2": 250})
 
-    def _grow(key, wanted, **kw):
-        seen.append(key)
-        if key == "bad":
-            raise RuntimeError("401 unauthorized")
-        return {"flash-weights-us-ca-2": 250}
-
-    monkeypatch.setattr(preload.runpod_api, "grow_network_volumes_for_key", _grow)
     monkeypatch.setattr(preload, "deploy_train_endpoint", lambda *a, **k: ("ep", "name", "fp"))
     monkeypatch.setattr(preload.runpod_api, "submit_job", lambda *a, **k: "job-1")
     monkeypatch.setattr(preload, "_poll_until_done", lambda *a, **k: {"preloaded": ["m1"]})
@@ -3752,7 +3744,6 @@ def test_a_bad_account_key_never_blocks_a_warm(monkeypatch):
     out = preload._preload_one_dc("US-CA-2", ["m1"], None, "RTX 4090", 60, 0.0)
 
     assert out["status"] == "ok"  # the warm still ran
-    assert seen == ["bad", "good"]  # and the failure did not stop the next account
 
 
 def test_assign_refreshes_a_stale_shared_cache_size():
@@ -3958,53 +3949,53 @@ def test_deploy_side_grow_takes_a_bounded_budget_not_the_run_deadline(monkeypatc
     assert seen["deadline_at"] - before <= jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0
 
 
-def test_pool_wide_grow_is_capped_even_with_a_hanging_account(monkeypatch):
-    """The preload walks the whole pool, so the CAP is across all accounts, not per account.
+def test_the_warm_names_the_volume_the_deploy_must_reconcile(monkeypatch):
+    """The warm attaches its own volume with spec=None, so the deploy cannot derive one.
 
-    Without it, one unreachable account's retries push the warm past the create allowance.
+    Without cache_volumes the deploy-side grow early-returns on spec=None and nothing reconciles
+    the warm's mount at all.
     """
     from flash.providers import weight_cache_preload as preload
-    from flash.providers.runpod import jobs
-    from flash.providers.runpod import keys as rp_keys
 
-    clock = {"t": 5000.0}
-    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
-    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["hangs", "healthy", "also-healthy"])
+    seen = {}
 
-    tried = []
+    def _deploy(gpu, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop here; the kwargs are what we are asserting on")
 
-    def _grow(key, wanted, **kw):
-        tried.append(key)
-        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0  # this one burns the whole budget
-        return {}
+    monkeypatch.setattr(preload, "deploy_train_endpoint", _deploy)
+    preload._preload_one_dc("US-CA-2", ["m"], None, "RTX 4090", 600, 1.0)
 
-    monkeypatch.setattr(preload.runpod_api, "grow_network_volumes_for_key", _grow)
-    preload._grow_existing_cache_volumes({"flash-weights-us-ca-2": 250})
-
-    # stopped after the account that consumed the budget instead of walking the rest
-    assert tried == ["hangs"]
+    assert seen["cache_volumes"] == {"flash-weights-us-ca-2": 250}
 
 
 def test_a_short_timeout_still_reconciles(monkeypatch):
-    """Regression: the cap must be carved from the front, not subtracted from the deadline.
+    """Regression: the grow budget is headroom ON TOP of timeout_s, not a slice carved out of it.
 
-    effective timeouts floor at 60s on their own, so reserving the 60s create allowance OUT of the
-    deadline skipped reconciliation entirely and reintroduced the under-sized mount.
+    effective timeouts floor at 60s on their own, and the grow yields the 60s create allowance, so
+    a deadline of exactly now+timeout_s left zero budget and skipped reconciliation entirely --
+    reintroducing the under-sized mount.
     """
     from flash.providers import weight_cache_preload as preload
-    from flash.providers.runpod import keys as rp_keys
+    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod.jobs import WEIGHT_CACHE_GROW_BUDGET_S
 
-    tried = []
-    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["k1", "k2"])
-    monkeypatch.setattr(
-        preload.runpod_api,
-        "grow_network_volumes_for_key",
-        lambda key, wanted, **kw: tried.append(key) or {},
-    )
+    clock = {"t": 5000.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
 
-    preload._grow_existing_cache_volumes({"flash-weights-us-ca-2": 250})
+    seen = {}
 
-    assert tried == ["k1", "k2"]
+    def _deploy(gpu, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop here; the deadline is what we are asserting on")
+
+    monkeypatch.setattr(preload, "deploy_train_endpoint", _deploy)
+    preload._preload_one_dc("US-CA-2", ["m"], None, "RTX 4090", 60, 1.0)
+
+    # the grow clamps to remaining - CREATE_ALLOWANCE_S, so headroom must survive that subtraction
+    budget = (seen["deadline_at"] - clock["t"]) - CREATE_ALLOWANCE_S
+    assert budget > 0
+    assert budget >= WEIGHT_CACHE_GROW_BUDGET_S
 
 
 def test_deploy_side_grow_yields_the_create_allowance_it_sits_in_front_of(monkeypatch):
@@ -4047,7 +4038,7 @@ def test_deploy_side_grow_is_wired_to_the_run_deadline(monkeypatch):
     from flash.providers.runpod import jobs
 
     src = inspect.getsource(jobs.deploy_train_endpoint)
-    assert "grow_weight_cache_volumes(spec, owning_key, deadline_at)" in src
+    assert "grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)" in src
 
 
 def test_one_bad_volume_never_blocks_the_others(monkeypatch):
@@ -4128,65 +4119,91 @@ def test_a_usable_worker_keeps_the_throttled_timer_clear():
     assert preload._throttled_workers({}) is False
 
 
-def test_the_active_account_is_reconciled_before_the_budget_can_run_out(monkeypatch):
-    """The active account is the one about to be attached, so it must never be the one skipped.
+def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
+    """The account a quota failover moves to must have its OWN volume grown before the attach.
 
-    Iterating pool order let an earlier unrelated key exhaust the cap, leaving the account the
-    deploy actually uses unreconciled -- and the preload passes spec=None, so the deploy-side grow
-    is a no-op and cannot repair it.
+    A sweep in front of the deploy could not do this: it ran once, against whichever accounts it
+    reached, before anyone knew which account the create would succeed on. The one the failover
+    lands on could be exactly the one left holding a stale, under-sized volume. Driven through
+    deploy_train_endpoint on purpose -- the warm passes spec=None, so a dropped cache_volumes
+    passthrough silently turns the whole reconciliation back into a no-op.
     """
-    from flash.providers import weight_cache_preload as preload
+    from flash.providers.runpod import auth as rp_auth
     from flash.providers.runpod import jobs
     from flash.providers.runpod import keys as rp_keys
 
-    clock = {"t": 5000.0}
-    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
-    # pool order is [first, active]; ordered_keys() puts the ACTIVE one first
-    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["active", "first"])
+    account = {"key": "first-account"}
+    # deploy_train_endpoint imports ensure_auth function-locally, so patch it at the source
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: account["key"])
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(rp_keys, "advance_key", lambda: account.update(key="second-account"))
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: True)
 
-    tried = []
+    grown = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: grown.append(key) or {},
+    )
 
-    def _grow(key, wanted, **kw):
-        tried.append(key)
-        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0  # whoever goes first burns the budget
-        return {}
+    def _endpoint(**kwargs):
+        raise RuntimeError("insufficient balance")
 
-    monkeypatch.setattr(preload.runpod_api, "grow_network_volumes_for_key", _grow)
-    preload._grow_existing_cache_volumes({"flash-weights-us-ca-2": 250})
+    # deploy_train_endpoint imports Endpoint function-locally from runpod_flash, so patch it there
+    import runpod_flash
 
-    assert tried == ["active"]
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    with pytest.raises(RuntimeError, match="insufficient balance"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            cache_volumes={"flash-weights-us-ca-2": 250},
+        )
+
+    # both attempts reconciled the account THEY were about to attach, not just the first
+    assert grown == ["first-account", "second-account"]
 
 
-def test_the_preload_deadline_starts_after_reconciliation(monkeypatch):
-    """timeout_s is the budget for this DC's job, not for the best-effort work in front of it.
+def test_datacenter_discovery_failure_never_fails_the_deploy(monkeypatch):
+    """Regression: discovery sat OUTSIDE the best-effort boundary and could abort the deploy.
 
-    Anchoring first meant a short --timeout-s could reach deploy_train_endpoint with under the 60s
-    create allowance left and be rejected without one launch attempt.
+    The helper promises it cannot fail a deploy -- a volume it cannot grow is simply attached as-is.
+    An SDK whose DataCenter.all() raises (say an incompatible runpod-flash update) broke that
+    promise from inside the one function that makes it, while the sibling
+    weight_cache_endpoint_kwargs deliberately catches the same failure and deploys cold.
     """
-    from flash.providers import weight_cache_preload as preload
-    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash import runner
+    from flash.providers.runpod import jobs
 
-    clock = {"t": 9000.0}
-    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    def _boom():
+        raise RuntimeError("incompatible SDK: DataCenter.all() is gone")
 
-    def _grow(_wanted):
-        clock["t"] += 19.0  # reconciliation spends nearly the whole cap
+    monkeypatch.setattr(jobs, "weight_cache_datacenters", _boom)
 
-    monkeypatch.setattr(preload, "_grow_existing_cache_volumes", _grow)
+    # must return, not raise
+    jobs.grow_weight_cache_volumes(_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME), "k")
 
-    seen = {}
 
-    def _deploy(gpu, **kw):
-        seen.update(kw)
-        raise RuntimeError("stop here; the deadline is what we are asserting on")
+def test_spec_none_without_named_volumes_stays_a_no_op(monkeypatch):
+    """Callers that neither carry a spec nor name volumes have nothing to reconcile."""
+    from flash.providers.runpod import jobs
 
-    monkeypatch.setattr(preload, "deploy_train_endpoint", _deploy)
+    grown = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: grown.append(key) or {},
+    )
 
-    preload._preload_one_dc("US-CA-2", ["m"], None, "RTX 4090", 65, 1.0)
+    jobs.grow_weight_cache_volumes(None, "k", None)
 
-    # the full 65s budget survives the grow, so the create allowance is still clear
-    assert seen["deadline_at"] - clock["t"] == 65
-    assert seen["deadline_at"] - clock["t"] >= CREATE_ALLOWANCE_S
+    assert grown == []
 
 
 def test_the_owning_key_is_read_inside_the_serialized_section():

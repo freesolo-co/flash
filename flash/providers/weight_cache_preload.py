@@ -204,50 +204,6 @@ def catalog_model_ids() -> list[str]:
     return [mid for mid, _ in fitting]
 
 
-def _grow_existing_cache_volumes(wanted: dict[str, int]) -> None:
-    """Raise any already-provisioned cache volume in ``wanted`` to the managed size, fleet-wide.
-
-    A NetworkVolume is only sized on CREATE: the SDK matches an existing volume by name+datacenter
-    and hands it back untouched, so every volume provisioned before a size bump stays at the old
-    size and the bump is a silent no-op. The warm then attaches an under-sized mount and the
-    download dies with "Disk quota exceeded" -- the exact failure the bump was meant to fix.
-
-    Unlike the deploy path, this walks the WHOLE pool: the warm passes ``spec=None`` so the deploy-side
-    grow is a no-op, and the volume may belong to any account. Order is ACTIVE-FIRST, because the pool
-    walk is capped: if an earlier unrelated key exhausted the budget, the one account the deploy is
-    about to use would be the one left unreconciled, and it would attach its own stale volume. The
-    account that matters most is reconciled before any budget can be spent.
-
-    The cap exists because an unreachable account would otherwise spend three request timeouts plus
-    backoff against the clock the launch needs. It is carved from the front rather than by reserving a
-    slice of the deadline: a short --timeout-s floors at 60s all by itself, so subtracting the create
-    allowance from it would silently skip reconciliation entirely and reintroduce the under-sized mount.
-
-    Best-effort throughout: a volume that cannot be grown still gets attached, which is no worse
-    than not trying, so nothing here fails a warm.
-    """
-    from flash.providers.runpod import keys as rp_keys
-    from flash.providers.runpod.jobs import WEIGHT_CACHE_GROW_BUDGET_S
-
-    reconcile_until = time.time() + WEIGHT_CACHE_GROW_BUDGET_S
-    for i, key in enumerate(rp_keys.ordered_keys()):
-        # i > 0 so the active account always gets its attempt: it is the one about to be attached,
-        # and skipping it is the failure this whole call exists to prevent.
-        if i > 0 and time.time() >= reconcile_until:
-            logger.warning("weight cache: out of reconciliation budget; attaching volume(s) as-is")
-            return
-        try:
-            grown = runpod_api.grow_network_volumes_for_key(key, wanted, deadline_at=reconcile_until)
-        except Exception as exc:
-            logger.warning(
-                "weight cache: could not grow volume(s) on RunPod account %d (%s); attaching as-is",
-                i, exc,
-            )
-            continue
-        for name, size in sorted(grown.items()):
-            logger.info("weight cache: grew %s to %d GB (was under the managed size)", name, size)
-
-
 def _preload_one_dc(
     dc_id: str,
     models: list[str],
@@ -275,12 +231,19 @@ def _preload_one_dc(
     endpoint_id = None
     key_fingerprint = None
     try:
-        _grow_existing_cache_volumes({vol_name: WEIGHT_CACHE_VOLUME_GB})
-        # Anchor AFTER reconciliation: timeout_s is the budget for this DC's job, not for the
-        # best-effort work in front of it. Starting the clock first meant a short --timeout-s could
-        # arrive at deploy_train_endpoint with less than the 60s create allowance left and be
-        # rejected without a single launch attempt.
-        deadline_at = time.time() + timeout_s
+        # timeout_s is the budget for this DC's job; the best-effort reconciliation in front of it
+        # gets its own bounded budget on top, never a slice carved out of the job's. Without the
+        # headroom a short --timeout-s floors at the 60s create allowance all by itself, the grow
+        # yields to that allowance, and reconciliation is skipped entirely -- reintroducing the
+        # under-sized mount this whole path exists to prevent.
+        from flash.providers.runpod.jobs import WEIGHT_CACHE_GROW_BUDGET_S
+
+        deadline_at = time.time() + timeout_s + WEIGHT_CACHE_GROW_BUDGET_S
+        # The warm attaches its own volume (spec=None), so the deploy cannot derive what to
+        # reconcile -- name it here. Reconciling per deploy attempt rather than sweeping the pool
+        # up front is what keeps a quota/balance failover correct: the attempt grows the volume
+        # owned by the account it is about to attach, so the account failover lands on is never the
+        # one left holding a stale, under-sized mount.
         endpoint_id, _name, key_fingerprint = deploy_train_endpoint(
             gpu,
             execution_timeout_ms=timeout_s * 1000,
@@ -288,6 +251,7 @@ def _preload_one_dc(
             spec=None,
             endpoint_kwargs=_endpoint_kwargs,
             deadline_at=deadline_at,
+            cache_volumes={vol_name: WEIGHT_CACHE_VOLUME_GB},
         )
         payload = {
             "mode": "preload",

@@ -146,7 +146,9 @@ def weight_cache_volumes(spec) -> list:
     ]
 
 
-def grow_weight_cache_volumes(spec, key: str, deadline_at: float | None = None) -> None:
+def grow_weight_cache_volumes(
+    spec, key: str, deadline_at: float | None = None, wanted: dict[str, int] | None = None
+) -> None:
     """Raise this account's already-provisioned shared-cache volumes to the managed size.
 
     A NetworkVolume is only sized on CREATE: the SDK matches an existing volume by name+datacenter
@@ -156,10 +158,14 @@ def grow_weight_cache_volumes(spec, key: str, deadline_at: float | None = None) 
     to reconcile one that already exists.
 
     Scoped to ``key`` because the caller has already picked the account it is deploying under, and
-    only that account's volumes are the ones about to be attached.
+    only that account's volumes are the ones about to be attached. Callers that attach a volume set
+    of their own -- the warm pins one datacenter -- pass it as ``wanted`` ({name: gb}); everyone else
+    leaves it None and the managed fleet is derived from ``spec``.
 
     Best-effort by design: a volume that cannot be grown still gets attached, which is no worse than
-    not trying, so this must never fail a deploy. It takes a short fixed budget rather than the run
+    not trying, so this must never fail a deploy. That covers datacenter discovery too, not just the
+    REST calls: an SDK whose ``DataCenter.all()`` raises would otherwise abort the deploy from inside
+    the one helper that promises it cannot. It takes a short fixed budget rather than the run
     deadline, and under ``deadline_at`` it additionally yields whatever the create allowance needs:
     the deploy re-checks that allowance after this returns, so spending into it would turn a
     best-effort reconciliation into the reason an otherwise-launchable deploy is rejected. Time it
@@ -167,22 +173,23 @@ def grow_weight_cache_volumes(spec, key: str, deadline_at: float | None = None) 
     """
     from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
 
-    base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
-    if str(base or "") != WEIGHT_CACHE_VOLUME_NAME:
-        return  # cache off, or a custom volume the caller owns the sizing of
-    wanted = {
-        weight_cache_volume_name(str(base), dc): WEIGHT_CACHE_VOLUME_GB
-        for dc in weight_cache_datacenters()
-    }
-    if not wanted:
-        return
-    budget = WEIGHT_CACHE_GROW_BUDGET_S
-    if deadline_at is not None:
-        budget = min(budget, remaining_seconds(deadline_at) - CREATE_ALLOWANCE_S)
-    if budget <= 0:
-        logger.warning("weight cache: no room to grow volume(s) before launch; attaching as-is")
-        return
     try:
+        if wanted is None:
+            base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
+            if str(base or "") != WEIGHT_CACHE_VOLUME_NAME:
+                return  # cache off, or a custom volume the caller owns the sizing of
+            wanted = {
+                weight_cache_volume_name(str(base), dc): WEIGHT_CACHE_VOLUME_GB
+                for dc in weight_cache_datacenters()
+            }
+        if not wanted:
+            return
+        budget = WEIGHT_CACHE_GROW_BUDGET_S
+        if deadline_at is not None:
+            budget = min(budget, remaining_seconds(deadline_at) - CREATE_ALLOWANCE_S)
+        if budget <= 0:
+            logger.warning("weight cache: no room to grow volume(s) before launch; attaching as-is")
+            return
         grown = runpod_api.grow_network_volumes_for_key(
             key, wanted, deadline_at=time.time() + budget
         )
@@ -432,11 +439,17 @@ def deploy_train_endpoint(
     spec=None,
     endpoint_kwargs: dict | Callable[[], dict] | None = None,
     deadline_at: float | None = None,
+    cache_volumes: dict[str, int] | None = None,
 ) -> tuple[str, str, str]:
     """Deploy a uniquely-named worker endpoint and return its id, name, and owning fingerprint.
 
     ``endpoint_kwargs`` may be a callable factory — re-invoked per account on quota failover so the
     SDK doesn't reuse a volume id stamped for the previous account.
+
+    ``cache_volumes`` ({name: gb}) names the shared-cache volumes a caller attaches itself, for
+    callers that pass ``spec=None`` and so cannot have them derived. Each failover attempt reconciles
+    the account it is about to deploy under, so the account a failover lands on never attaches a
+    stale, under-sized volume.
     """
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.resource_manager import ResourceManager
@@ -476,8 +489,10 @@ def deploy_train_endpoint(
             # Reconcile before attaching: a volume provisioned under an older, smaller managed size
             # is returned as-is by the SDK, so without this an ordinary training job mounts the
             # stale size and a model the new size admits fails with "Disk quota exceeded".
-            # Deadline-aware: the create allowance is re-checked below, so this yields to it.
-            grow_weight_cache_volumes(spec, owning_key, deadline_at)
+            # Inside the per-attempt body on purpose: failover picks a different account, and the
+            # volume about to be attached is the one owned by whichever account this attempt landed
+            # on. Deadline-aware: the create allowance is re-checked below, so this yields to it.
+            grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)
             # Re-invoke factory per account (avoids reusing a volume id stamped for the prior account).
             override = endpoint_kwargs() if callable(endpoint_kwargs) else endpoint_kwargs
             kwargs.update(override if override is not None else weight_cache_endpoint_kwargs(spec))
