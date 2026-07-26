@@ -625,21 +625,52 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 
 
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
-# 200 GB so the whole catalog fits: at the 2x peak factor below, 100 GB excluded the 27B (108 GB
-# peak) and 35B (140 GB peak) models -- exactly the ones whose cold download costs the most.
-WEIGHT_CACHE_VOLUME_GB = 200
+# 250 GB so the whole catalog fits ON ONE SHARED VOLUME. The binding constraint is NOT any single
+# model: the volume is persistent and preload never evicts, so by the time the largest model
+# downloads, every other model is already resident. The real requirement is therefore
+#   (resident bytes of every other model) + (peak footprint of the largest) <= volume
+#   = (162.5 - 71.9) + 143.8 = 234.4 GB for today's catalog.
+# 200 GB failed that by 34.4 GB and the 35B died with "Disk quota exceeded" on every datacenter,
+# no matter what order the downloads ran in. 250 GB clears it with ~15 GB of margin.
+WEIGHT_CACHE_VOLUME_GB = 250
 # Peak footprint ~= 2x bf16 download (checkpoint + Xet temp); must fit the fixed cache volume.
 _WEIGHT_CACHE_PEAK_FACTOR = 2.0
 
 
 def _fits_weight_cache(info: ModelInfo) -> bool:
-    """Whether the model's peak download footprint fits the shared weight-cache volume."""
+    """Whether the model's peak download footprint fits the shared weight-cache volume.
+
+    Sizes the model against an EMPTY volume. That is the right question for "may this model use
+    the cache at all", but it is NOT sufficient to prove the whole catalog can be warmed onto one
+    volume -- the cache is shared and never evicted, so a later model meets a volume already
+    holding every earlier one. ``weight_cache_catalog_peak_gb`` answers that cumulative question;
+    keep both in agreement when adding a large model.
+    """
     if not info.params_b:
         return (
             True  # unknown size -> keep the (attach) default; curated catalog models always set it
         )
     download_gb = info.params_b * 2.0  # bf16: 2 bytes/param (mirrors cost.facts.download_weight_gb)
     return _WEIGHT_CACHE_PEAK_FACTOR * download_gb <= WEIGHT_CACHE_VOLUME_GB
+
+
+def weight_cache_catalog_peak_gb() -> float:
+    """Peak GB the volume must hold to warm the WHOLE catalog onto one shared volume.
+
+    Every catalog model ends up resident together, and the largest one needs roughly double its
+    size in transit (weights + Xet reconstruction scratch). The worst moment is therefore the
+    largest model downloading while all the others are already on disk.
+    """
+    from flash.catalog import MODELS
+
+    sizes = sorted(
+        ((info.params_b or 0.0) * 2.0 for info in MODELS.values() if _fits_weight_cache(info)),
+        reverse=True,
+    )
+    if not sizes:
+        return 0.0
+    largest, rest = sizes[0], sizes[1:]
+    return sum(rest) + _WEIGHT_CACHE_PEAK_FACTOR * largest
 
 
 def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:

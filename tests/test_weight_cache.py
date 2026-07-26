@@ -2403,10 +2403,10 @@ def test_no_capacity_is_reported_distinctly_from_error(monkeypatch):
 
 
 def test_catalog_is_ordered_largest_first(monkeypatch):
-    """Largest-first is what lets the biggest model claim its Xet scratch on an empty volume.
+    """Largest-first makes a capacity failure surface first instead of 20 minutes in.
 
-    Smallest-first fills the shared volume with the small models and the largest one then dies with
-    "Disk quota exceeded" -- the exact model the cache exists to speed up.
+    It is deliberately not the thing that makes the catalog fit -- see
+    ``test_volume_holds_whole_catalog_with_largest_model_in_transit`` for that invariant.
     """
     from flash.providers.runpod import preload
 
@@ -2417,26 +2417,41 @@ def test_catalog_is_ordered_largest_first(monkeypatch):
     assert sizes == sorted(sizes, reverse=True), f"catalog must be largest-first, got {list(zip(ids, sizes))}"
 
 
-def test_whole_catalog_fits_the_volume_in_download_order(monkeypatch):
-    """Walk the real download order and assert no model ever needs more room than is left.
+def test_volume_holds_whole_catalog_with_largest_model_in_transit():
+    """The volume must fit every model resident PLUS the largest one's download scratch.
 
-    A download needs the weights plus ~as much again for Xet reconstruction, so the binding
-    constraint is peak-at-that-moment, not the final resident total.
+    Regression for a real 200 GB failure: the 35B died with "Disk quota exceeded" in every
+    datacenter. Download order does not save it -- the volume is persistent and nothing is
+    evicted, so the largest model always meets a volume already holding the rest.
+    """
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB, weight_cache_catalog_peak_gb
+
+    needed = weight_cache_catalog_peak_gb()
+    assert needed <= WEIGHT_CACHE_VOLUME_GB, (
+        f"catalog needs {needed:.1f} GB at peak but the volume is {WEIGHT_CACHE_VOLUME_GB} GB: "
+        "the largest model will fail with Disk quota exceeded on every datacenter"
+    )
+
+
+def test_catalog_peak_counts_others_resident_not_just_the_largest():
+    """Pin the shape of the calculation, not just today's numbers.
+
+    The bug was sizing the largest model against an EMPTY volume. Peak must therefore exceed both
+    the largest model's own peak and the plain resident total.
     """
     from flash.catalog import MODELS
-    from flash.providers.runpod import preload
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB
+    from flash.runner import _fits_weight_cache, weight_cache_catalog_peak_gb
 
-    used = 0.0
-    for model_id in preload.catalog_model_ids():
-        resident = (MODELS[model_id].params_b or 0.0) * 2.0
-        peak = resident * 2.0  # weights + reconstruction scratch
-        free = WEIGHT_CACHE_VOLUME_GB - used
-        assert peak <= free, (
-            f"{model_id} needs {peak:.1f} GB peak but only {free:.1f} GB free "
-            f"after {used:.1f} GB of earlier models -- it would fail with Disk quota exceeded"
-        )
-        used += resident
+    sizes = sorted(
+        ((info.params_b or 0.0) * 2.0 for info in MODELS.values() if _fits_weight_cache(info)),
+        reverse=True,
+    )
+    resident_total = sum(sizes)
+    largest_alone_peak = 2.0 * sizes[0]
+    needed = weight_cache_catalog_peak_gb()
+
+    assert needed > largest_alone_peak, "peak ignores the models already on the volume"
+    assert needed > resident_total, "peak ignores the largest model's in-transit scratch"
 
 
 def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):

@@ -79,13 +79,15 @@ def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool
 def catalog_model_ids() -> list[str]:
     """Catalog base models that fit the weight-cache volume, LARGEST FIRST.
 
-    Order matters and is not cosmetic. `_fits_weight_cache` sizes each model against an EMPTY
-    volume, but a preload fills one shared volume in sequence, and a download needs room for the
-    weights plus roughly as much again for Xet reconstruction scratch. Smallest-first spends the
-    volume on the small models and then cannot fit the largest one's scratch, so the biggest model
-    -- the one whose cold download costs the most, i.e. the whole point of the cache -- is exactly
-    the one that fails with "Disk quota exceeded". Largest-first takes its scratch while the volume
-    is still empty, and every smaller model then fits in what remains.
+    Largest-first only buys fail-fast: the biggest model is the one whose cold download costs the
+    most and is the likeliest to run out of room, so trying it before spending 20 minutes on the
+    small ones surfaces the failure early.
+
+    It is NOT what makes the catalog fit, and it must not be mistaken for a capacity fix. The volume
+    is persistent and preload never evicts, so on any DC warmed even once the largest model meets a
+    volume already holding everything else no matter what order this returns. Capacity comes from
+    sizing the volume for the whole resident catalog plus the largest model's in-transit scratch --
+    see ``flash.runner.weight_cache_catalog_peak_gb``.
     """
     from flash.catalog import MODELS
     from flash.runner import _fits_weight_cache
