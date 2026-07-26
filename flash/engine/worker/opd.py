@@ -538,6 +538,19 @@ def _format_skip_counts(counts: Counter[str]) -> str:
 
 
 def run_opd():
+    # backend selector (private worker env): default trl. the verl path imports nothing here so the
+    # default trl path is completely unchanged; verl runs out-of-process against its own interpreter.
+    backend = os.environ.get("FLASH_OPD_BACKEND", "trl").strip().lower()
+    if backend == "verl":
+        from flash.engine.worker.opd_verl import run_opd_verl
+
+        run_opd_verl()
+        return
+    if backend != "trl":
+        raise RuntimeError(
+            f"FLASH_OPD_BACKEND={backend!r} is not a known opd backend (expected 'trl' or 'verl')"
+        )
+
     import torch
 
     from flash.engine.worker.hf import load_tokenizer, model_revision_kwargs
