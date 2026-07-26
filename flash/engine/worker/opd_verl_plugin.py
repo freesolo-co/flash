@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -18,8 +19,30 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+try:
+    from flash_opd_verl_structured import StructuredOutputReplay, canonical_structured_spec
+except ImportError:
+    from flash.engine.worker.opd_verl_structured import (
+        StructuredOutputReplay,
+        canonical_structured_spec,
+    )
+
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
+_STRUCTURED_RUNTIME_VERSIONS = {
+    "verl": "0.8.0",
+    "vllm": "0.11.0",
+    "xgrammar": "0.1.25",
+}
+
+
+def _require_structured_runtime_versions() -> None:
+    for package, expected in _STRUCTURED_RUNTIME_VERSIONS.items():
+        actual = importlib.metadata.version(package)
+        if actual != expected:
+            raise RuntimeError(
+                f"structured OPD requires {package} {expected} exactly; found {actual}"
+            )
 
 
 def deterministic_rollout_seed(
@@ -112,15 +135,19 @@ def _bridge_score_payload(
     prompt_ids: list[int],
     response_ids: list[int],
     multi_modal_data=None,
+    forced: list[bool] | None = None,
 ) -> dict[str, Any]:
     prompt_ids = [int(token_id) for token_id in prompt_ids]
     response_ids = [int(token_id) for token_id in response_ids]
-    return {
+    payload = {
         "index": int(index),
         "prompt_length": len(prompt_ids),
         "sequence_ids": prompt_ids + response_ids,
         "image_count": _multi_modal_image_count(multi_modal_data),
     }
+    if forced is not None:
+        payload["forced"] = list(forced)
+    return payload
 
 
 def _raw_prompt_has_image_block(raw_prompt) -> bool:
@@ -298,11 +325,16 @@ def _install_verl_extensions() -> None:
             multi_modal_data=None,
             mm_processor_kwargs=None,
             routing_key=None,
+            forced: list[bool] | None = None,
         ):
             if routing_key is None:
                 raise RuntimeError("flash OPD bridge requires the indexed dataset row")
             request_payload = _bridge_score_payload(
-                routing_key, prompt_ids, response_ids, multi_modal_data
+                routing_key,
+                prompt_ids,
+                response_ids,
+                multi_modal_data,
+                forced,
             )
             try:
                 payload = await asyncio.to_thread(
@@ -347,6 +379,22 @@ def _install_verl_extensions() -> None:
                     routing_key = (
                         routing_value.item() if hasattr(routing_value, "item") else routing_value
                     )
+            forced = None
+            structured_spec = os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS", "")
+            if structured_spec:
+                replay = getattr(self, "_flash_structured_output_replay", None)
+                if replay is None:
+                    replay = StructuredOutputReplay(
+                        self.tokenizer,
+                        int(os.environ["FLASH_OPD_MODEL_VOCAB_SIZE"]),
+                    )
+                    self._flash_structured_output_replay = replay
+                forced = replay.forced_mask(
+                    prompt_ids,
+                    response_ids,
+                    canonical_structured_spec(json.loads(structured_spec)),
+                    thinking=os.environ.get("FLASH_OPD_THINKING") == "1",
+                )
             teacher_ids, teacher_logprobs = (
                 await self.teacher_server_manager.compute_teacher_logprobs_single(
                     prompt_ids=prompt_ids,
@@ -354,6 +402,7 @@ def _install_verl_extensions() -> None:
                     multi_modal_data=output.multi_modal_data,
                     mm_processor_kwargs=output.mm_processor_kwargs,
                     routing_key=routing_key,
+                    forced=forced,
                 )
             )
             output.extra_fields["teacher_ids"] = teacher_ids
@@ -387,6 +436,14 @@ def _install_verl_extensions() -> None:
             eos_ids = json.loads(os.environ.get("FLASH_OPD_EOS_TOKEN_IDS", "[]"))
             if eos_ids:
                 params["stop_token_ids"] = eos_ids
+            structured_spec = os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS", "")
+            if structured_spec:
+                _require_structured_runtime_versions()
+                from vllm.sampling_params import StructuredOutputsParams
+
+                params["structured_outputs"] = StructuredOutputsParams(
+                    **json.loads(structured_spec)
+                )
             output = await super().run(params, **kwargs)
             output.reward_score = 0.0
             return output
@@ -565,6 +622,9 @@ def main() -> None:
 
     verl_main()
 
+
+if os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS"):
+    _require_structured_runtime_versions()
 
 if importlib.util.find_spec("verl") is not None:
     _install_verl_extensions()

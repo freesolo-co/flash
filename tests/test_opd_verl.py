@@ -25,6 +25,8 @@ from flash.engine.worker.opd_verl import (
     _restore_verl_resume,
     _stage_retry_contract,
     _TeacherAlignmentBridge,
+    _trim_response_and_forced,
+    _validate_forced_mask,
     _write_opd_parquet,
     build_opd_verl_overrides,
     encode_shifted_group_metadata,
@@ -37,12 +39,19 @@ from flash.engine.worker.opd_verl_plugin import (
     _multi_modal_image_count,
     _post_json,
     _raw_prompt_has_image_block,
+    _require_structured_runtime_versions,
     _resolve_image_token_id,
     _set_current_global_batch_info,
     _signal_sequences,
     deterministic_rollout_seed,
 )
+from flash.engine.worker.opd_verl_structured import (
+    StructuredOutputReplay,
+    _count_legal_tokens,
+    canonical_structured_spec,
+)
 from flash.engine.worker.tokenizer_align import TeacherToken
+from flash.opd_verl_validation import validate_opd_verl_structured_outputs
 
 
 def _load_verl_rl_dataset(monkeypatch):
@@ -256,6 +265,145 @@ def test_shifted_group_metadata_uses_verl_prediction_layout():
     assert teacher_ids[2:6] == [0, 1, 1, -1]
 
 
+def _structured_test_tokenizer():
+    import tokenizers
+    import transformers
+    characters = list('{}[]":,0123456789truefalsenullabc xyz')
+    vocab = {"[UNK]": 0, "</think>": 1, "<eos>": 2}
+    for character in characters:
+        if character not in vocab:
+            vocab[character] = len(vocab)
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab=vocab, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Split("", behavior="isolated")
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        eos_token="<eos>",
+        additional_special_tokens=["</think>"],
+    )
+    return tokenizer, vocab
+
+
+def _structured_ids(vocab, text: str, *, eos: bool = True) -> list[int]:
+    token_ids = [vocab[character] for character in text]
+    if eos:
+        token_ids.append(vocab["<eos>"])
+    return token_ids
+
+
+@pytest.mark.parametrize(
+    ("spec", "text"),
+    [
+        ({"json": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}}, '{"a":"b"}'),
+        ({"json_object": True}, '{"a":1}'),
+        ({"regex": "[0-9]+"}, "12"),
+        ({"choice": ["ab", "ac"]}, "ab"),
+    ],
+)
+def test_xgrammar_replay_accepts_every_flash_constraint_kind(spec, text):
+    tokenizer, vocab = _structured_test_tokenizer()
+    replay = StructuredOutputReplay(tokenizer, len(vocab))
+    response_ids = _structured_ids(vocab, text)
+
+    forced = replay.forced_mask(
+        [], response_ids, canonical_structured_spec(spec), thinking=False
+    )
+
+    assert len(forced) == len(response_ids)
+    assert replay._compile(canonical_structured_spec(spec)) is replay._compile(
+        canonical_structured_spec(spec)
+    )
+
+
+def test_xgrammar_bit_count_distinguishes_forced_and_free_positions():
+    torch = pytest.importorskip("torch")
+    forced_mask = torch.tensor([[0b1000]], dtype=torch.int32)
+    free_mask = torch.tensor([[0b1010]], dtype=torch.int32)
+    padded_mask = torch.tensor([[-1]], dtype=torch.int32)
+
+    assert _count_legal_tokens(forced_mask, 4) == 1
+    assert _count_legal_tokens(free_mask, 4) == 2
+    assert _count_legal_tokens(padded_mask, 3) == 3
+
+
+def test_xgrammar_replay_fails_closed_when_generated_token_is_rejected():
+    tokenizer, vocab = _structured_test_tokenizer()
+    replay = StructuredOutputReplay(tokenizer, len(vocab))
+
+    with pytest.raises(RuntimeError, match="rejected a generated structured-output token"):
+        replay.forced_mask(
+            [],
+            _structured_ids(vocab, "b"),
+            canonical_structured_spec({"choice": ["a"]}),
+            thinking=False,
+        )
+
+
+def test_xgrammar_replay_masks_only_positions_after_thinking_boundary():
+    tokenizer, vocab = _structured_test_tokenizer()
+    replay = StructuredOutputReplay(tokenizer, len(vocab))
+    answer_ids = _structured_ids(vocab, "a")
+    response_ids = [vocab["x"], vocab["</think>"], *answer_ids]
+
+    generated_boundary = replay.forced_mask(
+        [],
+        response_ids,
+        canonical_structured_spec({"choice": ["a"]}),
+        thinking=True,
+    )
+    prompt_boundary = replay.forced_mask(
+        [vocab["</think>"]],
+        answer_ids,
+        canonical_structured_spec({"choice": ["a"]}),
+        thinking=True,
+    )
+
+    assert generated_boundary[:2] == [False, False]
+    assert all(generated_boundary[2:])
+    assert all(prompt_boundary)
+
+
+@pytest.mark.parametrize(
+    ("spec", "text"),
+    [
+        ({"choice": ["4"]}, "4"),
+        ({"regex": "[0-9]+"}, "42"),
+        (
+            {
+                "json": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                }
+            },
+            '{"answer":"4"}',
+        ),
+    ],
+)
+def test_xgrammar_replay_uses_real_qwen_padded_model_vocab(spec, text):
+    from transformers import AutoConfig, AutoTokenizer
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    assert len(tokenizer.get_vocab()) == 248077
+    assert config.text_config.vocab_size == 248320
+
+    replay = StructuredOutputReplay(tokenizer, config.text_config.vocab_size)
+    response_ids = tokenizer.encode(text, add_special_tokens=False)
+    forced = replay.forced_mask(
+        [],
+        response_ids,
+        canonical_structured_spec(spec),
+        thinking=False,
+    )
+
+    assert len(forced) == len(response_ids)
+    assert tuple(replay._bitmask.shape) == (1, 248320 // 32)
+
+
 def test_image_prompt_positions_remain_outside_alignment_groups():
     prompt_ids = [1, 151655, 151655, 2]
     teacher_ids, _teacher_logprobs = encode_shifted_group_metadata(
@@ -414,6 +562,8 @@ def _resume_accounting(step=2):
         "generated_tokens": 41,
         "teacher_input_tokens": 37,
         "truncated_rollouts": 3,
+        "forced_tokens": 9,
+        "dropped_forced_groups": 4,
         "granularity_n": 5,
         "samples_seen": 8,
         "teacher_ok": 6,
@@ -446,6 +596,13 @@ class _BridgeTeacher:
         ]
 
 
+class _MergedBridgeTeacher:
+    def score(self, prompt_text, completion_text):
+        assert prompt_text == "User: question\nAssistant: "
+        assert completion_text == "AB"
+        return [TeacherToken(text="AB", logprob=-1.1, start=0, end=2)]
+
+
 def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     bridge = _TeacherAlignmentBridge(
         prompts=[
@@ -471,6 +628,73 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     assert bridge.generated_tokens == 3
     with pytest.raises(ValueError, match="prompt ids"):
         bridge.score(0, 2, [10, 12, 65, 99])
+
+
+def test_fully_forced_groups_encode_as_no_signal_and_are_filtered():
+    torch = pytest.importorskip("torch")
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": "question"}],
+                teacher_messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=_BridgeTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+        structured=True,
+    )
+
+    encoded = bridge.score(
+        0,
+        2,
+        [10, 11, 65, 66, 99],
+        forced=[True, True, False],
+    )
+
+    assert encoded["teacher_ids"] == [-1, -1, -1, -1, -1]
+    full_sequence_ids = torch.tensor([encoded["teacher_ids"]]).unsqueeze(-1)
+    assert _full_sequence_signal_sequences(full_sequence_ids).tolist() == [False]
+    assert bridge.forced_tokens == 2
+    assert bridge.dropped_forced_groups == 2
+
+
+def test_partially_forced_alignment_group_is_kept_whole():
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": "question"}],
+                teacher_messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=_MergedBridgeTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+        structured=True,
+    )
+
+    encoded = bridge.score(
+        0,
+        2,
+        [10, 11, 65, 66, 99],
+        forced=[True, False, False],
+    )
+
+    assert encoded["teacher_ids"] == [-1, 0, 0, -1, -1]
+    assert encoded["teacher_logprobs"] == [0.0, -1.1, -1.1, 0.0, 0.0]
+    assert bridge.dropped_forced_groups == 0
 
 
 def test_bridge_rejects_child_prompt_with_extra_token_as_permanent_error():
@@ -517,6 +741,47 @@ def test_child_bridge_payload_carries_actual_prompt_boundary():
         "sequence_ids": [10, 11, 77, 65, 99],
         "image_count": 0,
     }
+
+
+def test_structured_child_bridge_payload_includes_forced_mask():
+    payload = _bridge_score_payload(
+        4,
+        [10, 11],
+        [65, 99],
+        forced=[True, False],
+    )
+
+    assert payload["forced"] == [True, False]
+
+
+def test_structured_bridge_requires_exact_boolean_mask_for_untrimmed_response():
+    with pytest.raises(ValueError, match="missing the forced mask"):
+        _validate_forced_mask(None, 2, required=True)
+    with pytest.raises(ValueError, match="only booleans"):
+        _validate_forced_mask([True, 0], 2, required=True)
+    with pytest.raises(ValueError, match="untrimmed response"):
+        _validate_forced_mask([True], 2, required=True)
+    assert _validate_forced_mask([True, False], 2, required=True) == [True, False]
+    assert _validate_forced_mask([True], 2, required=False) == []
+
+
+class _StopTokenizer:
+    def decode(self, token_ids, *, skip_special_tokens):
+        return "".join({1: "A", 2: "B", 3: "STOP"}[int(token_id)] for token_id in token_ids)
+
+
+def test_stop_trimming_slices_response_ids_and_forced_mask_identically():
+    kept_ids, completion_text, kept_forced = _trim_response_and_forced(
+        _StopTokenizer(),
+        [1, 2, 3],
+        "ABSTOP",
+        ("STOP",),
+        [True, False, True],
+    )
+
+    assert kept_ids == [1, 2]
+    assert completion_text == "AB"
+    assert kept_forced == [True, False]
 
 
 class _ScoredImageTokens(list):
@@ -683,6 +948,8 @@ def test_retry_sidecar_persists_real_accumulated_accounting(tmp_path):
     assert state["teacher_input_tokens"] == 37
     assert state["teacher_ok"] == 6
     assert state["teacher_transient"] == 1
+    assert state["forced_tokens"] == 9
+    assert state["dropped_forced_groups"] == 4
     assert state["samples_seen"] == 8
     assert state["train_wall_seconds"] == 12.5
     assert state["rollout_seed_ordinal"] == 12
@@ -719,6 +986,8 @@ def test_resume_restores_bridge_counters_and_extends_full_curves():
     assert restored["generated_tokens"] == 44
     assert restored["teacher_input_tokens"] == 42
     assert restored["teacher_ok"] == 7
+    assert restored["forced_tokens"] == 9
+    assert restored["dropped_forced_groups"] == 4
     assert restored["aligned_sequences"] == 6
     assert restored["empty_alignments"] == 2
     assert restored["train_wall_seconds"] >= 12.5
@@ -881,6 +1150,26 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["actor_rollout_ref.rollout.limit_images"] == "8"
     assert "actor.engine.ulysses_sequence_parallel_size" not in overrides
     assert "ref_log_prob" not in " ".join(overrides)
+    assert not any("structured_outputs_config" in key for key in overrides)
+
+
+def test_structured_overrides_pin_xgrammar_and_thinking_parser():
+    overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_verl_overrides(
+            _config(
+                thinking=True,
+                structured_outputs={"choice": ["4"]},
+            )
+        )
+    )
+
+    assert (
+        overrides[
+            "+actor_rollout_ref.rollout.engine_kwargs.vllm.structured_outputs_config"
+        ]
+        == "{backend:xgrammar,disable_any_whitespace:false,reasoning_parser:deepseek_r1}"
+    )
 
 
 def test_child_teacher_bridge_payload_sends_boundary_and_image_count_without_pixels():
@@ -931,6 +1220,9 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
         seed=42,
         stop_sequences=("</answer>",),
         eos_token_ids=frozenset({1, 2}),
+        structured_outputs=None,
+        model_vocab_size=248320,
+        thinking=False,
     )
     assert child["FLASH_OPD_BRIDGE_URL"] == "http://127.0.0.1:4444"
     assert child["FLASH_OPD_BRIDGE_TOKEN"] == "bridge-token"
@@ -938,8 +1230,111 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "FIREWORKS_API_KEY" not in child
     assert "HF_TOKEN" not in child
+    assert "FLASH_OPD_STRUCTURED_OUTPUTS" not in child
+    assert "FLASH_OPD_MODEL_VOCAB_SIZE" not in child
+    assert "FLASH_OPD_THINKING" not in child
 
 
+def test_structured_child_environment_carries_only_canonical_replay_inputs(tmp_path):
+    child = _build_opd_child_env(
+        shim_dir=str(tmp_path),
+        wandb_enabled=False,
+        bridge_url="http://127.0.0.1:4444",
+        bridge_token="bridge-token",
+        seed=42,
+        stop_sequences=(),
+        eos_token_ids=frozenset({1}),
+        structured_outputs={"choice": ["4"]},
+        model_vocab_size=248320,
+        thinking=True,
+    )
+
+    assert child["FLASH_OPD_STRUCTURED_OUTPUTS"] == '{"choice":["4"]}'
+    assert child["FLASH_OPD_MODEL_VOCAB_SIZE"] == "248320"
+    assert child["FLASH_OPD_THINKING"] == "1"
+
+
+
+
+
+
+
+
+def test_structured_validator_rejects_vllm_mistral_tokenizer_models(monkeypatch):
+    from flash import opd_verl_validation
+
+    monkeypatch.setattr(
+        opd_verl_validation,
+        "_resolve_structured_model_metadata",
+        lambda *_args: (32000, ("config.json", "tokenizer.model.v3")),
+    )
+
+    with pytest.raises(ValueError, match="does not support vLLM MistralTokenizer"):
+        validate_opd_verl_structured_outputs(
+            '{"choice":["4"]}',
+            model_id="mistralai/Mistral-7B-Instruct-v0.3",
+            compiler_vocab_size=32000,
+        )
+
+
+def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
+    from flash import opd_verl_validation
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("unstructured OPD must not resolve structured model metadata")
+
+    monkeypatch.setattr(opd_verl_validation, "_resolve_compiler_vocab_size", unexpected)
+    monkeypatch.setattr(opd_verl_validation, "_resolve_structured_model_metadata", unexpected)
+
+    result = validate_opd_verl_structured_outputs(
+        None,
+        model_id="open-org/cached-model",
+        model_revision="d" * 40,
+        model_policy="allow",
+    )
+
+    assert result.constraint is None
+    assert result.model_vocab_size == 0
+
+
+
+
+def test_structured_runtime_version_mismatch_fails_before_generation(monkeypatch):
+    versions = {"verl": "0.8.0", "vllm": "0.11.1", "xgrammar": "0.1.25"}
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+
+    with pytest.raises(RuntimeError, match=r"vllm 0\.11\.0 exactly"):
+        _require_structured_runtime_versions()
+
+
+def test_structured_runtime_rejects_wrong_xgrammar_version(monkeypatch):
+    versions = {"verl": "0.8.0", "vllm": "0.11.0", "xgrammar": "0.1.26"}
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+
+    with pytest.raises(RuntimeError, match=r"xgrammar 0\.1\.25 exactly"):
+        _require_structured_runtime_versions()
+
+
+def test_plugin_initialization_checks_structured_versions_before_verl_install(monkeypatch):
+    import importlib as importlib_module
+
+    from flash.engine.worker import opd_verl_plugin as plugin
+
+    versions = {"verl": "0.8.0", "vllm": "0.11.0", "xgrammar": "0.1.26"}
+    monkeypatch.setenv("FLASH_OPD_STRUCTURED_OUTPUTS", '{"choice":["4"]}')
+    monkeypatch.setattr(plugin.importlib.metadata, "version", versions.__getitem__)
+    monkeypatch.setattr(
+        plugin.importlib.util,
+        "find_spec",
+        lambda _name: pytest.fail("verl discovery must follow the structured version gate"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"xgrammar 0\.1\.25 exactly"):
+        importlib_module.reload(plugin)
+
+    monkeypatch.delenv("FLASH_OPD_STRUCTURED_OUTPUTS")
+    monkeypatch.setattr(plugin.importlib.util, "find_spec", lambda _name: None)
+    importlib_module.reload(plugin)
 
 
 
@@ -967,6 +1362,18 @@ def test_deterministic_seed_uses_every_rollout_identity_component():
 
 
 
+def test_worker_structured_validator_runs_before_model_download():
+    import inspect
+
+    from flash.engine.worker.opd_verl import run_opd_verl
+
+    source = inspect.getsource(run_opd_verl)
+    assert source.index("validate_opd_verl_structured_outputs(") < source.index(
+        "_w.prefetch_model("
+    )
+    assert "resolve_vocab_size" not in source
+
+
 def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     import inspect
 
@@ -980,14 +1387,17 @@ def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     assert '"global_pool"' in source
     assert "teacher_pool" not in source
     assert "Role.TeacherModel" not in source
+    assert 'params["structured_outputs"]' in source
+    assert 'params["logprobs"]' not in source
 
 
 def test_plugin_identifiers_remain_provider_neutral():
     import inspect
 
     import flash.engine.worker.opd_verl_plugin as plugin
+    import flash.engine.worker.opd_verl_structured as structured
 
-    source = inspect.getsource(plugin).lower()
+    source = (inspect.getsource(plugin) + inspect.getsource(structured)).lower()
     forbidden = ("parasail", "fireworks")
     for name in forbidden:
         assert f"class {name}" not in source
@@ -998,7 +1408,6 @@ def test_plugin_identifiers_remain_provider_neutral():
 def test_opd_backend_selector_routes_to_verl(monkeypatch):
     import flash.engine.worker.opd as opd_mod
     import flash.engine.worker.opd_verl as ov
-
     called = []
     monkeypatch.setattr(ov, "run_opd_verl", lambda *a, **k: called.append(True))
     monkeypatch.setenv("FLASH_OPD_BACKEND", "verl")
@@ -1012,12 +1421,10 @@ def test_opd_backend_selector_routes_to_verl(monkeypatch):
 @pytest.mark.parametrize(("is_tool_env", "multi_turn"), [(True, False), (False, True)])
 def test_worker_fails_closed_on_multiturn_or_tool(monkeypatch, is_tool_env, multi_turn):
     import flash.engine.worker.opd_verl as ov
-
     class FakeEnv:
         def __init__(self):
             self.is_tool_env = is_tool_env
             self.multi_turn = multi_turn
-
     monkeypatch.setattr(ov._w, "require_active_env", lambda: FakeEnv())
     with pytest.raises(RuntimeError, match="not yet supported on the verl OPD backend"):
         ov.run_opd_verl(spec=object())
