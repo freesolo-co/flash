@@ -625,19 +625,27 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 
 
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
-# 250 GB so the whole catalog fits ON ONE SHARED VOLUME. The binding constraint is NOT any single
-# model: the volume is persistent and preload never evicts, so by the time the largest model
-# downloads, every other model is already resident. The real requirement is therefore
-#   (resident bytes of every other model) + (peak footprint of the largest) <= volume
-#   = (162.5 - 71.9) + 143.8 = 234.4 GB for today's catalog.
-# 200 GB failed that by 34.4 GB and the 35B died with "Disk quota exceeded" on every datacenter,
-# no matter what order the downloads ran in. 250 GB clears it with ~15 GB of margin.
-# That 234.4 GB uses measured HF repo sizes; ``weight_cache_catalog_peak_gb`` recomputes the same
-# quantity from params_b and lands a bit lower (229.2 GB). Size against the larger, measured figure
-# -- params_b understates a repo that ships tokenizer/config/index files alongside the weights.
+# Must stay >= weight_cache_catalog_peak_gb(), which is what the whole catalog actually needs on one
+# shared volume; test_volume_holds_whole_catalog_with_largest_model_in_transit fails if it does not.
+# Grow this (and the provisioned volumes) rather than dropping a model from the cache.
 WEIGHT_CACHE_VOLUME_GB = 250
-# Peak footprint ~= 2x bf16 download (checkpoint + Xet temp); must fit the fixed cache volume.
+# A download needs the checkpoint plus roughly as much again for Xet reconstruction scratch.
 _WEIGHT_CACHE_PEAK_FACTOR = 2.0
+
+
+def _download_gb(info: ModelInfo) -> float:
+    """Full bf16 checkpoint size in GB, from catalog geometry (2 bytes/param).
+
+    Same rule as ``cost.facts.download_weight_gb``, which cannot be reused here: it resolves a model
+    *id* and fail-closes on anything off-catalog, while cache sizing runs on a ``ModelInfo`` that may
+    legitimately carry no ``params_b``.
+    """
+    return (info.params_b or 0.0) * 2.0
+
+
+def _peak_gb(info: ModelInfo) -> float:
+    """GB the volume must have free for this model to finish downloading."""
+    return _WEIGHT_CACHE_PEAK_FACTOR * _download_gb(info)
 
 
 def _fits_weight_cache(info: ModelInfo) -> bool:
@@ -653,27 +661,29 @@ def _fits_weight_cache(info: ModelInfo) -> bool:
         return (
             True  # unknown size -> keep the (attach) default; curated catalog models always set it
         )
-    download_gb = info.params_b * 2.0  # bf16: 2 bytes/param (mirrors cost.facts.download_weight_gb)
-    return _WEIGHT_CACHE_PEAK_FACTOR * download_gb <= WEIGHT_CACHE_VOLUME_GB
+    return _peak_gb(info) <= WEIGHT_CACHE_VOLUME_GB
 
 
 def weight_cache_catalog_peak_gb() -> float:
     """Peak GB the volume must hold to warm the WHOLE catalog onto one shared volume.
 
-    Every catalog model ends up resident together, and the largest one needs roughly double its
-    size in transit (weights + Xet reconstruction scratch). The worst moment is therefore the
-    largest model downloading while all the others are already on disk.
+    Every catalog model ends up resident together and nothing is ever evicted, so the worst moment
+    is the largest model downloading -- needing room for its scratch -- while all the others are
+    already on disk. That is strictly more than any single model's own peak, which is why sizing the
+    volume per-model let the 35B fail with "Disk quota exceeded" on every datacenter at 200 GB.
+
+    Derived from ``params_b``, so it slightly understates a repo that also ships tokenizer/config/
+    index files; the measured-bytes figure for today's catalog is ~5 GB higher. Keep real headroom
+    over this number rather than sizing to it exactly.
     """
     from flash.catalog import MODELS
 
-    sizes = sorted(
-        ((info.params_b or 0.0) * 2.0 for info in MODELS.values() if _fits_weight_cache(info)),
-        reverse=True,
-    )
-    if not sizes:
+    cached = [info for info in MODELS.values() if _fits_weight_cache(info)]
+    if not cached:
         return 0.0
-    largest, rest = sizes[0], sizes[1:]
-    return sum(rest) + _WEIGHT_CACHE_PEAK_FACTOR * largest
+    largest = max(cached, key=_download_gb)
+    resident_others = sum(_download_gb(info) for info in cached if info is not largest)
+    return resident_others + _peak_gb(largest)
 
 
 def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:
