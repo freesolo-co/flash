@@ -1,11 +1,18 @@
 """Preload (warm) the shared weight-cache volumes with the catalog's base-model weights.
 
+Covers BOTH substrates that hold a shared cache -- RunPod network volumes (``warm_weight_cache``)
+and Lambda filesystems (``warm_instances``) -- which is why this sits at the provider-neutral level
+rather than under one provider package. ``main`` is a single CLI over both: ``--gpu`` documents a
+per-mode default for each, and ``--teardown`` reclaims storage on every provider.
+
 Run it::
 
-    python -m flash.providers.runpod.preload                 # all catalog models, all DCs
-    python -m flash.providers.runpod.preload --datacenters US-CA-2,EU-RO-1 --models Qwen/Qwen3.5-4B
-    python -m flash.providers.runpod.preload --dry-run       # print the plan, provision nothing
-    python -m flash.providers.runpod.preload --teardown      # DELETE the cache volumes (reclaim $)
+    python -m flash.providers.weight_cache_preload                 # all catalog models, all DCs
+    python -m flash.providers.weight_cache_preload --datacenters US-CA-2,EU-RO-1 --models Qwen/Qwen3.5-4B
+    python -m flash.providers.weight_cache_preload --dry-run       # print the plan, provision nothing
+    python -m flash.providers.weight_cache_preload --provision     # CREATE lambda filesystems, no GPU
+    python -m flash.providers.weight_cache_preload --warm-instances  # warm the lambda caches
+    python -m flash.providers.weight_cache_preload --teardown      # DELETE the cache volumes (reclaim $)
 """
 
 from __future__ import annotations
