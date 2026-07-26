@@ -524,7 +524,7 @@ def deploy_train_endpoint(
         owed = max(0, rp_keys.key_count() - len(reconciled))
         return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S * owed
 
-    def _attempt_deadline() -> float | None:
+    def _attempt_deadline(owning_key: str | None = None) -> float | None:
         """``deadline_at`` less the ONE grow slice this attempt's own reconciliation can need.
 
         What admission is judged against. An attempt has to fund exactly one grow -- its own -- so
@@ -534,16 +534,23 @@ def deploy_train_endpoint(
         margin, protecting the reconciliation of failovers that would then never run. The training
         path attaches the managed cache on every ordinary run, so that was the common case.
 
-        Nothing is owed once every account has reconciled: no grow remains to fund, so reserving for
-        one would fail a create that had already done everything the reserve exists to protect.
+        Nothing is owed once the account this attempt deploys under has reconciled: its grow already
+        ran and spent real time, so charging the slice again re-deducts a cost that was paid --
+        rejecting a launchable create that sat within one slice of the deadline. ``owning_key`` is
+        that account when the caller has selected it; before selection the active key is the account
+        the selection will land on, so it stands in. When neither is known the slice stays charged,
+        which errs toward reserving.
         """
         if deadline_at is None or not _reconciles_a_managed_cache():
+            return deadline_at
+        key = owning_key if owning_key is not None else rp_keys.active_key()
+        if key is not None and key in reconciled:
             return deadline_at
         if rp_keys.key_count() <= len(reconciled):
             return deadline_at
         return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S
 
-    def _require_launchable() -> None:
+    def _require_launchable(owning_key: str | None = None) -> None:
         """Fail closed unless this attempt can still reconcile itself and then create.
 
         This is the terminal invariant, and it is why admission cannot simply use the raw deadline:
@@ -555,7 +562,7 @@ def deploy_train_endpoint(
         attempt that reaches the create has reconciled.
         """
         if deadline_at is not None:
-            require_create_allowance(_attempt_deadline())
+            require_create_allowance(_attempt_deadline(owning_key))
 
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
@@ -607,7 +614,10 @@ def deploy_train_endpoint(
             if deadline_at is None:
                 resource = asyncio.run(rm.get_or_deploy_resource(config))
             else:
-                _require_launchable()
+                # This attempt's own grow has run by now (the reconciled check above), so the
+                # re-check is judged without its slice -- charging it again would re-deduct a cost
+                # already paid and reject a launchable create within one slice of the deadline.
+                _require_launchable(owning_key)
                 create_deadline = _create_deadline()
                 # The create may still only SPEND down to the reserve, so a slow failed create
                 # cannot drain the slice the account a failover lands on needs to reconcile. The
