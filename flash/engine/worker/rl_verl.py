@@ -409,6 +409,15 @@ def _resolve_single_turn_inputs():
             "model_revision pinning is not yet supported on the verl backend (verl loads the model "
             "at its default revision); use the trl backend for revision-pinned runs."
         )
+    # entropy_quantile drives trl GRPOTrainer's internal top-entropy token masking (top_entropy_quantile);
+    # verl has no equivalent, so honoring the flash default (1.0 = no masking) is fine but any customer
+    # value < 1.0 must fail loud rather than train without the requested masking (silent drift).
+    _eq = getattr(_t, "entropy_quantile", None) if _t else None
+    if _eq is not None and float(_eq) < 1.0:
+        raise RuntimeError(
+            f"train.entropy_quantile={_eq} is not yet supported on the verl backend (trl's top-entropy "
+            "token masking has no verl equivalent); use the trl backend (unset FLASH_RL_BACKEND) for it."
+        )
     # flash's lora dropout is fixed at 0.0; verl matches (peft default). guard defensively so a future
     # non-zero recipe value can never be silently ignored.
     if float(RECIPE.lora.dropout) != 0.0:
@@ -551,7 +560,7 @@ def run_rl_verl():
     _w.heartbeat("rl_start", gpu=gpu_diagnostics())
     wait_for_gpu(
         _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
-        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+        gpu_type=_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else "",
     )
     setup_perf_backends()
 

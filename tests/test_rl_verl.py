@@ -226,3 +226,28 @@ def test_reward_server_scorer_can_capture_samples():
         assert [c[0] for c in captured] == ["c0", "c1", "c2"]
     finally:
         server.shutdown()
+
+
+def test_resolve_single_turn_inputs_guards_entropy_quantile(monkeypatch):
+    # entropy_quantile<1.0 has no verl equivalent (trl top-entropy masking); the single-turn resolver
+    # must fail loud rather than silently train without the requested masking.
+    import pytest
+
+    import flash.engine.worker.rl_verl as rlv
+    from flash.engine.worker._pkg import W
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict(
+        {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo", "train": {"entropy_quantile": 0.2}}
+    )
+
+    class _Env:
+        is_tool_env = False
+        multi_turn = False
+
+    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(W, "SEED", 42, raising=False)
+    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
+
+    with pytest.raises(RuntimeError, match="entropy_quantile"):
+        rlv._resolve_single_turn_inputs()
