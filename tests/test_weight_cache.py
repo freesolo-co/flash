@@ -2141,7 +2141,7 @@ def test_lambda_ladder_reaches_regions_the_cheapest_class_cannot(monkeypatch):
     )
     targets = preload._lambda_warm_targets(lj, None)
 
-    assert [(t.region, t.gpu) for t in targets] == [
+    assert [(c.region, cls) for c, cls in targets] == [
         ("us-east-1", "A10"),  # cheapest class wins a contested region
         ("asia-south-1", "A100 SXM 40GB"),  # unreachable on A10 alone
         ("us-west-3", "H100"),  # only H100 stocks it
@@ -2161,7 +2161,7 @@ def test_lambda_ladder_skips_a_class_whose_capacity_lookup_fails(monkeypatch):
     monkeypatch.setattr(lj, "usable_instances", flaky)
     targets = preload._lambda_warm_targets(lj, None)
 
-    assert [(t.region, t.gpu) for t in targets] == [("asia-south-1", "H100")]
+    assert [(c.region, cls) for c, cls in targets] == [("asia-south-1", "H100")]
 
 
 def test_lambda_explicit_gpu_pins_the_class_and_skips_the_ladder(monkeypatch):
@@ -2179,7 +2179,7 @@ def test_lambda_explicit_gpu_pins_the_class_and_skips_the_ladder(monkeypatch):
     targets = preload._lambda_warm_targets(lj, "B200")
 
     assert asked == ["B200"]  # ladder not walked
-    assert [(t.region, t.gpu) for t in targets] == [("us-east-1", "B200")]
+    assert [(c.region, cls) for c, cls in targets] == [("us-east-1", "B200")]
 
 
 def test_warm_result_reports_the_gpu_that_warmed_each_region(monkeypatch):
@@ -2191,6 +2191,38 @@ def test_warm_result_reports_the_gpu_that_warmed_each_region(monkeypatch):
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
     assert [(r["region"], r["gpu"], r["status"]) for r in res] == [("asia-south-1", "H100", "ok")]
+
+
+def test_warm_launches_the_class_the_ladder_claimed_not_the_default(monkeypatch):
+    """The launched box must use the ladder's class. Falling back to A10 would relaunch the bug.
+
+    A region reached only because H100 stocks it, launched on A10, fails exactly the way the
+    hardcoded class did -- so the class must be threaded through, never re-derived with a default.
+    """
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(lj, "usable_instances", _stocked(H100=["asia-south-1"]))
+    specced = []
+    real_spec = preload._preload_instance_spec
+    monkeypatch.setattr(
+        preload,
+        "_preload_instance_spec",
+        lambda gpu, run_id, wall_s=1800: (specced.append(gpu), real_spec(gpu, run_id, wall_s))[1],
+    )
+    preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    assert specced == ["H100"], f"launched on {specced}, not the class that stocks the region"
+
+
+def test_warm_reports_timeouts_and_partials_as_not_warmed(monkeypatch):
+    """A timed-out region left its cache incomplete; reporting only errors would read as success."""
+    preload, lj, _launched, _terminated = _wire_warm(monkeypatch, None)  # marker never appears
+    monkeypatch.setattr(lj, "usable_instances", _stocked(A10=["us-east-1"]))
+    res = preload.warm_instances(models=["a/b"], timeout_s=1, poll_interval_s=0.0)
+
+    assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "timeout")]
+    assert [r for r in res if r["status"] != "ok"], "timeout must not be counted as warmed"
 
 
 def test_warm_instances_explicit_gpu_overrides_default(monkeypatch):

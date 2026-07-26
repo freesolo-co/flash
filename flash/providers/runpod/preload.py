@@ -293,17 +293,21 @@ _LAMBDA_PRELOAD_GPU_LADDER = ("A10", "A100 SXM 40GB", "H100", "B200")
 _PRELOAD_STATUS_REPO = "Freesolo-Co/flash-weight-preload"
 
 
-def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list:
-    """One launch candidate per Lambda region, using the cheapest class that region actually stocks.
+def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list[tuple]:
+    """``(candidate, gpu_class)`` per Lambda region, using the cheapest class that region actually stocks.
 
     An explicit ``gpu`` pins the class and is never second-guessed. Otherwise each class in the ladder
     is asked which regions have capacity, cheapest first, and a region is claimed by the first class
     that can reach it -- so a region with no A10 is still warmed on A100/H100/B200 instead of being
     silently skipped. Capacity is a live, per-region property, so this is a lookup and not a constant.
+
+    The class is returned alongside the candidate rather than read back off it: the ladder is the
+    authority on what claimed each region, and defaulting a missing one would relaunch the very bug
+    this fixes -- an A10 box in a region that stocks no A10.
     """
     classes = [gpu] if gpu else list(_LAMBDA_PRELOAD_GPU_LADDER)
     claimed: set = set()
-    targets: list = []
+    targets: list[tuple] = []
     for cls in classes:
         try:
             candidates = lambda_jobs.usable_instances(cls)
@@ -314,7 +318,7 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list:
             if c.region in claimed:
                 continue
             claimed.add(c.region)
-            targets.append(c)
+            targets.append((c, cls))
     return targets
 
 
@@ -427,15 +431,13 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
     from flash.providers.lambdalabs import jobs as lambda_jobs
 
     targets = _lambda_warm_targets(lambda_jobs, gpu)
-    if targets:
-        logger.info(
-            "warm lambda: %d region(s) -> %s", len(targets),
-            ", ".join(f"{getattr(c, 'region', '?')}={getattr(c, 'gpu', None) or _LAMBDA_PRELOAD_GPU}"
-                      for c in targets),
-        )
     if not targets:
         logger.warning("warm: no Lambda capacity right now (nothing to warm)")
         return []
+    logger.info(
+        "warm lambda: %d region(s) -> %s", len(targets),
+        ", ".join(f"{getattr(c, 'region', '?')}={cls}" for c, cls in targets),
+    )
     # Fail fast before launching paid GPUs: status repo is the only completion signal.
     try:
         _ensure_status_repo(token)
@@ -445,17 +447,20 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
             "with write access before warming (refusing to launch paid GPUs that can't report)."
         ) from exc
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        # The class comes from the candidate, not the caller: the ladder may have claimed each region
-        # with a different one, and the spec must match the box actually being launched.
+        # The class comes from the ladder, not the caller: it may have claimed each region with a
+        # different one, and the spec must match the box actually being launched.
         futs = [
-            ex.submit(_warm_one_lambda_instance, lambda_jobs, c, models,
-                      getattr(c, "gpu", None) or _LAMBDA_PRELOAD_GPU, timeout_s, poll_interval_s)
-            for c in targets
+            ex.submit(_warm_one_lambda_instance, lambda_jobs, c, models, cls,
+                      timeout_s, poll_interval_s)
+            for c, cls in targets
         ]
         results = [f.result() for f in as_completed(futs)]
-    starved = sorted({r["region"] for r in results if r.get("status") == "error"})
-    if starved:
-        logger.warning("warm lambda: %d region(s) did not warm: %s", len(starved), ", ".join(starved))
+    # Anything not "ok" left that region's cache incomplete, so a timeout and a partial are as
+    # actionable as an error -- reporting only errors would read as success on a half-warmed fleet.
+    cold = sorted({r["region"] for r in results if r.get("status") != "ok"})
+    if cold:
+        logger.warning("warm lambda: %d of %d region(s) not fully warmed: %s",
+                       len(cold), len(results), ", ".join(cold))
     return results
 
 
