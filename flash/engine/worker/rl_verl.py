@@ -124,6 +124,10 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={cfg['micro_batch']}",
         f"custom_reward_function.path={cfg['reward_path']}",
         f"custom_reward_function.name={cfg['reward_name']}",
+        # verl trainer-v1 reward loop reads reward.custom_reward_function (the legacy top-level key
+        # is migrated in the main process but not visible to the RewardLoopWorker actor); emit both.
+        f"reward.custom_reward_function.path={cfg['reward_path']}",
+        f"reward.custom_reward_function.name={cfg['reward_name']}",
         "trainer.n_gpus_per_node=1",
         "trainer.nnodes=1",
         f"trainer.total_epochs={cfg['total_epochs']}",
@@ -654,7 +658,8 @@ def run_rl_verl():
         }
         overrides = build_verl_overrides(cfg)
 
-        _w.heartbeat("rl_train_start", gpu=gpu_diagnostics())
+        setup_seconds = time.time() - t_start
+        _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
         step_box = [0]
 
         def _progress():
@@ -729,6 +734,7 @@ def run_rl_verl():
         adapter_dir=adapter_dir,
         model_id=inp["model_id"],
         train_wall=train_wall,
+        setup_seconds=setup_seconds,
         train_tokens=0,
         generated_tokens=0,
         notes={
