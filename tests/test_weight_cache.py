@@ -2582,6 +2582,48 @@ def test_warm_cli_exits_nonzero_when_the_fleet_was_not_fully_measured(monkeypatc
     assert "not fully measured" in combined, combined
 
 
+def test_warm_incomplete_summary_does_not_contradict_the_warmed_count(monkeypatch, capsys):
+    """The two closing lines must not disagree about how many caches finished.
+
+    "X/Y regions warmed" counts only ok rows, while the incomplete-plan message counts every
+    launched region whatever its status. Calling the second one "warmed" printed "1/2 regions
+    warmed" immediately followed by "warmed 2 region(s)" -- the summary contradicting the tally one
+    line above it. It reports what the number actually is: regions examined.
+    """
+    from flash.providers.runpod import preload as _p
+
+    model = _p.catalog_model_ids()[0]
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": [model], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(preload, "_lambda_provisioned_regions", lambda: set())
+
+    def flaky(gpu, **k):
+        if gpu == "A10":
+            raise RuntimeError("instance-types API down")
+        # two regions launch, and one of them fails -- so warmed (1) != examined (2)
+        return [_cand("asia-south-1", gpu), _cand("us-west-2", gpu)] if gpu == "H100" else []
+
+    real_launch = lj.launch_and_submit
+
+    def one_region_fails(spec, seed, instances, **k):
+        if instances[0].region == "us-west-2":
+            raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
+        return real_launch(spec, seed, instances, **k)
+
+    monkeypatch.setattr(lj, "usable_instances", flaky)
+    monkeypatch.setattr(lj, "launch_and_submit", one_region_fails)
+    rc = preload.main(["--warm-instances", "--models", model])
+    combined = "".join(capsys.readouterr())
+
+    assert rc == 1, combined
+    assert "1/2 regions warmed" in combined, combined
+    assert "warmed 2 region(s)" not in combined, (
+        f"the summary must not claim more warmed regions than the tally above it: {combined!r}"
+    )
+    assert "examined 2 region(s)" in combined, combined
+
+
 def test_provisioned_region_snapshot_is_deadline_bounded(monkeypatch):
     """The reporting snapshot must carry its own deadline.
 

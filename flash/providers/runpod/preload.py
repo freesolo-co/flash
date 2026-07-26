@@ -693,11 +693,14 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
         # exited 0, where N counted only the regions we managed to look at. A region reachable
         # solely through the unanswered class is missing from both the numerator AND the
         # denominator, so the ratio looks perfect precisely because the gap is invisible.
+        # "examined", not "warmed": results holds every launched region whatever its status, so
+        # counting them as warmed would contradict the ok-only "X/Y regions warmed" line the CLI
+        # prints right above this one.
         raise IncompleteWarmPlanError(
-            f"warmed {len(results)} region(s), but at least one instance-type lookup failed or was "
-            "cut off by the planning budget, so the fleet was not fully measured. Regions reachable "
-            "only through an unanswered class were never examined -- they are unmeasured, not known "
-            "warm. Re-run once Lambda is answering to cover them.",
+            f"examined {len(results)} region(s), but at least one instance-type lookup failed or "
+            "was cut off by the planning budget, so the fleet was not fully measured. Regions "
+            "reachable only through an unanswered class were never examined -- they are unmeasured, "
+            "not known warm. Re-run once Lambda is answering to cover them.",
             results=results,
         )
     return results
