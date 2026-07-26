@@ -75,7 +75,17 @@ _PRELOAD_TIMEOUT_S = 5400
 
 
 def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool | None:
-    """True once a worker exists in any state (initializing counts: capacity exists).
+    """True once a worker exists in ANY state, including unhealthy and throttled.
+
+    The question here is "did this datacenter give us a box", not "is the box working". Every state
+    below answers yes, so each one refutes starvation:
+
+    - ``initializing`` / ``ready`` / ``running`` / ``idle`` -- allocated and fine
+    - ``unhealthy`` -- allocated, then the image failed to start. The main poller reads this as a
+      failed image pull (see ``jobs.py``, which retries on a fresh endpoint), so counting it as
+      "no capacity" would blame the datacenter for a broken image and tell the operator to change
+      GPU class, which cannot help.
+    - ``throttled`` -- RunPod has the box but is holding it back. Also not an empty datacenter.
 
     Returns None when health could not be read. That is deliberately NOT False: the caller escalates
     a sustained False into NoCapacityError and tears the endpoint down, so a health endpoint that is
@@ -93,7 +103,10 @@ def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool
     if health is None:
         return None
     workers = health.get("workers") or {}
-    return any(int(workers.get(k) or 0) > 0 for k in ("initializing", "ready", "running", "idle"))
+    return any(
+        int(workers.get(k) or 0) > 0
+        for k in ("initializing", "ready", "running", "idle", "unhealthy", "throttled")
+    )
 
 
 def catalog_model_ids() -> list[str]:

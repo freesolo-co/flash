@@ -2430,6 +2430,31 @@ def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
     assert preload._has_worker("ep", "fp", 0.0) is False  # a real empty answer IS evidence
 
 
+def test_a_broken_worker_image_is_not_reported_as_a_starved_datacenter(monkeypatch):
+    """unhealthy and throttled workers exist, so they refute starvation.
+
+    Regression: _has_worker counted only initializing/ready/running/idle. A worker that RunPod
+    allocated and then marked unhealthy (jobs.py reads that as a failed image pull and retries on a
+    fresh endpoint) looked identical to an empty datacenter, so the grace timer fired NoCapacityError
+    and told the operator to pick a different GPU class -- which cannot fix a broken image.
+    """
+    from flash.providers.runpod import preload
+
+    for state in ("unhealthy", "throttled"):
+        monkeypatch.setattr(
+            preload.runpod_api,
+            "endpoint_health_for_fingerprint",
+            lambda *a, _s=state, **k: {"workers": {"ready": 0, "running": 0, _s: 1}},
+        )
+        assert preload._has_worker("ep", "fp", 0.0) is True
+
+    # and end to end: the queued job must time out, never be blamed on the datacenter
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    with pytest.raises(TimeoutError):  # NOT NoCapacityError
+        preload._poll_until_done("ep", "job", "fp", timeout_s=1, poll_interval_s=0.0)
+
+
 def test_unreadable_health_never_becomes_no_capacity(monkeypatch):
     """A persistently failing health API must not masquerade as a starved datacenter.
 
