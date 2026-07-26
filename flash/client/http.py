@@ -140,14 +140,18 @@ def export_trace_records(
     api_key: str,
     base_url: str | None = None,
     limit: int | None = None,
+    export_format: str | None = None,
 ) -> dict[str, Any]:
-    """Freesolo environment records converted from a project's traces.
+    """A project's traces in the requested shape, converted server-side.
 
-    Returns ``{"records": [{"input", "output"}, ...], "traces": N, "skipped": N}``. The conversion
-    runs server-side, matching what the web app's trace export downloads."""
+    Returns ``{"records": [...], "traces": N, "skipped": N, "format": name}``. The
+    shape of each record depends on ``export_format`` (see EXPORT_FORMATS); the
+    conversion runs server-side, matching what the web app's export downloads."""
     query = {"project_id": project_id}
     if limit is not None:
         query["limit"] = str(int(limit))
+    if export_format is not None:
+        query["format"] = export_format
     path = f"{FREESOLO_TRACES_EXPORT_PATH}?{urllib.parse.urlencode(query)}"
     # a whole project's traces can be a large read; give it room beyond the default.
     return _freesolo_get(path, api_key, base_url, timeout=300.0)

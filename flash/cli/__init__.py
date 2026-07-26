@@ -42,7 +42,13 @@ from flash.cli.commands import (  # noqa: F401
 from flash.cli.env_setup import cmd_env_setup
 from flash.cli.env_test import cmd_env_test
 from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
-from flash.cli.traces import DEFAULT_EXPORT_PATH, cmd_traces_export
+from flash.cli.traces import (
+    DEFAULT_EXPORT_PATH,
+    EXPORT_FORMATS,
+    RAW_EXPORT_PATH,
+    RECORDS_FORMAT,
+    cmd_traces_export,
+)
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -350,10 +356,24 @@ def _build_parser() -> argparse.ArgumentParser:
     traces_export.add_argument(
         "-o",
         "--output",
-        help=f"output JSONL file; defaults to {DEFAULT_EXPORT_PATH}",
+        help=(
+            f"output JSONL file; defaults to {DEFAULT_EXPORT_PATH}, "
+            f"or {RAW_EXPORT_PATH} for --format raw"
+        ),
     )
     traces_export.add_argument(
         "-f", "--force", action="store_true", help="overwrite existing output"
+    )
+    traces_export.add_argument(
+        "--format",
+        choices=EXPORT_FORMATS,
+        default=RECORDS_FORMAT,
+        help=(
+            "records: {input, output} env records (default). "
+            "prompts: {input} only, for GRPO. "
+            "raw: the stored rows, converted by nothing. "
+            "SFT and GRPO both read records, so there is no per-algorithm format"
+        ),
     )
     traces_export.set_defaults(func=cmd_traces_export)
 
