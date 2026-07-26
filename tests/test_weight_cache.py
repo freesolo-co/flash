@@ -2278,6 +2278,33 @@ def test_warm_falls_back_to_a_pricier_class_when_the_cheap_one_is_rejected(monke
     assert [(r["region"], r["gpu"], r["status"]) for r in res] == [("us-east-1", "A100 SXM 40GB", "ok")]
 
 
+def test_warm_stops_the_ladder_on_an_ambiguous_create(monkeypatch):
+    """An ambiguous create must NOT fall through to the next class: that risks paying for two boxes.
+
+    Every class in a region shares one run_id, and UnreconciledCreateError means Lambda may have billed
+    an instance we cannot see. The error exists to forbid another create, so it must end the ladder.
+    """
+    from flash.providers.base import UnreconciledCreateError
+
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(
+        lj, "usable_instances", _stocked(A10=["us-east-1"], A100_SXM_40GB=["us-east-1"])
+    )
+    tried = []
+
+    def ambiguous_launch(spec, seed, instances, **k):
+        tried.append(instances[0].gpu)
+        raise UnreconciledCreateError("ambiguous Lambda launch; refusing another create")
+
+    monkeypatch.setattr(lj, "launch_and_submit", ambiguous_launch)
+    res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    assert tried == ["A10"], "an ambiguous create must not trigger a second launch for the same run"
+    assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "error")]
+
+
 def test_warm_names_regions_with_no_capacity_in_any_class(monkeypatch, caplog):
     """A region unreachable in every class produces no result, so only the filesystem list names it.
 

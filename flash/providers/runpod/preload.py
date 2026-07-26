@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flash._logging import get_logger
 from flash.providers._hf_artifacts import make_hf_text_reader
 from flash.providers._poll import preload_instance_run_id
+from flash.providers.base import UnreconciledCreateError
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.jobs import (
     build_function_input,
@@ -411,6 +412,14 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
                     deadline_at=deadline,
                 )
                 launch_err = None
+                break
+            except UnreconciledCreateError as exc:
+                # An ambiguous create means Lambda may have billed a box we cannot see, and every
+                # class here shares one run_id -- launching again could pay for two. This error
+                # exists precisely to forbid another create, so it must stop the ladder, not walk it.
+                launch_err = exc
+                logger.warning("warm lambda/%s: ambiguous create, not trying another class: %s",
+                               region, exc)
                 break
             except Exception as exc:  # no capacity / launch reject — try the next class up the ladder
                 launch_err = exc
