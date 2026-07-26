@@ -28,8 +28,16 @@ def _post(path: str, body: dict, *, subject: str) -> bool:
     )
 
 
-def record_published_environment(*, slug: str, name: str, key: dict) -> bool:
-    """Persist Hub metadata in the platform backend; best-effort, never blocks env push."""
+def record_published_environment(
+    *, slug: str, name: str, key: dict, project_id: str | None = None
+) -> bool:
+    """Persist Hub metadata in the platform backend; best-effort, never blocks env push.
+
+    ``project_id`` is the project the push asked to group this env under. Only send the key when
+    the push named one: the backend upserts on (org, slug), so an omitted key leaves an existing
+    grouping alone while a present one overwrites it. The backend resolves the id within the
+    caller's own org and ignores it if it doesn't resolve, so a typo can't fail the publish.
+    """
     org_id = org_id_of(key)
     if not org_id:
         return False
@@ -45,6 +53,9 @@ def record_published_environment(*, slug: str, name: str, key: dict) -> bool:
         "apiKeyId": key.get("api_key_id"),
         "metadata": {"source": "flash.env.push"},
     }
+    resolved_project_id = str(project_id or "").strip()
+    if resolved_project_id:
+        body["projectId"] = resolved_project_id
     return _post(_PATH, body, subject=f"record published environment {slug}")
 
 

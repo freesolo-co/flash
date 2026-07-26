@@ -625,19 +625,65 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 
 
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
-WEIGHT_CACHE_VOLUME_GB = 100
-# Peak footprint ~= 2x bf16 download (checkpoint + Xet temp); must fit the fixed cache volume.
+# Must stay >= weight_cache_catalog_peak_gb(), which is what the whole catalog actually needs on one
+# shared volume; test_volume_holds_whole_catalog_with_largest_model_in_transit fails if it does not.
+# Grow this (and the provisioned volumes) rather than dropping a model from the cache.
+WEIGHT_CACHE_VOLUME_GB = 250
+# A download needs the checkpoint plus roughly as much again for Xet reconstruction scratch.
 _WEIGHT_CACHE_PEAK_FACTOR = 2.0
 
 
+def _download_gb(info: ModelInfo) -> float:
+    """Full bf16 checkpoint size in GB, from catalog geometry (2 bytes/param).
+
+    Same rule as ``cost.facts.download_weight_gb``, which cannot be reused here: it resolves a model
+    *id* and fail-closes on anything off-catalog, while cache sizing runs on a ``ModelInfo`` that may
+    legitimately carry no ``params_b``.
+    """
+    return (info.params_b or 0.0) * 2.0
+
+
+def _peak_gb(info: ModelInfo) -> float:
+    """GB the volume must have free for this model to finish downloading."""
+    return _WEIGHT_CACHE_PEAK_FACTOR * _download_gb(info)
+
+
 def _fits_weight_cache(info: ModelInfo) -> bool:
-    """Whether the model's peak download footprint fits the shared weight-cache volume."""
+    """Whether the model's peak download footprint fits the shared weight-cache volume.
+
+    Sizes the model against an EMPTY volume. That is the right question for "may this model use
+    the cache at all", but it is NOT sufficient to prove the whole catalog can be warmed onto one
+    volume -- the cache is shared and never evicted, so a later model meets a volume already
+    holding every earlier one. ``weight_cache_catalog_peak_gb`` answers that cumulative question;
+    keep both in agreement when adding a large model.
+    """
     if not info.params_b:
         return (
             True  # unknown size -> keep the (attach) default; curated catalog models always set it
         )
-    download_gb = info.params_b * 2.0  # bf16: 2 bytes/param (mirrors cost.facts.download_weight_gb)
-    return _WEIGHT_CACHE_PEAK_FACTOR * download_gb <= WEIGHT_CACHE_VOLUME_GB
+    return _peak_gb(info) <= WEIGHT_CACHE_VOLUME_GB
+
+
+def weight_cache_catalog_peak_gb() -> float:
+    """Peak GB the volume must hold to warm the WHOLE catalog onto one shared volume.
+
+    Every catalog model ends up resident together and nothing is ever evicted, so the worst moment
+    is the largest model downloading -- needing room for its scratch -- while all the others are
+    already on disk. That is strictly more than any single model's own peak, which is why sizing the
+    volume per-model let the 35B fail with "Disk quota exceeded" on every datacenter at 200 GB.
+
+    Derived from ``params_b``, so it slightly understates a repo that also ships tokenizer/config/
+    index files; the measured-bytes figure for today's catalog is ~5 GB higher. Keep real headroom
+    over this number rather than sizing to it exactly.
+    """
+    from flash.catalog import MODELS
+
+    cached = [info for info in MODELS.values() if _fits_weight_cache(info)]
+    if not cached:
+        return 0.0
+    largest = max(cached, key=_download_gb)
+    resident_others = sum(_download_gb(info) for info in cached if info is not largest)
+    return resident_others + _peak_gb(largest)
 
 
 def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:
@@ -651,7 +697,12 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
     if existing and existing != WEIGHT_CACHE_VOLUME_NAME:
         return spec
     attach = is_catalog and (info is None or _fits_weight_cache(info))
-    if attach == (existing == WEIGHT_CACHE_VOLUME_NAME):
+    pinned = existing == WEIGHT_CACHE_VOLUME_NAME
+    # An already-pinned spec is only "correct" if it also carries the CURRENT managed size. A stale
+    # or internally-round-tripped spec can hold the shared name at a previous, smaller size; taking
+    # the no-op return there would deploy an undersized volume for models this size now admits.
+    sized = getattr(spec.gpu, "network_volume_gb", None) == WEIGHT_CACHE_VOLUME_GB
+    if attach == pinned and (sized or not attach):
         return spec
     d = spec.to_internal_dict()
     if attach:
