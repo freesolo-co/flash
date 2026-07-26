@@ -19,7 +19,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from flash._logging import get_logger
+from flash._logging import configure_logging, get_logger
 from flash.providers._hf_artifacts import make_hf_text_reader
 from flash.providers._poll import preload_instance_run_id
 from flash.providers.base import UnreconciledCreateError
@@ -518,24 +518,49 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
     return results
 
 
-def _log_unreachable_lambda_regions(provisioned: set[str], results: list[dict]) -> None:
-    """Name every provisioned region whose cache is not fully warm, however it got that way.
+def _unreachable_lambda_regions(provisioned: set[str], results: list[dict]) -> list[str]:
+    """Regions provisioned but never launched: no capacity in any ladder class, so no result at all.
 
-    Two ways a region ends up cold, and a summary built from results alone only sees the first:
-    it warmed but did not finish (``timeout``/``partial``/``error``), or it had no capacity in any
-    ladder class and so never produced a result at all. The second is the silent fleet gap this
-    change exists to expose, so it is reported from the provisioned filesystems instead.
+    This is the silent fleet gap the summary exists to expose -- a report built from results alone
+    cannot see it, because these regions never became targets.
+    """
+    return sorted(provisioned - {r["region"] for r in results})
+
+
+def _cold_lambda_regions(provisioned: set[str], results: list[dict]) -> tuple[list[str], int]:
+    """``(cold regions, fleet size)``. Cold = did not finish ``ok``, however it got that way.
+
+    Two ways a region ends up cold and a summary built from results alone only sees the first: it
+    warmed but did not finish (``timeout``/``partial``/``error``), or it had no capacity in any
+    ladder class and never produced a result. The second is reported from the provisioned
+    filesystems instead.
     """
     # Anything not "ok" left that region's cache incomplete, so a timeout and a partial are as
     # actionable as an error -- reporting only errors would read as success on a half-warmed fleet.
     incomplete = {r["region"] for r in results if r.get("status") != "ok"}
-    unreachable = provisioned - {r["region"] for r in results}
-    cold = sorted(incomplete | unreachable)
+    unreachable = _unreachable_lambda_regions(provisioned, results)
+    # Union, not just the pre-launch snapshot: eager provisioning can succeed in only a subset of
+    # regions and launch-time ensure_filesystem backstops the rest, so results may name regions the
+    # snapshot never had. Sizing the fleet off the snapshot alone under-counts it -- and could print
+    # a denominator smaller than the numerator it is being compared against.
+    total = len(provisioned | {r["region"] for r in results})
+    return sorted(incomplete | set(unreachable)), total
+
+
+def _log_unreachable_lambda_regions(provisioned: set[str], results: list[dict]) -> list[str]:
+    """Warn about every region whose cache is not fully warm. Returns them sorted, for printing.
+
+    Returned as well as logged because this is a library module: the ``flash`` logger carries only a
+    NullHandler until an app calls ``configure_logging``, so a caller that has not opted in would
+    otherwise lose the one message naming regions with no capacity in any class.
+    """
+    cold, total = _cold_lambda_regions(provisioned, results)
     if not cold:
-        return
-    total = len(provisioned) or len(results)
+        return []
+    unreachable = set(_unreachable_lambda_regions(provisioned, results))
     detail = ", ".join(f"{r} (no capacity)" if r in unreachable else r for r in cold)
     logger.warning("warm lambda: %d of %d region(s) not fully warmed: %s", len(cold), total, detail)
+    return cold
 
 
 def provision_lambda_filesystems(name: str | None = None) -> list[str]:
@@ -563,6 +588,11 @@ def provision_lambda_filesystems(name: str | None = None) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # This module is a library: the `flash` logger carries only a NullHandler until an app opts in,
+    # so every logger.warning here -- including the one naming regions with no capacity in any class,
+    # which has no other output path -- is discarded when run as __main__. An operator running the
+    # documented entry point would see "N/N regions warmed" and exit 0 over a half-cold fleet.
+    configure_logging()
     ap = argparse.ArgumentParser(description="Preload the flash weight-cache volumes.")
     ap.add_argument("--models", help="comma-separated HF model ids (default: whole catalog)")
     ap.add_argument("--datacenters", help="comma-separated DC ids (default: all storage DCs)")

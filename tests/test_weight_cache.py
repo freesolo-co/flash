@@ -2327,6 +2327,52 @@ def test_warm_names_regions_with_no_capacity_in_any_class(monkeypatch, caplog):
     assert "us-east-1" not in warned, "a region that warmed fine must not be reported cold"
 
 
+def test_warm_counts_launch_time_regions_in_the_fleet_total(monkeypatch):
+    """The denominator is the union, not the pre-launch snapshot.
+
+    Eager provisioning can succeed in only a subset of regions -- launch-time ensure_filesystem is
+    the documented backstop -- so results may name regions the snapshot never held. Sizing the fleet
+    off the snapshot alone under-counts it, and with one starved pre-provisioned region plus one
+    failed new region it printed the nonsense "2 of 1 region(s) not fully warmed".
+    """
+    from flash.providers.runpod import preload
+
+    cold, total = preload._cold_lambda_regions(
+        {"us-south-2"}, [{"region": "us-west-1", "status": "error"}]
+    )
+    assert cold == ["us-south-2", "us-west-1"]
+    assert total == 2, f"fleet total must count the launch-time region too, got {total}"
+    assert total >= len(cold), "the denominator can never be smaller than the numerator"
+
+
+def test_warm_cli_prints_regions_with_no_capacity(monkeypatch, capsys):
+    """The cold-region report must survive to stdout, not die in an unconfigured logger.
+
+    Regression: this module is a library, so the `flash` logger holds only a NullHandler. Running
+    the documented `python -m flash.providers.runpod.preload --warm-instances` entry point never
+    called configure_logging, so the one message naming regions with no capacity in any class was
+    discarded -- stdout said "1/1 regions warmed" and exited 0 over a half-cold fleet.
+    """
+    from flash.providers.runpod import preload as _p
+
+    # a real catalog id: --models refuses off-catalog ids before it ever reaches the warm path
+    model = _p.catalog_model_ids()[0]
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": [model], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(lj, "usable_instances", _stocked(A10=["us-east-1"]))
+    monkeypatch.setattr(
+        preload, "_lambda_provisioned_regions", lambda: {"us-east-1", "us-south-2"}
+    )
+    rc = preload.main(["--warm-instances", "--models", model])
+    out = capsys.readouterr()
+    combined = out.out + out.err
+    assert "us-south-2" in combined, f"the starved region never reached the operator: {combined!r}"
+    assert "no capacity" in combined, combined
+    # every launched region did succeed, so the run is still a success -- the point is visibility
+    assert rc == 0
+
+
 def test_warm_ranks_contested_regions_by_live_price_not_ladder_order(monkeypatch):
     """Selection must follow the live rate: a Lambda discount reorders classes the static tuple cannot.
 
