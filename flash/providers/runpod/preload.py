@@ -51,6 +51,10 @@ _HF_HOME = "/runpod-volume/hf-cache"
 _PRELOAD_GPU = "RTX 4090"
 _TERMINAL_OK = {"COMPLETED"}
 _TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
+# Only a QUEUED job can be starved. Any other nonterminal status means RunPod already handed the job
+# to a worker, so a zero-worker health reading there is a health-reporting artifact, not starvation --
+# and acting on it would delete the endpoint mid-download.
+_QUEUED = "IN_QUEUE"
 # Not every storage DC stocks every GPU class -- US-KS-2/US-MO-2/US-NC-2/US-NE-1/US-WA-1 carry no
 # RTX 4090 at all. A preload pinned to a class the DC cannot serve never allocates a worker: the job
 # just sits queued until the timeout, so the DC stays silently cold and we pay for the wait. Give up
@@ -194,8 +198,12 @@ def _poll_until_done(
     poll_interval_s: float,
 ) -> dict:
     deadline = time.time() + timeout_s
-    started_at = time.time()
     saw_worker = False
+    # Grace is measured over an UNBROKEN run of confirmed zero-worker readings, so it starts at the
+    # first such reading rather than at launch. Timing it from launch would let an unreadable health
+    # API age the timer silently, and the first definite False after that would fire instantly --
+    # deleting an endpoint whose download may be progressing.
+    starved_since: float | None = None
     while time.time() < deadline:
         st = runpod_api.job_status(
             endpoint_id,
@@ -204,17 +212,24 @@ def _poll_until_done(
             deadline_at=deadline,
         )
         status = (st or {}).get("status")
-        if not saw_worker and status not in _TERMINAL_OK and status not in _TERMINAL_FAIL:
+        # Restricted to IN_QUEUE: any other nonterminal status proves a worker was allocated, so
+        # zero-worker health then is a reporting artifact and never evidence of a starved DC.
+        if not saw_worker and status == _QUEUED:
             worker_state = _has_worker(endpoint_id, key_fingerprint, deadline)
             saw_worker = worker_state is True
-            # Only a definite "no workers" (False) is evidence of starvation. None means health was
-            # unreadable, and escalating that would delete the endpoint out from under a download
-            # that is very likely progressing -- a broken health API must not look like a dead DC.
-            if worker_state is False and time.time() - started_at >= _NO_CAPACITY_GRACE_S:
-                raise NoCapacityError(
-                    f"job {job_id} sat queued {_NO_CAPACITY_GRACE_S:.0f}s with no worker in any "
-                    "state: this datacenter cannot serve the requested GPU class"
-                )
+            if worker_state is False:
+                # Only a definite "no workers" starts or continues the run. None means health was
+                # unreadable, and treating that as starvation would delete the endpoint out from
+                # under a live download -- a broken health API must not look like a dead DC.
+                starved_since = time.time() if starved_since is None else starved_since
+                if time.time() - starved_since >= _NO_CAPACITY_GRACE_S:
+                    raise NoCapacityError(
+                        f"job {job_id} sat queued {_NO_CAPACITY_GRACE_S:.0f}s with no worker in any "
+                        "state: this datacenter cannot serve the requested GPU class"
+                    )
+            else:
+                # Unknown or a worker seen: the run of confirmed-starved readings is broken.
+                starved_since = None
         if status in _TERMINAL_OK:
             output = (st or {}).get("output")
             if not output:

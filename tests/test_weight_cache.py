@@ -2413,6 +2413,67 @@ def test_unreadable_health_never_becomes_no_capacity(monkeypatch):
         preload._poll_until_done("ep", "job-1", "fp", timeout_s=1, poll_interval_s=0.0)
 
 
+def test_unreadable_health_does_not_age_the_grace_timer(monkeypatch):
+    """Grace must count an unbroken run of CONFIRMED zero-worker readings, not wall time since launch.
+
+    Regression: the timer started at launch, so an unreadable health API aged it silently and the very
+    first definite "no workers" after that fired NoCapacityError instantly -- deleting an endpoint whose
+    download may have been progressing the whole time.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    def _health(*_a, **_k):
+        clock["t"] += 60.0
+        # unreadable for well past the grace window, then a single definite zero-worker answer
+        if clock["t"] <= preload._NO_CAPACITY_GRACE_S * 2:
+            raise RuntimeError("health api down")
+        return {"workers": {"initializing": 0, "ready": 0, "running": 0, "idle": 0}}
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    # timeout leaves room for the unreadable stretch but NOT for a fresh full grace window after it
+    timeout_s = preload._NO_CAPACITY_GRACE_S * 2 + 120.0
+    with pytest.raises(TimeoutError):  # NOT NoCapacityError
+        preload._poll_until_done("ep", "job", "fp", timeout_s=timeout_s, poll_interval_s=1.0)
+
+
+def test_no_capacity_guard_only_runs_while_the_job_is_queued(monkeypatch):
+    """IN_PROGRESS proves a worker was allocated, so zero-worker health there is a reporting artifact.
+
+    Regression: the guard ran on every nonterminal status. A job already downloading on a worker could
+    be declared starved on a stale health reading, and _preload_one_dc would delete the endpoint
+    mid-download.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    monkeypatch.setattr(preload, "decode_output", lambda o: {"preloaded": ["m"]})
+    # health insists there are no workers for the whole run -- the status is what must be believed
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"initializing": 0, "ready": 0, "running": 0, "idle": 0}},
+    )
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "job_status",
+        lambda *a, **k: (
+            {"status": "COMPLETED", "output": "x"}
+            if clock["t"] > preload._NO_CAPACITY_GRACE_S * 2
+            else {"status": "IN_PROGRESS"}
+        ),
+    )
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    assert out == {"preloaded": ["m"]}
+    assert clock["t"] > preload._NO_CAPACITY_GRACE_S  # ran past grace without being killed
+
+
 def test_no_capacity_is_reported_distinctly_from_error(monkeypatch):
     """A starved DC surfaces as status='no_capacity' so the summary can name it and the GPU class."""
     from flash.providers.runpod import preload
