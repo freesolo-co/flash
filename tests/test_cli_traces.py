@@ -359,3 +359,29 @@ def test_traces_export_empty_records_points_at_the_prompts_shape(
     assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
 
     assert "--format prompts" in capsys.readouterr().err
+
+
+def test_traces_export_skip_note_names_the_right_missing_half(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A prompts skip means no usable request; blaming a missing response would
+    contradict the reason the prompts shape exists."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda *a, **k: {
+            "records": [{"input": "hi"}],
+            "traces": 2,
+            "skipped": 1,
+            "format": "prompts",
+        },
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "prompts"]) == 0
+
+    printed = capsys.readouterr().out
+    assert "1 traces skipped: no usable request)" in printed
+    # the records-shaped reason must not leak into a prompts export.
+    assert "request/response pair" not in printed

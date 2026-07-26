@@ -129,6 +129,15 @@ _ROW_NOUN = {
     RAW_FORMAT: "traces",
 }
 
+# why a trace produced no row, per shape. `records` needs both halves of the
+# exchange; `prompts` only needs the request, so blaming a missing response
+# there would contradict the reason that shape exists. `raw` converts nothing
+# and so can never skip.
+_SKIP_REASON = {
+    RECORDS_FORMAT: "no usable request/response pair",
+    PROMPTS_FORMAT: "no usable request",
+}
+
 
 def _empty_export_error(project_id: str, export_format: str) -> ClientError:
     """Why an export came back empty, in terms of the shape that was asked for."""
@@ -170,7 +179,8 @@ def cmd_traces_export(args) -> int:
     noun = _ROW_NOUN.get(export_format, "rows")
     summary = f"exported {len(records)} {noun} to {output}"
     if skipped:
-        summary += f" ({skipped} traces skipped: no usable request/response pair)"
+        reason = _SKIP_REASON.get(export_format)
+        summary += f" ({skipped} traces skipped: {reason})" if reason else f" ({skipped} skipped)"
     if render.styled():
         print(render.ok(summary))
         # raw rows are for taking away, not for training: pointing them at
