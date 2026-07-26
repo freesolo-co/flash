@@ -2369,6 +2369,44 @@ def test_poll_waits_when_a_worker_is_initializing(monkeypatch):
     assert clock["t"] > preload._NO_CAPACITY_GRACE_S  # proves it did not bail out early
 
 
+def test_poll_restarts_the_grace_window_after_a_requeue(monkeypatch):
+    """Leaving the queue must reset the starvation anchor, not let it age through the running spell.
+
+    Regression: the grace anchor survived an IN_PROGRESS interval, so a job that queued briefly, ran
+    for longer than the grace window, then got re-queued after an interruption would be declared
+    starved on its FIRST zero-worker reading -- and _preload_one_dc deletes the endpoint on that,
+    killing a DC that has real capacity and had already been allocated a worker.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    # queued once, allocated (so saw_worker stays False only because health reads zero), then
+    # re-queued long after the grace window would have elapsed, then completes.
+    statuses = ["IN_QUEUE", "IN_PROGRESS", "IN_QUEUE", "COMPLETED"]
+    seq = iter(statuses)
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "job_status",
+        lambda *a, **k: {"status": next(seq, "COMPLETED"), "output": "x"},
+    )
+    # health always reports zero workers: the ONLY thing standing between this job and deletion is
+    # the anchor being reset when the status left the queue.
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"initializing": 0, "ready": 0, "running": 0, "idle": 0}},
+    )
+    monkeypatch.setattr(preload, "decode_output", lambda o: {"preloaded": ["m"]})
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 30.0)  # one sleep outruns it
+
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    assert out == {"preloaded": ["m"]}
+    # the running interval alone exceeded the grace window, proving the anchor did not carry over
+    assert clock["t"] > preload._NO_CAPACITY_GRACE_S
+
+
 def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
     """Health is a hint: an API error must not be read as 'no capacity' and kill a live download.
 

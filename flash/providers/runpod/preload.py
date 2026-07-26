@@ -212,9 +212,16 @@ def _poll_until_done(
             deadline_at=deadline,
         )
         status = (st or {}).get("status")
+        if status != _QUEUED:
+            # Leaving the queue breaks the run. A job that reached IN_PROGRESS was allocated a
+            # worker, so if it is later re-queued after an interruption it must serve a FRESH grace
+            # window: carrying the old anchor forward would charge the whole running interval to
+            # starvation and the first zero-worker reading after the re-queue would delete an
+            # endpoint that never actually waited on capacity.
+            starved_since = None
         # Restricted to IN_QUEUE: any other nonterminal status proves a worker was allocated, so
         # zero-worker health then is a reporting artifact and never evidence of a starved DC.
-        if not saw_worker and status == _QUEUED:
+        elif not saw_worker:
             worker_state = _has_worker(endpoint_id, key_fingerprint, deadline)
             saw_worker = worker_state is True
             if worker_state is False:
