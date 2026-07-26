@@ -2414,7 +2414,9 @@ def test_catalog_is_ordered_largest_first(monkeypatch):
     from flash.catalog import MODELS
 
     sizes = [MODELS[m].params_b or 0.0 for m in ids]
-    assert sizes == sorted(sizes, reverse=True), f"catalog must be largest-first, got {list(zip(ids, sizes))}"
+    assert sizes == sorted(sizes, reverse=True), (
+        f"catalog must be largest-first, got {list(zip(ids, sizes, strict=True))}"
+    )
 
 
 def test_volume_holds_whole_catalog_with_largest_model_in_transit():
@@ -2474,7 +2476,8 @@ def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):
 
     assert results[0]["status"] == "partial"
     text = caplog.text
-    assert "m2" in text and "429 rate limited" in text
+    assert "m2" in text
+    assert "429 rate limited" in text
     assert "US-CA-2" in text
     # the model that succeeded is not noise in the failure summary
     assert "m1 FAILED" not in text
