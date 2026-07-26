@@ -30,11 +30,21 @@ from flash.client.config import load_credentials
 from . import render
 
 DEFAULT_EXPORT_PATH = Path("dataset/train.jsonl")
+# raw rows are not a dataset. load_freesolo_environment auto-selects
+# dataset/train.jsonl as a run's dataset_path, so a raw dump written there could
+# be picked up by a later `env push` + `train` and fed to a run that cannot read
+# it. prompts stay on the default path: they are training input for GRPO.
+RAW_EXPORT_PATH = Path("traces.raw.jsonl")
 
 RECORDS_FORMAT = "records"
 PROMPTS_FORMAT = "prompts"
 RAW_FORMAT = "raw"
 EXPORT_FORMATS = (RECORDS_FORMAT, PROMPTS_FORMAT, RAW_FORMAT)
+
+
+def default_output_path(export_format: str) -> Path:
+    """Where an export lands when no --output is given."""
+    return RAW_EXPORT_PATH if export_format == RAW_FORMAT else DEFAULT_EXPORT_PATH
 
 
 def _require_api_key() -> str:
@@ -161,11 +171,24 @@ def cmd_traces_export(args) -> int:
     project_id = _resolve_project_id(args, api_key)
     export_format = getattr(args, "format", None) or RECORDS_FORMAT
 
-    output = Path(getattr(args, "output", None) or DEFAULT_EXPORT_PATH)
+    output = Path(getattr(args, "output", None) or default_output_path(export_format))
     if output.exists() and not getattr(args, "force", False):
         raise ClientError(f"{output} already exists; pass --force to overwrite it")
 
     exported = fetch_records(project_id, api_key, export_format)
+
+    # a backend predating format support ignores the query param and returns
+    # ordinary records. writing those out under the requested name would label
+    # {input, output} rows as prompts or raw -- for raw, an incomplete backup
+    # reported as success. only non-default requests can be mislabelled this way.
+    returned_format = exported.get("format")
+    if export_format != RECORDS_FORMAT and returned_format != export_format:
+        raise ClientError(
+            f"the freesolo backend did not honour --format {export_format} "
+            f"(it returned {returned_format or RECORDS_FORMAT}). It may predate format "
+            "support -- check FREESOLO_BASE_URL or upgrade the backend"
+        )
+
     records = exported.get("records") or []
     if not records:
         raise _empty_export_error(project_id, export_format)

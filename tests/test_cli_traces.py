@@ -326,10 +326,11 @@ def test_traces_export_raw_shape_is_not_called_training_rows(
 
     assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 0
 
-    assert _rows(tmp_path / "dataset/train.jsonl") == _RAW
+    # raw defaults off the training dataset path; see the dedicated test below.
+    assert _rows(tmp_path / "traces.raw.jsonl") == _RAW
     assert fake_traces["formats"] == [traces.RAW_FORMAT]
     printed = capsys.readouterr().out
-    assert "exported 1 traces to dataset/train.jsonl" in printed
+    assert "exported 1 traces to traces.raw.jsonl" in printed
     assert "training rows" not in printed
 
 
@@ -385,3 +386,62 @@ def test_traces_export_skip_note_names_the_right_missing_half(
     assert "1 traces skipped: no usable request)" in printed
     # the records-shaped reason must not leak into a prompts export.
     assert "request/response pair" not in printed
+
+
+def test_traces_export_refuses_a_format_the_backend_ignored(monkeypatch, tmp_path, capsys) -> None:
+    """A backend predating format support returns records for every request.
+
+    Writing those rows out as `raw` would label {input, output} pairs as a
+    complete trace dump -- an incomplete backup reported as success.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        # no "format" key at all, as an older backend would answer.
+        lambda *a, **k: {"records": _RECORDS, "traces": 2, "skipped": 0},
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 1
+
+    assert "did not honour --format raw" in capsys.readouterr().err
+    # nothing may be written when the shape could not be trusted.
+    assert not (tmp_path / "traces.raw.jsonl").exists()
+
+
+def test_traces_export_default_records_works_against_a_format_blind_backend(
+    monkeypatch, tmp_path
+) -> None:
+    """The default request cannot be mislabelled: records is what such a backend returns."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda *a, **k: {"records": _RECORDS, "traces": 2, "skipped": 0},
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1"]) == 0
+
+    assert _rows(tmp_path / "dataset/train.jsonl") == _RECORDS
+
+
+def test_raw_export_stays_off_the_training_dataset_path(fake_traces, monkeypatch, tmp_path) -> None:
+    """dataset/train.jsonl is auto-selected as a run's dataset_path, and raw rows
+    are not trainable, so raw must default somewhere else."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 0
+
+    assert _rows(tmp_path / "traces.raw.jsonl") == _RAW
+    assert not (tmp_path / "dataset/train.jsonl").exists()
+
+
+def test_prompts_export_keeps_the_training_dataset_path(fake_traces, monkeypatch, tmp_path) -> None:
+    """Prompts are training input for GRPO, so they belong on the default path."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "prompts"]) == 0
+
+    assert _rows(tmp_path / "dataset/train.jsonl") == _PROMPTS
