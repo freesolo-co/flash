@@ -2370,14 +2370,47 @@ def test_poll_waits_when_a_worker_is_initializing(monkeypatch):
 
 
 def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
-    """Health is a hint: an API error must not be read as 'no capacity' and kill a live download."""
+    """Health is a hint: an API error must not be read as 'no capacity' and kill a live download.
+
+    None, not False -- the caller escalates a sustained False into NoCapacityError and deletes the
+    endpoint, so conflating "cannot tell" with "no workers" would kill healthy downloads.
+    """
     from flash.providers.runpod import preload
 
     def _boom(*_a, **_k):
         raise RuntimeError("health api down")
 
     monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _boom)
-    assert preload._has_worker("ep", "fp", 0.0) is False
+    assert preload._has_worker("ep", "fp", 0.0) is None
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: None)
+    assert preload._has_worker("ep", "fp", 0.0) is None
+
+    monkeypatch.setattr(
+        preload.runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: {"workers": {}}
+    )
+    assert preload._has_worker("ep", "fp", 0.0) is False  # a real empty answer IS evidence
+
+
+def test_unreadable_health_never_becomes_no_capacity(monkeypatch):
+    """A persistently failing health API must not masquerade as a starved datacenter.
+
+    Regression: with health unreadable, the grace timer used to fire NoCapacityError and the caller's
+    finally deleted the endpoint mid-download. The job here stays IN_QUEUE well past the grace window
+    and must simply time out instead.
+    """
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("health api down")),
+    )
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    with pytest.raises(TimeoutError):  # NOT NoCapacityError
+        preload._poll_until_done("ep", "job-1", "fp", timeout_s=1, poll_interval_s=0.0)
 
 
 def test_no_capacity_is_reported_distinctly_from_error(monkeypatch):

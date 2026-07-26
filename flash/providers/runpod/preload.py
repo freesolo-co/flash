@@ -62,8 +62,14 @@ class NoCapacityError(RuntimeError):
     """A datacenter never allocated a worker, i.e. it cannot serve the requested GPU class."""
 
 
-def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool:
-    """True once the endpoint has a worker in any state (initializing counts: capacity exists)."""
+def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool | None:
+    """True once a worker exists in any state (initializing counts: capacity exists).
+
+    Returns None when health could not be read. That is deliberately NOT False: the caller escalates
+    a sustained False into NoCapacityError and tears the endpoint down, so a health endpoint that is
+    merely unreachable would look identical to a starved datacenter and could kill a download that is
+    running fine. Unknown must stay unknown -- only a positive "no workers" answer is evidence.
+    """
     try:
         health = runpod_api.endpoint_health_for_fingerprint(
             endpoint_id,
@@ -71,8 +77,10 @@ def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool
             deadline_at=deadline,
         )
     except Exception:
-        return False  # health is a hint, never a reason to fail a download that may be fine
-    workers = (health or {}).get("workers") or {}
+        return None
+    if health is None:
+        return None
+    workers = health.get("workers") or {}
     return any(int(workers.get(k) or 0) > 0 for k in ("initializing", "ready", "running", "idle"))
 
 
@@ -189,8 +197,12 @@ def _poll_until_done(
         )
         status = (st or {}).get("status")
         if not saw_worker and status not in _TERMINAL_OK and status not in _TERMINAL_FAIL:
-            saw_worker = _has_worker(endpoint_id, key_fingerprint, deadline)
-            if not saw_worker and time.time() - started_at >= _NO_CAPACITY_GRACE_S:
+            worker_state = _has_worker(endpoint_id, key_fingerprint, deadline)
+            saw_worker = worker_state is True
+            # Only a definite "no workers" (False) is evidence of starvation. None means health was
+            # unreadable, and escalating that would delete the endpoint out from under a download
+            # that is very likely progressing -- a broken health API must not look like a dead DC.
+            if worker_state is False and time.time() - started_at >= _NO_CAPACITY_GRACE_S:
                 raise NoCapacityError(
                     f"job {job_id} sat queued {_NO_CAPACITY_GRACE_S:.0f}s with no worker in any "
                     "state: this datacenter cannot serve the requested GPU class"
