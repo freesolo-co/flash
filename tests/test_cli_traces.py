@@ -23,20 +23,34 @@ _RECORDS = [
     {"input": "What is 2 + 2?", "output": "4"},
     {"input": "What is 3 + 5?", "output": "8"},
 ]
+# the same traces as prompts: the reply-less third call survives here.
+_PROMPTS = [
+    {"input": "What is 2 + 2?"},
+    {"input": "What is 3 + 5?"},
+    {"input": "What is 9 + 1?"},
+]
+_RAW = [{"id": "trace-1", "model": "gpt-4o-mini", "spans": [{"id": "span-1"}]}]
 
 
 @pytest.fixture
 def fake_traces(monkeypatch):
     """Stub the freesolo traces client; records what each command asked for."""
-    calls: dict[str, list] = {"projects": [], "records": []}
+    calls: dict[str, list] = {"projects": [], "records": [], "formats": []}
 
     def list_projects(api_key, base_url=None):
         calls["projects"].append(api_key)
         return _PROJECTS
 
-    def export_records(project_id, api_key, base_url=None, limit=None):
+    def export_records(project_id, api_key, base_url=None, limit=None, export_format=None):
         calls["records"].append(project_id)
-        return {"records": _RECORDS, "traces": 3, "skipped": 1}
+        calls["formats"].append(export_format)
+        if export_format == traces.PROMPTS_FORMAT:
+            # prompts keep the reply-less call that records drops, so this shape
+            # yields more rows and skips nothing.
+            return {"records": _PROMPTS, "traces": 3, "skipped": 0, "format": export_format}
+        if export_format == traces.RAW_FORMAT:
+            return {"records": _RAW, "traces": 3, "skipped": 0, "format": export_format}
+        return {"records": _RECORDS, "traces": 3, "skipped": 1, "format": "records"}
 
     monkeypatch.setattr(traces, "list_trace_projects", list_projects)
     monkeypatch.setattr(traces, "export_trace_records", export_records)
@@ -274,3 +288,187 @@ def test_project_options_label_by_name_and_skip_id_less_rows() -> None:
         ("proj-1", "support triage"),
         ("proj-2", "docs qa"),
     ]
+
+
+def test_traces_export_defaults_to_env_records(fake_traces, monkeypatch, tmp_path) -> None:
+    """No --format keeps the shape every existing caller already gets."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1"]) == 0
+
+    assert fake_traces["formats"] == [traces.RECORDS_FORMAT]
+
+
+def test_traces_export_prompts_shape_keeps_reply_less_calls(
+    fake_traces, monkeypatch, tmp_path, capsys
+) -> None:
+    """GRPO samples its own completions, so a call with no reply is still a prompt."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "prompts"]) == 0
+
+    rows = _rows(tmp_path / "dataset/train.jsonl")
+    assert rows == _PROMPTS
+    # every row is prompt-only: a gold completion here would be the wrong shape.
+    assert all(set(row) == {"input"} for row in rows)
+    assert fake_traces["formats"] == [traces.PROMPTS_FORMAT]
+    printed = capsys.readouterr().out
+    assert "exported 3 prompts to dataset/train.jsonl" in printed
+    # nothing was skipped, so no skip note should appear.
+    assert "skipped" not in printed
+
+
+def test_traces_export_raw_shape_is_not_called_training_rows(
+    fake_traces, monkeypatch, tmp_path, capsys
+) -> None:
+    """Raw rows are for taking away; calling them training rows would mislead."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 0
+
+    # raw defaults off the training dataset path; see the dedicated test below.
+    assert _rows(tmp_path / "traces.raw.jsonl") == _RAW
+    assert fake_traces["formats"] == [traces.RAW_FORMAT]
+    printed = capsys.readouterr().out
+    assert "exported 1 traces to traces.raw.jsonl" in printed
+    assert "training rows" not in printed
+
+
+def test_traces_export_rejects_an_algorithm_as_a_format(fake_traces, monkeypatch, tmp_path) -> None:
+    """SFT and GRPO read the same records file, so they are not formats."""
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["traces", "export", "--project", "proj-1", "--format", "sft"])
+
+    # argparse rejects an out-of-choices value before any request is made.
+    assert exit_info.value.code == 2
+    assert fake_traces["formats"] == []
+
+
+def test_traces_export_empty_records_points_at_the_prompts_shape(
+    fake_traces, monkeypatch, tmp_path, capsys
+) -> None:
+    """A project whose calls have no replies is still exportable as prompts."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda *a, **k: {"records": [], "traces": 2, "skipped": 2, "format": "records"},
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
+
+    assert "--format prompts" in capsys.readouterr().err
+
+
+def test_traces_export_skip_note_names_the_right_missing_half(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A prompts skip means no usable request; blaming a missing response would
+    contradict the reason the prompts shape exists."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda *a, **k: {
+            "records": [{"input": "hi"}],
+            "traces": 2,
+            "skipped": 1,
+            "format": "prompts",
+        },
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "prompts"]) == 0
+
+    printed = capsys.readouterr().out
+    assert "1 traces skipped: no usable request)" in printed
+    # the records-shaped reason must not leak into a prompts export.
+    assert "request/response pair" not in printed
+
+
+def test_traces_export_refuses_a_format_the_backend_ignored(monkeypatch, tmp_path, capsys) -> None:
+    """A backend predating format support returns records for every request.
+
+    Writing those rows out as `raw` would label {input, output} pairs as a
+    complete trace dump -- an incomplete backup reported as success.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        # no "format" key at all, as an older backend would answer.
+        lambda *a, **k: {"records": _RECORDS, "traces": 2, "skipped": 0},
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 1
+
+    assert "did not honour --format raw" in capsys.readouterr().err
+    # nothing may be written when the shape could not be trusted.
+    assert not (tmp_path / "traces.raw.jsonl").exists()
+
+
+def test_traces_export_default_records_works_against_a_format_blind_backend(
+    monkeypatch, tmp_path
+) -> None:
+    """The default request cannot be mislabelled: records is what such a backend returns."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda *a, **k: {"records": _RECORDS, "traces": 2, "skipped": 0},
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1"]) == 0
+
+    assert _rows(tmp_path / "dataset/train.jsonl") == _RECORDS
+
+
+def test_traces_export_refuses_an_explicit_mismatch_on_the_default_format(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Regression: the default request skipped the check entirely, so a backend that explicitly
+    answered `raw` had its trace rows written to dataset/train.jsonl as if they were environment
+    records. That path is auto-selected as a run's dataset_path, so a later `env push` + `train`
+    would feed spans to a run that cannot read them.
+
+    A MISSING format still means records -- that is what a format-blind backend returns, and the
+    test above pins it -- but an explicit label is the backend stating what it actually converted,
+    and any value other than the one asked for must be refused whichever format was requested.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda *a, **k: {"records": _RAW, "traces": 2, "skipped": 0, "format": "raw"},
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
+
+    assert "did not honour --format records" in capsys.readouterr().err
+    # nothing may be written when the shape could not be trusted
+    assert not (tmp_path / "dataset/train.jsonl").exists()
+
+
+def test_raw_export_stays_off_the_training_dataset_path(fake_traces, monkeypatch, tmp_path) -> None:
+    """dataset/train.jsonl is auto-selected as a run's dataset_path, and raw rows
+    are not trainable, so raw must default somewhere else."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 0
+
+    assert _rows(tmp_path / "traces.raw.jsonl") == _RAW
+    assert not (tmp_path / "dataset/train.jsonl").exists()
+
+
+def test_prompts_export_keeps_the_training_dataset_path(fake_traces, monkeypatch, tmp_path) -> None:
+    """Prompts are training input for GRPO, so they belong on the default path."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "prompts"]) == 0
+
+    assert _rows(tmp_path / "dataset/train.jsonl") == _PROMPTS
