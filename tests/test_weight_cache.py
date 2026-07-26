@@ -2440,6 +2440,40 @@ def test_poll_rechecks_health_after_a_requeue_loses_the_worker(monkeypatch):
         preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
     # health was probed again AFTER the requeue rather than skipped by a stale latch
     assert probes["n"] > 1
+
+
+def test_poll_rechecks_health_when_a_worker_vanishes_without_leaving_the_queue(monkeypatch):
+    """A worker that appears and then disappears while still IN_QUEUE must not latch the probe off.
+
+    Regression: the latch was only cleared on the transition out of IN_QUEUE, so a worker that was
+    briefly reported ``initializing`` and then reclaimed before the job ever started suppressed every
+    later health probe. The job never left the queue, so nothing reset the latch, the starvation
+    window never ran, and the preload burned the full 5400s timeout on a datacenter that had lost
+    the box -- leaving the region cold and the endpoint billing.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    # never leaves the queue: the status stream alone gives the poller no reason to re-probe
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    # one healthy reading, then the box is gone for good
+    probes = {"n": 0}
+
+    def _health(*_a, **_k):
+        probes["n"] += 1
+        alive = 1 if probes["n"] == 1 else 0
+        return {"workers": {"initializing": alive, "ready": 0, "running": 0, "idle": 0}}
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 30.0)  # one sleep outruns it
+
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    # the vanished worker was noticed instead of being masked by the latch
+    assert probes["n"] > 1
+    assert clock["t"] < 5400
     # and it gave up in the grace window instead of burning the full timeout
     assert clock["t"] < 5400
 

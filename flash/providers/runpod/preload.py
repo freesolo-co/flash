@@ -211,10 +211,6 @@ def _poll_until_done(
     poll_interval_s: float,
 ) -> dict:
     deadline = time.time() + timeout_s
-    # Scoped to ONE queued interval, not to the whole job. It exists only to stop re-probing health
-    # once this interval is known to have a worker; a job that is re-queued is starting a new
-    # interval whose capacity is an open question again.
-    saw_worker = False
     # Grace is measured over an UNBROKEN run of confirmed zero-worker readings, so it starts at the
     # first such reading rather than at launch. Timing it from launch would let an unreadable health
     # API age the timer silently, and the first definite False after that would fire instantly --
@@ -235,17 +231,17 @@ def _poll_until_done(
             # starvation and the first zero-worker reading after the re-queue would delete an
             # endpoint that never actually waited on capacity.
             starved_since = None
-            # The latch must clear with the anchor. Leaving it set would make the "fresh window"
-            # above unreachable: the health probe below is guarded on it, so a job that ran once and
-            # was then re-queued into a datacenter that can no longer schedule it would never probe
-            # again and would burn the full timeout instead of reporting lost capacity. ``jobs.py``
-            # re-arms its own queue timers on the same transition for the same reason.
-            saw_worker = False
         # Restricted to IN_QUEUE: any other nonterminal status proves a worker was allocated, so
         # zero-worker health then is a reporting artifact and never evidence of a starved DC.
-        elif not saw_worker:
+        #
+        # Health is re-read on EVERY queued poll rather than latched off after the first worker
+        # sighting. A box that is reported and then reclaimed while the job is still queued would
+        # otherwise suppress all later probes, and because the job never leaves the queue nothing
+        # would ever clear the latch -- the preload would burn the full timeout on a datacenter that
+        # had lost the worker. The grace anchor below, not the probe, is what keeps a transient
+        # zero-worker blip from tearing down a healthy endpoint.
+        else:
             worker_state = _has_worker(endpoint_id, key_fingerprint, deadline)
-            saw_worker = worker_state is True
             if worker_state is False:
                 # Only a definite "no workers" starts or continues the run. None means health was
                 # unreadable, and treating that as starvation would delete the endpoint out from
