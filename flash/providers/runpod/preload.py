@@ -229,6 +229,14 @@ def warm_weight_cache(
     ok = sum(1 for r in results if r.get("status") == "ok")
     starved = [r["datacenter"] for r in results if r.get("status") == "no_capacity"]
     logger.info("preload complete: %d/%d datacenters warmed", ok, len(results))
+    # A "partial" DC downloaded some models and failed others. The worker already reports which ones
+    # and why, but that detail died inside the result dict -- without it "partial" is unactionable.
+    for r in results:
+        if r.get("status") != "partial":
+            continue
+        failed = ((r.get("result") or {}).get("failed") or {})
+        for model_id, detail in sorted(failed.items()):
+            logger.warning("preload %s: %s FAILED: %s", r["datacenter"], model_id, detail)
     if starved:
         # Actionable: these stay cold until re-run with a class the DC actually stocks.
         logger.warning(

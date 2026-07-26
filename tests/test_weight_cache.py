@@ -16,6 +16,7 @@ API); the one SDK contract we lock — that our datacenter list is always a supe
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 import types
@@ -2399,3 +2400,50 @@ def test_no_capacity_is_reported_distinctly_from_error(monkeypatch):
     assert res["status"] == "no_capacity"
     assert res["gpu"] == "RTX 4090"
     assert res["datacenter"] == "US-KS-2"
+
+
+def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):
+    """'partial' alone is unactionable: the summary must name each failed model and its reason."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1", "m2"])
+    monkeypatch.setattr(preload, "weight_cache_datacenters", lambda: [])
+    monkeypatch.setattr(
+        preload,
+        "_preload_one_dc",
+        lambda dc, *a, **k: {
+            "datacenter": dc,
+            "status": "partial",
+            "result": {"preloaded": ["m1"], "failed": {"m2": "429 rate limited"}},
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        results = preload.warm_weight_cache(datacenters=["US-CA-2"], gpu="RTX 4090")
+
+    assert results[0]["status"] == "partial"
+    text = caplog.text
+    assert "m2" in text and "429 rate limited" in text
+    assert "US-CA-2" in text
+    # the model that succeeded is not noise in the failure summary
+    assert "m1 FAILED" not in text
+
+
+def test_ok_datacenter_logs_no_per_model_failures(monkeypatch, caplog):
+    """A fully warmed DC must not emit failure lines (the summary stays quiet when nothing is wrong)."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1"])
+    monkeypatch.setattr(preload, "weight_cache_datacenters", lambda: [])
+    monkeypatch.setattr(
+        preload,
+        "_preload_one_dc",
+        lambda dc, *a, **k: {
+            "datacenter": dc,
+            "status": "ok",
+            "result": {"preloaded": ["m1"], "failed": {}},
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        preload.warm_weight_cache(datacenters=["US-CA-2"], gpu="RTX 4090")
+
+    assert "FAILED" not in caplog.text
