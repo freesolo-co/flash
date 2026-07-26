@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import types
 
 import pytest
@@ -2152,8 +2153,9 @@ def test_lambda_ladder_reaches_regions_the_cheapest_class_cannot(monkeypatch):
             B200=[],
         ),
     )
-    targets = preload._lambda_warm_targets(lj, None)
+    targets, planned = preload._lambda_warm_targets(lj, None)
 
+    assert planned is True, "every class answered, so the plan is a complete measurement"
     assert _plan(targets) == [
         ("asia-south-1", ["A100 SXM 40GB"]),  # unreachable on A10 alone
         # contested region: cheapest first, but the pricier class is RETAINED as a launch fallback
@@ -2173,9 +2175,11 @@ def test_lambda_ladder_skips_a_class_whose_capacity_lookup_fails(monkeypatch):
         return [types.SimpleNamespace(region="asia-south-1", gpu=gpu)] if gpu == "H100" else []
 
     monkeypatch.setattr(lj, "usable_instances", flaky)
-    targets = preload._lambda_warm_targets(lj, None)
+    targets, planned = preload._lambda_warm_targets(lj, None)
 
     assert _plan(targets) == [("asia-south-1", ["H100"])]
+    # the A10 answer never came back, so any region reachable only via A10 is unexamined, not cold
+    assert planned is False, "a failed lookup must not be reported as a completed measurement"
 
 
 def test_lambda_explicit_gpu_pins_the_class_and_skips_the_ladder(monkeypatch):
@@ -2190,9 +2194,10 @@ def test_lambda_explicit_gpu_pins_the_class_and_skips_the_ladder(monkeypatch):
         return [types.SimpleNamespace(region="us-east-1", gpu=gpu)]
 
     monkeypatch.setattr(lj, "usable_instances", capture)
-    targets = preload._lambda_warm_targets(lj, "B200")
+    targets, planned = preload._lambda_warm_targets(lj, "B200")
 
     assert asked == ["B200"]  # ladder not walked
+    assert planned is True
     assert _plan(targets) == [("us-east-1", ["B200"])]  # and no fallback class smuggled in
 
 
@@ -2327,6 +2332,11 @@ def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeyp
         lj, "usable_instances", _stocked(A10=["us-east-1"], A100_SXM_40GB=["us-east-1"])
     )
     ensured, tried = [], []
+    # already provisioned, which is the steady state once `--provision` has run
+    monkeypatch.setattr(
+        lambda_api, "list_filesystems",
+        lambda **k: [{"name": "flash-weights", "region": {"name": "us-east-1"}}],
+    )
     monkeypatch.setattr(
         lambda_api, "ensure_filesystem",
         lambda name, region, **k: ensured.append((name, region)) or f"/lambda/nfs/{name}",
@@ -2339,22 +2349,54 @@ def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeyp
     monkeypatch.setattr(lj, "launch_and_submit", no_capacity)
     preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
-    assert len(ensured) == 1, f"filesystem must be ensured exactly once per region, got {ensured}"
-    assert [r for _, r in ensured] == ["us-east-1"]
+    assert ensured == [], "an already-listed filesystem must never reach the create path"
     assert tried == ["A10", "A100 SXM 40GB"], "capacity rejections should still walk the ladder"
 
 
-def test_warm_does_not_walk_the_ladder_while_the_filesystem_is_unconfirmed(monkeypatch):
-    """When the filesystem cannot be confirmed, a rejection must stop at ONE class.
+def test_warm_skips_a_region_whose_created_filesystem_is_not_yet_listed(monkeypatch):
+    """A create that succeeds but has not appeared in the listing must NOT launch.
+
+    Regression for the fix itself: ensure_filesystem returning only proves the create call succeeded.
+    launch_and_submit then does its OWN listing, and a filesystem that exists but is not yet visible
+    makes that listing miss and submit a second non-idempotent create -- the exact duplicate the
+    pre-ensure exists to prevent, just moved one call later. Visibility in the listing, not a
+    successful create, is what makes every later ensure a no-op. One cold region is recoverable; a
+    duplicate filesystem is billed until a human notices it.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(
+        lj, "usable_instances", _stocked(A10=["us-east-1"], A100_SXM_40GB=["us-east-1"])
+    )
+    tried = []
+    # the create "succeeds", but the object never shows up in the listing
+    monkeypatch.setattr(lambda_api, "list_filesystems", lambda **k: [])
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem", lambda name, region, **k: f"/lambda/nfs/{name}"
+    )
+    monkeypatch.setattr(
+        lj, "launch_and_submit",
+        lambda spec, seed, instances, **k: tried.append(instances[0].gpu),
+    )
+    res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    assert tried == [], "an unlisted filesystem must not launch: the launcher would create a duplicate"
+    assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "error")]
+
+
+def test_warm_does_not_launch_while_the_filesystem_is_unconfirmed(monkeypatch):
+    """When the filesystem cannot be confirmed, the region must not launch at all.
 
     Regression for the case a sentinel-text check could not see: ensure_filesystem guards its create
     but NOT the reconciliation listing inside its own except block, so when that listing times out
     the raw error propagates carrying no sentinel. launch_and_submit then wraps every failure --
-    genuine capacity rejections included -- in the same "no capacity" message, so the ladder cannot
-    tell a starved region from one whose create is in doubt. Walking anyway risks a SECOND
-    non-idempotent create for the same name and region: duplicate storage, billed forever. The
-    region still gets its one launch attempt, because launch_and_submit ensures the filesystem
-    itself and may well succeed.
+    genuine capacity rejections included -- in the same "no capacity" message, so nothing downstream
+    can tell a starved region from one whose create is in doubt. Launching anyway lets the launcher's
+    own ensure_filesystem submit a SECOND non-idempotent create for the same name and region:
+    duplicate storage, billed forever. Skipping the region costs one cold cycle.
     """
     from flash.providers.lambdalabs import api as lambda_api
 
@@ -2366,20 +2408,19 @@ def test_warm_does_not_walk_the_ladder_while_the_filesystem_is_unconfirmed(monke
     )
     tried = []
 
-    def boom(name, region, **k):
-        # a bare timeout from the reconciliation listing: Lambda WAS reached, so a create may be in
-        # flight, and no sentinel text appears anywhere in the message
+    def boom(**k):
+        # a bare timeout: Lambda WAS reached, so a create may be in flight, and no sentinel text
+        # appears anywhere in the message
         raise RuntimeError("read timed out")
 
-    def rejected(spec, seed, instances, **k):
-        tried.append(instances[0].gpu)
-        raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
-
-    monkeypatch.setattr(lambda_api, "ensure_filesystem", boom)
-    monkeypatch.setattr(lj, "launch_and_submit", rejected)
+    monkeypatch.setattr(lambda_api, "list_filesystems", boom)
+    monkeypatch.setattr(
+        lj, "launch_and_submit",
+        lambda spec, seed, instances, **k: tried.append(instances[0].gpu),
+    )
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
-    assert tried == ["A10"], "an unconfirmed filesystem must not walk to a second class"
+    assert tried == [], "an unconfirmed filesystem must not launch at all"
     assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "error")]
 
 
@@ -2406,7 +2447,7 @@ def test_ladder_planning_shares_one_deadline_across_every_class(monkeypatch):
         raise RuntimeError("instance-types timed out")
 
     monkeypatch.setattr(lj, "usable_instances", hang)
-    assert preload._lambda_warm_targets(lj, None) == []
+    assert preload._lambda_warm_targets(lj, None) == ([], False)
 
     # two classes fit in the budget; the ladder stops instead of walking all four
     assert asked == ["A10", "A100 SXM 40GB"]
@@ -2430,18 +2471,80 @@ def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
     )
     tried = []
 
-    def unconfigured(name, region, **k):
+    def unconfigured(**k):
+        # the exact text RestClient.missing_key_message builds in flash/providers/_http.py
         raise RuntimeError("LAMBDA_API_KEY not configured on the control-plane host")
 
     def rejected(spec, seed, instances, **k):
         tried.append(instances[0].gpu)
         raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
 
-    monkeypatch.setattr(lambda_api, "ensure_filesystem", unconfigured)
+    monkeypatch.setattr(lambda_api, "list_filesystems", unconfigured)
     monkeypatch.setattr(lj, "launch_and_submit", rejected)
     preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
     assert tried == ["A10", "A100 SXM 40GB"], "an unreachable Lambda must not pin the ladder"
+
+
+def test_warm_raises_when_capacity_could_not_be_measured(monkeypatch):
+    """A total lookup failure must raise, not return an empty list.
+
+    Empty is indistinguishable from a healthy "nothing to warm" at every call site -- the CLI printed
+    "no Lambda region had capacity" and exited 0 while the whole fleet stayed cold behind a Lambda
+    outage. "No capacity" and "we never got an answer" are different facts and only the first is a
+    success.
+    """
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
+    monkeypatch.setattr(preload, "_lambda_provisioned_regions", lambda: set())
+
+    def down(gpu, **k):
+        raise RuntimeError("instance-types: read timed out")
+
+    monkeypatch.setattr(lj, "usable_instances", down)
+    with pytest.raises(RuntimeError, match="could not determine Lambda capacity"):
+        preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+
+def test_warm_reports_a_genuine_zero_capacity_fleet_as_success(monkeypatch):
+    """Every class answered and none had capacity: that IS a healthy no-op and must not raise.
+
+    The counterpart to the outage case -- without this the fix would turn an ordinary quiet-inventory
+    day into a hard failure.
+    """
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
+    monkeypatch.setattr(preload, "_lambda_provisioned_regions", lambda: set())
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu, **k: [])
+
+    assert preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0) == []
+
+
+def test_provisioned_region_snapshot_is_deadline_bounded(monkeypatch):
+    """The reporting snapshot must carry its own deadline.
+
+    It runs AFTER the shared planning budget is already spent and list_filesystems retries
+    internally, so an unbounded call would add another retry-and-backoff cycle to the pre-launch
+    phase for what is only a summary line.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.runpod import preload
+
+    seen = {}
+
+    def capture(**k):
+        seen.update(k)
+        return []
+
+    monkeypatch.setattr(lambda_api, "list_filesystems", capture)
+    preload._lambda_provisioned_regions()
+
+    assert "deadline_at" in seen, "the optional snapshot must not block on an unbounded listing"
+    assert seen["deadline_at"] <= time.time() + preload._LAMBDA_SNAPSHOT_BUDGET_S + 1
 
 
 def test_warm_names_regions_with_no_capacity_in_any_class(monkeypatch, caplog):
@@ -2529,7 +2632,7 @@ def test_warm_ranks_contested_regions_by_live_price_not_ladder_order(monkeypatch
         return [types.SimpleNamespace(region="us-east-1", gpu=gpu, price_usd_hr=price)]
 
     monkeypatch.setattr(lj, "usable_instances", discounted)
-    assert _plan(preload._lambda_warm_targets(lj, None)) == [("us-east-1", ["H100", "A10"])]
+    assert _plan(preload._lambda_warm_targets(lj, None)[0]) == [("us-east-1", ["H100", "A10"])]
 
 
 def test_warm_ties_and_missing_prices_keep_ladder_order(monkeypatch):
@@ -2544,7 +2647,7 @@ def test_warm_ties_and_missing_prices_keep_ladder_order(monkeypatch):
         return [types.SimpleNamespace(region="us-east-1", gpu=gpu, price_usd_hr=None)]
 
     monkeypatch.setattr(lj, "usable_instances", priceless)
-    assert _plan(preload._lambda_warm_targets(lj, None)) == [
+    assert _plan(preload._lambda_warm_targets(lj, None)[0]) == [
         ("us-east-1", ["A10", "A100 SXM 40GB", "H100", "B200"])
     ]
 

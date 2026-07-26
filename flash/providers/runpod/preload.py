@@ -297,11 +297,15 @@ _LAMBDA_PRELOAD_GPU_LADDER = ("A10", "A100 SXM 40GB", "H100", "B200")
 # a healthy Lambda answers all four classes well inside it, tight enough that a hung /instance-types
 # cannot hold the warm hostage for the length of the per-class retry budgets stacked end to end.
 _LAMBDA_PLANNING_BUDGET_S = 180.0
+# Separate and much smaller: the filesystem snapshot is optional reporting that runs after the
+# planning budget is already spent, so it must not extend the pre-launch phase by another
+# retry-and-backoff cycle. Losing it only costs a summary line.
+_LAMBDA_SNAPSHOT_BUDGET_S = 30.0
 _PRELOAD_STATUS_REPO = "Freesolo-Co/flash-weight-preload"
 
 
-def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list[list]:
-    """One cheapest-first candidate list per Lambda region: ``[[cand, ...], ...]``.
+def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> tuple[list[list], bool]:
+    """``(one cheapest-first candidate list per Lambda region, planning was complete)``.
 
     An explicit ``gpu`` pins the class and is never second-guessed. Otherwise every ladder class is
     asked which regions have capacity, and each region keeps ALL the classes that can reach it, so a
@@ -317,8 +321,15 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list[list]:
     Lambda rate (falling back to the static table only when the live lookup fails). Ranking on the
     ladder's fixed order instead would keep claiming regions in a stale June price order and could
     launch the more expensive class after a Lambda discount.
+
+    The second element is False when any class went unanswered -- a lookup that failed or was cut off
+    by the planning budget. "No capacity" and "we never got an answer" are different facts, and only
+    the first may be reported as one: a region reachable solely through an unanswered class is not
+    known to be cold. The caller needs the distinction to avoid printing a definitive fleet summary
+    over a Lambda outage.
     """
     classes = [gpu] if gpu else list(_LAMBDA_PRELOAD_GPU_LADDER)
+    complete = True
     # ONE deadline across the whole ladder, not one per class. Each usable_instances does a live price
     # lookup and a capacity lookup, and each of those retries internally, so an /instance-types endpoint
     # that accepts connections and then hangs would burn its full retry budget four times over -- turning
@@ -332,6 +343,7 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list[list]:
                 "warm lambda: capacity planning budget (%ds) exhausted; skipping remaining "
                 "class(es) %s", int(_LAMBDA_PLANNING_BUDGET_S), ", ".join(classes[classes.index(cls):]),
             )
+            complete = False
             break
         try:
             candidates = lambda_jobs.usable_instances(
@@ -339,15 +351,17 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list[list]:
             )
         except Exception as exc:
             logger.warning("warm lambda: usable_instances(%s) failed (skipping): %s", cls, exc)
+            complete = False
             continue
         for c in candidates:
             by_region.setdefault(c.region, []).append(c)
     # Ties keep ladder order, which is the static cheapest-first sequence: a stable sort means an
     # unavailable live price degrades to the old behaviour instead of to an arbitrary one.
-    return [
+    targets = [
         sorted(cands, key=lambda c: getattr(c, "price_usd_hr", None) or math.inf)
         for _region, cands in sorted(by_region.items())
     ]
+    return targets, complete
 
 
 def _lambda_provisioned_regions() -> set[str]:
@@ -356,12 +370,21 @@ def _lambda_provisioned_regions() -> set[str]:
     The warm summary needs this because a region with no capacity in ANY ladder class never becomes a
     target and so never produces a result -- it would be invisible in a report built only from
     results, which is exactly the silent fleet gap this change exists to expose.
+
+    Deadline-bounded because this runs AFTER ``_lambda_warm_targets`` has already spent the shared
+    planning budget, and ``list_filesystems`` retries internally: an endpoint that accepts connections
+    then hangs would otherwise add several minutes of attempts and backoff to planning, for what is
+    only a reporting nicety. Losing the snapshot degrades the summary; blocking on it delays warming.
     """
     from flash.providers.lambdalabs import api as lambda_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     try:
-        fses = lambda_api.list_filesystems()
+        fses = lambda_api.list_filesystems(
+            **deadline_kwargs(
+                lambda_api.list_filesystems, time.time() + _LAMBDA_SNAPSHOT_BUDGET_S
+            ),
+        )
     except Exception as exc:
         logger.warning("warm lambda: list_filesystems failed, cannot report unreachable regions: %s", exc)
         return set()
@@ -392,50 +415,90 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
     })
 
 
-def _ensure_region_filesystem(region: str, deadline: float) -> bool:
-    """Create-or-reuse this region's weight-cache filesystem ONCE, before the class ladder runs.
+def _region_filesystem_is_listed(region: str, deadline: float) -> bool:
+    """True when this region's weight-cache filesystem is VISIBLE in the account listing.
 
-    ``launch_and_submit`` calls ``ensure_filesystem`` itself on every attempt, and
-    ``create_filesystem`` is not idempotent, so letting the ladder be the first caller means a
-    failure on the cheap class can be followed by a second create for the same name and region on
-    the next class -- duplicate storage, billed forever. Doing it here collapses that risk: once the
-    filesystem exists, every per-class call finds it in the listing and returns its mount point
-    without ever reaching the create path.
+    Visibility, not a successful create, is the property that matters. Every ``ensure_filesystem``
+    call begins by listing and returns early on a match, so once the filesystem is listed no later
+    caller can reach the non-idempotent create path for it.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    fses = lambda_api.list_filesystems(
+        **deadline_kwargs(lambda_api.list_filesystems, deadline),
+    )
+    return any(
+        fs.get("name") == WEIGHT_CACHE_VOLUME_NAME
+        and (fs.get("region") or {}).get("name") == region
+        for fs in fses
+    )
+
+
+def _ensure_region_filesystem(region: str, deadline: float) -> str:
+    """Confirm this region's weight-cache filesystem exists before any paid launch.
+
+    ``launch_and_submit`` calls ``ensure_filesystem`` itself on every attempt and
+    ``create_filesystem`` is not idempotent, so the filesystem has to be settled before the ladder
+    runs or a rejection on the cheap class can be followed by a second create for the same name and
+    region on the next -- duplicate storage, billed forever.
+
+    Creating here is not by itself enough, which is the subtle part. ``ensure_filesystem`` returning
+    only proves the create call succeeded; the launcher then does its own listing, and a filesystem
+    that exists but has not yet appeared in ``list_filesystems()`` makes that listing miss and submit
+    the very duplicate this is meant to prevent. So the create is followed by an explicit visibility
+    check, and only a listed filesystem counts as settled.
 
     Matching on error text instead cannot work. ``ensure_filesystem`` guards its create but not the
     reconciliation listing inside its own except block (api.py), so when that listing times out the
     raw error propagates, and ``launch_and_submit`` then wraps *every* failure -- real capacity
     rejections included -- in the same "all N region(s) rejected ... (no capacity)" message. The two
-    are indistinguishable downstream, so the duplicate create has to be prevented upstream.
+    are indistinguishable downstream, so the duplicate has to be prevented upstream.
 
-    Returns True when the ladder may walk classes freely: either the filesystem is now confirmed, or
-    Lambda was never reached at all so no create can be in flight. Returns False only for the narrow
-    case that actually risks a duplicate -- we did reach Lambda and the outcome is in doubt.
+    Returns one of:
+      ``"listed"``      -- confirmed present, so every later ensure reuses it and cannot create.
+      ``"unreachable"`` -- Lambda was never reached, so no create can exist and nothing is at risk.
+      ``"doubtful"``    -- we reached Lambda and cannot confirm the outcome; launching now could pay
+                           for a second filesystem forever, so the caller must skip the region.
     """
     from flash.providers.lambdalabs import api as lambda_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     try:
+        # Already listed: nothing to create, so skip the create path entirely rather than trusting it
+        # to no-op. This is the steady state once provisioning has run.
+        if _region_filesystem_is_listed(region, deadline):
+            return "listed"
         lambda_api.ensure_filesystem(
             WEIGHT_CACHE_VOLUME_NAME,
             region,
             **deadline_kwargs(lambda_api.ensure_filesystem, deadline),
         )
-        return True
+        if _region_filesystem_is_listed(region, deadline):
+            return "listed"
+        # Created, but the launcher's listing would still miss it. One cold cycle for this region is
+        # recoverable; a duplicate filesystem is billed until someone notices it by hand.
+        logger.warning("warm lambda/%s: filesystem created but not yet listed; skipping this cycle "
+                       "so the launcher cannot create a duplicate", region)
+        return "doubtful"
     except Exception as exc:
         # No credentials means no request was ever sent, so nothing can have been created. Treating
-        # that as doubt would disable the class ladder outright on any host without Lambda creds --
-        # exactly the fallback this module exists to provide.
+        # that as doubt would skip every region on any host without Lambda creds -- turning a missing
+        # key into a silent no-op instead of the launcher's own explicit failure.
         if not _lambda_is_reachable(exc):
-            logger.info("warm lambda/%s: skipping filesystem pre-ensure (%s)", region, exc)
-            return True
-        logger.warning("warm lambda/%s: filesystem pre-ensure failed and a create may be in "
-                       "flight (%s); the ladder will not walk classes", region, exc)
-        return False
+            logger.info("warm lambda/%s: skipping filesystem pre-check (%s)", region, exc)
+            return "unreachable"
+        logger.warning("warm lambda/%s: filesystem could not be confirmed (%s); skipping this cycle "
+                       "so the launcher cannot create a duplicate", region, exc)
+        return "doubtful"
 
 
 def _lambda_is_reachable(exc: Exception) -> bool:
-    """False when the failure proves no Lambda API call was ever issued (so no create can exist)."""
+    """False when the failure proves no Lambda API call was ever issued (so no create can exist).
+
+    The text comes from ``RestClient.missing_key_message`` (``_http.py``), the single place a missing
+    key is reported, and is matched on the substring both halves of that message share.
+    """
     return "not configured" not in str(exc).lower()
 
 
@@ -461,11 +524,13 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
 
     deadline = time.time() + effective_s
     try:
-        # Best-effort, before any class runs: get the create out of the way exactly once so the
-        # ladder's per-attempt ensure_filesystem calls only ever reuse. Never fatal --
-        # launch_and_submit ensures the filesystem itself, so this only closes the duplicate-create
-        # window and decides whether walking the ladder is safe.
-        may_walk_ladder = _ensure_region_filesystem(region, deadline)
+        # Settle the filesystem before any class runs, so every per-attempt ensure_filesystem inside
+        # the launcher only ever reuses and can never reach the non-idempotent create path.
+        fs_state = _ensure_region_filesystem(region, deadline)
+        if fs_state == "doubtful":
+            # Launching now would let the launcher's own listing miss and create a duplicate that is
+            # billed forever. A region left cold this cycle just downloads on first use.
+            return _result("error", error="filesystem unconfirmed; skipped to avoid a duplicate create")
         spec = launch_err = None
         for cand in candidates:
             # Rebuild per class: the spec carries the GPU, so reusing the cheap one's spec would
@@ -493,19 +558,14 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
                                region, exc)
                 break
             except Exception as exc:
-                # no capacity / launch reject. Walking to the next class is only safe once this
-                # region's filesystem is confirmed to exist, because then every per-class
-                # ensure_filesystem call reuses it and cannot reach the non-idempotent create path.
-                # Without that confirmation the next class could submit a SECOND create for the same
-                # name and region -- duplicate storage billed forever -- and the error text cannot
-                # tell us which happened: ensure_filesystem leaves its reconciliation listing
-                # unguarded, and launch_and_submit wraps a filesystem failure and a genuine capacity
-                # rejection in the same "no capacity" message. So when unconfirmed, stop at one class.
+                # no capacity / launch reject. Walking to the next class is safe here: the doubtful
+                # case already returned above, so the filesystem is either listed (every per-class
+                # ensure_filesystem reuses it and cannot create) or Lambda was never reachable at all
+                # (no create can exist). Deciding this from the error text is impossible --
+                # ensure_filesystem leaves its reconciliation listing unguarded, and launch_and_submit
+                # wraps a filesystem failure and a genuine capacity rejection in the same "no
+                # capacity" message -- which is why it is settled before the ladder instead.
                 launch_err = exc
-                if not may_walk_ladder:
-                    logger.warning("warm lambda/%s: %s rejected and a filesystem create may be in "
-                                   "flight; not trying another class: %s", region, gpu, exc)
-                    break
                 logger.info("warm lambda/%s: %s rejected (%s); trying next class", region, gpu, exc)
         if launch_err is not None or spec is None:
             return _result("error", error=f"launch: {launch_err}")
@@ -565,13 +625,26 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
 
     from flash.providers.lambdalabs import jobs as lambda_jobs
 
-    targets = _lambda_warm_targets(lambda_jobs, gpu)
+    targets, planned = _lambda_warm_targets(lambda_jobs, gpu)
     # Read before launching: a region with no capacity in any class never becomes a target, so the
     # provisioned set is the only place its name still exists.
     provisioned = _lambda_provisioned_regions()
     if not targets:
+        # An empty plan means one of two very different things, and only the first is a healthy
+        # no-op: every class answered and none had capacity, or we never got an answer. Reporting
+        # the second as "no capacity" would let a Lambda outage exit successfully while the whole
+        # fleet stays cold.
+        _log_unreachable_lambda_regions(provisioned, [], planned=planned)
+        if not planned:
+            # Raise rather than return empty: an empty list is indistinguishable from a healthy
+            # "nothing to do" at every call site, including the CLI, which would print "no capacity"
+            # and exit 0 over a total Lambda outage. The caller must see this as a failure.
+            raise RuntimeError(
+                "could not determine Lambda capacity: every instance-type lookup failed or was cut "
+                "off by the planning budget, so no region was warmed. This is NOT the same as no "
+                "capacity -- the fleet may be entirely cold. Check Lambda API reachability."
+            )
         logger.warning("warm: no Lambda capacity right now (nothing to warm)")
-        _log_unreachable_lambda_regions(provisioned, [])
         return []
     logger.info(
         "warm lambda: %d region(s) -> %s", len(targets),
@@ -597,7 +670,7 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
             for cands in targets
         ]
         results = [f.result() for f in as_completed(futs)]
-    _log_unreachable_lambda_regions(provisioned, results)
+    _log_unreachable_lambda_regions(provisioned, results, planned=planned)
     return results
 
 
@@ -630,18 +703,25 @@ def _cold_lambda_regions(provisioned: set[str], results: list[dict]) -> tuple[li
     return sorted(incomplete | set(unreachable)), total
 
 
-def _log_unreachable_lambda_regions(provisioned: set[str], results: list[dict]) -> list[str]:
+def _log_unreachable_lambda_regions(
+    provisioned: set[str], results: list[dict], *, planned: bool = True,
+) -> list[str]:
     """Warn about every region whose cache is not fully warm. Returns them sorted, for printing.
 
     Returned as well as logged because this is a library module: the ``flash`` logger carries only a
     NullHandler until an app calls ``configure_logging``, so a caller that has not opted in would
     otherwise lose the one message naming regions with no capacity in any class.
+
+    ``planned`` is False when some class went unanswered. A region that never became a target is
+    then not known to be cold, only unexamined, so it is labelled as such: claiming "no capacity"
+    off a lookup that never returned would report an outage as a finished measurement.
     """
     cold, total = _cold_lambda_regions(provisioned, results)
     if not cold:
         return []
     unreachable = set(_unreachable_lambda_regions(provisioned, results))
-    detail = ", ".join(f"{r} (no capacity)" if r in unreachable else r for r in cold)
+    label = "no capacity" if planned else "capacity unknown"
+    detail = ", ".join(f"{r} ({label})" if r in unreachable else r for r in cold)
     logger.warning("warm lambda: %d of %d region(s) not fully warmed: %s", len(cold), total, detail)
     return cold
 
