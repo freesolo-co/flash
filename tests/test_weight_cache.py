@@ -2310,15 +2310,54 @@ def test_warm_stops_the_ladder_on_an_ambiguous_create(monkeypatch):
     assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "error")]
 
 
-def test_warm_stops_the_ladder_on_an_unreconciled_filesystem_create(monkeypatch):
-    """An unreconciled FILESYSTEM create must end the ladder too, or it bills duplicate storage.
+def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeypatch):
+    """The filesystem must be ensured ONCE up front, not once per class inside the ladder.
 
-    ensure_filesystem runs per launch attempt and create_filesystem is not idempotent. When its
-    reconciliation listing cannot see the create it just submitted, retrying the next class submits a
-    SECOND create for the same name and region -- storage billed forever, with no instance to show
-    for it. Unlike a capacity rejection, this failure is not about the GPU class at all, so climbing
-    the ladder cannot help.
+    create_filesystem is not idempotent, so whoever calls ensure_filesystem first owns the duplicate
+    risk. Ensuring it here means every later per-class call inside launch_and_submit finds the
+    filesystem already listed and returns its mount point without reaching the create path -- so
+    walking the ladder on a capacity rejection can no longer bill a second filesystem.
     """
+    from flash.providers.lambdalabs import api as lambda_api
+
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(
+        lj, "usable_instances", _stocked(A10=["us-east-1"], A100_SXM_40GB=["us-east-1"])
+    )
+    ensured, tried = [], []
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem",
+        lambda name, region, **k: ensured.append((name, region)) or f"/lambda/nfs/{name}",
+    )
+
+    def no_capacity(spec, seed, instances, **k):
+        tried.append(instances[0].gpu)
+        raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
+
+    monkeypatch.setattr(lj, "launch_and_submit", no_capacity)
+    preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    assert len(ensured) == 1, f"filesystem must be ensured exactly once per region, got {ensured}"
+    assert [r for _, r in ensured] == ["us-east-1"]
+    assert tried == ["A10", "A100 SXM 40GB"], "capacity rejections should still walk the ladder"
+
+
+def test_warm_does_not_walk_the_ladder_while_the_filesystem_is_unconfirmed(monkeypatch):
+    """When the filesystem cannot be confirmed, a rejection must stop at ONE class.
+
+    Regression for the case a sentinel-text check could not see: ensure_filesystem guards its create
+    but NOT the reconciliation listing inside its own except block, so when that listing times out
+    the raw error propagates carrying no sentinel. launch_and_submit then wraps every failure --
+    genuine capacity rejections included -- in the same "no capacity" message, so the ladder cannot
+    tell a starved region from one whose create is in doubt. Walking anyway risks a SECOND
+    non-idempotent create for the same name and region: duplicate storage, billed forever. The
+    region still gets its one launch attempt, because launch_and_submit ensures the filesystem
+    itself and may well succeed.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
     )
@@ -2327,19 +2366,20 @@ def test_warm_stops_the_ladder_on_an_unreconciled_filesystem_create(monkeypatch)
     )
     tried = []
 
-    def unreconciled_fs(spec, seed, instances, **k):
-        tried.append(instances[0].gpu)
-        # launch_and_submit re-wraps ensure_filesystem's bare LambdaApiError, so the ladder only ever
-        # sees the message. Reproduce that wrapping rather than the inner error.
-        raise RuntimeError(
-            "all 1 Lambda region(s) rejected the A10 launch (no capacity): "
-            "ambiguous filesystem create could not be reconciled"
-        )
+    def boom(name, region, **k):
+        # a bare timeout from the reconciliation listing: Lambda WAS reached, so a create may be in
+        # flight, and no sentinel text appears anywhere in the message
+        raise RuntimeError("read timed out")
 
-    monkeypatch.setattr(lj, "launch_and_submit", unreconciled_fs)
+    def rejected(spec, seed, instances, **k):
+        tried.append(instances[0].gpu)
+        raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
+
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", boom)
+    monkeypatch.setattr(lj, "launch_and_submit", rejected)
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
-    assert tried == ["A10"], "an unreconciled filesystem create must not trigger a second create"
+    assert tried == ["A10"], "an unconfirmed filesystem must not walk to a second class"
     assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "error")]
 
 
@@ -2372,6 +2412,36 @@ def test_ladder_planning_shares_one_deadline_across_every_class(monkeypatch):
     assert asked == ["A10", "A100 SXM 40GB"]
     # and it is ONE deadline, not a fresh one per class
     assert deadlines == [100.0, 100.0]
+
+
+def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
+    """No credentials means no request was sent, so no create can exist and walking stays safe.
+
+    Without this distinction the pre-ensure would fail on every host lacking LAMBDA_API_KEY, pin the
+    ladder to a single class, and silently disable the class fallback this module exists to provide.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(
+        lj, "usable_instances", _stocked(A10=["us-east-1"], A100_SXM_40GB=["us-east-1"])
+    )
+    tried = []
+
+    def unconfigured(name, region, **k):
+        raise RuntimeError("LAMBDA_API_KEY not configured on the control-plane host")
+
+    def rejected(spec, seed, instances, **k):
+        tried.append(instances[0].gpu)
+        raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
+
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", unconfigured)
+    monkeypatch.setattr(lj, "launch_and_submit", rejected)
+    preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    assert tried == ["A10", "A100 SXM 40GB"], "an unreachable Lambda must not pin the ladder"
 
 
 def test_warm_names_regions_with_no_capacity_in_any_class(monkeypatch, caplog):

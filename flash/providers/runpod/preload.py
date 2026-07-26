@@ -392,16 +392,51 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
     })
 
 
-# ensure_filesystem raises a bare LambdaApiError carrying this text (there is no dedicated type),
-# and launch_and_submit re-wraps it into its generic all-regions-rejected message, so the substring
-# is the only signal that survives to the ladder. Kept next to the check it guards so a wording
-# change in api.py is caught by the test that pins both together.
-_UNRECONCILED_FS_CREATE = "ambiguous filesystem create could not be reconciled"
+def _ensure_region_filesystem(region: str, deadline: float) -> bool:
+    """Create-or-reuse this region's weight-cache filesystem ONCE, before the class ladder runs.
+
+    ``launch_and_submit`` calls ``ensure_filesystem`` itself on every attempt, and
+    ``create_filesystem`` is not idempotent, so letting the ladder be the first caller means a
+    failure on the cheap class can be followed by a second create for the same name and region on
+    the next class -- duplicate storage, billed forever. Doing it here collapses that risk: once the
+    filesystem exists, every per-class call finds it in the listing and returns its mount point
+    without ever reaching the create path.
+
+    Matching on error text instead cannot work. ``ensure_filesystem`` guards its create but not the
+    reconciliation listing inside its own except block (api.py), so when that listing times out the
+    raw error propagates, and ``launch_and_submit`` then wraps *every* failure -- real capacity
+    rejections included -- in the same "all N region(s) rejected ... (no capacity)" message. The two
+    are indistinguishable downstream, so the duplicate create has to be prevented upstream.
+
+    Returns True when the ladder may walk classes freely: either the filesystem is now confirmed, or
+    Lambda was never reached at all so no create can be in flight. Returns False only for the narrow
+    case that actually risks a duplicate -- we did reach Lambda and the outcome is in doubt.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    try:
+        lambda_api.ensure_filesystem(
+            WEIGHT_CACHE_VOLUME_NAME,
+            region,
+            **deadline_kwargs(lambda_api.ensure_filesystem, deadline),
+        )
+        return True
+    except Exception as exc:
+        # No credentials means no request was ever sent, so nothing can have been created. Treating
+        # that as doubt would disable the class ladder outright on any host without Lambda creds --
+        # exactly the fallback this module exists to provide.
+        if not _lambda_is_reachable(exc):
+            logger.info("warm lambda/%s: skipping filesystem pre-ensure (%s)", region, exc)
+            return True
+        logger.warning("warm lambda/%s: filesystem pre-ensure failed and a create may be in "
+                       "flight (%s); the ladder will not walk classes", region, exc)
+        return False
 
 
-def _is_unreconciled_filesystem_create(exc: Exception) -> bool:
-    """True when a launch failure hides a filesystem create that could not be reconciled."""
-    return _UNRECONCILED_FS_CREATE in str(exc)
+def _lambda_is_reachable(exc: Exception) -> bool:
+    """False when the failure proves no Lambda API call was ever issued (so no create can exist)."""
+    return "not configured" not in str(exc).lower()
 
 
 def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
@@ -426,6 +461,11 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
 
     deadline = time.time() + effective_s
     try:
+        # Best-effort, before any class runs: get the create out of the way exactly once so the
+        # ladder's per-attempt ensure_filesystem calls only ever reuse. Never fatal --
+        # launch_and_submit ensures the filesystem itself, so this only closes the duplicate-create
+        # window and decides whether walking the ladder is safe.
+        may_walk_ladder = _ensure_region_filesystem(region, deadline)
         spec = launch_err = None
         for cand in candidates:
             # Rebuild per class: the spec carries the GPU, so reusing the cheap one's spec would
@@ -453,20 +493,19 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
                                region, exc)
                 break
             except Exception as exc:
-                # Same rule for an unreconciled FILESYSTEM create. ensure_filesystem runs per launch
-                # attempt and create_filesystem is not idempotent, so when its reconciliation listing
-                # cannot see what it just submitted, the next class would submit a second create for
-                # the same name and region -- duplicate storage billed forever. Only a definitive
-                # capacity rejection may advance the ladder.
-                if _is_unreconciled_filesystem_create(exc):
-                    launch_err = exc
-                    logger.warning(
-                        "warm lambda/%s: filesystem create unreconciled, not trying another "
-                        "class: %s", region, exc,
-                    )
-                    break
-                # no capacity / launch reject -- try the next class up the ladder
+                # no capacity / launch reject. Walking to the next class is only safe once this
+                # region's filesystem is confirmed to exist, because then every per-class
+                # ensure_filesystem call reuses it and cannot reach the non-idempotent create path.
+                # Without that confirmation the next class could submit a SECOND create for the same
+                # name and region -- duplicate storage billed forever -- and the error text cannot
+                # tell us which happened: ensure_filesystem leaves its reconciliation listing
+                # unguarded, and launch_and_submit wraps a filesystem failure and a genuine capacity
+                # rejection in the same "no capacity" message. So when unconfirmed, stop at one class.
                 launch_err = exc
+                if not may_walk_ladder:
+                    logger.warning("warm lambda/%s: %s rejected and a filesystem create may be in "
+                                   "flight; not trying another class: %s", region, gpu, exc)
+                    break
                 logger.info("warm lambda/%s: %s rejected (%s); trying next class", region, gpu, exc)
         if launch_err is not None or spec is None:
             return _result("error", error=f"launch: {launch_err}")
