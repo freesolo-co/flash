@@ -100,6 +100,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
         # memory: match the trl path's gradient checkpointing.
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+        # 32k contexts: fused linear-CE computes logprobs/entropy from hidden states + lm_head in
+        # chunks (FusedLinearForPPO), never materializing the [tokens, vocab] logits tensor
+        # (~130 GB at 32k on a 248k vocab). torch backend = numerically exact, no extra deps.
+        "actor_rollout_ref.model.use_fused_kernels=True",
+        "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
         *(
             [f"actor_rollout_ref.model.lora_adapter_path={cfg['warmstart_adapter']}"]
             if cfg.get("warmstart_adapter")
