@@ -75,17 +75,17 @@ _PRELOAD_TIMEOUT_S = 5400
 
 
 def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool | None:
-    """True once a worker exists in ANY state, including unhealthy and throttled.
-
-    The question here is "did this datacenter give us a box", not "is the box working". Every state
-    below answers yes, so each one refutes starvation:
+    """True once a datacenter has actually given us a box, in any state it can then be in.
 
     - ``initializing`` / ``ready`` / ``running`` / ``idle`` -- allocated and fine
-    - ``unhealthy`` -- allocated, then the image failed to start. The main poller reads this as a
-      failed image pull (see ``jobs.py``, which retries on a fresh endpoint), so counting it as
-      "no capacity" would blame the datacenter for a broken image and tell the operator to change
-      GPU class, which cannot help.
-    - ``throttled`` -- RunPod has the box but is holding it back. Also not an empty datacenter.
+    - ``unhealthy`` -- allocated, then the image failed to start. ``jobs.py`` reads this as a failed
+      image pull and retries on a fresh endpoint, so counting it as "no capacity" would blame the
+      datacenter for a broken image and tell the operator to change GPU class, which cannot help.
+
+    ``throttled`` is deliberately NOT counted. ``jobs.py`` classifies a sustained throttled worker as
+    ``no_capacity`` ("retrying on the next-best GPU"), which is exactly the condition this poller
+    exists to catch: RunPod is not scheduling the pinned class here. Treating it as capacity would
+    make a preload sit the full timeout on a datacenter that will never run it.
 
     Returns None when health could not be read. That is deliberately NOT False: the caller escalates
     a sustained False into NoCapacityError and tears the endpoint down, so a health endpoint that is
@@ -105,7 +105,7 @@ def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool
     workers = health.get("workers") or {}
     return any(
         int(workers.get(k) or 0) > 0
-        for k in ("initializing", "ready", "running", "idle", "unhealthy", "throttled")
+        for k in ("initializing", "ready", "running", "idle", "unhealthy")
     )
 
 

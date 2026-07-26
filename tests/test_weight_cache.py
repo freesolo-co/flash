@@ -2431,7 +2431,7 @@ def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
 
 
 def test_a_broken_worker_image_is_not_reported_as_a_starved_datacenter(monkeypatch):
-    """unhealthy and throttled workers exist, so they refute starvation.
+    """An unhealthy worker still means the datacenter gave us a box, so it refutes starvation.
 
     Regression: _has_worker counted only initializing/ready/running/idle. A worker that RunPod
     allocated and then marked unhealthy (jobs.py reads that as a failed image pull and retries on a
@@ -2440,19 +2440,41 @@ def test_a_broken_worker_image_is_not_reported_as_a_starved_datacenter(monkeypat
     """
     from flash.providers.runpod import preload
 
-    for state in ("unhealthy", "throttled"):
-        monkeypatch.setattr(
-            preload.runpod_api,
-            "endpoint_health_for_fingerprint",
-            lambda *a, _s=state, **k: {"workers": {"ready": 0, "running": 0, _s: 1}},
-        )
-        assert preload._has_worker("ep", "fp", 0.0) is True
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"ready": 0, "running": 0, "unhealthy": 1}},
+    )
+    assert preload._has_worker("ep", "fp", 0.0) is True
 
     # and end to end: the queued job must time out, never be blamed on the datacenter
     monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
     monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
     with pytest.raises(TimeoutError):  # NOT NoCapacityError
         preload._poll_until_done("ep", "job", "fp", timeout_s=1, poll_interval_s=0.0)
+
+
+def test_a_throttled_worker_still_counts_as_no_capacity(monkeypatch):
+    """Throttled is the no-capacity signal itself, so it must NOT suppress the fail-fast path.
+
+    ``jobs.py`` classifies a sustained throttled worker as ``no_capacity`` and retries on the
+    next-best GPU. Counting it as an allocated box here would make a preload sit the full 5400s
+    timeout on a datacenter RunPod is never going to schedule -- the exact silent-cold-DC failure
+    this PR exists to remove.
+    """
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"ready": 0, "running": 0, "throttled": 1}},
+    )
+    assert preload._has_worker("ep", "fp", 0.0) is False
+
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=60, poll_interval_s=0.0)
 
 
 def test_unreadable_health_never_becomes_no_capacity(monkeypatch):
