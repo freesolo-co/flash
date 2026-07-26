@@ -18,6 +18,7 @@ from flash._logging import get_logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 from flash.providers._deadline import (
+    CREATE_ALLOWANCE_S,
     deadline_kwargs,
     remaining_seconds,
     require_create_allowance,
@@ -63,15 +64,41 @@ __all__ = [
     "build_function_input",
     "decode_output",
     "deploy_train_endpoint",
+    "grow_weight_cache_volumes",
     "make_hf_failure_detail_reader",
     "make_hf_heartbeat_reader",
     "poll_job",
     "submit_run",
     "weight_cache_datacenters",
     "weight_cache_endpoint_kwargs",
+    "weight_cache_grow_headroom_s",
     "weight_cache_volume_name",
     "weight_cache_volumes",
 ]
+
+# Growing an existing cache volume is best-effort reconciliation, so it gets a short fixed ceiling
+# rather than a share of the run deadline. An unreachable account would otherwise burn retries and
+# backoff against the same clock the launch needs, leaving less than the create allowance and
+# failing a deploy the healthy owning account could have served. Under a deadline the effective
+# budget is this OR whatever is left above the create allowance, whichever is smaller.
+WEIGHT_CACHE_GROW_BUDGET_S = 20.0
+
+
+def weight_cache_grow_headroom_s() -> float:
+    """Reconciliation headroom a whole ``deploy_train_endpoint`` call can need, in seconds.
+
+    Callers that hand the deployer a deadline add this on top of whatever their job needs, so the
+    reconciliation is funded from headroom rather than out of the job's own budget.
+
+    Scoped to the account pool rather than the retry count because a repeat attempt on an account
+    already reconciled in this call is skipped, so at most one grow per account actually runs.
+    Sizing alone does not keep a failover funded -- creates and quota back-offs would drain it
+    first, and a failing create has no bound to size against -- so the deployer additionally holds
+    each unreconciled account's slice back from them. This is the headroom, not the guarantee.
+    """
+    from flash.providers.runpod import keys as rp_keys
+
+    return WEIGHT_CACHE_GROW_BUDGET_S * max(1, rp_keys.key_count())
 
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
@@ -121,13 +148,74 @@ def weight_cache_volumes(spec) -> list:
         return []
     from runpod_flash import NetworkVolume
 
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
     from flash.spec import _volume_gb
 
-    size = _volume_gb(getattr(spec.gpu, "network_volume_gb", 100))
+    # The shared cache is platform-managed, so its size comes from the managed constant rather than
+    # whatever the spec happens to carry: a stale/round-tripped spec can still hold a pre-bump size,
+    # and honoring that would create (or attach) an undersized volume. Custom volumes are the
+    # caller's to size, so those keep the spec value.
+    size = _volume_gb(getattr(spec.gpu, "network_volume_gb", WEIGHT_CACHE_VOLUME_GB))
+    if str(base) == WEIGHT_CACHE_VOLUME_NAME:
+        size = max(size, WEIGHT_CACHE_VOLUME_GB)
     return [
         NetworkVolume(name=weight_cache_volume_name(str(base), dc), size=size, datacenter=dc)
         for dc in dcs
     ]
+
+
+def grow_weight_cache_volumes(
+    spec, key: str, deadline_at: float | None = None, wanted: dict[str, int] | None = None
+) -> None:
+    """Raise this account's already-provisioned shared-cache volumes to the managed size.
+
+    A NetworkVolume is only sized on CREATE: the SDK matches an existing volume by name+datacenter
+    and hands it back untouched, so every volume provisioned before a size bump keeps the old size
+    and the bump is a silent no-op. Requesting the new size on the attach is not enough -- the mount
+    stays small and the download dies with "Disk quota exceeded". Growing over REST is the only way
+    to reconcile one that already exists.
+
+    Scoped to ``key`` because the caller has already picked the account it is deploying under, and
+    only that account's volumes are the ones about to be attached. Callers that attach a volume set
+    of their own -- the warm pins one datacenter -- pass it as ``wanted`` ({name: gb}); everyone else
+    leaves it None and the managed fleet is derived from ``spec``.
+
+    Best-effort by design: a volume that cannot be grown still gets attached, which is no worse than
+    not trying, so this must never fail a deploy. That covers datacenter discovery too, not just the
+    REST calls: an SDK whose ``DataCenter.all()`` raises would otherwise abort the deploy from inside
+    the one helper that promises it cannot. It takes a short fixed budget rather than the run
+    deadline, and under ``deadline_at`` it additionally yields whatever the create allowance needs:
+    the deploy re-checks that allowance after this returns, so spending into it would turn a
+    best-effort reconciliation into the reason an otherwise-launchable deploy is rejected. Time it
+    cannot have, it skips.
+    """
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
+
+    try:
+        if wanted is None:
+            base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
+            if str(base or "") != WEIGHT_CACHE_VOLUME_NAME:
+                return  # cache off, or a custom volume the caller owns the sizing of
+            wanted = {
+                weight_cache_volume_name(str(base), dc): WEIGHT_CACHE_VOLUME_GB
+                for dc in weight_cache_datacenters()
+            }
+        if not wanted:
+            return
+        budget = WEIGHT_CACHE_GROW_BUDGET_S
+        if deadline_at is not None:
+            budget = min(budget, remaining_seconds(deadline_at) - CREATE_ALLOWANCE_S)
+        if budget <= 0:
+            logger.warning("weight cache: no room to grow volume(s) before launch; attaching as-is")
+            return
+        grown = runpod_api.grow_network_volumes_for_key(
+            key, wanted, deadline_at=time.time() + budget
+        )
+    except Exception as exc:
+        logger.warning("weight cache: could not grow volume(s) (%s); attaching as-is", exc)
+        return
+    for name, size in sorted(grown.items()):
+        logger.info("weight cache: grew %s to %d GB (was under the managed size)", name, size)
 
 
 def weight_cache_endpoint_kwargs(spec) -> dict:
@@ -369,11 +457,17 @@ def deploy_train_endpoint(
     spec=None,
     endpoint_kwargs: dict | Callable[[], dict] | None = None,
     deadline_at: float | None = None,
+    cache_volumes: dict[str, int] | None = None,
 ) -> tuple[str, str, str]:
     """Deploy a uniquely-named worker endpoint and return its id, name, and owning fingerprint.
 
     ``endpoint_kwargs`` may be a callable factory — re-invoked per account on quota failover so the
     SDK doesn't reuse a volume id stamped for the previous account.
+
+    ``cache_volumes`` ({name: gb}) names the shared-cache volumes a caller attaches itself, for
+    callers that pass ``spec=None`` and so cannot have them derived. Each failover attempt reconciles
+    the account it is about to deploy under, so the account a failover lands on never attaches a
+    stale, under-sized volume.
     """
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.resource_manager import ResourceManager
@@ -386,12 +480,54 @@ def deploy_train_endpoint(
     name = endpoint_name(friendly, name_suffix)
     image = worker_image_for_gpu(friendly, allow_default=True)
 
+    reconciled: set[str] = set()
+
+    def _reconciles_a_managed_cache() -> bool:
+        """Whether a grow on this call can actually spend budget.
+
+        Mirrors ``grow_weight_cache_volumes``'s own early return. A run that attaches no managed
+        cache -- an open-model run, an oversized catalog model, a spec carrying a custom volume the
+        caller sizes itself -- reconciles nothing, so reserving for it would shorten the deadline
+        for a create that was never going to grow anything.
+        """
+        if cache_volumes is not None:
+            return bool(cache_volumes)
+        from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+        base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
+        return str(base or "") == WEIGHT_CACHE_VOLUME_NAME
+
+    def _create_deadline() -> float | None:
+        """``deadline_at`` less the grow budget still owed to accounts this call has not reconciled.
+
+        Creates, sweeps and quota back-offs run against this rather than the raw deadline, so they
+        cannot spend the slice a later failover's reconciliation needs. Held, not competed for:
+        without the reserve one slow failed create (or a couple of quota back-offs) drags remaining
+        down to the create allowance, the next account's grow clamps to zero, and that account
+        attaches the stale volume this whole path exists to prevent. Sizing the caller's headroom
+        larger cannot close that -- a failing create has no bound to size against -- so the budget
+        is set aside up front instead.
+
+        What this buys is a terminal invariant rather than another guess: an attempt that clears its
+        allowance check always has room to reconcile, so an attempt that reaches the create has
+        reconciled. When the deadline really is gone the attempt now fails on the deadline instead
+        of quietly mounting an undersized volume and dying later on "Disk quota exceeded".
+
+        Reserved only for runs that actually attach the managed cache: holding time back from a
+        volume-free run would buy nothing and could fail an otherwise launchable create against a
+        deadline the create alone would have cleared.
+        """
+        if deadline_at is None or not _reconciles_a_managed_cache():
+            return deadline_at
+        owed = max(0, rp_keys.key_count() - len(reconciled))
+        return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S * owed
+
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
         from flash.spec import gpu_count_of
 
         if deadline_at is not None:
-            require_create_allowance(deadline_at)
+            require_create_allowance(_create_deadline())
         with FLASH_SDK_LOCK:
             owning_key = ensure_auth()
             owning_fingerprint = runpod_api.key_fingerprint(owning_key)
@@ -410,6 +546,22 @@ def deploy_train_endpoint(
             else:
                 kwargs["dependencies"] = resolve_worker_deps()
                 kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+            # Reconcile before attaching: a volume provisioned under an older, smaller managed size
+            # is returned as-is by the SDK, so without this an ordinary training job mounts the
+            # stale size and a model the new size admits fails with "Disk quota exceeded".
+            # Inside the per-attempt body on purpose: failover picks a different account, and the
+            # volume about to be attached is the one owned by whichever account this attempt landed
+            # on. Deadline-aware: the create allowance is re-checked below, so this yields to it.
+            # Once per account, not once per attempt: a quota retry re-selects the account it just
+            # reconciled, and paying for that again would spend the budget the account a later
+            # failover lands on still needs -- leaving the one volume that can still be stale
+            # unreconciled.
+            if owning_key not in reconciled:
+                reconciled.add(owning_key)
+                # Spends against the raw deadline: this account's slice of the reserve is released
+                # by the line above, so the grow draws its own budget and still yields the create
+                # allowance. The slices of the accounts not yet reconciled stay held back.
+                grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)
             # Re-invoke factory per account (avoids reusing a volume id stamped for the prior account).
             override = endpoint_kwargs() if callable(endpoint_kwargs) else endpoint_kwargs
             kwargs.update(override if override is not None else weight_cache_endpoint_kwargs(spec))
@@ -421,8 +573,9 @@ def deploy_train_endpoint(
             if deadline_at is None:
                 resource = asyncio.run(rm.get_or_deploy_resource(config))
             else:
-                require_create_allowance(deadline_at)
-                remaining = remaining_seconds(deadline_at)
+                create_deadline = _create_deadline()
+                require_create_allowance(create_deadline)
+                remaining = remaining_seconds(create_deadline)
                 resource = asyncio.run(
                     asyncio.wait_for(
                         rm.get_or_deploy_resource(config),
@@ -445,17 +598,21 @@ def deploy_train_endpoint(
                 # so it stays conservative (reap_warm=False): it reaps only endpoints fully scaled
                 # to zero, never another live run's between-jobs WARM endpoint. The control-plane
                 # periodic reaper does the run-aware, graced warm-idle sweep across all live runs.
+                # Reserved deadline, like the create: the sweep and the back-off sleep below are the
+                # likelier drain of the two, since quota pressure is exactly the condition that ends
+                # in a failover to an account that still needs reconciling.
+                quota_deadline = _create_deadline()
                 if deadline_at is not None:
-                    require_create_allowance(deadline_at)
+                    require_create_allowance(quota_deadline)
                 swept = _sweep_idle_flash_endpoints(
                     protected={canonical_endpoint_name(name)},
                     min_idle_s=0.0,
                     reap_warm=False,
-                    **deadline_kwargs(_sweep_idle_flash_endpoints, deadline_at),
+                    **deadline_kwargs(_sweep_idle_flash_endpoints, quota_deadline),
                 )
                 wait_s = 30 * quota_attempt
                 if deadline_at is not None:
-                    wait_s = min(wait_s, remaining_seconds(deadline_at))
+                    wait_s = min(wait_s, remaining_seconds(quota_deadline))
                 logger.warning(
                     "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
                     "retrying in %ds",
@@ -567,11 +724,19 @@ def _append_failure_artifacts(detail: str, failure_detail_reader) -> str:
 
 @dataclass
 class GraceTimer:
-    """Grace timer: arms on first active poll, expires after ``grace`` seconds of continuous active state."""
+    """Grace timer: arms on first active poll, expires after ``grace`` seconds of continuous active state.
+
+    ``since`` is the EFFECTIVE arm time, not the literal one: ``unknown`` shifts it forward by
+    intervals the caller could not observe, so ``now - since`` is always the time the state was
+    confirmed to hold rather than the wall time since arming. Clearing ``since`` is still a complete
+    reset -- ``seen`` only bounds the next unknown gap and means nothing while the timer is disarmed.
+    """
 
     since: float | None = None
+    seen: float | None = None
 
     def expired(self, active: bool, now: float, grace: float) -> bool:
+        self.seen = now
         if not active:
             self.since = None
             return False
@@ -579,6 +744,18 @@ class GraceTimer:
             self.since = now  # first poll the state held -> arm, but never fail on the same poll
             return False
         return now - self.since > grace
+
+    def unknown(self, now: float) -> None:
+        """A reading that proves nothing either way: hold the confirmed duration, drop the blind gap.
+
+        Resetting would let one flaky response restart the window every time, so a state that really
+        is stuck never fires. Charging the gap is the opposite failure: the reading that would have
+        cleared the anchor is exactly what a blackout hides, so the first definite reading after it
+        expires a timer whose current run had only just begun.
+        """
+        if self.since is not None and self.seen is not None:
+            self.since += now - self.seen
+        self.seen = now
 
 
 def poll_job(

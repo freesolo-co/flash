@@ -707,8 +707,18 @@ def get_train_endpoint(
                 kwargs["dependencies"] = resolve_worker_deps()
                 kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
             # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
-            from flash.providers.runpod.jobs import weight_cache_endpoint_kwargs
+            from flash.providers.runpod.jobs import (
+                grow_weight_cache_volumes,
+                weight_cache_endpoint_kwargs,
+            )
 
+            # Reconcile before attaching: the SDK returns an existing volume at its provisioned
+            # size, so a pre-bump volume stays small and the run fails on "Disk quota exceeded".
+            # Re-read the key HERE, not before _acquire_endpoint_slot: another thread can
+            # advance_key() while this one waits for the slot, and Endpoint below reads whatever the
+            # env var now holds. A key captured earlier would grow one account's volume and attach
+            # another's, leaving the attached one stale.
+            grow_weight_cache_volumes(spec, ensure_auth())
             kwargs.update(weight_cache_endpoint_kwargs(spec))
             ep = Endpoint(**kwargs)
             handler = ep(_train_body)
