@@ -744,7 +744,7 @@ def run_opd_verl(spec=None) -> None:
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
-        exact_type=spec.gpu.exact_type if spec else "",
+        exact_type=spec.gpu.type if spec else "",
     )
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
