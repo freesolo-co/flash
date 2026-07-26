@@ -963,7 +963,7 @@ def test_catalog_model_ids_are_the_cache_fitting_catalog():
     # non-fitting model only overflows the fixed mount). Mirrors the submit path's _fits_weight_cache.
     assert ids == {mid for mid, info in MODELS.items() if _fits_weight_cache(info)}
     assert ids <= set(MODELS)
-    # The whole catalog fits the 200 GB volume, so the large checkpoints — the ones with the
+    # The whole catalog fits the volume, so the large checkpoints — the ones with the
     # slowest cold downloads — are warmed too.
     assert "Qwen/Qwen3.6-27B" in ids
     assert "Qwen/Qwen3.6-35B-A3B" in ids
