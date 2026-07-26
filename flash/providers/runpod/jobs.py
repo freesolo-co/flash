@@ -571,6 +571,13 @@ def deploy_train_endpoint(
         _require_launchable()
         with FLASH_SDK_LOCK:
             owning_key = ensure_auth()
+            # Re-check with the key the attempt actually landed on: the pre-lock check read the
+            # process-global active key, and a concurrent deploy's advance_key() between the two
+            # can move selection to an account this call has not reconciled -- whose slice the
+            # pre-lock check may have released. Judged against the real key, an unreconciled
+            # account must still hold its grow slice, or the attempt fails closed here instead of
+            # clamping the grow to zero and attaching a stale volume.
+            _require_launchable(owning_key)
             owning_fingerprint = runpod_api.key_fingerprint(owning_key)
             isolate_flash_state(name_suffix)
             kwargs = {
