@@ -78,6 +78,10 @@ _NO_CAPACITY_GRACE_S = 420.0
 # holds a paid endpoint for the whole _PRELOAD_TIMEOUT_S. Matches poll_job's unhealthy_grace_s, which
 # calls the same condition a failed image pull and retries on a fresh endpoint.
 _UNHEALTHY_GRACE_S = 240.0
+# Boxes held throttled with nothing usable are RunPod declining to schedule the pinned class here.
+# Matches poll_job's throttled_grace_s, which calls the same condition no_capacity and walks to the
+# next-best GPU. Longer than the unhealthy grace because throttling can still come good.
+_THROTTLED_GRACE_S = 300.0
 
 
 class NoCapacityError(RuntimeError):
@@ -150,12 +154,32 @@ def _only_unhealthy_workers(workers: dict | None) -> bool:
     ``throttled`` blocks this too. A throttled box is capacity contention, not a failed image: it may
     still become runnable, and ``poll_job`` gives it its own longer grace. Calling a mixed
     unhealthy+throttled endpoint a broken image would tear it down at the shorter grace and blame a
-    failed image pull for what is actually a busy datacenter.
+    failed image pull for what is actually a busy datacenter. ``_throttled_workers`` is the timer
+    that covers that case instead.
     """
     if not workers:
         return False
     return _any_worker(workers, "unhealthy") and not _any_worker(
         workers, "initializing", "ready", "running", "idle", "throttled"
+    )
+
+
+def _throttled_workers(workers: dict | None) -> bool:
+    """True while RunPod is holding boxes throttled with nothing usable -- the same call ``poll_job``
+    classifies as ``no_capacity``.
+
+    ``unhealthy`` is deliberately NOT excluded here, and that is the whole point of this predicate.
+    A mixed unhealthy+throttled endpoint sits in the one gap the other two timers leave: ``_has_worker``
+    counts the unhealthy box as allocated capacity so the starvation timer resets, and
+    ``_only_unhealthy_workers`` is blocked by the throttled box so the broken-image timer resets.
+    Nothing would ever fire and the preload would hold a paid endpoint for the whole timeout before
+    reporting a bare TimeoutError. Throttling is what that endpoint is actually suffering from, so
+    it gets its own timer and the honest no-capacity verdict.
+    """
+    if not workers:
+        return False
+    return _any_worker(workers, "throttled") and not _any_worker(
+        workers, "initializing", "ready", "running", "idle"
     )
 
 
@@ -188,15 +212,16 @@ def _grow_existing_cache_volumes(wanted: dict[str, int]) -> None:
     size and the bump is a silent no-op. The warm then attaches an under-sized mount and the
     download dies with "Disk quota exceeded" -- the exact failure the bump was meant to fix.
 
-    Unlike the deploy path, this walks the WHOLE pool: the warm has not picked an account yet, so
-    the volume may belong to any of them. Each account therefore gets its own short budget, and the
-    pool as a whole is capped -- an unreachable account would otherwise spend three request timeouts
-    plus backoff against the deadline the launch needs and make deploy_train_endpoint reject a
-    launch the healthy owning account could have served.
+    Unlike the deploy path, this walks the WHOLE pool: the warm passes ``spec=None`` so the deploy-side
+    grow is a no-op, and the volume may belong to any account. Order is ACTIVE-FIRST, because the pool
+    walk is capped: if an earlier unrelated key exhausted the budget, the one account the deploy is
+    about to use would be the one left unreconciled, and it would attach its own stale volume. The
+    account that matters most is reconciled before any budget can be spent.
 
-    The cap is carved from the front rather than by reserving a slice of the deadline: a short
-    --timeout-s floors at 60s all by itself, so subtracting the create allowance from it would
-    silently skip reconciliation entirely and reintroduce the under-sized mount.
+    The cap exists because an unreachable account would otherwise spend three request timeouts plus
+    backoff against the clock the launch needs. It is carved from the front rather than by reserving a
+    slice of the deadline: a short --timeout-s floors at 60s all by itself, so subtracting the create
+    allowance from it would silently skip reconciliation entirely and reintroduce the under-sized mount.
 
     Best-effort throughout: a volume that cannot be grown still gets attached, which is no worse
     than not trying, so nothing here fails a warm.
@@ -205,8 +230,10 @@ def _grow_existing_cache_volumes(wanted: dict[str, int]) -> None:
     from flash.providers.runpod.jobs import WEIGHT_CACHE_GROW_BUDGET_S
 
     reconcile_until = time.time() + WEIGHT_CACHE_GROW_BUDGET_S
-    for i, key in enumerate(rp_keys.keys()):
-        if time.time() >= reconcile_until:
+    for i, key in enumerate(rp_keys.ordered_keys()):
+        # i > 0 so the active account always gets its attempt: it is the one about to be attached,
+        # and skipping it is the failure this whole call exists to prevent.
+        if i > 0 and time.time() >= reconcile_until:
             logger.warning("weight cache: out of reconciliation budget; attaching volume(s) as-is")
             return
         try:
@@ -247,9 +274,13 @@ def _preload_one_dc(
 
     endpoint_id = None
     key_fingerprint = None
-    deadline_at = time.time() + timeout_s
     try:
         _grow_existing_cache_volumes({vol_name: WEIGHT_CACHE_VOLUME_GB})
+        # Anchor AFTER reconciliation: timeout_s is the budget for this DC's job, not for the
+        # best-effort work in front of it. Starting the clock first meant a short --timeout-s could
+        # arrive at deploy_train_endpoint with less than the 60s create allowance left and be
+        # rejected without a single launch attempt.
+        deadline_at = time.time() + timeout_s
         endpoint_id, _name, key_fingerprint = deploy_train_endpoint(
             gpu,
             execution_timeout_ms=timeout_s * 1000,
@@ -310,6 +341,7 @@ def _poll_until_done(
     # progressing.
     starved = GraceTimer()
     unhealthy = GraceTimer()
+    throttled = GraceTimer()
     while time.time() < deadline:
         st = runpod_api.job_status(
             endpoint_id,
@@ -333,7 +365,7 @@ def _poll_until_done(
             # forward would charge the whole running interval to starvation and the first
             # zero-worker reading after the re-queue would delete an endpoint that never actually
             # waited on capacity. Same reasoning as poll_job clearing its in-queue timers.
-            starved.since = unhealthy.since = None
+            starved.since = unhealthy.since = throttled.since = None
         # Restricted to IN_QUEUE: any other nonterminal status proves a worker was allocated, so
         # zero-worker health then is a reporting artifact and never evidence of a starved DC.
         #
@@ -362,6 +394,14 @@ def _poll_until_done(
                     f"preload job {job_id} sat queued {_UNHEALTHY_GRACE_S:.0f}s with every worker "
                     "unhealthy: the worker image failed to start (likely a failed image pull), "
                     "which no datacenter or GPU class can fix"
+                )
+            # Throttled boxes count as allocated capacity above and block the unhealthy timer, so
+            # without this a mixed unhealthy+throttled endpoint clears both every poll and burns the
+            # whole timeout. This is the same call poll_job makes: RunPod is not scheduling here.
+            if throttled.expired(_throttled_workers(workers), now, _THROTTLED_GRACE_S):
+                raise NoCapacityError(
+                    f"job {job_id} sat queued {_THROTTLED_GRACE_S:.0f}s with every worker throttled "
+                    "and none usable: RunPod is not scheduling the requested GPU class here"
                 )
         if status in _TERMINAL_OK:
             output = (st or {}).get("output")

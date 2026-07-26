@@ -674,7 +674,7 @@ def get_train_endpoint(
     from flash.providers.runpod.auth import ensure_auth
     from flash.spec import gpu_count_of
 
-    owning_key = ensure_auth()
+    ensure_auth()
     _patch_runpod_backoff()
 
     friendly = canonical_gpu(friendly_gpu)
@@ -714,7 +714,11 @@ def get_train_endpoint(
 
             # Reconcile before attaching: the SDK returns an existing volume at its provisioned
             # size, so a pre-bump volume stays small and the run fails on "Disk quota exceeded".
-            grow_weight_cache_volumes(spec, owning_key)
+            # Re-read the key HERE, not before _acquire_endpoint_slot: another thread can
+            # advance_key() while this one waits for the slot, and Endpoint below reads whatever the
+            # env var now holds. A key captured earlier would grow one account's volume and attach
+            # another's, leaving the attached one stale.
+            grow_weight_cache_volumes(spec, ensure_auth())
             kwargs.update(weight_cache_endpoint_kwargs(spec))
             ep = Endpoint(**kwargs)
             handler = ep(_train_body)

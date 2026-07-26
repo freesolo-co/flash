@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from flash._logging import get_logger
 from flash.providers._http import RestClient, is_not_found
 from flash.providers.runpod import keys as _keys
+
+logger = get_logger(__name__)
 
 REST_BASE = "https://rest.runpod.io/v1"
 QUEUE_BASE = "https://api.runpod.ai/v2"
@@ -176,6 +179,10 @@ def grow_network_volumes_for_key(
 
     Returns {name: new_size} for the volumes actually grown. Volumes already at or above target are
     left alone; RunPod rejects a shrink, so only under-sized ones are touched.
+
+    Volumes are independent, so one that cannot be grown -- concurrently deleted, momentarily
+    unmodifiable -- only skips itself. Aborting the loop would leave every later datacenter's volume
+    unreconciled, and a run placed in one of those would still hit "Disk quota exceeded".
     """
     out = _CLIENT.request_with_retries_for_key(
         key, f"{REST_BASE}/networkvolumes", retries=2, deadline_at=deadline_at
@@ -193,14 +200,18 @@ def grow_network_volumes_for_key(
             continue
         if current >= int(target):
             continue
-        _CLIENT.request_with_retries_for_key(
-            key,
-            f"{REST_BASE}/networkvolumes/{vol_id}",
-            method="PATCH",
-            body={"size": int(target)},
-            retries=2,
-            deadline_at=deadline_at,
-        )
+        try:
+            _CLIENT.request_with_retries_for_key(
+                key,
+                f"{REST_BASE}/networkvolumes/{vol_id}",
+                method="PATCH",
+                body={"size": int(target)},
+                retries=2,
+                deadline_at=deadline_at,
+            )
+        except Exception as exc:
+            logger.warning("weight cache: could not grow %s (%s); leaving it as-is", name, exc)
+            continue
         grown[name] = int(target)
     return grown
 

@@ -3700,7 +3700,7 @@ def test_warm_grows_the_volume_before_attaching_it(monkeypatch):
     from flash.providers.runpod import keys as rp_keys
 
     order = []
-    monkeypatch.setattr(rp_keys, "keys", lambda: ["k1", "k2"])
+    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["k1", "k2"])
     monkeypatch.setattr(
         preload.runpod_api,
         "grow_network_volumes_for_key",
@@ -3734,7 +3734,7 @@ def test_a_bad_account_key_never_blocks_a_warm(monkeypatch):
     from flash.providers import weight_cache_preload as preload
     from flash.providers.runpod import keys as rp_keys
 
-    monkeypatch.setattr(rp_keys, "keys", lambda: ["bad", "good"])
+    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["bad", "good"])
     seen = []
 
     def _grow(key, wanted, **kw):
@@ -3969,7 +3969,7 @@ def test_pool_wide_grow_is_capped_even_with_a_hanging_account(monkeypatch):
 
     clock = {"t": 5000.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
-    monkeypatch.setattr(rp_keys, "keys", lambda: ["hangs", "healthy", "also-healthy"])
+    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["hangs", "healthy", "also-healthy"])
 
     tried = []
 
@@ -3995,7 +3995,7 @@ def test_a_short_timeout_still_reconciles(monkeypatch):
     from flash.providers.runpod import keys as rp_keys
 
     tried = []
-    monkeypatch.setattr(rp_keys, "keys", lambda: ["k1", "k2"])
+    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["k1", "k2"])
     monkeypatch.setattr(
         preload.runpod_api,
         "grow_network_volumes_for_key",
@@ -4048,3 +4048,157 @@ def test_deploy_side_grow_is_wired_to_the_run_deadline(monkeypatch):
 
     src = inspect.getsource(jobs.deploy_train_endpoint)
     assert "grow_weight_cache_volumes(spec, owning_key, deadline_at)" in src
+
+
+def test_one_bad_volume_never_blocks_the_others(monkeypatch):
+    """Volumes are independent: a PATCH that fails must not skip every later datacenter.
+
+    Aborting the loop left later DCs' volumes unreconciled, so a run placed in one still hit
+    "Disk quota exceeded" -- the failure this whole path exists to prevent.
+    """
+    from flash.providers.runpod import api as runpod_api
+
+    listed = [
+        {"name": "flash-weights-us-ca-2", "id": "v1", "size": 100},
+        {"name": "flash-weights-eu-ro-1", "id": "v2", "size": 100},
+        {"name": "flash-weights-us-tx-3", "id": "v3", "size": 100},
+    ]
+
+    def _req(key, url, method="GET", **kw):
+        if method == "GET":
+            return listed
+        if url.endswith("/v2"):  # the middle one is concurrently deleted
+            raise RuntimeError("404 volume not found")
+        return {}
+
+    monkeypatch.setattr(runpod_api._CLIENT, "request_with_retries_for_key", _req)
+
+    grown = runpod_api.grow_network_volumes_for_key(
+        "k",
+        {
+            "flash-weights-us-ca-2": 250,
+            "flash-weights-eu-ro-1": 250,
+            "flash-weights-us-tx-3": 250,
+        },
+    )
+
+    # the failing volume is skipped; the one AFTER it still gets reconciled
+    assert grown == {"flash-weights-us-ca-2": 250, "flash-weights-us-tx-3": 250}
+
+
+def test_a_mixed_unhealthy_and_throttled_endpoint_still_gives_up(monkeypatch):
+    """The gap between the two existing timers: neither fires, so nothing ever did.
+
+    _has_worker counts the unhealthy box as capacity (resets starvation) and _only_unhealthy_workers
+    is blocked by the throttled box (resets broken-image), so a persistently mixed endpoint burned
+    the full 5400s timeout on a paid endpoint before reporting a bare TimeoutError.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    mixed = {"unhealthy": 1, "throttled": 2}
+    assert preload._has_worker(mixed) is True  # starvation timer stays cleared
+    assert preload._only_unhealthy_workers(mixed) is False  # broken-image timer stays cleared
+    assert preload._throttled_workers(mixed) is True  # ...so this one has to fire
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        preload, "_worker_counts", lambda *a, **kw: dict(mixed)
+    )
+
+    def _status(*a, **kw):
+        clock["now"] += preload._THROTTLED_GRACE_S + 1.0
+        return {"status": "IN_QUEUE"}
+
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+
+    with pytest.raises(preload.NoCapacityError) as err:
+        preload._poll_until_done("ep", "job", "fp", 5400, 0.0)
+    assert "throttled" in str(err.value)
+
+
+def test_a_usable_worker_keeps_the_throttled_timer_clear():
+    """A throttled box next to a running one is contention, not a dead DC -- never give up on it."""
+    from flash.providers import weight_cache_preload as preload
+
+    assert preload._throttled_workers({"throttled": 3, "running": 1}) is False
+    assert preload._throttled_workers({"throttled": 1, "initializing": 1}) is False
+    assert preload._throttled_workers(None) is False
+    assert preload._throttled_workers({}) is False
+
+
+def test_the_active_account_is_reconciled_before_the_budget_can_run_out(monkeypatch):
+    """The active account is the one about to be attached, so it must never be the one skipped.
+
+    Iterating pool order let an earlier unrelated key exhaust the cap, leaving the account the
+    deploy actually uses unreconciled -- and the preload passes spec=None, so the deploy-side grow
+    is a no-op and cannot repair it.
+    """
+    from flash.providers import weight_cache_preload as preload
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 5000.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    # pool order is [first, active]; ordered_keys() puts the ACTIVE one first
+    monkeypatch.setattr(rp_keys, "ordered_keys", lambda: ["active", "first"])
+
+    tried = []
+
+    def _grow(key, wanted, **kw):
+        tried.append(key)
+        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0  # whoever goes first burns the budget
+        return {}
+
+    monkeypatch.setattr(preload.runpod_api, "grow_network_volumes_for_key", _grow)
+    preload._grow_existing_cache_volumes({"flash-weights-us-ca-2": 250})
+
+    assert tried == ["active"]
+
+
+def test_the_preload_deadline_starts_after_reconciliation(monkeypatch):
+    """timeout_s is the budget for this DC's job, not for the best-effort work in front of it.
+
+    Anchoring first meant a short --timeout-s could reach deploy_train_endpoint with under the 60s
+    create allowance left and be rejected without one launch attempt.
+    """
+    from flash.providers import weight_cache_preload as preload
+    from flash.providers._deadline import CREATE_ALLOWANCE_S
+
+    clock = {"t": 9000.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+
+    def _grow(_wanted):
+        clock["t"] += 19.0  # reconciliation spends nearly the whole cap
+
+    monkeypatch.setattr(preload, "_grow_existing_cache_volumes", _grow)
+
+    seen = {}
+
+    def _deploy(gpu, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop here; the deadline is what we are asserting on")
+
+    monkeypatch.setattr(preload, "deploy_train_endpoint", _deploy)
+
+    preload._preload_one_dc("US-CA-2", ["m"], None, "RTX 4090", 65, 1.0)
+
+    # the full 65s budget survives the grow, so the create allowance is still clear
+    assert seen["deadline_at"] - clock["t"] == 65
+    assert seen["deadline_at"] - clock["t"] >= CREATE_ALLOWANCE_S
+
+
+def test_the_owning_key_is_read_inside_the_serialized_section():
+    """Another thread can advance_key() while this one waits for the endpoint slot.
+
+    A key captured before the wait would grow one account's volume while Endpoint attaches the
+    account the env var now names -- leaving the attached volume stale.
+    """
+    import inspect
+
+    from flash.providers.runpod.train import endpoints
+
+    src = inspect.getsource(endpoints.get_train_endpoint)
+    assert "grow_weight_cache_volumes(spec, ensure_auth())" in src
+    assert "owning_key" not in src
