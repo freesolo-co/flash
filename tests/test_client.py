@@ -425,6 +425,24 @@ def test_publish_env_plain_without_progress(stub):
     assert seen["body"] == {"name": "e", "package_b64": "QQ=="}
 
 
+def test_publish_env_sends_project_id_when_given(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    out = client.publish_env(name="e", package_b64="QQ==", project_id="proj-1")
+    assert out["id"] == "freesolo-co/e"
+    assert seen["body"] == {"name": "e", "package_b64": "QQ==", "project_id": "proj-1"}
+
+
+def test_publish_env_omits_project_id_when_absent(stub):
+    # the backend upserts on (org, slug), so a key present in the body overwrites the stored
+    # grouping. a publish that names no project must leave the key out entirely rather than
+    # send a default, or a republish would move the env out of a dashboard-assigned project.
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.publish_env(name="e", package_b64="QQ==", project_id="")
+    assert "project_id" not in seen["body"]
+
+
 def test_delete_env_sends_delete_to_slug_path(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")

@@ -468,13 +468,15 @@ class _UploadProgress(TtyStatusLine):
         )
 
 
-def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress) -> int:
+def _upload_and_report(
+    name: str, *, package_b64: str, bar: _UploadProgress, project_id: str | None = None
+) -> int:
     """Upload a packaged env to the managed control plane and print the returned id."""
     from flash.client import ClientError, client_from_config
 
     try:
         result = client_from_config().publish_env(
-            name=name, package_b64=package_b64, progress=bar.callback
+            name=name, package_b64=package_b64, project_id=project_id, progress=bar.callback
         )
     except ClientError as exc:
         bar.clear()
@@ -539,6 +541,11 @@ def cmd_env_push(args) -> int:
     if not env_name:
         return _err("env name required: pass `--name <name>`")
 
+    # unlike `flash traces export`, an omitted --project is not a prompt: env push is
+    # non-interactive and grouping is optional, so no project means "leave the grouping
+    # where it is" (or the org's Default on a first publish).
+    project_id = str(getattr(args, "project", "") or "").strip() or None
+
     try:
         src, env_root, entrypoint, include_full_tree = _resolve_local_env_entrypoint(args.path)
     except ValueError as exc:
@@ -575,6 +582,8 @@ def cmd_env_push(args) -> int:
         bar.status("packaging environment")
         try:
             package_b64 = _tar_b64(pkg)
-            return _upload_and_report(env_name, package_b64=package_b64, bar=bar)
+            return _upload_and_report(
+                env_name, package_b64=package_b64, bar=bar, project_id=project_id
+            )
         finally:
             bar.clear()
