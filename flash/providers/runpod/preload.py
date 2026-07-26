@@ -20,6 +20,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash._logging import configure_logging, get_logger
+from flash.providers._deadline import deadline_kwargs
 from flash.providers._hf_artifacts import make_hf_text_reader
 from flash.providers._poll import preload_instance_run_id
 from flash.providers.base import UnreconciledCreateError
@@ -292,6 +293,10 @@ _LAMBDA_PRELOAD_GPU = "A10"
 # downloads weights, so any class works and the cheapest that a region actually stocks is the right one.
 # Ordered by Lambda list price (see lambdalabs/pricing.py); an explicit --gpu skips the ladder entirely.
 _LAMBDA_PRELOAD_GPU_LADDER = ("A10", "A100 SXM 40GB", "H100", "B200")
+# Wall budget for planning the whole warm, shared by every class in the ladder. Generous enough that
+# a healthy Lambda answers all four classes well inside it, tight enough that a hung /instance-types
+# cannot hold the warm hostage for the length of the per-class retry budgets stacked end to end.
+_LAMBDA_PLANNING_BUDGET_S = 180.0
 _PRELOAD_STATUS_REPO = "Freesolo-Co/flash-weight-preload"
 
 
@@ -314,10 +319,24 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list[list]:
     launch the more expensive class after a Lambda discount.
     """
     classes = [gpu] if gpu else list(_LAMBDA_PRELOAD_GPU_LADDER)
+    # ONE deadline across the whole ladder, not one per class. Each usable_instances does a live price
+    # lookup and a capacity lookup, and each of those retries internally, so an /instance-types endpoint
+    # that accepts connections and then hangs would burn its full retry budget four times over -- turning
+    # a single-class stall into ~20 minutes before this can report "no targets". The budget is for
+    # planning the fleet, so it belongs to the ladder as a whole.
+    deadline = time.time() + _LAMBDA_PLANNING_BUDGET_S
     by_region: dict[str, list] = {}
     for cls in classes:
+        if time.time() >= deadline:
+            logger.warning(
+                "warm lambda: capacity planning budget (%ds) exhausted; skipping remaining "
+                "class(es) %s", int(_LAMBDA_PLANNING_BUDGET_S), ", ".join(classes[classes.index(cls):]),
+            )
+            break
         try:
-            candidates = lambda_jobs.usable_instances(cls)
+            candidates = lambda_jobs.usable_instances(
+                cls, **deadline_kwargs(lambda_jobs.usable_instances, deadline),
+            )
         except Exception as exc:
             logger.warning("warm lambda: usable_instances(%s) failed (skipping): %s", cls, exc)
             continue
@@ -373,6 +392,18 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
     })
 
 
+# ensure_filesystem raises a bare LambdaApiError carrying this text (there is no dedicated type),
+# and launch_and_submit re-wraps it into its generic all-regions-rejected message, so the substring
+# is the only signal that survives to the ladder. Kept next to the check it guards so a wording
+# change in api.py is caught by the test that pins both together.
+_UNRECONCILED_FS_CREATE = "ambiguous filesystem create could not be reconciled"
+
+
+def _is_unreconciled_filesystem_create(exc: Exception) -> bool:
+    """True when a launch failure hides a filesystem create that could not be reconciled."""
+    return _UNRECONCILED_FS_CREATE in str(exc)
+
+
 def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
                               timeout_s: int, poll_interval_s: float) -> dict:
     """Launch a download-only preload instance in one Lambda region, poll its status marker, then
@@ -421,7 +452,20 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
                 logger.warning("warm lambda/%s: ambiguous create, not trying another class: %s",
                                region, exc)
                 break
-            except Exception as exc:  # no capacity / launch reject — try the next class up the ladder
+            except Exception as exc:
+                # Same rule for an unreconciled FILESYSTEM create. ensure_filesystem runs per launch
+                # attempt and create_filesystem is not idempotent, so when its reconciliation listing
+                # cannot see what it just submitted, the next class would submit a second create for
+                # the same name and region -- duplicate storage billed forever. Only a definitive
+                # capacity rejection may advance the ladder.
+                if _is_unreconciled_filesystem_create(exc):
+                    launch_err = exc
+                    logger.warning(
+                        "warm lambda/%s: filesystem create unreconciled, not trying another "
+                        "class: %s", region, exc,
+                    )
+                    break
+                # no capacity / launch reject -- try the next class up the ladder
                 launch_err = exc
                 logger.info("warm lambda/%s: %s rejected (%s); trying next class", region, gpu, exc)
         if launch_err is not None or spec is None:

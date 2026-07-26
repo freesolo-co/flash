@@ -2240,10 +2240,15 @@ def test_warm_reports_timeouts_and_partials_as_not_warmed(monkeypatch):
     # time module, so patching through it moves the clock for the whole process (pytest internals,
     # threads, HF clients) and leaks into later tests.
     real_time = preload.time
-    ticks = iter([0.0, 0.0, 0.0])
+    # Advance on SLEEP, not on a fixed number of time() reads: a counted tick list silently breaks
+    # whenever the code under test adds a clock read (it once left the poll loop spinning forever on
+    # a deadline it could never reach). One sleep outruns any deadline, so the loop takes exactly one
+    # pass and then times out, whatever else reads the clock.
+    clock = {"t": 0.0}
     monkeypatch.setattr(
         preload, "time",
-        types.SimpleNamespace(time=lambda: next(ticks, 1e9), sleep=lambda s: None,
+        types.SimpleNamespace(time=lambda: clock["t"],
+                              sleep=lambda s: clock.__setitem__("t", clock["t"] + 1e9),
                               monotonic=real_time.monotonic),
     )
     res = preload.warm_instances(models=["a/b"], timeout_s=1, poll_interval_s=0.0)
@@ -2303,6 +2308,70 @@ def test_warm_stops_the_ladder_on_an_ambiguous_create(monkeypatch):
 
     assert tried == ["A10"], "an ambiguous create must not trigger a second launch for the same run"
     assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "error")]
+
+
+def test_warm_stops_the_ladder_on_an_unreconciled_filesystem_create(monkeypatch):
+    """An unreconciled FILESYSTEM create must end the ladder too, or it bills duplicate storage.
+
+    ensure_filesystem runs per launch attempt and create_filesystem is not idempotent. When its
+    reconciliation listing cannot see the create it just submitted, retrying the next class submits a
+    SECOND create for the same name and region -- storage billed forever, with no instance to show
+    for it. Unlike a capacity rejection, this failure is not about the GPU class at all, so climbing
+    the ladder cannot help.
+    """
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(
+        lj, "usable_instances", _stocked(A10=["us-east-1"], A100_SXM_40GB=["us-east-1"])
+    )
+    tried = []
+
+    def unreconciled_fs(spec, seed, instances, **k):
+        tried.append(instances[0].gpu)
+        # launch_and_submit re-wraps ensure_filesystem's bare LambdaApiError, so the ladder only ever
+        # sees the message. Reproduce that wrapping rather than the inner error.
+        raise RuntimeError(
+            "all 1 Lambda region(s) rejected the A10 launch (no capacity): "
+            "ambiguous filesystem create could not be reconciled"
+        )
+
+    monkeypatch.setattr(lj, "launch_and_submit", unreconciled_fs)
+    res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    assert tried == ["A10"], "an unreconciled filesystem create must not trigger a second create"
+    assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "error")]
+
+
+def test_ladder_planning_shares_one_deadline_across_every_class(monkeypatch):
+    """Four classes must share ONE planning budget, not each get the full retry budget in turn.
+
+    Each usable_instances does a live price lookup and a capacity lookup, both of which retry
+    internally. Against an /instance-types endpoint that accepts connections then hangs, an unbounded
+    per-class call turns a single-class stall into roughly four stacked retry budgets before the warm
+    can even report "no targets". The ladder must stop once the shared budget is gone.
+    """
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload, "time", types.SimpleNamespace(time=lambda: clock["t"]))
+    monkeypatch.setattr(preload, "_LAMBDA_PLANNING_BUDGET_S", 100.0)
+    asked, deadlines = [], []
+
+    def hang(gpu, *, deadline_at=None):
+        asked.append(gpu)
+        deadlines.append(deadline_at)
+        clock["t"] += 60.0  # each class burns more than half the shared budget
+        raise RuntimeError("instance-types timed out")
+
+    monkeypatch.setattr(lj, "usable_instances", hang)
+    assert preload._lambda_warm_targets(lj, None) == []
+
+    # two classes fit in the budget; the ladder stops instead of walking all four
+    assert asked == ["A10", "A100 SXM 40GB"]
+    # and it is ONE deadline, not a fresh one per class
+    assert deadlines == [100.0, 100.0]
 
 
 def test_warm_names_regions_with_no_capacity_in_any_class(monkeypatch, caplog):
