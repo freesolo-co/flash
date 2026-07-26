@@ -144,6 +144,7 @@ def test_weight_cache_datacenters_ignores_removed_env_knob(monkeypatch):
 
 
 def test_weight_cache_volumes_distinct_name_per_dc():
+    from flash import runner
     from flash.providers.runpod import jobs
 
     vols = jobs.weight_cache_volumes(_vol_spec(gb=100))
@@ -157,21 +158,38 @@ def test_weight_cache_volumes_distinct_name_per_dc():
     assert {v.name for v in vols} == {f"flash-weights-{v.dataCenterId.value.lower()}" for v in vols}
     # exactly the full storage-DC set
     assert {v.dataCenterId for v in vols} == set(jobs.weight_cache_datacenters())
-    assert {v.size for v in vols} == {100}
+    # the SHARED cache is platform-managed, so a stale spec size never wins: a spec still carrying
+    # the pre-bump 100 must still build 250-GB volumes, or the bump is a no-op for anything that
+    # round-tripped a spec.
+    assert {v.size for v in vols} == {runner.WEIGHT_CACHE_VOLUME_GB}
 
 
 def test_weight_cache_volumes_size_tolerant_of_bad_values():
     # weight_cache_volumes builds NetworkVolumes from spec.gpu.network_volume_gb directly (a GpuSpec
     # can carry a raw value that bypassed JobSpec.from_dict's parse). A non-numeric/"0"/negative size
-    # must default to 100 via _volume_gb — never raise (best-effort would silently drop the cache) or
-    # create a 0-GB volume.
+    # must never raise (best-effort would silently drop the cache) or create a 0-GB volume; on the
+    # shared cache it lands on the managed size.
+    from flash import runner
     from flash.providers.runpod import jobs
 
     for raw in ("0", 0, -5, "abc", None, True):
         vols = jobs.weight_cache_volumes(_vol_spec(gb=raw))
-        assert {v.size for v in vols} == {100}, f"{raw!r} should default to 100 GB"
-    # a valid positive size still passes through
-    assert {v.size for v in jobs.weight_cache_volumes(_vol_spec(gb=250))} == {250}
+        assert {v.size for v in vols} == {runner.WEIGHT_CACHE_VOLUME_GB}, f"{raw!r} rejected"
+    # an oversized request on the shared cache still passes through: the floor only raises.
+    big = runner.WEIGHT_CACHE_VOLUME_GB + 50
+    assert {v.size for v in jobs.weight_cache_volumes(_vol_spec(gb=big))} == {big}
+
+
+def test_custom_volume_keeps_its_spec_size_while_shared_cache_is_managed():
+    """The managed floor applies to the SHARED cache only. A caller's own volume is theirs to size.
+
+    Flooring every volume at the cache size would silently over-provision (and over-bill) a custom
+    volume that was deliberately asked for small.
+    """
+    from flash.providers.runpod import jobs
+
+    vols = jobs.weight_cache_volumes(_vol_spec(name="my-own-volume", gb=20))
+    assert {v.size for v in vols} == {20}
 
 
 def test_weight_cache_volume_name_includes_datacenter():
@@ -1417,10 +1435,12 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
         spec=None,
         endpoint_kwargs=None,
         deadline_at=None,
+        cache_volumes=None,
     ):
         calls["gpu"] = gpu
         calls["suffix"] = name_suffix
         calls["endpoint_kwargs"] = endpoint_kwargs
+        calls["cache_volumes"] = cache_volumes
         return "ep-1", "name-1", _RUNPOD_FINGERPRINT
 
     submitted = {}
@@ -2927,35 +2947,41 @@ def test_warm_instances_cli_reports_planning_outage_without_traceback(monkeypatc
     assert preload.main(["--warm-instances"]) == 1
 
 
-def test_region_skipped_when_precheck_eats_the_launch_allowance(monkeypatch):
-    """The filesystem pre-check spends the same deadline the launcher gets. If it leaves under the
-    60s provider create allowance, launch_and_submit would raise that allowance error for EVERY
-    class, get caught as a launch failure, and walk the ladder to pricier classes -- reporting
-    "no capacity" for classes never actually tested. The region must stop and say what ran out."""
+def test_precheck_cannot_take_time_from_the_launch_deadline(monkeypatch):
+    """The pre-check runs on its OWN budget, so a slow one never shortens the launch/poll deadline.
+
+    Regression: it shared the run deadline while the instance wall cap and the reap deadline still
+    got the full effective_s. A slow pre-check therefore (a) ate into the provider's 60s create
+    allowance, so every class in the ladder failed that check inside launch_and_submit and the
+    region reported "no capacity" for classes never actually tested, and (b) ended the driver's poll
+    before the box it was watching, reporting a live download as timed out.
+    """
     from flash.providers import weight_cache_preload as preload
 
-    # A slow pre-check that returns "listed" but burns the wall clock getting there.
+    # A slow pre-check that returns "listed" but burns two minutes of wall clock getting there.
     def slow_precheck(region, deadline):
         clock["now"] += 120.0
         return "listed"
 
     clock = {"now": 1000.0}
+    seen = {}
     monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
     monkeypatch.setattr(preload, "_ensure_region_filesystem", slow_precheck)
-    # Nothing left for a create once the pre-check has taken its share.
-    monkeypatch.setattr(preload, "remaining_seconds", lambda deadline: 5.0)
+
+    def _launch(spec, **kwargs):
+        seen["deadline_at"] = kwargs["deadline_at"]
+        seen["wall_s"] = spec.gpu.max_wall_seconds
+        raise RuntimeError("stop here; the launch deadline is what this test is about")
 
     jobs_mod = types.SimpleNamespace(
-        launch_and_submit=lambda *a, **k: (_ for _ in ()).throw(
-            AssertionError("must not try any class with the allowance already spent")
-        ),
-        terminate_run_instances=lambda run_id: None,
+        launch_and_submit=_launch, terminate_run_instances=lambda run_id: None
     )
-    result = preload._warm_one_lambda_instance(
-        jobs_mod, [_cand("us-east-1"), _cand("us-east-1", gpu="H100")], ["a/b"], 5, 0.0
-    )
-    assert result["status"] == "error"
-    assert "launch deadline" in result["error"]
+    preload._warm_one_lambda_instance(jobs_mod, [_cand("us-east-1")], ["a/b"], 600, 0.0)
+
+    # The class WAS tried (the old code returned before the ladder), and it got the full budget:
+    # the launch deadline is 600s from the pre-check's END, matching the instance's own wall cap.
+    assert seen["wall_s"] == 600
+    assert seen["deadline_at"] == clock["now"] + 600
 
 
 def test_warm_instances_no_targets_is_noop_without_status_repo(monkeypatch):
@@ -3063,8 +3089,10 @@ def test_poll_gives_up_when_datacenter_never_allocates_a_worker(monkeypatch):
     monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _advance)
     with pytest.raises(preload.NoCapacityError):
         preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
-    # gave up inside the grace window, nowhere near the 5400s timeout
-    assert clock["t"] < preload._NO_CAPACITY_GRACE_S + 120.0
+    # gave up on the grace window, nowhere near the 5400s timeout. Bound allows two 60s polls on
+    # top of the grace: GraceTimer arms on the first confirmed reading rather than at launch, and
+    # never fires on the poll that armed it, so give-up lands a poll or two past _NO_CAPACITY_GRACE_S
+    assert clock["t"] <= preload._NO_CAPACITY_GRACE_S + 120.0
 
 
 def test_poll_waits_when_a_worker_is_initializing(monkeypatch):
@@ -3217,15 +3245,17 @@ def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
         raise RuntimeError("health api down")
 
     monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _boom)
-    assert preload._has_worker("ep", "fp", 0.0) is None
+    assert preload._worker_counts("ep", "fp", 0.0) is None
+    assert preload._has_worker(None) is None
 
     monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: None)
-    assert preload._has_worker("ep", "fp", 0.0) is None
+    assert preload._worker_counts("ep", "fp", 0.0) is None
 
     monkeypatch.setattr(
         preload.runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: {"workers": {}}
     )
-    assert preload._has_worker("ep", "fp", 0.0) is False  # a real empty answer IS evidence
+    # a real empty answer IS evidence
+    assert preload._has_worker(preload._worker_counts("ep", "fp", 0.0)) is False
 
 
 def test_a_broken_worker_image_is_not_reported_as_a_starved_datacenter(monkeypatch):
@@ -3243,13 +3273,61 @@ def test_a_broken_worker_image_is_not_reported_as_a_starved_datacenter(monkeypat
         "endpoint_health_for_fingerprint",
         lambda *a, **k: {"workers": {"ready": 0, "running": 0, "unhealthy": 1}},
     )
-    assert preload._has_worker("ep", "fp", 0.0) is True
+    assert preload._has_worker(preload._worker_counts("ep", "fp", 0.0)) is True
 
-    # and end to end: the queued job must time out, never be blamed on the datacenter
+    # and end to end: the queued job must NOT be blamed on the datacenter. Within the unhealthy
+    # grace it is still just a slow start, so the budget running out is a plain timeout.
     monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
     monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
     with pytest.raises(TimeoutError):  # NOT NoCapacityError
         preload._poll_until_done("ep", "job", "fp", timeout_s=1, poll_interval_s=0.0)
+
+
+def test_a_persistently_unhealthy_worker_is_reported_as_a_broken_image(monkeypatch):
+    """A box allocated and then left unhealthy is a broken image, and nothing but a fix helps.
+
+    It counts as capacity (see above), which is exactly why it needs its own timer: without one it
+    clears the starvation anchor on every poll and the preload holds a PAID endpoint for the whole
+    5400s budget before returning a bare "did not finish" that names nothing. ``poll_job`` already
+    calls this condition a failed image pull on a 240s grace; the preload poller must agree.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"ready": 0, "running": 0, "unhealthy": 1}},
+    )
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(preload, "_UNHEALTHY_GRACE_S", 0.0)  # grace already elapsed
+
+    with pytest.raises(RuntimeError, match="unhealthy") as exc:
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+    # and it must be actionable: a broken image, NOT a capacity verdict that sends the operator
+    # off to pick a different GPU class.
+    assert not isinstance(exc.value, preload.NoCapacityError)
+    assert "image failed to start" in str(exc.value)
+
+
+def test_an_unhealthy_worker_alongside_a_live_one_is_not_a_broken_image(monkeypatch):
+    """One bad box among healthy ones is not a failed image, so it must not abort the warm.
+
+    Same predicate ``poll_job`` uses: unhealthy only counts when nothing is usable and nothing is
+    still coming up. Firing here would throw away a download that is progressing on the good box.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    monkeypatch.setattr(preload, "_UNHEALTHY_GRACE_S", 0.0)  # grace already elapsed
+    monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    for alive in ("running", "ready", "idle", "initializing"):
+        monkeypatch.setattr(
+            preload.runpod_api,
+            "endpoint_health_for_fingerprint",
+            lambda *a, _s=alive, **k: {"workers": {"unhealthy": 1, _s: 1}},
+        )
+        assert preload._only_unhealthy_workers(preload._worker_counts("ep", "fp", 0.0)) is False
+        with pytest.raises(TimeoutError):  # ran out of budget, NOT declared broken
+            preload._poll_until_done("ep", "job", "fp", timeout_s=1, poll_interval_s=0.0)
 
 
 def test_a_throttled_worker_still_counts_as_no_capacity(monkeypatch):
@@ -3267,7 +3345,7 @@ def test_a_throttled_worker_still_counts_as_no_capacity(monkeypatch):
         "endpoint_health_for_fingerprint",
         lambda *a, **k: {"workers": {"ready": 0, "running": 0, "throttled": 1}},
     )
-    assert preload._has_worker("ep", "fp", 0.0) is False
+    assert preload._has_worker(preload._worker_counts("ep", "fp", 0.0)) is False
 
     monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)  # grace already elapsed
     monkeypatch.setattr(preload.runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
@@ -3534,3 +3612,1071 @@ def test_ok_datacenter_logs_no_per_model_failures(monkeypatch, caplog):
         preload.warm_weight_cache(datacenters=["US-CA-2"], gpu="RTX 4090")
 
     assert "FAILED" not in caplog.text
+
+
+def test_grow_raises_undersized_volumes_and_leaves_the_rest_alone(monkeypatch):
+    """A NetworkVolume is sized on CREATE ONLY, so a size bump is a silent no-op on the live fleet.
+
+    The SDK's _find_existing_volume matches on name+datacenter and hands the volume back untouched,
+    so every volume provisioned before the 100->250 bump stays at 100 forever: the attach succeeds
+    and the download then dies with "Disk quota exceeded", which is the exact failure the bump was
+    meant to fix. Growing over REST is the only way to reconcile what is already provisioned.
+    """
+    from flash.providers.runpod import api
+
+    calls = []
+
+    class _Client:
+        def request_with_retries_for_key(self, key, target, **kwargs):
+            calls.append((target, kwargs.get("method", "GET"), kwargs.get("body")))
+            if target.endswith("/networkvolumes"):
+                return [
+                    {"id": "v-old", "name": "flash-weights-us-ca-2", "size": 100},
+                    {"id": "v-new", "name": "flash-weights-eu-ro-1", "size": 250},
+                    {"id": "v-big", "name": "flash-weights-us-tx-3", "size": 400},
+                    {"id": "v-other", "name": "somebody-elses-volume", "size": 10},
+                ]
+            return {}
+
+    monkeypatch.setattr(api, "_CLIENT", _Client())
+    grown = api.grow_network_volumes_for_key(
+        "k",
+        {
+            "flash-weights-us-ca-2": 250,
+            "flash-weights-eu-ro-1": 250,
+            "flash-weights-us-tx-3": 250,
+        },
+    )
+
+    # only the under-sized managed volume is touched
+    assert grown == {"flash-weights-us-ca-2": 250}
+    patches = [(t, m, b) for t, m, b in calls if m == "PATCH"]
+    assert patches == [(f"{api.REST_BASE}/networkvolumes/v-old", "PATCH", {"size": 250})]
+    # RunPod REJECTS a shrink, so an already-larger volume must never be patched down; and a volume
+    # that is not ours is not ours to resize.
+    assert "v-big" not in str(patches)
+    assert "v-other" not in str(calls)
+
+
+def test_grow_tolerates_a_volume_listing_without_usable_sizes(monkeypatch):
+    """A malformed row must be skipped, not crash the warm: this runs on the launch path.
+
+    Raising here would take down a preload for every datacenter over one bad row from the listing
+    API, which is strictly worse than attaching a volume at whatever size it already has.
+    """
+    from flash.providers.runpod import api
+
+    patched = []
+
+    class _Client:
+        def request_with_retries_for_key(self, key, target, **kwargs):
+            if target.endswith("/networkvolumes"):
+                return {
+                    "networkVolumes": [
+                        {"id": "v-1", "name": "flash-weights-us-ca-2", "size": "not-a-number"},
+                        {"id": None, "name": "flash-weights-eu-ro-1", "size": 100},
+                        {"name": "flash-weights-us-tx-3", "size": 100},
+                        {"id": "v-4", "name": "flash-weights-us-ks-2", "size": 100},
+                    ]
+                }
+            patched.append(target)
+            return {}
+
+    monkeypatch.setattr(api, "_CLIENT", _Client())
+    grown = api.grow_network_volumes_for_key("k", dict.fromkeys(
+        ["flash-weights-us-ca-2", "flash-weights-eu-ro-1",
+         "flash-weights-us-tx-3", "flash-weights-us-ks-2"], 250))
+
+    assert grown == {"flash-weights-us-ks-2": 250}  # only the one complete, under-sized row
+    assert patched == [f"{api.REST_BASE}/networkvolumes/v-4"]
+
+
+def test_one_stalling_volume_cannot_starve_the_rest_of_the_fleet(monkeypatch):
+    """Regression: a PATCH that burns the shared deadline left every later datacenter unreconciled.
+
+    Skipping a failed volume is not enough on its own. A PATCH that times out or 5xxes spends real
+    time inside its own retries, and when every PATCH is handed the same absolute deadline the first
+    under-sized volume can consume all of it -- every later one then fails its deadline check
+    instantly. That is the same fleet-wide gap as aborting the loop, reached more slowly, and a run
+    placed in one of those datacenters still dies on "Disk quota exceeded".
+    """
+    import types
+
+    from flash.providers import _deadline
+    from flash.providers.runpod import api
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(_deadline, "time", types.SimpleNamespace(time=lambda: clock["t"]))
+    monkeypatch.setattr(api, "time", types.SimpleNamespace(time=lambda: clock["t"]))
+
+    granted = []
+
+    class _Client:
+        def request_with_retries_for_key(self, key, target, **kwargs):
+            if target.endswith("/networkvolumes"):
+                return [
+                    {"id": f"v-{i}", "name": f"flash-weights-dc-{i}", "size": 100}
+                    for i in range(4)
+                ]
+            budget = kwargs["deadline_at"] - clock["t"]
+            granted.append(round(budget, 1))
+            if budget <= 0:
+                raise RuntimeError("PATCH deadline exceeded")
+            if target.endswith("v-0"):
+                clock["t"] += budget  # a stalling volume spends everything it is given
+                raise RuntimeError("PATCH timed out")
+            clock["t"] += 0.5
+            return {}
+
+    monkeypatch.setattr(api, "_CLIENT", _Client())
+    grown = api.grow_network_volumes_for_key(
+        "k",
+        {f"flash-weights-dc-{i}": 250 for i in range(4)},
+        deadline_at=clock["t"] + 20.0,
+    )
+
+    # the stalling volume gets its own share, not the whole budget, so the rest still reconcile
+    assert granted[0] == 5.0
+    assert grown == {f"flash-weights-dc-{i}": 250 for i in (1, 2, 3)}
+
+
+def test_warm_grows_the_volume_before_attaching_it(monkeypatch):
+    """The grow must happen BEFORE the endpoint deploys, or the warm attaches the old size.
+
+    Ordering is the whole point: reconciling after the attach leaves this run downloading into the
+    under-sized mount it was supposed to fix.
+    """
+    import inspect
+
+    from flash import runner
+    from flash.providers.runpod import jobs
+
+    # the grow must sit ahead of the create inside the same serialized attempt
+    src = inspect.getsource(jobs.deploy_train_endpoint)
+    assert src.index("grow_weight_cache_volumes(") < src.index("ep = Endpoint(**kwargs)")
+
+    # and it asks for the MANAGED size on this DC's real (per-DC) volume name
+    asked = {}
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: asked.update(wanted) or {},
+    )
+    jobs.grow_weight_cache_volumes(
+        None, "k1", None, wanted={"flash-weights-us-ca-2": runner.WEIGHT_CACHE_VOLUME_GB}
+    )
+    assert asked == {"flash-weights-us-ca-2": runner.WEIGHT_CACHE_VOLUME_GB}
+
+
+def test_a_bad_account_key_never_blocks_a_warm(monkeypatch):
+    """Growing is best-effort: a failing grow must not stop the warm from deploying.
+
+    A volume that cannot be grown still gets attached, which is no worse than not trying at all --
+    but a warm aborted over an expired key warms nothing.
+    """
+    from flash.providers import weight_cache_preload as preload
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: (_ for _ in ()).throw(RuntimeError("401 unauthorized")),
+    )
+    # the grow raising must not propagate out of the helper the deploy calls
+    jobs.grow_weight_cache_volumes(None, "bad", None, wanted={"flash-weights-us-ca-2": 250})
+
+    monkeypatch.setattr(preload, "deploy_train_endpoint", lambda *a, **k: ("ep", "name", "fp"))
+    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda *a, **k: "job-1")
+    monkeypatch.setattr(preload, "_poll_until_done", lambda *a, **k: {"preloaded": ["m1"]})
+    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda *a, **k: None)
+
+    out = preload._preload_one_dc("US-CA-2", ["m1"], None, "RTX 4090", 60, 0.0)
+
+    assert out["status"] == "ok"  # the warm still ran
+
+
+def test_assign_refreshes_a_stale_shared_cache_size():
+    """A spec already pinned to the shared cache must still be re-sized to the MANAGED size.
+
+    Regression: _assign_weight_cache_volume returned early whenever the pin was already correct, so
+    a stale or internally round-tripped spec carrying the pre-bump 100 kept it. The 250 GB gate then
+    admitted the 27B/35B onto a 100 GB mount and the download failed with the same disk-quota error
+    the bump exists to prevent.
+    """
+    from flash import runner
+    from flash.catalog import MODELS
+
+    info = MODELS["Qwen/Qwen3.5-9B"]
+    spec = JobSpec.from_dict({
+        "model": info.id,
+        "run_id": "r",
+        "model_policy": "catalog",
+        "gpu": {
+            "type": "H100",
+            "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+            "network_volume_gb": 100,
+        },
+    })
+    out = runner._assign_weight_cache_volume(spec, info)
+    assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME
+    assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB
+
+
+def test_assign_leaves_a_custom_volume_size_alone():
+    """The size refresh is scoped to the SHARED cache: a caller's own volume keeps its own size.
+
+    A per-org volume is the caller's to size, and rewriting it to the managed number would silently
+    change what they are billed for.
+    """
+    from flash import runner
+    from flash.catalog import MODELS
+
+    info = MODELS["Qwen/Qwen3.5-9B"]
+    spec = JobSpec.from_dict({
+        "model": info.id,
+        "run_id": "r",
+        "model_policy": "catalog",
+        "gpu": {"type": "H100", "network_volume": "my-org-cache", "network_volume_gb": 100},
+    })
+    out = runner._assign_weight_cache_volume(spec, info)
+    assert out.gpu.network_volume == "my-org-cache"
+    assert out.gpu.network_volume_gb == 100
+
+
+def test_an_unknown_job_status_cannot_restart_the_starvation_grace(monkeypatch):
+    """Only a status that PROVES the job left the queue may reset the no-capacity timer.
+
+    Regression: the check was `status != _QUEUED`, which also matched None and any unrecognized
+    string. One flaky or empty job_status response therefore restarted the grace window, and a DC
+    that never allocates a worker would sit silently cold for the full 5400s instead of failing
+    fast -- the exact failure this poller exists to catch.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    # alternate IN_QUEUE with junk: under the old rule the junk poll cleared the anchor every time
+    statuses = iter(["IN_QUEUE", None, "IN_QUEUE", "SOMETHING_NEW", "IN_QUEUE"] * 50)
+    monkeypatch.setattr(
+        preload.runpod_api, "job_status", lambda *a, **k: {"status": next(statuses)}
+    )
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {}},  # confirmed zero workers
+    )
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 0.0)
+
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=60, poll_interval_s=0.0)
+
+
+def test_a_running_job_still_clears_the_starvation_grace(monkeypatch):
+    """The reset must still happen for a status that DOES prove allocation.
+
+    A job that reached IN_PROGRESS was given a worker, so a later re-queue must serve a FRESH grace
+    window: carrying the old anchor forward would charge the whole running interval to starvation
+    and delete an endpoint that never actually waited on capacity.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    clock = {"now": 1000.0}
+    statuses = iter(["IN_QUEUE", "IN_PROGRESS", "IN_QUEUE", "COMPLETED"])
+
+    def _status(*_a, **_k):
+        # jump well past the grace between the first queued poll and the running one, so a stale
+        # anchor carried forward would fire on the SECOND queued poll
+        clock["now"] += 200.0
+        return {"status": next(statuses), "output": {"preloaded": ["m1"]}}
+
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+    monkeypatch.setattr(
+        preload.runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: {"workers": {}}
+    )
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 100.0)
+    monkeypatch.setattr(preload, "decode_output", lambda out: out)
+
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+    assert out == {"preloaded": ["m1"]}
+
+
+def test_a_status_blackout_is_not_charged_to_the_starvation_grace(monkeypatch):
+    """Time the poller could not observe must not age an armed timer.
+
+    An unreadable job_status matches neither the left-queue branch nor the queued one, so the anchor
+    used to keep aging on wall time while nothing was being confirmed. If the job ran and was
+    re-queued inside that blackout -- which is exactly the transition the blackout hides -- the next
+    queued reading fired instantly and tore down an endpoint whose current starvation run had only
+    just begun.
+
+    The job here is queued for 60s, dark for 300s, then queued again, against a 100s grace. Only the
+    confirmed 60s+ may be charged, so the run must survive the first reading after the blackout.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    clock = {"now": 1000.0}
+    # 2 confirmed queued polls, a long unreadable gap, then queued again and done
+    statuses = iter(["IN_QUEUE", "IN_QUEUE", None, None, "IN_QUEUE", "COMPLETED"])
+    gaps = iter([0.0, 60.0, 150.0, 150.0, 10.0, 10.0])
+
+    def _status(*_a, **_k):
+        clock["now"] += next(gaps)
+        return {"status": next(statuses), "output": {"preloaded": ["m1"]}}
+
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {}},  # confirmed zero workers on every queued poll
+    )
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 100.0)
+    monkeypatch.setattr(preload, "decode_output", lambda out: out)
+
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+    assert out == {"preloaded": ["m1"]}
+
+
+def test_a_blackout_only_pauses_the_grace_and_never_restarts_it(monkeypatch):
+    """The pause must not become a reset: a genuinely starved DC still has to fail.
+
+    Holding the confirmed duration is the fix; discarding it would be the older bug in a new place,
+    letting one flaky response per grace window keep a dead datacenter alive for the full timeout.
+    Confirmed queued time accumulates across blackouts here and must still expire the timer.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    clock = {"now": 1000.0}
+    # every confirmed queued poll is separated by an unreadable one, so a reset-on-unknown rule
+    # would never let the anchor survive long enough to fire
+    statuses = iter(["IN_QUEUE", None] * 60)
+
+    def _status(*_a, **_k):
+        status = next(statuses)
+        # charge the elapsed time to the intervals that END at a confirmed reading; the blackouts
+        # themselves are instantaneous, so only genuinely confirmed queued time accumulates
+        if status == preload._QUEUED:
+            clock["now"] += 40.0
+        return {"status": status}
+
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+    monkeypatch.setattr(
+        preload.runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: {"workers": {}}
+    )
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 100.0)
+
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+
+
+def test_a_health_blackout_cannot_restart_the_starvation_grace(monkeypatch):
+    """An unreadable health API must pause the timers, not clear them.
+
+    _worker_counts returns None when health could not be read, and all three predicates read None as
+    inactive -- so running them on a blind reading CLEARED every anchor. One failed health call per
+    grace window then restarted every window, and a datacenter that never allocated a worker held a
+    paid endpoint for the full 5400s timeout before reporting a bare TimeoutError.
+
+    Health here alternates unreadable/confirmed-zero-workers, and only the confirmed polls advance
+    the clock. A reset-on-unknown rule never lets the anchor survive two confirmed polls in a row,
+    so it can never reach the 100s grace; pausing accumulates the confirmed time and must fire.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    clock = {"now": 1000.0}
+    polls = {"n": 0}
+
+    def _blind(n: int) -> bool:
+        return n % 2 == 0
+
+    def _status(*_a, **_k):
+        # the clock must move BEFORE the loop captures `now`, so charge the advance here rather than
+        # in the health stub. Time is charged only to intervals that END at a confirmed reading; the
+        # blackouts are instantaneous, so nothing but genuinely observed queued time accumulates.
+        if not _blind(polls["n"]):
+            clock["now"] += 40.0
+        return {"status": "IN_QUEUE"}
+
+    def _health(*_a, **_k):
+        # counter-driven, not an iterator: a StopIteration here would be swallowed by
+        # _worker_counts into a None reading and the poller would spin on a frozen clock
+        n = polls["n"]
+        polls["n"] += 1
+        return None if _blind(n) else {"workers": {}}
+
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 100.0)
+
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+
+
+def test_a_health_blackout_is_not_charged_to_the_grace_either(monkeypatch):
+    """The pause must stay a pause: blind time may not age an armed timer.
+
+    The mirror of the test above, and it guards the OPPOSITE failure. Pausing is the fix for the
+    reset bug, but charging the blind gap would be an over-correction -- the reading that would have
+    cleared the anchor (a worker finally appearing) is exactly what a health blackout hides, so the
+    first confirmed reading after a long dark stretch would tear down an endpoint whose download may
+    be progressing fine.
+
+    Zero workers are confirmed for 60s, health goes dark for 300s, then a confirmed reading returns
+    -- against a 100s grace. Only the confirmed 60s+10s may be charged, so the poll must survive to
+    completion. A rule that charged the dark 300s would raise NoCapacityError here instead.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    clock = {"now": 1000.0}
+    polls = {"n": 0}
+    statuses = ["IN_QUEUE"] * 5 + ["COMPLETED"]
+    # confirmed zero workers, a long unreadable stretch, then confirmed zero workers again: the
+    # post-blackout reading must stay a zero so a charge-the-gap rule actually has a timer to fire
+    healths = [{"workers": {}}, {"workers": {}}, None, None, {"workers": {}}]
+    gaps = [0.0, 60.0, 150.0, 150.0, 10.0, 10.0]
+
+    def _status(*_a, **_k):
+        clock["now"] += gaps[polls["n"]]
+        return {"status": statuses[polls["n"]], "output": {"preloaded": ["m1"]}}
+
+    def _health(*_a, **_k):
+        # indexed, not an iterator: _worker_counts swallows any exception into a None reading, so a
+        # StopIteration would silently become a blackout and spin the poller on a frozen clock
+        health = healths[polls["n"]]
+        polls["n"] += 1
+        return health
+
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 100.0)
+    monkeypatch.setattr(preload, "decode_output", lambda out: out)
+
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+    assert out == {"preloaded": ["m1"]}
+
+
+def test_a_throttled_worker_is_not_a_broken_image(monkeypatch):
+    """unhealthy + throttled is capacity contention, NOT a failed image pull.
+
+    A throttled box may still become runnable, and poll_job gives throttling its own longer grace.
+    Classifying the endpoint as exclusively unhealthy would tear it down at the shorter grace and
+    blame a broken image for what is really a busy datacenter.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    assert preload._only_unhealthy_workers({"unhealthy": 1, "throttled": 1}) is False
+    # with nothing else alive it IS the broken-image case
+    assert preload._only_unhealthy_workers({"unhealthy": 1}) is True
+
+
+def test_an_ordinary_deploy_grows_the_stale_volume_before_attaching(monkeypatch):
+    """Regression: growth used to live only in the preload utility.
+
+    An ordinary training job attaching a pre-bump volume only changed the REQUESTED size, and the
+    SDK returns an existing volume untouched, so the run mounted the old size and a newly admitted
+    model died on "Disk quota exceeded" unless an operator had separately run the preload first.
+    """
+    from flash import runner
+    from flash.providers.runpod import jobs
+
+    calls = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: calls.append((key, dict(wanted))) or {},
+    )
+
+    spec = _vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME)
+    jobs.grow_weight_cache_volumes(spec, "owning-key")
+
+    assert len(calls) == 1
+    key, wanted = calls[0]
+    # scoped to the account actually being deployed under, not the whole pool
+    assert key == "owning-key"
+    # every storage DC's real per-DC volume name, at the managed size
+    assert wanted
+    assert set(wanted.values()) == {runner.WEIGHT_CACHE_VOLUME_GB}
+    assert all(name.startswith(f"{runner.WEIGHT_CACHE_VOLUME_NAME}-") for name in wanted)
+
+
+def test_an_ordinary_deploy_leaves_a_custom_volume_alone(monkeypatch):
+    """Only the platform-managed cache is reconciled; a custom volume is the caller's to size."""
+    from flash.providers.runpod import jobs
+
+    calls = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: calls.append((key, dict(wanted))) or {},
+    )
+
+    jobs.grow_weight_cache_volumes(_vol_spec("my-own-volume"), "k")
+    jobs.grow_weight_cache_volumes(_vol_spec(None), "k")
+
+    assert calls == []
+
+
+def test_a_failed_grow_never_blocks_an_ordinary_deploy(monkeypatch):
+    """Reconciliation is best-effort: attaching the old size beats failing the deploy outright."""
+    from flash import runner
+    from flash.providers.runpod import jobs
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("runpod unreachable")
+
+    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _boom)
+
+    # must not raise
+    jobs.grow_weight_cache_volumes(_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME), "k")
+
+
+def test_deploy_side_grow_takes_a_bounded_budget_not_the_run_deadline(monkeypatch):
+    """A bad account must not eat the launch allowance the deploy still needs.
+
+    Passing the run deadline into a retrying listing let an unreachable account burn request
+    timeouts plus backoff against the same clock, leaving under the 60s minimum create allowance so
+    deploy_train_endpoint rejected a launch the healthy owning account could have served.
+    """
+    from flash import runner
+    from flash.providers.runpod import jobs
+
+    seen = {}
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: seen.update(kw) or {},
+    )
+
+    before = time.time()
+    jobs.grow_weight_cache_volumes(_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME), "k")
+
+    assert seen["deadline_at"] - before <= jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0
+
+
+def test_the_warm_names_the_volume_the_deploy_must_reconcile(monkeypatch):
+    """The warm attaches its own volume with spec=None, so the deploy cannot derive one.
+
+    Without cache_volumes the deploy-side grow early-returns on spec=None and nothing reconciles
+    the warm's mount at all.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    seen = {}
+
+    def _deploy(gpu, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop here; the kwargs are what we are asserting on")
+
+    monkeypatch.setattr(preload, "deploy_train_endpoint", _deploy)
+    preload._preload_one_dc("US-CA-2", ["m"], None, "RTX 4090", 600, 1.0)
+
+    assert seen["cache_volumes"] == {"flash-weights-us-ca-2": 250}
+
+
+def test_a_short_timeout_still_reconciles(monkeypatch):
+    """Regression: the grow budget is headroom ON TOP of timeout_s, not a slice carved out of it.
+
+    effective timeouts floor at 60s on their own, and the grow yields the 60s create allowance, so
+    a deadline of exactly now+timeout_s left zero budget and skipped reconciliation entirely --
+    reintroducing the under-sized mount.
+    """
+    from flash.providers import weight_cache_preload as preload
+    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod.jobs import (
+        WEIGHT_CACHE_GROW_BUDGET_S,
+        weight_cache_grow_headroom_s,
+    )
+
+    clock = {"t": 5000.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+
+    seen = {}
+
+    def _deploy(gpu, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop here; the deadline is what we are asserting on")
+
+    monkeypatch.setattr(preload, "deploy_train_endpoint", _deploy)
+    preload._preload_one_dc("US-CA-2", ["m"], None, "RTX 4090", 60, 1.0)
+
+    # the grow clamps to remaining - CREATE_ALLOWANCE_S, so headroom must survive that subtraction
+    budget = (seen["deadline_at"] - clock["t"]) - CREATE_ALLOWANCE_S
+    assert budget > 0
+    # and cover a whole deploy, not one attempt: a failover reconciles the account it lands on too
+    assert budget >= weight_cache_grow_headroom_s()
+    assert weight_cache_grow_headroom_s() >= WEIGHT_CACHE_GROW_BUDGET_S
+
+
+def test_deploy_side_grow_yields_the_create_allowance_it_sits_in_front_of(monkeypatch):
+    """Regression: growing must never be the reason a launchable deploy is rejected.
+
+    _deploy_once re-checks require_create_allowance AFTER the grow, so a fixed budget spent out of a
+    deadline that only just clears the 60s minimum drops it under -- turning best-effort
+    reconciliation into a hard deploy failure. The grow must yield the allowance back.
+    """
+    from flash import runner
+    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod import jobs
+
+    calls = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: calls.append(kw) or {},
+    )
+    spec = _vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME)
+
+    # only 10s of slack above the allowance: the full budget would overrun it
+    tight = time.time() + CREATE_ALLOWANCE_S + 10.0
+    before = time.time()
+    jobs.grow_weight_cache_volumes(spec, "k", tight)
+    assert calls, "a deploy with room to spare should still reconcile"
+    assert calls[0]["deadline_at"] <= tight - CREATE_ALLOWANCE_S + 1.0
+    assert calls[0]["deadline_at"] - before <= jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0
+
+    # no slack at all: skip entirely rather than eat into the allowance
+    calls.clear()
+    jobs.grow_weight_cache_volumes(spec, "k", time.time() + CREATE_ALLOWANCE_S)
+    assert calls == []
+
+
+def test_deploy_side_grow_is_wired_to_the_run_deadline(monkeypatch):
+    """The deadline must actually reach the helper, not just be honoured once it does."""
+    import inspect
+
+    from flash.providers.runpod import jobs
+
+    src = inspect.getsource(jobs.deploy_train_endpoint)
+    assert "grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)" in src
+
+
+def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
+    """Regression: headroom for ONE grow is spent by the first attempt, starving every later one.
+
+    The grow clamps to `remaining - CREATE_ALLOWANCE_S`. With a single budget of headroom, attempt
+    one's grow consumed it, leaving remaining == the allowance exactly: enough for
+    require_create_allowance to pass, so the deploy proceeded, but a zero grow budget -- so the
+    failover account attached its own stale volume and died on "Disk quota exceeded". That account
+    is the only one whose volume can still be under-sized by then, so starving it defeats the fix.
+    """
+    import runpod_flash
+
+    from flash.providers import _deadline
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
+
+    account = {"key": "acct-1"}
+    # both are imported function-locally by deploy_train_endpoint, so patch them at the source
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: account["key"])
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(rp_keys, "advance_key", lambda: account.update(key="acct-2"))
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: True)
+
+    events = []
+
+    def _grow(key, wanted, **kw):
+        events.append(("grow", key))
+        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S  # a real grow burns its budget
+        return {}
+
+    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+
+    def _endpoint(**kwargs):
+        events.append(("attach", account["key"]))
+        raise RuntimeError("insufficient balance")
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    deadline = clock["t"] + 60 + jobs.weight_cache_grow_headroom_s()
+    with pytest.raises(RuntimeError, match="insufficient balance"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            deadline_at=deadline,
+            cache_volumes={"flash-weights-us-ca-2": 250},
+        )
+
+    # every account reconciled BEFORE it attached, not just the first
+    grown = {k for kind, k in events if kind == "grow"}
+    attached = [k for kind, k in events if kind == "attach"]
+    assert attached == ["acct-1", "acct-2"]
+    assert grown == {"acct-1", "acct-2"}
+
+
+def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch):
+    """Regression: a create that runs long drains the headroom the NEXT account's grow needs.
+
+    Headroom sizing cannot fix this on its own -- a failed create is bounded only by the deadline
+    itself, so there is no amount a caller could have added. The deployer therefore holds each
+    unreconciled account's grow slice back from creates, sweeps and quota back-offs, so an attempt
+    that reaches the create has already been able to reconcile.
+    """
+    import runpod_flash
+
+    from flash.providers import _deadline
+    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
+
+    account = {"key": "acct-1"}
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: account["key"])
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(rp_keys, "advance_key", lambda: account.update(key="acct-2"))
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: "balance" in str(exc))
+
+    events = []
+
+    def _grow(key, wanted, **kw):
+        events.append(("grow", key))
+        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S
+        return {}
+
+    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+
+    # Sized so the failover attempt starts with exactly the create allowance left: enough for
+    # require_create_allowance to pass, but `min(budget, remaining - allowance)` is then 0, so the
+    # unreserved code proceeded to attach with no reconciliation at all.
+    deadline = clock["t"] + 900.0
+    burn = {"s": deadline - clock["t"] - jobs.WEIGHT_CACHE_GROW_BUDGET_S - CREATE_ALLOWANCE_S}
+
+    def _endpoint(**kwargs):
+        events.append(("attach", account["key"]))
+        clock["t"] += burn["s"]  # a create that runs long before failing
+        burn["s"] = 0.0
+        raise RuntimeError("insufficient balance")
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    with pytest.raises(RuntimeError, match=r"balance|deadline"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            deadline_at=deadline,
+            cache_volumes={"flash-weights-us-ca-2": 250},
+        )
+
+    # The invariant, which holds whichever way the deadline falls: an account that reached the
+    # create had reconciled first. Out of time is allowed to fail the deploy; it is not allowed to
+    # quietly attach a stale volume, which is the failure this PR exists to prevent.
+    attached = {k for kind, k in events if kind == "attach"}
+    grown = {k for kind, k in events if kind == "grow"}
+    assert attached <= grown, f"attached without reconciling: {sorted(attached - grown)}"
+
+
+def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
+    """Regression: a run that attaches no managed cache must not pay the reconciliation reserve.
+
+    An open-model run, an oversized catalog model, or a spec carrying a custom volume reconciles
+    nothing -- `grow_weight_cache_volumes` early-returns for all three. Reserving for them shortened
+    the deadline for a create that was never going to grow anything, so with two accounts and 90s
+    left the create failed its allowance check against an effective 50s without ever reaching the
+    provider.
+    """
+    import runpod_flash
+
+    from flash.providers import _deadline
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
+
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+
+    def _grow(key, wanted, **kw):  # pragma: no cover - must never run for a volume-free deploy
+        raise AssertionError("a volume-free run must not reconcile anything")
+
+    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+
+    reached = []
+
+    def _endpoint(**kwargs):
+        reached.append("create")
+        raise RuntimeError("reached the provider")
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    # exactly Codex's scenario: 2 accounts, 90s left, no managed cache attached
+    with pytest.raises(RuntimeError, match=r"reached the provider"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            deadline_at=clock["t"] + 90.0,
+            cache_volumes=None,
+        )
+
+    assert reached == ["create"], "volume-free deploy was rejected before reaching the provider"
+
+
+def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
+    """The headroom is scoped to the account pool, so each account may reconcile at most once.
+
+    A quota retry re-selects the account it just reconciled. Paying for that again would spend the
+    budget the account a later failover lands on still needs, reintroducing the starvation this
+    headroom exists to prevent.
+    """
+    import runpod_flash
+
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "only-account")
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 1)
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: False)
+    monkeypatch.setattr(jobs, "_is_workers_quota_error", lambda exc: True)
+    monkeypatch.setattr(jobs.time, "sleep", lambda *_a: None)
+
+    grows = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: grows.append(key) or {},
+    )
+
+    def _endpoint(**kwargs):
+        raise RuntimeError("no workers available")
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    with pytest.raises(RuntimeError, match="no workers available"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            cache_volumes={"flash-weights-us-ca-2": 250},
+        )
+
+    # three quota attempts against one account, but only one grow
+    assert grows == ["only-account"]
+
+
+def test_grow_headroom_covers_every_account_in_the_pool(monkeypatch):
+    """The caller cannot fund a whole deploy from a single grow budget: failover reconciles again."""
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 3)
+    assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S * 3
+
+    # an unconfigured pool still funds the one attempt that runs
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 0)
+    assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S
+
+
+def test_one_bad_volume_never_blocks_the_others(monkeypatch):
+    """Volumes are independent: a PATCH that fails must not skip every later datacenter.
+
+    Aborting the loop left later DCs' volumes unreconciled, so a run placed in one still hit
+    "Disk quota exceeded" -- the failure this whole path exists to prevent.
+    """
+    from flash.providers.runpod import api as runpod_api
+
+    listed = [
+        {"name": "flash-weights-us-ca-2", "id": "v1", "size": 100},
+        {"name": "flash-weights-eu-ro-1", "id": "v2", "size": 100},
+        {"name": "flash-weights-us-tx-3", "id": "v3", "size": 100},
+    ]
+
+    def _req(key, url, method="GET", **kw):
+        if method == "GET":
+            return listed
+        if url.endswith("/v2"):  # the middle one is concurrently deleted
+            raise RuntimeError("404 volume not found")
+        return {}
+
+    monkeypatch.setattr(runpod_api._CLIENT, "request_with_retries_for_key", _req)
+
+    grown = runpod_api.grow_network_volumes_for_key(
+        "k",
+        {
+            "flash-weights-us-ca-2": 250,
+            "flash-weights-eu-ro-1": 250,
+            "flash-weights-us-tx-3": 250,
+        },
+    )
+
+    # the failing volume is skipped; the one AFTER it still gets reconciled
+    assert grown == {"flash-weights-us-ca-2": 250, "flash-weights-us-tx-3": 250}
+
+
+def test_a_mixed_unhealthy_and_throttled_endpoint_still_gives_up(monkeypatch):
+    """The gap between the two existing timers: neither fires, so nothing ever did.
+
+    _has_worker counts the unhealthy box as capacity (resets starvation) and _only_unhealthy_workers
+    is blocked by the throttled box (resets broken-image), so a persistently mixed endpoint burned
+    the full 5400s timeout on a paid endpoint before reporting a bare TimeoutError.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    mixed = {"unhealthy": 1, "throttled": 2}
+    assert preload._has_worker(mixed) is True  # starvation timer stays cleared
+    assert preload._only_unhealthy_workers(mixed) is False  # broken-image timer stays cleared
+    assert preload._throttled_workers(mixed) is True  # ...so this one has to fire
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        preload, "_worker_counts", lambda *a, **kw: dict(mixed)
+    )
+
+    def _status(*a, **kw):
+        clock["now"] += preload._THROTTLED_GRACE_S + 1.0
+        return {"status": "IN_QUEUE"}
+
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+
+    with pytest.raises(preload.NoCapacityError) as err:
+        preload._poll_until_done("ep", "job", "fp", 5400, 0.0)
+    assert "throttled" in str(err.value)
+
+
+def test_a_usable_worker_keeps_the_throttled_timer_clear():
+    """A throttled box next to a running one is contention, not a dead DC -- never give up on it."""
+    from flash.providers import weight_cache_preload as preload
+
+    assert preload._throttled_workers({"throttled": 3, "running": 1}) is False
+    assert preload._throttled_workers({"throttled": 1, "initializing": 1}) is False
+    assert preload._throttled_workers(None) is False
+    assert preload._throttled_workers({}) is False
+
+
+def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
+    """The account a quota failover moves to must have its OWN volume grown before the attach.
+
+    A sweep in front of the deploy could not do this: it ran once, against whichever accounts it
+    reached, before anyone knew which account the create would succeed on. The one the failover
+    lands on could be exactly the one left holding a stale, under-sized volume. Driven through
+    deploy_train_endpoint on purpose -- the warm passes spec=None, so a dropped cache_volumes
+    passthrough silently turns the whole reconciliation back into a no-op.
+    """
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    account = {"key": "first-account"}
+    # deploy_train_endpoint imports ensure_auth function-locally, so patch it at the source
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: account["key"])
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(rp_keys, "advance_key", lambda: account.update(key="second-account"))
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: True)
+
+    grown = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: grown.append(key) or {},
+    )
+
+    def _endpoint(**kwargs):
+        raise RuntimeError("insufficient balance")
+
+    # deploy_train_endpoint imports Endpoint function-locally from runpod_flash, so patch it there
+    import runpod_flash
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    with pytest.raises(RuntimeError, match="insufficient balance"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            cache_volumes={"flash-weights-us-ca-2": 250},
+        )
+
+    # both attempts reconciled the account THEY were about to attach, not just the first
+    assert grown == ["first-account", "second-account"]
+
+
+def test_datacenter_discovery_failure_never_fails_the_deploy(monkeypatch):
+    """Regression: discovery sat OUTSIDE the best-effort boundary and could abort the deploy.
+
+    The helper promises it cannot fail a deploy -- a volume it cannot grow is simply attached as-is.
+    An SDK whose DataCenter.all() raises (say an incompatible runpod-flash update) broke that
+    promise from inside the one function that makes it, while the sibling
+    weight_cache_endpoint_kwargs deliberately catches the same failure and deploys cold.
+    """
+    from flash import runner
+    from flash.providers.runpod import jobs
+
+    def _boom():
+        raise RuntimeError("incompatible SDK: DataCenter.all() is gone")
+
+    monkeypatch.setattr(jobs, "weight_cache_datacenters", _boom)
+
+    # must return, not raise
+    jobs.grow_weight_cache_volumes(_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME), "k")
+
+
+def test_spec_none_without_named_volumes_stays_a_no_op(monkeypatch):
+    """Callers that neither carry a spec nor name volumes have nothing to reconcile."""
+    from flash.providers.runpod import jobs
+
+    grown = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: grown.append(key) or {},
+    )
+
+    jobs.grow_weight_cache_volumes(None, "k", None)
+
+    assert grown == []
+
+
+def test_the_owning_key_is_read_inside_the_serialized_section():
+    """Another thread can advance_key() while this one waits for the endpoint slot.
+
+    A key captured before the wait would grow one account's volume while Endpoint attaches the
+    account the env var now names -- leaving the attached volume stale.
+    """
+    import inspect
+
+    from flash.providers.runpod.train import endpoints
+
+    src = inspect.getsource(endpoints.get_train_endpoint)
+    assert "grow_weight_cache_volumes(spec, ensure_auth())" in src
+    assert "owning_key" not in src
