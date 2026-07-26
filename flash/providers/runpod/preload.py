@@ -51,14 +51,83 @@ _HF_HOME = "/runpod-volume/hf-cache"
 _PRELOAD_GPU = "RTX 4090"
 _TERMINAL_OK = {"COMPLETED"}
 _TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
+# Only a QUEUED job can be starved. Any other nonterminal status means RunPod already handed the job
+# to a worker, so a zero-worker health reading there is a health-reporting artifact, not starvation --
+# and acting on it would delete the endpoint mid-download.
+_QUEUED = "IN_QUEUE"
+# Not every storage DC stocks every GPU class -- US-KS-2/US-MO-2/US-NC-2/US-NE-1/US-WA-1 carry no
+# RTX 4090 at all. A preload pinned to a class the DC cannot serve never allocates a worker: the job
+# just sits queued until the timeout, so the DC stays silently cold and we pay for the wait. Give up
+# on a DC once it has held a queued job this long with no worker in any state.
+_NO_CAPACITY_GRACE_S = 420.0
+
+
+class NoCapacityError(RuntimeError):
+    """A datacenter never allocated a worker, i.e. it cannot serve the requested GPU class."""
+
+
+# Per-DC job budget for a preload. A fully cold volume must download the WHOLE catalog, so this is
+# sized off the measured worst case rather than left at a round number: a real cold 35B pull ran
+# 70 GB in ~870s (~0.08 GB/s), which puts the full ~159 GB catalog near 2000s -- already past a
+# 1800s budget before any retry or slow-mirror variance. Cold warms are rare and a too-short budget
+# throws away everything downloaded so far, so the asymmetry favours the larger number.
+_PRELOAD_TIMEOUT_S = 5400
+
+
+def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool | None:
+    """True once a datacenter has actually given us a box, in any state it can then be in.
+
+    - ``initializing`` / ``ready`` / ``running`` / ``idle`` -- allocated and fine
+    - ``unhealthy`` -- allocated, then the image failed to start. ``jobs.py`` reads this as a failed
+      image pull and retries on a fresh endpoint, so counting it as "no capacity" would blame the
+      datacenter for a broken image and tell the operator to change GPU class, which cannot help.
+
+    ``throttled`` is deliberately NOT counted. ``jobs.py`` classifies a sustained throttled worker as
+    ``no_capacity`` ("retrying on the next-best GPU"), which is exactly the condition this poller
+    exists to catch: RunPod is not scheduling the pinned class here. Treating it as capacity would
+    make a preload sit the full timeout on a datacenter that will never run it.
+
+    Returns None when health could not be read. That is deliberately NOT False: the caller escalates
+    a sustained False into NoCapacityError and tears the endpoint down, so a health endpoint that is
+    merely unreachable would look identical to a starved datacenter and could kill a download that is
+    running fine. Unknown must stay unknown -- only a positive "no workers" answer is evidence.
+    """
+    try:
+        health = runpod_api.endpoint_health_for_fingerprint(
+            endpoint_id,
+            key_fingerprint,
+            deadline_at=deadline,
+        )
+    except Exception:
+        return None
+    if health is None:
+        return None
+    workers = health.get("workers") or {}
+    return any(
+        int(workers.get(k) or 0) > 0
+        for k in ("initializing", "ready", "running", "idle", "unhealthy")
+    )
 
 
 def catalog_model_ids() -> list[str]:
-    """Catalog base models that fit the weight-cache volume."""
+    """Catalog base models that fit the weight-cache volume, LARGEST FIRST.
+
+    Largest-first only buys fail-fast: the biggest model is the one whose cold download costs the
+    most and is the likeliest to run out of room, so trying it before spending 20 minutes on the
+    small ones surfaces the failure early.
+
+    It is NOT what makes the catalog fit, and it must not be mistaken for a capacity fix. The volume
+    is persistent and preload never evicts, so on any DC warmed even once the largest model meets a
+    volume already holding everything else no matter what order this returns. Capacity comes from
+    sizing the volume for the whole resident catalog plus the largest model's in-transit scratch --
+    see ``flash.runner.weight_cache_catalog_peak_gb``.
+    """
     from flash.catalog import MODELS
     from flash.runner import _fits_weight_cache
 
-    return [mid for mid, info in MODELS.items() if _fits_weight_cache(info)]
+    fitting = [(mid, info) for mid, info in MODELS.items() if _fits_weight_cache(info)]
+    fitting.sort(key=lambda pair: (-(pair[1].params_b or 0.0), pair[0]))
+    return [mid for mid, _ in fitting]
 
 
 def _preload_one_dc(
@@ -121,6 +190,10 @@ def _preload_one_dc(
         if result.get("failed"):
             return {"datacenter": dc_id, "status": "partial", "result": result}
         return {"datacenter": dc_id, "status": "ok", "result": result}
+    except NoCapacityError as exc:
+        # Distinct from "error": nothing is broken, this DC just has no GPU of this class.
+        logger.warning("preload %s NO CAPACITY for %s: %s", dc_id, gpu, exc)
+        return {"datacenter": dc_id, "status": "no_capacity", "gpu": gpu, "error": str(exc)}
     except Exception as exc:  # one region failing must not abort the others
         logger.warning("preload %s FAILED: %s", dc_id, exc)
         return {"datacenter": dc_id, "status": "error", "error": str(exc)}
@@ -138,6 +211,11 @@ def _poll_until_done(
     poll_interval_s: float,
 ) -> dict:
     deadline = time.time() + timeout_s
+    # Grace is measured over an UNBROKEN run of confirmed zero-worker readings, so it starts at the
+    # first such reading rather than at launch. Timing it from launch would let an unreadable health
+    # API age the timer silently, and the first definite False after that would fire instantly --
+    # deleting an endpoint whose download may be progressing.
+    starved_since: float | None = None
     while time.time() < deadline:
         st = runpod_api.job_status(
             endpoint_id,
@@ -146,6 +224,37 @@ def _poll_until_done(
             deadline_at=deadline,
         )
         status = (st or {}).get("status")
+        if status != _QUEUED:
+            # Leaving the queue breaks the run. A job that reached IN_PROGRESS was allocated a
+            # worker, so if it is later re-queued after an interruption it must serve a FRESH grace
+            # window: carrying the old anchor forward would charge the whole running interval to
+            # starvation and the first zero-worker reading after the re-queue would delete an
+            # endpoint that never actually waited on capacity.
+            starved_since = None
+        # Restricted to IN_QUEUE: any other nonterminal status proves a worker was allocated, so
+        # zero-worker health then is a reporting artifact and never evidence of a starved DC.
+        #
+        # Health is re-read on EVERY queued poll rather than latched off after the first worker
+        # sighting. A box that is reported and then reclaimed while the job is still queued would
+        # otherwise suppress all later probes, and because the job never leaves the queue nothing
+        # would ever clear the latch -- the preload would burn the full timeout on a datacenter that
+        # had lost the worker. The grace anchor below, not the probe, is what keeps a transient
+        # zero-worker blip from tearing down a healthy endpoint.
+        else:
+            worker_state = _has_worker(endpoint_id, key_fingerprint, deadline)
+            if worker_state is False:
+                # Only a definite "no workers" starts or continues the run. None means health was
+                # unreadable, and treating that as starvation would delete the endpoint out from
+                # under a live download -- a broken health API must not look like a dead DC.
+                starved_since = time.time() if starved_since is None else starved_since
+                if time.time() - starved_since >= _NO_CAPACITY_GRACE_S:
+                    raise NoCapacityError(
+                        f"job {job_id} sat queued {_NO_CAPACITY_GRACE_S:.0f}s with no worker in any "
+                        "state: this datacenter cannot serve the requested GPU class"
+                    )
+            else:
+                # Unknown or a worker seen: the run of confirmed-starved readings is broken.
+                starved_since = None
         if status in _TERMINAL_OK:
             output = (st or {}).get("output")
             if not output:
@@ -165,7 +274,7 @@ def warm_weight_cache(
     models: list[str] | None = None,
     datacenters: list[str] | None = None,
     gpu: str = _PRELOAD_GPU,
-    timeout_s: int = 1800,
+    timeout_s: int = _PRELOAD_TIMEOUT_S,
     max_workers: int = 4,
     poll_interval_s: float = 10.0,
     token: str | None = None,
@@ -191,7 +300,22 @@ def warm_weight_cache(
         }
         results: list[dict] = [fut.result() for fut in as_completed(futs)]
     ok = sum(1 for r in results if r.get("status") == "ok")
+    starved = [r["datacenter"] for r in results if r.get("status") == "no_capacity"]
     logger.info("preload complete: %d/%d datacenters warmed", ok, len(results))
+    # A "partial" DC downloaded some models and failed others. The worker already reports which ones
+    # and why, but that detail died inside the result dict -- without it "partial" is unactionable.
+    for r in results:
+        if r.get("status") != "partial":
+            continue
+        failed = ((r.get("result") or {}).get("failed") or {})
+        for model_id, detail in sorted(failed.items()):
+            logger.warning("preload %s: %s FAILED: %s", r["datacenter"], model_id, detail)
+    if starved:
+        # Actionable: these stay cold until re-run with a class the DC actually stocks.
+        logger.warning(
+            "no %s capacity in %s -- re-run those with --datacenters %s --gpu <class>",
+            gpu, ", ".join(starved), ",".join(starved),
+        )
     return results
 
 
@@ -382,7 +506,7 @@ def _warm_one_lambda_instance(lambda_jobs, candidate, models: list, gpu: str,
 
 
 def warm_instances(models: list | None = None, gpu: str | None = None,
-                   timeout_s: int = 1800, poll_interval_s: float = 20.0,
+                   timeout_s: int = _PRELOAD_TIMEOUT_S, poll_interval_s: float = 20.0,
                    max_workers: int = 4) -> list[dict]:
     """Warm Lambda caches: one download-only launch per region with capacity. Returns status per region."""
     models = models or catalog_model_ids()
@@ -457,7 +581,8 @@ def main(argv: list[str] | None = None) -> int:
              "either. Defaulting to None (not a sentinel string) lets you explicitly pick even the "
              "per-mode default GPU without it being mistaken for 'no override'.",
     )
-    ap.add_argument("--timeout-s", type=int, default=1800, help="per-DC job timeout")
+    ap.add_argument("--timeout-s", type=int, default=_PRELOAD_TIMEOUT_S,
+                    help="per-DC job timeout (default sized for a fully cold whole-catalog warm)")
     ap.add_argument(
         "--max-workers", type=int, default=4,
         help="datacenters warmed concurrently. Each one deploys a preload endpoint, so this MUST stay "
