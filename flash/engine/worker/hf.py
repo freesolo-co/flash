@@ -722,7 +722,7 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
             # warmed configs): snapshot_download returns it as a cache hit without weights, and
             # the trainer then fails offline with "no pytorch_model.bin or model.safetensors".
             # validate weights exist before trusting the hit; one forced re-download repairs it.
-            if not _snapshot_has_weights(local_path):
+            if isinstance(local_path, str) and os.path.isdir(local_path) and not _snapshot_has_weights(local_path):
                 print(f"prefetch_model: cached snapshot for {model_id} has no weight files; re-downloading")
                 local_path = snapshot_download(
                     repo_id=model_id,
@@ -731,7 +731,7 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
                     force_download=True,
                     **model_revision_kwargs(revision),
                 )
-                if not _snapshot_has_weights(local_path):
+                if isinstance(local_path, str) and os.path.isdir(local_path) and not _snapshot_has_weights(local_path):
                     raise RuntimeError(
                         f"model snapshot for {model_id} has no weight files even after a forced "
                         "re-download; the repo layout is unsupported or the cache volume is corrupt"

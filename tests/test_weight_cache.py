@@ -408,8 +408,13 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
             cache_dir
         ):  # simulate a real download landing on the (mount) cache: create the repo folder
             folder = "models--" + repo_id.replace("/", "--")
-            os.makedirs(os.path.join(cache_dir, folder, "snapshots"), exist_ok=True)
-        return cache_dir or "/ephemeral"
+            snap = os.path.join(cache_dir, folder, "snapshots", "deadbeef")
+            os.makedirs(snap, exist_ok=True)
+            # a real download materializes weight files; prefetch validates they exist
+            with open(os.path.join(snap, "model.safetensors"), "w") as f:
+                f.write("stub")
+            return snap
+        return "/ephemeral"
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(ephemeral_hub))
