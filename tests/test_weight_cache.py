@@ -4109,6 +4109,76 @@ def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
     assert grown == {"acct-1", "acct-2"}
 
 
+def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch):
+    """Regression: a create that runs long drains the headroom the NEXT account's grow needs.
+
+    Headroom sizing cannot fix this on its own -- a failed create is bounded only by the deadline
+    itself, so there is no amount a caller could have added. The deployer therefore holds each
+    unreconciled account's grow slice back from creates, sweeps and quota back-offs, so an attempt
+    that reaches the create has already been able to reconcile.
+    """
+    import runpod_flash
+
+    from flash.providers import _deadline
+    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
+
+    account = {"key": "acct-1"}
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: account["key"])
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(rp_keys, "advance_key", lambda: account.update(key="acct-2"))
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: "balance" in str(exc))
+
+    events = []
+
+    def _grow(key, wanted, **kw):
+        events.append(("grow", key))
+        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S
+        return {}
+
+    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+
+    # Sized so the failover attempt starts with exactly the create allowance left: enough for
+    # require_create_allowance to pass, but `min(budget, remaining - allowance)` is then 0, so the
+    # unreserved code proceeded to attach with no reconciliation at all.
+    deadline = clock["t"] + 900.0
+    burn = {"s": deadline - clock["t"] - jobs.WEIGHT_CACHE_GROW_BUDGET_S - CREATE_ALLOWANCE_S}
+
+    def _endpoint(**kwargs):
+        events.append(("attach", account["key"]))
+        clock["t"] += burn["s"]  # a create that runs long before failing
+        burn["s"] = 0.0
+        raise RuntimeError("insufficient balance")
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    with pytest.raises(RuntimeError, match=r"balance|deadline"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            deadline_at=deadline,
+            cache_volumes={"flash-weights-us-ca-2": 250},
+        )
+
+    # The invariant, which holds whichever way the deadline falls: an account that reached the
+    # create had reconciled first. Out of time is allowed to fail the deploy; it is not allowed to
+    # quietly attach a stale volume, which is the failure this PR exists to prevent.
+    attached = {k for kind, k in events if kind == "attach"}
+    grown = {k for kind, k in events if kind == "grow"}
+    assert attached <= grown, f"attached without reconciling: {sorted(attached - grown)}"
+
+
 def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
     """The headroom is scoped to the account pool, so each account may reconcile at most once.
 

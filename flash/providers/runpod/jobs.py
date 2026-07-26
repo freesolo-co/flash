@@ -87,15 +87,14 @@ WEIGHT_CACHE_GROW_BUDGET_S = 20.0
 def weight_cache_grow_headroom_s() -> float:
     """Reconciliation headroom a whole ``deploy_train_endpoint`` call can need, in seconds.
 
-    Callers that hand the deployer a deadline must add this on top of whatever their job needs.
-    One attempt's worth is not enough: the grow yields the create allowance out of whatever is
-    LEFT, so headroom sized for a single attempt is spent by the first one, and every later attempt
-    then clamps to a zero budget and reconciles nothing. Those later attempts are the failover ones
-    -- exactly the attempts attaching a different account's volume, which is the only volume that
-    can still be stale by then.
+    Callers that hand the deployer a deadline add this on top of whatever their job needs, so the
+    reconciliation is funded from headroom rather than out of the job's own budget.
 
     Scoped to the account pool rather than the retry count because a repeat attempt on an account
     already reconciled in this call is skipped, so at most one grow per account actually runs.
+    Sizing alone does not keep a failover funded -- creates and quota back-offs would drain it
+    first, and a failing create has no bound to size against -- so the deployer additionally holds
+    each unreconciled account's slice back from them. This is the headroom, not the guarantee.
     """
     from flash.providers.runpod import keys as rp_keys
 
@@ -483,12 +482,33 @@ def deploy_train_endpoint(
 
     reconciled: set[str] = set()
 
+    def _create_deadline() -> float | None:
+        """``deadline_at`` less the grow budget still owed to accounts this call has not reconciled.
+
+        Creates, sweeps and quota back-offs run against this rather than the raw deadline, so they
+        cannot spend the slice a later failover's reconciliation needs. Held, not competed for:
+        without the reserve one slow failed create (or a couple of quota back-offs) drags remaining
+        down to the create allowance, the next account's grow clamps to zero, and that account
+        attaches the stale volume this whole path exists to prevent. Sizing the caller's headroom
+        larger cannot close that -- a failing create has no bound to size against -- so the budget
+        is set aside up front instead.
+
+        What this buys is a terminal invariant rather than another guess: an attempt that clears its
+        allowance check always has room to reconcile, so an attempt that reaches the create has
+        reconciled. When the deadline really is gone the attempt now fails on the deadline instead
+        of quietly mounting an undersized volume and dying later on "Disk quota exceeded".
+        """
+        if deadline_at is None:
+            return None
+        owed = max(0, rp_keys.key_count() - len(reconciled))
+        return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S * owed
+
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
         from flash.spec import gpu_count_of
 
         if deadline_at is not None:
-            require_create_allowance(deadline_at)
+            require_create_allowance(_create_deadline())
         with FLASH_SDK_LOCK:
             owning_key = ensure_auth()
             owning_fingerprint = runpod_api.key_fingerprint(owning_key)
@@ -519,6 +539,9 @@ def deploy_train_endpoint(
             # unreconciled.
             if owning_key not in reconciled:
                 reconciled.add(owning_key)
+                # Spends against the raw deadline: this account's slice of the reserve is released
+                # by the line above, so the grow draws its own budget and still yields the create
+                # allowance. The slices of the accounts not yet reconciled stay held back.
                 grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)
             # Re-invoke factory per account (avoids reusing a volume id stamped for the prior account).
             override = endpoint_kwargs() if callable(endpoint_kwargs) else endpoint_kwargs
@@ -531,8 +554,9 @@ def deploy_train_endpoint(
             if deadline_at is None:
                 resource = asyncio.run(rm.get_or_deploy_resource(config))
             else:
-                require_create_allowance(deadline_at)
-                remaining = remaining_seconds(deadline_at)
+                create_deadline = _create_deadline()
+                require_create_allowance(create_deadline)
+                remaining = remaining_seconds(create_deadline)
                 resource = asyncio.run(
                     asyncio.wait_for(
                         rm.get_or_deploy_resource(config),
@@ -555,17 +579,21 @@ def deploy_train_endpoint(
                 # so it stays conservative (reap_warm=False): it reaps only endpoints fully scaled
                 # to zero, never another live run's between-jobs WARM endpoint. The control-plane
                 # periodic reaper does the run-aware, graced warm-idle sweep across all live runs.
+                # Reserved deadline, like the create: the sweep and the back-off sleep below are the
+                # likelier drain of the two, since quota pressure is exactly the condition that ends
+                # in a failover to an account that still needs reconciling.
+                quota_deadline = _create_deadline()
                 if deadline_at is not None:
-                    require_create_allowance(deadline_at)
+                    require_create_allowance(quota_deadline)
                 swept = _sweep_idle_flash_endpoints(
                     protected={canonical_endpoint_name(name)},
                     min_idle_s=0.0,
                     reap_warm=False,
-                    **deadline_kwargs(_sweep_idle_flash_endpoints, deadline_at),
+                    **deadline_kwargs(_sweep_idle_flash_endpoints, quota_deadline),
                 )
                 wait_s = 30 * quota_attempt
                 if deadline_at is not None:
-                    wait_s = min(wait_s, remaining_seconds(deadline_at))
+                    wait_s = min(wait_s, remaining_seconds(quota_deadline))
                 logger.warning(
                     "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
                     "retrying in %ds",
