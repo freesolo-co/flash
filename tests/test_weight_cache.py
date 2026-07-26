@@ -4489,6 +4489,169 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
     assert grows == ["only-account"]
 
 
+def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
+    """Regression: the reserve is a spending cap, not an admission test.
+
+    ``submit_run`` hands the deployer the run wall deadline as-is -- it is a submission-to-terminal
+    budget, so unlike the preload it has no headroom to add on top and nothing to add it out of.
+    Charging the whole pool's reserve before the first create then made an attempt that could launch
+    look like one that could not: with 2 accounts and 90s left the allowance check ran against an
+    effective 50s and the deploy was rejected outright, to protect the reconciliation of failovers
+    that were never going to run. The training path attaches the managed cache on every ordinary
+    run, so this is the common case, not an edge one.
+    """
+    import runpod_flash
+
+    from flash import runner
+    from flash.providers import _deadline
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
+
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(
+        jobs.runpod_api, "grow_network_volumes_for_key", lambda key, wanted, **kw: {}
+    )
+
+    reached = []
+
+    def _endpoint(**kwargs):
+        reached.append("create")
+        raise RuntimeError("reached the provider")
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    # exactly what submit_run passes: the managed cache attached, deadline handed over unpadded
+    with pytest.raises(RuntimeError, match=r"reached the provider"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
+            endpoint_kwargs=lambda: {},
+            deadline_at=clock["t"] + 90.0,
+        )
+
+    assert reached == ["create"], "a deploy holding the create allowance was rejected before it ran"
+
+
+def test_the_grow_reserve_still_caps_what_a_create_may_spend(monkeypatch):
+    """The other direction: admission is judged on the real deadline, spending is not.
+
+    Relaxing the allowance check must not also hand the create the reserved slice to burn. The
+    create still runs under `_create_deadline()`, so the account a failover lands on keeps the
+    budget it needs to reconcile -- without that, this fix would reintroduce the stale under-sized
+    mount that the reserve exists to prevent.
+    """
+    import runpod_flash
+
+    from flash import runner
+    from flash.providers import _deadline
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
+
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(
+        jobs.runpod_api, "grow_network_volumes_for_key", lambda key, wanted, **kw: {}
+    )
+
+    timeouts = []
+
+    def _wait_for(coro, timeout=None):
+        timeouts.append(timeout)
+        coro.close()
+        raise RuntimeError("reached the provider")
+
+    monkeypatch.setattr(jobs.asyncio, "wait_for", _wait_for)
+    monkeypatch.setattr(
+        runpod_flash,
+        "Endpoint",
+        lambda **kw: types.SimpleNamespace(_build_resource_config=dict),
+    )
+
+    with pytest.raises(RuntimeError, match=r"reached the provider"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
+            endpoint_kwargs=lambda: {},
+            deadline_at=clock["t"] + 900.0,
+        )
+
+    # one account still unreconciled at create time, so its slice stays held back
+    assert timeouts == [900.0 - jobs.WEIGHT_CACHE_GROW_BUDGET_S]
+
+
+def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
+    """Regression: the reserve must yield the create allowance, like the grow it is reserved for.
+
+    Admission passing is not enough on its own. A pool large enough for the reserve to exceed what
+    is left hands `asyncio.wait_for` a zero (or negative) timeout, so the create fails without ever
+    reaching the provider -- rejecting the same launchable deploy one step later than the admission
+    check did. The floor is the allowance the deploy already proved it holds.
+    """
+    import runpod_flash
+
+    from flash import runner
+    from flash.providers import _deadline
+    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
+
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
+    # 8 accounts * 20s reserve = 160s, more than the 90s left
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 8)
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(
+        jobs.runpod_api, "grow_network_volumes_for_key", lambda key, wanted, **kw: {}
+    )
+
+    timeouts = []
+
+    def _wait_for(coro, timeout=None):
+        timeouts.append(timeout)
+        coro.close()
+        raise RuntimeError("reached the provider")
+
+    monkeypatch.setattr(jobs.asyncio, "wait_for", _wait_for)
+    monkeypatch.setattr(
+        runpod_flash,
+        "Endpoint",
+        lambda **kw: types.SimpleNamespace(_build_resource_config=dict),
+    )
+
+    with pytest.raises(RuntimeError, match=r"reached the provider"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
+            endpoint_kwargs=lambda: {},
+            deadline_at=clock["t"] + 90.0,
+        )
+
+    assert timeouts == [CREATE_ALLOWANCE_S]
+
+
 def test_grow_headroom_covers_every_account_in_the_pool(monkeypatch):
     """The caller cannot fund a whole deploy from a single grow budget: failover reconciles again."""
     from flash.providers.runpod import jobs
