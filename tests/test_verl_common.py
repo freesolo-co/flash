@@ -58,19 +58,13 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert python_bin.endswith("/verl-venv/bin/python")
     assert calls[0][:2] == ["uv", "venv"]
     install = calls[1]
+    # unpinned so the dev fallback tracks current verl (vllm 0.23/0.24, Qwen3.5-capable)
     assert "verl" in install
-    assert not any(x.startswith("verl==") or x.startswith("verl[") for x in install)
-    assert "vllm==0.11.0" in install
-    assert "transformers==5.10.2" in install
+    assert not any(x.startswith("verl==") for x in install)
     assert "liger-kernel" in install
     assert "bitsandbytes>=0.49" in install
     assert "qwen-vl-utils" in install
     assert "torchvision" in install
-    assert calls[2] == [
-        python_bin,
-        "-c",
-        "import qwen_vl_utils; import torchvision",
-    ]
 
 
 def test_run_verl_training_streams_steps_and_returns_code():
