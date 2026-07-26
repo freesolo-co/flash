@@ -3972,6 +3972,96 @@ def test_a_blackout_only_pauses_the_grace_and_never_restarts_it(monkeypatch):
         preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
 
 
+def test_a_health_blackout_cannot_restart_the_starvation_grace(monkeypatch):
+    """An unreadable health API must pause the timers, not clear them.
+
+    _worker_counts returns None when health could not be read, and all three predicates read None as
+    inactive -- so running them on a blind reading CLEARED every anchor. One failed health call per
+    grace window then restarted every window, and a datacenter that never allocated a worker held a
+    paid endpoint for the full 5400s timeout before reporting a bare TimeoutError.
+
+    Health here alternates unreadable/confirmed-zero-workers, and only the confirmed polls advance
+    the clock. A reset-on-unknown rule never lets the anchor survive two confirmed polls in a row,
+    so it can never reach the 100s grace; pausing accumulates the confirmed time and must fire.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    clock = {"now": 1000.0}
+    polls = {"n": 0}
+
+    def _blind(n: int) -> bool:
+        return n % 2 == 0
+
+    def _status(*_a, **_k):
+        # the clock must move BEFORE the loop captures `now`, so charge the advance here rather than
+        # in the health stub. Time is charged only to intervals that END at a confirmed reading; the
+        # blackouts are instantaneous, so nothing but genuinely observed queued time accumulates.
+        if not _blind(polls["n"]):
+            clock["now"] += 40.0
+        return {"status": "IN_QUEUE"}
+
+    def _health(*_a, **_k):
+        # counter-driven, not an iterator: a StopIteration here would be swallowed by
+        # _worker_counts into a None reading and the poller would spin on a frozen clock
+        n = polls["n"]
+        polls["n"] += 1
+        return None if _blind(n) else {"workers": {}}
+
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 100.0)
+
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+
+
+def test_a_health_blackout_is_not_charged_to_the_grace_either(monkeypatch):
+    """The pause must stay a pause: blind time may not age an armed timer.
+
+    The mirror of the test above, and it guards the OPPOSITE failure. Pausing is the fix for the
+    reset bug, but charging the blind gap would be an over-correction -- the reading that would have
+    cleared the anchor (a worker finally appearing) is exactly what a health blackout hides, so the
+    first confirmed reading after a long dark stretch would tear down an endpoint whose download may
+    be progressing fine.
+
+    Zero workers are confirmed for 60s, health goes dark for 300s, then a confirmed reading returns
+    -- against a 100s grace. Only the confirmed 60s+10s may be charged, so the poll must survive to
+    completion. A rule that charged the dark 300s would raise NoCapacityError here instead.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    clock = {"now": 1000.0}
+    polls = {"n": 0}
+    statuses = ["IN_QUEUE"] * 5 + ["COMPLETED"]
+    # confirmed zero workers, a long unreadable stretch, then confirmed zero workers again: the
+    # post-blackout reading must stay a zero so a charge-the-gap rule actually has a timer to fire
+    healths = [{"workers": {}}, {"workers": {}}, None, None, {"workers": {}}]
+    gaps = [0.0, 60.0, 150.0, 150.0, 10.0, 10.0]
+
+    def _status(*_a, **_k):
+        clock["now"] += gaps[polls["n"]]
+        return {"status": statuses[polls["n"]], "output": {"preloaded": ["m1"]}}
+
+    def _health(*_a, **_k):
+        # indexed, not an iterator: _worker_counts swallows any exception into a None reading, so a
+        # StopIteration would silently become a blackout and spin the poller on a frozen clock
+        health = healths[polls["n"]]
+        polls["n"] += 1
+        return health
+
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 100.0)
+    monkeypatch.setattr(preload, "decode_output", lambda out: out)
+
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+    assert out == {"preloaded": ["m1"]}
+
+
 def test_a_throttled_worker_is_not_a_broken_image(monkeypatch):
     """unhealthy + throttled is capacity contention, NOT a failed image pull.
 

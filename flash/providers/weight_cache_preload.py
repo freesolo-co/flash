@@ -344,31 +344,43 @@ def _poll_until_done(
         elif status == _QUEUED:
             now = time.time()
             workers = _worker_counts(endpoint_id, key_fingerprint, deadline)
-            # Only a definite "no workers" arms or holds the timer. None means health was
-            # unreadable, and treating that as starvation would delete the endpoint out from under
-            # a live download -- a broken health API must not look like a dead DC.
-            if starved.expired(_has_worker(workers) is False, now, _NO_CAPACITY_GRACE_S):
-                raise NoCapacityError(
-                    f"job {job_id} sat queued {_NO_CAPACITY_GRACE_S:.0f}s with no worker in any "
-                    "state: this datacenter cannot serve the requested GPU class"
-                )
-            # A box that was allocated and then died counts as capacity above, so without its own
-            # timer it clears the starvation one every poll and the preload holds a paid endpoint
-            # for the whole timeout before reporting a bare TimeoutError. The image is broken; say so.
-            if unhealthy.expired(_only_unhealthy_workers(workers), now, _UNHEALTHY_GRACE_S):
-                raise RuntimeError(
-                    f"preload job {job_id} sat queued {_UNHEALTHY_GRACE_S:.0f}s with every worker "
-                    "unhealthy: the worker image failed to start (likely a failed image pull), "
-                    "which no datacenter or GPU class can fix"
-                )
-            # Throttled boxes count as allocated capacity above and block the unhealthy timer, so
-            # without this a mixed unhealthy+throttled endpoint clears both every poll and burns the
-            # whole timeout. This is the same call poll_job makes: RunPod is not scheduling here.
-            if throttled.expired(_throttled_workers(workers), now, _THROTTLED_GRACE_S):
-                raise NoCapacityError(
-                    f"job {job_id} sat queued {_THROTTLED_GRACE_S:.0f}s with every worker throttled "
-                    "and none usable: RunPod is not scheduling the requested GPU class here"
-                )
+            if workers is None:
+                # Health unreadable. Every predicate below reads None as inactive, so running them
+                # would CLEAR all three anchors -- one failed health call per grace window would
+                # restart every window and a genuinely starved, broken or throttled DC would hold a
+                # paid endpoint for the whole timeout before reporting a bare TimeoutError. The job
+                # being confirmed queued says nothing about which of those it is suffering from;
+                # only health does, and health is what went dark. Pause, do not reset.
+                starved.unknown(now)
+                unhealthy.unknown(now)
+                throttled.unknown(now)
+            else:
+                # Only a definite "no workers" arms or holds the timer -- see the None branch above
+                # for why an unreadable health API must never look like a starved DC.
+                if starved.expired(_has_worker(workers) is False, now, _NO_CAPACITY_GRACE_S):
+                    raise NoCapacityError(
+                        f"job {job_id} sat queued {_NO_CAPACITY_GRACE_S:.0f}s with no worker in any "
+                        "state: this datacenter cannot serve the requested GPU class"
+                    )
+                # A box that was allocated and then died counts as capacity above, so without its
+                # own timer it clears the starvation one every poll and the preload holds a paid
+                # endpoint for the whole timeout before reporting a bare TimeoutError. The image is
+                # broken; say so.
+                if unhealthy.expired(_only_unhealthy_workers(workers), now, _UNHEALTHY_GRACE_S):
+                    raise RuntimeError(
+                        f"preload job {job_id} sat queued {_UNHEALTHY_GRACE_S:.0f}s with every "
+                        "worker unhealthy: the worker image failed to start (likely a failed image "
+                        "pull), which no datacenter or GPU class can fix"
+                    )
+                # Throttled boxes count as allocated capacity above and block the unhealthy timer,
+                # so without this a mixed unhealthy+throttled endpoint clears both every poll and
+                # burns the whole timeout. Same call poll_job makes: RunPod is not scheduling here.
+                if throttled.expired(_throttled_workers(workers), now, _THROTTLED_GRACE_S):
+                    raise NoCapacityError(
+                        f"job {job_id} sat queued {_THROTTLED_GRACE_S:.0f}s with every worker "
+                        "throttled and none usable: RunPod is not scheduling the requested GPU "
+                        "class here"
+                    )
         else:
             # Status unreadable. Neither branch above ran, so without this the armed anchors keep
             # aging on wall time the poller could not see -- and a run that ended and was re-queued
