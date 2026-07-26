@@ -856,7 +856,7 @@ def run_opd_verl(spec=None) -> None:
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
-        exact_type=spec.gpu.exact_type if spec else "",
+        exact_type=spec.gpu.type if spec else "",
     )
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
