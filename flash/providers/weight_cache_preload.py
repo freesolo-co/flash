@@ -235,10 +235,12 @@ def _preload_one_dc(
         # gets its own bounded budget on top, never a slice carved out of the job's. Without the
         # headroom a short --timeout-s floors at the 60s create allowance all by itself, the grow
         # yields to that allowance, and reconciliation is skipped entirely -- reintroducing the
-        # under-sized mount this whole path exists to prevent.
-        from flash.providers.runpod.jobs import WEIGHT_CACHE_GROW_BUDGET_S
+        # under-sized mount this whole path exists to prevent. The deployer may reconcile once per
+        # account on a quota/balance failover, so ask it how much a whole call can need rather than
+        # funding a single grow.
+        from flash.providers.runpod.jobs import weight_cache_grow_headroom_s
 
-        deadline_at = time.time() + timeout_s + WEIGHT_CACHE_GROW_BUDGET_S
+        deadline_at = time.time() + timeout_s + weight_cache_grow_headroom_s()
         # The warm attaches its own volume (spec=None), so the deploy cannot derive what to
         # reconcile -- name it here. Reconciling per deploy attempt rather than sweeping the pool
         # up front is what keeps a quota/balance failover correct: the attempt grows the volume

@@ -71,6 +71,7 @@ __all__ = [
     "submit_run",
     "weight_cache_datacenters",
     "weight_cache_endpoint_kwargs",
+    "weight_cache_grow_headroom_s",
     "weight_cache_volume_name",
     "weight_cache_volumes",
 ]
@@ -81,6 +82,24 @@ __all__ = [
 # failing a deploy the healthy owning account could have served. Under a deadline the effective
 # budget is this OR whatever is left above the create allowance, whichever is smaller.
 WEIGHT_CACHE_GROW_BUDGET_S = 20.0
+
+
+def weight_cache_grow_headroom_s() -> float:
+    """Reconciliation headroom a whole ``deploy_train_endpoint`` call can need, in seconds.
+
+    Callers that hand the deployer a deadline must add this on top of whatever their job needs.
+    One attempt's worth is not enough: the grow yields the create allowance out of whatever is
+    LEFT, so headroom sized for a single attempt is spent by the first one, and every later attempt
+    then clamps to a zero budget and reconciles nothing. Those later attempts are the failover ones
+    -- exactly the attempts attaching a different account's volume, which is the only volume that
+    can still be stale by then.
+
+    Scoped to the account pool rather than the retry count because a repeat attempt on an account
+    already reconciled in this call is skipped, so at most one grow per account actually runs.
+    """
+    from flash.providers.runpod import keys as rp_keys
+
+    return WEIGHT_CACHE_GROW_BUDGET_S * max(1, rp_keys.key_count())
 
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
@@ -462,6 +481,8 @@ def deploy_train_endpoint(
     name = endpoint_name(friendly, name_suffix)
     image = worker_image_for_gpu(friendly, allow_default=True)
 
+    reconciled: set[str] = set()
+
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
         from flash.spec import gpu_count_of
@@ -492,7 +513,13 @@ def deploy_train_endpoint(
             # Inside the per-attempt body on purpose: failover picks a different account, and the
             # volume about to be attached is the one owned by whichever account this attempt landed
             # on. Deadline-aware: the create allowance is re-checked below, so this yields to it.
-            grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)
+            # Once per account, not once per attempt: a quota retry re-selects the account it just
+            # reconciled, and paying for that again would spend the budget the account a later
+            # failover lands on still needs -- leaving the one volume that can still be stale
+            # unreconciled.
+            if owning_key not in reconciled:
+                reconciled.add(owning_key)
+                grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)
             # Re-invoke factory per account (avoids reusing a volume id stamped for the prior account).
             override = endpoint_kwargs() if callable(endpoint_kwargs) else endpoint_kwargs
             kwargs.update(override if override is not None else weight_cache_endpoint_kwargs(spec))

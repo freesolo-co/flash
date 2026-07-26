@@ -3978,7 +3978,10 @@ def test_a_short_timeout_still_reconciles(monkeypatch):
     """
     from flash.providers import weight_cache_preload as preload
     from flash.providers._deadline import CREATE_ALLOWANCE_S
-    from flash.providers.runpod.jobs import WEIGHT_CACHE_GROW_BUDGET_S
+    from flash.providers.runpod.jobs import (
+        WEIGHT_CACHE_GROW_BUDGET_S,
+        weight_cache_grow_headroom_s,
+    )
 
     clock = {"t": 5000.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
@@ -3995,7 +3998,9 @@ def test_a_short_timeout_still_reconciles(monkeypatch):
     # the grow clamps to remaining - CREATE_ALLOWANCE_S, so headroom must survive that subtraction
     budget = (seen["deadline_at"] - clock["t"]) - CREATE_ALLOWANCE_S
     assert budget > 0
-    assert budget >= WEIGHT_CACHE_GROW_BUDGET_S
+    # and cover a whole deploy, not one attempt: a failover reconciles the account it lands on too
+    assert budget >= weight_cache_grow_headroom_s()
+    assert weight_cache_grow_headroom_s() >= WEIGHT_CACHE_GROW_BUDGET_S
 
 
 def test_deploy_side_grow_yields_the_create_allowance_it_sits_in_front_of(monkeypatch):
@@ -4039,6 +4044,129 @@ def test_deploy_side_grow_is_wired_to_the_run_deadline(monkeypatch):
 
     src = inspect.getsource(jobs.deploy_train_endpoint)
     assert "grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)" in src
+
+
+def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
+    """Regression: headroom for ONE grow is spent by the first attempt, starving every later one.
+
+    The grow clamps to `remaining - CREATE_ALLOWANCE_S`. With a single budget of headroom, attempt
+    one's grow consumed it, leaving remaining == the allowance exactly: enough for
+    require_create_allowance to pass, so the deploy proceeded, but a zero grow budget -- so the
+    failover account attached its own stale volume and died on "Disk quota exceeded". That account
+    is the only one whose volume can still be under-sized by then, so starving it defeats the fix.
+    """
+    import runpod_flash
+
+    from flash.providers import _deadline
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
+
+    account = {"key": "acct-1"}
+    # both are imported function-locally by deploy_train_endpoint, so patch them at the source
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: account["key"])
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(rp_keys, "advance_key", lambda: account.update(key="acct-2"))
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: True)
+
+    events = []
+
+    def _grow(key, wanted, **kw):
+        events.append(("grow", key))
+        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S  # a real grow burns its budget
+        return {}
+
+    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+
+    def _endpoint(**kwargs):
+        events.append(("attach", account["key"]))
+        raise RuntimeError("insufficient balance")
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    deadline = clock["t"] + 60 + jobs.weight_cache_grow_headroom_s()
+    with pytest.raises(RuntimeError, match="insufficient balance"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            deadline_at=deadline,
+            cache_volumes={"flash-weights-us-ca-2": 250},
+        )
+
+    # every account reconciled BEFORE it attached, not just the first
+    grown = {k for kind, k in events if kind == "grow"}
+    attached = [k for kind, k in events if kind == "attach"]
+    assert attached == ["acct-1", "acct-2"]
+    assert grown == {"acct-1", "acct-2"}
+
+
+def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
+    """The headroom is scoped to the account pool, so each account may reconcile at most once.
+
+    A quota retry re-selects the account it just reconciled. Paying for that again would spend the
+    budget the account a later failover lands on still needs, reintroducing the starvation this
+    headroom exists to prevent.
+    """
+    import runpod_flash
+
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "only-account")
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 1)
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: False)
+    monkeypatch.setattr(jobs, "_is_workers_quota_error", lambda exc: True)
+    monkeypatch.setattr(jobs.time, "sleep", lambda *_a: None)
+
+    grows = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: grows.append(key) or {},
+    )
+
+    def _endpoint(**kwargs):
+        raise RuntimeError("no workers available")
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    with pytest.raises(RuntimeError, match="no workers available"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            cache_volumes={"flash-weights-us-ca-2": 250},
+        )
+
+    # three quota attempts against one account, but only one grow
+    assert grows == ["only-account"]
+
+
+def test_grow_headroom_covers_every_account_in_the_pool(monkeypatch):
+    """The caller cannot fund a whole deploy from a single grow budget: failover reconciles again."""
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 3)
+    assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S * 3
+
+    # an unconfigured pool still funds the one attempt that runs
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 0)
+    assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S
 
 
 def test_one_bad_volume_never_blocks_the_others(monkeypatch):
