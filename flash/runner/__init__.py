@@ -632,6 +632,9 @@ WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
 #   = (162.5 - 71.9) + 143.8 = 234.4 GB for today's catalog.
 # 200 GB failed that by 34.4 GB and the 35B died with "Disk quota exceeded" on every datacenter,
 # no matter what order the downloads ran in. 250 GB clears it with ~15 GB of margin.
+# That 234.4 GB uses measured HF repo sizes; ``weight_cache_catalog_peak_gb`` recomputes the same
+# quantity from params_b and lands a bit lower (229.2 GB). Size against the larger, measured figure
+# -- params_b understates a repo that ships tokenizer/config/index files alongside the weights.
 WEIGHT_CACHE_VOLUME_GB = 250
 # Peak footprint ~= 2x bf16 download (checkpoint + Xet temp); must fit the fixed cache volume.
 _WEIGHT_CACHE_PEAK_FACTOR = 2.0
