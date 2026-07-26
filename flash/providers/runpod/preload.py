@@ -51,6 +51,29 @@ _HF_HOME = "/runpod-volume/hf-cache"
 _PRELOAD_GPU = "RTX 4090"
 _TERMINAL_OK = {"COMPLETED"}
 _TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
+# Not every storage DC stocks every GPU class -- US-KS-2/US-MO-2/US-NC-2/US-NE-1/US-WA-1 carry no
+# RTX 4090 at all. A preload pinned to a class the DC cannot serve never allocates a worker: the job
+# just sits queued until the timeout, so the DC stays silently cold and we pay for the wait. Give up
+# on a DC once it has held a queued job this long with no worker in any state.
+_NO_CAPACITY_GRACE_S = 420.0
+
+
+class NoCapacityError(RuntimeError):
+    """A datacenter never allocated a worker, i.e. it cannot serve the requested GPU class."""
+
+
+def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool:
+    """True once the endpoint has a worker in any state (initializing counts: capacity exists)."""
+    try:
+        health = runpod_api.endpoint_health_for_fingerprint(
+            endpoint_id,
+            key_fingerprint,
+            deadline_at=deadline,
+        )
+    except Exception:
+        return False  # health is a hint, never a reason to fail a download that may be fine
+    workers = (health or {}).get("workers") or {}
+    return any(int(workers.get(k) or 0) > 0 for k in ("initializing", "ready", "running", "idle"))
 
 
 def catalog_model_ids() -> list[str]:
@@ -121,6 +144,10 @@ def _preload_one_dc(
         if result.get("failed"):
             return {"datacenter": dc_id, "status": "partial", "result": result}
         return {"datacenter": dc_id, "status": "ok", "result": result}
+    except NoCapacityError as exc:
+        # Distinct from "error": nothing is broken, this DC just has no GPU of this class.
+        logger.warning("preload %s NO CAPACITY for %s: %s", dc_id, gpu, exc)
+        return {"datacenter": dc_id, "status": "no_capacity", "gpu": gpu, "error": str(exc)}
     except Exception as exc:  # one region failing must not abort the others
         logger.warning("preload %s FAILED: %s", dc_id, exc)
         return {"datacenter": dc_id, "status": "error", "error": str(exc)}
@@ -138,6 +165,8 @@ def _poll_until_done(
     poll_interval_s: float,
 ) -> dict:
     deadline = time.time() + timeout_s
+    started_at = time.time()
+    saw_worker = False
     while time.time() < deadline:
         st = runpod_api.job_status(
             endpoint_id,
@@ -146,6 +175,13 @@ def _poll_until_done(
             deadline_at=deadline,
         )
         status = (st or {}).get("status")
+        if not saw_worker and status not in _TERMINAL_OK and status not in _TERMINAL_FAIL:
+            saw_worker = _has_worker(endpoint_id, key_fingerprint, deadline)
+            if not saw_worker and time.time() - started_at >= _NO_CAPACITY_GRACE_S:
+                raise NoCapacityError(
+                    f"job {job_id} sat queued {_NO_CAPACITY_GRACE_S:.0f}s with no worker in any "
+                    "state: this datacenter cannot serve the requested GPU class"
+                )
         if status in _TERMINAL_OK:
             output = (st or {}).get("output")
             if not output:
@@ -191,7 +227,14 @@ def warm_weight_cache(
         }
         results: list[dict] = [fut.result() for fut in as_completed(futs)]
     ok = sum(1 for r in results if r.get("status") == "ok")
+    starved = [r["datacenter"] for r in results if r.get("status") == "no_capacity"]
     logger.info("preload complete: %d/%d datacenters warmed", ok, len(results))
+    if starved:
+        # Actionable: these stay cold until re-run with a class the DC actually stocks.
+        logger.warning(
+            "no %s capacity in %s -- re-run those with --datacenters %s --gpu <class>",
+            gpu, ", ".join(starved), ",".join(starved),
+        )
     return results
 
 

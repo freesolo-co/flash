@@ -2292,3 +2292,110 @@ def test_cli_runpod_warm_gpu_falls_back_to_preload_default(monkeypatch):
     seen.clear()
     assert preload.main(["--datacenters", "US-CA-2", "--gpu", "H100"]) == 0
     assert seen["gpu"] == "H100"
+
+
+def _poll_env(monkeypatch, statuses, workers):
+    """Wire _poll_until_done's two API calls: job status sequence + a fixed worker-health dict."""
+    from flash.providers.runpod import preload
+
+    seq = list(statuses)
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "job_status",
+        lambda *a, **k: {"status": seq.pop(0) if seq else "IN_QUEUE"},
+    )
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": workers},
+    )
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: None)
+
+
+def test_poll_gives_up_when_datacenter_never_allocates_a_worker(monkeypatch):
+    """A DC with no GPU of the requested class must fail fast, not burn the whole timeout.
+
+    Regression: US-KS-2/US-MO-2/US-NC-2/US-NE-1/US-WA-1 stock no RTX 4090, so preload jobs there sat
+    queued with an all-zero worker set until the 5400s timeout and the DC stayed silently cold.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    _poll_env(
+        monkeypatch,
+        ["IN_QUEUE"] * 50,
+        {"initializing": 0, "ready": 0, "running": 0, "idle": 0},
+    )
+
+    def _advance(*_a, **_k):
+        clock["t"] += 60.0
+        return {"workers": {"initializing": 0, "ready": 0, "running": 0, "idle": 0}}
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _advance)
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    # gave up inside the grace window, nowhere near the 5400s timeout
+    assert clock["t"] < preload._NO_CAPACITY_GRACE_S + 120.0
+
+
+def test_poll_waits_when_a_worker_is_initializing(monkeypatch):
+    """An initializing worker proves capacity exists: a slow download must NOT be cut short."""
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    # advance the clock in sleep(), so time moves even after the health probe stops being called
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {"initializing": 1, "ready": 0, "running": 0, "idle": 0}},
+    )
+    monkeypatch.setattr(preload, "decode_output", lambda o: {"preloaded": ["m"]})
+    # stays queued well past the no-capacity grace window, then completes
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "job_status",
+        lambda *a, **k: (
+            {"status": "COMPLETED", "output": "x"}
+            if clock["t"] > preload._NO_CAPACITY_GRACE_S * 2
+            else {"status": "IN_QUEUE"}
+        ),
+    )
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    assert out == {"preloaded": ["m"]}
+    assert clock["t"] > preload._NO_CAPACITY_GRACE_S  # proves it did not bail out early
+
+
+def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
+    """Health is a hint: an API error must not be read as 'no capacity' and kill a live download."""
+    from flash.providers.runpod import preload
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("health api down")
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _boom)
+    assert preload._has_worker("ep", "fp", 0.0) is False
+
+
+def test_no_capacity_is_reported_distinctly_from_error(monkeypatch):
+    """A starved DC surfaces as status='no_capacity' so the summary can name it and the GPU class."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        preload,
+        "deploy_train_endpoint",
+        lambda *a, **k: ("ep-1", "name", "fp-1"),
+    )
+    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda *a, **k: "job-1")
+    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda *a, **k: True)
+
+    def _starved(*_a, **_k):
+        raise preload.NoCapacityError("never allocated")
+
+    monkeypatch.setattr(preload, "_poll_until_done", _starved)
+    res = preload._preload_one_dc("US-KS-2", ["m"], None, "RTX 4090", 60, 1.0)
+    assert res["status"] == "no_capacity"
+    assert res["gpu"] == "RTX 4090"
+    assert res["datacenter"] == "US-KS-2"
