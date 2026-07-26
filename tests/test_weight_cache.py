@@ -3087,8 +3087,10 @@ def test_poll_gives_up_when_datacenter_never_allocates_a_worker(monkeypatch):
     monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _advance)
     with pytest.raises(preload.NoCapacityError):
         preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
-    # gave up inside the grace window, nowhere near the 5400s timeout
-    assert clock["t"] < preload._NO_CAPACITY_GRACE_S + 120.0
+    # gave up on the grace window, nowhere near the 5400s timeout. Bound allows two 60s polls on
+    # top of the grace: GraceTimer arms on the first confirmed reading rather than at launch, and
+    # never fires on the poll that armed it, so give-up lands a poll or two past _NO_CAPACITY_GRACE_S
+    assert clock["t"] <= preload._NO_CAPACITY_GRACE_S + 120.0
 
 
 def test_poll_waits_when_a_worker_is_initializing(monkeypatch):

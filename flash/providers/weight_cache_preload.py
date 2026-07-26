@@ -33,6 +33,7 @@ from flash.providers._poll import preload_instance_run_id
 from flash.providers.base import UnreconciledCreateError
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.jobs import (
+    GraceTimer,
     build_function_input,
     decode_output,
     deploy_train_endpoint,
@@ -283,12 +284,13 @@ def _poll_until_done(
     poll_interval_s: float,
 ) -> dict:
     deadline = time.time() + timeout_s
-    # Both graces are measured over an UNBROKEN run of confirmed readings, so each starts at its
-    # first such reading rather than at launch. Timing from launch would let an unreadable health
-    # API age a timer silently, and the first definite reading after that would fire instantly --
-    # deleting an endpoint whose download may be progressing.
-    starved_since: float | None = None
-    unhealthy_since: float | None = None
+    # Same GraceTimer poll_job runs, for the same reason: each grace is measured over an UNBROKEN
+    # run of confirmed readings, so it arms on the first such reading rather than at launch. Timing
+    # from launch would let an unreadable health API age a timer silently, and the first definite
+    # reading after that would fire instantly -- deleting an endpoint whose download may be
+    # progressing.
+    starved = GraceTimer()
+    unhealthy = GraceTimer()
     while time.time() < deadline:
         st = runpod_api.job_status(
             endpoint_id,
@@ -312,7 +314,7 @@ def _poll_until_done(
             # forward would charge the whole running interval to starvation and the first
             # zero-worker reading after the re-queue would delete an endpoint that never actually
             # waited on capacity. Same reasoning as poll_job clearing its in-queue timers.
-            starved_since = unhealthy_since = None
+            starved.since = unhealthy.since = None
         # Restricted to IN_QUEUE: any other nonterminal status proves a worker was allocated, so
         # zero-worker health then is a reporting artifact and never evidence of a starved DC.
         #
@@ -320,37 +322,28 @@ def _poll_until_done(
         # sighting. A box that is reported and then reclaimed while the job is still queued would
         # otherwise suppress all later probes, and because the job never leaves the queue nothing
         # would ever clear the latch -- the preload would burn the full timeout on a datacenter that
-        # had lost the worker. The grace anchors below, not the probe, are what keep a transient
+        # had lost the worker. The grace timers below, not the probe, are what keep a transient
         # blip from tearing down a healthy endpoint.
         elif status == _QUEUED:
+            now = time.time()
             workers = _worker_counts(endpoint_id, key_fingerprint, deadline)
-            worker_state = _has_worker(workers)
-            if worker_state is False:
-                # Only a definite "no workers" starts or continues the run. None means health was
-                # unreadable, and treating that as starvation would delete the endpoint out from
-                # under a live download -- a broken health API must not look like a dead DC.
-                starved_since = time.time() if starved_since is None else starved_since
-                if time.time() - starved_since >= _NO_CAPACITY_GRACE_S:
-                    raise NoCapacityError(
-                        f"job {job_id} sat queued {_NO_CAPACITY_GRACE_S:.0f}s with no worker in any "
-                        "state: this datacenter cannot serve the requested GPU class"
-                    )
-            else:
-                # Unknown or a worker seen: the run of confirmed-starved readings is broken.
-                starved_since = None
-            # A box that was allocated and then died counts as capacity above, so without this it
-            # clears the starvation timer every poll and the preload holds a paid endpoint for the
-            # whole timeout before reporting a bare TimeoutError. The image is broken; say so.
-            if _only_unhealthy_workers(workers):
-                unhealthy_since = time.time() if unhealthy_since is None else unhealthy_since
-                if time.time() - unhealthy_since >= _UNHEALTHY_GRACE_S:
-                    raise RuntimeError(
-                        f"preload job {job_id} sat queued {_UNHEALTHY_GRACE_S:.0f}s with every "
-                        "worker unhealthy: the worker image failed to start (likely a failed image "
-                        "pull), which no datacenter or GPU class can fix"
-                    )
-            else:
-                unhealthy_since = None
+            # Only a definite "no workers" arms or holds the timer. None means health was
+            # unreadable, and treating that as starvation would delete the endpoint out from under
+            # a live download -- a broken health API must not look like a dead DC.
+            if starved.expired(_has_worker(workers) is False, now, _NO_CAPACITY_GRACE_S):
+                raise NoCapacityError(
+                    f"job {job_id} sat queued {_NO_CAPACITY_GRACE_S:.0f}s with no worker in any "
+                    "state: this datacenter cannot serve the requested GPU class"
+                )
+            # A box that was allocated and then died counts as capacity above, so without its own
+            # timer it clears the starvation one every poll and the preload holds a paid endpoint
+            # for the whole timeout before reporting a bare TimeoutError. The image is broken; say so.
+            if unhealthy.expired(_only_unhealthy_workers(workers), now, _UNHEALTHY_GRACE_S):
+                raise RuntimeError(
+                    f"preload job {job_id} sat queued {_UNHEALTHY_GRACE_S:.0f}s with every worker "
+                    "unhealthy: the worker image failed to start (likely a failed image pull), "
+                    "which no datacenter or GPU class can fix"
+                )
         if status in _TERMINAL_OK:
             output = (st or {}).get("output")
             if not output:
