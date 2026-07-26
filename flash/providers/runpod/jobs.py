@@ -482,6 +482,21 @@ def deploy_train_endpoint(
 
     reconciled: set[str] = set()
 
+    def _reconciles_a_managed_cache() -> bool:
+        """Whether a grow on this call can actually spend budget.
+
+        Mirrors ``grow_weight_cache_volumes``'s own early return. A run that attaches no managed
+        cache -- an open-model run, an oversized catalog model, a spec carrying a custom volume the
+        caller sizes itself -- reconciles nothing, so reserving for it would shorten the deadline
+        for a create that was never going to grow anything.
+        """
+        if cache_volumes is not None:
+            return bool(cache_volumes)
+        from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+        base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
+        return str(base or "") == WEIGHT_CACHE_VOLUME_NAME
+
     def _create_deadline() -> float | None:
         """``deadline_at`` less the grow budget still owed to accounts this call has not reconciled.
 
@@ -497,9 +512,13 @@ def deploy_train_endpoint(
         allowance check always has room to reconcile, so an attempt that reaches the create has
         reconciled. When the deadline really is gone the attempt now fails on the deadline instead
         of quietly mounting an undersized volume and dying later on "Disk quota exceeded".
+
+        Reserved only for runs that actually attach the managed cache: holding time back from a
+        volume-free run would buy nothing and could fail an otherwise launchable create against a
+        deadline the create alone would have cleared.
         """
-        if deadline_at is None:
-            return None
+        if deadline_at is None or not _reconciles_a_managed_cache():
+            return deadline_at
         owed = max(0, rp_keys.key_count() - len(reconciled))
         return deadline_at - WEIGHT_CACHE_GROW_BUDGET_S * owed
 

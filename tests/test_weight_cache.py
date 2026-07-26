@@ -4179,6 +4179,58 @@ def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch)
     assert attached <= grown, f"attached without reconciling: {sorted(attached - grown)}"
 
 
+def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
+    """Regression: a run that attaches no managed cache must not pay the reconciliation reserve.
+
+    An open-model run, an oversized catalog model, or a spec carrying a custom volume reconciles
+    nothing -- `grow_weight_cache_volumes` early-returns for all three. Reserving for them shortened
+    the deadline for a create that was never going to grow anything, so with two accounts and 90s
+    left the create failed its allowance check against an effective 50s without ever reaching the
+    provider.
+    """
+    import runpod_flash
+
+    from flash.providers import _deadline
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
+
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
+    monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
+    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+
+    def _grow(key, wanted, **kw):  # pragma: no cover - must never run for a volume-free deploy
+        raise AssertionError("a volume-free run must not reconcile anything")
+
+    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+
+    reached = []
+
+    def _endpoint(**kwargs):
+        reached.append("create")
+        raise RuntimeError("reached the provider")
+
+    monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
+
+    # exactly Codex's scenario: 2 accounts, 90s left, no managed cache attached
+    with pytest.raises(RuntimeError, match=r"reached the provider"):
+        jobs.deploy_train_endpoint(
+            "RTX 4090",
+            spec=None,
+            endpoint_kwargs=lambda: {},
+            deadline_at=clock["t"] + 90.0,
+            cache_volumes=None,
+        )
+
+    assert reached == ["create"], "volume-free deploy was rejected before reaching the provider"
+
+
 def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
     """The headroom is scoped to the account pool, so each account may reconcile at most once.
 
