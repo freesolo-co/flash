@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import time
 import uuid
@@ -293,21 +294,26 @@ _LAMBDA_PRELOAD_GPU_LADDER = ("A10", "A100 SXM 40GB", "H100", "B200")
 _PRELOAD_STATUS_REPO = "Freesolo-Co/flash-weight-preload"
 
 
-def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list[tuple]:
-    """``(candidate, gpu_class)`` per Lambda region, using the cheapest class that region actually stocks.
+def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list[list]:
+    """One cheapest-first candidate list per Lambda region: ``[[cand, ...], ...]``.
 
-    An explicit ``gpu`` pins the class and is never second-guessed. Otherwise each class in the ladder
-    is asked which regions have capacity, cheapest first, and a region is claimed by the first class
-    that can reach it -- so a region with no A10 is still warmed on A100/H100/B200 instead of being
-    silently skipped. Capacity is a live, per-region property, so this is a lookup and not a constant.
+    An explicit ``gpu`` pins the class and is never second-guessed. Otherwise every ladder class is
+    asked which regions have capacity, and each region keeps ALL the classes that can reach it, so a
+    region with no A10 is still warmed on A100/H100/B200 instead of being silently skipped. Capacity
+    is a live, per-region property, so this is a lookup and not a constant.
 
-    The class is returned alongside the candidate rather than read back off it: the ladder is the
-    authority on what claimed each region, and defaulting a missing one would relaunch the very bug
-    this fixes -- an A10 box in a region that stocks no A10.
+    The whole per-region list is kept rather than just its cheapest entry because preload mode
+    deliberately never refreshes candidates: handing the launcher a single candidate means one clean
+    capacity rejection leaves that region cold even though a pricier class from the same inventory
+    snapshot was sitting right there. The alternative to a fallback is not a cheaper box, it is no box.
+
+    Ranked by each candidate's own ``price_usd_hr``, which ``usable_instances`` fills from the live
+    Lambda rate (falling back to the static table only when the live lookup fails). Ranking on the
+    ladder's fixed order instead would keep claiming regions in a stale June price order and could
+    launch the more expensive class after a Lambda discount.
     """
     classes = [gpu] if gpu else list(_LAMBDA_PRELOAD_GPU_LADDER)
-    claimed: set = set()
-    targets: list[tuple] = []
+    by_region: dict[str, list] = {}
     for cls in classes:
         try:
             candidates = lambda_jobs.usable_instances(cls)
@@ -315,11 +321,35 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list[tuple]:
             logger.warning("warm lambda: usable_instances(%s) failed (skipping): %s", cls, exc)
             continue
         for c in candidates:
-            if c.region in claimed:
-                continue
-            claimed.add(c.region)
-            targets.append((c, cls))
-    return targets
+            by_region.setdefault(c.region, []).append(c)
+    # Ties keep ladder order, which is the static cheapest-first sequence: a stable sort means an
+    # unavailable live price degrades to the old behaviour instead of to an arbitrary one.
+    return [
+        sorted(cands, key=lambda c: getattr(c, "price_usd_hr", None) or math.inf)
+        for _region, cands in sorted(by_region.items())
+    ]
+
+
+def _lambda_provisioned_regions() -> set[str]:
+    """Regions where the weight-cache filesystem exists, per the Lambda API. Empty if unreadable.
+
+    The warm summary needs this because a region with no capacity in ANY ladder class never becomes a
+    target and so never produces a result -- it would be invisible in a report built only from
+    results, which is exactly the silent fleet gap this change exists to expose.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    try:
+        fses = lambda_api.list_filesystems()
+    except Exception as exc:
+        logger.warning("warm lambda: list_filesystems failed, cannot report unreachable regions: %s", exc)
+        return set()
+    return {
+        (fs.get("region") or {}).get("name")
+        for fs in fses
+        if fs.get("name") == WEIGHT_CACHE_VOLUME_NAME and (fs.get("region") or {}).get("name")
+    }
 
 
 def _ensure_status_repo(token: str | None) -> None:
@@ -342,15 +372,18 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
     })
 
 
-def _warm_one_lambda_instance(lambda_jobs, candidate, models: list, gpu: str,
+def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
                               timeout_s: int, poll_interval_s: float) -> dict:
-    """Launch a download-only preload instance pinned to ``candidate``'s region, poll its status
-    marker, then ALWAYS terminate. One region failing never aborts the others.
+    """Launch a download-only preload instance in one Lambda region, poll its status marker, then
+    ALWAYS terminate. One region failing never aborts the others.
 
-    ``gpu`` is per-region: the ladder claims each region with the cheapest class that stocks it, so a
-    fleet-wide warm is normally a mix. Every result carries the class that warmed that region.
+    ``candidates`` is that region's cheapest-first class list. Each is tried until one launches, so a
+    capacity rejection on the cheap class falls through to a pricier one instead of leaving the region
+    cold -- preload mode never refreshes candidates itself. The GPU class is read off the candidate
+    that actually launched, so a mixed-class fleet warm reports what each region really cost.
     """
-    region = getattr(candidate, "region", "?")
+    region = getattr(candidates[0], "region", "?")
+    gpu = getattr(candidates[0], "gpu", None) or _LAMBDA_PRELOAD_GPU
     effective_s = max(60, int(timeout_s))
     # Embed reap deadline in the run_id so orphan sweep can free the box if this driver process dies.
     reap_deadline = int(time.time()) + effective_s
@@ -359,28 +392,38 @@ def _warm_one_lambda_instance(lambda_jobs, candidate, models: list, gpu: str,
     def _result(status: str, **extra) -> dict:
         return {"provider": "lambda", "region": region, "gpu": gpu, "status": status, **extra}
 
-    spec = _preload_instance_spec(gpu, run_id, wall_s=effective_s)
-    prefix = f"{spec.phase}/{run_id}"
-    reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
-                                 min_interval_s=max(5.0, poll_interval_s))
-    # Also watch the attempt marker: if the box dies early the failmark is the only signal (avoids
-    # polling to full timeout on a dead box). Completion file is authoritative when present.
-    fail_reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/lambda_attempt0.json",
-                                      min_interval_s=max(5.0, poll_interval_s))
     deadline = time.time() + effective_s
     try:
-        try:
-            lambda_jobs.launch_and_submit(
-                spec,
-                seed=spec.seed,
-                instances=[candidate],
-                attempt=0,
-                mode="preload",
-                models=models,
-                deadline_at=deadline,
-            )
-        except Exception as exc:  # no capacity / launch reject — skip this region (warm-on-first-run covers it)
-            return _result("error", error=f"launch: {exc}")
+        spec = launch_err = None
+        for cand in candidates:
+            # Rebuild per class: the spec carries the GPU, so reusing the cheap one's spec would
+            # launch the very mismatch this fallback exists to avoid.
+            gpu = getattr(cand, "gpu", None) or gpu
+            spec = _preload_instance_spec(gpu, run_id, wall_s=effective_s)
+            try:
+                lambda_jobs.launch_and_submit(
+                    spec,
+                    seed=spec.seed,
+                    instances=[cand],
+                    attempt=0,
+                    mode="preload",
+                    models=models,
+                    deadline_at=deadline,
+                )
+                launch_err = None
+                break
+            except Exception as exc:  # no capacity / launch reject — try the next class up the ladder
+                launch_err = exc
+                logger.info("warm lambda/%s: %s rejected (%s); trying next class", region, gpu, exc)
+        if launch_err is not None or spec is None:
+            return _result("error", error=f"launch: {launch_err}")
+        prefix = f"{spec.phase}/{run_id}"
+        reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
+                                     min_interval_s=max(5.0, poll_interval_s))
+        # Also watch the attempt marker: if the box dies early the failmark is the only signal (avoids
+        # polling to full timeout on a dead box). Completion file is authoritative when present.
+        fail_reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/lambda_attempt0.json",
+                                          min_interval_s=max(5.0, poll_interval_s))
         logger.info("warm lambda/%s: launched preload (%d models)", region, len(models))
         text = None
         while time.time() < deadline:
@@ -431,12 +474,19 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
     from flash.providers.lambdalabs import jobs as lambda_jobs
 
     targets = _lambda_warm_targets(lambda_jobs, gpu)
+    # Read before launching: a region with no capacity in any class never becomes a target, so the
+    # provisioned set is the only place its name still exists.
+    provisioned = _lambda_provisioned_regions()
     if not targets:
         logger.warning("warm: no Lambda capacity right now (nothing to warm)")
+        _log_unreachable_lambda_regions(provisioned, [])
         return []
     logger.info(
         "warm lambda: %d region(s) -> %s", len(targets),
-        ", ".join(f"{getattr(c, 'region', '?')}={cls}" for c, cls in targets),
+        ", ".join(
+            f"{getattr(cands[0], 'region', '?')}={'/'.join(getattr(c, 'gpu', '?') for c in cands)}"
+            for cands in targets
+        ),
     )
     # Fail fast before launching paid GPUs: status repo is the only completion signal.
     try:
@@ -447,21 +497,36 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
             "with write access before warming (refusing to launch paid GPUs that can't report)."
         ) from exc
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        # The class comes from the ladder, not the caller: it may have claimed each region with a
-        # different one, and the spec must match the box actually being launched.
+        # Each region gets its whole cheapest-first list, not one pre-picked class, so the launcher
+        # can fall through to a pricier class rather than leaving the region cold.
         futs = [
-            ex.submit(_warm_one_lambda_instance, lambda_jobs, c, models, cls,
+            ex.submit(_warm_one_lambda_instance, lambda_jobs, cands, models,
                       timeout_s, poll_interval_s)
-            for c, cls in targets
+            for cands in targets
         ]
         results = [f.result() for f in as_completed(futs)]
+    _log_unreachable_lambda_regions(provisioned, results)
+    return results
+
+
+def _log_unreachable_lambda_regions(provisioned: set[str], results: list[dict]) -> None:
+    """Name every provisioned region whose cache is not fully warm, however it got that way.
+
+    Two ways a region ends up cold, and a summary built from results alone only sees the first:
+    it warmed but did not finish (``timeout``/``partial``/``error``), or it had no capacity in any
+    ladder class and so never produced a result at all. The second is the silent fleet gap this
+    change exists to expose, so it is reported from the provisioned filesystems instead.
+    """
     # Anything not "ok" left that region's cache incomplete, so a timeout and a partial are as
     # actionable as an error -- reporting only errors would read as success on a half-warmed fleet.
-    cold = sorted({r["region"] for r in results if r.get("status") != "ok"})
-    if cold:
-        logger.warning("warm lambda: %d of %d region(s) not fully warmed: %s",
-                       len(cold), len(results), ", ".join(cold))
-    return results
+    incomplete = {r["region"] for r in results if r.get("status") != "ok"}
+    unreachable = provisioned - {r["region"] for r in results}
+    cold = sorted(incomplete | unreachable)
+    if not cold:
+        return
+    total = len(provisioned) or len(results)
+    detail = ", ".join(f"{r} (no capacity)" if r in unreachable else r for r in cold)
+    logger.warning("warm lambda: %d of %d region(s) not fully warmed: %s", len(cold), total, detail)
 
 
 def provision_lambda_filesystems(name: str | None = None) -> list[str]:
@@ -494,10 +559,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--datacenters", help="comma-separated DC ids (default: all storage DCs)")
     ap.add_argument(
         "--gpu", default=None,
-        help="GPU class for the preload worker. Defaults are per-mode (RunPod warm -> "
-             f"{_PRELOAD_GPU!r}; --warm-instances -> {_LAMBDA_PRELOAD_GPU!r}); pass this to override "
-             "either. Defaulting to None (not a sentinel string) lets you explicitly pick even the "
-             "per-mode default GPU without it being mistaken for 'no override'.",
+        help="GPU class for the preload worker. Defaults are per-mode: RunPod warm -> "
+             f"{_PRELOAD_GPU!r}; --warm-instances -> the cheapest class each region actually stocks, "
+             f"tried in the order {' -> '.join(_LAMBDA_PRELOAD_GPU_LADDER)}, so a region with no "
+             "cheap capacity is warmed on a pricier class instead of being skipped. Pass this to "
+             "pin ONE class everywhere and disable that fallback (a region that does not stock it "
+             "is then left cold). Defaulting to None (not a sentinel string) lets you explicitly "
+             "pick even a default GPU without it being mistaken for 'no override'.",
     )
     ap.add_argument("--timeout-s", type=int, default=1800, help="per-DC job timeout")
     ap.add_argument(
@@ -583,7 +651,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         failed = [r for r in results if r.get("status") not in ("ok",)]
         for r in results:
-            print(f"  {r['provider']}/{r['region']}: {r['status']}"
+            # Name the GPU: without --gpu the ladder picks per region, so this is the only place the
+            # operator can see which paid class each region actually billed.
+            gpu_note = f" on {r['gpu']}" if r.get("gpu") else ""
+            print(f"  {r['provider']}/{r['region']}: {r['status']}{gpu_note}"
                   + (f" ({r.get('error')})" if r.get("error") else ""))
         print(f"{len(results) - len(failed)}/{len(results)} regions warmed")
         return 1 if failed else 0

@@ -1893,8 +1893,12 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
 # ---------------------------------------------------------------------------
 # Instance-provider WARM orchestrator (warm_instances): launch -> poll marker -> terminate
 # ---------------------------------------------------------------------------
-def _cand(region):
-    return types.SimpleNamespace(region=region)
+_LADDER_PRICE = {"A10": 1.29, "A100 SXM 40GB": 1.99, "H100": 3.29, "B200": 6.99}
+
+
+def _cand(region, gpu="A10"):
+    # gpu is read off the candidate now: the class that launches must be the one the region stocks.
+    return types.SimpleNamespace(region=region, gpu=gpu, price_usd_hr=_LADDER_PRICE.get(gpu))
 
 
 def _wire_warm(monkeypatch, marker):
@@ -2113,10 +2117,19 @@ def test_lambda_ladder_is_ordered_cheapest_first():
 
 
 def _stocked(**by_class):
-    """usable_instances stub: map each GPU class to the regions that stock it right now."""
+    """usable_instances stub: map each GPU class to the regions that stock it right now.
+
+    Carries ``price_usd_hr`` like the real call does, since selection ranks on the live price.
+    """
     return lambda gpu: [
-        types.SimpleNamespace(region=r, gpu=gpu) for r in by_class.get(gpu.replace(" ", "_"), [])
+        types.SimpleNamespace(region=r, gpu=gpu, price_usd_hr=_LADDER_PRICE.get(gpu))
+        for r in by_class.get(gpu.replace(" ", "_"), [])
     ]
+
+
+def _plan(targets):
+    """Flatten warm targets to ``[(region, [class, ...]), ...]`` in cheapest-first order."""
+    return [(cands[0].region, [c.gpu for c in cands]) for cands in targets]
 
 
 def test_lambda_ladder_reaches_regions_the_cheapest_class_cannot(monkeypatch):
@@ -2141,10 +2154,11 @@ def test_lambda_ladder_reaches_regions_the_cheapest_class_cannot(monkeypatch):
     )
     targets = preload._lambda_warm_targets(lj, None)
 
-    assert [(c.region, cls) for c, cls in targets] == [
-        ("us-east-1", "A10"),  # cheapest class wins a contested region
-        ("asia-south-1", "A100 SXM 40GB"),  # unreachable on A10 alone
-        ("us-west-3", "H100"),  # only H100 stocks it
+    assert _plan(targets) == [
+        ("asia-south-1", ["A100 SXM 40GB"]),  # unreachable on A10 alone
+        # contested region: cheapest first, but the pricier class is RETAINED as a launch fallback
+        ("us-east-1", ["A10", "A100 SXM 40GB"]),
+        ("us-west-3", ["H100"]),  # only H100 stocks it
     ]
 
 
@@ -2161,7 +2175,7 @@ def test_lambda_ladder_skips_a_class_whose_capacity_lookup_fails(monkeypatch):
     monkeypatch.setattr(lj, "usable_instances", flaky)
     targets = preload._lambda_warm_targets(lj, None)
 
-    assert [(c.region, cls) for c, cls in targets] == [("asia-south-1", "H100")]
+    assert _plan(targets) == [("asia-south-1", ["H100"])]
 
 
 def test_lambda_explicit_gpu_pins_the_class_and_skips_the_ladder(monkeypatch):
@@ -2179,7 +2193,7 @@ def test_lambda_explicit_gpu_pins_the_class_and_skips_the_ladder(monkeypatch):
     targets = preload._lambda_warm_targets(lj, "B200")
 
     assert asked == ["B200"]  # ladder not walked
-    assert [(c.region, cls) for c, cls in targets] == [("us-east-1", "B200")]
+    assert _plan(targets) == [("us-east-1", ["B200"])]  # and no fallback class smuggled in
 
 
 def test_warm_result_reports_the_gpu_that_warmed_each_region(monkeypatch):
@@ -2219,10 +2233,136 @@ def test_warm_reports_timeouts_and_partials_as_not_warmed(monkeypatch):
     """A timed-out region left its cache incomplete; reporting only errors would read as success."""
     preload, lj, _launched, _terminated = _wire_warm(monkeypatch, None)  # marker never appears
     monkeypatch.setattr(lj, "usable_instances", _stocked(A10=["us-east-1"]))
+    # The poll budget floors at 60s and each loop sleeps >=5s, so a real timeout_s=1 would burn a
+    # minute of wall clock. Expire the deadline instead of waiting for it.
+    #
+    # Swap the module reference rather than setattr on preload.time: that attribute IS the stdlib
+    # time module, so patching through it moves the clock for the whole process (pytest internals,
+    # threads, HF clients) and leaks into later tests.
+    real_time = preload.time
+    ticks = iter([0.0, 0.0, 0.0])
+    monkeypatch.setattr(
+        preload, "time",
+        types.SimpleNamespace(time=lambda: next(ticks, 1e9), sleep=lambda s: None,
+                              monotonic=real_time.monotonic),
+    )
     res = preload.warm_instances(models=["a/b"], timeout_s=1, poll_interval_s=0.0)
 
     assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "timeout")]
     assert [r for r in res if r["status"] != "ok"], "timeout must not be counted as warmed"
+
+
+def test_warm_falls_back_to_a_pricier_class_when_the_cheap_one_is_rejected(monkeypatch):
+    """A capacity rejection must climb the ladder, not leave the region cold.
+
+    Preload mode deliberately never refreshes candidates, so handing the launcher only the cheapest
+    class means one clean rejection wastes a region whose A100 capacity was in the same snapshot.
+    """
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(
+        lj, "usable_instances", _stocked(A10=["us-east-1"], A100_SXM_40GB=["us-east-1"])
+    )
+    tried = []
+
+    def picky_launch(spec, seed, instances, **k):
+        tried.append(instances[0].gpu)
+        if instances[0].gpu == "A10":
+            raise RuntimeError("no capacity for A10 in us-east-1")
+
+    monkeypatch.setattr(lj, "launch_and_submit", picky_launch)
+    res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    assert tried == ["A10", "A100 SXM 40GB"], "must try the next class after a rejection"
+    assert [(r["region"], r["gpu"], r["status"]) for r in res] == [("us-east-1", "A100 SXM 40GB", "ok")]
+
+
+def test_warm_names_regions_with_no_capacity_in_any_class(monkeypatch, caplog):
+    """A region unreachable in every class produces no result, so only the filesystem list names it.
+
+    Reporting from results alone would silently omit exactly the fleet gap this change exposes.
+    """
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(lj, "usable_instances", _stocked(A10=["us-east-1"]))
+    monkeypatch.setattr(
+        preload, "_lambda_provisioned_regions", lambda: {"us-east-1", "us-south-2", "us-south-3"}
+    )
+    with caplog.at_level("WARNING"):
+        preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    warned = "\n".join(r.getMessage() for r in caplog.records)
+    assert "us-south-2" in warned, warned
+    assert "us-south-3" in warned, warned
+    assert "no capacity" in warned
+    assert "us-east-1" not in warned, "a region that warmed fine must not be reported cold"
+
+
+def test_warm_ranks_contested_regions_by_live_price_not_ladder_order(monkeypatch):
+    """Selection must follow the live rate: a Lambda discount reorders classes the static tuple cannot.
+
+    ``usable_instances`` already attaches the live ``price_usd_hr``; ignoring it would keep claiming
+    regions in a stale snapshot order and launch the more expensive box.
+    """
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    def discounted(gpu):
+        # H100 discounted below A10 -- the ladder tuple still lists A10 first.
+        price = {"A10": 1.29, "H100": 0.49}.get(gpu)
+        if price is None:
+            return []
+        return [types.SimpleNamespace(region="us-east-1", gpu=gpu, price_usd_hr=price)]
+
+    monkeypatch.setattr(lj, "usable_instances", discounted)
+    assert _plan(preload._lambda_warm_targets(lj, None)) == [("us-east-1", ["H100", "A10"])]
+
+
+def test_warm_ties_and_missing_prices_keep_ladder_order(monkeypatch):
+    """With no usable live price the selection must degrade to the static cheapest-first order.
+
+    An unavailable price is common; it must not randomize which paid class a region gets.
+    """
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    def priceless(gpu):
+        return [types.SimpleNamespace(region="us-east-1", gpu=gpu, price_usd_hr=None)]
+
+    monkeypatch.setattr(lj, "usable_instances", priceless)
+    assert _plan(preload._lambda_warm_targets(lj, None)) == [
+        ("us-east-1", ["A10", "A100 SXM 40GB", "H100", "B200"])
+    ]
+
+
+def test_warm_cli_prints_the_gpu_class_each_region_used(monkeypatch, capsys):
+    """Without --gpu the class is per region, so the printed line is the only cost audit an operator gets."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        preload, "warm_instances",
+        lambda **k: [{"provider": "lambda", "region": "us-west-3", "gpu": "H100", "status": "ok"}],
+    )
+    preload.main(["--warm-instances"])
+
+    out = capsys.readouterr().out
+    assert "us-west-3" in out, out
+    assert "H100" in out, out
+
+
+def test_warm_cli_help_does_not_promise_the_old_single_class(monkeypatch, capsys):
+    """--help must not still advertise A10 for a paid mode that can now launch up to B200."""
+    from flash.providers.runpod import preload
+
+    with pytest.raises(SystemExit):
+        preload.main(["--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+
+    assert "B200" in help_text, "help hides that the default may launch the priciest class"
+    for cls in preload._LAMBDA_PRELOAD_GPU_LADDER:
+        assert cls in help_text, f"{cls} missing from --gpu help"
 
 
 def test_warm_instances_explicit_gpu_overrides_default(monkeypatch):
@@ -2286,7 +2426,7 @@ def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
     preload._ensure_status_repo("token")
     spec = preload._preload_instance_spec("A10", "preload-test")
     result = preload._warm_one_lambda_instance(
-        jobs_mod, _cand("us-east-1"), ["a/b"], "A10", 5, 0.0
+        jobs_mod, [_cand("us-east-1")], ["a/b"], 5, 0.0
     )
 
     assert managed_repo == preload._PRELOAD_STATUS_REPO
