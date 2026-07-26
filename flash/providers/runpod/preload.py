@@ -640,9 +640,11 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
             # "nothing to do" at every call site, including the CLI, which would print "no capacity"
             # and exit 0 over a total Lambda outage. The caller must see this as a failure.
             raise RuntimeError(
-                "could not determine Lambda capacity: every instance-type lookup failed or was cut "
-                "off by the planning budget, so no region was warmed. This is NOT the same as no "
-                "capacity -- the fleet may be entirely cold. Check Lambda API reachability."
+                "could not determine Lambda capacity: at least one instance-type lookup failed or "
+                "was cut off by the planning budget, and the classes that did answer reported no "
+                "capacity, so no region was warmed. This is NOT the same as a measured zero-capacity "
+                "fleet -- regions reachable only through an unanswered class are unexamined, not "
+                "known cold. Check the warnings above for which class(es) went unanswered."
             )
         logger.warning("warm: no Lambda capacity right now (nothing to warm)")
         return []
