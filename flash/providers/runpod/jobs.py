@@ -63,6 +63,7 @@ __all__ = [
     "build_function_input",
     "decode_output",
     "deploy_train_endpoint",
+    "grow_weight_cache_volumes",
     "make_hf_failure_detail_reader",
     "make_hf_heartbeat_reader",
     "poll_job",
@@ -72,6 +73,12 @@ __all__ = [
     "weight_cache_volume_name",
     "weight_cache_volumes",
 ]
+
+# Growing an existing cache volume is best-effort reconciliation, so it gets a short fixed budget
+# rather than a share of the run deadline. An unreachable account would otherwise burn retries and
+# backoff against the same clock the launch needs, leaving less than the 60s create allowance and
+# failing a deploy the healthy owning account could have served.
+WEIGHT_CACHE_GROW_BUDGET_S = 20.0
 
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
@@ -135,6 +142,45 @@ def weight_cache_volumes(spec) -> list:
         NetworkVolume(name=weight_cache_volume_name(str(base), dc), size=size, datacenter=dc)
         for dc in dcs
     ]
+
+
+def grow_weight_cache_volumes(spec, key: str) -> None:
+    """Raise this account's already-provisioned shared-cache volumes to the managed size.
+
+    A NetworkVolume is only sized on CREATE: the SDK matches an existing volume by name+datacenter
+    and hands it back untouched, so every volume provisioned before a size bump keeps the old size
+    and the bump is a silent no-op. Requesting the new size on the attach is not enough -- the mount
+    stays small and the download dies with "Disk quota exceeded". Growing over REST is the only way
+    to reconcile one that already exists.
+
+    Scoped to ``key`` because the caller has already picked the account it is deploying under, and
+    only that account's volumes are the ones about to be attached.
+
+    Best-effort by design: a volume that cannot be grown still gets attached, which is no worse than
+    not trying, so this must never fail a deploy. It also takes a short fixed budget rather than the
+    run deadline -- an unreachable account must not spend the launch allowance the deploy still
+    needs.
+    """
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
+
+    base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
+    if str(base or "") != WEIGHT_CACHE_VOLUME_NAME:
+        return  # cache off, or a custom volume the caller owns the sizing of
+    wanted = {
+        weight_cache_volume_name(str(base), dc): WEIGHT_CACHE_VOLUME_GB
+        for dc in weight_cache_datacenters()
+    }
+    if not wanted:
+        return
+    try:
+        grown = runpod_api.grow_network_volumes_for_key(
+            key, wanted, deadline_at=time.time() + WEIGHT_CACHE_GROW_BUDGET_S
+        )
+    except Exception as exc:
+        logger.warning("weight cache: could not grow volume(s) (%s); attaching as-is", exc)
+        return
+    for name, size in sorted(grown.items()):
+        logger.info("weight cache: grew %s to %d GB (was under the managed size)", name, size)
 
 
 def weight_cache_endpoint_kwargs(spec) -> dict:
@@ -417,6 +463,10 @@ def deploy_train_endpoint(
             else:
                 kwargs["dependencies"] = resolve_worker_deps()
                 kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+            # Reconcile before attaching: a volume provisioned under an older, smaller managed size
+            # is returned as-is by the SDK, so without this an ordinary training job mounts the
+            # stale size and a model the new size admits fails with "Disk quota exceeded".
+            grow_weight_cache_volumes(spec, owning_key)
             # Re-invoke factory per account (avoids reusing a volume id stamped for the prior account).
             override = endpoint_kwargs() if callable(endpoint_kwargs) else endpoint_kwargs
             kwargs.update(override if override is not None else weight_cache_endpoint_kwargs(spec))

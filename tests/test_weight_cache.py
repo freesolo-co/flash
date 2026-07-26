@@ -3858,3 +3858,150 @@ def test_a_running_job_still_clears_the_starvation_grace(monkeypatch):
 
     out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
     assert out == {"preloaded": ["m1"]}
+
+
+def test_a_throttled_worker_is_not_a_broken_image(monkeypatch):
+    """unhealthy + throttled is capacity contention, NOT a failed image pull.
+
+    A throttled box may still become runnable, and poll_job gives throttling its own longer grace.
+    Classifying the endpoint as exclusively unhealthy would tear it down at the shorter grace and
+    blame a broken image for what is really a busy datacenter.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    assert preload._only_unhealthy_workers({"unhealthy": 1, "throttled": 1}) is False
+    # with nothing else alive it IS the broken-image case
+    assert preload._only_unhealthy_workers({"unhealthy": 1}) is True
+
+
+def test_an_ordinary_deploy_grows_the_stale_volume_before_attaching(monkeypatch):
+    """Regression: growth used to live only in the preload utility.
+
+    An ordinary training job attaching a pre-bump volume only changed the REQUESTED size, and the
+    SDK returns an existing volume untouched, so the run mounted the old size and a newly admitted
+    model died on "Disk quota exceeded" unless an operator had separately run the preload first.
+    """
+    from flash import runner
+    from flash.providers.runpod import jobs
+
+    calls = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: calls.append((key, dict(wanted))) or {},
+    )
+
+    spec = _vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME)
+    jobs.grow_weight_cache_volumes(spec, "owning-key")
+
+    assert len(calls) == 1
+    key, wanted = calls[0]
+    # scoped to the account actually being deployed under, not the whole pool
+    assert key == "owning-key"
+    # every storage DC's real per-DC volume name, at the managed size
+    assert wanted
+    assert set(wanted.values()) == {runner.WEIGHT_CACHE_VOLUME_GB}
+    assert all(name.startswith(f"{runner.WEIGHT_CACHE_VOLUME_NAME}-") for name in wanted)
+
+
+def test_an_ordinary_deploy_leaves_a_custom_volume_alone(monkeypatch):
+    """Only the platform-managed cache is reconciled; a custom volume is the caller's to size."""
+    from flash.providers.runpod import jobs
+
+    calls = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: calls.append((key, dict(wanted))) or {},
+    )
+
+    jobs.grow_weight_cache_volumes(_vol_spec("my-own-volume"), "k")
+    jobs.grow_weight_cache_volumes(_vol_spec(None), "k")
+
+    assert calls == []
+
+
+def test_a_failed_grow_never_blocks_an_ordinary_deploy(monkeypatch):
+    """Reconciliation is best-effort: attaching the old size beats failing the deploy outright."""
+    from flash import runner
+    from flash.providers.runpod import jobs
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("runpod unreachable")
+
+    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _boom)
+
+    # must not raise
+    jobs.grow_weight_cache_volumes(_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME), "k")
+
+
+def test_deploy_side_grow_takes_a_bounded_budget_not_the_run_deadline(monkeypatch):
+    """A bad account must not eat the launch allowance the deploy still needs.
+
+    Passing the run deadline into a retrying listing let an unreachable account burn request
+    timeouts plus backoff against the same clock, leaving under the 60s minimum create allowance so
+    deploy_train_endpoint rejected a launch the healthy owning account could have served.
+    """
+    from flash import runner
+    from flash.providers.runpod import jobs
+
+    seen = {}
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: seen.update(kw) or {},
+    )
+
+    before = time.time()
+    jobs.grow_weight_cache_volumes(_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME), "k")
+
+    assert seen["deadline_at"] - before <= jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0
+
+
+def test_pool_wide_grow_is_capped_even_with_a_hanging_account(monkeypatch):
+    """The preload walks the whole pool, so the CAP is across all accounts, not per account.
+
+    Without it, one unreachable account's retries push the warm past the create allowance.
+    """
+    from flash.providers import weight_cache_preload as preload
+    from flash.providers.runpod import jobs
+    from flash.providers.runpod import keys as rp_keys
+
+    clock = {"t": 5000.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(rp_keys, "keys", lambda: ["hangs", "healthy", "also-healthy"])
+
+    tried = []
+
+    def _grow(key, wanted, **kw):
+        tried.append(key)
+        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0  # this one burns the whole budget
+        return {}
+
+    monkeypatch.setattr(preload.runpod_api, "grow_network_volumes_for_key", _grow)
+    preload._grow_existing_cache_volumes({"flash-weights-us-ca-2": 250})
+
+    # stopped after the account that consumed the budget instead of walking the rest
+    assert tried == ["hangs"]
+
+
+def test_a_short_timeout_still_reconciles(monkeypatch):
+    """Regression: the cap must be carved from the front, not subtracted from the deadline.
+
+    effective timeouts floor at 60s on their own, so reserving the 60s create allowance OUT of the
+    deadline skipped reconciliation entirely and reintroduced the under-sized mount.
+    """
+    from flash.providers import weight_cache_preload as preload
+    from flash.providers.runpod import keys as rp_keys
+
+    tried = []
+    monkeypatch.setattr(rp_keys, "keys", lambda: ["k1", "k2"])
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: tried.append(key) or {},
+    )
+
+    preload._grow_existing_cache_volumes({"flash-weights-us-ca-2": 250})
+
+    assert tried == ["k1", "k2"]

@@ -146,11 +146,16 @@ def _only_unhealthy_workers(workers: dict | None) -> bool:
     Same predicate ``poll_job`` runs while IN_QUEUE: unhealthy with nothing usable and nothing still
     coming up. A box that is initializing may yet come good, and one that is ready/running/idle
     already has, so neither is a broken image.
+
+    ``throttled`` blocks this too. A throttled box is capacity contention, not a failed image: it may
+    still become runnable, and ``poll_job`` gives it its own longer grace. Calling a mixed
+    unhealthy+throttled endpoint a broken image would tear it down at the shorter grace and blame a
+    failed image pull for what is actually a busy datacenter.
     """
     if not workers:
         return False
     return _any_worker(workers, "unhealthy") and not _any_worker(
-        workers, "initializing", "ready", "running", "idle"
+        workers, "initializing", "ready", "running", "idle", "throttled"
     )
 
 
@@ -175,7 +180,7 @@ def catalog_model_ids() -> list[str]:
     return [mid for mid, _ in fitting]
 
 
-def _grow_existing_cache_volumes(wanted: dict[str, int], deadline_at: float) -> None:
+def _grow_existing_cache_volumes(wanted: dict[str, int]) -> None:
     """Raise any already-provisioned cache volume in ``wanted`` to the managed size, fleet-wide.
 
     A NetworkVolume is only sized on CREATE: the SDK matches an existing volume by name+datacenter
@@ -183,15 +188,29 @@ def _grow_existing_cache_volumes(wanted: dict[str, int], deadline_at: float) -> 
     size and the bump is a silent no-op. The warm then attaches an under-sized mount and the
     download dies with "Disk quota exceeded" -- the exact failure the bump was meant to fix.
 
-    Best-effort, and deliberately so: it runs against every account in the pool because the volume
-    may belong to any of them, and a warm on a healthy account must not be blocked by a bad key.
-    A volume that cannot be grown still gets attached, which is no worse than not trying.
+    Unlike the deploy path, this walks the WHOLE pool: the warm has not picked an account yet, so
+    the volume may belong to any of them. Each account therefore gets its own short budget, and the
+    pool as a whole is capped -- an unreachable account would otherwise spend three request timeouts
+    plus backoff against the deadline the launch needs and make deploy_train_endpoint reject a
+    launch the healthy owning account could have served.
+
+    The cap is carved from the front rather than by reserving a slice of the deadline: a short
+    --timeout-s floors at 60s all by itself, so subtracting the create allowance from it would
+    silently skip reconciliation entirely and reintroduce the under-sized mount.
+
+    Best-effort throughout: a volume that cannot be grown still gets attached, which is no worse
+    than not trying, so nothing here fails a warm.
     """
     from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod.jobs import WEIGHT_CACHE_GROW_BUDGET_S
 
+    reconcile_until = time.time() + WEIGHT_CACHE_GROW_BUDGET_S
     for i, key in enumerate(rp_keys.keys()):
+        if time.time() >= reconcile_until:
+            logger.warning("weight cache: out of reconciliation budget; attaching volume(s) as-is")
+            return
         try:
-            grown = runpod_api.grow_network_volumes_for_key(key, wanted, deadline_at=deadline_at)
+            grown = runpod_api.grow_network_volumes_for_key(key, wanted, deadline_at=reconcile_until)
         except Exception as exc:
             logger.warning(
                 "weight cache: could not grow volume(s) on RunPod account %d (%s); attaching as-is",
@@ -230,7 +249,7 @@ def _preload_one_dc(
     key_fingerprint = None
     deadline_at = time.time() + timeout_s
     try:
-        _grow_existing_cache_volumes({vol_name: WEIGHT_CACHE_VOLUME_GB}, deadline_at)
+        _grow_existing_cache_volumes({vol_name: WEIGHT_CACHE_VOLUME_GB})
         endpoint_id, _name, key_fingerprint = deploy_train_endpoint(
             gpu,
             execution_timeout_ms=timeout_s * 1000,
