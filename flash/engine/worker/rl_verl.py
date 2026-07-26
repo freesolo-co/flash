@@ -623,10 +623,18 @@ def run_rl_verl():
         expected_steps = int(inp["steps"])
         # match flash's wandb reporting when configured (verl reads WANDB_API_KEY, which flash sets).
         loggers = "console,wandb" if "wandb" in (_w.wandb_report_to() or []) else "console"
-        # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path.
+        # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path — but NOT for
+        # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
+        # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
         try:
             import torch as _torch_cc
-            fp8_kv = bool(_torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9))
+
+            from flash.engine.worker.packing import model_is_gdn_hybrid
+
+            _cc_ok = bool(
+                _torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9)
+            )
+            fp8_kv = _cc_ok and not model_is_gdn_hybrid(inp["model_id"])
         except Exception:  # no cuda / probe failure -> conservative bf16 kv
             fp8_kv = False
         cfg = {
