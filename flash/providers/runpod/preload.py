@@ -304,6 +304,19 @@ _LAMBDA_SNAPSHOT_BUDGET_S = 30.0
 _PRELOAD_STATUS_REPO = "Freesolo-Co/flash-weight-preload"
 
 
+class IncompleteWarmPlanError(RuntimeError):
+    """Some regions warmed, but a class went unanswered so the fleet was never fully measured.
+
+    Carries the results of the launches that DID run: they are real, paid, completed work, and a
+    bare raise would throw them away along with the record of which regions are now warm. The
+    caller reports them and then treats the run as unfinished rather than as a clean sweep.
+    """
+
+    def __init__(self, message: str, *, results: list[dict]):
+        super().__init__(message)
+        self.results = results
+
+
 def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> tuple[list[list], bool]:
     """``(one cheapest-first candidate list per Lambda region, planning was complete)``.
 
@@ -673,6 +686,20 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
         ]
         results = [f.result() for f in as_completed(futs)]
     _log_unreachable_lambda_regions(provisioned, results, planned=planned)
+    if not planned:
+        # The reachable launches above are real work and are kept -- but the fleet was never fully
+        # measured, so this run cannot be reported as a finished one. Without this the mixed case
+        # (one class unanswered, another still yielding targets) printed "N/N regions warmed" and
+        # exited 0, where N counted only the regions we managed to look at. A region reachable
+        # solely through the unanswered class is missing from both the numerator AND the
+        # denominator, so the ratio looks perfect precisely because the gap is invisible.
+        raise IncompleteWarmPlanError(
+            f"warmed {len(results)} region(s), but at least one instance-type lookup failed or was "
+            "cut off by the planning budget, so the fleet was not fully measured. Regions reachable "
+            "only through an unanswered class were never examined -- they are unmeasured, not known "
+            "warm. Re-run once Lambda is answering to cover them.",
+            results=results,
+        )
     return results
 
 
@@ -847,9 +874,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             print("would warm Lambda caches (one download-only launch per region with capacity)")
             return 0
-        results = warm_instances(models=models, gpu=args.gpu,
-                                 timeout_s=args.timeout_s, max_workers=args.max_workers)
+        incomplete = ""
+        try:
+            results = warm_instances(models=models, gpu=args.gpu,
+                                     timeout_s=args.timeout_s, max_workers=args.max_workers)
+        except IncompleteWarmPlanError as exc:
+            # Still print the per-region lines below: those launches ran and were paid for, and a
+            # bare traceback would hide which regions are now warm. The run is reported as
+            # unfinished at the end instead of as a clean sweep.
+            results, incomplete = exc.results, str(exc)
         if not results:
+            if incomplete:
+                print(f"0 regions warmed — {incomplete}")
+                return 1
             print("0 regions warmed — no Lambda region had capacity to warm right now "
                   "(weights download cold on first run). Nothing launched.")
             return 0
@@ -861,6 +898,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {r['provider']}/{r['region']}: {r['status']}{gpu_note}"
                   + (f" ({r.get('error')})" if r.get("error") else ""))
         print(f"{len(results) - len(failed)}/{len(results)} regions warmed")
+        if incomplete:
+            # NOT "N/N regions warmed ... exit 0": the denominator counts only the regions we could
+            # see, so a perfect ratio here means the gap is invisible, not absent.
+            print(f"WARNING: {incomplete}")
+            return 1
         return 1 if failed else 0
     if args.teardown:
         if scoped:

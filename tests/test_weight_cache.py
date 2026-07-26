@@ -2524,6 +2524,64 @@ def test_warm_reports_a_genuine_zero_capacity_fleet_as_success(monkeypatch):
     assert preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0) == []
 
 
+def test_warm_does_not_report_a_partial_sweep_as_a_finished_one(monkeypatch):
+    """A class going unanswered while ANOTHER still yields targets must not exit 0.
+
+    Regression for the mixed case: the total-outage path already raised, but here A10 fails and
+    H100 still returns a region, so the run warmed 1 of 1 REACHABLE regions and printed
+    "1/1 regions warmed". Any region stocked only by the unanswered class is absent from the
+    numerator AND the denominator, so the ratio looks perfect precisely because the gap is
+    invisible. The launches that did run are kept on the exception -- they are paid work.
+    """
+    preload, lj, launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(preload, "_lambda_provisioned_regions", lambda: set())
+
+    def flaky(gpu, **k):
+        if gpu == "A10":
+            raise RuntimeError("instance-types API down")
+        return [_cand("asia-south-1", gpu)] if gpu == "H100" else []
+
+    monkeypatch.setattr(lj, "usable_instances", flaky)
+    with pytest.raises(preload.IncompleteWarmPlanError) as exc:
+        preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    # the reachable region really was warmed, and that work must survive the raise
+    assert [r["region"] for r in exc.value.results] == ["asia-south-1"]
+    assert [r["status"] for r in exc.value.results] == ["ok"]
+    assert [region for region, _mode, _models in launched] == ["asia-south-1"]
+
+
+def test_warm_cli_exits_nonzero_when_the_fleet_was_not_fully_measured(monkeypatch, capsys):
+    """The operator-visible half: unmeasured must not look like success at the shell.
+
+    The launches still print, since they ran and were billed, but the exit code has to say the
+    sweep is unfinished -- a green exit here is what let unexamined regions stay cold unnoticed.
+    """
+    from flash.providers.runpod import preload as _p
+
+    model = _p.catalog_model_ids()[0]
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": [model], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(preload, "_lambda_provisioned_regions", lambda: set())
+
+    def flaky(gpu, **k):
+        if gpu == "A10":
+            raise RuntimeError("instance-types API down")
+        return [_cand("asia-south-1", gpu)] if gpu == "H100" else []
+
+    monkeypatch.setattr(lj, "usable_instances", flaky)
+    rc = preload.main(["--warm-instances", "--models", model])
+    combined = "".join(capsys.readouterr())
+
+    assert rc == 1, f"an unmeasured fleet must not exit 0: {combined!r}"
+    # the paid launch is still reported, not swallowed by the failure
+    assert "asia-south-1" in combined, combined
+    assert "not fully measured" in combined, combined
+
+
 def test_provisioned_region_snapshot_is_deadline_bounded(monkeypatch):
     """The reporting snapshot must carry its own deadline.
 
