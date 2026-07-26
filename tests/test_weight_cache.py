@@ -3691,6 +3691,55 @@ def test_grow_tolerates_a_volume_listing_without_usable_sizes(monkeypatch):
     assert patched == [f"{api.REST_BASE}/networkvolumes/v-4"]
 
 
+def test_one_stalling_volume_cannot_starve_the_rest_of_the_fleet(monkeypatch):
+    """Regression: a PATCH that burns the shared deadline left every later datacenter unreconciled.
+
+    Skipping a failed volume is not enough on its own. A PATCH that times out or 5xxes spends real
+    time inside its own retries, and when every PATCH is handed the same absolute deadline the first
+    under-sized volume can consume all of it -- every later one then fails its deadline check
+    instantly. That is the same fleet-wide gap as aborting the loop, reached more slowly, and a run
+    placed in one of those datacenters still dies on "Disk quota exceeded".
+    """
+    import types
+
+    from flash.providers import _deadline
+    from flash.providers.runpod import api
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(_deadline, "time", types.SimpleNamespace(time=lambda: clock["t"]))
+    monkeypatch.setattr(api, "time", types.SimpleNamespace(time=lambda: clock["t"]))
+
+    granted = []
+
+    class _Client:
+        def request_with_retries_for_key(self, key, target, **kwargs):
+            if target.endswith("/networkvolumes"):
+                return [
+                    {"id": f"v-{i}", "name": f"flash-weights-dc-{i}", "size": 100}
+                    for i in range(4)
+                ]
+            budget = kwargs["deadline_at"] - clock["t"]
+            granted.append(round(budget, 1))
+            if budget <= 0:
+                raise RuntimeError("PATCH deadline exceeded")
+            if target.endswith("v-0"):
+                clock["t"] += budget  # a stalling volume spends everything it is given
+                raise RuntimeError("PATCH timed out")
+            clock["t"] += 0.5
+            return {}
+
+    monkeypatch.setattr(api, "_CLIENT", _Client())
+    grown = api.grow_network_volumes_for_key(
+        "k",
+        {f"flash-weights-dc-{i}": 250 for i in range(4)},
+        deadline_at=clock["t"] + 20.0,
+    )
+
+    # the stalling volume gets its own share, not the whole budget, so the rest still reconcile
+    assert granted[0] == 5.0
+    assert grown == {f"flash-weights-dc-{i}": 250 for i in (1, 2, 3)}
+
+
 def test_warm_grows_the_volume_before_attaching_it(monkeypatch):
     """The grow must happen BEFORE the endpoint deploys, or the warm attaches the old size.
 

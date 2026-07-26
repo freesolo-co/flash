@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Any
 
 from flash._logging import get_logger
+from flash.providers._deadline import remaining_seconds
 from flash.providers._http import RestClient, is_not_found
 from flash.providers.runpod import keys as _keys
 
@@ -183,12 +185,21 @@ def grow_network_volumes_for_key(
     Volumes are independent, so one that cannot be grown -- concurrently deleted, momentarily
     unmodifiable -- only skips itself. Aborting the loop would leave every later datacenter's volume
     unreconciled, and a run placed in one of those would still hit "Disk quota exceeded".
+
+    Skipping itself is not enough on its own, though: a PATCH that times out or 5xxes spends real
+    time inside its own retries, and handing every PATCH the same shared deadline lets the first
+    under-sized volume consume all of it. Every later one then fails its deadline check immediately
+    and the loop reconciles nothing -- the same fleet-wide gap as aborting, reached by a slower
+    route. So each PATCH gets an equal share of what is LEFT, recomputed per volume: a stalling
+    volume can spend only its own share, and time a fast one does not use flows to the volumes
+    behind it.
     """
     out = _CLIENT.request_with_retries_for_key(
         key, f"{REST_BASE}/networkvolumes", retries=2, deadline_at=deadline_at
     )
     vols = out if isinstance(out, list) else (out or {}).get("networkVolumes", []) or []
     grown: dict[str, int] = {}
+    pending = []
     for vol in vols:
         name, vol_id = vol.get("name"), vol.get("id")
         target = wanted.get(name)
@@ -199,20 +210,29 @@ def grow_network_volumes_for_key(
         except (TypeError, ValueError):
             continue
         if current >= int(target):
-            continue
+            continue  # already at or above target; RunPod rejects a shrink
+        pending.append((name, vol_id, int(target)))
+    for position, (name, vol_id, target) in enumerate(pending):
+        patch_deadline = deadline_at
+        if deadline_at is not None:
+            left = remaining_seconds(deadline_at)
+            if left <= 0:
+                logger.warning("weight cache: out of time before %s; leaving it as-is", name)
+                continue
+            patch_deadline = time.time() + left / max(1, len(pending) - position)
         try:
             _CLIENT.request_with_retries_for_key(
                 key,
                 f"{REST_BASE}/networkvolumes/{vol_id}",
                 method="PATCH",
-                body={"size": int(target)},
+                body={"size": target},
                 retries=2,
-                deadline_at=deadline_at,
+                deadline_at=patch_deadline,
             )
         except Exception as exc:
             logger.warning("weight cache: could not grow %s (%s); leaving it as-is", name, exc)
             continue
-        grown[name] = int(target)
+        grown[name] = target
     return grown
 
 
