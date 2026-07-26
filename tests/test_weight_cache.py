@@ -2402,6 +2402,43 @@ def test_no_capacity_is_reported_distinctly_from_error(monkeypatch):
     assert res["datacenter"] == "US-KS-2"
 
 
+def test_catalog_is_ordered_largest_first(monkeypatch):
+    """Largest-first is what lets the biggest model claim its Xet scratch on an empty volume.
+
+    Smallest-first fills the shared volume with the small models and the largest one then dies with
+    "Disk quota exceeded" -- the exact model the cache exists to speed up.
+    """
+    from flash.providers.runpod import preload
+
+    ids = preload.catalog_model_ids()
+    from flash.catalog import MODELS
+
+    sizes = [MODELS[m].params_b or 0.0 for m in ids]
+    assert sizes == sorted(sizes, reverse=True), f"catalog must be largest-first, got {list(zip(ids, sizes))}"
+
+
+def test_whole_catalog_fits_the_volume_in_download_order(monkeypatch):
+    """Walk the real download order and assert no model ever needs more room than is left.
+
+    A download needs the weights plus ~as much again for Xet reconstruction, so the binding
+    constraint is peak-at-that-moment, not the final resident total.
+    """
+    from flash.catalog import MODELS
+    from flash.providers.runpod import preload
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB
+
+    used = 0.0
+    for model_id in preload.catalog_model_ids():
+        resident = (MODELS[model_id].params_b or 0.0) * 2.0
+        peak = resident * 2.0  # weights + reconstruction scratch
+        free = WEIGHT_CACHE_VOLUME_GB - used
+        assert peak <= free, (
+            f"{model_id} needs {peak:.1f} GB peak but only {free:.1f} GB free "
+            f"after {used:.1f} GB of earlier models -- it would fail with Disk quota exceeded"
+        )
+        used += resident
+
+
 def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):
     """'partial' alone is unactionable: the summary must name each failed model and its reason."""
     from flash.providers.runpod import preload

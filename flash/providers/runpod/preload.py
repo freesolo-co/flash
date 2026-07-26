@@ -77,11 +77,22 @@ def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool
 
 
 def catalog_model_ids() -> list[str]:
-    """Catalog base models that fit the weight-cache volume."""
+    """Catalog base models that fit the weight-cache volume, LARGEST FIRST.
+
+    Order matters and is not cosmetic. `_fits_weight_cache` sizes each model against an EMPTY
+    volume, but a preload fills one shared volume in sequence, and a download needs room for the
+    weights plus roughly as much again for Xet reconstruction scratch. Smallest-first spends the
+    volume on the small models and then cannot fit the largest one's scratch, so the biggest model
+    -- the one whose cold download costs the most, i.e. the whole point of the cache -- is exactly
+    the one that fails with "Disk quota exceeded". Largest-first takes its scratch while the volume
+    is still empty, and every smaller model then fits in what remains.
+    """
     from flash.catalog import MODELS
     from flash.runner import _fits_weight_cache
 
-    return [mid for mid, info in MODELS.items() if _fits_weight_cache(info)]
+    fitting = [(mid, info) for mid, info in MODELS.items() if _fits_weight_cache(info)]
+    fitting.sort(key=lambda pair: (-(pair[1].params_b or 0.0), pair[0]))
+    return [mid for mid, _ in fitting]
 
 
 def _preload_one_dc(
