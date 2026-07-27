@@ -105,11 +105,6 @@ class RunConfig:
         return self.method == "opd"
 
     @property
-    def uses_opd_rollout(self) -> bool:
-        """True for algorithms that reuse the resident OPD rollout and sizing path."""
-        return self.method in ("opd", "opsd")
-
-    @property
     def has_rollout(self) -> bool:
         """True when a step samples on-policy student completions."""
         return samples_on_policy(self.method)
@@ -119,7 +114,7 @@ class RunConfig:
         lora = self.lora_rank if self.lora_rank is not None else RECIPE.lora.rank
         if self.has_rollout:
             # rollout algorithms use either the opd-style single-rollout recipe or grpo's group recipe.
-            rc = RECIPE.opd if self.uses_opd_rollout else RECIPE.rl
+            rc = RECIPE.opd if self.is_opd else RECIPE.rl
             comp = self.completion_len
             if comp is None:
                 comp = rc.max_completion_len_thinking if self.thinking else rc.max_completion_len
