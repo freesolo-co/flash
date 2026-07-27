@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 import urllib.request
@@ -81,6 +82,7 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "actor_rollout_ref.actor.ppo_epochs=2" in o
     assert "actor_rollout_ref.model.enable_gradient_checkpointing=True" in o
     assert "data.seed=42" in o
+    assert "actor_rollout_ref.rollout.seed=42" in o
     assert "trainer.total_training_steps=60" in o
     assert "trainer.save_freq=20" in o
     assert "trainer.max_actor_ckpt_to_keep=1" in o
@@ -127,6 +129,22 @@ def test_build_verl_overrides_kl_on_when_requested():
     assert "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2" in o
 
 
+def test_verl_uses_canonical_heartbeat_stage_contracts():
+    from flash.engine.worker.heartbeat import _HB_THROTTLED_STAGES
+    from flash.providers._poll import STEP_GATED_STAGES
+    from flash.runner import _TRAINING_STAGES
+
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    assert "rl_verl_training" not in src
+    assert "rl_verl_finalizing" not in src
+    assert 'liveness_heartbeat("rl_step"' in src
+    assert '"rl_finalizing"' in src
+    assert "rl_step" in _HB_THROTTLED_STAGES
+    assert "rl_step" in STEP_GATED_STAGES
+    assert "rl_step" in _TRAINING_STAGES
+    assert "rl_finalizing" in _HB_THROTTLED_STAGES
+
+
 # ------------------------------- reward module render -------------------------------
 def test_render_reward_module_is_valid_and_defines_compute_score():
     src = rl_verl.render_reward_module()
@@ -135,6 +153,13 @@ def test_render_reward_module_is_valid_and_defines_compute_score():
     assert callable(ns["compute_score"])
     # no flash import leaks into the verl-side shim.
     assert "import flash" not in src
+
+
+def test_render_reward_module_missing_index_raises():
+    ns: dict = {}
+    exec(compile(rl_verl.render_reward_module(), "<reward>", "exec"), ns)
+    with pytest.raises(RuntimeError, match="no example index"):
+        ns["compute_score"]("flash_env", "answer", "unused", extra_info={})
 
 
 # ------------------------------- reward parity -------------------------------
@@ -202,6 +227,27 @@ def test_reward_server_round_trip():
         with urllib.request.urlopen(req, timeout=10) as r:
             got = json.loads(r.read().decode())
         assert got["score"] == 7.0  # 3 + len("abcd")
+    finally:
+        server.shutdown()
+
+
+def test_reward_bridge_lookup_failure_raises(monkeypatch):
+    def missing_example(idx, solution_str):
+        raise IndexError(idx)
+
+    server, url = rl_verl.start_reward_server(missing_example)
+    try:
+        monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
+        ns: dict = {}
+        src = rl_verl.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
+        exec(compile(src, "<reward>", "exec"), ns)
+        with pytest.raises(RuntimeError, match="reward bridge request failed"):
+            ns["compute_score"](
+                "flash_env",
+                "answer",
+                "unused",
+                extra_info={"index": 99},
+            )
     finally:
         server.shutdown()
 
