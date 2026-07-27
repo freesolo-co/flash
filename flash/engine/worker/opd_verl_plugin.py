@@ -121,9 +121,15 @@ def _multi_modal_image_count(multi_modal_data) -> int:
         return 0
     if not isinstance(multi_modal_data, dict):
         raise TypeError("verl multimodal data must be a mapping")
+    # verl's rollout carries the payload under "image" (singular) for single-image rows and
+    # "images" for lists; count whichever is present.
     images = multi_modal_data.get("images")
     if images is None:
+        images = multi_modal_data.get("image")
+    if images is None:
         return 0
+    if not isinstance(images, (list, tuple)):
+        return 1
     try:
         return len(images)
     except TypeError as error:
@@ -467,7 +473,15 @@ def _install_verl_extensions() -> None:
         keys = [key for key, selected in zip(batch.keys, keep.tolist(), strict=True) if selected]
         tags = [tag for tag, selected in zip(batch.tags, keep.tolist(), strict=True) if selected]
         if not keys:
-            raise RuntimeError("flash OPD step produced no aligned teacher signal")
+            # a single all-transient-failure batch must not abort the whole run: keep the batch
+            # unfiltered and let the loss mask zero the unaligned sequences; the parent's
+            # no-signal-run guard still fails the run if NO step ever aligns.
+            print(
+                "[flash-opd] step produced no aligned teacher signal; passing batch through "
+                "with zeroed distillation mask (transient teacher failures)",
+                flush=True,
+            )
+            return batch
         return KVBatchMeta(
             keys=keys,
             tags=tags,

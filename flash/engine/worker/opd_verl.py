@@ -234,6 +234,10 @@ class _TeacherAlignmentBridge:
         self.forced_tokens = int(state.get("forced_tokens", 0))
         self.dropped_forced_groups = int(state.get("dropped_forced_groups", 0))
         self.coverage_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        # resume: baseline the per-step delta counters at the restored cumulative mass, so the
+        # first resumed step reports its own coverage instead of the whole prior run's.
+        self._prev_aligned = self.aligned_sequences
+        self._prev_cov_sum = self.coverage_sum
         self.teacher_ok = int(state.get("teacher_ok", 0))
         self.teacher_transient = int(state.get("teacher_transient", 0))
         self.teacher_error = int(state.get("teacher_error", 0))
@@ -491,7 +495,13 @@ class _OpdProgressState:
             snapshot = bridge.accounting_snapshot()
             self.loss_curve.append(float(loss))
             aligned = int(snapshot["aligned_sequences"])
-            coverage = float(snapshot["coverage_sum"]) / aligned if aligned else 0.0
+            cov_sum = float(snapshot["coverage_sum"])
+            # per-step coverage: delta over the previous snapshot, so the curve shows each step's
+            # own alignment quality instead of a cumulative average that flattens regressions.
+            d_aligned = aligned - getattr(self, "_prev_aligned", 0)
+            d_cov = cov_sum - getattr(self, "_prev_cov_sum", 0.0)
+            self._prev_aligned, self._prev_cov_sum = aligned, cov_sum
+            coverage = (d_cov / d_aligned) if d_aligned > 0 else (cov_sum / aligned if aligned else 0.0)
             self.coverage_curve.append(coverage)
             snapshot.update(
                 {
@@ -571,6 +581,8 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         "data.filter_overlong_prompts=true",
         "data.truncation=error",
         "data.shuffle=false",
+        f"data.seed={_hydra_val(config.get('seed', 42))}",
+        f"actor_rollout_ref.rollout.seed={_hydra_val(config.get('seed', 42))}",
         "data.dataloader_num_workers=0",
         "data.image_key=images",
         "data.return_raw_chat=true",
@@ -942,7 +954,14 @@ def run_opd_verl(spec=None) -> None:
     max_examples = int(getattr(spec.train, "max_examples", 0) or 0) if spec else 0
     if max_examples > 0:
         train = train[:max_examples]
-    prompt_rows = [(example, env.prompt_messages(example)) for example in train]
+    _scanned = [0]
+    with liveness_heartbeat("opd_prompt_scan", progress=lambda: _scanned[0]):
+        # rendering prompts for a large dataset can outlast the heartbeat window; keep the worker
+        # alive while scanning (the scan is O(dataset) tokenizer/template work).
+        prompt_rows = []
+        for example in train:
+            prompt_rows.append((example, env.prompt_messages(example)))
+            _scanned[0] += 1
     multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
     if multimodal:
         validate_multimodal_training(model_id, "opd", multi_turn=False)
@@ -950,16 +969,17 @@ def run_opd_verl(spec=None) -> None:
     random.Random(_w.SEED).shuffle(train)
 
     started_at = time.time()
+    # validate the teacher credential BEFORE the gpu probe + model prefetch: a missing key fails
+    # in milliseconds instead of after minutes of paid setup.
+    api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("the managed teacher api key is missing from the OPD parent worker")
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
-
-    api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("the managed teacher api key is missing from the OPD parent worker")
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
     processor = None
     if multimodal:
@@ -987,47 +1007,62 @@ def run_opd_verl(spec=None) -> None:
     dropped_long = 0
     package_root_value = getattr(env, "package_root", None)
     package_root = str(Path(package_root_value).resolve()) if package_root_value else None
-    for example in train:
-        messages = env.prompt_messages(example)
-        if record_has_images(example, messages):
-            assert processor is not None
-            normalized = normalize_prompt_images(example, messages, package_root)
-            student_messages = normalized.messages
-            image_descriptors = tuple(normalized.descriptors)
-            teacher_messages = image_teacher_prompt_messages(
-                student_messages, len(image_descriptors)
-            )
-            prompt_ids = _processor_expanded_prompt_ids(
-                processor,
-                student_messages,
-                image_descriptors,
-                package_root,
-                enable_thinking=bool(_w.THINKING),
-            )
-        else:
-            student_messages = messages
-            teacher_messages = messages
-            image_descriptors = ()
-            prompt_ids = _normalize_prompt_ids(
-                tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    enable_thinking=_w.THINKING,
+    _prepped = [0]
+    with liveness_heartbeat("opd_image_prep", progress=lambda: _prepped[0]):
+        for example in train:
+            _prepped[0] += 1
+            messages = env.prompt_messages(example)
+            if record_has_images(example, messages):
+                assert processor is not None
+                normalized = normalize_prompt_images(example, messages, package_root)
+                student_messages = normalized.messages
+                image_descriptors = tuple(normalized.descriptors)
+                teacher_messages = image_teacher_prompt_messages(
+                    student_messages, len(image_descriptors)
+                )
+                prompt_ids = _processor_expanded_prompt_ids(
+                    processor,
+                    student_messages,
+                    image_descriptors,
+                    package_root,
+                    enable_thinking=bool(_w.THINKING),
+                )
+            else:
+                student_messages = messages
+                teacher_messages = messages
+                image_descriptors = ()
+                if processor is not None:
+                    # mixed job: the verl child tokenizes EVERY row through the multimodal dataset
+                    # path (the processor), so text-only rows must freeze via the same path or the
+                    # bridge's exact prompt-id check trips on tokenizer-vs-processor differences.
+                    prompt_ids = _processor_expanded_prompt_ids(
+                        processor,
+                        student_messages,
+                        (),
+                        package_root,
+                        enable_thinking=bool(_w.THINKING),
+                    )
+                else:
+                    prompt_ids = _normalize_prompt_ids(
+                        tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            enable_thinking=_w.THINKING,
+                        )
+                    )
+            if len(prompt_ids) > prompt_budget:
+                dropped_long += 1
+                continue
+            prompts.append(
+                _BridgePrompt(
+                    student_messages=student_messages,
+                    teacher_messages=teacher_messages,
+                    prompt_ids=prompt_ids,
+                    image_descriptors=image_descriptors,
+                    package_root=package_root,
                 )
             )
-        if len(prompt_ids) > prompt_budget:
-            dropped_long += 1
-            continue
-        prompts.append(
-            _BridgePrompt(
-                student_messages=student_messages,
-                teacher_messages=teacher_messages,
-                prompt_ids=prompt_ids,
-                image_descriptors=image_descriptors,
-                package_root=package_root,
-            )
-        )
     if not prompts:
         raise RuntimeError("every OPD prompt exceeds the configured prompt budget")
     prompts_per_step = min(knobs.prompts_per_step, len(prompts))
@@ -1210,7 +1245,10 @@ def run_opd_verl(spec=None) -> None:
             if loss is None:
                 loss = _metric_value(line, "distillation/loss")
             if loss is None:
-                raise RuntimeError("verl OPD step log is missing the distillation loss metric")
+                # verl emits step-tagged lines that are not metric summaries (timers, val lines);
+                # skip those rather than killing the run. the end-of-run guard still fails loud
+                # when NO step ever produced a distillation loss.
+                return
             step = int(step_match.group(1))
             progress["loss"] = loss
             progress_state.record_step(step, loss, bridge)
@@ -1257,6 +1295,19 @@ def run_opd_verl(spec=None) -> None:
         if final_step < update_horizon:
             raise RuntimeError(
                 f"opd completed {final_step}/{update_horizon} requested optimizer updates"
+            )
+        if not final_accounting["loss_curve"]:
+            raise RuntimeError(
+                "verl OPD produced no distillation-loss metrics for the whole run — the "
+                "distillation path never engaged; refusing to publish"
+            )
+        if int(final_accounting.get("aligned_sequences", 0) or 0) <= 0:
+            # zeroed-mask pass-through batches still emit a (zero) loss metric, so the loss-curve
+            # check alone cannot distinguish real distillation from a run where the teacher never
+            # aligned once. require at least one aligned sequence before publishing.
+            raise RuntimeError(
+                "verl OPD saw zero aligned teacher sequences for the whole run — every batch was "
+                "no-signal; refusing to publish an unchanged adapter"
             )
         adapter_dir = os.path.join(workdir, "adapter")
         with liveness_heartbeat(
