@@ -798,6 +798,22 @@ def test_failure_accounting_metadata_uses_canonical_train_meta_contract():
     } & metadata.keys()
 
 
+def test_failure_accounting_metadata_omits_zero_skip_reasons():
+    # the verl snapshot always injects empty_alignment, but trl's counter only
+    # records reasons that occurred, so a clean run must persist no reasons.
+    metadata = _failure_accounting_metadata(
+        {
+            "teacher_transient": 0,
+            "teacher_error": 0,
+            "no_signal_resamples": 0,
+            "no_signal_skipped_steps": 0,
+            "skip_counts": {"empty_alignment": 0, "truncated_rollout": 2},
+        }
+    )
+
+    assert metadata["skip_reasons"] == {"truncated_rollout": 2}
+
+
 def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     import inspect
 

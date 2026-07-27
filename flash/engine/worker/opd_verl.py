@@ -1672,9 +1672,13 @@ def _failure_accounting_metadata(accounting: dict) -> dict:
         "teacher_errors": int(accounting["teacher_error"]),
         "no_signal_resamples": int(accounting["no_signal_resamples"]),
         "no_signal_skipped_steps": int(accounting["no_signal_skipped_steps"]),
+        # trl records skip reasons in a counter, so only reasons that actually
+        # occurred appear. the verl snapshot always injects empty_alignment, so
+        # drop zero counts to keep the persisted contract identical.
         "skip_reasons": {
             reason: int(count)
             for reason, count in sorted(accounting["skip_counts"].items())
+            if int(count) > 0
         },
     }
 
