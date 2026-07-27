@@ -773,13 +773,13 @@ def test_failure_accounting_metadata_uses_canonical_train_meta_contract():
         "no_signal_resamples": 5,
         "no_signal_skipped_steps": 1,
         "skip_reasons": {
-            "empty_alignment": 2,
+            "alignment_empty": 2,
             "empty_completion": 3,
             "truncated_rollout": 4,
         },
     }
     assert list(metadata["skip_reasons"]) == [
-        "empty_alignment",
+        "alignment_empty",
         "empty_completion",
         "truncated_rollout",
     ]
@@ -812,6 +812,22 @@ def test_failure_accounting_metadata_omits_zero_skip_reasons():
     )
 
     assert metadata["skip_reasons"] == {"truncated_rollout": 2}
+
+
+def test_failure_accounting_metadata_uses_trl_skip_reason_names():
+    # trl publishes this condition as alignment_empty via _sample_skip_reason,
+    # so consumers aggregating across backends see one category, not two.
+    metadata = _failure_accounting_metadata(
+        {
+            "teacher_transient": 0,
+            "teacher_error": 0,
+            "no_signal_resamples": 0,
+            "no_signal_skipped_steps": 0,
+            "skip_counts": {"empty_alignment": 3},
+        }
+    )
+
+    assert metadata["skip_reasons"] == {"alignment_empty": 3}
 
 
 def test_write_train_meta_integrates_canonical_failure_accounting_metadata():

@@ -1666,20 +1666,32 @@ def _metric_value(line: str, name: str) -> float | None:
     return None
 
 
+# the verl bridge stores the empty-alignment skip under its own internal key,
+# which the resume state also reads. trl publishes the same condition as
+# alignment_empty, so translate it at the metadata boundary only.
+_CANONICAL_SKIP_REASONS = {"empty_alignment": "alignment_empty"}
+
+
+def _canonical_skip_reasons(skip_counts: dict) -> dict:
+    canonical: dict[str, int] = {}
+    for reason, count in skip_counts.items():
+        count = int(count)
+        # trl records skip reasons in a counter, so only reasons that actually
+        # occurred appear. the verl snapshot always injects empty_alignment.
+        if count <= 0:
+            continue
+        name = _CANONICAL_SKIP_REASONS.get(reason, reason)
+        canonical[name] = canonical.get(name, 0) + count
+    return dict(sorted(canonical.items()))
+
+
 def _failure_accounting_metadata(accounting: dict) -> dict:
     return {
         "teacher_transient_failures": int(accounting["teacher_transient"]),
         "teacher_errors": int(accounting["teacher_error"]),
         "no_signal_resamples": int(accounting["no_signal_resamples"]),
         "no_signal_skipped_steps": int(accounting["no_signal_skipped_steps"]),
-        # trl records skip reasons in a counter, so only reasons that actually
-        # occurred appear. the verl snapshot always injects empty_alignment, so
-        # drop zero counts to keep the persisted contract identical.
-        "skip_reasons": {
-            reason: int(count)
-            for reason, count in sorted(accounting["skip_counts"].items())
-            if int(count) > 0
-        },
+        "skip_reasons": _canonical_skip_reasons(accounting["skip_counts"]),
     }
 
 
