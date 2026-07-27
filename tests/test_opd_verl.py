@@ -1188,6 +1188,10 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["actor_rollout_ref.actor.use_kl_loss"] == "false"
     assert overrides["algorithm.use_kl_in_reward"] == "false"
     assert overrides["actor_rollout_ref.model.use_remove_padding"] == "true"
+    # 32k: fused linear-CE must be on so the actor never materializes [tokens, vocab] logits;
+    # the distillation loss reads model_output["log_probs"], which the fused path emits exactly.
+    assert overrides["actor_rollout_ref.model.use_fused_kernels"] == "true"
+    assert overrides["actor_rollout_ref.model.fused_kernel_options.impl_backend"] == "torch"
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == "4"
     assert overrides["actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size"] == "4"
     assert overrides["actor_rollout_ref.rollout.max_model_len"] == "32768"
