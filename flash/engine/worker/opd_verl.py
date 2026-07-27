@@ -298,7 +298,7 @@ class _TeacherAlignmentBridge:
         with self._stats_lock:
             if classification == "transient":
                 self.teacher_transient += 1
-                if terminal:
+                if terminal and self._teacher_failure is None:
                     self._teacher_failure = (classification, message)
                 elif self._pending_teacher_transient is None:
                     self._pending_teacher_transient = (classification, message)
