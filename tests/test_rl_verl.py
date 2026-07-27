@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import threading
-from types import SimpleNamespace
 import urllib.request
+from types import SimpleNamespace
 
 import pytest
 
