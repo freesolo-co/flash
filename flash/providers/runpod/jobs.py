@@ -61,6 +61,7 @@ __all__ = [
     "JobHandle",
     "PollResult",
     "apply_disk_gb",
+    "apply_image_override_constraints",
     "build_function_input",
     "decode_output",
     "deploy_train_endpoint",
@@ -230,15 +231,44 @@ def weight_cache_endpoint_kwargs(spec) -> dict:
         return {}
 
 
+def apply_image_override_constraints(config) -> None:
+    """Attach the override image's registry auth to a built endpoint config.
+
+    A private override image (FLASH_WORKER_IMAGE + FLASH_WORKER_IMAGE_REGISTRY_AUTH) cannot be
+    pulled without the provider-side registry credential; without it the worker crash-loops as
+    unhealthy before any flash code runs.
+    """
+    from flash.providers._worker import worker_image_override
+
+    override = worker_image_override()
+    if not (override and override.registry_auth_id):
+        return
+    template = getattr(config, "template", None)
+    if template is None:
+        logger.warning("image override registry auth set but endpoint config has no template")
+        return
+    template.containerRegistryAuthId = override.registry_auth_id
+
+
 def apply_disk_gb(config, disk_gb: int | None) -> None:
     """Raise the worker's container disk on a built endpoint config. Raise-only (SDK default is 64 GB)."""
-    if not disk_gb:
+    from flash.providers._worker import worker_image_override
+
+    _override = worker_image_override()
+    if not disk_gb and not (_override and _override.min_disk_gb):
         return
     template = getattr(config, "template", None)
     if template is None:
         logger.warning("disk_gb=%s requested but endpoint config has no template", disk_gb)
         return
-    template.containerDiskInGb = max(int(disk_gb), int(template.containerDiskInGb or 0))
+
+    floors = [int(disk_gb or 0), int(template.containerDiskInGb or 0)]
+    override = _override
+    if override and override.min_disk_gb:
+        # a large override image cannot extract into the default container disk; its floor wins
+        # over a smaller request but never lowers one.
+        floors.append(int(override.min_disk_gb))
+    template.containerDiskInGb = max(floors)
 
 
 @dataclass
@@ -617,6 +647,7 @@ def deploy_train_endpoint(
             ep._qb_target = _train_body
             config = ep._build_resource_config()
             apply_disk_gb(config, disk_gb)
+            apply_image_override_constraints(config)
             rm = ResourceManager()
             if deadline_at is None:
                 resource = asyncio.run(rm.get_or_deploy_resource(config))

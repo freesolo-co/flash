@@ -646,10 +646,27 @@ def _patch_runpod_backoff() -> None:
 
 
 def min_cuda_for(friendly_gpu: str) -> str:
-    """Minimum host CUDA driver version for this GPU class (Blackwell requires >=13.0)."""
+    """Minimum host CUDA driver version for this GPU class (Blackwell requires >=13.0).
+
+    An overriding worker image can raise the floor further: a cu13-built image crashes at CUDA
+    init on 12.x-driver hosts regardless of the GPU class, so the effective floor is the max of
+    the class floor and the image's own requirement.
+    """
+    from flash.providers._worker import worker_image_override
     from flash.providers.base import min_cuda_modern
 
-    return min_cuda_modern(friendly_gpu)
+    floor = min_cuda_modern(friendly_gpu)
+    override = worker_image_override()
+    if override and override.min_cuda:
+        parse = lambda v: tuple(int(x) for x in v.split("."))  # noqa: E731
+        try:
+            if parse(override.min_cuda) > parse(floor):
+                return override.min_cuda
+        except ValueError:
+            raise ValueError(
+                f"FLASH_WORKER_IMAGE_MIN_CUDA must look like '13.0', got {override.min_cuda!r}"
+            ) from None
+    return floor
 
 
 def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
@@ -722,10 +739,11 @@ def get_train_endpoint(
             kwargs.update(weight_cache_endpoint_kwargs(spec))
             ep = Endpoint(**kwargs)
             handler = ep(_train_body)
-            from flash.providers.runpod.jobs import apply_disk_gb
+            from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
 
             cfg = ep._build_resource_config()
             apply_disk_gb(cfg, disk_gb)
+            apply_image_override_constraints(cfg)
             if cache_handler:
                 _ENDPOINT_CACHE[name] = handler
             return handler
