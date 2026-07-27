@@ -138,6 +138,10 @@ class _TeacherAlignmentBridge:
         )
         self.truncated_rollouts = int(state.get("truncated_rollouts", 0))
         self.coverage_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        # resume: baseline the per-step delta counters at the restored cumulative mass, so the
+        # first resumed step reports its own coverage instead of the whole prior run's.
+        self._prev_aligned = self.aligned_sequences
+        self._prev_cov_sum = self.coverage_sum
         self.teacher_ok = int(state.get("teacher_ok", 0))
         self.teacher_transient = int(state.get("teacher_transient", 0))
         self.teacher_error = int(state.get("teacher_error", 0))
@@ -1003,6 +1007,14 @@ def run_opd_verl(spec=None) -> None:
             raise RuntimeError(
                 "verl OPD produced no distillation-loss metrics for the whole run — the "
                 "distillation path never engaged; refusing to publish"
+            )
+        if int(final_accounting.get("aligned_sequences", 0) or 0) <= 0:
+            # zeroed-mask pass-through batches still emit a (zero) loss metric, so the loss-curve
+            # check alone cannot distinguish real distillation from a run where the teacher never
+            # aligned once. require at least one aligned sequence before publishing.
+            raise RuntimeError(
+                "verl OPD saw zero aligned teacher sequences for the whole run — every batch was "
+                "no-signal; refusing to publish an unchanged adapter"
             )
         adapter_dir = os.path.join(workdir, "adapter")
         with liveness_heartbeat(
