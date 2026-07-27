@@ -2100,6 +2100,22 @@ def test_mutation_marker_failure_preserves_bridge_classification(
             _raise_verl_failure(exit_error.value.code, None)
 
 
+@pytest.mark.parametrize(
+    "classifications",
+    [("permanent", "transient"), ("transient", "permanent")],
+)
+def test_mutation_failure_preserves_permanent_precedence(classifications):
+    bridge = _text_bridge(_BridgeTeacher())
+
+    for classification in classifications:
+        bridge._record_mutation_failure(
+            classification,
+            f"{classification} failure",
+        )
+
+    assert bridge.mutation_failure == ("permanent", "permanent failure")
+
+
 def test_mutation_success_response_disconnect_does_not_latch_marker_failure():
     callback_calls = []
     bridge = _text_bridge(
