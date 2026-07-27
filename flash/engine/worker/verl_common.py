@@ -45,6 +45,8 @@ def resolve_verl_python(workdir: str) -> str:
                 "verl",
                 "liger-kernel",
                 "bitsandbytes>=0.49",
+                "qwen-vl-utils",
+                "torchvision",
             ],
             check=True,
         )
