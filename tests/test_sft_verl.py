@@ -106,7 +106,7 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "trainer.total_epochs": "4",
         "trainer.test_freq": "-1",
         "trainer.resume_mode": "auto",
-        "trainer.max_ckpt_to_keep": "null",
+        "trainer.max_ckpt_to_keep": "1",
         "trainer.total_training_steps": "120",
     }
     assert "optim.eps" not in overrides
