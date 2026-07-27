@@ -1462,6 +1462,8 @@ def _reconcile_no_signal_notification_failure(
     bridge: _TeacherAlignmentBridge,
     failures: tuple[tuple[str, str] | None, ...],
 ) -> tuple[str, str] | None:
+    if bridge.teacher_failure is not None:
+        return None
     selected = None
     for failure in failures:
         if failure is None:

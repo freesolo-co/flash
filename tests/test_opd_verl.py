@@ -1948,6 +1948,41 @@ def test_permanent_no_signal_notification_precedes_pending_transient(failures):
         _raise_verl_failure(1, bridge.teacher_failure, no_signal_failure=failure)
 
 
+@pytest.mark.parametrize(
+    ("classification", "message"),
+    [
+        ("permanent", "bad credentials"),
+        ("transient", "teacher unavailable"),
+    ],
+)
+def test_authoritative_teacher_failure_precedes_transient_no_signal_evidence(
+    classification,
+    message,
+):
+    from flash.engine.worker.opd_verl import _reconcile_no_signal_notification_failure
+    from flash.engine.worker.perf import RetriableInfraError
+
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge._record_teacher_failure(classification, message, terminal=True)
+
+    failure = _reconcile_no_signal_notification_failure(
+        bridge,
+        (
+            ("transient", "resample transport failed"),
+            ("transient", "abandon transport failed"),
+        ),
+    )
+
+    assert failure is None
+    assert bridge.teacher_failure == (classification, message)
+    if classification == "permanent":
+        with pytest.raises(RuntimeError, match="permanent teacher failure"):
+            _raise_verl_failure(1, bridge.teacher_failure, no_signal_failure=failure)
+    else:
+        with pytest.raises(RetriableInfraError, match="after bounded retries"):
+            _raise_verl_failure(1, bridge.teacher_failure, no_signal_failure=failure)
+
+
 def test_transient_no_signal_notification_without_pending_is_retriable():
     from flash.engine.worker.opd_verl import _reconcile_no_signal_notification_failure
     from flash.engine.worker.perf import RetriableInfraError
