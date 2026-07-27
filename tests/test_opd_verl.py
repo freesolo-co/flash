@@ -962,6 +962,8 @@ def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests
     teacher = _BatchingTeacher(prompt_texts)
     bridge = _batching_bridge(teacher, prompt_texts)
     bridge.start()
+    assert bridge._server is not None
+    assert bridge._server.request_queue_size >= len(prompt_texts)
     try:
         outcomes = _concurrent_bridge_scores(bridge, range(17))
     finally:

@@ -80,6 +80,11 @@ _TRANSIENT_TEACHER_EXIT = 87
 _TEXT_TEACHER_BATCH_SIZE = 8
 _TEXT_TEACHER_FLUSH_WAIT_S = 0.1
 _TEXT_TEACHER_SHUTDOWN_WAIT_S = 5.0
+_TEXT_TEACHER_REQUEST_BACKLOG = 64
+
+
+class _TeacherBridgeHTTPServer(ThreadingHTTPServer):
+    request_queue_size = _TEXT_TEACHER_REQUEST_BACKLOG
 
 
 @dataclass
@@ -1270,7 +1275,7 @@ class _TeacherAlignmentBridge:
         )
         self._text_teacher_batcher.start()
         try:
-            self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            self._server = _TeacherBridgeHTTPServer(("127.0.0.1", 0), Handler)
         except Exception:
             self._text_teacher_batcher.close()
             raise
