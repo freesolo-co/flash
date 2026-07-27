@@ -14,6 +14,7 @@ import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import (
@@ -38,8 +39,11 @@ from flash.engine.worker.sft_verl import (
     _durable_required_save_steps,
     _export_checkpoint_adapter,
     _hydra_val,
+    _materialize_verl_images,
+    _multimodal_messages_with_images,
     _NvidiaSmiPeakSampler,
     _probe_gpu_in_subprocess,
+    _verl_image_message_content,
     _VerlCheckpointWatcher,
     _warmstart_adapter_path,
 )
@@ -60,15 +64,23 @@ _TRANSIENT_TEACHER_EXIT = 87
 
 @dataclass(frozen=True)
 class _BridgePrompt:
-    messages: list[dict]
+    student_messages: list[dict]
+    teacher_messages: list[dict]
     prompt_ids: tuple[int, ...]
+    image_descriptors: tuple[str, ...]
+    package_root: str | None
 
 
 def _prompt_pool_fingerprint(prompts: list[_BridgePrompt]) -> str:
     digest = hashlib.sha256()
     for prompt in prompts:
+        fingerprint_fields = [prompt.student_messages, list(prompt.prompt_ids)]
+        if prompt.image_descriptors:
+            fingerprint_fields.extend(
+                [prompt.teacher_messages, list(prompt.image_descriptors)]
+            )
         payload = json.dumps(
-            [prompt.messages, list(prompt.prompt_ids)],
+            fingerprint_fields,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -76,6 +88,49 @@ def _prompt_pool_fingerprint(prompts: list[_BridgePrompt]) -> str:
         digest.update(len(payload).to_bytes(8, "big"))
         digest.update(payload)
     return digest.hexdigest()
+
+
+def _normalize_prompt_ids(value) -> tuple[int, ...]:
+    if isinstance(value, dict):
+        value = value["input_ids"]
+    elif hasattr(value, "input_ids"):
+        value = value.input_ids
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, tuple):
+        value = list(value)
+    if value and isinstance(value[0], list | tuple):
+        value = value[0]
+    if not isinstance(value, list):
+        raise TypeError("processor prompt input_ids must be list-like")
+    return tuple(int(token_id.item() if hasattr(token_id, "item") else token_id) for token_id in value)
+
+
+def _processor_expanded_prompt_ids(
+    processor,
+    messages: list[dict],
+    image_descriptors: tuple[str, ...],
+    package_root: str | None,
+    *,
+    enable_thinking: bool,
+) -> tuple[int, ...]:
+    from flash.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(image_descriptors), package_root)
+    prepared = _multimodal_messages_with_images(messages, images)
+    raw_prompt = processor.apply_chat_template(
+        prepared,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
+    model_inputs = processor(
+        text=[raw_prompt],
+        images=images,
+        videos=None,
+        return_tensors="pt",
+    )
+    return _normalize_prompt_ids(model_inputs)
 
 
 def encode_shifted_group_metadata(
@@ -199,12 +254,24 @@ class _TeacherAlignmentBridge:
         )
         return {"teacher_ids": teacher_ids, "teacher_logprobs": teacher_logprobs}
 
-    def score(self, index: int, prompt_length: int, sequence_ids: list[int]) -> dict:
+    def score(
+        self,
+        index: int,
+        prompt_length: int,
+        sequence_ids: list[int],
+        image_count: int = 0,
+    ) -> dict:
         with self._stats_lock:
             self.score_requests += 1
         if index < 0 or index >= len(self.prompts):
             raise ValueError("flash OPD bridge received an unknown dataset index")
         prompt = self.prompts[index]
+        expected_image_count = len(prompt.image_descriptors)
+        if int(image_count) != expected_image_count:
+            raise ValueError(
+                f"verl rollout reported {int(image_count)} image(s) for dataset index {index}; "
+                f"the frozen prompt has {expected_image_count}"
+            )
         prompt_ids = list(prompt.prompt_ids)
         prompt_length = int(prompt_length)
         sequence_ids = [int(token_id) for token_id in sequence_ids]
@@ -227,18 +294,32 @@ class _TeacherAlignmentBridge:
         )
         if not completion_text.strip() or "�" in completion_text:
             return self._empty(prompt_length, len(response_ids))
-        teacher_prompt = _teacher_prompt_text(prompt.messages, self.thinking_prefill)
-        teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+        teacher_prompt = _teacher_prompt_text(prompt.teacher_messages, self.thinking_prefill)
+        if prompt.image_descriptors:
+            from flash.multimodal import image_descriptors_to_data_uris
+
+            teacher_images = image_descriptors_to_data_uris(
+                prompt.image_descriptors, prompt.package_root
+            )
+            teacher_tokens = self.teacher.score_many_multimodal(
+                [(teacher_prompt, completion_text, teacher_images)]
+            )[0]
+            teacher_input_tokens = int(getattr(teacher_tokens, "input_tokens", 0) or 0)
+        else:
+            teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+            teacher_input_tokens = 0
         with self._stats_lock:
             self.teacher_ok += 1
         student_ids, student_tokens = student_tokens_with_offsets(
             self.tokenizer, kept_ids, completion_text
         )
+        if not prompt.image_descriptors:
+            teacher_input_tokens = prompt_length + len(student_ids)
         groups = groupwise_alignment(student_tokens, teacher_tokens)
         groups = [(indices, logsum) for indices, logsum in groups if indices]
         coverage = groupwise_coverage(groups, student_tokens)
         with self._stats_lock:
-            self.teacher_input_tokens += prompt_length + len(student_ids)
+            self.teacher_input_tokens += teacher_input_tokens
             self.coverage_sum += coverage
             if groups:
                 self.aligned_sequences += 1
@@ -279,7 +360,10 @@ class _TeacherAlignmentBridge:
                     payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                     if self.path == "/score":
                         result = bridge.score(
-                            payload["index"], payload["prompt_length"], payload["sequence_ids"]
+                            payload["index"],
+                            payload["prompt_length"],
+                            payload["sequence_ids"],
+                            payload.get("image_count", 0),
                         )
                     elif self.path == "/mutation":
                         bridge.notify_mutation()
@@ -442,6 +526,7 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         f"data.seed={_hydra_val(config.get('seed', 42))}",
         f"actor_rollout_ref.rollout.seed={_hydra_val(config.get('seed', 42))}",
         "data.dataloader_num_workers=0",
+        "data.image_key=images",
         "data.return_raw_chat=true",
         "data.return_multi_modal_inputs=false",
         "data.apply_chat_template_kwargs={enable_thinking:" + _hydra_val(config.get("thinking", False)) + "}",
@@ -469,6 +554,7 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         "actor_rollout_ref.rollout.mode=async",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={_hydra_val(config['n_gpus_per_node'])}",
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
+        "actor_rollout_ref.rollout.limit_images=8",
         f"actor_rollout_ref.rollout.max_model_len={_hydra_val(config.get('max_model_len', 32768))}",
         f"actor_rollout_ref.rollout.temperature={_hydra_val(config.get('temperature', 1.0))}",
         f"actor_rollout_ref.rollout.top_p={_hydra_val(config.get('top_p', 1.0))}",
@@ -533,10 +619,28 @@ def _build_opd_child_env(
     return child
 
 
+def _opd_multimodal_parquet_features():
+    from datasets import Features, Value
+
+    return Features(
+        {
+            "prompt": [{"role": Value("string"), "content": Value("string")}],
+            "images": [{"image": Value("string")}],
+            "data_source": Value("string"),
+            "reward_model": {
+                "style": Value("string"),
+                "ground_truth": Value("string"),
+            },
+            "extra_info": {"index": Value("int64")},
+        }
+    )
+
+
 def _write_opd_parquet(rows: list[dict], path: str) -> None:
     from datasets import Dataset
 
-    Dataset.from_list(rows).to_parquet(path)
+    features = _opd_multimodal_parquet_features() if any("images" in row for row in rows) else None
+    Dataset.from_list(rows, features=features).to_parquet(path)
 
 
 def _metric_value(line: str, name: str) -> float | None:
@@ -727,7 +831,13 @@ def _generation_eos_from_cached_config(model_id: str, model_revision: str, token
 def run_opd_verl(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
     from flash.engine.worker.teacher import TeacherClient
-    from flash.multimodal import record_has_images
+    from flash.multimodal import (
+        image_teacher_prompt_messages,
+        normalize_prompt_images,
+        record_has_images,
+        validate_image_opd_teacher,
+        validate_multimodal_training,
+    )
 
     spec = spec or _w.JOB_SPEC
     env = _w.require_active_env()
@@ -750,11 +860,15 @@ def run_opd_verl(spec=None) -> None:
     with liveness_heartbeat("opd_prompt_scan", progress=lambda: _scanned[0]):
         # rendering prompts for a large dataset can outlast the heartbeat window; keep the worker
         # alive while scanning (the scan is O(dataset) tokenizer/template work).
+        prompt_rows = []
         for example in train:
-            messages = env.prompt_messages(example)
+            prompt_rows.append((example, env.prompt_messages(example)))
             _scanned[0] += 1
-            if record_has_images(example, messages):
-                raise RuntimeError(f"multimodal OPD is {unsupported_backend}")
+    multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
+    model_id = spec.model if spec else RECIPE.hf_model_id
+    if multimodal:
+        validate_multimodal_training(model_id, "opd", multi_turn=False)
+        validate_image_opd_teacher(knobs.teacher_model)
     random.Random(_w.SEED).shuffle(train)
 
     started_at = time.time()
@@ -768,11 +882,21 @@ def run_opd_verl(spec=None) -> None:
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
-    tokenizer = _w.load_tokenizer(model_id, revision=model_revision)
+    processor = None
+    if multimodal:
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            **_w.model_revision_kwargs(model_revision),
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = _w.load_tokenizer(model_id, revision=model_revision)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     thinking_prefill = _thinking_prefill_text(tokenizer)
@@ -785,25 +909,64 @@ def run_opd_verl(spec=None) -> None:
 
     prompts: list[_BridgePrompt] = []
     dropped_long = 0
-    for example in train:
-        messages = env.prompt_messages(example)
-        prompt_ids = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=_w.THINKING,
-        )
-        if prompt_ids and isinstance(prompt_ids[0], list):
-            prompt_ids = prompt_ids[0]
-        if len(prompt_ids) > prompt_budget:
-            dropped_long += 1
-            continue
-        prompts.append(
-            _BridgePrompt(
-                messages=messages,
-                prompt_ids=tuple(int(token_id) for token_id in prompt_ids),
+    package_root_value = getattr(env, "package_root", None)
+    package_root = str(Path(package_root_value).resolve()) if package_root_value else None
+    _prepped = [0]
+    with liveness_heartbeat("opd_image_prep", progress=lambda: _prepped[0]):
+        for example in train:
+            _prepped[0] += 1
+            messages = env.prompt_messages(example)
+            if record_has_images(example, messages):
+                assert processor is not None
+                normalized = normalize_prompt_images(example, messages, package_root)
+                student_messages = normalized.messages
+                image_descriptors = tuple(normalized.descriptors)
+                teacher_messages = image_teacher_prompt_messages(
+                    student_messages, len(image_descriptors)
+                )
+                prompt_ids = _processor_expanded_prompt_ids(
+                    processor,
+                    student_messages,
+                    image_descriptors,
+                    package_root,
+                    enable_thinking=bool(_w.THINKING),
+                )
+            else:
+                student_messages = messages
+                teacher_messages = messages
+                image_descriptors = ()
+                if processor is not None:
+                    # mixed job: the verl child tokenizes EVERY row through the multimodal dataset
+                    # path (the processor), so text-only rows must freeze via the same path or the
+                    # bridge's exact prompt-id check trips on tokenizer-vs-processor differences.
+                    prompt_ids = _processor_expanded_prompt_ids(
+                        processor,
+                        student_messages,
+                        (),
+                        package_root,
+                        enable_thinking=bool(_w.THINKING),
+                    )
+                else:
+                    prompt_ids = _normalize_prompt_ids(
+                        tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            enable_thinking=_w.THINKING,
+                        )
+                    )
+            if len(prompt_ids) > prompt_budget:
+                dropped_long += 1
+                continue
+            prompts.append(
+                _BridgePrompt(
+                    student_messages=student_messages,
+                    teacher_messages=teacher_messages,
+                    prompt_ids=prompt_ids,
+                    image_descriptors=image_descriptors,
+                    package_root=package_root,
+                )
             )
-        )
     if not prompts:
         raise RuntimeError("every OPD prompt exceeds the configured prompt budget")
     prompts_per_step = min(knobs.prompts_per_step, len(prompts))
@@ -819,23 +982,47 @@ def run_opd_verl(spec=None) -> None:
     workdir = os.path.join("/tmp", "flash-opd-verl", _w.RUN_ID, f"seed-{_w.SEED}")
     shutil.rmtree(workdir, ignore_errors=True)
     data_dir = os.path.join(workdir, "data")
+    image_dir = os.path.join(workdir, "images")
     shim_dir = os.path.join(workdir, "shim")
     local_dir = os.path.join(workdir, "checkpoints")
     export_root = os.path.join(workdir, "checkpoint-adapters")
     for path in (data_dir, shim_dir, local_dir, export_root):
         os.makedirs(path, exist_ok=True)
 
+    materialized_images: dict[int, list[dict[str, str]]] = {}
+    if multimodal:
+        for index, prompt in enumerate(prompts):
+            uris = _materialize_verl_images(
+                list(prompt.image_descriptors),
+                prompt.package_root,
+                image_dir,
+                index,
+            )
+            materialized_images[index] = [{"image": uri} for uri in uris]
+
     rows = []
     for ordinal in range(update_horizon * prompts_per_step):
         index = ordinal % len(prompts)
-        rows.append(
-            {
-                "prompt": prompts[index].messages,
-                "data_source": "flash_opd",
-                "reward_model": {"style": "rule", "ground_truth": ""},
-                "extra_info": {"index": index},
-            }
-        )
+        prompt = prompts[index]
+        row = {
+            "prompt": (
+                [
+                    {
+                        "role": str(message.get("role") or ""),
+                        "content": _verl_image_message_content(message.get("content")),
+                    }
+                    for message in prompt.student_messages
+                ]
+                if multimodal
+                else prompt.student_messages
+            ),
+            "data_source": "flash_opd",
+            "reward_model": {"style": "rule", "ground_truth": ""},
+            "extra_info": {"index": index},
+        }
+        if multimodal:
+            row["images"] = materialized_images[index]
+        rows.append(row)
     train_file = os.path.join(data_dir, "train.parquet")
     val_file = os.path.join(data_dir, "val.parquet")
     _write_opd_parquet(rows, train_file)
