@@ -112,30 +112,6 @@ def test_build_verl_overrides_fp8_kv_gated_on_hardware():
     assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8" in on
 
 
-def test_resolve_verl_loggers_console_when_no_api_key(monkeypatch):
-    # no WANDB_API_KEY -> console only, and no wandb probe of the verl interpreter.
-    monkeypatch.delenv("WANDB_API_KEY", raising=False)
-    monkeypatch.setattr(
-        rl_verl.subprocess, "run",
-        lambda *a, **k: pytest.fail("must not probe verl env without an api key"),
-    )
-    assert rl_verl._resolve_verl_loggers("/verl/bin/python") == "console"
-
-
-def test_resolve_verl_loggers_enables_wandb_only_when_verl_env_has_it(monkeypatch):
-    # api key set AND wandb importable in the verl interpreter -> wandb logger enabled.
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.setattr(rl_verl.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
-    assert rl_verl._resolve_verl_loggers("/verl/bin/python") == "console,wandb"
-
-
-def test_resolve_verl_loggers_falls_back_to_console_when_verl_env_lacks_wandb(monkeypatch):
-    # api key set but wandb missing in the verl interpreter -> console only (never aborts verl).
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.setattr(rl_verl.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
-    assert rl_verl._resolve_verl_loggers("/verl/bin/python") == "console"
-
-
 def test_build_verl_overrides_kl_off_by_default():
     # flash default kl_penalty_coef=0 (dr-grpo, no kl term) -> no reference policy.
     o = rl_verl.build_verl_overrides(_overrides_cfg(kl_coef=0.0))
@@ -286,3 +262,39 @@ def test_build_verl_overrides_enable_fused_linear_ce():
     o = rl_verl.build_verl_overrides(_overrides_cfg())
     assert "actor_rollout_ref.model.use_fused_kernels=True" in o
     assert "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch" in o
+
+
+def test_model_revision_resolves_pinned_snapshot_for_verl():
+    # model_revision no longer fails closed: prefetch pins the revision and verl gets the pinned
+    # snapshot dir as model.path (a bare repo id would resolve the cached "main" ref offline).
+    import inspect
+
+    resolver_src = inspect.getsource(rl_verl._resolve_single_turn_inputs)
+    assert "model_revision pinning is not yet supported" not in resolver_src
+    run_src = inspect.getsource(rl_verl.run_rl_verl)
+    assert "local_files_only=True" in run_src
+    assert 'revision=inp["model_revision"]' in run_src
+
+
+def test_resolve_verl_loggers_console_when_no_api_key(monkeypatch):
+    # no WANDB_API_KEY -> console only, and no wandb probe of the verl interpreter.
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rl_verl.subprocess, "run",
+        lambda *a, **k: pytest.fail("must not probe verl env without an api key"),
+    )
+    assert rl_verl._resolve_verl_loggers("/verl/bin/python") == "console"
+
+
+def test_resolve_verl_loggers_enables_wandb_only_when_verl_env_has_it(monkeypatch):
+    # api key set AND wandb importable in the verl interpreter -> wandb logger enabled.
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    monkeypatch.setattr(rl_verl.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    assert rl_verl._resolve_verl_loggers("/verl/bin/python") == "console,wandb"
+
+
+def test_resolve_verl_loggers_falls_back_to_console_when_verl_env_lacks_wandb(monkeypatch):
+    # api key set but wandb missing in the verl interpreter -> console only (never aborts verl).
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    monkeypatch.setattr(rl_verl.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
+    assert rl_verl._resolve_verl_loggers("/verl/bin/python") == "console"
