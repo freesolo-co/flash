@@ -608,6 +608,19 @@ def _reject_image_completion(completion) -> None:
 
 
 def run_sft():
+    # backend selector (private worker env): default trl. the verl path imports nothing here so the
+    # default trl path is completely unchanged; verl runs out-of-process against its own interpreter.
+    backend = os.environ.get("FLASH_SFT_BACKEND", "trl").strip().lower()
+    if backend == "verl":
+        from flash.engine.worker.sft_verl import run_sft_verl
+
+        run_sft_verl()
+        return
+    if backend != "trl":
+        raise RuntimeError(
+            f"FLASH_SFT_BACKEND={backend!r} is not a known sft backend (expected 'trl' or 'verl')"
+        )
+
     from datasets import Dataset
     from transformers import AutoProcessor
     from trl import SFTConfig as TRLSFTConfig

@@ -415,6 +415,17 @@ class Candidate:
     gpu: str
     hourly_usd: float
     vram_gb: int
+    # cards in this candidate combination; hourly_usd and vram_gb stay PER-CARD so existing
+    # single-gpu consumers are unchanged. total cost = gpu_count * hourly_usd.
+    gpu_count: int = 1
+
+    @property
+    def total_hourly_usd(self) -> float:
+        return self.gpu_count * self.hourly_usd
+
+    @property
+    def total_vram_gb(self) -> int:
+        return self.gpu_count * self.vram_gb
 
 
 @dataclass(frozen=True)
@@ -424,6 +435,8 @@ class Allocation:
     hourly_usd: float
     min_vram_gb: int
     candidates: tuple[Candidate, ...]  # full ranked list; retry walks this
+    # cards in the chosen combination (1 = classic single-gpu allocation; hourly_usd is per-card)
+    gpu_count: int = 1
 
 
 @dataclass(frozen=True)
