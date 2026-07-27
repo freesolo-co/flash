@@ -498,7 +498,9 @@ class ApiClient:
             "GET",
             f"/v1/envs/{quoted}/package",
             timeout=1800.0,
-            max_bytes=loader._MAX_BUILTIN_PACKAGE_BYTES,
+            # this endpoint serves hub packages too, so it keeps the generic archive ceiling.
+            # the tighter built-in ceiling belongs to the inline carrier, not to this download.
+            max_bytes=loader._MAX_ARCHIVE_BYTES,
             extra_headers={"X-Freesolo-Project-Id": project_id},
         )
 

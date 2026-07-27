@@ -544,11 +544,23 @@ def test_download_env_package_caps_response_body(stub, monkeypatch):
     from flash.envs import loader as adapter
 
     url, _seen = stub
-    monkeypatch.setattr(adapter, "_MAX_BUILTIN_PACKAGE_BYTES", 5)
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_BYTES", 5)
     client = ApiClient(url, "fslo-user-test")
 
     with pytest.raises(ClientError, match="maximum allowed size"):
         client.download_env_package("acme/my-env", project_id=_PROJECT_ID)
+
+
+def test_download_env_package_allows_hub_packages_above_builtin_ceiling(stub, monkeypatch):
+    # this endpoint serves hub packages as well as built-ins, so the tighter inline-carrier
+    # ceiling must not cap it; a hub package larger than that ceiling still downloads.
+    from flash.envs import loader as adapter
+
+    url, _seen = stub
+    monkeypatch.setattr(adapter, "_MAX_BUILTIN_PACKAGE_BYTES", 4)
+    client = ApiClient(url, "fslo-user-test")
+
+    assert client.download_env_package("acme/my-env", project_id=_PROJECT_ID) == b"package-bytes"
 
 
 def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
