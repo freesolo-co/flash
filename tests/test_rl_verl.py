@@ -165,6 +165,40 @@ def test_render_reward_module_missing_index_raises():
         ns["compute_score"]("flash_env", "answer", "unused", extra_info={})
 
 
+@pytest.mark.parametrize("index", [True, 1.9])
+def test_render_reward_module_rejects_lossy_index(monkeypatch, index):
+    monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", "http://unused")
+    ns: dict = {}
+    exec(compile(rl_verl.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns)
+    monkeypatch.setattr(
+        ns["urllib"].request,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("invalid index must not reach the reward server"),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid example index"):
+        ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": index})
+
+
+@pytest.mark.parametrize("index", [1, 1.0])
+def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
+    scored = []
+    server, url = rl_verl.start_reward_server(
+        lambda idx, solution: scored.append((idx, solution)) or 3.0,
+        example_count=2,
+    )
+    try:
+        monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
+        ns: dict = {}
+        exec(compile(rl_verl.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns)
+        assert ns["compute_score"](
+            "flash_env", "answer", "unused", extra_info={"index": index}
+        ) == 3.0
+        assert scored == [(1, "answer")]
+    finally:
+        server.shutdown()
+
+
 # ------------------------------- reward parity -------------------------------
 class _BreakdownEnv:
     def scores_breakdown(self, graded, ex, state):
@@ -236,7 +270,8 @@ def test_reward_server_round_trip():
         server.shutdown()
 
 
-def test_reward_server_rejects_negative_index_before_lookup():
+@pytest.mark.parametrize("index", [-1, 2])
+def test_reward_server_rejects_out_of_range_index_before_lookup(index):
     examples = [{"name": "first"}, {"name": "last"}]
     scored = []
 
@@ -246,7 +281,7 @@ def test_reward_server_rejects_negative_index_before_lookup():
 
     server, url = rl_verl.start_reward_server(scorer, example_count=len(examples))
     try:
-        body = json.dumps({"index": -1, "solution_str": "answer"}).encode()
+        body = json.dumps({"index": index, "solution_str": "answer"}).encode()
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(req, timeout=10)
