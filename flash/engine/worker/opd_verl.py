@@ -819,7 +819,16 @@ class _TeacherAlignmentBridge:
         with self._mutation_lock:
             if self._mutation_notified:
                 return
-            self.mutation_callback()
+            try:
+                self.mutation_callback()
+            except Exception as error:
+                classification = (
+                    "transient"
+                    if isinstance(error, _w.RetriableInfraError)
+                    else "permanent"
+                )
+                self._record_mutation_failure(classification, str(error))
+                raise
             self._mutation_notified = True
 
     def start(self) -> None:
@@ -883,8 +892,6 @@ class _TeacherAlignmentBridge:
                     )
                     if self.path in {"/score", "/multiturn/score"}:
                         bridge._record_teacher_failure(classification, str(error))
-                    elif self.path == "/mutation":
-                        bridge._record_mutation_failure(classification, str(error))
                     self._send_json(
                         503 if classification == "transient" else 422,
                         {

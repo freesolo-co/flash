@@ -1595,6 +1595,30 @@ def test_mutation_marker_failure_preserves_bridge_classification(
             _raise_verl_failure(exit_error.value.code, None)
 
 
+def test_mutation_success_response_disconnect_does_not_latch_marker_failure():
+    callback_calls = []
+    bridge = _text_bridge(
+        _BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True)
+    )
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+
+    def disconnect_during_response(_handler, _status, _payload):
+        raise BrokenPipeError("client disconnected")
+
+    handler._send_json = disconnect_during_response
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as transport_error:
+            _post_json(bridge.url, bridge.token, "/mutation", {})
+    finally:
+        bridge.close()
+
+    assert transport_error.value.classification == "transient"
+    assert callback_calls == [True]
+    assert bridge.mutation_failure is None
+    assert bridge.teacher_failure is None
+
+
 @pytest.mark.parametrize("retriable", [True, False])
 def test_mutation_marker_failure_survives_actor_exit_and_generic_driver_status(
     retriable,
