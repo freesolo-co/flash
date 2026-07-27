@@ -31,6 +31,7 @@ from flash.engine.worker.opd_verl import (
     _restore_verl_resume,
     _stage_retry_contract,
     _TeacherAlignmentBridge,
+    _TextTeacherBatcher,
     _trim_response_and_forced,
     _validate_forced_mask,
     _write_opd_parquet,
@@ -1080,6 +1081,66 @@ def test_text_teacher_batch_mixed_dedup_preserves_logical_accounting(monkeypatch
     assert bridge.teacher_ok == 8
     assert bridge.teacher_input_tokens == 40
     assert bridge.aligned_sequences == 8
+
+
+def test_text_teacher_batcher_close_allows_inflight_scatter_within_bound():
+    class BlockingTeacher:
+        def __init__(self):
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.items = None
+
+        def score_many(self, items):
+            self.items = list(items)
+            self.entered.set()
+            assert self.release.wait(timeout=2.0)
+            return [
+                [
+                    TeacherToken(
+                        text=completion_text,
+                        logprob=-float(int(prompt_text.removeprefix("prompt-")) + 1),
+                        start=0,
+                        end=len(completion_text),
+                    )
+                ]
+                for prompt_text, completion_text in items
+            ]
+
+    teacher = BlockingTeacher()
+    batcher = _TextTeacherBatcher(teacher, max_batch_size=8, flush_wait_s=5.0)
+    batcher.start()
+    start = threading.Barrier(8)
+
+    def score(index):
+        start.wait(timeout=2.0)
+        return batcher.score(f"prompt-{index}", "AB")
+
+    executor = ThreadPoolExecutor(max_workers=8)
+    futures = [executor.submit(score, index) for index in range(8)]
+    close_thread = None
+    try:
+        assert teacher.entered.wait(timeout=2.0)
+        close_thread = threading.Thread(target=lambda: batcher.close(timeout_s=1.0))
+        close_thread.start()
+        with batcher._condition:
+            assert batcher._condition.wait_for(lambda: batcher._closed, timeout=1.0)
+        teacher.release.set()
+        results = [future.result(timeout=2.0) for future in futures]
+        close_thread.join(timeout=2.0)
+        assert not close_thread.is_alive()
+    finally:
+        teacher.release.set()
+        if close_thread is not None:
+            close_thread.join(timeout=2.0)
+        batcher.close(timeout_s=0.1)
+        executor.shutdown(wait=True)
+
+    assert teacher.items is not None
+    assert len(teacher.items) == 8
+    for index, result in enumerate(results):
+        assert result == [
+            TeacherToken(text="AB", logprob=-float(index + 1), start=0, end=2)
+        ]
 
 
 def test_text_teacher_batcher_shutdown_cannot_strand_pending_bridge_waiter(monkeypatch):

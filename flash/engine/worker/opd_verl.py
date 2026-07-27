@@ -294,14 +294,18 @@ class _TextTeacherBatcher:
         error = TeacherError("text teacher batcher shut down", permanent=True)
         with self._condition:
             self._closed = True
-            stranded = [*self._pending, *self._in_flight]
+            pending = list(self._pending)
             self._pending.clear()
             self._condition.notify_all()
             thread = self._thread
-        for waiter in stranded:
+        for waiter in pending:
             waiter.complete(error=_teacher_batch_error(error))
         if thread is not None:
             thread.join(timeout=max(0.0, timeout_s))
+        with self._condition:
+            in_flight = list(self._in_flight)
+        for waiter in in_flight:
+            waiter.complete(error=_teacher_batch_error(error))
 
 
 @dataclass(frozen=True)
