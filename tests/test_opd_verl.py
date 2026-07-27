@@ -1811,7 +1811,9 @@ def test_lost_cycle_commit_response_retries_without_mutation_failure(
     bridge = _text_bridge(SuccessThenTransientTeacher())
     bridge.score(0, 2, [10, 11, 65, 66, 99])
     mutation_failure_path = str(tmp_path / "mutation-failure")
+    cycle_failure_path = str(tmp_path / "cycle-commit-failure")
     monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", mutation_failure_path)
+    monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", cycle_failure_path)
 
     def unexpected_exit(code):
         raise AssertionError(f"cycle commitment exited rank with status {code}")
@@ -1846,6 +1848,7 @@ def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_cycle_commit_failure_fallback
     from flash.engine.worker.teacher import TeacherError
 
     class SuccessThenTransientTeacher:
@@ -1861,7 +1864,9 @@ def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback
     bridge = _text_bridge(SuccessThenTransientTeacher())
     bridge.score(0, 2, [10, 11, 65, 66, 99])
     mutation_failure_path = str(tmp_path / "mutation-failure")
+    cycle_failure_path = str(tmp_path / "cycle-commit-failure")
     monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", mutation_failure_path)
+    monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", cycle_failure_path)
 
     def unexpected_exit(code):
         raise AssertionError(f"cycle commitment exited rank with status {code}")
@@ -1910,36 +1915,92 @@ def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback
     assert actor_updates == [batch]
     assert bridge.mutation_failure is None
     assert not list(tmp_path.glob("mutation-failure.*.json"))
+    assert _read_cycle_commit_failure_fallback(cycle_failure_path) is None
     assert bridge.teacher_failure == ("transient", "teacher unavailable")
 
 
-def test_explicit_cycle_commit_rejection_aborts_before_actor_update(monkeypatch):
+def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(
+    monkeypatch, tmp_path
+):
     import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.perf import RetriableInfraError
 
+    attempts = []
     actor_updates = []
+    failure_path = str(tmp_path / "cycle-commit-failure")
 
     class ActorGroup:
         def update_actor(self, batch):
             actor_updates.append(batch)
 
-    def reject_commit(_url, _token):
+    def fail_before_parent(*_args, **_kwargs):
+        attempts.append(True)
+        raise FlashTeacherBridgeError(
+            "cycle bridge unavailable",
+            classification="transient",
+            delivery_unknown=True,
+        )
+
+    monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", failure_path)
+    monkeypatch.setattr(plugin, "_post_json", fail_before_parent)
+
+    with pytest.raises(FlashTeacherBridgeError):
+        plugin._update_actor_after_teacher_cycle_commit(
+            ActorGroup(), object(), "http://bridge", "token"
+        )
+
+    fallback = _read_cycle_commit_failure_fallback(failure_path)
+    assert attempts == [True, True]
+    assert actor_updates == []
+    assert fallback == ("transient", "cycle bridge unavailable")
+    with pytest.raises(RetriableInfraError, match="pre-update cycle commitment"):
+        _raise_verl_failure(1, None, cycle_commit_failure=fallback)
+
+
+def test_explicit_cycle_commit_rejection_aborts_before_actor_update(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_cycle_commit_failure_fallback
+
+    attempts = []
+    actor_updates = []
+    failure_path = str(tmp_path / "cycle-commit-failure")
+
+    class ActorGroup:
+        def update_actor(self, batch):
+            actor_updates.append(batch)
+
+    def reject_commit(*_args, **_kwargs):
+        attempts.append(True)
         raise FlashTeacherBridgeError(
             "cycle commit rejected",
             classification="permanent",
         )
 
-    monkeypatch.setattr(plugin, "_post_teacher_cycle_committed", reject_commit)
+    monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", failure_path)
+    monkeypatch.setattr(plugin, "_post_json", reject_commit)
 
     with pytest.raises(FlashTeacherBridgeError, match="cycle commit rejected"):
         plugin._update_actor_after_teacher_cycle_commit(
             ActorGroup(), object(), "http://bridge", "token"
         )
 
+    fallback = _read_cycle_commit_failure_fallback(failure_path)
+    assert attempts == [True]
     assert actor_updates == []
+    assert fallback == ("permanent", "cycle commit rejected")
+    with pytest.raises(RuntimeError, match="permanent pre-update cycle commitment"):
+        _raise_verl_failure(1, None, cycle_commit_failure=fallback)
 
 
-def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch):
+def test_persistent_cycle_commit_failure_aborts_before_actor_update(
+    monkeypatch, tmp_path
+):
     import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.perf import RetriableInfraError
 
     bridge = _text_bridge(_BridgeTeacher())
     commit_calls = []
@@ -1951,6 +2012,9 @@ def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch)
 
     bridge.commit_teacher_cycle = record_commit
     actor_updates = []
+    accounting_before = bridge.accounting_snapshot()
+    failure_path = str(tmp_path / "cycle-commit-failure")
+    monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", failure_path)
 
     class ActorGroup:
         def update_actor(self, batch):
@@ -1973,12 +2037,41 @@ def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch)
     finally:
         bridge.close()
 
+    fallback = _read_cycle_commit_failure_fallback(failure_path)
     assert error.value.classification == "transient"
     assert error.value.delivery_unknown
     assert sends == [200, 200]
     assert commit_calls == [True, True]
     assert actor_updates == []
     assert bridge.mutation_failure is None
+    assert bridge.accounting_snapshot() == accounting_before
+    assert fallback is not None
+    assert fallback[0] == "transient"
+    with pytest.raises(RetriableInfraError, match="pre-update cycle commitment"):
+        _raise_verl_failure(1, None, cycle_commit_failure=fallback)
+
+
+def test_cycle_commit_fallback_reader_ignores_incomplete_records(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_cycle_commit_failure_fallback
+
+    failure_path = str(tmp_path / "cycle-commit-failure")
+    monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", failure_path)
+
+    plugin._write_cycle_commit_failure_fallback("transient", "cycle timeout")
+    Path(f"{failure_path}.malformed.permanent.json").write_text("{")
+    Path(f"{failure_path}.incomplete.permanent.json.tmp").write_text(
+        json.dumps({"classification": "permanent", "message": "incomplete"})
+    )
+
+    completed = list(tmp_path.glob("cycle-commit-failure.*.transient.json"))
+    assert len(completed) == 1
+    assert _read_cycle_commit_failure_fallback(failure_path) == (
+        "transient",
+        "cycle timeout",
+    )
 
 
 def test_mixed_transient_and_teacher_empty_alignment_exhaustion_remains_permanent():
@@ -2934,6 +3027,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
         mutation_failure_path=str(tmp_path / "mutation-failure"),
         abandonment_failure_path=str(tmp_path / "abandonment-failure"),
         resample_failure_path=str(tmp_path / "resample-failure"),
+        cycle_commit_failure_path=str(tmp_path / "cycle-commit-failure"),
     )
     assert child["FLASH_OPD_BRIDGE_URL"] == "http://127.0.0.1:4444"
     assert child["FLASH_OPD_BRIDGE_TOKEN"] == "bridge-token"
@@ -2943,6 +3037,9 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
     )
     assert child["FLASH_OPD_RESAMPLE_FAILURE_PATH"] == str(
         tmp_path / "resample-failure"
+    )
+    assert child["FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH"] == str(
+        tmp_path / "cycle-commit-failure"
     )
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_verl_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"

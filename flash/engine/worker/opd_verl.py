@@ -1293,6 +1293,7 @@ def _build_opd_child_env(
     mutation_failure_path: str = "",
     abandonment_failure_path: str = "",
     resample_failure_path: str = "",
+    cycle_commit_failure_path: str = "",
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -1311,6 +1312,8 @@ def _build_opd_child_env(
         child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] = abandonment_failure_path
     if resample_failure_path:
         child["FLASH_OPD_RESAMPLE_FAILURE_PATH"] = resample_failure_path
+    if cycle_commit_failure_path:
+        child["FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH"] = cycle_commit_failure_path
     if multi_turn:
         child.update(
             {
@@ -1401,13 +1404,21 @@ def _read_failure_fallback_records(base_path: str) -> list[tuple[str, str]]:
     return failures
 
 
-def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
+def _read_classified_failure_fallback(base_path: str) -> tuple[str, str] | None:
     failures = _read_failure_fallback_records(base_path)
     for classification in ("permanent", "transient"):
         for failure_classification, message in failures:
             if failure_classification == classification:
                 return classification, message
     return None
+
+
+def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
+
+
+def _read_cycle_commit_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
 
 
 def _read_abandonment_failure_fallback(base_path: str) -> bool:
@@ -1422,6 +1433,7 @@ def _raise_verl_failure(
     return_code: int,
     teacher_failure: tuple[str, str] | None,
     mutation_failure: tuple[str, str] | None = None,
+    cycle_commit_failure: tuple[str, str] | None = None,
 ) -> None:
     if return_code == 0:
         return
@@ -1430,6 +1442,15 @@ def _raise_verl_failure(
         if classification == "transient":
             raise _w.RetriableInfraError(f"optimizer marker failure: {message}")
         raise RuntimeError(f"permanent optimizer marker failure: {message}")
+    if cycle_commit_failure is not None:
+        classification, message = cycle_commit_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(
+                f"pre-update cycle commitment failure: {message}"
+            )
+        raise RuntimeError(
+            f"permanent pre-update cycle commitment failure: {message}"
+        )
     if teacher_failure is not None:
         classification, message = teacher_failure
         if classification == "transient":
@@ -1800,6 +1821,7 @@ def run_opd_verl(spec=None) -> None:
     mutation_failure_path = os.path.join(workdir, "mutation-failure")
     abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
     resample_failure_path = os.path.join(workdir, "resample-failure")
+    cycle_commit_failure_path = os.path.join(workdir, "cycle-commit-failure")
     for path in (data_dir, shim_dir, local_dir, export_root):
         os.makedirs(path, exist_ok=True)
 
@@ -1972,6 +1994,7 @@ def run_opd_verl(spec=None) -> None:
             mutation_failure_path=mutation_failure_path,
             abandonment_failure_path=abandonment_failure_path,
             resample_failure_path=resample_failure_path,
+            cycle_commit_failure_path=cycle_commit_failure_path,
         )
         command = [python_bin, entry_path, *overrides]
         progress = {"step": resume_step, "loss": None}
@@ -2036,10 +2059,14 @@ def run_opd_verl(spec=None) -> None:
         )
         if fallback_mutation_failure is not None:
             bridge._record_mutation_failure(*fallback_mutation_failure)
+        cycle_commit_failure = _read_cycle_commit_failure_fallback(
+            cycle_commit_failure_path
+        )
         _raise_verl_failure(
             return_code,
             bridge.teacher_failure,
             bridge.mutation_failure,
+            cycle_commit_failure,
         )
         final_accounting = progress_state.final_state(bridge)
         train_wall = float(final_accounting["train_wall_seconds"])

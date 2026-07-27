@@ -374,6 +374,14 @@ def _write_resample_failure_fallback(classification: str, message: str) -> None:
     )
 
 
+def _write_cycle_commit_failure_fallback(classification: str, message: str) -> None:
+    _write_failure_fallback(
+        os.environ.get("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", ""),
+        classification,
+        message,
+    )
+
+
 def _exit_for_mutation_failure(error: FlashTeacherBridgeError) -> None:
     _write_mutation_failure_fallback(error.classification, str(error))
     exit_code = (
@@ -447,8 +455,26 @@ def _post_teacher_cycle_committed(url: str, token: str) -> None:
         return
     except FlashTeacherBridgeError as error:
         if not error.delivery_unknown:
+            _write_cycle_commit_failure_fallback(error.classification, str(error))
             raise
-    _post_json(url, token, "/teacher-cycle/committed", {})
+    except Exception as error:
+        _write_cycle_commit_failure_fallback(
+            "permanent",
+            f"unexpected cycle commitment bridge failure: {type(error).__name__}",
+        )
+        raise
+
+    try:
+        _post_json(url, token, "/teacher-cycle/committed", {})
+    except FlashTeacherBridgeError as error:
+        _write_cycle_commit_failure_fallback(error.classification, str(error))
+        raise
+    except Exception as error:
+        _write_cycle_commit_failure_fallback(
+            "permanent",
+            f"unexpected cycle commitment bridge failure: {type(error).__name__}",
+        )
+        raise
 
 
 def _update_actor_after_teacher_cycle_commit(
