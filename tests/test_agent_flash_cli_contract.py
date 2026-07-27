@@ -46,28 +46,33 @@ from flash.spec import JobSpec
 
 
 @pytest.mark.parametrize(
-    "subcommand",
+    "command",
     [
-        "train",
-        "status",
-        "runs",
-        "cancel",
-        "env",
+        ("train",),
+        ("runs", "status"),
+        ("runs", "list"),
+        ("runs", "cancel"),
+        ("env",),
     ],
 )
-def test_agent_required_subcommands_exist(subcommand: str) -> None:
-    """The agent's worker drives the CLI's `train/status/runs/cancel/env/...`
-    subcommands.
-
-    argparse exits with code 2 and an 'invalid choice' message when a subcommand
-    does not exist. We invoke each with `--help`, which exits 0 for a real
-    subcommand (and never touches the network/credentials). A removed/renamed
-    subcommand would make this raise SystemExit(2) instead.
-    """
+def test_agent_required_subcommands_exist(command: tuple[str, ...]) -> None:
+    """The agent contract uses the canonical grouped run-management commands."""
     with pytest.raises(SystemExit) as excinfo:
-        main([subcommand, "--help"])
-    # --help exits 0 for an existing subcommand; an unknown subcommand exits 2.
-    assert excinfo.value.code == 0, f"`flash {subcommand}` is missing from the CLI"
+        main([*command, "--help"])
+    rendered = " ".join(command)
+    assert excinfo.value.code == 0, f"`flash {rendered}` is missing from the CLI"
+
+
+def test_deployed_agent_root_run_shims_remain_callable_but_hidden(capsys) -> None:
+    for command in ("status", "log", "cancel", "checkpoints"):
+        with pytest.raises(SystemExit) as excinfo:
+            main([command, "--help"])
+        assert excinfo.value.code == 0
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    help_text = capsys.readouterr().out
+    for command in ("status", "log", "cancel", "checkpoints"):
+        assert f"\n    {command} " not in help_text
 
 
 def test_env_push_subcommand_exists() -> None:
@@ -96,6 +101,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
     config = tmp_path / "rl.toml"
     config.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
         'id = "owner/env"\n'
@@ -103,7 +109,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
         "epochs = 1\n"
         "max_examples = 10\n"
         "[gpu]\n"
-        ''
+        ""
     )
 
     seen: dict = {}
@@ -191,7 +197,7 @@ def test_agent_terminal_states_subset_of_flash_terminal_states() -> None:
 
 
 def test_get_status_returns_fields_the_agent_reads(tmp_path, monkeypatch) -> None:
-    """`flash status <run_id>` returns the run's status JSON; the agent reads `state`
+    """`flash runs status <run_id>` returns the run's status JSON; the agent reads `state`
     and `run_id` from it (and the CLI's status/runs commands read cost_usd/spec). Assert a
     persisted RunStatus exposes those keys so a field rename in RunStatus can't
     silently strip what the agent/CLI consume.
@@ -200,7 +206,11 @@ def test_get_status_returns_fields_the_agent_reads(tmp_path, monkeypatch) -> Non
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     rid = new_run_id()
-    status = RunStatus(run_id=rid, state="done", spec={"model": "m"})
+    status = RunStatus(
+        run_id=rid,
+        state="done",
+        spec={"model": "m", "project": "11111111-1111-4111-8111-111111111111"},
+    )
     runner._save_status(status)
 
     loaded = get_status(rid).to_dict()
@@ -218,6 +228,7 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     spec = JobSpec.from_dict(
         {
             "run_id": rid,
+            "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "sft",
             "model": "Qwen/Qwen3.5-2B",
             "train": {

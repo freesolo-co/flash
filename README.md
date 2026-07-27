@@ -9,11 +9,14 @@ The allocator picks the cheapest validated managed GPU class that fits the run.
 - `flash train <cfg.toml>` / control-plane `POST /runs` — submit a training job;
   one dedicated GPU per run, supervised server-side (stall watchdog, bounded
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
-- `flash checkpoints`, `flash deploy`, `flash chat` — serving for trained adapters,
-  including deployable intermediate RL checkpoints.
+- `flash runs checkpoint`, `flash models deploy`, `flash models chat` — serving for trained
+  adapters, including deployable intermediate RL checkpoints.
+- **Required Freesolo projects.** Create one with `flash projects create NAME` and retrieve UUIDs
+  with `flash projects list`. Every training TOML has a required top-level `project = "<uuid>"`;
+  Flash validates that UUID against the authenticated organization before run allocation.
 - **Freesolo SDK environments.** Every run names a Freesolo environment id.
-  Scaffold `environment.py` plus `dataset/train.jsonl`, upload `.` or another
-  folder with `flash env push --name <name> <folder>`, then reference the
+  Scaffold with `flash env setup --project <uuid>`, then upload `.` or another
+  folder with `flash env push --project <uuid> --name <name> <folder>` and reference the
   returned id. The worker loads it through `freesolo.environments`. There are no
   built-in task environments. Single-turn and bounded multi-turn environments are
   supported.
@@ -63,17 +66,17 @@ not a user knob and not an operator-wide env var. Clients authenticate with thei
 
 ## Release channels
 
-Two channels are published to PyPI from the *same source*, distinguished by one line in
+Two channels are published to PyPI from the _same source_, distinguished by one line in
 `flash/_channel.py` (`CHANNEL`):
 
-| Channel | PyPI package | CLI | Default plane | Published from |
-| --- | --- | --- | --- | --- |
-| prod | `freesolo-flash` | `flash` | `flash.freesolo.co` | push to `main` that bumps `[project].version` (`.github/workflows/publish.yml`) |
-| dev | `freesolo-flash-dev` | `flash-dev` | `flash-dev.freesolo.co` | push to `dev` whose `[tool.flash-dev].version` isn't on PyPI yet (`.github/workflows/publish-dev.yml`) |
+| Channel | PyPI package         | CLI         | Default plane           | Published from                                                                                         |
+| ------- | -------------------- | ----------- | ----------------------- | ------------------------------------------------------------------------------------------------------ |
+| prod    | `freesolo-flash`     | `flash`     | `flash.freesolo.co`     | push to `main` that bumps `[project].version` (`.github/workflows/publish.yml`)                        |
+| dev     | `freesolo-flash-dev` | `flash-dev` | `flash-dev.freesolo.co` | push to `dev` whose `[tool.flash-dev].version` isn't on PyPI yet (`.github/workflows/publish-dev.yml`) |
 
 Each environment holds exactly **one** channel: both packages ship the same import package
 (`flash/`) with one baked `CHANNEL` line, so installing both into the same environment makes the
-later install win for *both* CLIs. For side-by-side prod and staging, install each channel in its
+later install win for _both_ CLIs. For side-by-side prod and staging, install each channel in its
 own virtualenv (or via `pipx`, which isolates per tool). The dev build is produced by
 `scripts/build_dev_dist.py`, which renames the package/CLI and flips `CHANNEL` to `dev` before
 `uv build`. Both channels ship at the **same version**: `[project].version` and
@@ -83,7 +86,7 @@ so cutting a release means bumping both together. Either CLI still honours an ex
 
 ## Serving From an API
 
-`flash chat` is a CLI wrapper around the Flash control-plane chat endpoint. To call a
+`flash models chat` is a CLI wrapper around the Flash control-plane chat endpoint. To call a
 deployed adapter from your own app, deploy the finished run once and then POST chat
 requests with your freesolo API key:
 

@@ -22,9 +22,9 @@ def test_format_heartbeat_appends_named_reward_metrics() -> None:
     base_line = _format_heartbeat(heartbeat)
 
     assert base_line == "worker: stage=rl_step step=4 reward=0.650"
-    assert _format_heartbeat(
-        {**heartbeat, "reward_metrics": {"success": 0.8, "format": 0.5}}
-    ) == (base_line + " success=0.800 format=0.500")
+    assert _format_heartbeat({**heartbeat, "reward_metrics": {"success": 0.8, "format": 0.5}}) == (
+        base_line + " success=0.800 format=0.500"
+    )
 
 
 class _FakeClient:
@@ -73,7 +73,11 @@ class _FakeClient:
                 "state": "done",
                 "cost_usd": 0.25,
                 "updated_at": 1700000000.0,
-                "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+                "spec": {
+                    "project": "11111111-1111-4111-8111-111111111111",
+                    "model": "Qwen/Qwen3.5-0.8B",
+                    "algorithm": "sft",
+                },
             }
         ]
 
@@ -159,6 +163,23 @@ class _FakeClient:
         }
 
 
+@pytest.fixture(autouse=True)
+def project_api(monkeypatch):
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.test", "fslo-test")
+    )
+    monkeypatch.setattr(
+        cli.commands, "load_credentials", lambda: ("https://flash.test", "fslo-test")
+    )
+    monkeypatch.setattr(
+        "flash.client.get_project", lambda project_id, api_key: {"id": project_id, "name": "Test"}
+    )
+    monkeypatch.setattr(
+        "flash.client.list_projects",
+        lambda api_key: [{"id": "11111111-1111-4111-8111-111111111111", "name": "Test project"}],
+    )
+
+
 @pytest.fixture
 def fake_client(monkeypatch) -> _FakeClient:
     client = _FakeClient()
@@ -177,6 +198,80 @@ def test_whoami_prints_identity(fake_client, capsys) -> None:
     assert "t@example.com" in out
     # Rendered as a human card, not raw JSON.
     assert "{" not in out
+
+
+def test_project_create_prints_only_returned_id_in_plain_mode(monkeypatch, capsys) -> None:
+    seen = {}
+    monkeypatch.setattr(
+        cli.commands, "load_credentials", lambda: ("https://flash.test", "fslo-test")
+    )
+
+    def create(name, description, api_key):
+        seen.update(name=name, description=description, api_key=api_key)
+        return {"id": "33333333-3333-4333-8333-333333333333"}
+
+    monkeypatch.setattr("flash.client.create_project", create)
+    assert _run(["projects", "create", " My project ", "--description", " desc "]) == 0
+    assert capsys.readouterr().out == "33333333-3333-4333-8333-333333333333\n"
+    assert seen == {"name": " My project ", "description": " desc ", "api_key": "fslo-test"}
+
+
+def test_projects_list_prints_ids_and_names(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "flash.client.list_projects",
+        lambda api_key: [
+            {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "name": "Test project",
+            }
+        ],
+    )
+
+    assert _run(["projects", "list"]) == 0
+    assert capsys.readouterr().out == ("11111111-1111-4111-8111-111111111111\tTest project\n")
+
+
+def test_projects_create_uses_plural_group(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "flash.client.create_project",
+        lambda name, description, api_key: {"id": "33333333-3333-4333-8333-333333333333"},
+    )
+
+    assert _run(["projects", "create", "My project"]) == 0
+    assert capsys.readouterr().out == "33333333-3333-4333-8333-333333333333\n"
+
+
+def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
+    config = tmp_path / "run.toml"
+    config.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        'algorithm = "grpo"\n'
+        "[environment]\n"
+        'id = "acme/example"\n'
+        "[train]\n"
+        "epochs = 1\n"
+        "max_examples = 1\n",
+        encoding="utf-8",
+    )
+
+    assert _run(["train", str(config), "--cost"]) == 1
+    assert "project" in capsys.readouterr().err.lower()
+
+
+def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> None:
+    from argparse import Namespace
+
+    from flash.cli import env_setup
+    from flash.client import ApiError, ClientError
+
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ApiError(403, "forbidden")),
+    )
+
+    with pytest.raises(ClientError, match="not accessible") as excinfo:
+        env_setup._require_setup_project(Namespace(project="11111111-1111-4111-8111-111111111111"))
+    assert type(excinfo.value) is ClientError
 
 
 def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
@@ -234,7 +329,7 @@ def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
 
 
 def test_models_table(fake_client, capsys) -> None:
-    assert _run(["models"]) == 0
+    assert _run(["models", "list"]) == 0
     out = capsys.readouterr().out
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
@@ -266,6 +361,7 @@ def _train_config(tmp_path, *, extra_train: str = ""):
     path = tmp_path / "train.toml"
     path.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/env"\n'
         f"[train]\nepochs = 1\nmax_examples = 2\n{extra_train}"
@@ -340,6 +436,7 @@ def test_train_dry_run_sends_declared_runtime_secrets(
     config = tmp_path / "train.toml"
     config.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/env"\nsecrets = ["SERPAPI_API_KEY"]\n'
         "[train]\nepochs = 1\nmax_examples = 2\n"
@@ -451,24 +548,24 @@ def test_train_live_and_dry_run_send_the_same_sparse_spec(fake_client, tmp_path,
 
 
 def test_status_runs_and_log_command(fake_client, capsys) -> None:
-    assert _run(["status", "flash-1"]) == 0
+    assert _run(["runs", "status", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert "done" in out
     assert "cost_usd" in out
 
-    assert _run(["runs"]) == 0
+    assert _run(["runs", "list"]) == 0
     out = capsys.readouterr().out
     assert "ALGO" in out
     assert "flash-1" in out
     assert "done" in out
     assert "SFT" in out
 
-    assert _run(["status", "flash-1", "--follow"]) == 0
+    assert _run(["runs", "status", "flash-1", "--follow"]) == 0
     out = capsys.readouterr().out
     assert "cost_usd" in out
     assert "hello from the worker" not in out
 
-    assert _run(["log", "flash-1"]) == 0
+    assert _run(["runs", "log", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert "hello from the worker" in out
     assert "----- console_sft.txt -----" in out
@@ -480,7 +577,7 @@ def test_log_prints_partial_log_line_with_newline(fake_client, capsys) -> None:
     fake_client.log_text = "partial log line"
     fake_client.get_worker_output = lambda run_id: {}
 
-    assert _run(["log", "flash-1"]) == 0
+    assert _run(["runs", "log", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert out == "partial log line\n"
 
@@ -500,7 +597,7 @@ def test_log_snapshot_reads_one_offset_page_without_status(fake_client, capsys) 
     fake_client.get_logs = get_logs
     fake_client.get_worker_output = lambda run_id: {}
 
-    assert _run(["log", "flash-1"]) == 0
+    assert _run(["runs", "log", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert out == "first\n"
     assert calls == [0]
@@ -664,7 +761,9 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
 
     assert state == "done"
     assert printed_any is False
-    metric_lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("step=")]
+    metric_lines = [
+        line for line in capsys.readouterr().err.splitlines() if line.startswith("step=")
+    ]
     assert metric_lines == [
         "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
         "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256",
@@ -701,25 +800,25 @@ def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
     so (on stderr in the plain path, keeping the stdout JSON machine-readable)."""
     import json as _json
 
-    assert _run(["cancel", "flash-1"]) == 0
+    assert _run(["runs", "cancel", "flash-1"]) == 0
     assert ("checkpoints", "flash-1") in fake_client.calls
     out, err = capsys.readouterr()
     assert _json.loads(out)["state"] == "cancelled"  # stdout stays pure JSON in the plain path
     assert "2 deployable checkpoint(s) survive this cancel" in err
-    assert "flash checkpoints flash-1" in err
-    assert "flash deploy flash-1/step-40" in err  # points at the newest surviving step
+    assert "flash runs checkpoint flash-1" in err
+    assert "flash models deploy flash-1/step-40" in err  # points at the newest surviving step
 
 
 def test_cancel_hint_is_best_effort_when_checkpoint_listing_fails(
     fake_client, capsys, monkeypatch
 ) -> None:
-    """The surviving-checkpoints lookup must never break `flash cancel` itself."""
+    """The surviving-checkpoints lookup must never break `flash runs cancel` itself."""
 
     def boom(run_id):
         raise RuntimeError("backend hiccup")
 
     monkeypatch.setattr(fake_client, "checkpoints", boom)
-    assert _run(["cancel", "flash-1"]) == 0
+    assert _run(["runs", "cancel", "flash-1"]) == 0
     out, err = capsys.readouterr()
     assert '"state": "cancelled"' in out
     assert "deployable checkpoint" not in err
@@ -732,43 +831,43 @@ def test_cancel_hint_survives_malformed_checkpoint_shape(fake_client, capsys, mo
     monkeypatch.setattr(
         fake_client, "checkpoints", lambda run_id: [{"no_step": 1}, {"step": None}, {"step": 7}]
     )
-    assert _run(["cancel", "flash-1"]) == 0  # did not raise on the malformed entries
+    assert _run(["runs", "cancel", "flash-1"]) == 0  # did not raise on the malformed entries
     out, err = capsys.readouterr()
     assert '"state": "cancelled"' in out
     assert "3 deployable checkpoint(s) survive this cancel" in err
-    assert "flash deploy flash-1/step-7" in err  # max of the RECOVERABLE steps
+    assert "flash models deploy flash-1/step-7" in err  # max of the RECOVERABLE steps
 
     monkeypatch.setattr(fake_client, "checkpoints", lambda run_id: [{"no_step": 1}])
-    assert _run(["cancel", "flash-1"]) == 0
+    assert _run(["runs", "cancel", "flash-1"]) == 0
     _, err2 = capsys.readouterr()
     assert "1 deployable checkpoint(s) survive this cancel" in err2
     assert "flash deploy" not in err2
 
 
 def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
-    assert _run(["cancel", "flash-1"]) == 0
+    assert _run(["runs", "cancel", "flash-1"]) == 0
     assert ("cancel", "flash-1") in fake_client.calls
 
-    assert _run(["deploy", "flash-1"]) == 0
+    assert _run(["models", "deploy", "flash-1"]) == 0
     assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
 
-    assert _run(["deploy", "flash-1/step-40"]) == 0
+    assert _run(["models", "deploy", "flash-1/step-40"]) == 0
     assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
     err = capsys.readouterr().err
-    assert "flash undeploy flash-1`" in err
-    assert "flash undeploy flash-1/step-40`" not in err
+    assert "flash models undeploy flash-1`" in err
+    assert "flash models undeploy flash-1/step-40`" not in err
 
-    assert _run(["deployments"]) == 0
+    assert _run(["models", "deployments"]) == 0
     deployments_out = capsys.readouterr().out
     assert "flash-1" in deployments_out
     assert "REVISION" in deployments_out
 
-    assert _run(["undeploy", "flash-1"]) == 0
+    assert _run(["models", "undeploy", "flash-1"]) == 0
     assert ("undeploy", "flash-1") in fake_client.calls
 
 
 def test_deployments_json_passes_server_rows_through(fake_client, capsys) -> None:
-    assert _run(["deployments", "--json"]) == 0
+    assert _run(["models", "deployments", "--json"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert rows == [
         {
@@ -784,12 +883,12 @@ def test_deployments_json_passes_server_rows_through(fake_client, capsys) -> Non
 
 def test_deployments_json_empty_list(fake_client, monkeypatch, capsys) -> None:
     monkeypatch.setattr(fake_client, "deployments", lambda: [])
-    assert _run(["deployments", "--json"]) == 0
+    assert _run(["models", "deployments", "--json"]) == 0
     assert capsys.readouterr().out.strip() == "[]"
 
 
 def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
-    assert _run(["chat", "flash-1", "-m", "What is 6*7?"]) == 0
+    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?"]) == 0
     assert "42" in capsys.readouterr().out
     assert fake_client.calls[-1][0] == "chat_stream"
 
@@ -797,21 +896,21 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
 def test_chat_checkpoint_ref_is_forwarded_unchanged(fake_client) -> None:
     target = "flash-1/step-40"
 
-    assert _run(["chat", target, "-m", "What is 6*7?"]) == 0
+    assert _run(["models", "chat", target, "-m", "What is 6*7?"]) == 0
     assert fake_client.calls[-1][0] == "chat_stream"
     assert fake_client.calls[-1][1] == target
 
 
 def test_chat_accepts_full_immutable_revision(fake_client) -> None:
     revision = "flash-1@step-40." + "a" * 40
-    assert _run(["chat", revision, "-m", "What is 6*7?"]) == 0
+    assert _run(["models", "chat", revision, "-m", "What is 6*7?"]) == 0
     assert fake_client.calls[-1][0] == "chat_stream"
     assert fake_client.calls[-1][1] == revision
 
 
 def test_chat_system_flag_prepends_system_message(fake_client) -> None:
     """--system gives evals training-prompt parity without calling the HTTP API directly."""
-    assert _run(["chat", "flash-1", "-m", "What is 6*7?", "--system", "be brief"]) == 0
+    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?", "--system", "be brief"]) == 0
     _, _, messages = fake_client.calls[-1]
     assert messages == [
         {"role": "system", "content": "be brief"},
@@ -820,7 +919,7 @@ def test_chat_system_flag_prepends_system_message(fake_client) -> None:
 
 
 def test_chat_without_system_flag_sends_user_message_only(fake_client) -> None:
-    assert _run(["chat", "flash-1", "-m", "What is 6*7?"]) == 0
+    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?"]) == 0
     _, _, messages = fake_client.calls[-1]
     assert messages == [{"role": "user", "content": "What is 6*7?"}]
 
@@ -828,14 +927,14 @@ def test_chat_without_system_flag_sends_user_message_only(fake_client) -> None:
 @pytest.mark.parametrize("flag", ["--enable-thinking", "--disable-thinking"])
 def test_chat_does_not_expose_thinking_override_flags(fake_client, flag) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        _run(["chat", "flash-1", "-m", "What is 6*7?", flag])
+        _run(["models", "chat", "flash-1", "-m", "What is 6*7?", flag])
     assert excinfo.value.code == 2
 
 
 def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.chdir(tmp_path)
 
-    assert _run(["env", "setup"]) == 0
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     assert (tmp_path / "environment.py").is_file()
     dataset = tmp_path / "dataset/train.jsonl"
@@ -847,11 +946,13 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert grpo.is_file()
     assert sft.is_file()
     assert not (tmp_path / "configs/endpoints.toml").exists()
+    assert 'project = "11111111-1111-4111-8111-111111111111"' in grpo.read_text()
     assert 'algorithm = "grpo"' in grpo.read_text()
     assert "epochs = 1" in grpo.read_text()
     assert "max_examples = 2" in grpo.read_text()
     assert "cheapest fitting managed class" in grpo.read_text()
     assert "private environment-scoped repo" in grpo.read_text()
+    assert 'project = "11111111-1111-4111-8111-111111111111"' in sft.read_text()
     assert 'algorithm = "sft"' in sft.read_text()
     assert "epochs = 1" in sft.read_text()
     assert "max_examples = 2" in sft.read_text()
@@ -860,6 +961,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     opd = tmp_path / "configs/opd.toml"
     assert opd.is_file()
     opd_text = opd.read_text()
+    assert 'project = "11111111-1111-4111-8111-111111111111"' in opd_text
     assert 'algorithm = "opd"' in opd_text
     assert "epochs = 1" in opd_text
     assert "max_examples = 2" in opd_text
@@ -882,9 +984,14 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "longest shared token prefix" in training_text
     assert "flash env pull your-org/my-env" in training_text
     assert "private environment-scoped repo" in training_text
-    assert "flash checkpoints <run-id>" in training_text
-    assert "flash deployments" in training_text
-    assert "flash export --adapter-id <run-id> --repository <you>/<repo>" in training_text
+    assert 'project = "11111111-1111-4111-8111-111111111111"' in training_text
+    assert "flash runs checkpoint <run-id>" in training_text
+    assert "flash models deployments" in training_text
+    assert "flash models export --adapter-id <run-id> --repository <you>/<repo>" in training_text
+    assert (
+        "flash env push --project 11111111-1111-4111-8111-111111111111 --name my-env ."
+        in training_text
+    )
     assert "HF_TOKEN" in training_text
     assert "runpod" not in training_text.lower()
     assert "lambda" not in training_text.lower()
@@ -901,7 +1008,10 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     and the starter env docstring must NOT warn it is single-turn only / fails fast."""
     monkeypatch.chdir(tmp_path)
 
-    assert _run(["env", "setup", "--multi-turn"]) == 0
+    assert (
+        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
+        == 0
+    )
 
     env_py = (tmp_path / "environment.py").read_text()
     assert "EnvironmentMultiTurn" in env_py  # genuinely a multi-turn scaffold
@@ -924,7 +1034,7 @@ def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
     # Non-interactive (pytest stdin is not a tty) with no flags stays on today's scaffold: no
     # reasoning knobs land in either config.
     monkeypatch.chdir(tmp_path)
-    assert _run(["env", "setup"]) == 0
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
     rl = (tmp_path / "configs/rl.toml").read_text()
     sft = (tmp_path / "configs/sft.toml").read_text()
     assert "thinking = true" not in rl
@@ -935,7 +1045,10 @@ def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
 
 def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
-    assert _run(["env", "setup", "--reasoning"]) == 0
+    assert (
+        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--reasoning"])
+        == 0
+    )
     rl = (tmp_path / "configs/rl.toml").read_text()
     sft = (tmp_path / "configs/sft.toml").read_text()
     assert "thinking = true" in rl
@@ -949,13 +1062,21 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
 
 def test_env_setup_no_reasoning_flag_is_explicit_off(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
-    assert _run(["env", "setup", "--no-reasoning"]) == 0
+    assert (
+        _run(
+            ["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--no-reasoning"]
+        )
+        == 0
+    )
     assert "thinking = true" not in (tmp_path / "configs/rl.toml").read_text()
 
 
 def test_env_setup_multi_turn_flag_scaffolds_multiturn(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
-    assert _run(["env", "setup", "--multi-turn"]) == 0
+    assert (
+        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
+        == 0
+    )
     assert "EnvironmentMultiTurn" in (tmp_path / "environment.py").read_text()
     assert "secret whole number" in (tmp_path / "dataset/train.jsonl").read_text()
 
@@ -968,7 +1089,7 @@ def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
-    answers = iter(["2", "2"])
+    answers = iter(["1", "", "2", "2"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
     assert _run(["env", "setup"]) == 0
     assert "EnvironmentMultiTurn" in (tmp_path / "environment.py").read_text()
@@ -984,7 +1105,8 @@ def test_env_setup_interactive_enter_takes_defaults(monkeypatch, tmp_path) -> No
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "")
+    answers = iter(["1", "", "", ""])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
     assert _run(["env", "setup"]) == 0
     env_py = (tmp_path / "environment.py").read_text()
     assert "EnvironmentSingleTurn" in env_py
@@ -1004,18 +1126,49 @@ def test_env_setup_under_ci_never_prompts(monkeypatch, tmp_path) -> None:
         raise AssertionError("prompted under CI")
 
     monkeypatch.setattr("builtins.input", _boom)
-    assert _run(["env", "setup"]) == 0
+    assert _run(["env", "setup"]) == 1
+    assert not (tmp_path / "environment.py").exists()
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
     assert "EnvironmentSingleTurn" in (tmp_path / "environment.py").read_text()
     assert "thinking = true" not in (tmp_path / "configs/rl.toml").read_text()
+
+
+def test_env_setup_yes_requires_project_before_creating_files(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert _run(["env", "setup", "--yes"]) == 1
+    assert "--project PROJECT_UUID is required" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_env_setup_rejects_projectless_or_conflicting_existing_configs(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "sft.toml").write_text('model = "Qwen/Qwen3.5-4B"\n')
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
+    assert "has no valid top-level project UUID" in capsys.readouterr().err
+    assert not (tmp_path / "environment.py").exists()
+
+    (configs / "sft.toml").write_text('project = "22222222-2222-4222-8222-222222222222"\n')
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
+    assert "does not match selected project" in capsys.readouterr().err
+    assert not (tmp_path / "environment.py").exists()
 
 
 def test_env_setup_reasoning_flag_warns_when_configs_exist(monkeypatch, tmp_path, capsys) -> None:
     # First scaffold (no reasoning), then re-run with --reasoning: the existing configs win and the
     # command warns instead of silently ignoring the flag or writing mismatched configs.
     monkeypatch.chdir(tmp_path)
-    assert _run(["env", "setup"]) == 0
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
     capsys.readouterr()
-    assert _run(["env", "setup", "--reasoning"]) == 0
+    assert (
+        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--reasoning"])
+        == 0
+    )
     err = capsys.readouterr().err
     assert "existing configs are no reasoning" in err
     assert "ignoring --reasoning" in err
@@ -1030,7 +1183,7 @@ def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None
             raise ApiError(404, "unknown run")
 
     monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _Erroring())
-    assert _run(["status", "nope"]) != 0
+    assert _run(["runs", "status", "nope"]) != 0
     assert "unknown run" in capsys.readouterr().err
 
 
@@ -1041,6 +1194,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     # An unrecorded env resolves to the Freesolo SDK; the env is loaded lazily by the worker.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
+        project="11111111-1111-4111-8111-111111111111",
         environment=EnvironmentSpec(id="owner/env"),
     )
     assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.2.60"]
@@ -1048,6 +1202,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
+        project="11111111-1111-4111-8111-111111111111",
         environment=EnvironmentSpec(
             id="github:owner/repo@main:env/environment.py", pip=("custom==1",)
         ),
@@ -1061,6 +1216,7 @@ def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeyp
     assert (
         _run(
             [
+                "models",
                 "export",
                 "--adapter-id",
                 "flash-1/step-40",
@@ -1082,7 +1238,7 @@ def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeyp
 def test_export_reads_hf_token_from_env_and_defaults_private(fake_client, monkeypatch) -> None:
     # No --api-key: the token resolves from HF_TOKEN, and the repo defaults to private.
     monkeypatch.setenv("HF_TOKEN", "hf_env")
-    assert _run(["export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 0
+    assert _run(["models", "export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 0
     assert ("export", "flash-1", "me/adapters", "hf_env", True) in fake_client.calls
 
 
@@ -1091,7 +1247,7 @@ def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, t
         monkeypatch.delenv(var, raising=False)
     # A clean cwd so a stray local .env can't supply a token.
     monkeypatch.chdir(tmp_path)
-    assert _run(["export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 1
+    assert _run(["models", "export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 1
     err = capsys.readouterr().err
     assert "HuggingFace token" in err
     # The control plane is never contacted when there's no token to send.
@@ -1099,23 +1255,23 @@ def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, t
 
 
 def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:
-    assert _run(["deploy", "flash-1"]) == 0
+    assert _run(["models", "deploy", "flash-1"]) == 0
     assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
     assert not any(c[0] == "chat" for c in fake_client.calls)
     err = capsys.readouterr().err
-    assert "flash deployments" in err
+    assert "flash models deployments" in err
     assert "OpenAI-compatible base URL" in err
 
 
 def test_deploy_checkpoint_enqueues_base_run_deployment(fake_client) -> None:
-    assert _run(["deploy", "flash-1/step-40"]) == 0
+    assert _run(["models", "deploy", "flash-1/step-40"]) == 0
     assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
     assert not any(c[0] == "chat" for c in fake_client.calls)
 
 
 def test_deploy_no_verify_flag_is_removed(fake_client) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        _run(["deploy", "flash-1", "--no-verify"])
+        _run(["models", "deploy", "flash-1", "--no-verify"])
     assert excinfo.value.code == 2
     assert not any(call[0] == "deploy" for call in fake_client.calls)
 
@@ -1127,9 +1283,9 @@ def test_deploy_dry_run_skips_active_deployment_note(fake_client, monkeypatch, c
         lambda run_id, **_: {"run_id": run_id, "state": "dry_run"},
         raising=False,
     )
-    assert _run(["deploy", "flash-1", "--dry-run"]) == 0
+    assert _run(["models", "deploy", "flash-1", "--dry-run"]) == 0
     assert not any(c[0] == "chat" for c in fake_client.calls)
-    assert "flash deployments" not in capsys.readouterr().err
+    assert "flash models deployments" not in capsys.readouterr().err
 
 
 def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> None:
@@ -1144,7 +1300,7 @@ def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> 
         raising=False,
     )
 
-    assert _run(["deploy", "flash-1"]) == 1
+    assert _run(["models", "deploy", "flash-1"]) == 1
     err = capsys.readouterr().err
     assert "deployment failed: smoke generation failed" in err
     assert "once it is ready" not in err

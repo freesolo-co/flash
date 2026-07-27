@@ -140,6 +140,38 @@ def cmd_whoami(args) -> int:
     return 0
 
 
+def cmd_projects_create(args) -> int:
+    from flash.client import create_project
+
+    _api_url, api_key = load_credentials()
+    if not api_key:
+        raise ClientError("not logged in. Run `flash login` before creating a project")
+    result = create_project(args.name, getattr(args, "description", None), api_key)
+    project_id = result["id"]
+    if render.styled():
+        print(render.project_created(project_id, str(args.name).strip()))
+    else:
+        print(project_id)
+    return 0
+
+
+def cmd_projects_list(args) -> int:
+    from flash.client import list_projects
+
+    _api_url, api_key = load_credentials()
+    if not api_key:
+        raise ClientError("not logged in. Run `flash login` before listing projects")
+    projects = list_projects(api_key)
+    if render.styled():
+        print(render.projects_table(projects))
+        return 0
+    for project in projects:
+        project_id = str(project.get("id") or "").strip()
+        name = str(project.get("name") or "").strip()
+        print(f"{project_id}\t{name}")
+    return 0
+
+
 def cmd_models(args) -> int:
     rows = public_model_rows()
     if render.styled():
@@ -201,7 +233,10 @@ def cmd_env_list(args) -> int:
         print(render.env_list(sorted(paths)))
         return 0
     if paths:
-        print("local env sources (publish with `flash env push --name <name> <path>`):")
+        print(
+            "local env sources (publish with `flash env push --project <project-uuid> "
+            "--name <name> <path>`):"
+        )
         for path in sorted(paths):
             print(f"  {path}")
     else:
@@ -222,6 +257,7 @@ def _cmd_train_cost(args) -> int:
         run_id=None,
         overrides=args.overrides,
         extra_configs=args.extra_configs,
+        project_required=True,
     )
     preflight_train_context_within_serving(spec)
     if spec.train.init_from_adapter:
@@ -302,6 +338,7 @@ def cmd_train(args) -> int:
         run_id=None,
         overrides=args.overrides,
         extra_configs=args.extra_configs,
+        project_required=True,
     )
     payload = spec_payload(spec, authored_train_keys=authored_train_keys)
     client = client_from_config()
@@ -371,7 +408,7 @@ def cmd_train(args) -> int:
     else:
         print(
             f"run {run_id} submitted; following logs "
-            f"(Ctrl-C detaches, `flash log {run_id} --follow` resumes)",
+            f"(Ctrl-C detaches, `flash runs log {run_id} --follow` resumes)",
             file=sys.stderr,
         )
     return _follow_run(client, run_id)
@@ -622,10 +659,10 @@ def cmd_cancel(args) -> int:
         out = sys.stdout if render.styled() else sys.stderr
         base = (
             f"{len(checkpoints)} deployable checkpoint(s) survive this cancel — list with "
-            f"`flash checkpoints {args.run_id}`"
+            f"`flash runs checkpoint {args.run_id}`"
         )
         msg = (
-            f"{base}, deploy one with `flash deploy {args.run_id}/step-{max(steps)}`."
+            f"{base}, deploy one with `flash models deploy {args.run_id}/step-{max(steps)}`."
             if steps
             else f"{base}."
         )
@@ -655,7 +692,7 @@ def cmd_checkpoints(args) -> int:
         # the canonical short form, paste-able into train.init_from_adapter.
         print(f"step {c['step']} {format_checkpoint_ref(args.run_id, c['step'])}")
     print(
-        f"\ndeploy one with `flash deploy {args.run_id}/step-<STEP>`.",
+        f"\ndeploy one with `flash models deploy {args.run_id}/step-<STEP>`.",
         file=sys.stderr,
     )
     return 0
@@ -664,7 +701,7 @@ def cmd_checkpoints(args) -> int:
 def cmd_deploy(args) -> int:
     from flash.schema import parse_checkpoint_ref
 
-    # `flash deploy <run_id>/step-N` is the same checkpoint ref `flash checkpoints` prints.
+    # `flash models deploy <run_id>/step-n` is the same ref `flash runs checkpoint` prints.
     parsed = parse_checkpoint_ref(args.run_id)
     if parsed is None:
         print(
@@ -684,7 +721,7 @@ def cmd_deploy(args) -> int:
     if dep.get("state") != "dry_run":
         openai_base = str(dep.get("openai_base_url") or "")
         note = (
-            f"serving is billed per token only; use `flash undeploy {base_run_id}` "
+            f"serving is billed per token only; use `flash models undeploy {base_run_id}` "
             "to deregister the adapter."
         )
         print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
@@ -700,13 +737,13 @@ def cmd_deploy(args) -> int:
         if state == "failed":
             detail = str(dep.get("error") or dep.get("detail") or "unknown error")
             status_note = (
-                f"deployment failed: {detail}; run `flash deployments` for details and "
-                f"retry `flash deploy {args.run_id}` after fixing the error."
+                f"deployment failed: {detail}; run `flash models deployments` for details and "
+                f"retry `flash models deploy {args.run_id}` after fixing the error."
             )
         else:
             status_note = (
-                f"deployment state is {state!r}; run `flash deployments` to check progress "
-                "and use `flash chat` once it is ready."
+                f"deployment state is {state!r}; run `flash models deployments` to check progress "
+                "and use `flash models chat` once it is ready."
             )
         print(
             render.arrow(status_note) if render.styled() else f"note: {status_note}",

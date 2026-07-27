@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
+    "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 1, "max_examples": 1},
@@ -283,9 +284,15 @@ def api(tmp_path, monkeypatch):
     # so stub both to keep startup + submit hermetic (CPU-only, no network).
     import flash.providers as providers_mod
     import flash.providers.runpod.train.endpoints as rp_endpoints
+    import flash.server.projects as projects_mod
     import flash.server.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(
+        projects_mod,
+        "require_project_access",
+        lambda *, project_id, **_kwargs: project_id,
+    )
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
     # FREESOLO_INTERNAL_KEY also makes create_app() startup run the RunPod slot-store reconcile
     # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
