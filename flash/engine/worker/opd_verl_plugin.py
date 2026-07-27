@@ -358,6 +358,14 @@ def _write_mutation_failure_fallback(classification: str, message: str) -> None:
     )
 
 
+def _write_score_delivery_failure_fallback(classification: str, message: str) -> None:
+    _write_failure_fallback(
+        os.environ.get("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", ""),
+        classification,
+        message,
+    )
+
+
 def _write_abandonment_failure_fallback(classification: str, message: str) -> None:
     _write_failure_fallback(
         os.environ.get("FLASH_OPD_ABANDONMENT_FAILURE_PATH", ""),
@@ -380,6 +388,17 @@ def _write_cycle_commit_failure_fallback(classification: str, message: str) -> N
         classification,
         message,
     )
+
+
+def _exit_for_score_failure(error: FlashTeacherBridgeError) -> None:
+    if error.delivery_unknown:
+        _write_score_delivery_failure_fallback(error.classification, str(error))
+    exit_code = (
+        _PERMANENT_TEACHER_EXIT
+        if error.classification == "permanent"
+        else _TRANSIENT_TEACHER_EXIT
+    )
+    os._exit(exit_code)
 
 
 def _exit_for_mutation_failure(
@@ -663,12 +682,7 @@ def _install_verl_extensions() -> None:
                     request_payload,
                 )
             except FlashTeacherBridgeError as error:
-                exit_code = (
-                    _PERMANENT_TEACHER_EXIT
-                    if error.classification == "permanent"
-                    else _TRANSIENT_TEACHER_EXIT
-                )
-                os._exit(exit_code)
+                _exit_for_score_failure(error)
             except Exception:
                 os._exit(_PERMANENT_TEACHER_EXIT)
             teacher_ids = torch.tensor(payload["teacher_ids"], dtype=torch.int32).unsqueeze(-1)

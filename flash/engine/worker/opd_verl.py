@@ -1318,6 +1318,7 @@ def _build_opd_child_env(
     max_turns: int = 0,
     max_model_len: int = 32768,
     mutation_failure_path: str = "",
+    score_delivery_failure_path: str = "",
     abandonment_failure_path: str = "",
     resample_failure_path: str = "",
     cycle_commit_failure_path: str = "",
@@ -1335,6 +1336,8 @@ def _build_opd_child_env(
     )
     if mutation_failure_path:
         child["FLASH_OPD_MUTATION_FAILURE_PATH"] = mutation_failure_path
+    if score_delivery_failure_path:
+        child["FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH"] = score_delivery_failure_path
     if abandonment_failure_path:
         child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] = abandonment_failure_path
     if resample_failure_path:
@@ -1444,6 +1447,10 @@ def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
     return _read_classified_failure_fallback(base_path)
 
 
+def _read_score_delivery_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
+
+
 def _read_cycle_commit_failure_fallback(base_path: str) -> tuple[str, str] | None:
     return _read_classified_failure_fallback(base_path)
 
@@ -1456,6 +1463,17 @@ def _read_abandonment_failure_fallback(
 
 def _read_resample_failure_fallback(base_path: str) -> tuple[str, str] | None:
     return _read_classified_failure_fallback(base_path)
+
+
+def _reconcile_score_delivery_failure(
+    bridge: _TeacherAlignmentBridge,
+    failure: tuple[str, str] | None,
+) -> tuple[str, str] | None:
+    if failure is None or bridge.teacher_failure is not None:
+        return None
+    if bridge._promote_pending_teacher_failure():
+        return None
+    return failure
 
 
 def _reconcile_no_signal_notification_failure(
@@ -1485,6 +1503,7 @@ def _raise_verl_failure(
     mutation_failure: tuple[str, str] | None = None,
     cycle_commit_failure: tuple[str, str] | None = None,
     no_signal_failure: tuple[str, str] | None = None,
+    score_delivery_failure: tuple[str, str] | None = None,
 ) -> None:
     if return_code == 0:
         return
@@ -1509,6 +1528,13 @@ def _raise_verl_failure(
                 f"transient no-signal notification failure: {message}"
             )
         raise RuntimeError(f"permanent no-signal notification failure: {message}")
+    if score_delivery_failure is not None:
+        classification, message = score_delivery_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(
+                f"transient teacher score delivery failure: {message}"
+            )
+        raise RuntimeError(f"permanent teacher score delivery failure: {message}")
     if teacher_failure is not None:
         classification, message = teacher_failure
         if classification == "transient":
@@ -1877,6 +1903,7 @@ def run_opd_verl(spec=None) -> None:
     local_dir = os.path.join(workdir, "checkpoints")
     export_root = os.path.join(workdir, "checkpoint-adapters")
     mutation_failure_path = os.path.join(workdir, "mutation-failure")
+    score_delivery_failure_path = os.path.join(workdir, "score-delivery-failure")
     abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
     resample_failure_path = os.path.join(workdir, "resample-failure")
     cycle_commit_failure_path = os.path.join(workdir, "cycle-commit-failure")
@@ -2050,6 +2077,7 @@ def run_opd_verl(spec=None) -> None:
             max_turns=max_turns,
             max_model_len=max_model_len,
             mutation_failure_path=mutation_failure_path,
+            score_delivery_failure_path=score_delivery_failure_path,
             abandonment_failure_path=abandonment_failure_path,
             resample_failure_path=resample_failure_path,
             cycle_commit_failure_path=cycle_commit_failure_path,
@@ -2108,6 +2136,10 @@ def run_opd_verl(spec=None) -> None:
         finally:
             watcher.stop(require_complete=training_completed)
         peak_gpu_gb = gpu_sampler.stop_gb()
+        score_delivery_failure = _reconcile_score_delivery_failure(
+            bridge,
+            _read_score_delivery_failure_fallback(score_delivery_failure_path),
+        )
         no_signal_failure = _reconcile_no_signal_notification_failure(
             bridge,
             (
@@ -2129,6 +2161,7 @@ def run_opd_verl(spec=None) -> None:
             bridge.mutation_failure,
             cycle_commit_failure,
             no_signal_failure,
+            score_delivery_failure,
         )
         final_accounting = progress_state.final_state(bridge)
         train_wall = float(final_accounting["train_wall_seconds"])

@@ -81,6 +81,47 @@ def _send_truncated_json_response(handler, status, payload):
     handler.close_connection = True
 
 
+def _capture_client_only_score_delivery_loss(bridge, monkeypatch, tmp_path):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_score_delivery_failure_fallback
+
+    failure_path = str(tmp_path / "score-delivery-failure")
+    monkeypatch.setenv("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", failure_path)
+
+    class ChildExit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    monkeypatch.setattr(plugin.os, "_exit", child_exit)
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+    handler._send_json = _send_truncated_json_response
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as transport_error:
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+            )
+        with pytest.raises(ChildExit) as actor_exit:
+            plugin._exit_for_score_failure(transport_error.value)
+        fallback = _read_score_delivery_failure_fallback(failure_path)
+        records = list(tmp_path.glob("score-delivery-failure.*.transient.json"))
+    finally:
+        bridge.close()
+
+    assert [record.name for record in records] == [
+        f"score-delivery-failure.{os.getpid()}.transient.json"
+    ]
+    assert not [path for path in tmp_path.iterdir() if path.name.endswith(".tmp")]
+    return transport_error.value, actor_exit.value.code, fallback
+
+
 class _ThreadedDistributedWorld:
     def __init__(self, size):
         self.size = size
@@ -888,6 +929,114 @@ def test_recovered_transient_lost_response_promotes_transient_terminal_cause():
     assert bridge.teacher_failure == ("transient", "teacher unavailable")
     assert bridge.teacher_transient == 1
     assert bridge.teacher_error == 0
+
+
+def test_client_only_score_loss_promotes_recovered_transient_once(
+    monkeypatch, tmp_path
+):
+    from flash.engine.worker.opd_verl import _reconcile_score_delivery_failure
+    from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.teacher import TeacherError
+
+    class TransientTeacher:
+        def score(self, _prompt_text, _completion_text):
+            raise TeacherError("teacher unavailable", permanent=False)
+
+    bridge = _text_bridge(TransientTeacher())
+    transport_error, exit_code, fallback = _capture_client_only_score_delivery_loss(
+        bridge,
+        monkeypatch,
+        tmp_path,
+    )
+    score_delivery_failure = _reconcile_score_delivery_failure(bridge, fallback)
+
+    assert transport_error.delivery_unknown
+    assert exit_code == 87
+    assert fallback is not None
+    assert fallback[0] == "transient"
+    assert http.client.IncompleteRead.__name__ in fallback[1]
+    assert score_delivery_failure is None
+    assert bridge.teacher_failure == ("transient", "teacher unavailable")
+    assert bridge.score_requests == 1
+    assert bridge.episodes_seen == 1
+    assert bridge.teacher_transient == 1
+    assert bridge.teacher_ok == 0
+    assert bridge.teacher_error == 0
+    assert bridge.no_signal_resamples == 0
+    assert bridge.no_signal_skipped_steps == 0
+    with pytest.raises(RetriableInfraError, match="teacher unavailable"):
+        _raise_verl_failure(
+            1,
+            bridge.teacher_failure,
+            score_delivery_failure=score_delivery_failure,
+        )
+
+
+def test_client_only_successful_score_loss_is_direct_retriable_once(
+    monkeypatch, tmp_path
+):
+    from flash.engine.worker.opd_verl import _reconcile_score_delivery_failure
+    from flash.engine.worker.perf import RetriableInfraError
+
+    bridge = _text_bridge(_BridgeTeacher())
+    transport_error, exit_code, fallback = _capture_client_only_score_delivery_loss(
+        bridge,
+        monkeypatch,
+        tmp_path,
+    )
+    score_delivery_failure = _reconcile_score_delivery_failure(bridge, fallback)
+
+    assert transport_error.delivery_unknown
+    assert exit_code == 87
+    assert score_delivery_failure == fallback
+    assert bridge.teacher_failure is None
+    assert bridge.score_requests == 1
+    assert bridge.episodes_seen == 1
+    assert bridge.teacher_transient == 0
+    assert bridge.teacher_ok == 1
+    assert bridge.teacher_error == 0
+    assert bridge.no_signal_resamples == 0
+    assert bridge.no_signal_skipped_steps == 0
+    with pytest.raises(RetriableInfraError, match="teacher score delivery failure"):
+        _raise_verl_failure(
+            1,
+            bridge.teacher_failure,
+            score_delivery_failure=score_delivery_failure,
+        )
+
+
+def test_client_only_score_loss_preserves_authoritative_permanent_failure(
+    monkeypatch, tmp_path
+):
+    from flash.engine.worker.opd_verl import _reconcile_score_delivery_failure
+
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge._record_teacher_failure("permanent", "bad credentials", terminal=True)
+    transport_error, exit_code, fallback = _capture_client_only_score_delivery_loss(
+        bridge,
+        monkeypatch,
+        tmp_path,
+    )
+    score_delivery_failure = _reconcile_score_delivery_failure(bridge, fallback)
+
+    assert transport_error.delivery_unknown
+    assert exit_code == 87
+    assert fallback is not None
+    assert score_delivery_failure is None
+    assert bridge.teacher_failure == ("permanent", "bad credentials")
+    assert bridge.score_requests == 1
+    assert bridge.episodes_seen == 1
+    assert bridge.teacher_transient == 0
+    assert bridge.teacher_ok == 1
+    assert bridge.teacher_error == 1
+    assert bridge.no_signal_resamples == 0
+    assert bridge.no_signal_skipped_steps == 0
+    with pytest.raises(RuntimeError, match="permanent teacher failure: bad credentials"):
+        _raise_verl_failure(
+            1,
+            bridge.teacher_failure,
+            score_delivery_failure=score_delivery_failure,
+        )
 
 
 @pytest.mark.parametrize(
@@ -3313,6 +3462,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
         model_vocab_size=248320,
         thinking=False,
         mutation_failure_path=str(tmp_path / "mutation-failure"),
+        score_delivery_failure_path=str(tmp_path / "score-delivery-failure"),
         abandonment_failure_path=str(tmp_path / "abandonment-failure"),
         resample_failure_path=str(tmp_path / "resample-failure"),
         cycle_commit_failure_path=str(tmp_path / "cycle-commit-failure"),
@@ -3320,6 +3470,9 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
     assert child["FLASH_OPD_BRIDGE_URL"] == "http://127.0.0.1:4444"
     assert child["FLASH_OPD_BRIDGE_TOKEN"] == "bridge-token"
     assert child["FLASH_OPD_MUTATION_FAILURE_PATH"] == str(tmp_path / "mutation-failure")
+    assert child["FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH"] == str(
+        tmp_path / "score-delivery-failure"
+    )
     assert child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] == str(
         tmp_path / "abandonment-failure"
     )
