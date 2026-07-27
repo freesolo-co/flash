@@ -1,0 +1,643 @@
+"""CPU contracts for the OPD migration to verl 0.8.0."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from flash.engine.worker.opd import _gkd_loss_from_logps
+from flash.engine.worker.opd_verl import (
+    _BridgePrompt,
+    _build_opd_child_env,
+    _OpdProgressState,
+    _raise_verl_failure,
+    _restore_verl_resume,
+    _stage_retry_contract,
+    _TeacherAlignmentBridge,
+    build_opd_verl_overrides,
+    encode_shifted_group_metadata,
+)
+from flash.engine.worker.opd_verl_plugin import (
+    FlashTeacherBridgeError,
+    _bridge_score_payload,
+    _flash_groupwise_reverse_kl_values,
+    _full_sequence_signal_sequences,
+    _post_json,
+    _set_current_global_batch_info,
+    _signal_sequences,
+    deterministic_rollout_seed,
+)
+from flash.engine.worker.tokenizer_align import TeacherToken
+
+
+def _aggregate_seq_mean_token_mean(values, response_mask):
+    counts = response_mask.sum(dim=-1)
+    sequence_losses = (values * response_mask).sum(dim=-1) / counts
+    return sequence_losses.mean()
+
+
+def test_groupwise_reverse_kl_scalar_and_analytic_gradient_match_legacy():
+    torch = pytest.importorskip("torch")
+    student = torch.tensor(
+        [[-0.4, -0.8, -1.2, -2.0], [-0.3, -0.9, -1.1, -1.7]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    teacher_logsums = torch.tensor(
+        [[-0.6, -2.3, -2.3, 0.0], [-0.5, -1.4, -1.4, 0.0]],
+        dtype=torch.float64,
+    )
+    group_ids = torch.tensor([[0, 1, 1, -1], [0, 1, 1, -1]])
+    response_mask = torch.ones_like(student, dtype=torch.bool)
+    coef = 0.7
+
+    values = _flash_groupwise_reverse_kl_values(
+        student, teacher_logsums, group_ids, response_mask, coef
+    )
+    verl_loss = _aggregate_seq_mean_token_mean(values, response_mask)
+    verl_gradient = torch.autograd.grad(verl_loss, student, retain_graph=True)[0]
+
+    legacy_losses = [
+        _gkd_loss_from_logps(
+            student[row],
+            [([0], float(teacher_logsums[row, 0])), ([1, 2], float(teacher_logsums[row, 1]))],
+            kl_coef=coef,
+        )
+        for row in range(2)
+    ]
+    legacy_loss = torch.stack(legacy_losses).mean()
+    legacy_gradient = torch.autograd.grad(legacy_loss, student)[0]
+
+    assert torch.allclose(verl_loss, legacy_loss, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(verl_gradient, legacy_gradient, atol=1e-12, rtol=1e-12)
+    assert torch.equal(verl_gradient[:, 3], torch.zeros(2, dtype=torch.float64))
+
+
+def test_dynamic_microbatches_refresh_global_batch_info_and_match_flash_sequence_mean():
+    torch = pytest.importorskip("torch")
+    steps = [
+        {
+            "student": [
+                [-0.4, -0.8, -1.2, -2.0],
+                [-0.3, -0.9, -1.7, -2.1],
+                [-0.6, -1.4, -2.2, -2.8],
+            ],
+            "teacher": [
+                [-0.6, -2.3, -2.3, 0.0],
+                [-0.5, -1.5, 0.0, 0.0],
+                [-0.9, 0.0, 0.0, 0.0],
+            ],
+            "groups": [[0, 1, 1, -1], [0, 1, -1, -1], [0, -1, -1, -1]],
+            "mask": [[1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 0, 0]],
+            "splits": [(0, 2), (2, 3)],
+        },
+        {
+            "student": [[-0.2, -0.7, -1.3, -1.9], [-0.5, -1.0, -1.6, -2.4]],
+            "teacher": [[-0.4, -1.8, -1.8, 0.0], [-0.8, -1.1, 0.0, 0.0]],
+            "groups": [[0, 1, 1, -1], [0, 1, -1, -1]],
+            "mask": [[1, 1, 1, 1], [1, 1, 1, 0]],
+            "splits": [(0, 1), (1, 2)],
+        },
+    ]
+    coef = 0.7
+    observed = []
+    expected = []
+
+    for step in steps:
+        student = torch.tensor(step["student"], dtype=torch.float64, requires_grad=True)
+        teacher = torch.tensor(step["teacher"], dtype=torch.float64)
+        group_ids = torch.tensor(step["groups"])
+        response_mask = torch.tensor(step["mask"], dtype=torch.bool)
+        config = SimpleNamespace(
+            global_batch_info={
+                "dp_size": 99,
+                "batch_num_tokens": 1,
+                "global_batch_size": 99,
+                "loss_scale_factor": 99,
+            },
+            loss_scale_factor=None,
+        )
+        micro_losses = []
+        global_batch_size = student.shape[0]
+        batch_num_tokens = int(response_mask.sum().item())
+        for start, end in step["splits"]:
+            data = {
+                "dp_size": 1,
+                "batch_num_tokens": batch_num_tokens,
+                "global_batch_size": global_batch_size,
+            }
+            _set_current_global_batch_info(config, data)
+            values = _flash_groupwise_reverse_kl_values(
+                student[start:end],
+                teacher[start:end],
+                group_ids[start:end],
+                response_mask[start:end],
+                coef,
+            )
+            counts = response_mask[start:end].sum(dim=-1)
+            sequence_losses = (values * response_mask[start:end]).sum(dim=-1) / counts
+            micro_losses.append(
+                sequence_losses.sum()
+                / config.global_batch_info["global_batch_size"]
+                * config.global_batch_info["dp_size"]
+            )
+            _set_current_global_batch_info(config, data)
+        actual = torch.stack(micro_losses).sum()
+        legacy = torch.stack(
+            [
+                _gkd_loss_from_logps(
+                    student[row],
+                    [
+                        (
+                            torch.nonzero(group_ids[row].eq(group_id), as_tuple=False)
+                            .flatten()
+                            .tolist(),
+                            float(teacher[row][group_ids[row].eq(group_id)][0]),
+                        )
+                        for group_id in torch.unique(
+                            group_ids[row][group_ids[row].ge(0)], sorted=True
+                        )
+                    ],
+                    kl_coef=coef,
+                )
+                for row in range(student.shape[0])
+            ]
+        ).mean()
+        actual_gradient = torch.autograd.grad(actual, student, retain_graph=True)[0]
+        legacy_gradient = torch.autograd.grad(legacy, student)[0]
+
+        assert config.global_batch_info == {
+            "dp_size": 1,
+            "batch_num_tokens": batch_num_tokens,
+            "global_batch_size": global_batch_size,
+            "loss_scale_factor": None,
+        }
+        assert torch.allclose(actual, legacy, atol=1e-12, rtol=1e-12)
+        assert torch.allclose(actual_gradient, legacy_gradient, atol=1e-12, rtol=1e-12)
+        observed.append(float(actual.detach()))
+        expected.append(float(legacy.detach()))
+
+    assert observed == pytest.approx(expected, abs=1e-12, rel=1e-12)
+    assert len(steps[0]["student"]) != len(steps[1]["student"])
+
+
+def test_no_signal_sequence_is_excluded_before_actor_training():
+    torch = pytest.importorskip("torch")
+    group_ids = torch.tensor([[0, -1, -1], [-1, -1, -1], [2, 2, -1]])
+    response_mask = torch.tensor([[1, 1, 1], [1, 1, 0], [1, 1, 0]], dtype=torch.bool)
+    assert _signal_sequences(group_ids, response_mask).tolist() == [True, False, True]
+    full_sequence_ids = torch.tensor(
+        [[-1, -1, 0, -1], [-1, -1, -1, -1], [-1, 2, 2, -1]]
+    ).unsqueeze(-1)
+    assert _full_sequence_signal_sequences(full_sequence_ids).tolist() == [True, False, True]
+
+
+def test_shifted_group_metadata_uses_verl_prediction_layout():
+    teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
+        prompt_length=3,
+        response_length=4,
+        groups=[([0], -0.5), ([1, 2], -1.75)],
+    )
+    assert teacher_ids == [-1, -1, 0, 1, 1, -1, -1]
+    assert teacher_logprobs == [0.0, 0.0, -0.5, -1.75, -1.75, 0.0, 0.0]
+    assert teacher_ids[2:6] == [0, 1, 1, -1]
+
+
+class _BridgeTokenizer:
+    eos_token_id = 99
+
+    def decode(self, token_ids, *, skip_special_tokens):
+        mapping = {65: "A", 66: "B", 99: "" if skip_special_tokens else "<eos>"}
+        return "".join(mapping[int(token_id)] for token_id in token_ids)
+
+
+def _resume_accounting(step=2):
+    return {
+        "contract_version": 2,
+        "seed": 42,
+        "opt_steps": step,
+        "step": step,
+        "rollout_seed_ordinal": 12,
+        "prompt_pool_fingerprint": "a" * 64,
+        "generated_tokens": 41,
+        "teacher_input_tokens": 37,
+        "truncated_rollouts": 3,
+        "granularity_n": 5,
+        "samples_seen": 8,
+        "teacher_ok": 6,
+        "teacher_transient": 1,
+        "teacher_error": 0,
+        "no_signal_resamples": 2,
+        "no_signal_skipped_steps": 1,
+        "episodes_seen": 8,
+        "mt_turn_records": 0,
+        "granularity_sum": 3.5,
+        "train_wall_seconds": 12.5,
+        "loss_curve": [1.25, 0.75][:step],
+        "coverage_curve": [0.5, 0.7][:step],
+        "skip_counts": {"empty_alignment": 2},
+        "opd_phase_seconds": {"teacher": 4.0},
+        "opd_phase_counts": {"teacher": 6},
+        "aligned_sequences": 5,
+        "empty_alignments": 2,
+        "coverage_sum": 3.5,
+    }
+
+
+class _BridgeTeacher:
+    def score(self, prompt_text, completion_text):
+        assert prompt_text == "User: question\nAssistant: "
+        assert completion_text == "AB"
+        return [
+            TeacherToken(text="A", logprob=-0.4, start=0, end=1),
+            TeacherToken(text="B", logprob=-0.7, start=1, end=2),
+        ]
+
+
+def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=_BridgeTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+    encoded = bridge.score(0, 2, [10, 11, 65, 66, 99])
+    assert encoded["teacher_ids"] == [-1, 0, 1, -1, -1]
+    assert encoded["teacher_logprobs"] == [0.0, -0.4, -0.7, 0.0, 0.0]
+    assert bridge.aligned_sequences == 1
+    assert bridge.generated_tokens == 3
+    with pytest.raises(ValueError, match="prompt ids"):
+        bridge.score(0, 2, [10, 12, 65, 99])
+
+
+def test_bridge_rejects_child_prompt_with_extra_token_as_permanent_error():
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=_BridgeTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+    bridge.start()
+    try:
+        with pytest.raises(FlashTeacherBridgeError, match="exactly match") as error:
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                _bridge_score_payload(0, [10, 11, 77], [65, 99]),
+            )
+    finally:
+        bridge.close()
+
+    assert error.value.classification == "permanent"
+    assert bridge.teacher_failure is not None
+    assert bridge.teacher_failure[0] == "permanent"
+
+
+def test_child_bridge_payload_carries_actual_prompt_boundary():
+    payload = _bridge_score_payload(4, [10, 11, 77], [65, 99])
+
+    assert payload == {
+        "index": 4,
+        "prompt_length": 3,
+        "sequence_ids": [10, 11, 77, 65, 99],
+    }
+
+
+def test_retry_sidecar_persists_real_accumulated_accounting(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    adapter = tmp_path / "adapter"
+    checkpoint.mkdir()
+    adapter.mkdir()
+    (checkpoint / "optim_state.bin").write_bytes(b"optimizer")
+    (checkpoint / "data.pt").write_bytes(b"rng")
+    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
+    accounting = _resume_accounting()
+
+    _stage_retry_contract(
+        str(checkpoint),
+        step=2,
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        adapter_dir=str(adapter),
+        accounting_state=accounting,
+    )
+
+    import json
+
+    state = json.loads((checkpoint / "opd_state.json").read_text())
+    assert state["loss_curve"] == [1.25, 0.75]
+    assert state["coverage_curve"] == [0.5, 0.7]
+    assert state["generated_tokens"] == 41
+    assert state["teacher_input_tokens"] == 37
+    assert state["teacher_ok"] == 6
+    assert state["teacher_transient"] == 1
+    assert state["samples_seen"] == 8
+    assert state["train_wall_seconds"] == 12.5
+    assert state["rollout_seed_ordinal"] == 12
+
+
+def test_resume_restores_bridge_counters_and_extends_full_curves():
+    state = _resume_accounting()
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=_BridgeTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+        initial_state=state,
+    )
+    progress = _OpdProgressState(state)
+    progress.start_training()
+    bridge.score(0, 2, [10, 11, 65, 66, 99])
+    progress.record_step(3, 0.5, bridge)
+    restored = progress.checkpoint_state(3, timeout_s=0.1)
+
+    assert restored["loss_curve"] == [1.25, 0.75, 0.5]
+    assert restored["coverage_curve"][:2] == [0.5, 0.7]
+    assert restored["generated_tokens"] == 44
+    assert restored["teacher_input_tokens"] == 42
+    assert restored["teacher_ok"] == 7
+    assert restored["aligned_sequences"] == 6
+    assert restored["empty_alignments"] == 2
+    assert restored["train_wall_seconds"] >= 12.5
+
+
+def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path):
+    from flash.engine.worker import opd_verl
+
+    resume = tmp_path / "checkpoint-2"
+    resume.mkdir()
+    state = _resume_accounting()
+    import json
+
+    (resume / "opd_state.json").write_text(json.dumps(state))
+    (resume / "payload.bin").write_bytes(b"checkpoint")
+    monkeypatch.setattr(opd_verl._w, "OPD_RESUME_REVISION", "revision")
+    monkeypatch.setattr(opd_verl._w, "SEED", 42)
+    monkeypatch.setattr(
+        opd_verl._w,
+        "hf_resume_checkpoint",
+        lambda **_kwargs: str(resume),
+    )
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+
+    step, restored = _restore_verl_resume(
+        str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=3
+    )
+
+    assert step == 2
+    assert restored == state
+    assert (local_dir / "global_step_2" / "payload.bin").read_bytes() == b"checkpoint"
+
+
+@pytest.mark.parametrize(
+    ("permanent", "classification"), [(True, "permanent"), (False, "transient")]
+)
+def test_bridge_returns_typed_teacher_failures_and_records_classification(
+    permanent, classification
+):
+    from flash.engine.worker.teacher import TeacherError
+
+    class FailingTeacher:
+        def score(self, _prompt_text, _completion_text):
+            raise TeacherError(f"{classification} teacher failure", permanent=permanent)
+
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=FailingTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+    bridge.start()
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as error:
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                {"index": 0, "prompt_length": 2, "sequence_ids": [10, 11, 65, 66, 99]},
+            )
+    finally:
+        bridge.close()
+
+    assert error.value.classification == classification
+    assert str(error.value) == f"{classification} teacher failure"
+    assert bridge.teacher_failure == (classification, f"{classification} teacher failure")
+    assert bridge.teacher_error == int(permanent)
+    assert bridge.teacher_transient == int(not permanent)
+    assert bridge.teacher_ok == 0
+
+
+def test_bridge_transport_failure_is_typed_retriable(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def offline(*_args, **_kwargs):
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(urllib.request, "urlopen", offline)
+    with pytest.raises(FlashTeacherBridgeError) as error:
+        _post_json("http://127.0.0.1:1", "token", "/score", {})
+    assert error.value.classification == "transient"
+
+
+def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
+    from flash.engine.worker.perf import RetriableInfraError
+
+    with pytest.raises(RuntimeError, match="permanent teacher failure"):
+        _raise_verl_failure(86, ("permanent", "bad credentials"))
+    with pytest.raises(RetriableInfraError, match="transient teacher failure"):
+        _raise_verl_failure(87, ("transient", "service unavailable"))
+    with pytest.raises(RetriableInfraError, match="transient teacher bridge failure"):
+        _raise_verl_failure(87, None)
+    with pytest.raises(RuntimeError, match="permanent teacher bridge failure"):
+        _raise_verl_failure(86, None)
+    with pytest.raises(RuntimeError, match="subprocess exited with status 9"):
+        _raise_verl_failure(9, None)
+
+
+def _config(**overrides):
+    config = {
+        "train_files": ["/w/train.parquet"],
+        "val_files": ["/w/val.parquet"],
+        "train_batch_size": 8,
+        "max_prompt_length": 1024,
+        "max_response_length": 512,
+        "model_path": "/models/student",
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "target_modules": "all-linear",
+        "learning_rate": 1e-5,
+        "local_dir": "/w/checkpoints",
+        "save_freq": 20,
+        "n_gpus_per_node": 4,
+        "ulysses_sequence_parallel_size": 4,
+        "seed": 42,
+        "project_name": "flash",
+        "experiment_name": "opd-test",
+        "total_training_steps": 10,
+        "group_size": 2,
+        "bridge_url": "http://127.0.0.1:1234",
+        "bridge_token": "token",
+        "kl_penalty_coef": 0.5,
+    }
+    config.update(overrides)
+    return config
+
+
+def test_overrides_match_verl_0_8_sync_distillation_contract():
+    overrides = dict(value.split("=", 1) for value in build_opd_verl_overrides(_config()))
+    assert overrides["distillation._target_"] == "flash_opd_verl_plugin.FlashRemoteDistillationConfig"
+    assert overrides["distillation.distillation_loss.loss_mode"] == "flash_groupwise_reverse_kl"
+    assert overrides["distillation.distillation_loss.use_policy_gradient"] == "false"
+    assert overrides["distillation.distillation_loss.use_task_rewards"] == "false"
+    assert overrides["actor_rollout_ref.actor.loss_agg_mode"] == "seq-mean-token-mean"
+    assert overrides["actor_rollout_ref.actor.use_kl_loss"] == "false"
+    assert overrides["algorithm.use_kl_in_reward"] == "false"
+    assert overrides["actor_rollout_ref.model.use_remove_padding"] == "true"
+    assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == "4"
+    assert overrides["actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size"] == "4"
+    assert overrides["actor_rollout_ref.rollout.max_model_len"] == "32768"
+    assert overrides["distillation.n_gpus_per_node"] == "0"
+    assert overrides["distillation.nnodes"] == "0"
+    assert overrides["distillation.teacher_key"] == "index"
+    assert "actor.engine.ulysses_sequence_parallel_size" not in overrides
+    assert "ref_log_prob" not in " ".join(overrides)
+
+
+def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("FIREWORKS_API_KEY", "teacher-secret")
+    monkeypatch.setenv("HF_TOKEN", "hub-secret")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    child = _build_opd_child_env(
+        shim_dir=str(tmp_path),
+        wandb_enabled=False,
+        bridge_url="http://127.0.0.1:4444",
+        bridge_token="bridge-token",
+        seed=42,
+        stop_sequences=("</answer>",),
+        eos_token_ids=frozenset({1, 2}),
+    )
+    assert child["FLASH_OPD_BRIDGE_URL"] == "http://127.0.0.1:4444"
+    assert child["FLASH_OPD_BRIDGE_TOKEN"] == "bridge-token"
+    assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_verl_plugin"
+    assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert "FIREWORKS_API_KEY" not in child
+    assert "HF_TOKEN" not in child
+
+
+@pytest.mark.parametrize(
+    ("is_tool_env", "multi_turn"),
+    [(True, False), (False, True)],
+)
+def test_worker_fails_closed_on_multiturn_or_tool(monkeypatch, is_tool_env, multi_turn):
+    # the verl OPD worker fails closed on unsupported job types at the worker layer (early, before
+    # any GPU work). early rejection at the runner/preflight layer is a separate follow-up.
+    import flash.engine.worker.opd_verl as ov
+
+    class FakeEnv:
+        def __init__(self):
+            self.is_tool_env = is_tool_env
+            self.multi_turn = multi_turn
+
+    monkeypatch.setattr(ov._w, "require_active_env", lambda: FakeEnv())
+    with pytest.raises(RuntimeError, match="not yet supported on the verl OPD backend"):
+        ov.run_opd_verl(spec=object())
+
+
+def test_deterministic_seed_uses_every_rollout_identity_component():
+    baseline = deterministic_rollout_seed(42, 3, 7, 1)
+    assert baseline == deterministic_rollout_seed(42, 3, 7, 1)
+    assert len(
+        {
+            baseline,
+            deterministic_rollout_seed(43, 3, 7, 1),
+            deterministic_rollout_seed(42, 4, 7, 1),
+            deterministic_rollout_seed(42, 3, 8, 1),
+            deterministic_rollout_seed(42, 3, 7, 2),
+        }
+    ) == 5
+    assert 0 <= baseline < 2**63
+
+
+def test_opd_backend_selector_routes_to_verl(monkeypatch):
+    # FLASH_OPD_BACKEND selector: default trl unchanged; verl opt-in dispatches to run_opd_verl
+    # out-of-process; unknown value fails closed.
+    import flash.engine.worker.opd as opd_mod
+    import flash.engine.worker.opd_verl as ov
+
+    called = []
+    monkeypatch.setattr(ov, "run_opd_verl", lambda *a, **k: called.append(True))
+
+    monkeypatch.setenv("FLASH_OPD_BACKEND", "verl")
+    opd_mod.run_opd()
+    assert called == [True]
+
+    monkeypatch.setenv("FLASH_OPD_BACKEND", "bogus")
+    with pytest.raises(RuntimeError, match="not a known opd backend"):
+        opd_mod.run_opd()
+
+
+def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
+    import inspect
+
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    source = inspect.getsource(plugin)
+    assert '@register_distillation_loss(' in source
+    assert 'names=["flash_groupwise_reverse_kl"]' in source
+    assert 'main_ppo_sync.TaskRunner = FlashTaskRunner' in source
+    assert 'resource_pool_spec = {' in source
+    assert '"global_pool"' in source
+    assert "teacher_pool" not in source
+    assert "Role.TeacherModel" not in source
+
+
+def test_plugin_identifiers_remain_provider_neutral():
+    import inspect
+
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    source = inspect.getsource(plugin).lower()
+    forbidden = ("parasail", "fireworks")
+    for name in forbidden:
+        assert f"class {name}" not in source
+        assert f"def {name}" not in source
+        assert f"_{name}" not in source
