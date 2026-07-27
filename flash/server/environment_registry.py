@@ -31,9 +31,6 @@ _PACKAGE_PATH = "/api/flash/environments/package/internal"
 _USE_PATH = "/api/flash/environments/use/internal"
 _DEFAULT_HUB_REPO = "freesolo-co/environment-hub"
 _DEFAULT_HUB_REF = "main"
-# a hub source response is only {"sourceKind":"hub"}, so this window holds any well-formed
-# hub reply with room to spare while still refusing to buffer a built-in inline package.
-_SOURCE_KIND_PROBE_BYTES = 512
 
 
 def _post(path: str, body: dict, *, subject: str) -> bool:
@@ -217,21 +214,21 @@ def _read_environment_package_response(
 def resolve_environment_source_kind(
     *, slug: str, project_id: str, key: dict, org_id: str | None = None
 ) -> str:
-    """Resolve only the source kind without materializing an inline built-in package."""
+    """Resolve which source kind backs one project's managed environment."""
+    from flash.envs.loader import _MAX_BUILTIN_PACKAGE_BASE64_CHARS
+
     raw = _read_environment_package_response(
         slug=slug,
         project_id=project_id,
         key=key,
         org_id=org_id,
-        max_bytes=_SOURCE_KIND_PROBE_BYTES,
-        reject_oversize=False,
+        max_bytes=_MAX_BUILTIN_PACKAGE_BASE64_CHARS + 4096,
+        reject_oversize=True,
     )
-    # a hub response is the fixed one-key object {"sourceKind":"hub"}, so it always fits well
-    # inside the probe window. filling the window therefore proves an inline built-in package
-    # without decoding it, and a response that fits is parsed by field name so json member
-    # order never decides the outcome.
-    if len(raw) >= _SOURCE_KIND_PROBE_BYTES:
-        return "builtin"
+    # the source kind is always decided by parsing the response and reading the field by name,
+    # so json member order never decides the outcome and an unparsed response is never
+    # classified. a reply too large to parse fails closed above rather than defaulting to a
+    # kind, because misreading hub as built-in would skip the hub package deletion.
     try:
         payload = json.loads(raw)
     except (TypeError, ValueError) as exc:

@@ -67,45 +67,24 @@ def test_package_source_accepts_exact_hub_response(monkeypatch):
     assert _resolve_source(monkeypatch, {"sourceKind": "hub"}) == {"source_kind": "hub"}
 
 
-def test_source_kind_reads_only_the_response_prefix(monkeypatch):
-    raw = json.dumps(
-        {
-            "sourceKind": "builtin",
-            "packageBase64": "A" * 10_000,
-            "packageSha256": "a" * 64,
-        }
-    ).encode()
-    reads: list[int] = []
+def test_source_kind_never_classifies_a_padded_hub_response_as_builtin(monkeypatch):
+    # a hub response padded past any fixed probe window must still resolve as hub. classifying
+    # it as built-in would skip the hub package deletion and orphan the package in github while
+    # the delete route still reports success.
+    raw = (json.dumps({"sourceKind": "hub"}) + " " * 4096).encode()
 
-    class Response:
-        def __enter__(self):
-            return self
+    assert _resolve_source_kind(monkeypatch, raw) == "hub"
 
-        def __exit__(self, *_args):
-            return False
 
-        def read(self, size=-1):
-            reads.append(size)
-            return raw[:size]
+def test_source_kind_rejects_an_oversized_response(monkeypatch):
+    # an unparseably large reply must fail closed rather than default to a source kind.
+    raw = b"{" + b" " * (loader._MAX_BUILTIN_PACKAGE_BASE64_CHARS + 8192)
 
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
-    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
-    monkeypatch.setattr(
-        environment_registry.urllib.request,
-        "urlopen",
-        lambda _request, timeout=None: Response(),
-    )
+    with pytest.raises(HTTPException) as excinfo:
+        _resolve_source_kind(monkeypatch, raw)
 
-    assert (
-        environment_registry.resolve_environment_source_kind(
-            slug="acme/example",
-            project_id=_PROJECT_ID,
-            key={"org_id": "org-test"},
-        )
-        == "builtin"
-    )
-    assert reads == [513]
-    assert reads[0] < len(raw)
+    assert excinfo.value.status_code == 502
+    assert "too large" in str(excinfo.value.detail)
 
 
 def _resolve_source_kind(monkeypatch, raw: bytes) -> str:
