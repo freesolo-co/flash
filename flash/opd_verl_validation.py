@@ -25,15 +25,17 @@ def _xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> bool:
     if not isinstance(schema, dict):
         return False
     schema_type = schema.get("type")
-    if schema_type in {"integer", "number"} and "multipleOf" in schema:
+    # keywords trigger the guidance fallback whether or not "type" is spelled out (json-schema
+    # keywords apply implicitly); an untyped schema with these keywords must also be rejected.
+    if schema_type in {"integer", "number", None} and "multipleOf" in schema:
         return True
-    if schema_type == "array" and any(
+    if schema_type in {"array", None} and any(
         key in schema for key in ("uniqueItems", "contains", "minContains", "maxContains")
     ):
         return True
-    if schema_type == "string" and "format" in schema:
+    if schema_type in {"string", None} and "format" in schema:
         return True
-    if schema_type == "object" and any(
+    if schema_type in {"object", None} and any(
         key in schema
         for key in ("minProperties", "maxProperties", "propertyNames", "patternProperties")
     ):
