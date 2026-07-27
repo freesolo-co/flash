@@ -579,6 +579,70 @@ def test_forced_sample_payload_commits_after_same_step_liveness(monkeypatch, sta
     assert len(uploads) == 2
 
 
+def test_initial_rl_step_persists_through_throttle_and_bills_cancel(monkeypatch):
+    import json
+
+    import flash.engine.worker as ne
+    import flash.runner as runner
+
+    persisted = []
+    required_flags = []
+
+    def upload(local, *args, **kwargs):
+        required_flags.append(kwargs.get("required"))
+        with open(local) as f:
+            persisted.append(json.load(f))
+        return True
+
+    monkeypatch.setattr(ne, "hf_upload_file", upload)
+    ne._HB_LAST_UPLOAD = time.time()
+    ne._HB_LAST_COMMITTED_STEP = 0
+
+    committed = ne.heartbeat("rl_step", step=0, initial=True)
+
+    assert committed is True
+    assert required_flags == [True]
+    assert persisted[-1]["stage"] == "rl_step"
+    assert persisted[-1]["step"] == 0
+    status = runner.RunStatus(
+        run_id="r",
+        state="cancelled",
+        spec={},
+        last_heartbeat=persisted[-1],
+    )
+    assert runner.actual_steps_run(status) == 1
+
+
+def test_initial_rl_step_lock_timeout_is_retriable(monkeypatch):
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    import flash.engine.worker as ne
+
+    monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(
+        ne,
+        "hf_upload_file",
+        lambda *args, **kwargs: pytest.fail("lock timeout must not attempt an upload"),
+    )
+    ne._HB_LAST_UPLOAD = 17.0
+    ne._HB_LAST_COMMITTED_STEP = 4
+    ne._HB_LAST_FORCED_UPLOAD = 9.0
+
+    assert hb._HB_UPLOAD_LOCK.acquire(timeout=1.0)
+    try:
+        with pytest.raises(ne.RetriableInfraError, match="initial heartbeat upload lock"):
+            ne.heartbeat("rl_step", step=0, initial=True)
+        assert ne._HB_LAST_UPLOAD == 17.0
+        assert ne._HB_LAST_COMMITTED_STEP == 4
+        assert ne._HB_LAST_FORCED_UPLOAD == 9.0
+
+        assert ne.heartbeat("rl_step", step=5) is False
+        assert ne._HB_LAST_UPLOAD == 17.0
+        assert ne._HB_LAST_COMMITTED_STEP == 4
+        assert ne._HB_LAST_FORCED_UPLOAD == 9.0
+    finally:
+        hb._HB_UPLOAD_LOCK.release()
+
+
 def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
     """Regression (cursor[bot], heartbeat.py): when optimizer steps land FARTHER apart than the force
     floor (the normal teacher-round-trip-gated regime), every DISTINCT completed step still commits
