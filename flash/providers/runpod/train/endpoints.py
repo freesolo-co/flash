@@ -646,10 +646,27 @@ def _patch_runpod_backoff() -> None:
 
 
 def min_cuda_for(friendly_gpu: str) -> str:
-    """Minimum host CUDA driver version for this GPU class (Blackwell requires >=13.0)."""
+    """Minimum host CUDA driver version for this GPU class (Blackwell requires >=13.0).
+
+    An overriding worker image can raise the floor further: a cu13-built image crashes at CUDA
+    init on 12.x-driver hosts regardless of the GPU class, so the effective floor is the max of
+    the class floor and the image's own requirement.
+    """
+    from flash.providers._worker import worker_image_override
     from flash.providers.base import min_cuda_modern
 
-    return min_cuda_modern(friendly_gpu)
+    floor = min_cuda_modern(friendly_gpu)
+    override = worker_image_override()
+    if override and override.min_cuda:
+        parse = lambda v: tuple(int(x) for x in v.split("."))  # noqa: E731
+        try:
+            if parse(override.min_cuda) > parse(floor):
+                return override.min_cuda
+        except ValueError:
+            raise ValueError(
+                f"FLASH_WORKER_IMAGE_MIN_CUDA must look like '13.0', got {override.min_cuda!r}"
+            ) from None
+    return floor
 
 
 def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
@@ -707,15 +724,26 @@ def get_train_endpoint(
                 kwargs["dependencies"] = resolve_worker_deps()
                 kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
             # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
-            from flash.providers.runpod.jobs import weight_cache_endpoint_kwargs
+            from flash.providers.runpod.jobs import (
+                grow_weight_cache_volumes,
+                weight_cache_endpoint_kwargs,
+            )
 
+            # Reconcile before attaching: the SDK returns an existing volume at its provisioned
+            # size, so a pre-bump volume stays small and the run fails on "Disk quota exceeded".
+            # Re-read the key HERE, not before _acquire_endpoint_slot: another thread can
+            # advance_key() while this one waits for the slot, and Endpoint below reads whatever the
+            # env var now holds. A key captured earlier would grow one account's volume and attach
+            # another's, leaving the attached one stale.
+            grow_weight_cache_volumes(spec, ensure_auth())
             kwargs.update(weight_cache_endpoint_kwargs(spec))
             ep = Endpoint(**kwargs)
             handler = ep(_train_body)
-            from flash.providers.runpod.jobs import apply_disk_gb
+            from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
 
             cfg = ep._build_resource_config()
             apply_disk_gb(cfg, disk_gb)
+            apply_image_override_constraints(cfg)
             if cache_handler:
                 _ENDPOINT_CACHE[name] = handler
             return handler

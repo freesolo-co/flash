@@ -19,8 +19,10 @@ def _fake_client(capture: dict, *, slug: str = "acme/environment"):
     """A stand-in ApiClient that records the publish_env call and returns an env id."""
 
     class _C:
-        def publish_env(self, *, name, package_b64, progress=None):
-            capture.update(name=name, package_b64=package_b64, progress=progress)
+        def publish_env(self, *, name, package_b64, project_id=None, progress=None):
+            capture.update(
+                name=name, package_b64=package_b64, project_id=project_id, progress=progress
+            )
             return {"id": slug}
 
     return lambda: _C()
@@ -42,8 +44,8 @@ def _member_names(package_b64: str) -> list[str]:
         return [member.name for member in tar.getmembers()]
 
 
-def _args(path, *, name: str = "my-env"):
-    return argparse.Namespace(path=str(path), name=name)
+def _args(path, *, name: str = "my-env", project: str | None = None):
+    return argparse.Namespace(path=str(path), name=name, project=project)
 
 
 def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):
@@ -272,6 +274,33 @@ def test_push_needs_no_local_github_credentials(monkeypatch, tmp_path):
     assert cap["package_b64"]
 
 
+def test_push_forwards_project_id(monkeypatch, tmp_path):
+    """`--project <id>` groups the published env under that project."""
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, project="  proj-1  ")) == 0
+    # a pasted id is stripped before it travels, so the resolver never sees the padding.
+    assert cap["project_id"] == "proj-1"
+
+
+@pytest.mark.parametrize("project", [None, "", "   "])
+def test_push_without_project_sends_none(monkeypatch, tmp_path, project):
+    """No --project means "leave the grouping alone", not "move it to a default".
+
+    The publish upserts on (org, slug), so anything the CLI sends would overwrite a project
+    the user assigned from the dashboard. Passing None keeps the key out of the request."""
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, project=project)) == 0
+    assert cap["project_id"] is None
+
+
 def test_push_reports_server_error(monkeypatch, tmp_path, capsys):
     from flash.client import ClientError
 
@@ -467,7 +496,7 @@ def test_push_renders_and_forwards_upload_progress(monkeypatch, tmp_path):
     seen: dict = {}
 
     class _C:
-        def publish_env(self, *, name, package_b64, progress=None):
+        def publish_env(self, *, name, package_b64, project_id=None, progress=None):
             # On a TTY the CLI hands us a real callback; drive it from 0 to 100%.
             assert progress is not None
             progress(0, 10)
