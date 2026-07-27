@@ -33,6 +33,7 @@ from flash.engine.worker.opd_verl import (
 )
 from flash.engine.worker.opd_verl_plugin import (
     FlashTeacherBridgeError,
+    _AllNoSignalBatch,
     _bridge_score_payload,
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
@@ -41,6 +42,7 @@ from flash.engine.worker.opd_verl_plugin import (
     _raw_prompt_has_image_block,
     _require_structured_runtime_versions,
     _resolve_image_token_id,
+    _run_with_no_signal_replacements,
     _set_current_global_batch_info,
     _signal_sequences,
     deterministic_rollout_seed,
@@ -252,6 +254,50 @@ def test_no_signal_sequence_is_excluded_before_actor_training():
         [[-1, -1, 0, -1], [-1, -1, -1, -1], [-1, 2, 2, -1]]
     ).unsqueeze(-1)
     assert _full_sequence_signal_sequences(full_sequence_ids).tolist() == [True, False, True]
+
+
+def test_all_no_signal_rollout_dispatches_bounded_usable_replacement():
+    attempts = []
+    seeds = []
+    cleaned = []
+    prepared = []
+    resamples = []
+    abandoned = []
+
+    def run_attempt(attempt_ordinal):
+        attempts.append(attempt_ordinal)
+        seeds.append(
+            deterministic_rollout_seed(
+                42,
+                3,
+                7,
+                1,
+                no_signal_attempt_ordinal=attempt_ordinal,
+            )
+        )
+        if attempt_ordinal < 2:
+            raise _AllNoSignalBatch(f"empty-batch-{attempt_ordinal}")
+        return "usable-batch"
+
+    result = _run_with_no_signal_replacements(
+        run_attempt,
+        cleaned.append,
+        lambda: prepared.append(True),
+        lambda: resamples.append(True),
+        lambda: abandoned.append(True),
+    )
+
+    assert result == "usable-batch"
+    assert attempts == [0, 1, 2]
+    assert seeds[0] == deterministic_rollout_seed(42, 3, 7, 1)
+    assert len(set(seeds)) == 3
+    assert seeds[1] == deterministic_rollout_seed(
+        42, 3, 7, 1, no_signal_attempt_ordinal=1
+    )
+    assert cleaned == ["empty-batch-0", "empty-batch-1"]
+    assert prepared == [True, True]
+    assert resamples == [True, True]
+    assert abandoned == []
 
 
 def test_shifted_group_metadata_uses_verl_prediction_layout():
@@ -1156,6 +1202,19 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert "ref_log_prob" not in " ".join(overrides)
     assert not any("structured_outputs_config" in key for key in overrides)
 
+    multi_turn_overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_verl_overrides(
+            _config(multi_turn=True, max_sequence_length=1536, max_model_len=1536)
+        )
+    )
+    assert (
+        multi_turn_overrides["actor_rollout_ref.rollout.agent.default_agent_loop"]
+        == "flash_multi_turn"
+    )
+    assert multi_turn_overrides["actor_rollout_ref.rollout.prompt_length"] == "1536"
+    assert multi_turn_overrides["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"] == "1536"
+
 
 def test_structured_overrides_pin_xgrammar_and_thinking_parser():
     overrides = dict(
@@ -1256,6 +1315,34 @@ def test_structured_child_environment_carries_only_canonical_replay_inputs(tmp_p
     assert child["FLASH_OPD_STRUCTURED_OUTPUTS"] == '{"choice":["4"]}'
     assert child["FLASH_OPD_MODEL_VOCAB_SIZE"] == "248320"
     assert child["FLASH_OPD_THINKING"] == "1"
+
+
+def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path):
+    child = _build_opd_child_env(
+        shim_dir=str(tmp_path),
+        wandb_enabled=False,
+        bridge_url="http://127.0.0.1:4444",
+        bridge_token="bridge-token",
+        seed=42,
+        stop_sequences=(),
+        eos_token_ids=frozenset({1}),
+        structured_outputs=None,
+        model_vocab_size=248320,
+        thinking=False,
+        multi_turn=True,
+        max_turns=6,
+        max_model_len=4096,
+    )
+
+    assert child["FLASH_OPD_MAX_TURNS"] == "6"
+    assert child["FLASH_OPD_MAX_MODEL_LEN"] == "4096"
+    assert json.loads(child["FLASH_OPD_ENV_CAPABILITIES"]) == [
+        "new_rollout_state",
+        "record_model_turn",
+        "env_reply",
+        "rollout_done",
+    ]
+    assert "FIREWORKS_API_KEY" not in child
 
 
 
@@ -1359,8 +1446,9 @@ def test_deterministic_seed_uses_every_rollout_identity_component():
             deterministic_rollout_seed(42, 4, 7, 1),
             deterministic_rollout_seed(42, 3, 8, 1),
             deterministic_rollout_seed(42, 3, 7, 2),
+            deterministic_rollout_seed(42, 3, 7, 1, no_signal_attempt_ordinal=1),
         }
-    ) == 5
+    ) == 6
     assert 0 <= baseline < 2**63
 
 
@@ -1392,16 +1480,24 @@ def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     assert "teacher_pool" not in source
     assert "Role.TeacherModel" not in source
     assert 'params["structured_outputs"]' in source
+    assert "build_flash_multi_turn_agent_loop" in source
+    assert "AgentLoopWorkerTQ._agent_loop_postprocess" not in source
+    assert "_run_with_no_signal_replacements" in source
     assert 'params["logprobs"]' not in source
 
 
 def test_plugin_identifiers_remain_provider_neutral():
     import inspect
 
+    import flash.engine.worker.opd_verl_multiturn as multiturn
     import flash.engine.worker.opd_verl_plugin as plugin
     import flash.engine.worker.opd_verl_structured as structured
 
-    source = (inspect.getsource(plugin) + inspect.getsource(structured)).lower()
+    source = (
+        inspect.getsource(plugin)
+        + inspect.getsource(structured)
+        + inspect.getsource(multiturn)
+    ).lower()
     forbidden = ("parasail", "fireworks")
     for name in forbidden:
         assert f"class {name}" not in source
@@ -1422,13 +1518,14 @@ def test_opd_backend_selector_routes_to_verl(monkeypatch):
         opd_mod.run_opd()
 
 
-@pytest.mark.parametrize(("is_tool_env", "multi_turn"), [(True, False), (False, True)])
-def test_worker_fails_closed_on_multiturn_or_tool(monkeypatch, is_tool_env, multi_turn):
+def test_worker_fails_closed_on_tool_env(monkeypatch):
+    # multi-turn is now supported; native tool-calling OPD still fails closed at the worker layer.
     import flash.engine.worker.opd_verl as ov
+
     class FakeEnv:
-        def __init__(self):
-            self.is_tool_env = is_tool_env
-            self.multi_turn = multi_turn
+        is_tool_env = True
+        multi_turn = False
+
     monkeypatch.setattr(ov._w, "require_active_env", lambda: FakeEnv())
-    with pytest.raises(RuntimeError, match="not yet supported on the verl OPD backend"):
+    with pytest.raises(RuntimeError, match="native tool-calling OPD environments are not supported"):
         ov.run_opd_verl(spec=object())
