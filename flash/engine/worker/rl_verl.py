@@ -93,6 +93,9 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"data.max_prompt_length={cfg['max_prompt_len']}",
         f"data.max_response_length={cfg['max_completion']}",
         "data.prompt_key=prompt",
+        # rollout prompt parity: verl renders raw messages with the tokenizer's chat template;
+        # thread flash's thinking mode so the rollout sees the same prompt as the trl path.
+        f"+data.apply_chat_template_kwargs.enable_thinking={str(bool(cfg.get('thinking', False))).lower()}",
         f"data.seed={cfg['seed']}",
         f"actor_rollout_ref.model.path={cfg['model_id']}",
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
@@ -103,6 +106,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # 32k contexts: fused linear-CE computes logprobs/entropy from hidden states + lm_head in
         # chunks (FusedLinearForPPO), never materializing the [tokens, vocab] logits tensor
         # (~130 GB at 32k on a 248k vocab). torch backend = numerically exact, no extra deps.
+        "actor_rollout_ref.model.use_remove_padding=True",
         "actor_rollout_ref.model.use_fused_kernels=True",
         "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
         *(
@@ -175,6 +179,7 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         '"""flash reward bridge shim (generated). posts each completion to the flash worker."""\n'
         "import json\n"
         "import os\n"
+        "import urllib.error\n"
         "import urllib.request\n"
         "\n"
         f"_URL = os.environ.get({url_env!r}, '')\n"
@@ -189,7 +194,9 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         "    try:\n"
         "        with urllib.request.urlopen(req, timeout=120) as r:\n"
         "            return float(json.loads(r.read().decode()).get('score', 0.0))\n"
-        "    except Exception as exc:  # noqa: BLE001 -- a scoring error must not kill training\n"
+        "    except urllib.error.URLError as exc:  # bridge unreachable -> every reward would be 0\n"
+        "        raise RuntimeError('flash reward bridge unreachable: %s' % exc)\n"
+        "    except Exception as exc:  # noqa: BLE001 -- a per-sample scoring error must not kill training\n"
         "        print('[flash-reward-bridge] scoring failed:', exc, flush=True)\n"
         "        return 0.0\n"
     )
@@ -470,8 +477,14 @@ def _resolve_single_turn_inputs():
             )
         with open(os.path.join(warmstart_adapter, "adapter_config.json")) as f:
             _src_cfg = json.load(f)
-        lora_rank = int(_src_cfg.get("r", lora_rank))
-        lora_alpha = int(_src_cfg.get("lora_alpha", lora_alpha))
+        # a patterned adapter trains some modules at higher rank than the base `r`; verl allocates
+        # one uniform rank, so it must cover the MAXIMUM prepared rank or the load truncates.
+        _ranks = [int(_src_cfg.get("r", lora_rank))]
+        _ranks += [int(v) for v in (_src_cfg.get("rank_pattern") or {}).values()]
+        lora_rank = max(_ranks)
+        _alphas = [int(_src_cfg.get("lora_alpha", lora_alpha))]
+        _alphas += [int(v) for v in (_src_cfg.get("alpha_pattern") or {}).values()]
+        lora_alpha = max(_alphas)
         print(
             f"[rl-verl] warm-start: continuing source adapter (r={lora_rank}, alpha={lora_alpha}) "
             f"from {_t.init_from_adapter}",
@@ -527,6 +540,14 @@ def _resolve_single_turn_inputs():
         epochs=epochs, prompt_count=len(prompts), prompts_per_step=prompts_per_step
     )
     steps = resolve_update_horizon(derived_steps, getattr(_t, "max_steps", None) if _t else None)
+    # verl stops at BOTH total_epochs and total_training_steps; when an explicit max_steps exceeds
+    # the epoch-derived count, raise epochs so the dataloader can actually serve the horizon
+    # (otherwise verl exits early at total_epochs and the run under-trains).
+    if int(steps) > int(derived_steps) and len(prompts) > 0:
+        import math as _math
+
+        steps_per_epoch = max(1, _math.ceil(len(prompts) / prompts_per_step))
+        epochs = max(epochs, _math.ceil(int(steps) / steps_per_epoch))
     save_every = int(_t.save_every) if (_t and _t.save_every) else 20
 
     return {
@@ -583,9 +604,20 @@ def run_rl_verl():
         # cached "main" ref, not the pin. hand verl the pinned revision's snapshot dir instead.
         from huggingface_hub import snapshot_download as _snap
 
-        model_path_for_verl = _snap(
-            inp["model_id"], revision=inp["model_revision"], local_files_only=True
-        )
+        from flash.engine.worker.hf import _shared_weight_cache_dir
+
+        # prefetch_model lands pinned weights on the shared volume when attached; resolve from the
+        # same cache_dir it used, else fall back to the ephemeral default cache.
+        _shared = _shared_weight_cache_dir()
+        try:
+            model_path_for_verl = _snap(
+                inp["model_id"], revision=inp["model_revision"],
+                cache_dir=_shared, local_files_only=True,
+            )
+        except Exception:
+            model_path_for_verl = _snap(
+                inp["model_id"], revision=inp["model_revision"], local_files_only=True
+            )
     else:
         _w.prefetch_model(inp["model_id"])
 
@@ -600,6 +632,9 @@ def run_rl_verl():
     workdir = f"/tmp/rl_verl_seed{_w.SEED}"
     os.makedirs(workdir, exist_ok=True)
     local_dir = os.path.join(workdir, "ckpt")
+    # a retry reuses the pod workdir; stale global_step_N dirs from a prior attempt would satisfy
+    # _latest_global_step_dir and publish an old policy as if this attempt trained it.
+    shutil.rmtree(local_dir, ignore_errors=True)
     train_pq = os.path.join(workdir, "train.parquet")
     val_pq = os.path.join(workdir, "val.parquet")
     reward_py = os.path.join(workdir, "reward.py")
@@ -634,8 +669,21 @@ def run_rl_verl():
         python_bin = _resolve_verl_python(workdir)
         micro_batch = 1
         expected_steps = int(inp["steps"])
-        # match flash's wandb reporting when configured (verl reads WANDB_API_KEY, which flash sets).
-        loggers = "console,wandb" if "wandb" in (_w.wandb_report_to() or []) else "console"
+        # match flash's wandb reporting when configured (verl reads WANDB_API_KEY, which flash
+        # sets) — but only when wandb is importable in the VERL interpreter (verl logs from its own
+        # process; enabling the logger without the module aborts training there).
+        loggers = "console"
+        if "wandb" in (_w.wandb_report_to() or []):
+            _wandb_ok = (
+                subprocess.run(
+                    [python_bin, "-c", "import wandb"], capture_output=True, check=False
+                ).returncode
+                == 0
+            )
+            if _wandb_ok:
+                loggers = "console,wandb"
+            else:
+                print("[rl-verl] wandb requested but not importable in the verl interpreter; console only", flush=True)
         # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path — but NOT for
         # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
         # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
@@ -647,7 +695,9 @@ def run_rl_verl():
             _cc_ok = bool(
                 _torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9)
             )
-            fp8_kv = _cc_ok and not model_is_gdn_hybrid(inp["model_id"])
+            fp8_kv = _cc_ok and not model_is_gdn_hybrid(
+                inp["model_id"], revision=inp["model_revision"]
+            )
         except Exception:  # no cuda / probe failure -> conservative bf16 kv
             fp8_kv = False
         cfg = {
@@ -658,6 +708,7 @@ def run_rl_verl():
             "prompts_per_step": inp["prompts_per_step"], "micro_batch": micro_batch,
             "max_prompt_len": inp["max_prompt_len"], "max_completion": inp["max_completion"],
             "temperature": inp["temperature"], "top_p": inp["top_p"], "kl_coef": inp["kl_coef"],
+            "thinking": bool(_w.THINKING),
             "loss_agg_mode": "seq-mean-token-sum-norm", "seed": inp["seed"],
             "num_iterations": inp["num_iterations"], "steps": expected_steps,
             "warmstart_adapter": inp["warmstart_adapter"],
@@ -669,6 +720,7 @@ def run_rl_verl():
 
         setup_seconds = time.time() - t_start
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
+        t_train = time.time()
         step_box = [0]
 
         def _progress():
@@ -684,36 +736,52 @@ def run_rl_verl():
         reward_re = re.compile(r"critic/rewards/mean:([-\d.eE+]+)")
         loss_re = re.compile(r"actor/pg_loss:([-\d.eE+]+)")
         reward_history: list[float] = []
+        resp_len_re = re.compile(r"response_length/mean:([\d.eE+-]+)")
+        resp_len_history: list[float] = []
         loss_curve: list[float] = []
         last_dump_step = [-1]
         with liveness_heartbeat("rl_verl_training", progress=_progress, progress_step=True):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env_for_verl,
+                start_new_session=True,
             )
-            for line in proc.stdout:
-                print(f"[verl] {line}", end="", flush=True)
-                m = step_re.search(line)
-                if m:
-                    step_box[0] = int(m.group(1))
-                    # dump one sample completion per new step to the flash log (matches trl #607).
-                    if step_box[0] != last_dump_step[0]:
-                        with _samples_lock:
-                            samp = recent_samples[-1] if recent_samples else None
-                        if samp:
-                            last_dump_step[0] = step_box[0]
-                            preview = " ".join(sanitize_rollout_text(samp[0])[:300].split())
-                            print(
-                                f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
-                                flush=True,
-                            )
-                # capture verl's per-step reward + policy loss for train_meta observability parity.
-                for pat, sink in ((reward_re, reward_history), (loss_re, loss_curve)):
-                    hit = pat.search(line)
-                    if hit:
-                        with contextlib.suppress(ValueError):
-                            sink.append(float(hit.group(1)))
-            rc = proc.wait()
+            try:
+                for line in proc.stdout:
+                    print(f"[verl] {line}", end="", flush=True)
+                    m = step_re.search(line)
+                    if m:
+                        step_box[0] = int(m.group(1))
+                        # dump one sample completion per new step to the flash log (matches trl #607).
+                        if step_box[0] != last_dump_step[0]:
+                            with _samples_lock:
+                                samp = recent_samples[-1] if recent_samples else None
+                            if samp:
+                                last_dump_step[0] = step_box[0]
+                                preview = " ".join(sanitize_rollout_text(samp[0])[:300].split())
+                                print(
+                                    f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
+                                    flush=True,
+                                )
+                    # capture verl's per-step reward + policy loss for train_meta observability parity.
+                    for pat, sink in (
+                        (reward_re, reward_history),
+                        (loss_re, loss_curve),
+                        (resp_len_re, resp_len_history),
+                    ):
+                        hit = pat.search(line)
+                        if hit:
+                            with contextlib.suppress(ValueError):
+                                sink.append(float(hit.group(1)))
+                rc = proc.wait()
+            except BaseException:
+                # the stream loop died (upload error, cancel, oom in the parent): a still-running
+                # verl child would keep burning the gpu unattended — kill its whole process group.
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.killpg(os.getpgid(proc.pid), 15)
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=10)
+                raise
         if rc != 0:
             raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
     finally:
@@ -724,6 +792,13 @@ def run_rl_verl():
     adapter_dir = f"{out_dir}/adapter"
     shutil.rmtree(adapter_dir, ignore_errors=True)
     os.makedirs(adapter_dir, exist_ok=True)
+    train_wall = time.time() - t_train
+    if not reward_history:
+        raise RuntimeError(
+            "verl reported no reward metrics for the whole run — the flash reward bridge was "
+            "never consulted (wiring regression); refusing to publish a policy trained on "
+            "default rewards"
+        )
     actor_dir, steps_run = _latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
         raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")
@@ -736,7 +811,6 @@ def run_rl_verl():
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         _w.publish_deployable_checkpoint(adapter_dir, steps_run)
 
-    train_wall = time.time() - t_start
     _w.heartbeat("rl_trained", train_wall=train_wall, step=steps_run, gpu=gpu_diagnostics())
     _w.write_train_meta(
         phase="rl",
@@ -745,7 +819,12 @@ def run_rl_verl():
         train_wall=train_wall,
         setup_seconds=setup_seconds,
         train_tokens=0,
-        generated_tokens=0,
+        generated_tokens=int(
+            sum(resp_len_history) / max(1, len(resp_len_history))
+            * steps_run * inp["prompts_per_step"] * inp["group_size"]
+        )
+        if resp_len_history
+        else 0,
         notes={
             "backend": "verl",
             "steps": steps_run,
