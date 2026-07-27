@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -47,8 +48,11 @@ _CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024
 # never evict an entry used within this window; a concurrent run may be loading it.
 _CACHE_MIN_AGE_SECONDS = 600
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
-_MAX_BUILTIN_PACKAGE_BYTES = _MAX_ARCHIVE_BYTES
+# built-in packages travel inline and contain only the small seeded environment, so keep
+# their carrier ceiling independent from and much smaller than the generic archive ceiling.
+_MAX_BUILTIN_PACKAGE_BYTES = 1024 * 1024
 _MAX_BUILTIN_PACKAGE_BASE64_CHARS = ((_MAX_BUILTIN_PACKAGE_BYTES + 2) // 3) * 4
+_BUILTIN_CACHE_COMPLETE = ".complete"
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
 _MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
@@ -638,26 +642,10 @@ def _decode_builtin_environment_package(package_base64: str, package_sha256: str
     return package
 
 
-def _resolve_builtin_environment_package(
-    env_ref: str, package_base64: str, package_sha256: str
+def _extract_builtin_environment_package(
+    package: bytes, dest: Path, *, env_ref: str | None = None
 ) -> Path:
-    """Verify, extract, and cache a Freesolo-provided built-in environment package."""
-    package = _decode_builtin_environment_package(package_base64, package_sha256)
-    digest = package_sha256
-    cache_dir = _CACHE_ROOT / f"builtin-{digest}"
-    env_file = cache_dir / _DEFAULT_ENVIRONMENT_PATH
-    if env_file.is_file():
-        with contextlib.suppress(OSError):
-            os.utime(cache_dir)
-        return env_file
-
-    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-builtin-"))
     try:
-        extracted = tmp_parent / "package"
-        extracted.mkdir()
-        # verify the immutable carrier again immediately before archive extraction.
-        if hashlib.sha256(package).hexdigest() != digest:
-            raise RuntimeError("built-in environment package sha256 mismatch")
         reader = LimitedArchiveReader(
             gzip.GzipFile(fileobj=io.BytesIO(package)),
             archive_stream_limit(_MAX_ARCHIVE_BYTES, _MAX_ARCHIVE_MEMBERS),
@@ -667,21 +655,81 @@ def _resolve_builtin_environment_package(
         )
         extract_validated_archive_members(
             reader,
-            extract_base=extracted,
+            extract_base=dest,
             content_byte_limit=_MAX_ARCHIVE_BYTES,
             extracted_member_limit=_MAX_ARCHIVE_MEMBERS,
             scanned_member_limit=_MAX_ARCHIVE_SCAN_MEMBERS,
         )
-        if not (extracted / _DEFAULT_ENVIRONMENT_PATH).is_file():
-            raise FileNotFoundError(
-                f"built-in environment {env_ref!r} package did not contain environment.py"
-            )
-        cache_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        shutil.copytree(extracted, cache_dir)
-        _evict_env_cache(keep=cache_dir)
-        return cache_dir / _DEFAULT_ENVIRONMENT_PATH
+    except (EOFError, OSError, tarfile.TarError) as exc:
+        raise RuntimeError(
+            "built-in environment package is not a readable gzip tar archive"
+        ) from exc
+
+    env_file = dest / _DEFAULT_ENVIRONMENT_PATH
+    if not env_file.is_file():
+        subject = (
+            f"built-in environment {env_ref!r} package"
+            if env_ref
+            else "built-in environment package"
+        )
+        raise FileNotFoundError(f"{subject} did not contain environment.py")
+    return env_file
+
+
+def _validate_builtin_environment_package(package: bytes) -> None:
+    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-builtin-validate-"))
+    try:
+        _extract_builtin_environment_package(package, tmp_parent)
     finally:
+        shutil.rmtree(tmp_parent, ignore_errors=True)
+
+
+def _builtin_cache_entry_is_valid(cache_dir: Path) -> bool:
+    return (cache_dir / _DEFAULT_ENVIRONMENT_PATH).is_file() and (
+        cache_dir / _BUILTIN_CACHE_COMPLETE
+    ).is_file()
+
+
+def _resolve_builtin_environment_package(
+    env_ref: str, package_base64: str, package_sha256: str
+) -> Path:
+    """Verify, extract, and cache a Freesolo-provided built-in environment package."""
+    package = _decode_builtin_environment_package(package_base64, package_sha256)
+    digest = package_sha256
+    cache_dir = _CACHE_ROOT / f"builtin-{digest}"
+    env_file = cache_dir / _DEFAULT_ENVIRONMENT_PATH
+    if _builtin_cache_entry_is_valid(cache_dir):
+        with contextlib.suppress(OSError):
+            os.utime(cache_dir)
+        return env_file
+
+    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-builtin-"))
+    staging_dir: Path | None = None
+    try:
+        extracted = tmp_parent / "package"
+        extracted.mkdir()
+        # verify the immutable carrier again immediately before archive extraction.
+        if hashlib.sha256(package).hexdigest() != digest:
+            raise RuntimeError("built-in environment package sha256 mismatch")
+        _extract_builtin_environment_package(package, extracted, env_ref=env_ref)
+
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(prefix=f".{cache_dir.name}-", dir=cache_dir.parent))
+        shutil.rmtree(staging_dir)
+        shutil.copytree(extracted, staging_dir)
+        (staging_dir / _BUILTIN_CACHE_COMPLETE).touch()
+        if cache_dir.exists() and not _builtin_cache_entry_is_valid(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        try:
+            staging_dir.rename(cache_dir)
+        except OSError:
+            if not _builtin_cache_entry_is_valid(cache_dir):
+                raise
+        _evict_env_cache(keep=cache_dir)
+        return env_file
+    finally:
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
         shutil.rmtree(tmp_parent, ignore_errors=True)
 
 

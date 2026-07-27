@@ -150,6 +150,12 @@ def api(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         environment_registry_mod,
+        "resolve_environment_source_kind",
+        lambda **_kwargs: "hub",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        environment_registry_mod,
         "record_published_environment",
         lambda **_kwargs: True,
     )
@@ -5824,12 +5830,8 @@ def test_delete_builtin_environment_never_calls_github(api, monkeypatch):
 
     monkeypatch.setattr(
         environment_registry,
-        "resolve_environment_package_source",
-        lambda **_kwargs: {
-            "source_kind": "builtin",
-            "package_base64": "QQ==",
-            "package_sha256": "a" * 64,
-        },
+        "resolve_environment_source_kind",
+        lambda **_kwargs: "builtin",
     )
     monkeypatch.setattr(
         envs_mod,
@@ -5848,6 +5850,41 @@ def test_delete_builtin_environment_never_calls_github(api, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert response.json() == {"id": "acme/example", "deleted": True}
+
+
+@pytest.mark.parametrize("failure", ["false", "exception"])
+def test_delete_builtin_environment_requires_metadata_removal(api, monkeypatch, failure):
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(
+        environment_registry,
+        "resolve_environment_source_kind",
+        lambda **_kwargs: "builtin",
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("built-in deletion must not call github storage"),
+    )
+
+    def record_deleted(**_kwargs):
+        if failure == "exception":
+            raise OSError("backend unavailable")
+        return False
+
+    monkeypatch.setattr(environment_registry, "record_deleted_environment", record_deleted)
+
+    response = api.delete(
+        "/v1/envs/acme/example",
+        headers={
+            **_bearer(_login()),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Freesolo built-in environment deletion failed"
 
 
 def test_delete_env_project_mismatch_blocks_storage(api, monkeypatch):

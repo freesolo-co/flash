@@ -702,7 +702,7 @@ on a beyond-noise improvement.
 ```bash
 flash env setup                       # scaffold environment.py, dataset/, configs/, this file
 flash env push --project <project-uuid> --name my-env .        # publish the environment; paste the returned id into [environment]
-flash env pull your-org/my-env        # download a published environment into the current folder
+flash env pull your-org/my-env --project <project-uuid>  # download a published environment
 flash env delete --project <project-uuid> your-org/my-env -y   # delete a published environment
 flash train configs/sft.toml --dry-run # validate the config on the server (no GPU, no charge)
 flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit

@@ -37,6 +37,8 @@ def _builtin_payload(package: bytes) -> dict[str, str]:
 
 
 def _resolve_source(monkeypatch, payload: object) -> dict[str, str]:
+    raw = json.dumps(payload).encode()
+
     class Response:
         def __enter__(self):
             return self
@@ -44,8 +46,8 @@ def _resolve_source(monkeypatch, payload: object) -> dict[str, str]:
         def __exit__(self, *_args):
             return False
 
-        def read(self):
-            return json.dumps(payload).encode()
+        def read(self, size=-1):
+            return raw if size < 0 else raw[:size]
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -63,6 +65,47 @@ def _resolve_source(monkeypatch, payload: object) -> dict[str, str]:
 
 def test_package_source_accepts_exact_hub_response(monkeypatch):
     assert _resolve_source(monkeypatch, {"sourceKind": "hub"}) == {"source_kind": "hub"}
+
+
+def test_source_kind_reads_only_the_response_prefix(monkeypatch):
+    raw = json.dumps(
+        {
+            "sourceKind": "builtin",
+            "packageBase64": "A" * 10_000,
+            "packageSha256": "a" * 64,
+        }
+    ).encode()
+    reads: list[int] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            reads.append(size)
+            return raw[:size]
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda _request, timeout=None: Response(),
+    )
+
+    assert (
+        environment_registry.resolve_environment_source_kind(
+            slug="acme/example",
+            project_id=_PROJECT_ID,
+            key={"org_id": "org-test"},
+        )
+        == "builtin"
+    )
+    assert reads == [513]
+    assert reads[0] < len(raw)
 
 
 def test_package_source_preserves_project_mismatch_status_without_leak(monkeypatch):
@@ -100,6 +143,50 @@ def test_package_source_accepts_and_verifies_builtin_response(monkeypatch):
         "package_base64": base64.b64encode(package).decode("ascii"),
         "package_sha256": hashlib.sha256(package).hexdigest(),
     }
+
+
+def test_package_source_bounds_response_read_before_json_parse(monkeypatch):
+    monkeypatch.setattr(loader, "_MAX_BUILTIN_PACKAGE_BASE64_CHARS", 4)
+    reads: list[int] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            reads.append(size)
+            return b"x" * size
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda _request, timeout=None: Response(),
+    )
+
+    with pytest.raises(HTTPException, match="response is too large"):
+        environment_registry.resolve_environment_package_source(
+            slug="acme/example",
+            project_id=_PROJECT_ID,
+            key={"org_id": "org-test"},
+        )
+    assert reads == [4101]
+
+
+@pytest.mark.parametrize(
+    "package",
+    [
+        b"not a gzip tar",
+        _package({"README.md": b"missing entrypoint\n"}),
+    ],
+)
+def test_package_source_rejects_invalid_builtin_archive(monkeypatch, package):
+    with pytest.raises(HTTPException, match="archive is invalid"):
+        _resolve_source(monkeypatch, _builtin_payload(package))
 
 
 @pytest.mark.parametrize(
@@ -204,6 +291,55 @@ def test_builtin_loader_rechecks_sha_immediately_before_extraction(monkeypatch, 
 
     with pytest.raises(RuntimeError, match="sha256 mismatch"):
         loader._resolve_builtin_environment_package("acme/example", "ignored", "a" * 64)
+
+
+def test_builtin_loader_does_not_publish_partial_cache_entry(monkeypatch, tmp_path):
+    package = _package({"environment.py": b"# example\n"})
+    payload = _builtin_payload(package)
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(loader, "_CACHE_ROOT", cache_root)
+
+    def interrupted_copy(_source, destination):
+        destination.mkdir()
+        (destination / "environment.py").write_bytes(b"partial")
+        raise OSError("interrupted")
+
+    monkeypatch.setattr(loader.shutil, "copytree", interrupted_copy)
+
+    with pytest.raises(OSError, match="interrupted"):
+        loader._resolve_builtin_environment_package(
+            "acme/example", payload["packageBase64"], payload["packageSha256"]
+        )
+
+    final_cache = cache_root / f"builtin-{payload['packageSha256']}"
+    assert not final_cache.exists()
+    assert list(cache_root.iterdir()) == []
+
+
+def test_builtin_loader_accepts_atomic_publish_race_winner(monkeypatch, tmp_path):
+    package = _package({"environment.py": b"# example\n"})
+    payload = _builtin_payload(package)
+    cache_root = tmp_path / "cache"
+    final_cache = cache_root / f"builtin-{payload['packageSha256']}"
+    monkeypatch.setattr(loader, "_CACHE_ROOT", cache_root)
+    real_rename = loader.Path.rename
+
+    def publish_winner(path, target):
+        if target == final_cache:
+            final_cache.mkdir(parents=True)
+            (final_cache / "environment.py").write_bytes(b"# winner\n")
+            (final_cache / loader._BUILTIN_CACHE_COMPLETE).touch()
+            raise FileExistsError("race winner")
+        return real_rename(path, target)
+
+    monkeypatch.setattr(loader.Path, "rename", publish_winner)
+
+    resolved = loader._resolve_builtin_environment_package(
+        "acme/example", payload["packageBase64"], payload["packageSha256"]
+    )
+
+    assert resolved.read_bytes() == b"# winner\n"
+    assert [path for path in cache_root.iterdir() if path.name.startswith(".")] == []
 
 
 def test_builtin_loader_requires_environment_entrypoint(monkeypatch, tmp_path):

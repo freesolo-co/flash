@@ -144,7 +144,7 @@ def delete_env(
     from flash.server.environment_registry import (
         record_deleted_environment,
         require_environment_project,
-        resolve_environment_package_source,
+        resolve_environment_source_kind,
     )
     from flash.server.projects import require_project_access
     from flash.spec import require_project_id
@@ -174,22 +174,39 @@ def delete_env(
         key=key,
         org_id=x_freesolo_org_id,
     )
-    source = resolve_environment_package_source(
+    source_kind = resolve_environment_source_kind(
         slug=env_id,
         project_id=project_id,
         key=key,
         org_id=x_freesolo_org_id,
     )
-    if source["source_kind"] == "builtin":
-        deleted = True
-    else:
+    if source_kind == "builtin":
         try:
-            deleted = envs.delete_package(slug=env_id, key=key)
-        except envs.EnvPublishError as exc:
-            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+            deleted = record_deleted_environment(
+                slug=env_id,
+                project_id=project_id,
+                key=key,
+                org_id=x_freesolo_org_id,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Freesolo built-in environment deletion failed",
+            ) from exc
+        if not deleted:
+            raise HTTPException(
+                status_code=502,
+                detail="Freesolo built-in environment deletion failed",
+            )
+        return {"id": env_id, "deleted": True}
 
-    # github (the package store) is the source of truth and is already updated; dropping the
-    # web-ui metadata mirror remains best-effort and must never turn a successful delete into a 500.
+    try:
+        deleted = envs.delete_package(slug=env_id, key=key)
+    except envs.EnvPublishError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    # github is authoritative for hub packages and is already updated; dropping the web-ui
+    # metadata mirror remains best-effort and must not turn a successful hub delete into a 500.
     try:
         record_deleted_environment(
             slug=env_id,

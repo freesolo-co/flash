@@ -158,10 +158,15 @@ def require_environment_project(
         )
 
 
-def resolve_environment_package_source(
-    *, slug: str, project_id: str, key: dict, org_id: str | None = None
-) -> dict[str, str]:
-    """Fetch and validate one project's managed environment package source."""
+def _read_environment_package_response(
+    *,
+    slug: str,
+    project_id: str,
+    key: dict,
+    org_id: str | None,
+    max_bytes: int,
+    reject_oversize: bool,
+) -> bytes:
     resolved_project_id, resolved_org_id, token = _environment_request_identity(
         project_id=project_id,
         key=key,
@@ -176,7 +181,7 @@ def resolve_environment_package_source(
     )
     try:
         with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_S) as response:
-            raw = response.read()
+            raw = response.read(max_bytes + 1)
     except urllib.error.HTTPError as exc:
         detail = _validation_error_detail(exc)
         if exc.code in {404, 409}:
@@ -198,6 +203,72 @@ def resolve_environment_package_source(
             status_code=503,
             detail="Freesolo environment package resolution is unavailable",
         ) from exc
+    if reject_oversize and len(raw) > max_bytes:
+        raise HTTPException(
+            status_code=502,
+            detail="Freesolo environment package resolution response is too large",
+        )
+    return raw[:max_bytes]
+
+
+def resolve_environment_source_kind(
+    *, slug: str, project_id: str, key: dict, org_id: str | None = None
+) -> str:
+    """Resolve only the source kind without materializing an inline built-in package."""
+    raw = _read_environment_package_response(
+        slug=slug,
+        project_id=project_id,
+        key=key,
+        org_id=org_id,
+        max_bytes=512,
+        reject_oversize=False,
+    )
+    match = re.match(rb'\s*\{\s*"sourceKind"\s*:\s*"(hub|builtin)"', raw)
+    if match is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Freesolo environment package resolution returned an invalid source kind",
+        )
+    source_kind = match.group(1).decode("ascii")
+    if source_kind == "hub":
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Freesolo environment package resolution returned invalid JSON",
+            ) from exc
+        if payload != {"sourceKind": "hub"}:
+            raise HTTPException(
+                status_code=502,
+                detail="Freesolo Hub environment package response has an invalid shape",
+            )
+    elif re.match(rb'\s*\{\s*"sourceKind"\s*:\s*"builtin"\s*,\s*"packageBase64"\s*:', raw) is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Freesolo built-in environment package response has an invalid shape",
+        )
+    return source_kind
+
+
+def resolve_environment_package_source(
+    *, slug: str, project_id: str, key: dict, org_id: str | None = None
+) -> dict[str, str]:
+    """Fetch and validate one project's managed environment package source."""
+    from flash.envs.loader import (
+        _MAX_BUILTIN_PACKAGE_BASE64_CHARS,
+        _MAX_BUILTIN_PACKAGE_BYTES,
+        _validate_builtin_environment_package,
+    )
+
+    raw = _read_environment_package_response(
+        slug=slug,
+        project_id=project_id,
+        key=key,
+        org_id=org_id,
+        max_bytes=_MAX_BUILTIN_PACKAGE_BASE64_CHARS + 4096,
+        reject_oversize=True,
+    )
     try:
         payload = json.loads(raw) if raw else {}
     except (TypeError, ValueError) as exc:
@@ -241,12 +312,6 @@ def resolve_environment_package_source(
             status_code=502,
             detail="Freesolo built-in environment package sha256 is invalid",
         )
-
-    from flash.envs.loader import (
-        _MAX_BUILTIN_PACKAGE_BASE64_CHARS,
-        _MAX_BUILTIN_PACKAGE_BYTES,
-    )
-
     if len(package_base64) > _MAX_BUILTIN_PACKAGE_BASE64_CHARS:
         raise HTTPException(
             status_code=502,
@@ -269,6 +334,13 @@ def resolve_environment_package_source(
             status_code=502,
             detail="Freesolo built-in environment package sha256 mismatch",
         )
+    try:
+        _validate_builtin_environment_package(package)
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Freesolo built-in environment package archive is invalid: {exc}",
+        ) from exc
     return {
         "source_kind": "builtin",
         "package_base64": package_base64,
@@ -279,11 +351,10 @@ def resolve_environment_package_source(
 def record_deleted_environment(
     *, slug: str, project_id: str, key: dict, org_id: str | None = None
 ) -> bool:
-    """Remove the platform-backend metadata mirror for a deleted environment.
+    """Remove the platform-backend environment row after its source-specific delete.
 
-    Symmetric to :func:`record_published_environment`: the package store (GitHub) is the source
-    of truth and is already updated by the time this runs, so dropping the row the web UI lists
-    is deliberately best-effort and never blocks ``flash env delete``.
+    Hub callers may treat this as a best-effort metadata mirror drop after GitHub succeeds.
+    Built-in callers must treat its result as authoritative because the row owns that package.
 
     ``key`` supplies the org for a user-key delete (``flash env delete``). The internal key is
     org-agnostic, so for the web UI delete the caller passes the authenticated user's ``org_id``
