@@ -278,3 +278,11 @@ def test_resolve_single_turn_inputs_guards_entropy_quantile(monkeypatch):
 
     with pytest.raises(RuntimeError, match="entropy_quantile"):
         rlv._resolve_single_turn_inputs()
+
+
+def test_build_verl_overrides_enable_fused_linear_ce():
+    # 32k GRPO must not materialize [tokens, vocab] logits; fused torch-backend linear-CE
+    # computes logprobs from hidden states in chunks (numerically exact).
+    o = rl_verl.build_verl_overrides(_overrides_cfg())
+    assert "actor_rollout_ref.model.use_fused_kernels=True" in o
+    assert "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch" in o
