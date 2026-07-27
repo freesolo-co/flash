@@ -794,7 +794,94 @@ def test_transient_teacher_sample_returns_no_signal_while_following_peer_trains(
     assert bridge.teacher_transient == 1
     assert bridge.teacher_ok == 1
     assert bridge.teacher_error == 0
-    assert bridge.teacher_failure == ("transient", "teacher unavailable")
+    assert bridge.teacher_failure is None
+
+
+def test_recovered_transient_does_not_make_later_deterministic_exhaustion_retriable():
+    from flash.engine.worker.teacher import TeacherError
+
+    class TransientSignalThenEmptyTeacher:
+        def __init__(self):
+            self.calls = 0
+
+        def score(self, prompt_text, completion_text):
+            self.calls += 1
+            if self.calls == 1:
+                raise TeacherError("teacher unavailable", permanent=False)
+            if self.calls == 2:
+                return _BridgeTeacher().score(prompt_text, completion_text)
+            return []
+
+    mutations = []
+    bridge = _text_bridge(
+        TransientSignalThenEmptyTeacher(),
+        mutation_callback=lambda: mutations.append(True),
+    )
+    bridge.start()
+    try:
+        transient = _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+        )
+        signal = _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+        )
+        _post_json(bridge.url, bridge.token, "/mutation", {})
+        with pytest.raises(RuntimeError, match="after 3 rollout attempts"):
+            _exhaust_bridge_no_signal(bridge)
+        with pytest.raises(RuntimeError, match="subprocess exited with status 1"):
+            _raise_verl_failure(1, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert transient["teacher_ids"] == [-1, -1, -1, -1, -1]
+    assert signal["teacher_ids"] == [-1, 0, 1, -1, -1]
+    assert bridge.teacher_transient == 1
+    assert bridge.teacher_ok == 4
+    assert bridge.empty_alignments == 3
+    assert mutations == [True]
+
+
+def test_recovered_transient_does_not_mask_unrelated_child_exit():
+    from flash.engine.worker.teacher import TeacherError
+
+    class TransientThenSignalTeacher:
+        def __init__(self):
+            self.calls = 0
+
+        def score(self, prompt_text, completion_text):
+            self.calls += 1
+            if self.calls == 1:
+                raise TeacherError("teacher unavailable", permanent=False)
+            return _BridgeTeacher().score(prompt_text, completion_text)
+
+    bridge = _text_bridge(TransientThenSignalTeacher())
+    bridge.start()
+    try:
+        _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+        )
+        _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+        )
+        with pytest.raises(RuntimeError, match="subprocess exited with status 9"):
+            _raise_verl_failure(9, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert bridge.teacher_transient == 1
+    assert bridge.teacher_ok == 1
 
 
 def test_fully_forced_groups_encode_as_no_signal_and_are_filtered():
@@ -1288,6 +1375,7 @@ def test_all_transient_teacher_samples_exhaust_replacements_as_retriable():
     assert bridge.teacher_transient == 3
     assert bridge.teacher_ok == 0
     assert bridge.teacher_error == 0
+    assert bridge.teacher_failure == ("transient", "teacher unavailable")
     assert bridge.no_signal_resamples == 2
     assert bridge.no_signal_skipped_steps == 1
     assert mutations == []

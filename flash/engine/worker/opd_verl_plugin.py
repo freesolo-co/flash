@@ -714,19 +714,15 @@ def _install_verl_extensions() -> None:
     def build_optimizer_with_mutation_notice(self, module):
         optimizer = original_build_optimizer(self, module)
         original_step = optimizer.step
-        notified = False
 
         @functools.wraps(original_step)
         def step_with_notice(*args, **kwargs):
-            nonlocal notified
-            if not notified:
-                _post_json(
-                    os.environ["FLASH_OPD_BRIDGE_URL"],
-                    os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-                    "/mutation",
-                    {},
-                )
-                notified = True
+            _post_json(
+                os.environ["FLASH_OPD_BRIDGE_URL"],
+                os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+                "/mutation",
+                {},
+            )
             return original_step(*args, **kwargs)
 
         optimizer.step = step_with_notice
