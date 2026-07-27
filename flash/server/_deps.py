@@ -89,18 +89,17 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
     if env_raw is None:
         env_raw = {}
     if not isinstance(env_raw, dict):
-        raise HTTPException(
-            status_code=400, detail="spec.environment must be a JSON object"
-        )
+        raise HTTPException(status_code=400, detail="spec.environment must be a JSON object")
     if env_raw.get("path"):
         raise HTTPException(
             status_code=400,
             detail="local environment paths are not supported on the managed service; "
-            "publish the environment with `flash env push --name <name>`, then reference it "
+            "publish the environment with `flash env push --project <project-uuid> --name <name>`, "
+            "then reference it "
             "by the returned environment id",
         )
     try:
-        return spec_from_dict(spec_raw, run_id=run_id)
+        return spec_from_dict(spec_raw, run_id=run_id, project_required=True)
     except (ConfigError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

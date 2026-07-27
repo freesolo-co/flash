@@ -22,7 +22,8 @@ def load_environment(
     if not env_id:
         raise ValueError(
             "no environment specified: set [environment] id to the id returned by "
-            "`flash env push --name <name>` (for example 'your-name/your-env')"
+            "`flash env push --project <project-uuid> --name <name>` "
+            "(for example 'your-name/your-env')"
         )
     # resolved_sha is positional-only so a user param named "resolved_sha" can't shadow it.
     return load_freesolo_environment(env_id, resolved_sha or None, **params)

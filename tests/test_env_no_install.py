@@ -24,7 +24,20 @@ def test_remaining_env_subcommands_still_parse():
     parser = _build_parser()
     assert parser.parse_args(["env", "setup"]).env_cmd == "setup"
     assert parser.parse_args(["env", "list"]).env_cmd == "list"
-    assert parser.parse_args(["env", "push", "--name", "x", "."]).env_cmd == "push"
+    assert (
+        parser.parse_args(
+            [
+                "env",
+                "push",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--name",
+                "x",
+                ".",
+            ]
+        ).env_cmd
+        == "push"
+    )
 
 
 def test_install_manifest_machinery_is_removed():
@@ -40,7 +53,9 @@ def test_install_manifest_machinery_is_removed():
 
 
 def test_env_list_reports_local_only(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("FLASH_STYLE", "0")  # force the plain renderer so substring asserts are stable
+    monkeypatch.setenv(
+        "FLASH_STYLE", "0"
+    )  # force the plain renderer so substring asserts are stable
     monkeypatch.chdir(tmp_path)
     (tmp_path / "environment.py").write_text("# env\n")
     rc = cmd_env_list(argparse.Namespace())
@@ -48,11 +63,14 @@ def test_env_list_reports_local_only(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "local env sources" in out
     assert "." in out
+    assert "flash env push --project <project-uuid> --name <name> <path>" in out
     assert "installed environments" not in out  # the removed manifest section
 
 
 def test_env_list_empty_hint(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("FLASH_STYLE", "0")  # force the plain renderer so substring asserts are stable
+    monkeypatch.setenv(
+        "FLASH_STYLE", "0"
+    )  # force the plain renderer so substring asserts are stable
     monkeypatch.chdir(tmp_path)
     rc = cmd_env_list(argparse.Namespace())
     assert rc == 0

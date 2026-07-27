@@ -359,6 +359,7 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "Qwen/Qwen3.5-9B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
         'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
@@ -367,7 +368,7 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
         "max_examples = 800\n"
         "batch_size = 16\n"
         "[gpu]\n"
-        ''
+        ""
     )
     args = types.SimpleNamespace(
         config=str(cfg),
@@ -391,6 +392,7 @@ def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         "[environment]\n"
         'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
@@ -416,6 +418,7 @@ def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "some-org/unlisted-7b"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
         'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'

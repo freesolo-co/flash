@@ -386,14 +386,14 @@ def _resolve_explicit_chat_revision(
                 status_code=409,
                 detail=(
                     f"run {run_id} has multiple verified revisions at step {want}; chat the full "
-                    "immutable adapter revision from `flash deployments`"
+                    "immutable adapter revision from `flash models deployments`"
                 ),
             )
         raise HTTPException(
             status_code=409,
             detail=(
                 f"run {run_id} has no deployed checkpoint at step {want}; deploy it first with "
-                f"`flash deploy {run_id}/step-{want}` "
+                f"`flash models deploy {run_id}/step-{want}` "
                 f"(currently deployed steps: {_format_deployed_steps(index)})"
             ),
         )
@@ -415,7 +415,7 @@ def recover_deployments() -> int:
             deployment,
             "failed",
             error="deployment lifecycle interrupted by control-plane restart",
-            detail="deployment interrupted; retry `flash deploy`",
+            detail="deployment interrupted; retry `flash models deploy`",
             recovered_at=time.time(),
         )
         mark_deployment_failed(status.run_id, failed)
@@ -761,7 +761,7 @@ def _finish_deployment_unlocked(
                 error = (
                     f"run {run_id} has no run-level adapter at "
                     f"{deployment.get('adapter_hf_prefix')} (the run likely never finalized); "
-                    f"deploy a saved checkpoint instead, e.g. `flash deploy "
+                    f"deploy a saved checkpoint instead, e.g. `flash models deploy "
                     f"{run_id}/step-{steps[-1]}` (available steps: "
                     f"{', '.join(str(step) for step in steps)})"
                 )
@@ -921,12 +921,17 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 status_code=409,
                 detail=(
                     f"run {run_id} already has a deployment in "
-                    f"{current_deployment.get('state')} state; run `flash deployments` "
+                    f"{current_deployment.get('state')} state; run `flash models deployments` "
                     "to check progress"
                 ),
             )
         checkpoint_step, is_checkpoint, deploy_prefix = _resolve_deployable_target(
-            run_id, effective_spec, status, payload.get("step"), action="deploy", enforce_state=not dry_run
+            run_id,
+            effective_spec,
+            status,
+            payload.get("step"),
+            action="deploy",
+            enforce_state=not dry_run,
         )
         if not dry_run and not effective_spec.train.hf_repo:
             raise HTTPException(
@@ -1172,7 +1177,9 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     verified_revisions = _verified_adapter_revisions(status)
     deployment = status.deployment or {}
     ready_deployment = _previous_ready_deployment(deployment)
-    ready_revision = ready_deployment.get("adapter_revision") if ready_deployment is not None else None
+    ready_revision = (
+        ready_deployment.get("adapter_revision") if ready_deployment is not None else None
+    )
     pinned_revision = _resolve_explicit_chat_revision(
         run_id,
         adapter_revision,
@@ -1207,7 +1214,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                 status_code=409,
                 detail=(
                     f"run {run_id} deployment is {deployment_state}; run "
-                    "`flash deployments` to check progress"
+                    "`flash models deployments` to check progress"
                 ),
             )
         if deployment_state == "failed":
@@ -1221,11 +1228,11 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             raise HTTPException(
                 status_code=409,
                 detail=f"run {run_id} was cancelled; deploy a checkpoint with "
-                f"`flash deploy {run_id}/step-<N>` first",
+                f"`flash models deploy {run_id}/step-<N>` first",
             )
         raise HTTPException(
             status_code=409,
-            detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
+            detail=f"run {run_id} has no active deployment; `flash models deploy {run_id}` first",
         )
     if not effective_spec.train.hf_repo:
         raise HTTPException(
