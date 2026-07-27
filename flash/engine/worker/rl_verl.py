@@ -546,7 +546,9 @@ def _resolve_single_turn_inputs():
     if int(steps) > int(derived_steps) and len(prompts) > 0:
         import math as _math
 
-        steps_per_epoch = max(1, _math.ceil(len(prompts) / prompts_per_step))
+        # verl's dataloader drops the last partial batch: floor, not ceil, else the bumped
+        # epoch count still under-serves the requested horizon.
+        steps_per_epoch = max(1, len(prompts) // prompts_per_step)
         epochs = max(epochs, _math.ceil(int(steps) / steps_per_epoch))
     save_every = int(_t.save_every) if (_t and _t.save_every) else 20
 
