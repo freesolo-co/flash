@@ -654,7 +654,11 @@ class _TeacherAlignmentBridge:
                 messages = self.active_env.env_reply(session["messages"], state)
                 messages = validate_teacher_messages(messages, source="environment reply")
                 session["messages"].extend(messages)
-                terminal = not messages
+                # the env's reply may itself end the episode (rollout_done consults the updated
+                # state); recheck before gluing a next-turn prompt no model turn will answer.
+                terminal = not messages or self.active_env.rollout_done(
+                    state, session["turn_limit"]
+                )
                 if not terminal:
                     assert self._env_glue is not None
                     next_prefix.extend(
