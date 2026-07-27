@@ -25,6 +25,8 @@ import urllib.request
 
 from flash.engine.worker.tokenizer_align import TeacherToken
 
+_MAX_LOGPROB_ROUNDING_ERROR = 1e-6
+
 
 class TeacherError(RuntimeError):
     """Teacher API call failed. ``permanent`` marks non-retryable causes (bad key / model id /
@@ -139,7 +141,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
             _bad(f"teacher echo response token_logprobs has a non-numeric value: {lp!r}")
         if not math.isfinite(lp):
             _bad(f"teacher echo response token_logprobs has a non-finite value: {lp!r}")
-        if lp > 1e-6:
+        if lp > _MAX_LOGPROB_ROUNDING_ERROR:
             # A log-probability cannot exceed 0. A malformed 200 with a POSITIVE value is a
             # probability > 1: summed into teacher_logsum it poisons the reverse-KL coefficient
             # (logP_student.detach() - logP_teacher) with impossible teacher mass, so OPD would
@@ -345,7 +347,7 @@ def _validate_multimodal_echo(
                 "teacher multimodal echo response token_logprobs has a non-finite value: "
                 f"{logprob!r}"
             )
-        if logprob > 1e-6:
+        if logprob > _MAX_LOGPROB_ROUNDING_ERROR:
             _bad(
                 "teacher multimodal echo response token_logprobs has a positive value "
                 f"{logprob!r} (a log-probability cannot exceed 0)."
