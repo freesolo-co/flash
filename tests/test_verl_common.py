@@ -65,6 +65,9 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "bitsandbytes>=0.49" in install
     assert "qwen-vl-utils" in install
     assert "torchvision" in install
+    assert "xgrammar==0.1.25" in install
+    assert "tqdm" in install
+    assert "pyarrow" in install
 
 
 def test_run_verl_training_streams_steps_and_returns_code():
