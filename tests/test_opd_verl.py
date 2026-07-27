@@ -1546,6 +1546,55 @@ def test_repeated_mutation_notice_maps_later_bridge_failure_to_child_exit(
             _raise_verl_failure(exit_error.value.code, None)
 
 
+@pytest.mark.parametrize(
+    ("retriable", "expected_exit"),
+    [(True, 87), (False, 86)],
+)
+def test_mutation_marker_failure_preserves_bridge_classification(
+    monkeypatch, retriable, expected_exit
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.perf import RetriableInfraError
+
+    marker_error = (
+        RetriableInfraError("marker upload failed")
+        if retriable
+        else RuntimeError("invalid marker configuration")
+    )
+    callback_calls = []
+
+    def fail_marker():
+        callback_calls.append(True)
+        raise marker_error
+
+    bridge = _text_bridge(_BridgeTeacher(), mutation_callback=fail_marker)
+
+    class ChildExit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    monkeypatch.setattr(plugin.os, "_exit", child_exit)
+    bridge.start()
+    try:
+        with pytest.raises(ChildExit) as exit_error:
+            plugin._post_mutation_notice(bridge.url, bridge.token)
+    finally:
+        bridge.close()
+
+    assert callback_calls == [True]
+    assert exit_error.value.code == expected_exit
+    if retriable:
+        with pytest.raises(RetriableInfraError, match="transient teacher bridge failure"):
+            _raise_verl_failure(exit_error.value.code, None)
+    else:
+        with pytest.raises(RuntimeError, match="permanent teacher bridge failure"):
+            _raise_verl_failure(exit_error.value.code, None)
+
+
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
     from flash.engine.worker.perf import RetriableInfraError
 

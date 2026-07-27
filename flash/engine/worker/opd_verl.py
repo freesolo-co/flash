@@ -867,7 +867,8 @@ class _TeacherAlignmentBridge:
                 except Exception as error:
                     classification = (
                         "transient"
-                        if isinstance(error, TeacherError) and not error.permanent
+                        if isinstance(error, _w.RetriableInfraError)
+                        or (isinstance(error, TeacherError) and not error.permanent)
                         else "permanent"
                     )
                     if self.path in {"/score", "/multiturn/score"}:
