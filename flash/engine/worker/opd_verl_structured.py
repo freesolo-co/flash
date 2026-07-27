@@ -151,7 +151,13 @@ class StructuredOutputReplay:
                 )
         if len(forced) != len(response_ids):
             raise AssertionError("structured OPD forced mask has the wrong response length")
-        if grammar_start < len(response_ids) and not matcher.is_terminated():
+        if grammar_start >= len(response_ids):
+            # the response ended at (or before) the grammar region: no structured output was
+            # generated at all — reject rather than replaying an empty region as valid.
+            raise RuntimeError(
+                "structured OPD response contains no tokens in the grammar region"
+            )
+        if not matcher.is_terminated():
             # a grammar like a bare integer is not "terminated" after `4` (it could continue as
             # `42`); completeness means STOPPING here is legal. accept the output iff the matcher
             # can take the stop token now — otherwise the structured output was truncated

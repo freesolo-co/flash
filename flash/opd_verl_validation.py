@@ -25,6 +25,13 @@ def _xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> bool:
     if not isinstance(schema, dict):
         return False
     schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        # array-valued type: the keyword applies if ANY member type would trigger the fallback;
+        # normalize by re-running the predicate per member.
+        return any(
+            _xgrammar_unsupported_json_feature({**schema, "type": member})
+            for member in schema_type
+        )
     # keywords trigger the guidance fallback whether or not "type" is spelled out (json-schema
     # keywords apply implicitly); an untyped schema with these keywords must also be rejected.
     if schema_type in {"integer", "number", None} and "multipleOf" in schema:
