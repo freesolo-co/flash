@@ -288,11 +288,19 @@ class _TeacherAlignmentBridge:
         self._pending_teacher_transient: tuple[str, str] | None = None
         self._pending_teacher_success = False
 
-    def _record_teacher_failure(self, classification: str, message: str) -> None:
+    def _record_teacher_failure(
+        self,
+        classification: str,
+        message: str,
+        *,
+        terminal: bool = False,
+    ) -> None:
         with self._stats_lock:
             if classification == "transient":
                 self.teacher_transient += 1
-                if self._pending_teacher_transient is None:
+                if terminal:
+                    self._teacher_failure = (classification, message)
+                elif self._pending_teacher_transient is None:
                     self._pending_teacher_transient = (classification, message)
             else:
                 self.teacher_error += 1
@@ -890,8 +898,14 @@ class _TeacherAlignmentBridge:
                         or (isinstance(error, TeacherError) and not error.permanent)
                         else "permanent"
                     )
-                    if self.path in {"/score", "/multiturn/score"}:
+                    if self.path == "/score":
                         bridge._record_teacher_failure(classification, str(error))
+                    elif self.path == "/multiturn/score":
+                        bridge._record_teacher_failure(
+                            classification,
+                            str(error),
+                            terminal=True,
+                        )
                     self._send_json(
                         503 if classification == "transient" else 422,
                         {
