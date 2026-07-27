@@ -682,6 +682,46 @@ def write_base_model_provenance(adapter_dir: str, model_id: str, model_revision:
         json.dump(payload, fh, indent=2, sort_keys=True)
 
 
+class _SnapshotWeightsMissing(RuntimeError):
+    """A forced re-download still produced a snapshot without model weights."""
+
+
+def _snapshot_has_weights(snapshot_dir: str) -> bool:
+    """True when a downloaded snapshot contains resolvable model weights (all indexed shards)."""
+    weight_names = ("model", "pytorch_model", "tf_model", "flax_model")
+
+    def _resolves(name: str) -> bool:
+        path = os.path.join(snapshot_dir, name)
+        return os.path.isfile(os.path.realpath(path))
+
+    try:
+        entries = os.listdir(snapshot_dir)
+        # sharded checkpoints: the index enumerates every required shard; a partial download with
+        # SOME shards present must not pass. validate all indexed shards resolve.
+        for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+            if index_name in entries:
+                try:
+                    with open(os.path.join(snapshot_dir, index_name)) as f:
+                        index = json.load(f)
+                    shards = set((index.get("weight_map") or {}).values())
+                except (OSError, ValueError):
+                    return False
+                return bool(shards) and all(_resolves(shard) for shard in shards)
+        for name in entries:
+            if not name.endswith((".safetensors", ".bin")):
+                continue
+            # exclude non-weight .bin artifacts (tokenizer.bin, training_args.bin, adapters)
+            if not name.startswith(weight_names):
+                continue
+            # HF cache entries are symlinks into blobs/: a dangling link (partial download) must
+            # not count as weights present.
+            if _resolves(name):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def prefetch_model(model_id: str, revision: str = "") -> float:
     """Pull base-model weights into the HF cache up front; return seconds spent.
 
@@ -700,12 +740,30 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
     ):
         def _download() -> None:
             _require_hf_deadline_allowance()
-            snapshot_download(
+            local_path = snapshot_download(
                 repo_id=model_id,
                 cache_dir=shared_hub,
                 ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
                 **model_revision_kwargs(revision),
             )
+            # a shared-volume snapshot can be stale/partial (e.g. a serving preload that only
+            # warmed configs): snapshot_download returns it as a cache hit without weights, and
+            # the trainer then fails offline with "no pytorch_model.bin or model.safetensors".
+            # validate weights exist before trusting the hit; one forced re-download repairs it.
+            if isinstance(local_path, str) and os.path.isdir(local_path) and not _snapshot_has_weights(local_path):
+                print(f"prefetch_model: cached snapshot for {model_id} has no weight files; re-downloading")
+                local_path = snapshot_download(
+                    repo_id=model_id,
+                    cache_dir=shared_hub,
+                    ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+                    force_download=True,
+                    **model_revision_kwargs(revision),
+                )
+                if isinstance(local_path, str) and os.path.isdir(local_path) and not _snapshot_has_weights(local_path):
+                    raise _SnapshotWeightsMissing(
+                        f"model snapshot for {model_id} has no weight files even after a forced "
+                        "re-download; the repo layout is unsupported or the cache volume is corrupt"
+                    )
             if shared_hub:
                 _link_base_model_into_ephemeral_cache(model_id, shared_hub)
 
@@ -722,7 +780,13 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
         else:
             try:
                 _download()
+            except _SnapshotWeightsMissing:
+                # a FORCED re-download still had no weights — swallowing it would let the trainer
+                # fail later with a far more confusing offline error. propagate.
+                raise
             except Exception as e:
+                # transient fetch errors stay non-fatal on the default revision: the trainer's own
+                # cache lookup may still succeed (warm cache), and prefetch is best-effort there.
                 print("prefetch_model warn:", e)
     secs = round(time.time() - t0, 1)
     _w.heartbeat(
