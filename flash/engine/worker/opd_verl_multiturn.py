@@ -159,7 +159,11 @@ def prepare_assistant_turn(
     ended_before_cap = stop_reason == "completed" and len(raw_ids) < int(max_tokens)
     terminated = ended_by_eos or ended_by_stop or ended_before_cap
     if stop_reason == "aborted":
+        # an aborted rollout is truncated REGARDLESS of what signals appear inside the sampled
+        # ids: the validator requires termination == "truncated" for truncated turns, so the
+        # label must not leak eos/stop from partial content.
         terminated = False
+        ended_by_eos = ended_by_stop = ended_before_cap = False
     termination = (
         "eos"
         if ended_by_eos
@@ -171,7 +175,10 @@ def prepare_assistant_turn(
     )
     response_ids = raw_ids
     completion_text = tokenizer.decode(response_ids, skip_special_tokens=True)
-    if terminated and ended_by_stop:
+    # trim a trailing stop suffix whenever one ended the text — including when an EOS is ALSO
+    # present (the label prefers eos, but the bridge's eos validation requires the trimmed span
+    # to match; leaving the stop text in place desyncs response_ids from raw_response_ids).
+    if terminated and ended_by_stop and not ended_by_eos:
         response_ids, completion_text = _trim_trailing_stop(
             tokenizer, response_ids, stop_text, stop_sequences
         )
