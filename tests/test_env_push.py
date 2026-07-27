@@ -19,7 +19,7 @@ def _fake_client(capture: dict, *, slug: str = "acme/environment"):
     """A stand-in ApiClient that records the publish_env call and returns an env id."""
 
     class _C:
-        def publish_env(self, *, name, package_b64, project_id=None, progress=None):
+        def publish_env(self, *, name, package_b64, project_id, progress=None):
             capture.update(
                 name=name, package_b64=package_b64, project_id=project_id, progress=progress
             )
@@ -44,7 +44,9 @@ def _member_names(package_b64: str) -> list[str]:
         return [member.name for member in tar.getmembers()]
 
 
-def _args(path, *, name: str = "my-env", project: str | None = None):
+def _args(
+    path, *, name: str = "my-env", project: str | None = "11111111-1111-4111-8111-111111111111"
+):
     return argparse.Namespace(path=str(path), name=name, project=project)
 
 
@@ -281,24 +283,23 @@ def test_push_forwards_project_id(monkeypatch, tmp_path):
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    assert cli.cmd_env_push(_args(env_file, project="  proj-1  ")) == 0
+    assert (
+        cli.cmd_env_push(_args(env_file, project="  11111111-1111-4111-8111-111111111111  ")) == 0
+    )
     # a pasted id is stripped before it travels, so the resolver never sees the padding.
-    assert cap["project_id"] == "proj-1"
+    assert cap["project_id"] == "11111111-1111-4111-8111-111111111111"
 
 
 @pytest.mark.parametrize("project", [None, "", "   "])
-def test_push_without_project_sends_none(monkeypatch, tmp_path, project):
-    """No --project means "leave the grouping alone", not "move it to a default".
-
-    The publish upserts on (org, slug), so anything the CLI sends would overwrite a project
-    the user assigned from the dashboard. Passing None keeps the key out of the request."""
+def test_push_requires_project_before_packaging(monkeypatch, tmp_path, capsys, project):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    assert cli.cmd_env_push(_args(env_file, project=project)) == 0
-    assert cap["project_id"] is None
+    assert cli.cmd_env_push(_args(env_file, project=project)) == 1
+    assert "project id is required" in capsys.readouterr().err
+    assert cap == {}
 
 
 def test_push_reports_server_error(monkeypatch, tmp_path, capsys):
@@ -496,7 +497,7 @@ def test_push_renders_and_forwards_upload_progress(monkeypatch, tmp_path):
     seen: dict = {}
 
     class _C:
-        def publish_env(self, *, name, package_b64, project_id=None, progress=None):
+        def publish_env(self, *, name, package_b64, project_id, progress=None):
             # On a TTY the CLI hands us a real callback; drive it from 0 to 100%.
             assert progress is not None
             progress(0, 10)
@@ -658,6 +659,7 @@ def test_push_rejects_when_member_count_exceeds_limit_including_dirs(monkeypatch
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses dir perms")
 def test_push_fails_fast_on_unreadable_directory(monkeypatch, tmp_path, capsys):
     import os as _os
+
     env_dir = tmp_path / "env"
     env_dir.mkdir()
     (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")

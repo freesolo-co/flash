@@ -244,7 +244,7 @@ def _load_active_env():
         raise RuntimeError(
             "JobSpec sets no environment: provide [environment] id "
             "(a Freesolo environment id like 'your-name/your-env', returned by "
-            "`flash env push --name <name>`)."
+            "`flash env push --project <project-uuid> --name <name>`)."
         )
     return load_environment(
         env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
@@ -265,7 +265,7 @@ def require_active_env():
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
             "carry a JobSpec naming [environment] id "
             "(a Freesolo environment id like 'your-name/your-env', returned by "
-            "`flash env push --name <name>`)."
+            "`flash env push --project <project-uuid> --name <name>`)."
         )
     return ACTIVE_ENV
 
@@ -418,7 +418,11 @@ def main():
         )
         try:
             heartbeat(
-                f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics, diag=gpu_diagnostics()
+                f"error_{RUN_MODE}",
+                error=detail,
+                **hb_flags,
+                **_err_metrics,
+                diag=gpu_diagnostics(),
             )
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics)
