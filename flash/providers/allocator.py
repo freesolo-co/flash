@@ -49,6 +49,10 @@ def required_vram_gb(
 # buffers; a combination only counts as fitting when the combined VRAM clears the need with this
 # margin. conservative on purpose: a too-optimistic shard model OOMs a paid run.
 _SHARD_VRAM_EFFICIENCY = 0.85
+# activations/buffers replicate PER CARD regardless of sharding; every card in a combination must
+# individually hold this floor on top of its parameter shard, so tiny cards cannot fake a fit by
+# count alone (e.g. 4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
+_REPLICATED_PER_CARD_GB = 8
 # combinations larger than this are never proposed: shard-efficiency loss and inter-card overhead
 # grow with count, and cost estimates get less reliable.
 _MAX_COMBINATION_CARDS = 4
@@ -65,8 +69,11 @@ def _combination_candidates(
     """
     combos: list[Candidate] = []
     for c in singles:
+        if c.vram_gb <= _REPLICATED_PER_CARD_GB:
+            continue  # card too small to hold the replicated working set at all
         for count in range(2, min(max_gpu_count, _MAX_COMBINATION_CARDS) + 1):
-            if count * c.vram_gb * _SHARD_VRAM_EFFICIENCY >= need:
+            usable = count * (c.vram_gb - _REPLICATED_PER_CARD_GB) * _SHARD_VRAM_EFFICIENCY
+            if usable + _REPLICATED_PER_CARD_GB >= need:
                 combos.append(
                     Candidate(
                         provider=c.provider,
@@ -126,10 +133,22 @@ def allocate(
             raise UnsupportedGpuError(
                 f"exact GPU {exact!r} is not an active validated GPU class"
             )
-        if exact_info.vram_gb < need:
+        if exact_info.vram_gb < need and max_gpu_count <= 1:
             raise UnsupportedGpuError(
                 f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
                 f"but this run requires at least {need} GB"
+            )
+        if (
+            exact_info.vram_gb < need
+            and max_gpu_count > 1
+            and min(max_gpu_count, _MAX_COMBINATION_CARDS)
+            * exact_info.vram_gb
+            * _SHARD_VRAM_EFFICIENCY
+            < need
+        ):
+            raise UnsupportedGpuError(
+                f"exact GPU {exact!r} cannot fit this run even as a "
+                f"{min(max_gpu_count, _MAX_COMBINATION_CARDS)}-card combination"
             )
         exact_providers = providers_for(exact)
         if provider and provider not in exact_providers:

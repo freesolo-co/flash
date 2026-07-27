@@ -1439,7 +1439,8 @@ def test_combo_single_kept_when_cheaper_than_combination(monkeypatch):
 
 
 def test_combo_uses_smallest_fitting_count_and_shard_margin(monkeypatch):
-    # 200 GB need: 2 x 80 GB = 136 GB effective (too small), 3 x 80 GB = 204 GB effective (fits).
+    # 200 GB need on 80 GB cards with the replicated-floor model:
+    # usable/card = (80-8)*0.85 = 61.2 -> 3 cards = 191.6 GB (too small), 4 cards = 252.8 (fits).
     from flash.providers import allocator
     from flash.providers.base import Candidate
 
@@ -1447,7 +1448,21 @@ def test_combo_uses_smallest_fitting_count_and_shard_margin(monkeypatch):
     _stub_provider(monkeypatch, allocator, cands)
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
     a = allocator.allocate("m", "sft", max_gpu_count=4)
-    assert (a.gpu, a.gpu_count) == ("A100 PCIe", 3)
+    assert (a.gpu, a.gpu_count) == ("A100 PCIe", 4)
+
+
+def test_combo_replicated_floor_excludes_tiny_cards(monkeypatch):
+    # cards at/below the replicated floor can never combine, regardless of count.
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, UnsupportedGpuError
+
+    cands = [Candidate(provider="runpod", gpu="TINY 8GB", hourly_usd=0.1, vram_gb=8)]
+    _stub_provider(monkeypatch, allocator, cands)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
+    import pytest as _pytest
+
+    with _pytest.raises(UnsupportedGpuError):
+        allocator.allocate("m", "sft", max_gpu_count=4)
 
 
 def test_combo_summary_shows_count_and_total(monkeypatch):

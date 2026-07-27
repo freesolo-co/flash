@@ -418,8 +418,9 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
         key=lambda c: (
             c.provider in failed_providers,  # 1) escape providers that already failed this run
             (c.provider, c.gpu) in tried_classes,  # 2) then prefer a class not yet tried
-            c.hourly_usd,  # 3) then cheapest
-            c.vram_gb,  # 4) then the smaller card (don't burn a big GPU on a small job)
+            getattr(c, "gpu_count", 1) * c.hourly_usd,  # 3) then cheapest TOTAL cost
+            getattr(c, "gpu_count", 1),  # 4) fewer cards on ties (less inter-card overhead)
+            c.vram_gb,  # 5) then the smaller card (don't burn a big GPU on a small job)
         ),
     )
 
@@ -430,7 +431,11 @@ def _oom_escalated(candidates, oom_vram_floor: int):
     would just OOM again). EMPTY means the run already OOM'd the largest available class."""
     if not oom_vram_floor:
         return list(candidates)
-    return [c for c in candidates if c.vram_gb > oom_vram_floor]
+    return [
+        c
+        for c in candidates
+        if getattr(c, "gpu_count", 1) * c.vram_gb > oom_vram_floor
+    ]
 
 
 def _await_runpod_completed_metrics(
