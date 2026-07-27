@@ -1666,6 +1666,35 @@ def _metric_value(line: str, name: str) -> float | None:
     return None
 
 
+# the verl bridge stores the empty-alignment skip under its own internal key,
+# which the resume state also reads. trl publishes the same condition as
+# alignment_empty, so translate it at the metadata boundary only.
+_CANONICAL_SKIP_REASONS = {"empty_alignment": "alignment_empty"}
+
+
+def _canonical_skip_reasons(skip_counts: dict) -> dict:
+    canonical: dict[str, int] = {}
+    for reason, count in skip_counts.items():
+        count = int(count)
+        # trl records skip reasons in a counter, so only reasons that actually
+        # occurred appear. the verl snapshot always injects empty_alignment.
+        if count <= 0:
+            continue
+        name = _CANONICAL_SKIP_REASONS.get(reason, reason)
+        canonical[name] = canonical.get(name, 0) + count
+    return dict(sorted(canonical.items()))
+
+
+def _failure_accounting_metadata(accounting: dict) -> dict:
+    return {
+        "teacher_transient_failures": int(accounting["teacher_transient"]),
+        "teacher_errors": int(accounting["teacher_error"]),
+        "no_signal_resamples": int(accounting["no_signal_resamples"]),
+        "no_signal_skipped_steps": int(accounting["no_signal_skipped_steps"]),
+        "skip_reasons": _canonical_skip_reasons(accounting["skip_counts"]),
+    }
+
+
 def _read_failure_fallback_records(base_path: str) -> list[tuple[str, str]]:
     if not base_path:
         return []
@@ -2496,8 +2525,7 @@ def run_opd_verl(spec=None) -> None:
                 "aligned_sequences": int(final_accounting["aligned_sequences"]),
                 "empty_alignments": int(final_accounting["empty_alignments"]),
                 "teacher_ok": int(final_accounting["teacher_ok"]),
-                "teacher_transient": int(final_accounting["teacher_transient"]),
-                "teacher_error": int(final_accounting["teacher_error"]),
+                **_failure_accounting_metadata(final_accounting),
                 "temperature": knobs.temperature,
                 "group_size": knobs.group_size,
                 "prompts_per_step": prompts_per_step,
