@@ -292,7 +292,26 @@ def _resolve_verl_python(workdir: str) -> str:
         # full install is used. exact pins are validated on the gpu pod before paid launch.
         subprocess.run(["uv", "venv", venv], check=True)
         subprocess.run(["uv", "pip", "install", "--python", py, "verl"], check=True)
+        if os.environ.get("WANDB_API_KEY"):
+            # verl does not pull wandb; add it (best-effort) so verl's wandb logger can import it in
+            # this isolated interpreter instead of aborting. a failure here -> console logger below.
+            subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
     return py
+
+
+def _resolve_verl_loggers(python_bin: str) -> str:
+    """verl's ``trainer.logger`` list. verl logs from its own interpreter, so enable the wandb
+    logger only when WANDB_API_KEY is set AND wandb is importable in that interpreter; otherwise
+    console-only. this never inits a flash-side run (flash does not train in-process on this path,
+    so a flash-side run would stay empty) and never aborts verl when its env lacks wandb."""
+    if not os.environ.get("WANDB_API_KEY"):
+        return "console"
+    has_wandb = (
+        subprocess.run([python_bin, "-c", "import wandb"], capture_output=True).returncode == 0
+    )
+    if not has_wandb:
+        print("[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; using console logger only")
+    return "console,wandb" if has_wandb else "console"
 
 
 def _export_peft_adapter(
@@ -443,6 +462,17 @@ def _resolve_single_turn_inputs():
         print(
             f"[rl-verl] advantage_clip={gcfg['advantage_clip']} recorded; verl centers grpo "
             "advantages (no value clip), matching the trl path",
+            flush=True,
+        )
+    # trl drops truncated (non-eos) completions from the grpo loss (mask_truncated_completions,
+    # default True); verl's vllm rollout here has no per-completion truncation-mask knob, so verl
+    # keeps them. stop_sequences (the only case that turns masking off) already fails loudly above,
+    # so this is always the default-True case. record the divergence for parity observability
+    # rather than silently ignoring it; adding verl-side masking is a tracked follow-up.
+    if _w.grpo_mask_truncated_completions(_t):
+        print(
+            "[rl-verl] mask_truncated_completions=True; verl keeps truncated completions in the "
+            "grpo loss (no verl truncation-mask knob) -- recorded parity caveat, not applied",
             flush=True,
         )
     learning_rate = float(_t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate)
@@ -622,11 +652,12 @@ def run_rl_verl():
 
     server, reward_url = start_reward_server(_score)
     try:
+        proc = None
         python_bin = _resolve_verl_python(workdir)
         micro_batch = 1
         expected_steps = int(inp["steps"])
-        # match flash's wandb reporting when configured (verl reads WANDB_API_KEY, which flash sets).
-        loggers = "console,wandb" if "wandb" in (_w.wandb_report_to() or []) else "console"
+        # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).
+        loggers = _resolve_verl_loggers(python_bin)
         # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path — but NOT for
         # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
         # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
@@ -657,6 +688,11 @@ def run_rl_verl():
             "total_epochs": inp["epochs"], "save_freq": inp["save_every"], "local_dir": local_dir,
         }
         overrides = build_verl_overrides(cfg)
+
+        # clear any checkpoints left by a prior run on this fixed per-seed worker dir, so finalize's
+        # highest-global_step_N pick can only ever see THIS run's checkpoints (a retry or partial
+        # run otherwise leaves stale global_step_* folders that could export a prior run's adapter).
+        shutil.rmtree(local_dir, ignore_errors=True)
 
         setup_seconds = time.time() - t_start
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
@@ -708,6 +744,13 @@ def run_rl_verl():
         if rc != 0:
             raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
     finally:
+        # ensure the verl child can't outlive us holding gpu memory if stdout reading raised before
+        # proc.wait() (shutting down the reward server alone would leave main_ppo running).
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=10)
         server.shutdown()
 
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
@@ -718,6 +761,15 @@ def run_rl_verl():
     actor_dir, steps_run = _latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
         raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")
+    # an empty reward_history means the reward bridge never scored a completion (rollout produced
+    # nothing, or scoring never ran): a no-op run, not a success. mirror the trl path and fail
+    # loudly instead of exporting/publishing an untrained adapter. verl never resumes -> ckpt None.
+    if _w._grpo_is_no_op_failure(reward_history, None, expected_steps, steps_run):
+        raise RuntimeError(
+            f"verl grpo scored no reward over {steps_run} step(s) — the rollout produced no "
+            "completions, so the policy was never actually trained. failing loudly instead of "
+            "publishing a no-op run as done."
+        )
 
     with liveness_heartbeat("rl_verl_finalizing", progress=lambda: steps_run, progress_step=True, keepalive=True):
         _export_peft_adapter(actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin)
