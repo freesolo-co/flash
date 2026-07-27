@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import threading
+import urllib.error
 import urllib.request
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import flash.engine.worker as W
@@ -81,6 +84,7 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "actor_rollout_ref.actor.ppo_epochs=2" in o
     assert "actor_rollout_ref.model.enable_gradient_checkpointing=True" in o
     assert "data.seed=42" in o
+    assert "actor_rollout_ref.rollout.seed=42" in o
     assert "trainer.total_training_steps=60" in o
     assert "trainer.save_freq=20" in o
     assert "trainer.max_actor_ckpt_to_keep=1" in o
@@ -127,6 +131,24 @@ def test_build_verl_overrides_kl_on_when_requested():
     assert "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2" in o
 
 
+def test_verl_uses_canonical_heartbeat_stage_contracts():
+    from flash.engine.worker.heartbeat import _HB_THROTTLED_STAGES
+    from flash.providers._poll import STEP_GATED_STAGES
+    from flash.runner import _TRAINING_STAGES
+
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    assert "rl_verl_training" not in src
+    assert "rl_verl_finalizing" not in src
+    initial_heartbeat = '_w.heartbeat("rl_step", step=0, initial=True)'
+    assert initial_heartbeat in src
+    assert src.index(initial_heartbeat) < src.index('liveness_heartbeat("rl_step"')
+    assert '"rl_finalizing"' in src
+    assert "rl_step" in _HB_THROTTLED_STAGES
+    assert "rl_step" in STEP_GATED_STAGES
+    assert "rl_step" in _TRAINING_STAGES
+    assert "rl_finalizing" in _HB_THROTTLED_STAGES
+
+
 # ------------------------------- reward module render -------------------------------
 def test_render_reward_module_is_valid_and_defines_compute_score():
     src = rl_verl.render_reward_module()
@@ -135,6 +157,51 @@ def test_render_reward_module_is_valid_and_defines_compute_score():
     assert callable(ns["compute_score"])
     # no flash import leaks into the verl-side shim.
     assert "import flash" not in src
+
+
+def test_render_reward_module_missing_index_raises():
+    ns: dict = {}
+    exec(compile(rl_verl.render_reward_module(), "<reward>", "exec"), ns)
+    with pytest.raises(RuntimeError, match="no example index"):
+        ns["compute_score"]("flash_env", "answer", "unused", extra_info={})
+
+
+@pytest.mark.parametrize(
+    "index",
+    [True, 1.9, np.bool_(True), np.bool_(False), float("nan"), float("inf"), float("-inf")],
+    ids=["bool", "fractional", "numpy-true", "numpy-false", "nan", "positive-inf", "negative-inf"],
+)
+def test_render_reward_module_rejects_invalid_index(monkeypatch, index):
+    monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", "http://unused")
+    ns: dict = {}
+    exec(compile(rl_verl.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns)
+    monkeypatch.setattr(
+        ns["urllib"].request,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("invalid index must not reach the reward server"),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid example index"):
+        ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": index})
+
+
+@pytest.mark.parametrize("index", [1, 1.0, np.int64(1), np.float64(1.0)])
+def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
+    scored = []
+    server, url = rl_verl.start_reward_server(
+        lambda idx, solution: scored.append((idx, solution)) or 3.0,
+        example_count=2,
+    )
+    try:
+        monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
+        ns: dict = {}
+        exec(compile(rl_verl.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns)
+        assert ns["compute_score"](
+            "flash_env", "answer", "unused", extra_info={"index": index}
+        ) == 3.0
+        assert scored == [(1, "answer")]
+    finally:
+        server.shutdown()
 
 
 # ------------------------------- reward parity -------------------------------
@@ -195,13 +262,57 @@ def test_score_single_turn_env_error_is_zero():
 
 # ------------------------------- reward rpc bridge -------------------------------
 def test_reward_server_round_trip():
-    server, url = rl_verl.start_reward_server(lambda idx, s: float(idx) + len(s))
+    server, url = rl_verl.start_reward_server(
+        lambda idx, s: float(idx) + len(s), example_count=4
+    )
     try:
         body = json.dumps({"index": 3, "solution_str": "abcd"}).encode()
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as r:
             got = json.loads(r.read().decode())
         assert got["score"] == 7.0  # 3 + len("abcd")
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("index", [-1, 2])
+def test_reward_server_rejects_out_of_range_index_before_lookup(index):
+    examples = [{"name": "first"}, {"name": "last"}]
+    scored = []
+
+    def scorer(index, solution_str):
+        scored.append(examples[index]["name"])
+        return 1.0
+
+    server, url = rl_verl.start_reward_server(scorer, example_count=len(examples))
+    try:
+        body = json.dumps({"index": index, "solution_str": "answer"}).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 400
+        assert scored == []
+    finally:
+        server.shutdown()
+
+
+def test_reward_bridge_lookup_failure_raises(monkeypatch):
+    def missing_example(idx, solution_str):
+        raise IndexError(idx)
+
+    server, url = rl_verl.start_reward_server(missing_example, example_count=100)
+    try:
+        monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
+        ns: dict = {}
+        src = rl_verl.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
+        exec(compile(src, "<reward>", "exec"), ns)
+        with pytest.raises(RuntimeError, match="reward bridge request failed"):
+            ns["compute_score"](
+                "flash_env",
+                "answer",
+                "unused",
+                extra_info={"index": 99},
+            )
     finally:
         server.shutdown()
 
@@ -218,7 +329,7 @@ def test_reward_server_scorer_can_capture_samples():
             del captured[:-64]
         return float(len(sol))
 
-    server, url = rl_verl.start_reward_server(scorer)
+    server, url = rl_verl.start_reward_server(scorer, example_count=3)
     try:
         for i in range(3):
             body = json.dumps({"index": i, "solution_str": f"c{i}"}).encode()

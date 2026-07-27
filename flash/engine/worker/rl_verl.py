@@ -97,6 +97,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # thread flash's thinking mode so the rollout sees the same prompt as the trl path.
         f"+data.apply_chat_template_kwargs.enable_thinking={str(bool(cfg.get('thinking', False))).lower()}",
         f"data.seed={cfg['seed']}",
+        f"actor_rollout_ref.rollout.seed={cfg['seed']}",
         f"actor_rollout_ref.model.path={cfg['model_id']}",
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
@@ -187,18 +188,29 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         "\n"
         "def compute_score(data_source, solution_str, ground_truth, extra_info=None):\n"
         "    idx = (extra_info or {}).get('index')\n"
-        "    if idx is None or not _URL:\n"
-        "        return 0.0\n"
-        "    body = json.dumps({'index': int(idx), 'solution_str': solution_str or ''}).encode()\n"
+        "    if idx is None:\n"
+        "        raise RuntimeError('flash reward bridge received no example index')\n"
+        "    if not _URL:\n"
+        "        raise RuntimeError('flash reward bridge url is not configured')\n"
+        "    if isinstance(idx, bool) or getattr(getattr(idx, 'dtype', None), 'kind', None) == 'b':\n"
+        "        raise RuntimeError('flash reward bridge received an invalid example index: %r' % idx)\n"
+        "    try:\n"
+        "        exact_idx = int(idx)\n"
+        "    except (TypeError, ValueError, OverflowError) as exc:\n"
+        "        raise RuntimeError('flash reward bridge received an invalid example index: %r' % idx) from exc\n"
+        "    if exact_idx != idx:\n"
+        "        raise RuntimeError('flash reward bridge received an invalid example index: %r' % idx)\n"
+        "    idx = exact_idx\n"
+        "    body = json.dumps({'index': idx, 'solution_str': solution_str or ''}).encode()\n"
         "    req = urllib.request.Request(_URL, data=body, headers={'Content-Type': 'application/json'})\n"
         "    try:\n"
         "        with urllib.request.urlopen(req, timeout=120) as r:\n"
-        "            return float(json.loads(r.read().decode()).get('score', 0.0))\n"
-        "    except urllib.error.URLError as exc:  # bridge unreachable -> every reward would be 0\n"
-        "        raise RuntimeError('flash reward bridge unreachable: %s' % exc)\n"
-        "    except Exception as exc:  # noqa: BLE001 -- a per-sample scoring error must not kill training\n"
-        "        print('[flash-reward-bridge] scoring failed:', exc, flush=True)\n"
-        "        return 0.0\n"
+        "            payload = json.loads(r.read().decode())\n"
+        "            return float(payload['score'])\n"
+        "    except urllib.error.URLError as exc:\n"
+        "        raise RuntimeError('flash reward bridge request failed: %s' % exc) from exc\n"
+        "    except Exception as exc:\n"
+        "        raise RuntimeError('flash reward bridge returned an invalid response: %s' % exc) from exc\n"
     )
 
 
@@ -246,7 +258,7 @@ def score_single_turn(
 # --------------------------------------------------------------------------------------------
 # reward rpc bridge: verl subprocess -> flash live env.
 # --------------------------------------------------------------------------------------------
-def start_reward_server(score_by_index):
+def start_reward_server(score_by_index, *, example_count: int):
     """start a localhost http reward server. score_by_index(index, solution_str) -> float.
 
     returns (server, url). the server runs in a daemon thread; call server.shutdown() when done.
@@ -264,16 +276,21 @@ def start_reward_server(score_by_index):
                 self.send_response(404)
                 self.end_headers()
                 return
-            n = int(self.headers.get("Content-Length", "0"))
             try:
+                n = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
+                index = int(payload["index"])
+                if index < 0 or index >= example_count:
+                    raise IndexError(f"reward example index {index} is outside [0, {example_count})")
                 with score_lock:
-                    score = float(score_by_index(int(payload["index"]), payload.get("solution_str", "")))
-            except Exception as exc:  # never 500 the trainer; score 0
-                print(f"[rl-verl] reward server error: {exc}", flush=True)
-                score = 0.0
-            body = json.dumps({"score": score}).encode()
-            self.send_response(200)
+                    score = float(score_by_index(index, payload.get("solution_str", "")))
+            except Exception as exc:
+                print(f"[rl-verl] reward server request failed: {exc}", flush=True)
+                body = json.dumps({"error": str(exc)}).encode()
+                self.send_response(400)
+            else:
+                body = json.dumps({"score": score}).encode()
+                self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -696,7 +713,7 @@ def run_rl_verl():
             del recent_samples[:-64]
         return score
 
-    server, reward_url = start_reward_server(_score)
+    server, reward_url = start_reward_server(_score, example_count=len(rollout_examples))
     try:
         python_bin = _resolve_verl_python(workdir)
         micro_batch = 1
@@ -739,6 +756,7 @@ def run_rl_verl():
 
         setup_seconds = time.time() - t_start
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
+        _w.heartbeat("rl_step", step=0, initial=True)
         t_train = time.time()
         step_box = [0]
 
@@ -759,7 +777,7 @@ def run_rl_verl():
         resp_len_history: list[float] = []
         loss_curve: list[float] = []
         last_dump_step = [-1]
-        with liveness_heartbeat("rl_verl_training", progress=_progress, progress_step=True):
+        with liveness_heartbeat("rl_step", progress=_progress, progress_step=True):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env_for_verl,
@@ -822,7 +840,12 @@ def run_rl_verl():
     if steps_run < expected_steps:
         raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")
 
-    with liveness_heartbeat("rl_verl_finalizing", progress=lambda: steps_run, progress_step=True, keepalive=True):
+    with liveness_heartbeat(
+        "rl_finalizing",
+        progress=lambda: steps_run,
+        progress_step=True,
+        keepalive=True,
+    ):
         _export_peft_adapter(actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin)
         tok.save_pretrained(adapter_dir)
         _stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
