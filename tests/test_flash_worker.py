@@ -809,3 +809,65 @@ def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
         3600.0 / worker._HB_MIN_INTERVAL_S + 3600.0 / endpoints._CONSOLE_UPLOAD_INTERVAL_S
     )
     assert steady_state_commits_per_hour <= 5.0
+
+
+def test_worker_image_override_carries_deploy_constraints(monkeypatch):
+    # the override image's own requirements (registry auth, cuda floor, disk floor) ride with it
+    from flash.providers import _worker
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/private-worker:cu13")
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-123")
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_CUDA", "13.0")
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_DISK_GB", "150")
+    o = _worker.worker_image_override()
+    assert o.image == "ghcr.io/example/private-worker:cu13"
+    assert o.registry_auth_id == "auth-123"
+    assert o.min_cuda == "13.0"
+    assert o.min_disk_gb == 150
+    assert _worker.worker_image_for_gpu("H200") == o.image
+
+
+def test_worker_image_override_absent_is_none(monkeypatch):
+    from flash.providers import _worker
+
+    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
+    assert _worker.worker_image_override() is None
+
+
+def test_min_cuda_for_takes_image_floor_when_higher(monkeypatch):
+    from flash.providers.runpod.train.endpoints import min_cuda_for
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:cu13")
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_CUDA", "13.0")
+    # H200 class floor is 12.x; the cu13 image raises it
+    assert min_cuda_for("H200") == "13.0"
+    # class floor wins when the image floor is lower
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_CUDA", "11.8")
+    assert min_cuda_for("B200") != "11.8"
+
+
+def test_apply_disk_honors_image_floor(monkeypatch):
+    from types import SimpleNamespace
+
+    from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:big")
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_DISK_GB", "150")
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-xyz")
+    tpl = SimpleNamespace(containerDiskInGb=64, containerRegistryAuthId=None)
+    cfg = SimpleNamespace(template=tpl)
+    apply_disk_gb(cfg, 80)
+    assert tpl.containerDiskInGb == 150  # image floor wins over the 80 GB request
+    apply_image_override_constraints(cfg)
+    assert tpl.containerRegistryAuthId == "auth-xyz"
+
+
+def test_snapshot_weight_validation(tmp_path):
+    from flash.engine.worker.hf import _snapshot_has_weights
+
+    d = tmp_path / "snap"
+    d.mkdir()
+    (d / "config.json").write_text("{}")
+    assert not _snapshot_has_weights(str(d))  # configs only = stale partial snapshot
+    (d / "model.safetensors-00001-of-00001.safetensors").write_text("x")
+    assert _snapshot_has_weights(str(d))

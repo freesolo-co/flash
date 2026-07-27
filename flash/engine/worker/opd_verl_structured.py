@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import json
 import re
@@ -127,7 +128,14 @@ class StructuredOutputReplay:
                 try:
                     grammar_start = response_ids.index(think_end_token_id) + 1
                 except ValueError:
-                    return [False] * len(response_ids)
+                    # a thinking response that never closes </think> never entered the grammar
+                    # region: vllm enforced the constraint only after the think block, so this
+                    # completion is unconstrained text — reject it rather than silently training
+                    # on it with an all-unforced mask.
+                    raise RuntimeError(
+                        "structured OPD thinking response never closed </think>; the grammar "
+                        "region was never entered (truncated or runaway thinking)"
+                    ) from None
 
         compiled = self._compile(canonical_spec)
         matcher = self._xgrammar.GrammarMatcher(compiled)
@@ -143,6 +151,27 @@ class StructuredOutputReplay:
                 )
         if len(forced) != len(response_ids):
             raise AssertionError("structured OPD forced mask has the wrong response length")
+        if grammar_start >= len(response_ids):
+            # the response ended at (or before) the grammar region: no structured output was
+            # generated at all — reject rather than replaying an empty region as valid.
+            raise RuntimeError(
+                "structured OPD response contains no tokens in the grammar region"
+            )
+        if not matcher.is_terminated():
+            # a grammar like a bare integer is not "terminated" after `4` (it could continue as
+            # `42`); completeness means STOPPING here is legal. accept the output iff the matcher
+            # can take the stop token now — otherwise the structured output was truncated
+            # mid-grammar and would train on garbage.
+            stop_ok = False
+            for _stop_id in list(getattr(matcher, "stop_token_ids", []) or []):
+                with contextlib.suppress(Exception):
+                    if matcher.accept_token(int(_stop_id)):
+                        stop_ok = matcher.is_terminated()
+                        break
+            if not stop_ok:
+                raise RuntimeError(
+                    "structured OPD replay ended mid-grammar (truncated structured output)"
+                )
         return forced
 
 

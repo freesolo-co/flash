@@ -92,7 +92,11 @@ def export_peft_adapter(
     merge_out = out_adapter_dir.rstrip("/") + "_merge"
     shutil.rmtree(merge_out, ignore_errors=True)
     merge_env = dict(os.environ)
-    # the base config/tokenizer are already cached; keep the merger off hf's rate-limited api.
+    # the merger reads only local checkpoint files: strip credentials/tokens from its env (least
+    # privilege), and keep it fully offline so it never touches hf's rate-limited api.
+    for _k in list(merge_env):
+        if any(t in _k.upper() for t in ("TOKEN", "SECRET", "API_KEY", "PASSWORD", "CREDENTIAL")):
+            merge_env.pop(_k)
     merge_env["HF_HUB_OFFLINE"] = "1"
     merge_env["TRANSFORMERS_OFFLINE"] = "1"
     merge_env["HF_HUB_DISABLE_XET"] = "1"
