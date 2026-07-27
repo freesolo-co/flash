@@ -313,7 +313,8 @@ class _TeacherAlignmentBridge:
 
     def _record_mutation_failure(self, classification: str, message: str) -> None:
         with self._stats_lock:
-            self._mutation_failure = (classification, message)
+            if classification == "permanent" or self._mutation_failure is None:
+                self._mutation_failure = (classification, message)
 
     @property
     def mutation_failure(self) -> tuple[str, str] | None:
