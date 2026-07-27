@@ -56,10 +56,15 @@ def deterministic_rollout_seed(
     no_signal_attempt_ordinal: int = 0,
 ) -> int:
     """Derive one stable vLLM request seed from the complete rollout identity."""
-    payload = (
-        f"{int(flash_seed)}:{int(global_step)}:{int(example_index)}:"
-        f"{int(rollout_ordinal)}:{int(assistant_turn_ordinal)}"
-    )
+    # single-turn rollouts (turn ordinal 0) keep the pre-multiturn payload byte-identical, so a
+    # resumed single-turn run continues its original deterministic trajectory; the turn suffix is
+    # appended only for multi-turn identities.
+    payload = f"{int(flash_seed)}:{int(global_step)}:{int(example_index)}:{int(rollout_ordinal)}"
+    turn_ordinal = int(assistant_turn_ordinal)
+    if turn_ordinal < 0:
+        raise ValueError("flash OPD assistant turn ordinal must be nonnegative")
+    if turn_ordinal:
+        payload += f":{turn_ordinal}"
     attempt_ordinal = int(no_signal_attempt_ordinal)
     if attempt_ordinal < 0:
         raise ValueError("flash OPD no-signal attempt ordinal must be nonnegative")

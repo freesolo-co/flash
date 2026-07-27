@@ -417,7 +417,10 @@ def build_flash_multi_turn_agent_loop(
                     glue_ids = _dedup_seam_terminator(
                         response_ids, glue_tokenizer(env_messages)
                     )
-                    if len(prefix_ids) + len(glue_ids) > max_model_len:
+                    # stop while at least a minimal generation window remains: gluing right up to
+                    # max_model_len leaves the next turn zero tokens to generate (the engine would
+                    # immediately truncate), so reserve a small slack for the next model turn.
+                    if len(prefix_ids) + len(glue_ids) + 8 > max_model_len:
                         break
                     prefix_ids.extend(glue_ids)
                 score_payload = await _run_executor_call(

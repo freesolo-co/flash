@@ -642,16 +642,19 @@ class _TeacherAlignmentBridge:
             messages: list[dict] = []
             next_prefix = [*accepted_prefix, *response_ids]
             if not terminal:
+                # check episode termination BEFORE requesting an environment reply: at the turn
+                # limit or when the env already reports done, the extra env_reply both wastes an
+                # env call and appends a user turn no model turn will ever answer.
+                assistant_turns = turn_ordinal + 1
+                turn_limit = session["turn_limit"]
+                terminal = assistant_turns >= turn_limit or self.active_env.rollout_done(
+                    state, turn_limit
+                )
+            if not terminal:
                 messages = self.active_env.env_reply(session["messages"], state)
                 messages = validate_teacher_messages(messages, source="environment reply")
                 session["messages"].extend(messages)
-                assistant_turns = turn_ordinal + 1
-                turn_limit = session["turn_limit"]
-                terminal = (
-                    not messages
-                    or assistant_turns >= turn_limit
-                    or self.active_env.rollout_done(state, turn_limit)
-                )
+                terminal = not messages
                 if not terminal:
                     assert self._env_glue is not None
                     next_prefix.extend(
