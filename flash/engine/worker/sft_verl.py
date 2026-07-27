@@ -87,13 +87,23 @@ def _hydra_val(value) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, float):
+        # fixed-point keeps hydra off scientific notation, but 12 places truncates lrs below
+        # 1e-12 to zero; fall back to repr for those (hydra parses e-notation fine when quoted).
+        if value != 0 and abs(value) < 1e-12:
+            return repr(value)
         rendered = f"{value:.12f}".rstrip("0")
         return rendered + "0" if rendered.endswith(".") else rendered
     if isinstance(value, dict):
         return "{" + ",".join(f"{key}:{_hydra_val(item)}" for key, item in value.items()) + "}"
     if isinstance(value, (list, tuple, set, frozenset)):
         return "[" + ",".join(_hydra_val(item) for item in value) + "]"
-    return str(value)
+    text = str(value)
+    # quote strings containing hydra/shell-special characters so paths and ids survive parsing
+    # (e.g. commas or '=' in a dataset path would split the override).
+    if any(ch in text for ch in (",", "=", " ", "[", "]", "{", "}", "(", ")", ":", "'", '"')):
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return text
 
 
 def _optimizer_override_config(cfg: dict) -> dict:
@@ -162,7 +172,10 @@ def build_sft_verl_overrides(cfg: dict) -> list[str]:
         f"trainer.total_epochs={_hydra_val(cfg['loop_epochs'])}",
         "trainer.test_freq=-1",
         "trainer.resume_mode=auto",
-        "trainer.max_ckpt_to_keep=null",
+        # retain only the latest full-state checkpoint on the pod: each global_step_N holds model
+        # +optimizer shards (GBs); unbounded retention fills the container disk on long runs. flash
+        # publishes required interval checkpoints to HF durably, so on-pod history is redundant.
+        "trainer.max_ckpt_to_keep=1",
     ]
     if steps:
         overrides.append(f"trainer.total_training_steps={_hydra_val(steps)}")
@@ -683,10 +696,24 @@ class _VerlCheckpointWatcher:
 def _cached_model_path(model_id: str, model_revision: str) -> str:
     from huggingface_hub import snapshot_download
 
-    return snapshot_download(
-        repo_id=model_id,
-        revision=model_revision or None,
-        local_files_only=True,
+    from flash.engine.worker.hf import _shared_weight_cache_dir
+    from flash.engine.worker.perf import RetriableInfraError
+
+    # prefetch lands weights on the shared volume when attached; resolve from the same cache first.
+    for cache_dir in (_shared_weight_cache_dir(), None):
+        try:
+            return snapshot_download(
+                repo_id=model_id,
+                revision=model_revision or None,
+                cache_dir=cache_dir,
+                local_files_only=True,
+            )
+        except Exception:
+            continue
+    # the prefetch step reported success but the cache has no resolvable snapshot: a transient
+    # volume/link glitch, not a config error — retriable so the run lands on a healthy worker.
+    raise RetriableInfraError(
+        f"model {model_id} not resolvable from the local HF cache after prefetch"
     )
 
 

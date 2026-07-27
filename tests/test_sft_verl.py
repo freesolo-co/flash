@@ -82,8 +82,6 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "model.target_modules": "all-linear",
         "model.lora_adapter_path": "null",
         "model.use_remove_padding": "true",
-        "model.use_fused_kernels": "true",
-        "model.fused_kernel_options.impl_backend": "torch",
         "model.use_liger": "true",
         "model.enable_gradient_checkpointing": "true",
         "engine.strategy": "fsdp2",
@@ -108,7 +106,9 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "trainer.total_epochs": "4",
         "trainer.test_freq": "-1",
         "trainer.resume_mode": "auto",
-        "trainer.max_ckpt_to_keep": "null",
+        "model.use_fused_kernels": "true",
+        "model.fused_kernel_options.impl_backend": "torch",
+        "trainer.max_ckpt_to_keep": "1",
         "trainer.total_training_steps": "120",
     }
     assert "optim.eps" not in overrides

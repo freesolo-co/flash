@@ -32,7 +32,12 @@ def publish_env(payload: dict, key: Annotated[dict, Depends(require_key)]):
 
     # Best-effort: env is already published (GitHub is source of truth); don't 500 on metadata failure.
     try:
-        record_published_environment(slug=slug, name="" if _name is None else _name, key=key)
+        record_published_environment(
+            slug=slug,
+            name="" if _name is None else _name,
+            key=key,
+            project_id=payload.get("project_id"),
+        )
     except Exception as exc:
         logger.warning("record_published_environment failed (non-fatal): %s", exc, exc_info=True)
     return {"id": slug}

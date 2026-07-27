@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from flash._logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
@@ -43,6 +45,48 @@ def required_vram_gb(
     )
 
 
+# FSDP shards parameters/optimizer across cards but replicates activations and adds collective
+# buffers; a combination only counts as fitting when the combined VRAM clears the need with this
+# margin. conservative on purpose: a too-optimistic shard model OOMs a paid run.
+_SHARD_VRAM_EFFICIENCY = 0.85
+# activations/buffers replicate PER CARD regardless of sharding; every card in a combination must
+# individually hold this floor on top of its parameter shard, so tiny cards cannot fake a fit by
+# count alone (e.g. 4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
+_REPLICATED_PER_CARD_GB = 8
+# combinations larger than this are never proposed: shard-efficiency loss and inter-card overhead
+# grow with count, and cost estimates get less reliable.
+_MAX_COMBINATION_CARDS = 4
+
+
+def _combination_candidates(
+    singles: list[Candidate], need: int, max_gpu_count: int
+) -> list[Candidate]:
+    """Expand single-card candidates into fitting multi-card combinations (same class x count).
+
+    Per-card fields stay per-card; a combination fits when count * vram * _SHARD_VRAM_EFFICIENCY
+    covers the need. Only the smallest fitting count per class is proposed (larger counts of the
+    same class only cost more).
+    """
+    combos: list[Candidate] = []
+    for c in singles:
+        if c.vram_gb <= _REPLICATED_PER_CARD_GB:
+            continue  # card too small to hold the replicated working set at all
+        for count in range(2, min(max_gpu_count, _MAX_COMBINATION_CARDS) + 1):
+            usable = count * (c.vram_gb - _REPLICATED_PER_CARD_GB) * _SHARD_VRAM_EFFICIENCY
+            if usable + _REPLICATED_PER_CARD_GB >= need:
+                combos.append(
+                    Candidate(
+                        provider=c.provider,
+                        gpu=c.gpu,
+                        hourly_usd=c.hourly_usd,
+                        vram_gb=c.vram_gb,
+                        gpu_count=count,
+                    )
+                )
+                break
+    return combos
+
+
 def allocate(
     model_id: str,
     algorithm: str,
@@ -54,8 +98,15 @@ def allocate(
     provider: str = "",
     gpu_type: str = "",
     model_revision: str = "",
+    max_gpu_count: int = 1,
 ) -> Allocation:
-    """Pick the cheapest fitting (provider, GPU class) able to run the job."""
+    """Pick the cheapest fitting combination of (provider, GPU class, count) able to run the job.
+
+    With ``max_gpu_count=1`` (the default) this is exactly the classic cheapest single-class
+    allocation. A caller whose algorithm can shard across cards passes a higher cap, and fitting
+    multi-card combinations (same class x count) then compete on TOTAL hourly cost — e.g.
+    2 x A100 beats 1 x H200 whenever 2 * $A100 < $H200 and the sharded fit clears the need.
+    """
     need = required_vram_gb(
         model_id,
         algorithm,
@@ -82,10 +133,20 @@ def allocate(
             raise UnsupportedGpuError(
                 f"exact GPU {exact!r} is not an active validated GPU class"
             )
-        if exact_info.vram_gb < need:
+        if exact_info.vram_gb < need and max_gpu_count <= 1:
             raise UnsupportedGpuError(
                 f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
                 f"but this run requires at least {need} GB"
+            )
+        _max_cards = min(max_gpu_count, _MAX_COMBINATION_CARDS)
+        _pin_usable = (
+            _max_cards * max(0, exact_info.vram_gb - _REPLICATED_PER_CARD_GB) * _SHARD_VRAM_EFFICIENCY
+            + _REPLICATED_PER_CARD_GB
+        )
+        if exact_info.vram_gb < need and max_gpu_count > 1 and _pin_usable < need:
+            raise UnsupportedGpuError(
+                f"exact GPU {exact!r} cannot fit this run even as a "
+                f"{min(max_gpu_count, _MAX_COMBINATION_CARDS)}-card combination"
             )
         exact_providers = providers_for(exact)
         if provider and provider not in exact_providers:
@@ -99,6 +160,14 @@ def allocate(
         max_wall_seconds=max_wall_seconds,
         gpu_type=exact,
     )
+    allow_combos = max_gpu_count > 1
+    # with combinations allowed, a card can contribute as one of N; query providers at the reduced
+    # per-card floor so classes too small to fit alone still surface, then split fit-alone singles
+    # from combination material below.
+    per_card_need = need
+    if allow_combos:
+        cap = min(max_gpu_count, _MAX_COMBINATION_CARDS)
+        per_card_need = max(1, math.ceil(need / (cap * _SHARD_VRAM_EFFICIENCY)))
     candidates: list[Candidate] = []
     lookup_failed = False
     # runpod prices off a static table (no live lookup), so it never blips; lambda/vast query live
@@ -107,7 +176,7 @@ def allocate(
     # runpod uses the same loop but does not raise CapacityLookupError.
     for name in available:
         try:
-            found = get_provider(name).live_candidates(need, constraints)
+            found = get_provider(name).live_candidates(per_card_need, constraints)
             candidates += [
                 candidate
                 for candidate in found
@@ -116,6 +185,10 @@ def allocate(
         except CapacityLookupError as exc:
             lookup_failed = True
             logger.warning("%s capacity lookup failed (%s); allocating without it", name, exc.__cause__)
+    if allow_combos:
+        fit_alone = [c for c in candidates if c.vram_gb >= need]
+        undersized = [c for c in candidates if c.vram_gb < need]
+        candidates = fit_alone + _combination_candidates(undersized, need, max_gpu_count)
     if not candidates:
         if lookup_failed:
             # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
@@ -140,9 +213,13 @@ def allocate(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
             f"({', '.join(available) or '(none)'}); the run genuinely exceeds every active GPU class"
         )
-    # cheapest first; ties break by VRAM, then GPU class name. sorting is stable, so provider and
-    # provider-local order apply only when all three key fields match.
-    ranked = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, c.gpu))
+    # cheapest TOTAL cost first (count * per-card rate; == per-card rate for singles); ties prefer
+    # fewer cards (less inter-card overhead), then combined VRAM, then class name. sorting is stable,
+    # so provider and provider-local order apply only when all key fields match.
+    ranked = sorted(
+        candidates,
+        key=lambda c: (c.total_hourly_usd, c.gpu_count, c.total_vram_gb, c.gpu),
+    )
     best = ranked[0]
     return Allocation(
         provider=best.provider,
@@ -150,15 +227,19 @@ def allocate(
         hourly_usd=best.hourly_usd,
         min_vram_gb=need,
         candidates=tuple(ranked),
+        gpu_count=best.gpu_count,
     )
 
 
 def allocation_summary(a: Allocation) -> str:
+    shape = f"{a.gpu_count}x {a.gpu}" if a.gpu_count > 1 else a.gpu
+    total = a.gpu_count * a.hourly_usd
     head = (
-        f"allocated {a.gpu} on {a.provider} at ${a.hourly_usd:.2f}/hr "
+        f"allocated {shape} on {a.provider} at ${total:.2f}/hr "
         f"(need >= {a.min_vram_gb} GB VRAM)"
     )
     if len(a.candidates) > 1:
         nxt = a.candidates[1]
-        head += f"; next-best: {nxt.gpu}@{nxt.provider} ${nxt.hourly_usd:.2f}/hr"
+        nxt_shape = f"{nxt.gpu_count}x {nxt.gpu}" if nxt.gpu_count > 1 else nxt.gpu
+        head += f"; next-best: {nxt_shape}@{nxt.provider} ${nxt.total_hourly_usd:.2f}/hr"
     return head

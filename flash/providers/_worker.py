@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import dataclass
 from io import BytesIO
 
 from flash._channel import CHANNEL
@@ -72,11 +73,53 @@ WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100"})
 
 
+@dataclass(frozen=True)
+class WorkerImageOverride:
+    """A worker-image override plus the deploy constraints the image itself demands.
+
+    An override image is not just a name: a private registry needs an auth id, a cu13 image
+    crashes on cu12 driver hosts, and a large image cannot extract into the default container
+    disk. Carrying these together keeps every deploy site consistent (an override can never be
+    scheduled onto a host that cannot boot it).
+    """
+
+    image: str
+    registry_auth_id: str = ""
+    min_cuda: str = ""
+    min_disk_gb: int = 0
+
+
+def worker_image_override() -> WorkerImageOverride | None:
+    """Parse the FLASH_WORKER_IMAGE override with its optional deploy constraints.
+
+    FLASH_WORKER_IMAGE holds the image ref. The image's own deploy requirements ride in
+    FLASH_WORKER_IMAGE_REGISTRY_AUTH (provider registry-credential id for private images),
+    FLASH_WORKER_IMAGE_MIN_CUDA (host driver floor the image's CUDA build needs), and
+    FLASH_WORKER_IMAGE_MIN_DISK_GB (container disk floor for image extraction).
+    """
+    image = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
+    if not image:
+        return None
+    disk_raw = os.environ.get("FLASH_WORKER_IMAGE_MIN_DISK_GB", "").strip()
+    try:
+        min_disk_gb = int(disk_raw) if disk_raw else 0
+    except ValueError as exc:
+        raise ValueError(
+            f"FLASH_WORKER_IMAGE_MIN_DISK_GB must be an integer, got {disk_raw!r}"
+        ) from exc
+    return WorkerImageOverride(
+        image=image,
+        registry_auth_id=os.environ.get("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "").strip(),
+        min_cuda=os.environ.get("FLASH_WORKER_IMAGE_MIN_CUDA", "").strip(),
+        min_disk_gb=min_disk_gb,
+    )
+
+
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
     """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base), respecting the FLASH_WORKER_IMAGE override."""
-    override = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
+    override = worker_image_override()
     if override:
-        return override
+        return override.image
     if friendly_gpu and allow_default:
         info = get_gpu_info(friendly_gpu)
         # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
