@@ -366,6 +366,14 @@ def _write_abandonment_failure_fallback(classification: str, message: str) -> No
     )
 
 
+def _write_resample_failure_fallback(classification: str, message: str) -> None:
+    _write_failure_fallback(
+        os.environ.get("FLASH_OPD_RESAMPLE_FAILURE_PATH", ""),
+        classification,
+        message,
+    )
+
+
 def _exit_for_mutation_failure(error: FlashTeacherBridgeError) -> None:
     _write_mutation_failure_fallback(error.classification, str(error))
     exit_code = (
@@ -405,6 +413,20 @@ def _post_mutation_notice(url: str, token: str) -> None:
         os._exit(_PERMANENT_TEACHER_EXIT)
 
 
+def _post_no_signal_resample(url: str, token: str) -> None:
+    try:
+        _post_json(url, token, "/no-signal/resample", {})
+    except FlashTeacherBridgeError as error:
+        _write_resample_failure_fallback(error.classification, str(error))
+        raise
+    except Exception as error:
+        _write_resample_failure_fallback(
+            "permanent",
+            f"unexpected resample bridge failure: {type(error).__name__}",
+        )
+        raise
+
+
 def _post_no_signal_abandoned(url: str, token: str) -> None:
     try:
         _post_json(url, token, "/no-signal/abandoned", {})
@@ -429,6 +451,22 @@ def _post_teacher_cycle_committed(url: str, token: str) -> None:
     _post_json(url, token, "/teacher-cycle/committed", {})
 
 
+def _update_actor_after_teacher_cycle_commit(
+    actor_rollout_wg,
+    batch,
+    url: str,
+    token: str,
+):
+    _post_teacher_cycle_committed(url, token)
+    return actor_rollout_wg.update_actor(batch)
+
+
+def _mutation_acknowledgement_barrier() -> None:
+    import torch
+
+    torch.distributed.barrier()
+
+
 def _wrap_optimizer_with_mutation_notice(optimizer, url: str, token: str):
     original_step = optimizer.step
     mutation_acknowledged = False
@@ -438,6 +476,7 @@ def _wrap_optimizer_with_mutation_notice(optimizer, url: str, token: str):
         nonlocal mutation_acknowledged
         if not mutation_acknowledged:
             _post_mutation_notice(url, token)
+            _mutation_acknowledgement_barrier()
             mutation_acknowledged = True
         return original_step(*args, **kwargs)
 
@@ -738,29 +777,19 @@ def _install_verl_extensions() -> None:
             def prepare_replacement() -> None:
                 self.checkpoint_manager.update_weights()
 
-            def record(path: str) -> None:
-                _post_json(
-                    os.environ["FLASH_OPD_BRIDGE_URL"],
-                    os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-                    path,
-                    {},
-                )
-
-            result = _run_with_no_signal_replacements(
+            return _run_with_no_signal_replacements(
                 run_attempt,
                 cleanup_attempt,
                 prepare_replacement,
-                lambda: record("/no-signal/resample"),
+                lambda: _post_no_signal_resample(
+                    os.environ["FLASH_OPD_BRIDGE_URL"],
+                    os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+                ),
                 lambda: _post_no_signal_abandoned(
                     os.environ["FLASH_OPD_BRIDGE_URL"],
                     os.environ["FLASH_OPD_BRIDGE_TOKEN"],
                 ),
             )
-            _post_teacher_cycle_committed(
-                os.environ["FLASH_OPD_BRIDGE_URL"],
-                os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-            )
-            return result
 
         def _compute_reward_colocate(self, batch, metrics):
             data = tq.kv_batch_get(
@@ -800,7 +829,12 @@ def _install_verl_extensions() -> None:
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
             }
             batch.extra_info.update(extra_info)
-            output = self.actor_rollout_wg.update_actor(batch)
+            output = _update_actor_after_teacher_cycle_commit(
+                self.actor_rollout_wg,
+                batch,
+                os.environ["FLASH_OPD_BRIDGE_URL"],
+                os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+            )
             output = rename_dict(output["metrics"], "actor/")
             output["perf/mfu/actor"] = output.pop("actor/mfu")
             metrics.update(reduce_metrics(output))

@@ -357,7 +357,7 @@ class _TeacherAlignmentBridge:
                 return None
             return self._mutation_failure
 
-    def _promote_abandoned_teacher_failure(self) -> None:
+    def _promote_pending_teacher_failure(self) -> None:
         with self._stats_lock:
             if (
                 self._teacher_failure is None
@@ -1292,6 +1292,7 @@ def _build_opd_child_env(
     max_model_len: int = 32768,
     mutation_failure_path: str = "",
     abandonment_failure_path: str = "",
+    resample_failure_path: str = "",
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -1308,6 +1309,8 @@ def _build_opd_child_env(
         child["FLASH_OPD_MUTATION_FAILURE_PATH"] = mutation_failure_path
     if abandonment_failure_path:
         child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] = abandonment_failure_path
+    if resample_failure_path:
+        child["FLASH_OPD_RESAMPLE_FAILURE_PATH"] = resample_failure_path
     if multi_turn:
         child.update(
             {
@@ -1408,6 +1411,10 @@ def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
 
 
 def _read_abandonment_failure_fallback(base_path: str) -> bool:
+    return bool(_read_failure_fallback_records(base_path))
+
+
+def _read_resample_failure_fallback(base_path: str) -> bool:
     return bool(_read_failure_fallback_records(base_path))
 
 
@@ -1792,6 +1799,7 @@ def run_opd_verl(spec=None) -> None:
     export_root = os.path.join(workdir, "checkpoint-adapters")
     mutation_failure_path = os.path.join(workdir, "mutation-failure")
     abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
+    resample_failure_path = os.path.join(workdir, "resample-failure")
     for path in (data_dir, shim_dir, local_dir, export_root):
         os.makedirs(path, exist_ok=True)
 
@@ -1963,6 +1971,7 @@ def run_opd_verl(spec=None) -> None:
             max_model_len=max_model_len,
             mutation_failure_path=mutation_failure_path,
             abandonment_failure_path=abandonment_failure_path,
+            resample_failure_path=resample_failure_path,
         )
         command = [python_bin, entry_path, *overrides]
         progress = {"step": resume_step, "loss": None}
@@ -2018,8 +2027,10 @@ def run_opd_verl(spec=None) -> None:
         finally:
             watcher.stop(require_complete=training_completed)
         peak_gpu_gb = gpu_sampler.stop_gb()
+        if _read_resample_failure_fallback(resample_failure_path):
+            bridge._promote_pending_teacher_failure()
         if _read_abandonment_failure_fallback(abandonment_failure_path):
-            bridge._promote_abandoned_teacher_failure()
+            bridge._promote_pending_teacher_failure()
         fallback_mutation_failure = _read_mutation_failure_fallback(
             mutation_failure_path
         )
