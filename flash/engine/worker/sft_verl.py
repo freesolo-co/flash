@@ -143,6 +143,11 @@ def build_sft_verl_overrides(cfg: dict) -> list[str]:
         f"model.target_modules={_hydra_val(cfg['target_modules'])}",
         f"model.lora_adapter_path={_hydra_val(cfg.get('lora_adapter_path'))}",
         "model.use_remove_padding=true",
+        # 32k contexts: the fused linear-CE forward never materializes the [tokens, vocab] logits
+        # tensor (~130 GB at 32k on a 248k vocab), computing loss from hidden states + lm_head in
+        # chunks instead. torch backend = numerically exact CE, no extra deps.
+        "model.use_fused_kernels=true",
+        "model.fused_kernel_options.impl_backend=torch",
         f"model.use_liger={_hydra_val(cfg.get('use_liger', True))}",
         f"model.enable_gradient_checkpointing={_hydra_val(cfg.get('gradient_checkpointing', True))}",
         f"engine.strategy={_hydra_val(cfg.get('strategy', 'fsdp2'))}",
