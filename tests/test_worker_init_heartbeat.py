@@ -613,6 +613,36 @@ def test_initial_rl_step_persists_through_throttle_and_bills_cancel(monkeypatch)
     assert runner.actual_steps_run(status) == 1
 
 
+def test_initial_rl_step_lock_timeout_is_retriable(monkeypatch):
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    import flash.engine.worker as ne
+
+    monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(
+        ne,
+        "hf_upload_file",
+        lambda *args, **kwargs: pytest.fail("lock timeout must not attempt an upload"),
+    )
+    ne._HB_LAST_UPLOAD = 17.0
+    ne._HB_LAST_COMMITTED_STEP = 4
+    ne._HB_LAST_FORCED_UPLOAD = 9.0
+
+    assert hb._HB_UPLOAD_LOCK.acquire(timeout=1.0)
+    try:
+        with pytest.raises(ne.RetriableInfraError, match="initial heartbeat upload lock"):
+            ne.heartbeat("rl_step", step=0, initial=True)
+        assert ne._HB_LAST_UPLOAD == 17.0
+        assert ne._HB_LAST_COMMITTED_STEP == 4
+        assert ne._HB_LAST_FORCED_UPLOAD == 9.0
+
+        assert ne.heartbeat("rl_step", step=5) is False
+        assert ne._HB_LAST_UPLOAD == 17.0
+        assert ne._HB_LAST_COMMITTED_STEP == 4
+        assert ne._HB_LAST_FORCED_UPLOAD == 9.0
+    finally:
+        hb._HB_UPLOAD_LOCK.release()
+
+
 def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
     """Regression (cursor[bot], heartbeat.py): when optimizer steps land FARTHER apart than the force
     floor (the normal teacher-round-trip-gated regime), every DISTINCT completed step still commits

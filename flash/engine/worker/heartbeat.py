@@ -243,6 +243,10 @@ def heartbeat(
                 _HB_UPLOAD_LOCK.release()
         else:
             _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
+            if initial:
+                raise _w.RetriableInfraError(
+                    f"initial heartbeat upload lock remained busy >{lock_timeout}s for {stage}"
+                )
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", _console_heartbeat_snapshot(payload, payload_committed))
     return payload_committed
