@@ -1877,6 +1877,38 @@ def test_deterministic_empty_alignment_exhaustion_remains_permanent():
     assert bridge.empty_alignments == 3
 
 
+def test_multiturn_transient_bridge_failure_latches_terminal_cause():
+    from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.teacher import TeacherError
+
+    bridge = _text_bridge(_BridgeTeacher())
+
+    def fail_score(_session_id):
+        raise TeacherError("multi-turn teacher unavailable", permanent=False)
+
+    bridge.score_multiturn = fail_score
+    bridge.start()
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as actor_error:
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/multiturn/score",
+                {"session_id": "session-1"},
+            )
+        with pytest.raises(RetriableInfraError, match="after bounded retries"):
+            _raise_verl_failure(1, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert actor_error.value.classification == "transient"
+    assert bridge.teacher_failure == (
+        "transient",
+        "multi-turn teacher unavailable",
+    )
+    assert bridge.teacher_transient == 1
+
+
 def test_bridge_transport_failure_is_typed_retriable(monkeypatch):
     import urllib.error
     import urllib.request
