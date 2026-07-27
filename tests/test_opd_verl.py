@@ -1920,6 +1920,48 @@ def test_mutation_marker_failure_preserves_bridge_classification(
             _raise_verl_failure(exit_error.value.code, None)
 
 
+@pytest.mark.parametrize("retriable", [True, False])
+def test_mutation_marker_failure_survives_actor_exit_and_generic_driver_status(
+    retriable,
+):
+    from flash.engine.worker.perf import RetriableInfraError
+
+    marker_error = (
+        RetriableInfraError("marker upload failed")
+        if retriable
+        else RuntimeError("invalid marker configuration")
+    )
+
+    def fail_marker():
+        raise marker_error
+
+    bridge = _text_bridge(_BridgeTeacher(), mutation_callback=fail_marker)
+    bridge.start()
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as actor_error:
+            _post_json(bridge.url, bridge.token, "/mutation", {})
+    finally:
+        bridge.close()
+
+    expected_classification = "transient" if retriable else "permanent"
+    assert actor_error.value.classification == expected_classification
+    assert bridge.teacher_failure is None
+    if retriable:
+        with pytest.raises(RetriableInfraError, match="optimizer marker failure"):
+            _raise_verl_failure(
+                1,
+                bridge.teacher_failure,
+                bridge.mutation_failure,
+            )
+    else:
+        with pytest.raises(RuntimeError, match="permanent optimizer marker failure"):
+            _raise_verl_failure(
+                1,
+                bridge.teacher_failure,
+                bridge.mutation_failure,
+            )
+
+
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
     from flash.engine.worker.perf import RetriableInfraError
 
