@@ -253,7 +253,7 @@ def score_single_turn(
 # --------------------------------------------------------------------------------------------
 # reward rpc bridge: verl subprocess -> flash live env.
 # --------------------------------------------------------------------------------------------
-def start_reward_server(score_by_index):
+def start_reward_server(score_by_index, *, example_count: int):
     """start a localhost http reward server. score_by_index(index, solution_str) -> float.
 
     returns (server, url). the server runs in a daemon thread; call server.shutdown() when done.
@@ -275,6 +275,8 @@ def start_reward_server(score_by_index):
                 n = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
                 index = int(payload["index"])
+                if index < 0 or index >= example_count:
+                    raise IndexError(f"reward example index {index} is outside [0, {example_count})")
                 with score_lock:
                     score = float(score_by_index(index, payload.get("solution_str", "")))
             except Exception as exc:
@@ -706,7 +708,7 @@ def run_rl_verl():
             del recent_samples[:-64]
         return score
 
-    server, reward_url = start_reward_server(_score)
+    server, reward_url = start_reward_server(_score, example_count=len(rollout_examples))
     try:
         python_bin = _resolve_verl_python(workdir)
         micro_batch = 1
@@ -749,6 +751,7 @@ def run_rl_verl():
 
         setup_seconds = time.time() - t_start
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
+        _w.heartbeat("rl_step", step=0, initial=True)
         t_train = time.time()
         step_box = [0]
 

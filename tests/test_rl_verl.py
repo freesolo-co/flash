@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import threading
+import urllib.error
 import urllib.request
 from types import SimpleNamespace
 
@@ -137,7 +138,9 @@ def test_verl_uses_canonical_heartbeat_stage_contracts():
     src = inspect.getsource(rl_verl.run_rl_verl)
     assert "rl_verl_training" not in src
     assert "rl_verl_finalizing" not in src
-    assert 'liveness_heartbeat("rl_step"' in src
+    initial_heartbeat = '_w.heartbeat("rl_step", step=0, initial=True)'
+    assert initial_heartbeat in src
+    assert src.index(initial_heartbeat) < src.index('liveness_heartbeat("rl_step"')
     assert '"rl_finalizing"' in src
     assert "rl_step" in _HB_THROTTLED_STAGES
     assert "rl_step" in STEP_GATED_STAGES
@@ -220,7 +223,9 @@ def test_score_single_turn_env_error_is_zero():
 
 # ------------------------------- reward rpc bridge -------------------------------
 def test_reward_server_round_trip():
-    server, url = rl_verl.start_reward_server(lambda idx, s: float(idx) + len(s))
+    server, url = rl_verl.start_reward_server(
+        lambda idx, s: float(idx) + len(s), example_count=4
+    )
     try:
         body = json.dumps({"index": 3, "solution_str": "abcd"}).encode()
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
@@ -231,11 +236,31 @@ def test_reward_server_round_trip():
         server.shutdown()
 
 
+def test_reward_server_rejects_negative_index_before_lookup():
+    examples = [{"name": "first"}, {"name": "last"}]
+    scored = []
+
+    def scorer(index, solution_str):
+        scored.append(examples[index]["name"])
+        return 1.0
+
+    server, url = rl_verl.start_reward_server(scorer, example_count=len(examples))
+    try:
+        body = json.dumps({"index": -1, "solution_str": "answer"}).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 400
+        assert scored == []
+    finally:
+        server.shutdown()
+
+
 def test_reward_bridge_lookup_failure_raises(monkeypatch):
     def missing_example(idx, solution_str):
         raise IndexError(idx)
 
-    server, url = rl_verl.start_reward_server(missing_example)
+    server, url = rl_verl.start_reward_server(missing_example, example_count=100)
     try:
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
         ns: dict = {}
@@ -264,7 +289,7 @@ def test_reward_server_scorer_can_capture_samples():
             del captured[:-64]
         return float(len(sol))
 
-    server, url = rl_verl.start_reward_server(scorer)
+    server, url = rl_verl.start_reward_server(scorer, example_count=3)
     try:
         for i in range(3):
             body = json.dumps({"index": i, "solution_str": f"c{i}"}).encode()

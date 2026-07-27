@@ -579,6 +579,37 @@ def test_forced_sample_payload_commits_after_same_step_liveness(monkeypatch, sta
     assert len(uploads) == 2
 
 
+def test_initial_rl_step_persists_through_throttle_and_bills_cancel(monkeypatch):
+    import json
+
+    import flash.engine.worker as ne
+    import flash.runner as runner
+
+    persisted = []
+
+    def upload(local, *args, **kwargs):
+        with open(local) as f:
+            persisted.append(json.load(f))
+        return True
+
+    monkeypatch.setattr(ne, "hf_upload_file", upload)
+    ne._HB_LAST_UPLOAD = time.time()
+    ne._HB_LAST_COMMITTED_STEP = 0
+
+    committed = ne.heartbeat("rl_step", step=0, initial=True)
+
+    assert committed is True
+    assert persisted[-1]["stage"] == "rl_step"
+    assert persisted[-1]["step"] == 0
+    status = runner.RunStatus(
+        run_id="r",
+        state="cancelled",
+        spec={},
+        last_heartbeat=persisted[-1],
+    )
+    assert runner.actual_steps_run(status) == 1
+
+
 def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
     """Regression (cursor[bot], heartbeat.py): when optimizer steps land FARTHER apart than the force
     floor (the normal teacher-round-trip-gated regime), every DISTINCT completed step still commits
