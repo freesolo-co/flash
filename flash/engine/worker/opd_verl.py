@@ -1019,6 +1019,12 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.model.path={_hydra_val(config['model_path'])}",
         "actor_rollout_ref.model.trust_remote_code=true",
         "actor_rollout_ref.model.use_remove_padding=true",
+        # 32k contexts: the fused linear-CE forward computes per-token log_probs from hidden states
+        # + lm_head in chunks (FusedLinearForPPO), never materializing the [tokens, vocab] logits
+        # tensor (~130 GB at 32k on a 248k vocab). the distillation loss consumes exactly
+        # model_output["log_probs"], so the fused path is loss-equivalent. torch backend = exact.
+        "actor_rollout_ref.model.use_fused_kernels=true",
+        "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
         "actor_rollout_ref.model.enable_gradient_checkpointing=true",
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",
