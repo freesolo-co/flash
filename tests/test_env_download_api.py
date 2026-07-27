@@ -10,6 +10,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 _USER_TOKEN = "fslo-user-env-download"
+_PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _bearer(key: str) -> dict[str, str]:
@@ -50,11 +51,23 @@ def api(tmp_path, monkeypatch):
     import flash.providers as providers_mod
     import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.app as app_mod
+    import flash.server.environment_registry as environment_registry
+    import flash.server.projects as projects
     import flash.server.run_registry as run_registry
 
     importlib.reload(app_mod)
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
+    monkeypatch.setattr(
+        projects,
+        "require_project_access",
+        lambda *, project_id, **_kwargs: project_id,
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "resolve_environment_package_source",
+        lambda **_kwargs: {"source_kind": "hub"},
+    )
     monkeypatch.setattr(
         rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
     )
@@ -76,7 +89,10 @@ def test_download_env_package_endpoint_returns_package(api, monkeypatch):
 
     monkeypatch.setattr(envs_mod, "download_package", fake_download_package)
 
-    resp = api.get("/v1/envs/acme/my-env/package", headers=_bearer(_USER_TOKEN))
+    resp = api.get(
+        "/v1/envs/acme/my-env/package",
+        headers={**_bearer(_USER_TOKEN), "X-Freesolo-Project-Id": _PROJECT_ID},
+    )
 
     assert resp.status_code == 200, resp.text
     assert resp.content == b"package-bytes"
@@ -87,6 +103,45 @@ def test_download_env_package_endpoint_returns_package(api, monkeypatch):
     assert api.get("/v1/envs/acme/my-env/package").status_code in (401, 403)
 
 
+def test_download_builtin_env_package_never_calls_github(api, monkeypatch):
+    import base64
+    import hashlib
+
+    import flash.server.environment_registry as registry
+    import flash.server.envs as envs_mod
+
+    package = b"builtin-package"
+    monkeypatch.setattr(
+        registry,
+        "resolve_environment_package_source",
+        lambda **_kwargs: {
+            "source_kind": "builtin",
+            "package_base64": base64.b64encode(package).decode("ascii"),
+            "package_sha256": hashlib.sha256(package).hexdigest(),
+        },
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "download_package",
+        lambda **_kwargs: pytest.fail("built-in download must not call github storage"),
+    )
+
+    response = api.get(
+        "/v1/envs/acme/example/package",
+        headers={**_bearer(_USER_TOKEN), "X-Freesolo-Project-Id": _PROJECT_ID},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.content == package
+
+
+def test_download_env_package_requires_project_header(api):
+    response = api.get("/v1/envs/acme/my-env/package", headers=_bearer(_USER_TOKEN))
+
+    assert response.status_code == 400
+    assert "X-Freesolo-Project-Id is required" in response.text
+
+
 def test_download_env_package_endpoint_rejects_non_canonical_id(api, monkeypatch):
     import flash.server.envs as envs_mod
 
@@ -94,6 +149,9 @@ def test_download_env_package_endpoint_rejects_non_canonical_id(api, monkeypatch
         envs_mod, "download_package", lambda **_k: pytest.fail("storage must not be touched")
     )
 
-    resp = api.get("/v1/envs/Acme/My-Env/package", headers=_bearer(_USER_TOKEN))
+    resp = api.get(
+        "/v1/envs/Acme/My-Env/package",
+        headers={**_bearer(_USER_TOKEN), "X-Freesolo-Project-Id": _PROJECT_ID},
+    )
 
     assert resp.status_code == 400, resp.text

@@ -56,6 +56,21 @@ _MANAGED_REJECTIONS = [
         {"environment": {"id": "owner/env", "resolved_sha": "a" * 40}},
         r"\[environment\] unknown key\(s\): resolved_sha",
     ),
+    (
+        "environment.source_kind",
+        {"environment": {"id": "owner/env", "source_kind": "builtin"}},
+        r"\[environment\] unknown key\(s\): source_kind",
+    ),
+    (
+        "environment.package_base64",
+        {"environment": {"id": "owner/env", "package_base64": "QQ=="}},
+        r"\[environment\] unknown key\(s\): package_base64",
+    ),
+    (
+        "environment.package_sha256",
+        {"environment": {"id": "owner/env", "package_sha256": "a" * 64}},
+        r"\[environment\] unknown key\(s\): package_sha256",
+    ),
 ]
 
 
@@ -133,6 +148,44 @@ def test_internal_dict_retains_all_managed_fields():
     assert internal["gpu"]["max_retries"] == 9
     assert internal["gpu"]["max_wall_seconds"] == 7200
     assert internal["environment"]["resolved_sha"] == "b" * 40
+
+
+def test_builtin_package_fields_are_internal_only():
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "sft",
+            "environment": {
+                "id": "acme/example",
+                "source_kind": "builtin",
+                "package_base64": "QQ==",
+                "package_sha256": "a" * 64,
+            },
+            "train": {"epochs": 1, "max_examples": 8},
+        }
+    )
+
+    public = spec.to_dict()
+    assert not {"source_kind", "package_base64", "package_sha256"} & set(public["environment"])
+    internal = spec.to_internal_dict()["environment"]
+    assert internal["source_kind"] == "builtin"
+    assert internal["package_base64"] == "QQ=="
+    assert internal["package_sha256"] == "a" * 64
+
+
+def test_builtin_package_carrier_requires_complete_consistent_fields():
+    with pytest.raises(ValueError, match="package_base64 is required"):
+        JobSpec.from_dict(
+            {
+                "environment": {
+                    "id": "acme/example",
+                    "source_kind": "builtin",
+                    "package_sha256": "a" * 64,
+                }
+            }
+        )
+    with pytest.raises(ValueError, match="require source_kind='builtin'"):
+        JobSpec.from_dict({"environment": {"id": "acme/example", "package_base64": "QQ=="}})
 
 
 def test_public_spec_round_trips_through_user_parser():

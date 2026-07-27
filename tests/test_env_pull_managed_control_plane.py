@@ -15,6 +15,8 @@ from flash.envs.pull import (
     pull_environment_package_from_archive,
 )
 
+_PROJECT_ID = "11111111-1111-4111-8111-111111111111"
+
 
 def _package_tarball(entries: dict[str, bytes] | None = None) -> bytes:
     entries = entries or {
@@ -32,16 +34,23 @@ def _package_tarball(entries: dict[str, bytes] | None = None) -> bytes:
 
 
 def _args(**kw) -> Namespace:
-    base = {"env_id": "david-freesolo-co/stuff", "path": None, "output": None, "force": False}
+    base = {
+        "env_id": "david-freesolo-co/stuff",
+        "path": None,
+        "output": None,
+        "force": False,
+        "project": _PROJECT_ID,
+    }
     base.update(kw)
     return Namespace(**base)
 
 
 def _client_factory(package: bytes, seen: dict[str, str] | None = None):
     class _Client:
-        def download_env_package(self, env_id: str) -> bytes:
+        def download_env_package(self, env_id: str, *, project_id: str) -> bytes:
             if seen is not None:
                 seen["env_id"] = env_id
+                seen["project_id"] = project_id
             return package
 
     return lambda: _Client()
@@ -87,7 +96,7 @@ def test_cmd_env_pull_managed_whole_env_uses_authenticated_package(monkeypatch, 
     rc = cmd_env_pull(_args(output=str(dest)))
 
     assert rc == 0
-    assert seen == {"env_id": "david-freesolo-co/stuff"}
+    assert seen == {"env_id": "david-freesolo-co/stuff", "project_id": _PROJECT_ID}
     assert (dest / "environment.py").is_file()
     assert (dest / "datasets" / "train.jsonl").is_file()
 
@@ -101,14 +110,14 @@ def test_cmd_env_pull_managed_whole_env_strips_slug_before_request(monkeypatch, 
     rc = cmd_env_pull(_args(env_id="  david-freesolo-co/stuff  ", output=str(tmp_path / "stuff")))
 
     assert rc == 0
-    assert seen == {"env_id": "david-freesolo-co/stuff"}
+    assert seen == {"env_id": "david-freesolo-co/stuff", "project_id": _PROJECT_ID}
 
 
 def test_cmd_env_pull_managed_rejects_mixed_case_before_request(monkeypatch, tmp_path):
     calls = {"n": 0}
 
     class _Client:
-        def download_env_package(self, env_id: str) -> bytes:
+        def download_env_package(self, env_id: str, *, project_id: str) -> bytes:
             calls["n"] += 1
             return _package_tarball()
 
@@ -147,7 +156,7 @@ def test_cmd_env_pull_managed_single_file_uses_authenticated_package(monkeypatch
     rc = cmd_env_pull(_args(path="datasets/train.jsonl", output=str(out)))
 
     assert rc == 0
-    assert seen == {"env_id": "david-freesolo-co/stuff"}
+    assert seen == {"env_id": "david-freesolo-co/stuff", "project_id": _PROJECT_ID}
     assert out.read_bytes() == b'{"a":1}\n'
 
 

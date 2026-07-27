@@ -18,6 +18,7 @@ from flash.envs import loader as adapter
 from flash.envs.pull import environment_local_dirname
 
 _TOP = "freesolo-co-environment-hub-deadbeef"
+_PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _tarball(entries: dict[str, bytes]) -> bytes:
@@ -55,7 +56,8 @@ class _FakeClient:
     def __init__(self, package: bytes):
         self._package = package
 
-    def download_env_package(self, env_id: str) -> bytes:
+    def download_env_package(self, env_id: str, *, project_id: str) -> bytes:
+        assert project_id == _PROJECT_ID
         return self._package
 
 
@@ -69,6 +71,7 @@ def _margs(**kw) -> Namespace:
         "path": None,
         "output": None,
         "force": False,
+        "project": _PROJECT_ID,
     }
     base.update(kw)
     return Namespace(**base)
@@ -77,12 +80,34 @@ def _margs(**kw) -> Namespace:
 # --- managed-only `flash env pull` CLI -------------------------------------------------
 
 
+def test_cmd_env_pull_requires_project_before_network(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: pytest.fail("missing project must block the request"),
+    )
+
+    rc = cmd_env_pull(_margs(project=None))
+
+    assert rc == 1
+    assert "--project <project-uuid>" in capsys.readouterr().err
+
+
+def test_cmd_env_pull_rejects_invalid_project_before_network(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: pytest.fail("invalid project must block the request"),
+    )
+
+    rc = cmd_env_pull(_margs(project="not-a-uuid"))
+
+    assert rc == 1
+    assert "project id must be a valid UUID" in capsys.readouterr().err
+
+
 def test_cmd_env_pull_single_file(monkeypatch, tmp_path):
     _patch_client(
         monkeypatch,
-        _package_tarball(
-            {"environment.py": b"# env\n", "datasets/train.jsonl": b"line1\nline2\n"}
-        ),
+        _package_tarball({"environment.py": b"# env\n", "datasets/train.jsonl": b"line1\nline2\n"}),
     )
     out = tmp_path / "train.jsonl"
 

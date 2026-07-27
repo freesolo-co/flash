@@ -247,7 +247,12 @@ def _load_active_env():
             "`flash env push --project <project-uuid> --name <name>`)."
         )
     return load_environment(
-        env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
+        env_id,
+        JOB_SPEC.environment.params,
+        resolved_sha=JOB_SPEC.environment.resolved_sha,
+        source_kind=JOB_SPEC.environment.source_kind,
+        package_base64=JOB_SPEC.environment.package_base64,
+        package_sha256=JOB_SPEC.environment.package_sha256,
     )
 
 

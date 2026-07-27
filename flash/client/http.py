@@ -408,8 +408,13 @@ class ApiClient:
         *,
         timeout: float | None = None,
         max_bytes: int | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> bytes:
-        headers = {"Accept": "application/gzip", **self._auth_headers()}
+        headers = {
+            "Accept": "application/gzip",
+            **self._auth_headers(),
+            **(extra_headers or {}),
+        }
         req = urllib.request.Request(
             f"{self.api_url}{path}",
             method=method,
@@ -480,16 +485,21 @@ class ApiClient:
             extra_headers={"X-Freesolo-Project-Id": project_id},
         )
 
-    def download_env_package(self, env_id: str) -> bytes:
-        """Download a managed environment package through the Flash control plane."""
+    def download_env_package(self, env_id: str, *, project_id: str) -> bytes:
+        """Download one project's managed environment package through the control plane."""
         from flash.envs import loader
 
+        try:
+            project_id = require_project_id(project_id)
+        except (TypeError, ValueError) as exc:
+            raise ClientError(str(exc).replace("project", "project id", 1)) from exc
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request_bytes(
             "GET",
             f"/v1/envs/{quoted}/package",
             timeout=1800.0,
-            max_bytes=loader._MAX_ARCHIVE_BYTES,
+            max_bytes=loader._MAX_BUILTIN_PACKAGE_BYTES,
+            extra_headers={"X-Freesolo-Project-Id": project_id},
         )
 
     def create_run(

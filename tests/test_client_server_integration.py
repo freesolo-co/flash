@@ -136,6 +136,11 @@ def make_client(tmp_path, monkeypatch):
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
     monkeypatch.setattr(environment_registry, "require_environment_project", lambda **_kwargs: None)
     monkeypatch.setattr(
+        environment_registry,
+        "resolve_environment_package_source",
+        lambda **_kwargs: {"source_kind": "hub"},
+    )
+    monkeypatch.setattr(
         projects_mod,
         "require_project_access",
         lambda *, project_id, **_kwargs: project_id,

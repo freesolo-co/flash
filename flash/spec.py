@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 from uuid import UUID
@@ -81,6 +82,29 @@ def require_project_id(value: Any) -> str:
         return str(UUID(project_id))
     except ValueError as exc:
         raise ValueError("project must be a valid UUID") from exc
+
+
+def _environment_source_fields(env: dict[str, Any]) -> tuple[str, str, str]:
+    values = {
+        name: env.get(name, "") for name in ("source_kind", "package_base64", "package_sha256")
+    }
+    for name, value in values.items():
+        if not isinstance(value, str):
+            raise TypeError(f"environment.{name} must be a string")
+
+    source_kind = values["source_kind"].strip()
+    package_base64 = values["package_base64"]
+    package_sha256 = values["package_sha256"]
+    if source_kind not in {"", "hub", "builtin"}:
+        raise ValueError("environment.source_kind must be 'hub' or 'builtin'")
+    if source_kind == "builtin":
+        if not package_base64:
+            raise ValueError("builtin environment package_base64 is required")
+        if not re.fullmatch(r"[0-9a-f]{64}", package_sha256):
+            raise ValueError("builtin environment package_sha256 must be lowercase hex")
+    elif package_base64 or package_sha256:
+        raise ValueError("environment package fields require source_kind='builtin'")
+    return source_kind, package_base64, package_sha256
 
 
 def _coerce_wandb(value: Any) -> WandbSpec:
@@ -262,8 +286,18 @@ class EnvironmentSpec:
     pip: tuple[str, ...] = ()
     # Names only — values sent out-of-band via runtime_secrets, never stored in spec.
     secrets: tuple[str, ...] = ()
-    # Resolved once in control plane to avoid GitHub rate-limits on cold spawn waves.
+    # resolved once in control plane to avoid github rate limits on cold spawn waves.
     resolved_sha: str = ""
+    # platform-managed source metadata for project-scoped built-in packages.
+    source_kind: str = ""
+    package_base64: str = ""
+    package_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        source_kind, package_base64, package_sha256 = _environment_source_fields(asdict(self))
+        object.__setattr__(self, "source_kind", source_kind)
+        object.__setattr__(self, "package_base64", package_base64)
+        object.__setattr__(self, "package_sha256", package_sha256)
 
 
 @dataclass(frozen=True)
@@ -413,7 +447,9 @@ class JobSpec:
         gpu = data["gpu"]
         for managed in MANAGED_GPU_KEYS:
             gpu.pop(managed, None)
-        data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
+        environment = data["environment"]
+        for managed in ("resolved_sha", "source_kind", "package_base64", "package_sha256"):
+            environment.pop(managed, None)
         return data
 
     def to_internal_dict(self) -> dict[str, Any]:
@@ -478,6 +514,7 @@ class JobSpec:
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")
         project = require_project_id(project_raw) if project_raw.strip() else ""
+        source_kind, package_base64, package_sha256 = _environment_source_fields(env)
         return cls(
             model=data.get("model", cls.model),
             model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
@@ -488,6 +525,9 @@ class JobSpec:
                 pip=tuple(str(p) for p in env.get("pip") or ()),
                 secrets=_str_tuple(env.get("secrets")),
                 resolved_sha=str(env.get("resolved_sha") or ""),
+                source_kind=source_kind,
+                package_base64=package_base64,
+                package_sha256=package_sha256,
             ),
             train=TrainSpec(
                 epochs=_opt_int(train.get("epochs")),

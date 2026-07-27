@@ -265,9 +265,9 @@ _TOP_LEVEL_KEYS = frozenset(
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
 _GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
-# [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
-# is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
-_ENV_MANAGED_KEYS = frozenset({"resolved_sha"})
+# [environment] user-authorable keys, derived from environmentspec (mirrors _gpu_keys). managed
+# source fields are assigned by the control plane and never accepted from user config.
+_ENV_MANAGED_KEYS = frozenset({"resolved_sha", "source_kind", "package_base64", "package_sha256"})
 _ENVIRONMENT_KEYS = (
     frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
 )

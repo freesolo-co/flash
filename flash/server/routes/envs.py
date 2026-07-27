@@ -69,15 +69,51 @@ def publish_env(
 
 
 @router.get("/v1/envs/{env_id:path}/package")
-def download_env_package(env_id: str, key: Annotated[dict, Depends(require_key)]):
-    """Download a managed Freesolo environment package from the GitHub-backed hub."""
+def download_env_package(
+    env_id: str,
+    key: Annotated[dict, Depends(require_key)],
+    authorization: Annotated[str | None, Header()] = None,
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
+    """Download one project's managed Freesolo environment package."""
+    import base64
+
     from flash.server import envs
+    from flash.server.environment_registry import resolve_environment_package_source
+    from flash.server.projects import require_project_access
+    from flash.spec import require_project_id
 
     try:
+        project_id = require_project_id(x_freesolo_project_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc).replace("project", "X-Freesolo-Project-Id", 1),
+        ) from exc
+    project_id = require_project_access(
+        project_id=project_id,
+        key=key,
+        authorization=authorization,
+        org_id=x_freesolo_org_id,
+    )
+    try:
         env_id = envs.canonical_env_id(env_id)
-        package = envs.download_package(slug=env_id, key=key)
     except envs.EnvPublishError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    source = resolve_environment_package_source(
+        slug=env_id,
+        project_id=project_id,
+        key=key,
+        org_id=x_freesolo_org_id,
+    )
+    if source["source_kind"] == "builtin":
+        package = base64.b64decode(source["package_base64"], validate=True)
+    else:
+        try:
+            package = envs.download_package(slug=env_id, key=key)
+        except envs.EnvPublishError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     return Response(
         content=package,
         media_type="application/gzip",
@@ -108,6 +144,7 @@ def delete_env(
     from flash.server.environment_registry import (
         record_deleted_environment,
         require_environment_project,
+        resolve_environment_package_source,
     )
     from flash.server.projects import require_project_access
     from flash.spec import require_project_id
@@ -137,10 +174,19 @@ def delete_env(
         key=key,
         org_id=x_freesolo_org_id,
     )
-    try:
-        deleted = envs.delete_package(slug=env_id, key=key)
-    except envs.EnvPublishError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    source = resolve_environment_package_source(
+        slug=env_id,
+        project_id=project_id,
+        key=key,
+        org_id=x_freesolo_org_id,
+    )
+    if source["source_kind"] == "builtin":
+        deleted = True
+    else:
+        try:
+            deleted = envs.delete_package(slug=env_id, key=key)
+        except envs.EnvPublishError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
     # github (the package store) is the source of truth and is already updated; dropping the
     # web-ui metadata mirror remains best-effort and must never turn a successful delete into a 500.

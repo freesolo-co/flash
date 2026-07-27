@@ -35,7 +35,9 @@ def test_urlopen_raises_typed_error_on_429(monkeypatch):
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
-        urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(_http_error(429, "slow down"))
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(429, "slow down")),
     )
     with pytest.raises(GitHubRateLimitError):
         _urlopen(urllib.request.Request("https://api.github.com/x"))
@@ -101,9 +103,20 @@ def test_rate_limit_error_is_retriable_runtime_error():
 def _fake_loader(captured):
     # Mirrors the real signature: pinned_sha is POSITIONAL-ONLY (the `/`), so a user param named
     # "pinned_sha" lands in **kwargs instead of binding to the internal pin.
-    def loader(env_id, pinned_sha=None, /, **kwargs):
+    def loader(
+        env_id,
+        pinned_sha=None,
+        source_kind="",
+        package_base64="",
+        package_sha256="",
+        /,
+        **kwargs,
+    ):
         captured["env_id"] = env_id
         captured["pinned_sha"] = pinned_sha
+        captured["source_kind"] = source_kind
+        captured["package_base64"] = package_base64
+        captured["package_sha256"] = package_sha256
         captured["kwargs"] = kwargs
         return object()
 
@@ -143,6 +156,27 @@ def test_registry_user_pinned_sha_param_is_forwarded_not_consumed(monkeypatch):
 
     assert captured["pinned_sha"] == "a" * 40  # control-plane pin (positional)
     assert captured["kwargs"]["pinned_sha"] == "user-data"  # user's param, forwarded to the SDK
+
+
+def test_registry_passes_builtin_package_carrier_out_of_band(monkeypatch):
+    import flash.envs.adapter as adapter
+    from flash.envs.registry import load_environment
+
+    captured = {}
+    monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
+
+    load_environment(
+        "owner/env",
+        params={"package_base64": "user-value"},
+        source_kind="builtin",
+        package_base64="QQ==",
+        package_sha256="a" * 64,
+    )
+
+    assert captured["source_kind"] == "builtin"
+    assert captured["package_base64"] == "QQ=="
+    assert captured["package_sha256"] == "a" * 64
+    assert captured["kwargs"]["package_base64"] == "user-value"
 
 
 def test_registry_omits_pin_when_unset(monkeypatch):
@@ -223,6 +257,28 @@ def test_assign_resolved_env_sha_noop_without_env_or_already_pinned(monkeypatch)
     # Already pinned.
     pinned = JobSpec(environment=EnvironmentSpec(id=_GH_ENV, resolved_sha="c" * 40))
     assert runner._assign_resolved_env_sha(pinned).environment.resolved_sha == "c" * 40
+
+
+def test_assign_resolved_env_sha_skips_builtin_package(monkeypatch):
+    import flash.envs.loader as adapter
+    from flash import runner
+    from flash.spec import EnvironmentSpec, JobSpec
+
+    monkeypatch.setattr(
+        adapter,
+        "managed_slug_to_github_ref",
+        lambda _value: pytest.fail("built-in source must not resolve github sha"),
+    )
+    spec = JobSpec(
+        environment=EnvironmentSpec(
+            id="acme/example",
+            source_kind="builtin",
+            package_base64="QQ==",
+            package_sha256="a" * 64,
+        )
+    )
+
+    assert runner._assign_resolved_env_sha(spec) is spec
 
 
 def test_background_submit_defers_env_sha_off_creation_path(monkeypatch, tmp_path):

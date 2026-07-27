@@ -13,7 +13,13 @@ def worker_pip_for_env(env_id: str) -> list[str]:
 
 
 def load_environment(
-    env_id: str, params: dict | None = None, resolved_sha: str | None = None
+    env_id: str,
+    params: dict | None = None,
+    resolved_sha: str | None = None,
+    *,
+    source_kind: str = "",
+    package_base64: str = "",
+    package_sha256: str = "",
 ) -> Environment:
     """Load a Freesolo SDK environment and wrap it in Flash's protocol."""
     params = params or {}
@@ -25,5 +31,12 @@ def load_environment(
             "`flash env push --project <project-uuid> --name <name>` "
             "(for example 'your-name/your-env')"
         )
-    # resolved_sha is positional-only so a user param named "resolved_sha" can't shadow it.
-    return load_freesolo_environment(env_id, resolved_sha or None, **params)
+    # managed source values are positional-only so user params cannot shadow them.
+    return load_freesolo_environment(
+        env_id,
+        resolved_sha or None,
+        source_kind,
+        package_base64,
+        package_sha256,
+        **params,
+    )

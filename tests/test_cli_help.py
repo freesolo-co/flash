@@ -94,6 +94,25 @@ def test_grouped_command_argparse_contracts() -> None:
     assert args.func is cli.cmd_projects_create
 
 
+def test_env_pull_parser_requires_explicit_project() -> None:
+    parser = cli._build_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["env", "pull", "acme/example"])
+    assert exc_info.value.code == 2
+
+    args = parser.parse_args(
+        [
+            "env",
+            "pull",
+            "acme/example",
+            "--project",
+            "11111111-1111-4111-8111-111111111111",
+        ]
+    )
+    assert args.project == "11111111-1111-4111-8111-111111111111"
+    assert args.func is cli.cmd_env_pull
+
+
 def test_root_model_commands_are_not_registered() -> None:
     assert not {"deploy", "chat", "deployments", "undeploy", "export"} & _registered_subcommands()
 

@@ -8,9 +8,12 @@ names remain importable from ``flash.envs.adapter``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
@@ -44,6 +47,8 @@ _CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024
 # never evict an entry used within this window; a concurrent run may be loading it.
 _CACHE_MIN_AGE_SECONDS = 600
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+_MAX_BUILTIN_PACKAGE_BYTES = _MAX_ARCHIVE_BYTES
+_MAX_BUILTIN_PACKAGE_BASE64_CHARS = ((_MAX_BUILTIN_PACKAGE_BYTES + 2) // 3) * 4
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
 _MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
@@ -615,6 +620,71 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path) -> Path:
     return extracted_dir
 
 
+def _decode_builtin_environment_package(package_base64: str, package_sha256: str) -> bytes:
+    if not isinstance(package_base64, str):
+        raise RuntimeError("built-in environment package must be base64 text")
+    if len(package_base64) > _MAX_BUILTIN_PACKAGE_BASE64_CHARS:
+        raise RuntimeError("built-in environment package is too large")
+    if not isinstance(package_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", package_sha256):
+        raise RuntimeError("built-in environment package sha256 is invalid")
+    try:
+        package = base64.b64decode(package_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RuntimeError("built-in environment package is not valid base64") from exc
+    if len(package) > _MAX_BUILTIN_PACKAGE_BYTES:
+        raise RuntimeError("built-in environment package is too large")
+    if hashlib.sha256(package).hexdigest() != package_sha256:
+        raise RuntimeError("built-in environment package sha256 mismatch")
+    return package
+
+
+def _resolve_builtin_environment_package(
+    env_ref: str, package_base64: str, package_sha256: str
+) -> Path:
+    """Verify, extract, and cache a Freesolo-provided built-in environment package."""
+    package = _decode_builtin_environment_package(package_base64, package_sha256)
+    digest = package_sha256
+    cache_dir = _CACHE_ROOT / f"builtin-{digest}"
+    env_file = cache_dir / _DEFAULT_ENVIRONMENT_PATH
+    if env_file.is_file():
+        with contextlib.suppress(OSError):
+            os.utime(cache_dir)
+        return env_file
+
+    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-builtin-"))
+    try:
+        extracted = tmp_parent / "package"
+        extracted.mkdir()
+        # verify the immutable carrier again immediately before archive extraction.
+        if hashlib.sha256(package).hexdigest() != digest:
+            raise RuntimeError("built-in environment package sha256 mismatch")
+        reader = LimitedArchiveReader(
+            gzip.GzipFile(fileobj=io.BytesIO(package)),
+            archive_stream_limit(_MAX_ARCHIVE_BYTES, _MAX_ARCHIVE_MEMBERS),
+            lambda: RuntimeError(
+                f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
+            ),
+        )
+        extract_validated_archive_members(
+            reader,
+            extract_base=extracted,
+            content_byte_limit=_MAX_ARCHIVE_BYTES,
+            extracted_member_limit=_MAX_ARCHIVE_MEMBERS,
+            scanned_member_limit=_MAX_ARCHIVE_SCAN_MEMBERS,
+        )
+        if not (extracted / _DEFAULT_ENVIRONMENT_PATH).is_file():
+            raise FileNotFoundError(
+                f"built-in environment {env_ref!r} package did not contain environment.py"
+            )
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        shutil.copytree(extracted, cache_dir)
+        _evict_env_cache(keep=cache_dir)
+        return cache_dir / _DEFAULT_ENVIRONMENT_PATH
+    finally:
+        shutil.rmtree(tmp_parent, ignore_errors=True)
+
+
 def _safe_mtime(path: Path) -> float:
     try:
         return path.stat().st_mtime
@@ -711,7 +781,17 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         shutil.rmtree(tmp_parent, ignore_errors=True)
 
 
-def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) -> str:
+def _resolve_environment_reference(
+    env_ref: str,
+    pinned_sha: str | None = None,
+    source_kind: str = "",
+    package_base64: str = "",
+    package_sha256: str = "",
+) -> str:
+    if source_kind == "builtin":
+        return str(_resolve_builtin_environment_package(env_ref, package_base64, package_sha256))
+    if package_base64 or package_sha256:
+        raise RuntimeError("built-in environment package fields require source_kind='builtin'")
     if is_managed_environment_slug(env_ref):
         return str(
             _resolve_github_environment_file(managed_slug_to_github_ref(env_ref), pinned_sha)
@@ -800,12 +880,26 @@ def _validate_packaged_dataset_split(split: str) -> str:
     return split
 
 
-def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **kwargs):
-    # pinned_sha is positional-only so user [environment.params] named "pinned_sha" goes to **kwargs, not here.
+def load_freesolo_environment(
+    env_id: str,
+    pinned_sha: str | None = None,
+    source_kind: str = "",
+    package_base64: str = "",
+    package_sha256: str = "",
+    /,
+    **kwargs,
+):
+    # managed source arguments are positional-only so user environment params cannot shadow them.
     from flash.envs.adapter import FreesoloEnvironment
 
     tools = _import_freesolo_environment_tools()
-    reference = _resolve_environment_reference(env_id, pinned_sha)
+    reference = _resolve_environment_reference(
+        env_id,
+        pinned_sha,
+        source_kind,
+        package_base64,
+        package_sha256,
+    )
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 

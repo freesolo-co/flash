@@ -144,6 +144,12 @@ def api(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         environment_registry_mod,
+        "resolve_environment_package_source",
+        lambda **_kwargs: {"source_kind": "hub"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        environment_registry_mod,
         "record_published_environment",
         lambda **_kwargs: True,
     )
@@ -218,7 +224,7 @@ def test_environment_project_validation_blocks_before_run_preparation(
         assert kwargs["slug"] == "acme/my-env"
         raise HTTPException(status_code=409, detail="flash environment belongs to another project")
 
-    monkeypatch.setattr(registry, "require_environment_project", reject_environment)
+    monkeypatch.setattr(registry, "resolve_environment_package_source", reject_environment)
     monkeypatch.setattr(
         runs_route._app,
         "prepare_job",
@@ -235,13 +241,53 @@ def test_environment_project_validation_blocks_before_run_preparation(
     assert response.json()["detail"] == "flash environment belongs to another project"
 
 
+def test_create_run_injects_builtin_package_only_into_internal_spec(api, monkeypatch) -> None:
+    import base64
+    import hashlib
+
+    import flash.server.environment_registry as registry
+    import flash.server.routes.runs as runs_route
+
+    package = b"builtin-package"
+    package_base64 = base64.b64encode(package).decode("ascii")
+    package_sha256 = hashlib.sha256(package).hexdigest()
+    monkeypatch.setattr(
+        registry,
+        "resolve_environment_package_source",
+        lambda **_kwargs: {
+            "source_kind": "builtin",
+            "package_base64": package_base64,
+            "package_sha256": package_sha256,
+        },
+    )
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={
+            "spec": {**SPEC, "environment": {"id": "acme/example"}},
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    public_environment = response.json()["spec"]["environment"]
+    assert not {"source_kind", "package_base64", "package_sha256"} & set(public_environment)
+    status = runs_route._app.get_status(response.json()["run_id"])
+    assert "package_base64" not in status.spec["environment"]
+    worker_environment = status.effective_preparation["worker_spec"]["environment"]
+    assert worker_environment["source_kind"] == "builtin"
+    assert worker_environment["package_base64"] == package_base64
+    assert worker_environment["package_sha256"] == package_sha256
+
+
 def test_non_hub_github_environment_skips_project_ownership_validation(api, monkeypatch) -> None:
     import flash.server.environment_registry as registry
 
     monkeypatch.setattr(
         registry,
-        "require_environment_project",
-        lambda **_kwargs: pytest.fail("non-hub environment must not reach project validation"),
+        "resolve_environment_package_source",
+        lambda **_kwargs: pytest.fail("non-hub environment must not reach package resolution"),
     )
 
     response = api.post(
@@ -266,8 +312,8 @@ def test_malformed_managed_hub_reference_fails_closed(api, monkeypatch, environm
 
     monkeypatch.setattr(
         registry,
-        "require_environment_project",
-        lambda **_kwargs: pytest.fail("malformed hub reference must not reach project validation"),
+        "resolve_environment_package_source",
+        lambda **_kwargs: pytest.fail("malformed hub reference must not reach package resolution"),
     )
     monkeypatch.setattr(
         runs_route._app,
@@ -297,10 +343,8 @@ def test_run_rejects_noncanonical_managed_environment_before_registry(
 
     monkeypatch.setattr(
         registry,
-        "require_environment_project",
-        lambda **_kwargs: pytest.fail(
-            "noncanonical environment must not reach registry validation"
-        ),
+        "resolve_environment_package_source",
+        lambda **_kwargs: pytest.fail("noncanonical environment must not reach package resolution"),
     )
     monkeypatch.setattr(
         runs_route._app,
@@ -5772,6 +5816,38 @@ def test_delete_env_validates_project_and_environment_before_storage(api, monkey
     assert environment_call["project_id"] == "11111111-1111-4111-8111-111111111111"
     assert environment_call["key"]["org_id"].startswith("org-")
     assert environment_call["org_id"] is None
+
+
+def test_delete_builtin_environment_never_calls_github(api, monkeypatch):
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(
+        environment_registry,
+        "resolve_environment_package_source",
+        lambda **_kwargs: {
+            "source_kind": "builtin",
+            "package_base64": "QQ==",
+            "package_sha256": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("built-in deletion must not call github storage"),
+    )
+    monkeypatch.setattr(environment_registry, "record_deleted_environment", lambda **_kwargs: True)
+
+    response = api.delete(
+        "/v1/envs/acme/example",
+        headers={
+            **_bearer(_login()),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": "acme/example", "deleted": True}
 
 
 def test_delete_env_project_mismatch_blocks_storage(api, monkeypatch):

@@ -350,6 +350,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="output file (with PATH) or directory (whole env); defaults to the env/file name",
     )
     env_pull.add_argument("-f", "--force", action="store_true", help="overwrite existing output")
+    env_pull.add_argument(
+        "--project",
+        required=True,
+        metavar="PROJECT_UUID",
+        help="Freesolo project UUID that owns the environment",
+    )
     env_pull.set_defaults(func=cmd_env_pull)
 
     env_delete = env_sub.add_parser("delete", help="delete a published Freesolo environment")

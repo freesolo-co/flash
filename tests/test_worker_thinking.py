@@ -83,6 +83,40 @@ def test_thinking_text_unit():
     assert ne.thinking_text("<think>still going 42") == "still going 42"
 
 
+def test_worker_passes_builtin_package_carrier_to_environment_loader(monkeypatch):
+    import flash.engine.worker as worker
+    from flash.spec import EnvironmentSpec, JobSpec
+
+    captured = {}
+
+    def fake_load_environment(env_id, params, **kwargs):
+        captured.update(env_id=env_id, params=params, **kwargs)
+        return object()
+
+    spec = JobSpec(
+        environment=EnvironmentSpec(
+            id="acme/example",
+            params={"difficulty": "easy"},
+            source_kind="builtin",
+            package_base64="QQ==",
+            package_sha256="a" * 64,
+        )
+    )
+    monkeypatch.setattr(worker, "JOB_SPEC", spec)
+    monkeypatch.setattr(worker, "load_environment", fake_load_environment)
+
+    worker._load_active_env()
+
+    assert captured == {
+        "env_id": "acme/example",
+        "params": {"difficulty": "easy"},
+        "resolved_sha": "",
+        "source_kind": "builtin",
+        "package_base64": "QQ==",
+        "package_sha256": "a" * 64,
+    }
+
+
 def test_thinking_budget_selection(monkeypatch):
     # A JobSpec with an env id makes the worker resolve ACTIVE_ENV at import; stub the loader so
     # this CPU dry-run doesn't load the Freesolo env. We only exercise THINKING / micro-batch here.

@@ -975,7 +975,13 @@ def preflight_validate_image_opd(spec) -> None:
         )
 
         env = spec.environment
-        reference = _resolve_environment_reference(env.id, env.resolved_sha or None)
+        reference = _resolve_environment_reference(
+            env.id,
+            env.resolved_sha or None,
+            getattr(env, "source_kind", ""),
+            getattr(env, "package_base64", ""),
+            getattr(env, "package_sha256", ""),
+        )
         reference_path = Path(reference)
         base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
         source = params.get("dataset_path")

@@ -158,18 +158,30 @@ def create_run(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if environment_slug is not None:
+        from dataclasses import replace
+
         from flash.server import envs as managed_envs
-        from flash.server.environment_registry import require_environment_project
+        from flash.server.environment_registry import resolve_environment_package_source
 
         try:
             environment_slug = managed_envs.canonical_env_id(environment_slug)
         except managed_envs.EnvPublishError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-        require_environment_project(
+        package_source = resolve_environment_package_source(
             slug=environment_slug,
             project_id=project_id,
             key=reporting_key,
         )
+        if package_source["source_kind"] == "builtin":
+            spec = replace(
+                spec,
+                environment=replace(
+                    spec.environment,
+                    source_kind="builtin",
+                    package_base64=package_source["package_base64"],
+                    package_sha256=package_source["package_sha256"],
+                ),
+            )
     runtime_secrets = _runtime_secrets(payload, spec)
     affordability_org_id = str(key.get("org_id") or "").strip()
     bill_on_completion = not dry_run and key.get("auth_kind") != "internal"

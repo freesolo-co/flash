@@ -76,6 +76,13 @@ def cmd_env_pull(args) -> int:
         environment_local_dirname,
         pull_environment_package_from_archive,
     )
+    from flash.spec import require_project_id
+
+    try:
+        project_id = require_project_id(getattr(args, "project", None))
+    except (TypeError, ValueError) as exc:
+        detail = str(exc).replace("project", "project id", 1)
+        return _err(f"{detail}: pass `--project <project-uuid>`")
 
     env_id = str(args.env_id or "").strip()
     managed_env_id, managed_error = _normalize_managed_hub_id(env_id)
@@ -105,7 +112,7 @@ def cmd_env_pull(args) -> int:
             if (out.exists() or out.is_symlink()) and not args.force:
                 print(f"refusing to overwrite {out} (pass --force)", file=sys.stderr)
                 return 1
-            package = client_from_config().download_env_package(env_id)
+            package = client_from_config().download_env_package(env_id, project_id=project_id)
             data = download_environment_file_from_archive(package, args.path)
             out.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(out, data)
@@ -116,7 +123,7 @@ def cmd_env_pull(args) -> int:
         else:
             out = Path(args.output) if args.output else Path(environment_local_dirname(env_id))
             ensure_environment_pull_destination_available(out, overwrite=args.force)
-            package = client_from_config().download_env_package(env_id)
+            package = client_from_config().download_env_package(env_id, project_id=project_id)
             pull_environment_package_from_archive(package, out, overwrite=args.force)
             if render.styled():
                 print(render.env_pulled(f"{out}/", env_id))

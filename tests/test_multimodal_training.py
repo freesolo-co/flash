@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import io
 import json
 import sys
+import tarfile
 import urllib.parse
 from types import ModuleType, SimpleNamespace
 
@@ -786,6 +788,46 @@ def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_pa
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
         mm.preflight_validate_image_opd(unsupported)
+
+
+def test_image_opd_preflight_uses_builtin_package_without_github(monkeypatch, tmp_path):
+    from flash.envs import loader
+
+    package_buffer = io.BytesIO()
+    records = json.dumps(
+        {"input": "color?", "output": "red", "image": "dataset/red.png"}
+    ).encode()
+    with tarfile.open(fileobj=package_buffer, mode="w:gz") as archive:
+        for name, data in {
+            "environment.py": b"def load_environment(**kwargs):\n    return None\n",
+            "dataset/train.jsonl": records + b"\n",
+        }.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    package = package_buffer.getvalue()
+    monkeypatch.setattr(loader, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(
+        loader,
+        "managed_slug_to_github_ref",
+        lambda _value: pytest.fail("built-in image preflight must not resolve github"),
+    )
+    environment = SimpleNamespace(
+        id="acme/example",
+        resolved_sha="",
+        source_kind="builtin",
+        package_base64=base64.b64encode(package).decode("ascii"),
+        package_sha256=hashlib.sha256(package).hexdigest(),
+        params={},
+    )
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=environment,
+        train=SimpleNamespace(teacher_model="kimi-k2.6"),
+    )
+
+    mm.preflight_validate_image_opd(spec)
 
 
 @pytest.mark.parametrize("teacher_model", ["", "glm-5.2", "deepseek-v4-pro"])

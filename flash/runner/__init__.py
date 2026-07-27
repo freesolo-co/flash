@@ -595,7 +595,7 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     import logging
 
     env_id = spec.environment.id
-    if not env_id or spec.environment.resolved_sha:
+    if not env_id or spec.environment.resolved_sha or spec.environment.source_kind == "builtin":
         return spec
     try:
         from flash.envs.loader import (
@@ -951,6 +951,8 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
 
         if _is_commit_sha(effective_sha):
             effective_environment["resolved_sha"] = ""
+    for managed_source in ("source_kind", "package_base64", "package_sha256"):
+        effective_environment[managed_source] = public_environment.get(managed_source)
     effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
     effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
