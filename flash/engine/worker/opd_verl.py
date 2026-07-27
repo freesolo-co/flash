@@ -891,47 +891,62 @@ def run_opd_verl(spec=None) -> None:
     dropped_long = 0
     package_root_value = getattr(env, "package_root", None)
     package_root = str(Path(package_root_value).resolve()) if package_root_value else None
-    for example in train:
-        messages = env.prompt_messages(example)
-        if record_has_images(example, messages):
-            assert processor is not None
-            normalized = normalize_prompt_images(example, messages, package_root)
-            student_messages = normalized.messages
-            image_descriptors = tuple(normalized.descriptors)
-            teacher_messages = image_teacher_prompt_messages(
-                student_messages, len(image_descriptors)
-            )
-            prompt_ids = _processor_expanded_prompt_ids(
-                processor,
-                student_messages,
-                image_descriptors,
-                package_root,
-                enable_thinking=bool(_w.THINKING),
-            )
-        else:
-            student_messages = messages
-            teacher_messages = messages
-            image_descriptors = ()
-            prompt_ids = _normalize_prompt_ids(
-                tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    enable_thinking=_w.THINKING,
+    _prepped = [0]
+    with liveness_heartbeat("opd_image_prep", progress=lambda: _prepped[0]):
+        for example in train:
+            _prepped[0] += 1
+            messages = env.prompt_messages(example)
+            if record_has_images(example, messages):
+                assert processor is not None
+                normalized = normalize_prompt_images(example, messages, package_root)
+                student_messages = normalized.messages
+                image_descriptors = tuple(normalized.descriptors)
+                teacher_messages = image_teacher_prompt_messages(
+                    student_messages, len(image_descriptors)
+                )
+                prompt_ids = _processor_expanded_prompt_ids(
+                    processor,
+                    student_messages,
+                    image_descriptors,
+                    package_root,
+                    enable_thinking=bool(_w.THINKING),
+                )
+            else:
+                student_messages = messages
+                teacher_messages = messages
+                image_descriptors = ()
+                if processor is not None:
+                    # mixed job: the verl child tokenizes EVERY row through the multimodal dataset
+                    # path (the processor), so text-only rows must freeze via the same path or the
+                    # bridge's exact prompt-id check trips on tokenizer-vs-processor differences.
+                    prompt_ids = _processor_expanded_prompt_ids(
+                        processor,
+                        student_messages,
+                        (),
+                        package_root,
+                        enable_thinking=bool(_w.THINKING),
+                    )
+                else:
+                    prompt_ids = _normalize_prompt_ids(
+                        tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            enable_thinking=_w.THINKING,
+                        )
+                    )
+            if len(prompt_ids) > prompt_budget:
+                dropped_long += 1
+                continue
+            prompts.append(
+                _BridgePrompt(
+                    student_messages=student_messages,
+                    teacher_messages=teacher_messages,
+                    prompt_ids=prompt_ids,
+                    image_descriptors=image_descriptors,
+                    package_root=package_root,
                 )
             )
-        if len(prompt_ids) > prompt_budget:
-            dropped_long += 1
-            continue
-        prompts.append(
-            _BridgePrompt(
-                student_messages=student_messages,
-                teacher_messages=teacher_messages,
-                prompt_ids=prompt_ids,
-                image_descriptors=image_descriptors,
-                package_root=package_root,
-            )
-        )
     if not prompts:
         raise RuntimeError("every OPD prompt exceeds the configured prompt budget")
     prompts_per_step = min(knobs.prompts_per_step, len(prompts))
