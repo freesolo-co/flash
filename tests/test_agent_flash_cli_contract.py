@@ -13,6 +13,9 @@ Run: cd flash && .venv/bin/python -m pytest \
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -244,3 +247,34 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     )
     # the public short ref: exactly what train.init_from_adapter accepts
     assert get_status(rid).to_dict()["adapter_ref"] == rid
+
+
+def test_done_status_with_removed_spec_key_serializes_without_adapter_ref(tmp_path, monkeypatch) -> None:
+    # a record written by an OLDER plane can carry a since-removed spec key (gpu.exact_type,
+    # pre-#670); strict JobSpec parsing raises on it. the record must still serialize (one bad
+    # record must not 500 the whole runs list) -- it just resolves no adapter ref.
+    from flash import runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    rid = "flash-status-legacy-spec-key"
+    legacy_spec = {
+        "run_id": rid,
+        "algorithm": "sft",
+        "model": "Qwen/Qwen3.5-2B",
+        "gpu": {"type": "H100", "exact_type": "H100 SXM"},
+        "train": {"epochs": 1},
+    }
+    # written directly: these records were created by the older plane and sit on disk as-is
+    # (the current plane's _save_status could never produce one).
+    os.makedirs(runner.RUNS_DIR, exist_ok=True)
+    record = RunStatus(
+        run_id=rid,
+        state="done",
+        spec=legacy_spec,
+        effective_preparation={"worker_spec": dict(legacy_spec)},
+    )
+    with open(os.path.join(runner.RUNS_DIR, f"{rid}.json"), "w") as f:
+        json.dump(dataclasses.asdict(record), f)
+    loaded = get_status(rid).to_dict()
+    assert loaded["state"] == "done"
+    assert loaded["adapter_ref"] is None

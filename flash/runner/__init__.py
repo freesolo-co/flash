@@ -99,7 +99,16 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     """
     if not (status.effective_preparation or {}).get("worker_spec"):
         return None
-    if not _internal_spec_from_status(status).train.hf_repo:
+    try:
+        spec = _internal_spec_from_status(status)
+    except Exception:
+        # a status json written by an OLDER plane can carry since-removed spec keys (e.g.
+        # ``gpu.exact_type`` pre-#670), and stored run records are never rewritten. JobSpec.from_dict
+        # is strict, so parsing raises -- and one such record would 500 the whole runs list. same
+        # operational tolerance as _runstatus_from_json: the record stays readable, it just shows no
+        # adapter ref (its spec cannot name one we could resolve).
+        return None
+    if not spec.train.hf_repo:
         return None
     return status.run_id
 
