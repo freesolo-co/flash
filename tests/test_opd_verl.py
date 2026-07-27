@@ -1743,6 +1743,25 @@ def test_bridge_preserves_typed_permanent_teacher_failure():
     assert bridge.teacher_ok == 0
 
 
+@pytest.mark.parametrize(
+    "classifications",
+    [("permanent", "transient"), ("transient", "permanent")],
+)
+def test_terminal_teacher_failure_preserves_permanent_precedence(classifications):
+    bridge = _text_bridge(_BridgeTeacher())
+
+    for classification in classifications:
+        bridge._record_teacher_failure(
+            classification,
+            f"{classification} failure",
+            terminal=True,
+        )
+
+    assert bridge.teacher_failure == ("permanent", "permanent failure")
+    assert bridge.teacher_error == 1
+    assert bridge.teacher_transient == 1
+
+
 def test_all_transient_teacher_samples_exhaust_replacements_as_retriable():
     from flash.engine.worker.perf import RetriableInfraError
     from flash.engine.worker.teacher import TeacherError
