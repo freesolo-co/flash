@@ -19,9 +19,12 @@ from flash.engine.worker.opd_verl import (
     _BridgePrompt,
     _build_opd_child_env,
     _OpdProgressState,
+    _OpdVerlCheckpointWatcher,
+    _processed_resume_steps,
     _processor_expanded_prompt_ids,
     _prompt_pool_fingerprint,
     _raise_verl_failure,
+    _render_opd_sitecustomize,
     _restore_verl_resume,
     _stage_retry_contract,
     _TeacherAlignmentBridge,
@@ -1032,7 +1035,7 @@ def test_resume_restores_bridge_counters_and_extends_full_curves():
     restored = progress.checkpoint_state(3, timeout_s=0.1)
 
     assert restored["loss_curve"] == [1.25, 0.75, 0.5]
-    assert restored["coverage_curve"][:2] == [0.5, 0.7]
+    assert restored["coverage_curve"] == [0.5, 0.7, 1.0]
     assert restored["generated_tokens"] == 44
     assert restored["teacher_input_tokens"] == 42
     assert restored["teacher_ok"] == 7
@@ -1070,6 +1073,52 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
     assert step == 2
     assert restored == state
     assert (local_dir / "global_step_2" / "payload.bin").read_bytes() == b"checkpoint"
+
+
+def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker as worker
+
+    class Api:
+        def file_exists(self, **_kwargs):
+            return False
+
+    monkeypatch.setattr(worker, "HF_REPO", "owner/artifacts")
+    monkeypatch.setattr(worker, "hf_prefix", lambda: "opd/run")
+    monkeypatch.setattr(worker, "hf_api", Api)
+    local_dir = tmp_path / "checkpoints"
+    checkpoint_dir = local_dir / "global_step_3"
+    checkpoint_dir.mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("3")
+    watcher = _OpdVerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(3,),
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        accounting_state=lambda _step: _resume_accounting(3),
+    )
+
+    watcher.processed_steps.update(_processed_resume_steps((3,), 3))
+    published = []
+
+    def publish(step, path):
+        published.append((step, path))
+        watcher.processed_steps.add(step)
+
+    watcher._publish = publish
+    watcher.start()
+    watcher.stop(require_complete=True)
+
+    assert published == [(3, str(checkpoint_dir))]
+    assert watcher.processed_steps == {3}
+    assert _processed_resume_steps((4,), 3) == {3}
 
 
 @pytest.mark.parametrize(
@@ -1176,6 +1225,38 @@ def _config(**overrides):
     }
     config.update(overrides)
     return config
+
+
+def test_sitecustomize_saves_only_exact_required_steps(monkeypatch):
+    saved = []
+
+    class FakeCheckpointHandler:
+        def save_checkpoint(self, step):
+            saved.append(step)
+            return step
+
+    modules = {}
+    for name in ("verl", "verl.utils", "verl.utils.checkpoint"):
+        module = types.ModuleType(name)
+        module.__path__ = []
+        modules[name] = module
+    modules["verl.utils.checkpoint.checkpoint_handler"] = types.ModuleType(
+        "verl.utils.checkpoint.checkpoint_handler"
+    )
+    modules["verl.utils.checkpoint.checkpoint_handler"].CheckpointHandler = (
+        FakeCheckpointHandler
+    )
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    source = _render_opd_sitecustomize(save_at_steps=(3, 7), total_steps=7)
+    exec(compile(source, "sitecustomize.py", "exec"), {})
+    handler = FakeCheckpointHandler()
+
+    results = [handler.save_checkpoint(step) for step in range(1, 8)]
+
+    assert saved == [3, 7]
+    assert results == [None, None, 3, None, None, None, 7]
 
 
 def test_overrides_match_verl_0_8_sync_distillation_contract():
