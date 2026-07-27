@@ -2791,8 +2791,19 @@ def test_persistent_cycle_commit_failure_aborts_before_actor_update(
         '"' * 9000,
         "\\" * 9000,
         ("\x00\n\r\t") * 3000,
+        chr(0xD800) * 9000,
+        chr(0xDC00) * 9000,
+        bytes([0x80, 0xFF]).decode("utf-8", errors="surrogateescape") * 4500,
     ],
-    ids=["non-ascii", "quotes", "backslashes", "controls"],
+    ids=[
+        "non-ascii",
+        "quotes",
+        "backslashes",
+        "controls",
+        "high-surrogate",
+        "low-surrogate",
+        "surrogateescape",
+    ],
 )
 def test_failure_fallback_serialization_is_valid_and_within_reader_limit(
     tmp_path, message
@@ -2805,12 +2816,15 @@ def test_failure_fallback_serialization_is_valid_and_within_reader_limit(
 
     records = list(tmp_path.glob("cycle-commit-failure.*.transient.json"))
     assert len(records) == 1
-    serialized = records[0].read_text()
+    encoded = records[0].read_bytes()
+    serialized = encoded.decode("utf-8")
     record = json.loads(serialized)
+    normalized_message = message.encode("utf-8", errors="replace").decode("utf-8")
+    assert len(encoded) <= 8192
     assert len(serialized) <= 8192
     assert record["classification"] == "transient"
     assert record["message"]
-    assert message.startswith(record["message"])
+    assert normalized_message.startswith(record["message"])
     assert _read_cycle_commit_failure_fallback(failure_path) == (
         "transient",
         record["message"].strip(),

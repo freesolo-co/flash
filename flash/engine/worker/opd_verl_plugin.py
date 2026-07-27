@@ -312,27 +312,27 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
 
 
 def _serialize_failure_fallback(classification: str, message: str) -> bytes:
-    message = str(message)
+    message = str(message).encode("utf-8", errors="replace").decode("utf-8")
     lower = 0
     upper = min(len(message), _FAILURE_FALLBACK_MAX_CHARS)
     serialized = json.dumps(
         {"classification": classification, "message": ""},
         ensure_ascii=False,
         separators=(",", ":"),
-    )
+    ).encode("utf-8")
     while lower <= upper:
         length = (lower + upper) // 2
         candidate = json.dumps(
             {"classification": classification, "message": message[:length]},
             ensure_ascii=False,
             separators=(",", ":"),
-        )
+        ).encode("utf-8")
         if len(candidate) <= _FAILURE_FALLBACK_MAX_CHARS:
             serialized = candidate
             lower = length + 1
         else:
             upper = length - 1
-    return serialized.encode("utf-8")
+    return serialized
 
 
 def _write_failure_fallback(
