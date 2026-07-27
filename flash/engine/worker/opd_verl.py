@@ -386,18 +386,29 @@ class _TeacherAlignmentBridge:
         if not completion_text.strip() or "�" in completion_text:
             return self._empty(prompt_length, len(response_ids))
         teacher_prompt = _teacher_prompt_text(prompt.teacher_messages, self.thinking_prefill)
+        teacher_images = None
         if prompt.image_descriptors:
             from flash.multimodal import image_descriptors_to_data_uris
 
             teacher_images = image_descriptors_to_data_uris(
                 prompt.image_descriptors, prompt.package_root
             )
-            teacher_tokens = self.teacher.score_many_multimodal(
-                [(teacher_prompt, completion_text, teacher_images)]
-            )[0]
+        try:
+            if teacher_images is not None:
+                teacher_batches = self.teacher.score_many_multimodal(
+                    [(teacher_prompt, completion_text, teacher_images)]
+                )
+            else:
+                teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+        except TeacherError as error:
+            if error.permanent:
+                raise
+            self._record_teacher_failure("transient", str(error))
+            return self._empty(prompt_length, len(response_ids))
+        if teacher_images is not None:
+            teacher_tokens = teacher_batches[0]
             teacher_input_tokens = int(getattr(teacher_tokens, "input_tokens", 0) or 0)
         else:
-            teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
             teacher_input_tokens = 0
         with self._stats_lock:
             self.teacher_ok += 1

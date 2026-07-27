@@ -656,6 +656,48 @@ class _MergedBridgeTeacher:
         return [TeacherToken(text="AB", logprob=-1.1, start=0, end=2)]
 
 
+def _text_bridge(teacher, *, mutation_callback=None):
+    return _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": "question"}],
+                teacher_messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=teacher,
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=(
+            mutation_callback if mutation_callback is not None else lambda: None
+        ),
+    )
+
+
+def _exhaust_bridge_no_signal(bridge):
+    def run_attempt(attempt_ordinal):
+        payload = _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+        )
+        assert payload["teacher_ids"] == [-1, -1, -1, -1, -1]
+        raise _AllNoSignalBatch(attempt_ordinal)
+
+    return _run_with_no_signal_replacements(
+        run_attempt,
+        lambda _batch: None,
+        lambda: None,
+        lambda: _post_json(bridge.url, bridge.token, "/no-signal/resample", {}),
+        lambda: _post_json(bridge.url, bridge.token, "/no-signal/abandoned", {}),
+    )
+
+
 def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     bridge = _TeacherAlignmentBridge(
         prompts=[
@@ -681,6 +723,78 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     assert bridge.generated_tokens == 3
     with pytest.raises(ValueError, match="prompt ids"):
         bridge.score(0, 2, [10, 12, 65, 99])
+
+
+def test_transient_teacher_sample_returns_no_signal_while_following_peer_trains():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.teacher import TeacherError
+
+    class FlakyTeacher:
+        def __init__(self):
+            self.calls = 0
+
+        def score(self, prompt_text, completion_text):
+            self.calls += 1
+            if self.calls == 1:
+                raise TeacherError("teacher unavailable", permanent=False)
+            return _BridgeTeacher().score(prompt_text, completion_text)
+
+    bridge = _text_bridge(FlakyTeacher())
+    bridge.start()
+    try:
+        transient = _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+        )
+        signal = _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+        )
+    finally:
+        bridge.close()
+
+    assert transient == {
+        "teacher_ids": [-1, -1, -1, -1, -1],
+        "teacher_logprobs": [0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+    assert signal == {
+        "teacher_ids": [-1, 0, 1, -1, -1],
+        "teacher_logprobs": [0.0, -0.4, -0.7, 0.0, 0.0],
+    }
+    group_ids = torch.tensor([transient["teacher_ids"], signal["teacher_ids"]])
+    teacher_logsums = torch.tensor(
+        [transient["teacher_logprobs"], signal["teacher_logprobs"]],
+        dtype=torch.float64,
+    )
+    response_mask = torch.tensor(
+        [[False, True, True, True, False], [False, True, True, True, False]]
+    )
+    student_logprobs = torch.tensor(
+        [[-0.3, -0.5, -0.8, -1.1, -0.2], [-0.4, -0.6, -0.9, -1.2, -0.3]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    values = _flash_groupwise_reverse_kl_values(
+        student_logprobs,
+        teacher_logsums,
+        group_ids,
+        response_mask,
+        0.5,
+    )
+    values.sum().backward()
+
+    assert _full_sequence_signal_sequences(group_ids.unsqueeze(-1)).tolist() == [False, True]
+    assert torch.equal(student_logprobs.grad[0], torch.zeros(5, dtype=torch.float64))
+    assert student_logprobs.grad[1].abs().sum().item() > 0
+    assert bridge.score_requests == 2
+    assert bridge.teacher_transient == 1
+    assert bridge.teacher_ok == 1
+    assert bridge.teacher_error == 0
+    assert bridge.teacher_failure == ("transient", "teacher unavailable")
 
 
 def test_fully_forced_groups_encode_as_no_signal_and_are_filtered():
@@ -1121,35 +1235,14 @@ def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(
     assert _processed_resume_steps((4,), 3) == {3}
 
 
-@pytest.mark.parametrize(
-    ("permanent", "classification"), [(True, "permanent"), (False, "transient")]
-)
-def test_bridge_returns_typed_teacher_failures_and_records_classification(
-    permanent, classification
-):
+def test_bridge_preserves_typed_permanent_teacher_failure():
     from flash.engine.worker.teacher import TeacherError
 
     class FailingTeacher:
         def score(self, _prompt_text, _completion_text):
-            raise TeacherError(f"{classification} teacher failure", permanent=permanent)
+            raise TeacherError("permanent teacher failure", permanent=True)
 
-    bridge = _TeacherAlignmentBridge(
-        prompts=[
-            _BridgePrompt(
-                student_messages=[{"role": "user", "content": "question"}],
-                teacher_messages=[{"role": "user", "content": "question"}],
-                prompt_ids=(10, 11),
-                image_descriptors=(),
-                package_root=None,
-            )
-        ],
-        tokenizer=_BridgeTokenizer(),
-        teacher=FailingTeacher(),
-        thinking_prefill="",
-        eos_token_ids=frozenset({99}),
-        stop_sequences=(),
-        mutation_callback=lambda: None,
-    )
+    bridge = _text_bridge(FailingTeacher())
     bridge.start()
     try:
         with pytest.raises(FlashTeacherBridgeError) as error:
@@ -1157,17 +1250,69 @@ def test_bridge_returns_typed_teacher_failures_and_records_classification(
                 bridge.url,
                 bridge.token,
                 "/score",
-                {"index": 0, "prompt_length": 2, "sequence_ids": [10, 11, 65, 66, 99]},
+                _bridge_score_payload(0, [10, 11], [65, 66, 99]),
             )
     finally:
         bridge.close()
 
-    assert error.value.classification == classification
-    assert str(error.value) == f"{classification} teacher failure"
-    assert bridge.teacher_failure == (classification, f"{classification} teacher failure")
-    assert bridge.teacher_error == int(permanent)
-    assert bridge.teacher_transient == int(not permanent)
+    assert error.value.classification == "permanent"
+    assert str(error.value) == "permanent teacher failure"
+    assert bridge.teacher_failure == ("permanent", "permanent teacher failure")
+    assert bridge.teacher_error == 1
+    assert bridge.teacher_transient == 0
     assert bridge.teacher_ok == 0
+
+
+def test_all_transient_teacher_samples_exhaust_replacements_as_retriable():
+    from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.teacher import TeacherError
+
+    class TransientTeacher:
+        def score(self, _prompt_text, _completion_text):
+            raise TeacherError("teacher unavailable", permanent=False)
+
+    mutations = []
+    bridge = _text_bridge(
+        TransientTeacher(), mutation_callback=lambda: mutations.append(True)
+    )
+    bridge.start()
+    try:
+        with pytest.raises(RuntimeError, match="after 3 rollout attempts"):
+            _exhaust_bridge_no_signal(bridge)
+        with pytest.raises(RetriableInfraError, match="after bounded retries"):
+            _raise_verl_failure(1, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert bridge.score_requests == 3
+    assert bridge.teacher_transient == 3
+    assert bridge.teacher_ok == 0
+    assert bridge.teacher_error == 0
+    assert bridge.no_signal_resamples == 2
+    assert bridge.no_signal_skipped_steps == 1
+    assert mutations == []
+
+
+def test_deterministic_empty_alignment_exhaustion_remains_permanent():
+    class EmptyAlignmentTeacher:
+        def score(self, _prompt_text, _completion_text):
+            return []
+
+    bridge = _text_bridge(EmptyAlignmentTeacher())
+    bridge.start()
+    try:
+        with pytest.raises(RuntimeError, match="after 3 rollout attempts"):
+            _exhaust_bridge_no_signal(bridge)
+        with pytest.raises(RuntimeError, match="subprocess exited with status 1"):
+            _raise_verl_failure(1, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert bridge.teacher_failure is None
+    assert bridge.teacher_ok == 3
+    assert bridge.teacher_transient == 0
+    assert bridge.teacher_error == 0
+    assert bridge.empty_alignments == 3
 
 
 def test_bridge_transport_failure_is_typed_retriable(monkeypatch):
