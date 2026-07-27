@@ -74,9 +74,13 @@ def _reference_turns(env, example: dict) -> list[str]:
     # openai-style text blocks is replayed instead of echoed; text-free turns (null content
     # or image-only blocks) yield an empty replay string that is kept in place.
     messages = _check_messages(env.sft_completion(example), "sft_completion")
+    # only assistant turns stand in for the policy model; a gold completion with no assistant
+    # message must NOT replay user/system text as the model response -- yield no replay text so
+    # _resolve_policy falls back to echo.
     assistant = [m for m in messages if m["role"].strip().lower() == "assistant"]
-    selected = assistant or messages
-    return [_message_text(m["content"]) for m in selected]
+    # assistant turns only (a gold with no assistant message must echo, not replay user/system);
+    # keep text-free turns positionally (empty string) so multi-turn replay stays aligned.
+    return [_message_text(m["content"]) for m in assistant]
 
 
 def _resolve_policy(reference_turns: list[str]) -> str:
