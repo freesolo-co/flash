@@ -138,14 +138,12 @@ def allocate(
                 f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
                 f"but this run requires at least {need} GB"
             )
-        if (
-            exact_info.vram_gb < need
-            and max_gpu_count > 1
-            and min(max_gpu_count, _MAX_COMBINATION_CARDS)
-            * exact_info.vram_gb
-            * _SHARD_VRAM_EFFICIENCY
-            < need
-        ):
+        _max_cards = min(max_gpu_count, _MAX_COMBINATION_CARDS)
+        _pin_usable = (
+            _max_cards * max(0, exact_info.vram_gb - _REPLICATED_PER_CARD_GB) * _SHARD_VRAM_EFFICIENCY
+            + _REPLICATED_PER_CARD_GB
+        )
+        if exact_info.vram_gb < need and max_gpu_count > 1 and _pin_usable < need:
             raise UnsupportedGpuError(
                 f"exact GPU {exact!r} cannot fit this run even as a "
                 f"{min(max_gpu_count, _MAX_COMBINATION_CARDS)}-card combination"

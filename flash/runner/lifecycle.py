@@ -417,7 +417,8 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
         candidates,
         key=lambda c: (
             c.provider in failed_providers,  # 1) escape providers that already failed this run
-            (c.provider, c.gpu) in tried_classes,  # 2) then prefer a class not yet tried
+            (c.provider, c.gpu, getattr(c, "gpu_count", 1)) in tried_classes
+            or (c.provider, c.gpu) in tried_classes,  # 2) then prefer a shape not yet tried
             getattr(c, "gpu_count", 1) * c.hourly_usd,  # 3) then cheapest TOTAL cost
             getattr(c, "gpu_count", 1),  # 4) fewer cards on ties (less inter-card overhead)
             c.vram_gb,  # 5) then the smaller card (don't burn a big GPU on a small job)
