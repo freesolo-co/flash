@@ -262,8 +262,8 @@ def apply_disk_gb(config, disk_gb: int | None) -> None:
         logger.warning("disk_gb=%s requested but endpoint config has no template", disk_gb)
         return
 
-    floors = [int(disk_gb), int(template.containerDiskInGb or 0)]
-    override = worker_image_override()
+    floors = [int(disk_gb or 0), int(template.containerDiskInGb or 0)]
+    override = _override
     if override and override.min_disk_gb:
         # a large override image cannot extract into the default container disk; its floor wins
         # over a smaller request but never lowers one.

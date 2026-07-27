@@ -682,11 +682,32 @@ def write_base_model_provenance(adapter_dir: str, model_id: str, model_revision:
         json.dump(payload, fh, indent=2, sort_keys=True)
 
 
+class _SnapshotWeightsMissing(RuntimeError):
+    """A forced re-download still produced a snapshot without model weights."""
+
+
 def _snapshot_has_weights(snapshot_dir: str) -> bool:
-    """True when a downloaded snapshot contains at least one resolvable model weight file."""
+    """True when a downloaded snapshot contains resolvable model weights (all indexed shards)."""
     weight_names = ("model", "pytorch_model", "tf_model", "flax_model")
+
+    def _resolves(name: str) -> bool:
+        path = os.path.join(snapshot_dir, name)
+        return os.path.isfile(os.path.realpath(path))
+
     try:
-        for name in os.listdir(snapshot_dir):
+        entries = os.listdir(snapshot_dir)
+        # sharded checkpoints: the index enumerates every required shard; a partial download with
+        # SOME shards present must not pass. validate all indexed shards resolve.
+        for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+            if index_name in entries:
+                try:
+                    with open(os.path.join(snapshot_dir, index_name)) as f:
+                        index = json.load(f)
+                    shards = set((index.get("weight_map") or {}).values())
+                except (OSError, ValueError):
+                    return False
+                return bool(shards) and all(_resolves(shard) for shard in shards)
+        for name in entries:
             if not name.endswith((".safetensors", ".bin")):
                 continue
             # exclude non-weight .bin artifacts (tokenizer.bin, training_args.bin, adapters)
@@ -694,8 +715,7 @@ def _snapshot_has_weights(snapshot_dir: str) -> bool:
                 continue
             # HF cache entries are symlinks into blobs/: a dangling link (partial download) must
             # not count as weights present.
-            path = os.path.join(snapshot_dir, name)
-            if os.path.isfile(os.path.realpath(path)):
+            if _resolves(name):
                 return True
     except OSError:
         return False
@@ -740,7 +760,7 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
                     **model_revision_kwargs(revision),
                 )
                 if isinstance(local_path, str) and os.path.isdir(local_path) and not _snapshot_has_weights(local_path):
-                    raise RuntimeError(
+                    raise _SnapshotWeightsMissing(
                         f"model snapshot for {model_id} has no weight files even after a forced "
                         "re-download; the repo layout is unsupported or the cache volume is corrupt"
                     )
@@ -760,10 +780,9 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
         else:
             try:
                 _download()
-            except RuntimeError:
-                # the stale-cache repair path raises RuntimeError only after a FORCED re-download
-                # still had no weights — swallowing it would let the trainer fail later with a
-                # far more confusing offline error. propagate.
+            except _SnapshotWeightsMissing:
+                # a FORCED re-download still had no weights — swallowing it would let the trainer
+                # fail later with a far more confusing offline error. propagate.
                 raise
             except Exception as e:
                 # transient fetch errors stay non-fatal on the default revision: the trainer's own
