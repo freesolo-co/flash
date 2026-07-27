@@ -894,6 +894,8 @@ class _OpdProgressState:
         self.loss_curve = [float(value) for value in state.get("loss_curve", [])]
         self.coverage_curve = [float(value) for value in state.get("coverage_curve", [])]
         self.base_train_wall_seconds = float(state.get("train_wall_seconds", 0.0))
+        self._prev_aligned = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
+        self._prev_cov_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
         self._train_started_at: float | None = None
         self._step_states: dict[int, dict] = {}
         if resume_state is not None:
@@ -921,8 +923,8 @@ class _OpdProgressState:
             cov_sum = float(snapshot["coverage_sum"])
             # per-step coverage: delta over the previous snapshot, so the curve shows each step's
             # own alignment quality instead of a cumulative average that flattens regressions.
-            d_aligned = aligned - getattr(self, "_prev_aligned", 0)
-            d_cov = cov_sum - getattr(self, "_prev_cov_sum", 0.0)
+            d_aligned = aligned - self._prev_aligned
+            d_cov = cov_sum - self._prev_cov_sum
             self._prev_aligned, self._prev_cov_sum = aligned, cov_sum
             coverage = (d_cov / d_aligned) if d_aligned > 0 else (cov_sum / aligned if aligned else 0.0)
             self.coverage_curve.append(coverage)
@@ -1103,6 +1105,28 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
             + _hydra_val(structured_outputs_config)
         )
     return overrides
+
+
+def _render_opd_sitecustomize(
+    *, save_at_steps: tuple[int, ...], total_steps: int
+) -> str:
+    required_steps = tuple(int(step) for step in save_at_steps)
+    return f'''# generated flash opd runtime patches for verl 0.8
+from verl.utils.checkpoint.checkpoint_handler import CheckpointHandler as _FlashCheckpointHandler
+
+_flash_required_save_steps = frozenset({required_steps!r})
+_flash_total_steps = {int(total_steps)}
+_flash_original_save_checkpoint = _FlashCheckpointHandler.save_checkpoint
+
+
+def _flash_save_exact_checkpoint(self, step):
+    if _flash_required_save_steps and step not in _flash_required_save_steps and step != _flash_total_steps:
+        return None
+    return _flash_original_save_checkpoint(self, step)
+
+
+_FlashCheckpointHandler.save_checkpoint = _flash_save_exact_checkpoint
+'''
 
 
 def _build_opd_child_env(
@@ -1349,6 +1373,15 @@ def _restore_verl_resume(
     with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
         file.write(str(step))
     return step, state
+
+
+def _processed_resume_steps(
+    required_steps: tuple[int, ...], resume_step: int
+) -> set[int]:
+    processed = _durable_required_save_steps(required_steps, resume_step)
+    if resume_step and resume_step not in required_steps:
+        processed.add(resume_step)
+    return processed
 
 
 def _generation_eos_from_cached_config(model_id: str, model_revision: str, tokenizer) -> frozenset[int]:
@@ -1633,6 +1666,13 @@ def run_opd_verl(spec=None) -> None:
     entry_path = os.path.join(shim_dir, "flash_opd_verl_entry.py")
     with open(entry_path, "w", encoding="utf-8") as file:
         file.write("import verl\nfrom flash_opd_verl_plugin import main\nmain()\n")
+    with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
+        file.write(
+            _render_opd_sitecustomize(
+                save_at_steps=knobs.save_at_steps,
+                total_steps=update_horizon,
+            )
+        )
 
     resume_step, resume_state = _restore_verl_resume(
         local_dir,
@@ -1704,10 +1744,8 @@ def run_opd_verl(spec=None) -> None:
             group_size=knobs.group_size,
             accounting_state=progress_state.checkpoint_state,
         )
-        if resume_step:
-            watcher.processed_steps.add(resume_step)
         watcher.processed_steps.update(
-            _durable_required_save_steps(knobs.save_at_steps, resume_step)
+            _processed_resume_steps(knobs.save_at_steps, resume_step)
         )
         child_env = _build_opd_child_env(
             shim_dir=shim_dir,
@@ -1758,10 +1796,10 @@ def run_opd_verl(spec=None) -> None:
         train_started_at = time.time()
         return_code = 0
         training_completed = resume_step >= update_horizon
-        if resume_step < update_horizon:
-            progress_state.start_training()
-            watcher.start()
-            try:
+        watcher.start()
+        try:
+            if resume_step < update_horizon:
+                progress_state.start_training()
                 with liveness_heartbeat(
                     "opd_step",
                     progress=lambda: int(progress["step"] or 0),
@@ -1775,8 +1813,8 @@ def run_opd_verl(spec=None) -> None:
                         heartbeat=child_heartbeat,
                     )
                     training_completed = return_code == 0
-            finally:
-                watcher.stop(require_complete=training_completed)
+        finally:
+            watcher.stop(require_complete=training_completed)
         peak_gpu_gb = gpu_sampler.stop_gb()
         _raise_verl_failure(return_code, bridge.teacher_failure)
         final_accounting = progress_state.final_state(bridge)
