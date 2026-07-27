@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -324,6 +325,14 @@ class _TeacherAlignmentBridge:
             if self._teacher_failure is None:
                 self._teacher_failure = failure
 
+    def _record_teacher_delivery_failure(self, error: Exception) -> None:
+        with self._stats_lock:
+            if self._teacher_failure is None:
+                self._teacher_failure = (
+                    "transient",
+                    f"teacher bridge response delivery failed: {type(error).__name__}",
+                )
+
     def _record_mutation_failure(self, classification: str, message: str) -> None:
         with self._stats_lock:
             if self._mutation_callback_failure is not None:
@@ -357,7 +366,7 @@ class _TeacherAlignmentBridge:
                 return None
             return self._mutation_failure
 
-    def _promote_pending_teacher_failure(self) -> None:
+    def _promote_pending_teacher_failure(self) -> bool:
         with self._stats_lock:
             if (
                 self._teacher_failure is None
@@ -367,6 +376,8 @@ class _TeacherAlignmentBridge:
                 self._teacher_failure = self._pending_teacher_transient
                 self._pending_teacher_transient = None
                 self._pending_teacher_success = False
+                return True
+            return False
 
     def accounting_snapshot(self) -> dict:
         with self._stats_lock:
@@ -921,6 +932,7 @@ class _TeacherAlignmentBridge:
 
             def do_POST(self):
                 recovered_teacher_failure = None
+                request_succeeded = False
                 try:
                     if self.headers.get("Authorization") != f"Bearer {bridge.token}":
                         raise PermissionError("flash OPD bridge authorization failed")
@@ -962,9 +974,17 @@ class _TeacherAlignmentBridge:
                         result = {"ok": True}
                     else:
                         raise ValueError("flash OPD bridge path is unknown")
+                    request_succeeded = True
                     self._send_json(200, result)
                 except Exception as error:
-                    if isinstance(error, _RecordedMutationCallbackFailure):
+                    teacher_delivery_failure = (
+                        request_succeeded
+                        and self.path in {"/score", "/multiturn/score"}
+                        and isinstance(error, (OSError, http.client.HTTPException))
+                    )
+                    if teacher_delivery_failure:
+                        classification = "transient"
+                    elif isinstance(error, _RecordedMutationCallbackFailure):
                         classification = error.classification
                     else:
                         classification = (
@@ -973,7 +993,14 @@ class _TeacherAlignmentBridge:
                             or (isinstance(error, TeacherError) and not error.permanent)
                             else "permanent"
                         )
-                    if self.path == "/score":
+                    if teacher_delivery_failure:
+                        if recovered_teacher_failure is not None:
+                            bridge._promote_recovered_teacher_failure(
+                                recovered_teacher_failure
+                            )
+                        else:
+                            bridge._record_teacher_delivery_failure(error)
+                    elif self.path == "/score":
                         if recovered_teacher_failure is not None:
                             bridge._promote_recovered_teacher_failure(
                                 recovered_teacher_failure
@@ -1421,12 +1448,33 @@ def _read_cycle_commit_failure_fallback(base_path: str) -> tuple[str, str] | Non
     return _read_classified_failure_fallback(base_path)
 
 
-def _read_abandonment_failure_fallback(base_path: str) -> bool:
-    return bool(_read_failure_fallback_records(base_path))
+def _read_abandonment_failure_fallback(
+    base_path: str,
+) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
 
 
-def _read_resample_failure_fallback(base_path: str) -> bool:
-    return bool(_read_failure_fallback_records(base_path))
+def _read_resample_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
+
+
+def _reconcile_no_signal_notification_failure(
+    bridge: _TeacherAlignmentBridge,
+    failures: tuple[tuple[str, str] | None, ...],
+) -> tuple[str, str] | None:
+    selected = None
+    for failure in failures:
+        if failure is None:
+            continue
+        if failure[0] == "permanent" or selected is None:
+            selected = failure
+    if (
+        selected is not None
+        and selected[0] == "transient"
+        and bridge._promote_pending_teacher_failure()
+    ):
+        return None
+    return selected
 
 
 def _raise_verl_failure(
@@ -1434,6 +1482,7 @@ def _raise_verl_failure(
     teacher_failure: tuple[str, str] | None,
     mutation_failure: tuple[str, str] | None = None,
     cycle_commit_failure: tuple[str, str] | None = None,
+    no_signal_failure: tuple[str, str] | None = None,
 ) -> None:
     if return_code == 0:
         return
@@ -1451,6 +1500,13 @@ def _raise_verl_failure(
         raise RuntimeError(
             f"permanent pre-update cycle commitment failure: {message}"
         )
+    if no_signal_failure is not None:
+        classification, message = no_signal_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(
+                f"transient no-signal notification failure: {message}"
+            )
+        raise RuntimeError(f"permanent no-signal notification failure: {message}")
     if teacher_failure is not None:
         classification, message = teacher_failure
         if classification == "transient":
@@ -2050,10 +2106,13 @@ def run_opd_verl(spec=None) -> None:
         finally:
             watcher.stop(require_complete=training_completed)
         peak_gpu_gb = gpu_sampler.stop_gb()
-        if _read_resample_failure_fallback(resample_failure_path):
-            bridge._promote_pending_teacher_failure()
-        if _read_abandonment_failure_fallback(abandonment_failure_path):
-            bridge._promote_pending_teacher_failure()
+        no_signal_failure = _reconcile_no_signal_notification_failure(
+            bridge,
+            (
+                _read_resample_failure_fallback(resample_failure_path),
+                _read_abandonment_failure_fallback(abandonment_failure_path),
+            ),
+        )
         fallback_mutation_failure = _read_mutation_failure_fallback(
             mutation_failure_path
         )
@@ -2067,6 +2126,7 @@ def run_opd_verl(spec=None) -> None:
             bridge.teacher_failure,
             bridge.mutation_failure,
             cycle_commit_failure,
+            no_signal_failure,
         )
         final_accounting = progress_state.final_state(bridge)
         train_wall = float(final_accounting["train_wall_seconds"])

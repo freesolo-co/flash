@@ -382,8 +382,13 @@ def _write_cycle_commit_failure_fallback(classification: str, message: str) -> N
     )
 
 
-def _exit_for_mutation_failure(error: FlashTeacherBridgeError) -> None:
-    _write_mutation_failure_fallback(error.classification, str(error))
+def _exit_for_mutation_failure(
+    error: FlashTeacherBridgeError,
+    *,
+    write_fallback: bool = True,
+) -> None:
+    if write_fallback:
+        _write_mutation_failure_fallback(error.classification, str(error))
     exit_code = (
         _PERMANENT_TEACHER_EXIT
         if error.classification == "permanent"
@@ -392,33 +397,49 @@ def _exit_for_mutation_failure(error: FlashTeacherBridgeError) -> None:
     os._exit(exit_code)
 
 
-def _post_mutation_notice(url: str, token: str) -> None:
+def _unexpected_mutation_bridge_error(error: Exception) -> FlashTeacherBridgeError:
+    return FlashTeacherBridgeError(
+        f"unexpected mutation bridge failure: {type(error).__name__}",
+        classification="permanent",
+    )
+
+
+def _publish_mutation_notice(url: str, token: str) -> None:
     payload = {"process_id": os.getpid()}
     try:
         _post_json(url, token, "/mutation", payload)
         return
     except FlashTeacherBridgeError as error:
         if not error.delivery_unknown:
-            _exit_for_mutation_failure(error)
-            return
+            _write_mutation_failure_fallback(error.classification, str(error))
+            raise
     except Exception as error:
+        bridge_error = _unexpected_mutation_bridge_error(error)
         _write_mutation_failure_fallback(
-            "permanent",
-            f"unexpected mutation bridge failure: {type(error).__name__}",
+            bridge_error.classification,
+            str(bridge_error),
         )
-        os._exit(_PERMANENT_TEACHER_EXIT)
-        return
+        raise bridge_error from error
 
     try:
         _post_json(url, token, "/mutation", payload)
-    except FlashTeacherBridgeError as retry_error:
-        _exit_for_mutation_failure(retry_error)
-    except Exception as retry_error:
+    except FlashTeacherBridgeError as error:
+        _write_mutation_failure_fallback(error.classification, str(error))
+        raise
+    except Exception as error:
+        bridge_error = _unexpected_mutation_bridge_error(error)
         _write_mutation_failure_fallback(
-            "permanent",
-            f"unexpected mutation bridge failure: {type(retry_error).__name__}",
+            bridge_error.classification,
+            str(bridge_error),
         )
-        os._exit(_PERMANENT_TEACHER_EXIT)
+        raise bridge_error from error
+
+
+def _post_mutation_notice(url: str, token: str) -> None:
+    try:
+        _publish_mutation_notice(url, token)
+    except FlashTeacherBridgeError as error:
+        _exit_for_mutation_failure(error, write_fallback=False)
 
 
 def _post_no_signal_resample(url: str, token: str) -> None:
@@ -487,10 +508,26 @@ def _update_actor_after_teacher_cycle_commit(
     return actor_rollout_wg.update_actor(batch)
 
 
-def _mutation_acknowledgement_barrier() -> None:
+def _mutation_distributed():
     import torch
 
-    torch.distributed.barrier()
+    return torch.distributed
+
+
+def _coordinate_first_mutation_notice(url: str, token: str) -> None:
+    distributed = _mutation_distributed()
+    distributed.barrier()
+    outcome: list[tuple[str, str] | None] = [None]
+    if distributed.get_rank() == 0:
+        try:
+            _publish_mutation_notice(url, token)
+        except FlashTeacherBridgeError as error:
+            outcome[0] = (error.classification, str(error))
+    distributed.broadcast_object_list(outcome, src=0)
+    distributed.barrier()
+    if outcome[0] is not None:
+        classification, message = outcome[0]
+        raise FlashTeacherBridgeError(message, classification=classification)
 
 
 def _wrap_optimizer_with_mutation_notice(optimizer, url: str, token: str):
@@ -501,8 +538,7 @@ def _wrap_optimizer_with_mutation_notice(optimizer, url: str, token: str):
     def step_with_notice(*args, **kwargs):
         nonlocal mutation_acknowledged
         if not mutation_acknowledged:
-            _post_mutation_notice(url, token)
-            _mutation_acknowledgement_barrier()
+            _coordinate_first_mutation_notice(url, token)
             mutation_acknowledged = True
         return original_step(*args, **kwargs)
 

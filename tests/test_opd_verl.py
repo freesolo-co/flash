@@ -81,6 +81,42 @@ def _send_truncated_json_response(handler, status, payload):
     handler.close_connection = True
 
 
+class _ThreadedDistributedWorld:
+    def __init__(self, size):
+        self.size = size
+        self.local = threading.local()
+        self.readiness = threading.Barrier(size)
+        self.broadcast_ready = threading.Barrier(size)
+        self.broadcast_copied = threading.Barrier(size)
+        self.confirmation = threading.Barrier(size)
+        self.broadcast_value = None
+        self.events = []
+
+    def run(self, rank, operation):
+        self.local.rank = rank
+        self.local.barrier_index = 0
+        return operation()
+
+    def get_rank(self):
+        return self.local.rank
+
+    def barrier(self):
+        phase = self.local.barrier_index
+        self.local.barrier_index += 1
+        self.events.append(("barrier", phase, self.local.rank))
+        target = self.readiness if phase == 0 else self.confirmation
+        target.wait(timeout=5)
+
+    def broadcast_object_list(self, values, src):
+        self.events.append(("broadcast", self.local.rank))
+        if self.local.rank == src:
+            self.broadcast_value = values[0]
+        self.broadcast_ready.wait(timeout=5)
+        if self.local.rank != src:
+            values[0] = self.broadcast_value
+        self.broadcast_copied.wait(timeout=5)
+
+
 def _load_verl_rl_dataset(monkeypatch):
     test_root = os.environ.get("FLASH_VERL_TEST_ROOT", "").strip()
     if test_root:
@@ -852,6 +888,123 @@ def test_recovered_transient_lost_response_promotes_transient_terminal_cause():
     assert bridge.teacher_failure == ("transient", "teacher unavailable")
     assert bridge.teacher_transient == 1
     assert bridge.teacher_error == 0
+
+
+@pytest.mark.parametrize(
+    ("error_type", "error_args"),
+    [
+        (BrokenPipeError, ("client disconnected",)),
+        (ConnectionResetError, ("connection reset",)),
+        (TimeoutError, ("delivery timed out",)),
+        (OSError, ("socket failed",)),
+        (http.client.IncompleteRead, (b"partial", 1)),
+    ],
+)
+def test_singleturn_success_delivery_failure_is_terminal_retriable(
+    error_type,
+    error_args,
+):
+    from flash.engine.worker.perf import RetriableInfraError
+
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+
+    def fail_delivery(_handler, _status, _payload):
+        raise error_type(*error_args)
+
+    handler._send_json = fail_delivery
+    try:
+        with pytest.raises(FlashTeacherBridgeError):
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+            )
+        with pytest.raises(RetriableInfraError, match="after bounded retries"):
+            _raise_verl_failure(1, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert bridge.teacher_failure is not None
+    assert bridge.teacher_failure[0] == "transient"
+    assert error_type.__name__ in bridge.teacher_failure[1]
+    assert bridge.teacher_ok == 1
+    assert bridge.teacher_transient == 0
+    assert bridge.teacher_error == 0
+
+
+@pytest.mark.parametrize(
+    ("error_type", "error_args"),
+    [
+        (BrokenPipeError, ("client disconnected",)),
+        (ConnectionResetError, ("connection reset",)),
+        (TimeoutError, ("delivery timed out",)),
+        (OSError, ("socket failed",)),
+        (http.client.IncompleteRead, (b"partial", 1)),
+    ],
+)
+def test_multiturn_success_delivery_failure_is_terminal_retriable(
+    error_type,
+    error_args,
+):
+    from flash.engine.worker.perf import RetriableInfraError
+
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge.score_multiturn = lambda _session_id: {"ok": True}
+    accounting_before = bridge.accounting_snapshot()
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+
+    def fail_delivery(_handler, _status, _payload):
+        raise error_type(*error_args)
+
+    handler._send_json = fail_delivery
+    try:
+        with pytest.raises(FlashTeacherBridgeError):
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/multiturn/score",
+                {"session_id": "session-1"},
+            )
+        with pytest.raises(RetriableInfraError, match="after bounded retries"):
+            _raise_verl_failure(1, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert bridge.teacher_failure is not None
+    assert bridge.teacher_failure[0] == "transient"
+    assert error_type.__name__ in bridge.teacher_failure[1]
+    assert bridge.accounting_snapshot() == accounting_before
+
+
+def test_success_delivery_failure_does_not_overwrite_permanent_teacher_failure():
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge._record_teacher_failure("permanent", "bad credentials")
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+
+    def fail_delivery(_handler, _status, _payload):
+        raise BrokenPipeError("client disconnected")
+
+    handler._send_json = fail_delivery
+    try:
+        with pytest.raises(FlashTeacherBridgeError):
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+            )
+    finally:
+        bridge.close()
+
+    assert bridge.teacher_failure == ("permanent", "bad credentials")
+    assert bridge.teacher_ok == 1
+    assert bridge.teacher_transient == 0
+    assert bridge.teacher_error == 1
 
 
 def test_recovered_transient_does_not_make_later_deterministic_exhaustion_retriable():
@@ -1768,6 +1921,69 @@ def test_successful_resample_creates_no_marker_and_prepares_replacement(
     assert not _read_resample_failure_fallback(failure_path)
 
 
+@pytest.mark.parametrize(
+    "failures",
+    [
+        (("permanent", "resample rejected"), ("transient", "abandon timeout")),
+        (("transient", "resample timeout"), ("permanent", "abandon rejected")),
+    ],
+)
+def test_permanent_no_signal_notification_precedes_pending_transient(failures):
+    from flash.engine.worker.opd_verl import _reconcile_no_signal_notification_failure
+    from flash.engine.worker.teacher import TeacherError
+
+    class TransientTeacher:
+        def score(self, _prompt_text, _completion_text):
+            raise TeacherError("teacher unavailable", permanent=False)
+
+    bridge = _text_bridge(TransientTeacher())
+    bridge.score(0, 2, [10, 11, 65, 66, 99])
+
+    failure = _reconcile_no_signal_notification_failure(bridge, failures)
+
+    assert failure is not None
+    assert failure[0] == "permanent"
+    assert bridge.teacher_failure is None
+    with pytest.raises(RuntimeError, match="permanent no-signal notification"):
+        _raise_verl_failure(1, bridge.teacher_failure, no_signal_failure=failure)
+
+
+def test_transient_no_signal_notification_without_pending_is_retriable():
+    from flash.engine.worker.opd_verl import _reconcile_no_signal_notification_failure
+    from flash.engine.worker.perf import RetriableInfraError
+
+    bridge = _text_bridge(_BridgeTeacher())
+    failure = _reconcile_no_signal_notification_failure(
+        bridge,
+        (("transient", "resample transport failed"),),
+    )
+
+    assert failure == ("transient", "resample transport failed")
+    assert bridge.teacher_failure is None
+    with pytest.raises(RetriableInfraError, match="no-signal notification"):
+        _raise_verl_failure(1, None, no_signal_failure=failure)
+
+
+def test_transient_no_signal_notification_promotes_causal_teacher_failure():
+    from flash.engine.worker.opd_verl import _reconcile_no_signal_notification_failure
+    from flash.engine.worker.teacher import TeacherError
+
+    class TransientTeacher:
+        def score(self, _prompt_text, _completion_text):
+            raise TeacherError("teacher unavailable", permanent=False)
+
+    bridge = _text_bridge(TransientTeacher())
+    bridge.score(0, 2, [10, 11, 65, 66, 99])
+
+    failure = _reconcile_no_signal_notification_failure(
+        bridge,
+        (("transient", "abandon transport failed"),),
+    )
+
+    assert failure is None
+    assert bridge.teacher_failure == ("transient", "teacher unavailable")
+
+
 def test_successful_cycle_commit_allows_next_transient_cycle_to_promote():
     from flash.engine.worker.teacher import TeacherError
 
@@ -2345,8 +2561,7 @@ def test_repeated_mutation_notice_maps_later_bridge_failure_to_child_exit(
 def test_optimizer_rank_posts_marker_once_across_multiple_steps(monkeypatch):
     import flash.engine.worker.opd_verl_plugin as plugin
 
-    notices = []
-    barriers = []
+    coordination = []
     updates = []
 
     class Optimizer:
@@ -2354,15 +2569,13 @@ def test_optimizer_rank_posts_marker_once_across_multiple_steps(monkeypatch):
             updates.append(True)
             return len(updates)
 
+    def coordinate(url, token):
+        coordination.append((url, token))
+
     monkeypatch.setattr(
         plugin,
-        "_post_mutation_notice",
-        lambda url, token: notices.append((url, token)),
-    )
-    monkeypatch.setattr(
-        plugin,
-        "_mutation_acknowledgement_barrier",
-        lambda: barriers.append(True),
+        "_coordinate_first_mutation_notice",
+        coordinate,
         raising=False,
     )
     optimizer = plugin._wrap_optimizer_with_mutation_notice(
@@ -2373,8 +2586,7 @@ def test_optimizer_rank_posts_marker_once_across_multiple_steps(monkeypatch):
 
     assert optimizer.step() == 1
     assert optimizer.step() == 2
-    assert notices == [("http://bridge", "token")]
-    assert barriers == [True]
+    assert coordination == [("http://bridge", "token")]
     assert updates == [True, True]
 
 
@@ -2383,68 +2595,112 @@ def test_each_optimizer_rank_acknowledges_marker_while_parent_publishes_once(
 ):
     import flash.engine.worker.opd_verl_plugin as plugin
 
+    world = _ThreadedDistributedWorld(2)
     callback_calls = []
     rank_updates = []
-    events = []
-    world_barrier = threading.Barrier(2)
     bridge = _text_bridge(
-        _BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True)
+        _BridgeTeacher(),
+        mutation_callback=lambda: (
+            callback_calls.append(True),
+            world.events.append(("callback", 0)),
+        ),
     )
-    original_post = plugin._post_json
-    marker_posts = []
-
-    def record_post(url, token, path, payload):
-        if path == "/mutation":
-            marker_posts.append(payload)
-            events.append("notice")
-        return original_post(url, token, path, payload)
 
     class Optimizer:
         def __init__(self, rank):
             self.rank = rank
 
         def step(self):
-            events.append("step")
+            world.events.append(("step", self.rank))
             rank_updates.append(self.rank)
 
-    def barrier():
-        events.append("barrier")
-        world_barrier.wait(timeout=5)
-
-    monkeypatch.setattr(plugin, "_post_json", record_post)
-    monkeypatch.setattr(
-        plugin,
-        "_mutation_acknowledgement_barrier",
-        barrier,
-        raising=False,
-    )
+    monkeypatch.setattr(plugin, "_mutation_distributed", lambda: world, raising=False)
     bridge.start()
     try:
-        rank_zero = plugin._wrap_optimizer_with_mutation_notice(
-            Optimizer(0), bridge.url, bridge.token
-        )
-        rank_one = plugin._wrap_optimizer_with_mutation_notice(
-            Optimizer(1), bridge.url, bridge.token
-        )
+        optimizers = [
+            plugin._wrap_optimizer_with_mutation_notice(
+                Optimizer(rank), bridge.url, bridge.token
+            )
+            for rank in range(2)
+        ]
         with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(lambda optimizer: optimizer.step(), (rank_zero, rank_one)))
+            list(
+                pool.map(
+                    lambda item: world.run(item[0], item[1].step),
+                    enumerate(optimizers),
+                )
+            )
     finally:
         bridge.close()
 
-    assert len(marker_posts) == 2
+    readiness = [event for event in world.events if event[:2] == ("barrier", 0)]
+    confirmation = [event for event in world.events if event[:2] == ("barrier", 1)]
+    callback_index = next(
+        index for index, event in enumerate(world.events) if event[0] == "callback"
+    )
+    first_step_index = next(
+        index for index, event in enumerate(world.events) if event[0] == "step"
+    )
+    assert len(readiness) == 2
+    assert len(confirmation) == 2
     assert callback_calls == [True]
     assert sorted(rank_updates) == [0, 1]
-    assert events.count("barrier") == 2
-    assert events.index("step") > max(
-        index for index, event in enumerate(events) if event == "notice"
-    )
+    assert callback_index > max(world.events.index(event) for event in readiness)
+    assert first_step_index > max(world.events.index(event) for event in confirmation)
 
 
-def test_failed_rank_acknowledgement_prevents_all_optimizer_steps(monkeypatch):
+def test_failed_rank_readiness_prevents_marker_callback_and_optimizer_steps(
+    monkeypatch,
+):
     import flash.engine.worker.opd_verl_plugin as plugin
 
-    notices = []
-    barriers = []
+    callbacks = []
+    updates = []
+
+    class UnreadyWorld:
+        def barrier(self):
+            raise RuntimeError("world readiness failed")
+
+        def get_rank(self):
+            return 0
+
+        def broadcast_object_list(self, _values, _src):
+            raise AssertionError("publication outcome must not broadcast")
+
+    class Optimizer:
+        def step(self):
+            updates.append(True)
+
+    monkeypatch.setattr(
+        plugin,
+        "_mutation_distributed",
+        lambda: UnreadyWorld(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_publish_mutation_notice",
+        lambda _url, _token: callbacks.append(True),
+        raising=False,
+    )
+    optimizer = plugin._wrap_optimizer_with_mutation_notice(
+        Optimizer(), "http://bridge", "token"
+    )
+
+    with pytest.raises(RuntimeError, match="readiness failed"):
+        optimizer.step()
+
+    assert callbacks == []
+    assert updates == []
+
+
+def test_marker_publication_failure_reaches_all_ranks_before_optimizer_step(
+    monkeypatch,
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    world = _ThreadedDistributedWorld(2)
+    callbacks = []
     updates = []
 
     class Optimizer:
@@ -2454,40 +2710,37 @@ def test_failed_rank_acknowledgement_prevents_all_optimizer_steps(monkeypatch):
         def step(self):
             updates.append(self.rank)
 
-    def post_notice(_url, token):
-        notices.append(token)
-        if token == "failed-rank":
-            raise FlashTeacherBridgeError(
-                "persistent mutation transport failure",
-                classification="transient",
-                delivery_unknown=True,
-            )
+    def fail_publication(_url, _token):
+        callbacks.append(True)
+        raise FlashTeacherBridgeError(
+            "marker publication failed",
+            classification="transient",
+        )
 
-    def barrier():
-        barriers.append(True)
-        raise RuntimeError("world barrier lost a rank")
-
-    monkeypatch.setattr(plugin, "_post_mutation_notice", post_notice)
+    monkeypatch.setattr(plugin, "_mutation_distributed", lambda: world, raising=False)
     monkeypatch.setattr(
         plugin,
-        "_mutation_acknowledgement_barrier",
-        barrier,
+        "_publish_mutation_notice",
+        fail_publication,
         raising=False,
     )
-    failed_rank = plugin._wrap_optimizer_with_mutation_notice(
-        Optimizer(0), "http://bridge", "failed-rank"
-    )
-    acknowledged_rank = plugin._wrap_optimizer_with_mutation_notice(
-        Optimizer(1), "http://bridge", "acknowledged-rank"
-    )
+    optimizers = [
+        plugin._wrap_optimizer_with_mutation_notice(
+            Optimizer(rank), "http://bridge", "token"
+        )
+        for rank in range(2)
+    ]
 
-    with pytest.raises(FlashTeacherBridgeError):
-        failed_rank.step()
-    with pytest.raises(RuntimeError, match="lost a rank"):
-        acknowledged_rank.step()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(world.run, rank, optimizer.step)
+            for rank, optimizer in enumerate(optimizers)
+        ]
+        for future in futures:
+            with pytest.raises(FlashTeacherBridgeError, match="publication failed"):
+                future.result()
 
-    assert notices == ["failed-rank", "acknowledged-rank"]
-    assert barriers == [True]
+    assert callbacks == [True]
     assert updates == []
 
 
