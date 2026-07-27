@@ -13,7 +13,7 @@ import re
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -60,7 +60,11 @@ from flash.engine.worker.sft_verl import (
     _warmstart_adapter_path,
 )
 from flash.engine.worker.teacher import TeacherError
-from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
+from flash.engine.worker.tokenizer_align import (
+    TeacherToken,
+    groupwise_alignment,
+    groupwise_coverage,
+)
 from flash.engine.worker.verl_common import (
     latest_global_step_dir,
     resolve_verl_python,
@@ -72,6 +76,232 @@ _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
 _VERL_METRIC_RE = re.compile(r"(?:^| - )(?P<name>[^:]+):(?P<value>[^ ]+)")
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
+_TEXT_TEACHER_BATCH_SIZE = 8
+_TEXT_TEACHER_FLUSH_WAIT_S = 0.1
+_TEXT_TEACHER_SHUTDOWN_WAIT_S = 5.0
+
+
+@dataclass
+class _TextTeacherWaiter:
+    item: tuple[str, str]
+    enqueued_at: float
+    done: threading.Event = field(default_factory=threading.Event)
+    result: list[TeacherToken] | None = None
+    error: Exception | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def complete(
+        self,
+        *,
+        result: list[TeacherToken] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        with self._lock:
+            if self.done.is_set():
+                return
+            self.result = result
+            self.error = error
+            self.done.set()
+
+    def wait(self) -> list[TeacherToken]:
+        self.done.wait()
+        if self.error is not None:
+            raise self.error
+        if self.result is None:
+            raise RuntimeError("text teacher batch waiter completed without a result")
+        return self.result
+
+
+def _teacher_batch_error(error: Exception) -> Exception:
+    if isinstance(error, TeacherError):
+        return TeacherError(str(error), permanent=error.permanent)
+    return RuntimeError(str(error))
+
+
+def _validate_text_teacher_batch(
+    scored,
+    items: list[tuple[str, str]],
+) -> list[list[TeacherToken]]:
+    expected = len(items)
+    if not isinstance(scored, list) or len(scored) != expected:
+        actual = len(scored) if isinstance(scored, list) else type(scored).__name__
+        raise TeacherError(
+            f"teacher text batch returned {actual} result(s) for {expected} unique input(s)",
+            permanent=True,
+        )
+    for result_index, (tokens, (_prompt_text, completion_text)) in enumerate(
+        zip(scored, items, strict=True)
+    ):
+        if not isinstance(tokens, list):
+            raise TeacherError(
+                f"teacher text batch result {result_index} is not a token list",
+                permanent=True,
+            )
+        previous_start = -1
+        previous_end = -1
+        for token_index, token in enumerate(tokens):
+            if not isinstance(token, TeacherToken):
+                raise TeacherError(
+                    f"teacher text batch result {result_index} contains an invalid token",
+                    permanent=True,
+                )
+            if not isinstance(token.text, str):
+                raise TeacherError(
+                    f"teacher text batch result {result_index} token {token_index} has invalid text",
+                    permanent=True,
+                )
+            if (
+                isinstance(token.logprob, bool)
+                or not isinstance(token.logprob, int | float)
+                or not math.isfinite(token.logprob)
+                or token.logprob > 0
+            ):
+                raise TeacherError(
+                    f"teacher text batch result {result_index} token {token_index} has invalid logprob",
+                    permanent=True,
+                )
+            if (
+                isinstance(token.start, bool)
+                or isinstance(token.end, bool)
+                or not isinstance(token.start, int)
+                or not isinstance(token.end, int)
+                or token.start < 0
+                or token.end < token.start
+                or token.end > len(completion_text)
+                or token.start < previous_start
+                or token.end < previous_end
+            ):
+                raise TeacherError(
+                    f"teacher text batch result {result_index} token {token_index} has invalid offsets",
+                    permanent=True,
+                )
+            previous_start = token.start
+            previous_end = token.end
+    return scored
+
+
+class _TextTeacherBatcher:
+    def __init__(
+        self,
+        teacher,
+        *,
+        max_batch_size: int = _TEXT_TEACHER_BATCH_SIZE,
+        flush_wait_s: float = _TEXT_TEACHER_FLUSH_WAIT_S,
+    ) -> None:
+        if max_batch_size <= 0:
+            raise ValueError("text teacher batch size must be positive")
+        if flush_wait_s <= 0:
+            raise ValueError("text teacher flush wait must be positive")
+        self.teacher = teacher
+        self.max_batch_size = int(max_batch_size)
+        self.flush_wait_s = float(flush_wait_s)
+        self._condition = threading.Condition()
+        self._pending: list[_TextTeacherWaiter] = []
+        self._in_flight: list[_TextTeacherWaiter] = []
+        self._closed = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("text teacher batcher is closed")
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(
+                target=self._run,
+                name="flash-opd-text-teacher-batcher",
+                daemon=True,
+            )
+            thread = self._thread
+        thread.start()
+
+    def score(self, prompt_text: str, completion_text: str) -> list[TeacherToken]:
+        with self._condition:
+            if self._closed:
+                raise TeacherError("text teacher batcher shut down", permanent=True)
+            waiter = _TextTeacherWaiter(
+                (prompt_text, completion_text),
+                enqueued_at=time.monotonic(),
+            )
+            self._pending.append(waiter)
+            self._condition.notify_all()
+        return waiter.wait()
+
+    def _take_batch(self) -> list[_TextTeacherWaiter] | None:
+        with self._condition:
+            while not self._pending:
+                if self._closed:
+                    return None
+                self._condition.wait()
+            deadline = self._pending[0].enqueued_at + self.flush_wait_s
+            while len(self._pending) < self.max_batch_size and not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._condition.wait(remaining)
+            if self._closed:
+                return None
+            batch = self._pending[: self.max_batch_size]
+            del self._pending[: len(batch)]
+            self._in_flight = batch
+            return batch
+
+    def _score_batch(self, batch: list[_TextTeacherWaiter]) -> None:
+        unique_items: list[tuple[str, str]] = []
+        item_indexes: dict[tuple[str, str], int] = {}
+        scatter_indexes: list[int] = []
+        for waiter in batch:
+            index = item_indexes.get(waiter.item)
+            if index is None:
+                index = len(unique_items)
+                item_indexes[waiter.item] = index
+                unique_items.append(waiter.item)
+            scatter_indexes.append(index)
+        scored = _validate_text_teacher_batch(
+            self.teacher.score_many(unique_items),
+            unique_items,
+        )
+        for waiter, index in zip(batch, scatter_indexes, strict=True):
+            waiter.complete(result=scored[index])
+
+    def _run(self) -> None:
+        try:
+            while True:
+                batch = self._take_batch()
+                if batch is None:
+                    return
+                try:
+                    self._score_batch(batch)
+                except Exception as error:
+                    for waiter in batch:
+                        waiter.complete(error=_teacher_batch_error(error))
+                finally:
+                    with self._condition:
+                        self._in_flight = []
+                        self._condition.notify_all()
+        finally:
+            error = TeacherError("text teacher batcher stopped", permanent=True)
+            with self._condition:
+                stranded = [*self._pending, *self._in_flight]
+                self._pending.clear()
+                self._in_flight = []
+                self._closed = True
+                self._condition.notify_all()
+            for waiter in stranded:
+                waiter.complete(error=_teacher_batch_error(error))
+
+    def close(self, timeout_s: float = _TEXT_TEACHER_SHUTDOWN_WAIT_S) -> None:
+        error = TeacherError("text teacher batcher shut down", permanent=True)
+        with self._condition:
+            self._closed = True
+            stranded = [*self._pending, *self._in_flight]
+            self._pending.clear()
+            self._condition.notify_all()
+            thread = self._thread
+        for waiter in stranded:
+            waiter.complete(error=_teacher_batch_error(error))
+        if thread is not None:
+            thread.join(timeout=max(0.0, timeout_s))
 
 
 @dataclass(frozen=True)
@@ -249,6 +479,7 @@ class _TeacherAlignmentBridge:
         self.token = hashlib.sha256(os.urandom(32)).hexdigest()
         self._server = None
         self._thread = None
+        self._text_teacher_batcher: _TextTeacherBatcher | None = None
         self._env_lock = threading.Lock()
         self._sessions_lock = threading.Lock()
         self._sessions: dict[str, dict] = {}
@@ -402,7 +633,12 @@ class _TeacherAlignmentBridge:
                     [(teacher_prompt, completion_text, teacher_images)]
                 )
             else:
-                teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+                if self._text_teacher_batcher is None:
+                    teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+                else:
+                    teacher_tokens = self._text_teacher_batcher.score(
+                        teacher_prompt, completion_text
+                    )
         except TeacherError as error:
             if error.permanent:
                 raise
@@ -883,7 +1119,17 @@ class _TeacherAlignmentBridge:
                         },
                     )
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._text_teacher_batcher = _TextTeacherBatcher(
+            self.teacher,
+            max_batch_size=_TEXT_TEACHER_BATCH_SIZE,
+            flush_wait_s=_TEXT_TEACHER_FLUSH_WAIT_S,
+        )
+        self._text_teacher_batcher.start()
+        try:
+            self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        except Exception:
+            self._text_teacher_batcher.close()
+            raise
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         if self.multi_turn:
@@ -909,6 +1155,9 @@ class _TeacherAlignmentBridge:
             self._session_tombstones.clear()
         if self._server is not None:
             self._server.shutdown()
+        if self._text_teacher_batcher is not None:
+            self._text_teacher_batcher.close()
+        if self._server is not None:
             self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)

@@ -8,7 +8,10 @@ import importlib.util
 import json
 import os
 import sys
+import threading
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -656,7 +659,23 @@ class _MergedBridgeTeacher:
         return [TeacherToken(text="AB", logprob=-1.1, start=0, end=2)]
 
 
+class _ScoreManyTeacherAdapter:
+    def __init__(self, teacher):
+        self.teacher = teacher
+
+    def score(self, prompt_text, completion_text):
+        return self.teacher.score(prompt_text, completion_text)
+
+    def score_many(self, items):
+        return [
+            self.teacher.score(prompt_text, completion_text)
+            for prompt_text, completion_text in items
+        ]
+
+
 def _text_bridge(teacher, *, mutation_callback=None):
+    if not hasattr(teacher, "score_many"):
+        teacher = _ScoreManyTeacherAdapter(teacher)
     return _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
@@ -676,6 +695,100 @@ def _text_bridge(teacher, *, mutation_callback=None):
             mutation_callback if mutation_callback is not None else lambda: None
         ),
     )
+
+
+def _batching_bridge(teacher, prompt_texts):
+    return _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": prompt_text}],
+                teacher_messages=[{"role": "user", "content": prompt_text}],
+                prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
+            )
+            for prompt_text in prompt_texts
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=teacher,
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+
+
+class _BatchingTeacher:
+    def __init__(self, prompt_texts, *, failure: str | None = None):
+        self.logprobs = {
+            f"User: {prompt_text}\nAssistant: ": -float(index + 1)
+            for index, prompt_text in enumerate(dict.fromkeys(prompt_texts))
+        }
+        self.failure = failure
+        self.batches = []
+        self.called = threading.Event()
+        self._lock = threading.Lock()
+
+    def score_many(self, items):
+        with self._lock:
+            self.batches.append(list(items))
+        self.called.set()
+        if self.failure == "transient":
+            from flash.engine.worker.teacher import TeacherError
+
+            raise TeacherError("teacher unavailable", permanent=False)
+        if self.failure == "permanent":
+            from flash.engine.worker.teacher import TeacherError
+
+            raise TeacherError("permanent teacher failure", permanent=True)
+        if self.failure == "wrong_count":
+            return []
+        if self.failure == "malformed_result":
+            return [[object()] for _item in items]
+        if self.failure == "invalid_offsets":
+            return [
+                [TeacherToken(text="AB", logprob=-1.0, start=0, end=3)]
+                for _item in items
+            ]
+        return [
+            [
+                TeacherToken(
+                    text=completion_text,
+                    logprob=self.logprobs[prompt_text],
+                    start=0,
+                    end=len(completion_text),
+                )
+            ]
+            for prompt_text, completion_text in items
+        ]
+
+
+def _concurrent_bridge_scores(bridge, indexes, *, via_http=True):
+    start = threading.Barrier(len(indexes))
+
+    def score(index):
+        start.wait(timeout=5.0)
+        try:
+            if via_http:
+                result = _post_json(
+                    bridge.url,
+                    bridge.token,
+                    "/score",
+                    _bridge_score_payload(index, [10, 11], [65, 66, 99]),
+                )
+            else:
+                result = bridge.score(index, 2, [10, 11, 65, 66, 99])
+            return "ok", result
+        except Exception as error:
+            return "error", error
+
+    with ThreadPoolExecutor(max_workers=len(indexes)) as executor:
+        futures = [executor.submit(score, index) for index in indexes]
+        return [future.result(timeout=10.0) for future in futures]
+
+
+def _teacher_logsum(result):
+    return result["teacher_logprobs"][1]
 
 
 def _exhaust_bridge_no_signal(bridge):
@@ -723,6 +836,214 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     assert bridge.generated_tokens == 3
     with pytest.raises(ValueError, match="prompt ids"):
         bridge.score(0, 2, [10, 12, 65, 99])
+
+
+def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests():
+    prompt_texts = [f"question-{index}" for index in range(17)]
+    teacher = _BatchingTeacher(prompt_texts)
+    bridge = _batching_bridge(teacher, prompt_texts)
+    bridge.start()
+    try:
+        outcomes = _concurrent_bridge_scores(bridge, range(17))
+    finally:
+        bridge.close()
+
+    assert all(status == "ok" for status, _result in outcomes)
+    batch_sizes = [len(batch) for batch in teacher.batches]
+    assert sum(batch_sizes) == 17
+    assert max(batch_sizes) == 8
+    assert all(size <= 8 for size in batch_sizes)
+
+
+def test_text_teacher_batcher_flushes_final_partial_batch_within_bound():
+    teacher = _BatchingTeacher(["question"])
+    bridge = _batching_bridge(teacher, ["question"])
+    bridge.start()
+    started = time.monotonic()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _post_json,
+                bridge.url,
+                bridge.token,
+                "/score",
+                _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+            )
+            assert teacher.called.wait(timeout=0.5)
+            elapsed = time.monotonic() - started
+            result = future.result(timeout=5.0)
+    finally:
+        bridge.close()
+
+    assert elapsed < 0.5
+    assert result["teacher_ids"] == [-1, 0, 0, -1, -1]
+    assert [len(batch) for batch in teacher.batches] == [1]
+
+
+def test_text_teacher_batcher_deduplicates_exact_pairs_and_scatters_to_all_waiters(
+    monkeypatch,
+):
+    from flash.engine.worker import opd_verl as opd_verl_mod
+
+    monkeypatch.setattr(opd_verl_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    prompt_texts = ["same question"] * 8
+    teacher = _BatchingTeacher(prompt_texts)
+    bridge = _batching_bridge(teacher, prompt_texts)
+    bridge.start()
+    try:
+        outcomes = _concurrent_bridge_scores(bridge, range(8), via_http=False)
+    finally:
+        bridge.close()
+
+    assert teacher.batches == [
+        [("User: same question\nAssistant: ", "AB")]
+    ]
+    assert all(status == "ok" for status, _result in outcomes)
+    assert [_teacher_logsum(result) for _status, result in outcomes] == [-1.0] * 8
+    assert bridge.score_requests == 8
+    assert bridge.teacher_ok == 8
+
+
+def test_text_teacher_batcher_keeps_nonidentical_inputs_separate_and_ordered(monkeypatch):
+    from flash.engine.worker import opd_verl as opd_verl_mod
+
+    monkeypatch.setattr(opd_verl_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    prompt_texts = [f"distinct-{index}" for index in range(8)]
+    teacher = _BatchingTeacher(prompt_texts)
+    bridge = _batching_bridge(teacher, prompt_texts)
+    bridge.start()
+    try:
+        outcomes = _concurrent_bridge_scores(bridge, range(8), via_http=False)
+    finally:
+        bridge.close()
+
+    assert len(teacher.batches) == 1
+    assert len(teacher.batches[0]) == 8
+    for index, (status, result) in enumerate(outcomes):
+        teacher_prompt = f"User: distinct-{index}\nAssistant: "
+        assert status == "ok"
+        assert _teacher_logsum(result) == teacher.logprobs[teacher_prompt]
+
+
+def test_text_teacher_batch_transient_failure_recovers_each_logical_sample_once(monkeypatch):
+    from flash.engine.worker import opd_verl as opd_verl_mod
+
+    monkeypatch.setattr(opd_verl_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    prompt_texts = [f"transient-{index}" for index in range(8)]
+    teacher = _BatchingTeacher(prompt_texts, failure="transient")
+    bridge = _batching_bridge(teacher, prompt_texts)
+    bridge.start()
+    try:
+        outcomes = _concurrent_bridge_scores(bridge, range(8), via_http=False)
+        _post_json(bridge.url, bridge.token, "/no-signal/abandoned", {})
+    finally:
+        bridge.close()
+
+    assert len(teacher.batches) == 1
+    assert all(status == "ok" for status, _result in outcomes)
+    assert all(
+        result["teacher_ids"] == [-1, -1, -1, -1, -1]
+        for _status, result in outcomes
+    )
+    assert bridge.score_requests == 8
+    assert bridge.teacher_transient == 8
+    assert bridge.teacher_ok == 0
+    assert bridge.teacher_error == 0
+    assert bridge.teacher_failure == ("transient", "teacher unavailable")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["permanent", "wrong_count", "malformed_result", "invalid_offsets"],
+)
+def test_text_teacher_batch_failures_complete_every_waiter_fail_closed(failure):
+    prompt_texts = [f"failure-{index}" for index in range(8)]
+    teacher = _BatchingTeacher(prompt_texts, failure=failure)
+    bridge = _batching_bridge(teacher, prompt_texts)
+    bridge.start()
+    try:
+        outcomes = _concurrent_bridge_scores(bridge, range(8))
+    finally:
+        bridge.close()
+
+    assert teacher.batches
+    assert sum(len(batch) for batch in teacher.batches) == 8
+    assert all(len(batch) <= 8 for batch in teacher.batches)
+    assert all(status == "error" for status, _error in outcomes)
+    errors = [error for _status, error in outcomes]
+    assert all(isinstance(error, FlashTeacherBridgeError) for error in errors)
+    assert all(error.classification == "permanent" for error in errors)
+    assert bridge.score_requests == 8
+    assert bridge.teacher_error == 8
+    assert bridge.teacher_transient == 0
+    assert bridge.teacher_ok == 0
+
+
+def test_text_teacher_batch_mixed_dedup_preserves_logical_accounting(monkeypatch):
+    from flash.engine.worker import opd_verl as opd_verl_mod
+
+    monkeypatch.setattr(opd_verl_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    prompt_texts = [
+        "duplicate",
+        "unique-a",
+        "duplicate",
+        "unique-b",
+        "duplicate",
+        "unique-a",
+        "duplicate",
+        "unique-b",
+    ]
+    teacher = _BatchingTeacher(prompt_texts)
+    bridge = _batching_bridge(teacher, prompt_texts)
+    bridge.start()
+    try:
+        outcomes = _concurrent_bridge_scores(bridge, range(8), via_http=False)
+    finally:
+        bridge.close()
+
+    assert len(teacher.batches) == 1
+    assert len(teacher.batches[0]) == 3
+    for prompt_text, (status, result) in zip(prompt_texts, outcomes, strict=True):
+        assert status == "ok"
+        assert _teacher_logsum(result) == teacher.logprobs[
+            f"User: {prompt_text}\nAssistant: "
+        ]
+    assert bridge.score_requests == 8
+    assert bridge.teacher_ok == 8
+    assert bridge.teacher_input_tokens == 40
+    assert bridge.aligned_sequences == 8
+
+
+def test_text_teacher_batcher_shutdown_cannot_strand_pending_bridge_waiter(monkeypatch):
+    from flash.engine.worker import opd_verl as opd_verl_mod
+
+    monkeypatch.setattr(opd_verl_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 10.0)
+    teacher = _BatchingTeacher(["question"])
+    bridge = _batching_bridge(teacher, ["question"])
+    bridge.start()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        _post_json,
+        bridge.url,
+        bridge.token,
+        "/score",
+        _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+    )
+    batcher = bridge._text_teacher_batcher
+    assert batcher is not None
+    with batcher._condition:
+        assert batcher._condition.wait_for(lambda: bool(batcher._pending), timeout=1.0)
+
+    bridge.close()
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as error:
+            future.result(timeout=2.0)
+    finally:
+        executor.shutdown(wait=True)
+
+    assert error.value.classification == "permanent"
+    assert not teacher.called.is_set()
+    assert bridge.teacher_error == 1
 
 
 def test_transient_teacher_sample_returns_no_signal_while_following_peer_trains():
@@ -1102,7 +1423,13 @@ def test_multimodal_bridge_rebuilds_teacher_images_in_frozen_order_and_accounts_
         mutation_callback=lambda: None,
     )
 
-    encoded = bridge.score(0, 2, [10, 11, 65, 66, 99], image_count=2)
+    bridge.start()
+    try:
+        encoded = bridge.score(0, 2, [10, 11, 65, 66, 99], image_count=2)
+        with pytest.raises(ValueError, match="exactly match"):
+            bridge.score(0, 3, [10, 11, 77, 65, 99], image_count=2)
+    finally:
+        bridge.close()
 
     expected_uris = image_descriptors_to_data_uris(descriptors, tmp_path)
     assert teacher.items == [
@@ -1110,8 +1437,6 @@ def test_multimodal_bridge_rebuilds_teacher_images_in_frozen_order_and_accounts_
     ]
     assert encoded["teacher_ids"] == [-1, 0, 1, -1, -1]
     assert bridge.teacher_input_tokens == 17
-    with pytest.raises(ValueError, match="exactly match"):
-        bridge.score(0, 3, [10, 11, 77, 65, 99], image_count=2)
 
 
 def test_bridge_rejects_parent_child_image_count_mismatch_before_scoring():
