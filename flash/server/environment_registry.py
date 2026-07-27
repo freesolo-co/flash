@@ -31,6 +31,9 @@ _PACKAGE_PATH = "/api/flash/environments/package/internal"
 _USE_PATH = "/api/flash/environments/use/internal"
 _DEFAULT_HUB_REPO = "freesolo-co/environment-hub"
 _DEFAULT_HUB_REF = "main"
+# a hub source response is only {"sourceKind":"hub"}, so this window holds any well-formed
+# hub reply with room to spare while still refusing to buffer a built-in inline package.
+_SOURCE_KIND_PROBE_BYTES = 512
 
 
 def _post(path: str, body: dict, *, subject: str) -> bool:
@@ -220,35 +223,46 @@ def resolve_environment_source_kind(
         project_id=project_id,
         key=key,
         org_id=org_id,
-        max_bytes=512,
+        max_bytes=_SOURCE_KIND_PROBE_BYTES,
         reject_oversize=False,
     )
-    match = re.match(rb'\s*\{\s*"sourceKind"\s*:\s*"(hub|builtin)"', raw)
-    if match is None:
+    # a hub response is the fixed one-key object {"sourceKind":"hub"}, so it always fits well
+    # inside the probe window. filling the window therefore proves an inline built-in package
+    # without decoding it, and a response that fits is parsed by field name so json member
+    # order never decides the outcome.
+    if len(raw) >= _SOURCE_KIND_PROBE_BYTES:
+        return "builtin"
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=502,
-            detail="Freesolo environment package resolution returned an invalid source kind",
+            detail="Freesolo environment package resolution returned invalid JSON",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Freesolo environment package resolution returned an invalid response",
         )
-    source_kind = match.group(1).decode("ascii")
+    source_kind = payload.get("sourceKind")
     if source_kind == "hub":
-        try:
-            payload = json.loads(raw)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=502,
-                detail="Freesolo environment package resolution returned invalid JSON",
-            ) from exc
-        if payload != {"sourceKind": "hub"}:
+        if set(payload) != {"sourceKind"}:
             raise HTTPException(
                 status_code=502,
                 detail="Freesolo Hub environment package response has an invalid shape",
             )
-    elif re.match(rb'\s*\{\s*"sourceKind"\s*:\s*"builtin"\s*,\s*"packageBase64"\s*:', raw) is None:
-        raise HTTPException(
-            status_code=502,
-            detail="Freesolo built-in environment package response has an invalid shape",
-        )
-    return source_kind
+        return "hub"
+    if source_kind == "builtin":
+        if set(payload) != {"sourceKind", "packageBase64", "packageSha256"}:
+            raise HTTPException(
+                status_code=502,
+                detail="Freesolo built-in environment package response has an invalid shape",
+            )
+        return "builtin"
+    raise HTTPException(
+        status_code=502,
+        detail="Freesolo environment package resolution returned an invalid source kind",
+    )
 
 
 def resolve_environment_package_source(

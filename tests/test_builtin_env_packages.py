@@ -108,6 +108,54 @@ def test_source_kind_reads_only_the_response_prefix(monkeypatch):
     assert reads[0] < len(raw)
 
 
+def _resolve_source_kind(monkeypatch, raw: bytes) -> str:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            return raw[:size] if size and size > 0 else raw
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda _request, timeout=None: Response(),
+    )
+    return environment_registry.resolve_environment_source_kind(
+        slug="acme/example",
+        project_id=_PROJECT_ID,
+        key={"org_id": "org-test"},
+    )
+
+
+def test_source_kind_ignores_json_member_order(monkeypatch):
+    # json object member order carries no meaning, so a built-in response that lists
+    # sourceKind after the package fields must still resolve rather than fail as invalid.
+    raw = json.dumps(
+        {
+            "packageSha256": "a" * 64,
+            "packageBase64": "QQ==",
+            "sourceKind": "builtin",
+        }
+    ).encode()
+
+    assert _resolve_source_kind(monkeypatch, raw) == "builtin"
+
+
+def test_source_kind_rejects_unknown_kind(monkeypatch):
+    raw = json.dumps({"sourceKind": "other"}).encode()
+
+    with pytest.raises(HTTPException) as excinfo:
+        _resolve_source_kind(monkeypatch, raw)
+
+    assert excinfo.value.status_code == 502
+
+
 def test_package_source_preserves_project_mismatch_status_without_leak(monkeypatch):
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/package/internal",
