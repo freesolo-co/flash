@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import flash.engine.worker as W
@@ -165,8 +166,12 @@ def test_render_reward_module_missing_index_raises():
         ns["compute_score"]("flash_env", "answer", "unused", extra_info={})
 
 
-@pytest.mark.parametrize("index", [True, 1.9])
-def test_render_reward_module_rejects_lossy_index(monkeypatch, index):
+@pytest.mark.parametrize(
+    "index",
+    [True, 1.9, np.bool_(True), np.bool_(False), float("nan"), float("inf"), float("-inf")],
+    ids=["bool", "fractional", "numpy-true", "numpy-false", "nan", "positive-inf", "negative-inf"],
+)
+def test_render_reward_module_rejects_invalid_index(monkeypatch, index):
     monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", "http://unused")
     ns: dict = {}
     exec(compile(rl_verl.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns)
@@ -180,7 +185,7 @@ def test_render_reward_module_rejects_lossy_index(monkeypatch, index):
         ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": index})
 
 
-@pytest.mark.parametrize("index", [1, 1.0])
+@pytest.mark.parametrize("index", [1, 1.0, np.int64(1), np.float64(1.0)])
 def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
     scored = []
     server, url = rl_verl.start_reward_server(
