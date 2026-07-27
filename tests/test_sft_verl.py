@@ -106,7 +106,9 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "trainer.total_epochs": "4",
         "trainer.test_freq": "-1",
         "trainer.resume_mode": "auto",
-        "trainer.max_ckpt_to_keep": "null",
+        "model.use_fused_kernels": "true",
+        "model.fused_kernel_options.impl_backend": "torch",
+        "trainer.max_ckpt_to_keep": "1",
         "trainer.total_training_steps": "120",
     }
     assert "optim.eps" not in overrides
@@ -703,3 +705,12 @@ def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypat
     assert captured["meta"]["notes"]["loss_curve"] == [1.0]
     assert captured["meta"]["notes"]["loraplus_applied"] is True
     assert captured["meta"]["notes"]["realized_max_length"] > 0
+
+
+def test_overrides_enable_fused_linear_ce_for_long_context():
+    # 32k contexts must not materialize [tokens, vocab] logits; the fused torch-backend
+    # linear-CE computes loss from hidden states in chunks (numerically exact CE).
+    o = build_sft_verl_overrides(_cfg(max_length=32768))
+    assert "model.use_fused_kernels=true" in o
+    assert "model.fused_kernel_options.impl_backend=torch" in o
+    assert "data.max_length=32768" in o

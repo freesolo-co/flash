@@ -140,14 +140,18 @@ def export_trace_records(
     api_key: str,
     base_url: str | None = None,
     limit: int | None = None,
+    export_format: str | None = None,
 ) -> dict[str, Any]:
-    """Freesolo environment records converted from a project's traces.
+    """A project's traces in the requested shape, converted server-side.
 
-    Returns ``{"records": [{"input", "output"}, ...], "traces": N, "skipped": N}``. The conversion
-    runs server-side, matching what the web app's trace export downloads."""
+    Returns ``{"records": [...], "traces": N, "skipped": N, "format": name}``. The
+    shape of each record depends on ``export_format`` (see EXPORT_FORMATS); the
+    conversion runs server-side, matching what the web app's export downloads."""
     query = {"project_id": project_id}
     if limit is not None:
         query["limit"] = str(int(limit))
+    if export_format is not None:
+        query["format"] = export_format
     path = f"{FREESOLO_TRACES_EXPORT_PATH}?{urllib.parse.urlencode(query)}"
     # a whole project's traces can be a large read; give it room beyond the default.
     return _freesolo_get(path, api_key, base_url, timeout=300.0)
@@ -360,10 +364,17 @@ class ApiClient:
         *,
         name: str,
         package_b64: str,
+        project_id: str | None = None,
         progress: ProgressCallback | None = None,
     ) -> dict:
-        """Upload a packaged Freesolo environment to the managed Environments Hub."""
+        """Upload a packaged Freesolo environment to the managed Environments Hub.
+
+        ``project_id`` groups the environment under one of the org's projects. Omit it and the
+        env keeps whatever project it is already in, or lands in the org's Default on a first
+        publish — so a republish never has to restate a grouping set from the dashboard."""
         body = {"name": name, "package_b64": package_b64}
+        if project_id:
+            body["project_id"] = project_id
         return self._request("POST", "/v1/envs", body=body, timeout=1800.0, progress=progress)
 
     def delete_env(self, env_id: str) -> dict:

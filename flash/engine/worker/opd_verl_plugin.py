@@ -416,7 +416,15 @@ def _install_verl_extensions() -> None:
         keys = [key for key, selected in zip(batch.keys, keep.tolist(), strict=True) if selected]
         tags = [tag for tag, selected in zip(batch.tags, keep.tolist(), strict=True) if selected]
         if not keys:
-            raise RuntimeError("flash OPD step produced no aligned teacher signal")
+            # a single all-transient-failure batch must not abort the whole run: keep the batch
+            # unfiltered and let the loss mask zero the unaligned sequences; the parent's
+            # no-signal-run guard still fails the run if NO step ever aligns.
+            print(
+                "[flash-opd] step produced no aligned teacher signal; passing batch through "
+                "with zeroed distillation mask (transient teacher failures)",
+                flush=True,
+            )
+            return batch
         return KVBatchMeta(
             keys=keys,
             tags=tags,

@@ -193,6 +193,10 @@ class _TeacherAlignmentBridge:
         )
         self.truncated_rollouts = int(state.get("truncated_rollouts", 0))
         self.coverage_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        # resume: baseline the per-step delta counters at the restored cumulative mass, so the
+        # first resumed step reports its own coverage instead of the whole prior run's.
+        self._prev_aligned = self.aligned_sequences
+        self._prev_cov_sum = self.coverage_sum
         self.teacher_ok = int(state.get("teacher_ok", 0))
         self.teacher_transient = int(state.get("teacher_transient", 0))
         self.teacher_error = int(state.get("teacher_error", 0))
@@ -433,7 +437,13 @@ class _OpdProgressState:
             snapshot = bridge.accounting_snapshot()
             self.loss_curve.append(float(loss))
             aligned = int(snapshot["aligned_sequences"])
-            coverage = float(snapshot["coverage_sum"]) / aligned if aligned else 0.0
+            cov_sum = float(snapshot["coverage_sum"])
+            # per-step coverage: delta over the previous snapshot, so the curve shows each step's
+            # own alignment quality instead of a cumulative average that flattens regressions.
+            d_aligned = aligned - getattr(self, "_prev_aligned", 0)
+            d_cov = cov_sum - getattr(self, "_prev_cov_sum", 0.0)
+            self._prev_aligned, self._prev_cov_sum = aligned, cov_sum
+            coverage = (d_cov / d_aligned) if d_aligned > 0 else (cov_sum / aligned if aligned else 0.0)
             self.coverage_curve.append(coverage)
             snapshot.update(
                 {
@@ -513,6 +523,8 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         "data.filter_overlong_prompts=true",
         "data.truncation=error",
         "data.shuffle=false",
+        f"data.seed={_hydra_val(config.get('seed', 42))}",
+        f"actor_rollout_ref.rollout.seed={_hydra_val(config.get('seed', 42))}",
         "data.dataloader_num_workers=0",
         "data.image_key=images",
         "data.return_raw_chat=true",
@@ -844,7 +856,14 @@ def run_opd_verl(spec=None) -> None:
     max_examples = int(getattr(spec.train, "max_examples", 0) or 0) if spec else 0
     if max_examples > 0:
         train = train[:max_examples]
-    prompt_rows = [(example, env.prompt_messages(example)) for example in train]
+    _scanned = [0]
+    with liveness_heartbeat("opd_prompt_scan", progress=lambda: _scanned[0]):
+        # rendering prompts for a large dataset can outlast the heartbeat window; keep the worker
+        # alive while scanning (the scan is O(dataset) tokenizer/template work).
+        prompt_rows = []
+        for example in train:
+            prompt_rows.append((example, env.prompt_messages(example)))
+            _scanned[0] += 1
     multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
     model_id = spec.model if spec else RECIPE.hf_model_id
     if multimodal:
@@ -853,6 +872,11 @@ def run_opd_verl(spec=None) -> None:
     random.Random(_w.SEED).shuffle(train)
 
     started_at = time.time()
+    # validate the teacher credential BEFORE the gpu probe + model prefetch: a missing key fails
+    # in milliseconds instead of after minutes of paid setup.
+    api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("the managed teacher api key is missing from the OPD parent worker")
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
@@ -860,10 +884,6 @@ def run_opd_verl(spec=None) -> None:
     )
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
-
-    api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("the managed teacher api key is missing from the OPD parent worker")
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
     processor = None
     if multimodal:
@@ -1119,7 +1139,10 @@ def run_opd_verl(spec=None) -> None:
             if loss is None:
                 loss = _metric_value(line, "distillation/loss")
             if loss is None:
-                raise RuntimeError("verl OPD step log is missing the distillation loss metric")
+                # verl emits step-tagged lines that are not metric summaries (timers, val lines);
+                # skip those rather than killing the run. the end-of-run guard still fails loud
+                # when NO step ever produced a distillation loss.
+                return
             step = int(step_match.group(1))
             progress["loss"] = loss
             progress_state.record_step(step, loss, bridge)
@@ -1166,6 +1189,19 @@ def run_opd_verl(spec=None) -> None:
         if final_step < update_horizon:
             raise RuntimeError(
                 f"opd completed {final_step}/{update_horizon} requested optimizer updates"
+            )
+        if not final_accounting["loss_curve"]:
+            raise RuntimeError(
+                "verl OPD produced no distillation-loss metrics for the whole run — the "
+                "distillation path never engaged; refusing to publish"
+            )
+        if int(final_accounting.get("aligned_sequences", 0) or 0) <= 0:
+            # zeroed-mask pass-through batches still emit a (zero) loss metric, so the loss-curve
+            # check alone cannot distinguish real distillation from a run where the teacher never
+            # aligned once. require at least one aligned sequence before publishing.
+            raise RuntimeError(
+                "verl OPD saw zero aligned teacher sequences for the whole run — every batch was "
+                "no-signal; refusing to publish an unchanged adapter"
             )
         adapter_dir = os.path.join(workdir, "adapter")
         with liveness_heartbeat(
