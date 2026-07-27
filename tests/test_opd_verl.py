@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import importlib.metadata
 import importlib.util
 import json
@@ -66,6 +67,17 @@ def _write_mutation_failure_after_start(start, classification, message):
 
     start.wait()
     _write_mutation_failure_fallback(classification, message)
+
+
+def _send_truncated_json_response(handler, status, payload):
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(encoded) + 1))
+    handler.end_headers()
+    handler.wfile.write(encoded)
+    handler.wfile.flush()
+    handler.close_connection = True
 
 
 def _load_verl_rl_dataset(monkeypatch):
@@ -1639,6 +1651,65 @@ def test_lost_cycle_commit_response_retries_without_mutation_failure(
     assert bridge.teacher_failure == ("transient", "teacher unavailable")
 
 
+def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.teacher import TeacherError
+
+    class SuccessThenTransientTeacher:
+        def __init__(self):
+            self.calls = 0
+
+        def score(self, prompt_text, completion_text):
+            self.calls += 1
+            if self.calls == 1:
+                return _BridgeTeacher().score(prompt_text, completion_text)
+            raise TeacherError("teacher unavailable", permanent=False)
+
+    bridge = _text_bridge(SuccessThenTransientTeacher())
+    bridge.score(0, 2, [10, 11, 65, 66, 99])
+    mutation_failure_path = str(tmp_path / "mutation-failure")
+    monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", mutation_failure_path)
+
+    def unexpected_exit(code):
+        raise AssertionError(f"cycle commitment exited rank with status {code}")
+
+    monkeypatch.setattr(plugin.os, "_exit", unexpected_exit)
+    commit_calls = []
+    original_commit = bridge.commit_teacher_cycle
+
+    def record_commit():
+        commit_calls.append(True)
+        return original_commit()
+
+    bridge.commit_teacher_cycle = record_commit
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+    original_send = handler._send_json
+    sends = []
+
+    def truncate_first_response(request_handler, status, payload):
+        sends.append(status)
+        if len(sends) == 1:
+            return _send_truncated_json_response(request_handler, status, payload)
+        return original_send(request_handler, status, payload)
+
+    handler._send_json = truncate_first_response
+    try:
+        plugin._post_teacher_cycle_committed(bridge.url, bridge.token)
+        bridge.score(0, 2, [10, 11, 65, 66, 99])
+        bridge.record_no_signal_abandoned()
+    finally:
+        bridge.close()
+
+    assert sends == [200, 200]
+    assert commit_calls == [True, True]
+    assert bridge.mutation_failure is None
+    assert not list(tmp_path.glob("mutation-failure.*.json"))
+    assert bridge.teacher_failure == ("transient", "teacher unavailable")
+
+
 def test_mixed_transient_and_teacher_empty_alignment_exhaustion_remains_permanent():
     from flash.engine.worker.teacher import TeacherError
 
@@ -2147,6 +2218,98 @@ def test_mutation_lost_success_response_retries_once_without_republishing_marker
     assert sends == [200, 422, 200]
     assert not list(tmp_path.glob("mutation-failure.*.json"))
     assert bridge.mutation_failure is None
+
+
+def test_incomplete_mutation_response_retries_once_without_republishing_marker(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    callback_calls = []
+    optimizer_steps = []
+    bridge = _text_bridge(
+        _BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True)
+    )
+    failure_path = str(tmp_path / "mutation-failure")
+    monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
+
+    class UnexpectedChildExit(RuntimeError):
+        pass
+
+    def child_exit(code):
+        raise UnexpectedChildExit(code)
+
+    monkeypatch.setattr(plugin.os, "_exit", child_exit)
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+    original_send = handler._send_json
+    sends = []
+
+    def truncate_first_response(request_handler, status, payload):
+        sends.append(status)
+        if len(sends) == 1:
+            return _send_truncated_json_response(request_handler, status, payload)
+        return original_send(request_handler, status, payload)
+
+    handler._send_json = truncate_first_response
+    try:
+        plugin._post_mutation_notice(bridge.url, bridge.token)
+        optimizer_steps.append(True)
+    finally:
+        bridge.close()
+
+    assert callback_calls == [True]
+    assert optimizer_steps == [True]
+    assert sends == [200, 200]
+    assert not list(tmp_path.glob("mutation-failure.*.json"))
+    assert bridge.mutation_failure is None
+
+
+def test_persistent_incomplete_mutation_response_fails_closed_after_one_retry(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_mutation_failure_fallback
+
+    callback_calls = []
+    optimizer_steps = []
+    bridge = _text_bridge(
+        _BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True)
+    )
+    failure_path = str(tmp_path / "mutation-failure")
+    monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+    sends = []
+
+    def truncate_response(request_handler, status, payload):
+        sends.append(status)
+        return _send_truncated_json_response(request_handler, status, payload)
+
+    class ChildExit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    handler._send_json = truncate_response
+    monkeypatch.setattr(plugin.os, "_exit", child_exit)
+    try:
+        with pytest.raises(ChildExit) as exit_error:
+            plugin._post_mutation_notice(bridge.url, bridge.token)
+        fallback = _read_mutation_failure_fallback(failure_path)
+    finally:
+        bridge.close()
+
+    assert callback_calls == [True]
+    assert optimizer_steps == []
+    assert sends == [200, 200]
+    assert exit_error.value.code == 87
+    assert fallback is not None
+    assert fallback[0] == "transient"
+    assert http.client.IncompleteRead.__name__ in fallback[1]
 
 
 def test_persistent_mutation_response_loss_writes_fallback_without_optimizer_step(

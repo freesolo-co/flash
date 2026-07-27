@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import functools
 import hashlib
+import http.client
 import importlib.metadata
 import importlib.util
 import json
@@ -288,7 +289,12 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
                 classification="permanent",
             ) from error
         raise FlashTeacherBridgeError(message, classification=classification) from error
-    except (OSError, TimeoutError, urllib.error.URLError) as error:
+    except (
+        OSError,
+        TimeoutError,
+        urllib.error.URLError,
+        http.client.HTTPException,
+    ) as error:
         raise FlashTeacherBridgeError(
             f"flash OPD bridge transport failed: {type(error).__name__}",
             classification="transient",
