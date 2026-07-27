@@ -1008,11 +1008,7 @@ def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
             if algo not in info.algos:
                 continue
             train = {"epochs": 1, "max_examples": 8}
-            # opsd runs only in reasoning mode (the config gate rejects nonthink opsd), so thread
-            # thinking=true through both the vram sizing and the config for opsd rows so they stay
-            # consistent; other algorithms keep the default thinking=false sizing.
-            row_thinking = algo == "opsd"
-            need = allocator.required_vram_gb(model_id, algo, train=train, thinking=row_thinking)
+            need = allocator.required_vram_gb(model_id, algo, train=train)
 
             for configured_gpu in configured_gpu_types:
                 raw = {
@@ -1024,8 +1020,6 @@ def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
                     "train": train,
                     "gpu": {"type": configured_gpu},
                 }
-                if row_thinking:
-                    raw["thinking"] = True
                 key = (model_id, algo, configured_gpu)
                 if get_gpu_info(configured_gpu).vram_gb < need:
                     with pytest.raises(ConfigError, match="requires at least"):
