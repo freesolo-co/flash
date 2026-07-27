@@ -304,7 +304,26 @@ def _resolve_verl_python(workdir: str) -> str:
         # full install is used. exact pins are validated on the gpu pod before paid launch.
         subprocess.run(["uv", "venv", venv], check=True)
         subprocess.run(["uv", "pip", "install", "--python", py, "verl"], check=True)
+        if os.environ.get("WANDB_API_KEY"):
+            # verl does not pull wandb; add it (best-effort) so verl's wandb logger can import it in
+            # this isolated interpreter instead of aborting. a failure here -> console logger below.
+            subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
     return py
+
+
+def _resolve_verl_loggers(python_bin: str) -> str:
+    """verl's ``trainer.logger`` list. verl logs from its own interpreter, so enable the wandb
+    logger only when WANDB_API_KEY is set AND wandb is importable in that interpreter; otherwise
+    console-only. this never inits a flash-side run (flash does not train in-process on this path,
+    so a flash-side run would stay empty) and never aborts verl when its env lacks wandb."""
+    if not os.environ.get("WANDB_API_KEY"):
+        return "console"
+    has_wandb = (
+        subprocess.run([python_bin, "-c", "import wandb"], capture_output=True).returncode == 0
+    )
+    if not has_wandb:
+        print("[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; using console logger only")
+    return "console,wandb" if has_wandb else "console"
 
 
 def _export_peft_adapter(
@@ -451,6 +470,17 @@ def _resolve_single_turn_inputs():
         print(
             f"[rl-verl] advantage_clip={gcfg['advantage_clip']} recorded; verl centers grpo "
             "advantages (no value clip), matching the trl path",
+            flush=True,
+        )
+    # trl drops truncated (non-eos) completions from the grpo loss (mask_truncated_completions,
+    # default True); verl's vllm rollout here has no per-completion truncation-mask knob, so verl
+    # keeps them. stop_sequences (the only case that turns masking off) already fails loudly above,
+    # so this is always the default-True case. record the divergence for parity observability
+    # rather than silently ignoring it; adding verl-side masking is a tracked follow-up.
+    if _w.grpo_mask_truncated_completions(_t):
+        print(
+            "[rl-verl] mask_truncated_completions=True; verl keeps truncated completions in the "
+            "grpo loss (no verl truncation-mask knob) -- recorded parity caveat, not applied",
             flush=True,
         )
     learning_rate = float(_t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate)
@@ -671,21 +701,8 @@ def run_rl_verl():
         python_bin = _resolve_verl_python(workdir)
         micro_batch = 1
         expected_steps = int(inp["steps"])
-        # match flash's wandb reporting when configured (verl reads WANDB_API_KEY, which flash
-        # sets) — but only when wandb is importable in the VERL interpreter (verl logs from its own
-        # process; enabling the logger without the module aborts training there).
-        loggers = "console"
-        if "wandb" in (_w.wandb_report_to() or []):
-            _wandb_ok = (
-                subprocess.run(
-                    [python_bin, "-c", "import wandb"], capture_output=True, check=False
-                ).returncode
-                == 0
-            )
-            if _wandb_ok:
-                loggers = "console,wandb"
-            else:
-                print("[rl-verl] wandb requested but not importable in the verl interpreter; console only", flush=True)
+        # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).
+        loggers = _resolve_verl_loggers(python_bin)
         # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path — but NOT for
         # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
         # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.

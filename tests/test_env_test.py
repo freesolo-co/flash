@@ -267,6 +267,33 @@ def test_env_test_text_block_sft_completion_replays(monkeypatch, tmp_path, capsy
     assert "overall: PASS" in out
 
 
+class _UserOnlySftEnv(_SingleTurnEnv):
+    def sft_completion(self, example):
+        # gold completion with NO assistant turn: user/system text must never stand in for the
+        # model response -- the driver has to fall back to echo instead of replaying it.
+        return [
+            {"role": "system", "content": "system preamble"},
+            {"role": "user", "content": "user text that must not be replayed"},
+        ]
+
+    def reward(self, completion, example, state=None):
+        self.completions.append(completion)
+        return 1.0 if completion == "4" else 0.0
+
+
+def test_env_test_non_assistant_sft_completion_uses_echo(monkeypatch, tmp_path, capsys):
+    # regression: a gold completion whose only messages are user/system (no assistant) must echo,
+    # not replay the user/system text as the model response.
+    env_dir = _environment_dir(tmp_path)
+    env = _UserOnlySftEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    out = capsys.readouterr().out
+    assert "episode 1: policy=echo turns=1" in out
+    assert "user text that must not be replayed" not in "".join(env.completions)
+
+
 def test_env_test_scalar_sft_completion_fails_contract(monkeypatch, tmp_path, capsys):
     # a malformed gold answer (scalar content) must fail the episode, not echo-pass; the
     # adapter passes scalars through untouched, so the driver has to reject them itself
