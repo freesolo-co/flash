@@ -284,6 +284,7 @@ class _TeacherAlignmentBridge:
         self.opd_phase_seconds = dict(state.get("opd_phase_seconds", {}))
         self.opd_phase_counts = dict(state.get("opd_phase_counts", {}))
         self._teacher_failure: tuple[str, str] | None = None
+        self._mutation_failure: tuple[str, str] | None = None
         self._pending_teacher_transient: tuple[str, str] | None = None
         self._pending_teacher_success = False
 
@@ -301,6 +302,15 @@ class _TeacherAlignmentBridge:
     def teacher_failure(self) -> tuple[str, str] | None:
         with self._stats_lock:
             return self._teacher_failure
+
+    def _record_mutation_failure(self, classification: str, message: str) -> None:
+        with self._stats_lock:
+            self._mutation_failure = (classification, message)
+
+    @property
+    def mutation_failure(self) -> tuple[str, str] | None:
+        with self._stats_lock:
+            return self._mutation_failure
 
     def accounting_snapshot(self) -> dict:
         with self._stats_lock:
@@ -873,6 +883,8 @@ class _TeacherAlignmentBridge:
                     )
                     if self.path in {"/score", "/multiturn/score"}:
                         bridge._record_teacher_failure(classification, str(error))
+                    elif self.path == "/mutation":
+                        bridge._record_mutation_failure(classification, str(error))
                     self._send_json(
                         503 if classification == "transient" else 422,
                         {
@@ -1254,10 +1266,17 @@ def _metric_value(line: str, name: str) -> float | None:
 
 
 def _raise_verl_failure(
-    return_code: int, teacher_failure: tuple[str, str] | None
+    return_code: int,
+    teacher_failure: tuple[str, str] | None,
+    mutation_failure: tuple[str, str] | None = None,
 ) -> None:
     if return_code == 0:
         return
+    if mutation_failure is not None:
+        classification, message = mutation_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(f"optimizer marker failure: {message}")
+        raise RuntimeError(f"permanent optimizer marker failure: {message}")
     if teacher_failure is not None:
         classification, message = teacher_failure
         if classification == "transient":
@@ -1849,7 +1868,11 @@ def run_opd_verl(spec=None) -> None:
         finally:
             watcher.stop(require_complete=training_completed)
         peak_gpu_gb = gpu_sampler.stop_gb()
-        _raise_verl_failure(return_code, bridge.teacher_failure)
+        _raise_verl_failure(
+            return_code,
+            bridge.teacher_failure,
+            bridge.mutation_failure,
+        )
         final_accounting = progress_state.final_state(bridge)
         train_wall = float(final_accounting["train_wall_seconds"])
 
