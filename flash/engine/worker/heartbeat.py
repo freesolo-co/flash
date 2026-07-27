@@ -122,7 +122,9 @@ def _console_heartbeat_snapshot(payload: dict, payload_committed: bool = True) -
     return json.dumps(console_payload)
 
 
-def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
+def heartbeat(
+    stage: str, *, liveness: bool = False, force: bool = False, initial: bool = False, **kw
+):
     global _HB_CLAIM_SEQ
     ts = time.time()
     # liveness pings don't count as progress; provider stall detection skips them.
@@ -185,6 +187,9 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
                     and (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
                 ):
                     upload_due = True
+        # the initial training snapshot must land before the shared throttle can hide it.
+        if initial:
+            upload_due = True
         prev_last_upload = _w._HB_LAST_UPLOAD
         prev_last_step = _w._HB_LAST_COMMITTED_STEP
         prev_last_forced = _w._HB_LAST_FORCED_UPLOAD
@@ -214,7 +219,10 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
                 with open(up, "w") as f:
                     f.write(snapshot)
                 try:
-                    committed = _w.hf_upload_file(up, "heartbeat.json")
+                    if initial:
+                        committed = _w.hf_upload_file(up, "heartbeat.json", required=True)
+                    else:
+                        committed = _w.hf_upload_file(up, "heartbeat.json")
                 finally:
                     with contextlib.suppress(OSError):
                         os.remove(up)
@@ -235,6 +243,10 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
                 _HB_UPLOAD_LOCK.release()
         else:
             _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
+            if initial:
+                raise _w.RetriableInfraError(
+                    f"initial heartbeat upload lock remained busy >{lock_timeout}s for {stage}"
+                )
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", _console_heartbeat_snapshot(payload, payload_committed))
     return payload_committed

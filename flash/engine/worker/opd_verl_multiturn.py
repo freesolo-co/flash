@@ -246,12 +246,33 @@ async def _run_executor_call(loop, callback):
         raise
 
 
+def _post_multiturn_score(
+    post_json,
+    score_failure_handler,
+    url: str,
+    token: str,
+    session_id: str,
+):
+    try:
+        return post_json(
+            url,
+            token,
+            "/multiturn/score",
+            {"session_id": session_id},
+        )
+    except Exception as error:
+        if getattr(error, "delivery_unknown", False):
+            score_failure_handler(error)
+        raise
+
+
 def build_flash_multi_turn_agent_loop(
     *,
     register,
     agent_loop_base,
     agent_loop_output,
     post_json,
+    score_failure_handler,
     deterministic_seed,
     permanent_teacher_exit: int = 86,
     transient_teacher_exit: int = 87,
@@ -432,11 +453,12 @@ def build_flash_multi_turn_agent_loop(
                     prefix_ids.extend(glue_ids)
                 score_payload = await _run_executor_call(
                     self.loop,
-                    lambda: post_json(
+                    lambda: _post_multiturn_score(
+                        post_json,
+                        score_failure_handler,
                         bridge_url,
                         bridge_token,
-                        "/multiturn/score",
-                        {"session_id": session_id},
+                        session_id,
                     ),
                 )
                 scored_turns = score_payload["turns"]

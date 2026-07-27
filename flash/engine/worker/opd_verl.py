@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -308,6 +309,12 @@ class _TextTeacherBatcher:
             waiter.complete(error=_teacher_batch_error(error))
 
 
+class _RecordedMutationCallbackFailure(RuntimeError):
+    def __init__(self, classification: str, message: str) -> None:
+        super().__init__(message)
+        self.classification = classification
+
+
 @dataclass(frozen=True)
 class _BridgePrompt:
     student_messages: list[dict]
@@ -520,6 +527,8 @@ class _TeacherAlignmentBridge:
         self.opd_phase_counts = dict(state.get("opd_phase_counts", {}))
         self._teacher_failure: tuple[str, str] | None = None
         self._mutation_failure: tuple[str, str] | None = None
+        self._mutation_callback_failure: tuple[str, str] | None = None
+        self._mutation_callback_succeeded = False
         self._pending_teacher_transient: tuple[str, str] | None = None
         self._pending_teacher_success = False
 
@@ -546,15 +555,64 @@ class _TeacherAlignmentBridge:
         with self._stats_lock:
             return self._teacher_failure
 
+    def _promote_recovered_teacher_failure(self, failure: tuple[str, str]) -> None:
+        with self._stats_lock:
+            if self._teacher_failure is None:
+                self._teacher_failure = failure
+
+    def _record_teacher_delivery_failure(self, error: Exception) -> None:
+        with self._stats_lock:
+            if self._teacher_failure is None:
+                self._teacher_failure = (
+                    "transient",
+                    f"teacher bridge response delivery failed: {type(error).__name__}",
+                )
+
     def _record_mutation_failure(self, classification: str, message: str) -> None:
         with self._stats_lock:
+            if self._mutation_callback_failure is not None:
+                return
+            if self._mutation_callback_succeeded:
+                return
             if classification == "permanent" or self._mutation_failure is None:
                 self._mutation_failure = (classification, message)
+
+    def _record_mutation_callback_failure(
+        self,
+        classification: str,
+        message: str,
+    ) -> tuple[str, str]:
+        with self._stats_lock:
+            if self._mutation_callback_failure is None:
+                self._mutation_callback_failure = (classification, message)
+            return self._mutation_callback_failure
+
+    @staticmethod
+    def _raise_recorded_mutation_failure(failure: tuple[str, str]) -> None:
+        classification, message = failure
+        raise _RecordedMutationCallbackFailure(classification, message)
 
     @property
     def mutation_failure(self) -> tuple[str, str] | None:
         with self._stats_lock:
+            if self._mutation_callback_failure is not None:
+                return self._mutation_callback_failure
+            if self._mutation_callback_succeeded:
+                return None
             return self._mutation_failure
+
+    def _promote_pending_teacher_failure(self) -> bool:
+        with self._stats_lock:
+            if (
+                self._teacher_failure is None
+                and self._pending_teacher_transient is not None
+                and not self._pending_teacher_success
+            ):
+                self._teacher_failure = self._pending_teacher_transient
+                self._pending_teacher_transient = None
+                self._pending_teacher_success = False
+                return True
+            return False
 
     def accounting_snapshot(self) -> dict:
         with self._stats_lock:
@@ -597,6 +655,8 @@ class _TeacherAlignmentBridge:
         sequence_ids: list[int],
         image_count: int = 0,
         forced=None,
+        *,
+        recovered_failure: list[tuple[str, str]] | None = None,
     ) -> dict:
         with self._stats_lock:
             self.score_requests += 1
@@ -665,7 +725,10 @@ class _TeacherAlignmentBridge:
         except TeacherError as error:
             if error.permanent:
                 raise
-            self._record_teacher_failure("transient", str(error))
+            failure = ("transient", str(error))
+            self._record_teacher_failure(*failure)
+            if recovered_failure is not None:
+                recovered_failure.append(failure)
             return self._empty(prompt_length, len(response_ids))
         if teacher_images is not None:
             teacher_tokens = teacher_batches[0]
@@ -1061,13 +1124,20 @@ class _TeacherAlignmentBridge:
             self._pending_teacher_success = False
         return {"ok": True}
 
-    def notify_mutation(self) -> None:
+    def commit_teacher_cycle(self) -> dict:
         with self._stats_lock:
             self._pending_teacher_transient = None
             self._pending_teacher_success = False
+        return {"ok": True}
+
+    def notify_mutation(self) -> None:
         with self._mutation_lock:
             if self._mutation_notified:
                 return
+            with self._stats_lock:
+                callback_failure = self._mutation_callback_failure
+            if callback_failure is not None:
+                self._raise_recorded_mutation_failure(callback_failure)
             try:
                 self.mutation_callback()
             except Exception as error:
@@ -1076,8 +1146,13 @@ class _TeacherAlignmentBridge:
                     if isinstance(error, _w.RetriableInfraError)
                     else "permanent"
                 )
-                self._record_mutation_failure(classification, str(error))
-                raise
+                callback_failure = self._record_mutation_callback_failure(
+                    classification,
+                    str(error),
+                )
+                self._raise_recorded_mutation_failure(callback_failure)
+            with self._stats_lock:
+                self._mutation_callback_succeeded = True
             self._mutation_notified = True
 
     def start(self) -> None:
@@ -1096,19 +1171,25 @@ class _TeacherAlignmentBridge:
                 self.wfile.write(encoded)
 
             def do_POST(self):
+                recovered_teacher_failure = None
+                request_succeeded = False
                 try:
                     if self.headers.get("Authorization") != f"Bearer {bridge.token}":
                         raise PermissionError("flash OPD bridge authorization failed")
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                     if self.path == "/score":
+                        recovered_failures: list[tuple[str, str]] = []
                         result = bridge.score(
                             payload["index"],
                             payload["prompt_length"],
                             payload["sequence_ids"],
                             payload.get("image_count", 0),
                             payload.get("forced"),
+                            recovered_failure=recovered_failures,
                         )
+                        if recovered_failures:
+                            recovered_teacher_failure = recovered_failures[0]
                     elif self.path == "/multiturn/start":
                         result = bridge.start_multiturn(
                             index=payload["index"],
@@ -1126,21 +1207,46 @@ class _TeacherAlignmentBridge:
                         result = bridge.record_no_signal_resample()
                     elif self.path == "/no-signal/abandoned":
                         result = bridge.record_no_signal_abandoned()
+                    elif self.path == "/teacher-cycle/committed":
+                        result = bridge.commit_teacher_cycle()
                     elif self.path == "/mutation":
                         bridge.notify_mutation()
                         result = {"ok": True}
                     else:
                         raise ValueError("flash OPD bridge path is unknown")
+                    request_succeeded = True
                     self._send_json(200, result)
                 except Exception as error:
-                    classification = (
-                        "transient"
-                        if isinstance(error, _w.RetriableInfraError)
-                        or (isinstance(error, TeacherError) and not error.permanent)
-                        else "permanent"
+                    teacher_delivery_failure = (
+                        request_succeeded
+                        and self.path in {"/score", "/multiturn/score"}
+                        and isinstance(error, (OSError, http.client.HTTPException))
                     )
-                    if self.path == "/score":
-                        bridge._record_teacher_failure(classification, str(error))
+                    if teacher_delivery_failure:
+                        classification = "transient"
+                    elif isinstance(error, _RecordedMutationCallbackFailure):
+                        classification = error.classification
+                    else:
+                        classification = (
+                            "transient"
+                            if isinstance(error, _w.RetriableInfraError)
+                            or (isinstance(error, TeacherError) and not error.permanent)
+                            else "permanent"
+                        )
+                    if teacher_delivery_failure:
+                        if recovered_teacher_failure is not None:
+                            bridge._promote_recovered_teacher_failure(
+                                recovered_teacher_failure
+                            )
+                        else:
+                            bridge._record_teacher_delivery_failure(error)
+                    elif self.path == "/score":
+                        if recovered_teacher_failure is not None:
+                            bridge._promote_recovered_teacher_failure(
+                                recovered_teacher_failure
+                            )
+                        else:
+                            bridge._record_teacher_failure(classification, str(error))
                     elif self.path == "/multiturn/score":
                         bridge._record_teacher_failure(
                             classification,
@@ -1464,6 +1570,11 @@ def _build_opd_child_env(
     multi_turn: bool = False,
     max_turns: int = 0,
     max_model_len: int = 32768,
+    mutation_failure_path: str = "",
+    score_delivery_failure_path: str = "",
+    abandonment_failure_path: str = "",
+    resample_failure_path: str = "",
+    cycle_commit_failure_path: str = "",
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -1476,6 +1587,16 @@ def _build_opd_child_env(
             "FLASH_OPD_EOS_TOKEN_IDS": json.dumps(sorted(eos_token_ids)),
         }
     )
+    if mutation_failure_path:
+        child["FLASH_OPD_MUTATION_FAILURE_PATH"] = mutation_failure_path
+    if score_delivery_failure_path:
+        child["FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH"] = score_delivery_failure_path
+    if abandonment_failure_path:
+        child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] = abandonment_failure_path
+    if resample_failure_path:
+        child["FLASH_OPD_RESAMPLE_FAILURE_PATH"] = resample_failure_path
+    if cycle_commit_failure_path:
+        child["FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH"] = cycle_commit_failure_path
     if multi_turn:
         child.update(
             {
@@ -1540,10 +1661,102 @@ def _metric_value(line: str, name: str) -> float | None:
     return None
 
 
+def _read_failure_fallback_records(base_path: str) -> list[tuple[str, str]]:
+    if not base_path:
+        return []
+    base = Path(base_path)
+    failures: list[tuple[str, str]] = []
+    for path in sorted(base.parent.glob(f"{base.name}.*.json")):
+        try:
+            with path.open(encoding="utf-8") as file:
+                encoded = file.read(8193)
+            if len(encoded) > 8192:
+                continue
+            record = json.loads(encoded)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        classification = record.get("classification")
+        message = record.get("message")
+        if classification not in {"permanent", "transient"}:
+            continue
+        if not isinstance(message, str) or not message.strip():
+            continue
+        failures.append((classification, message.strip()))
+    return failures
+
+
+def _read_classified_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    failures = _read_failure_fallback_records(base_path)
+    for classification in ("permanent", "transient"):
+        for failure_classification, message in failures:
+            if failure_classification == classification:
+                return classification, message
+    return None
+
+
+def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
+
+
+def _read_score_delivery_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
+
+
+def _read_cycle_commit_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
+
+
+def _read_abandonment_failure_fallback(
+    base_path: str,
+) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
+
+
+def _read_resample_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    return _read_classified_failure_fallback(base_path)
+
+
+def _reconcile_score_delivery_failure(
+    bridge: _TeacherAlignmentBridge,
+    failure: tuple[str, str] | None,
+) -> tuple[str, str] | None:
+    if failure is None or bridge.teacher_failure is not None:
+        return None
+    if bridge._promote_pending_teacher_failure():
+        return None
+    return failure
+
+
+def _reconcile_no_signal_notification_failure(
+    bridge: _TeacherAlignmentBridge,
+    failures: tuple[tuple[str, str] | None, ...],
+) -> tuple[str, str] | None:
+    if bridge.teacher_failure is not None:
+        return None
+    selected = None
+    for failure in failures:
+        if failure is None:
+            continue
+        if failure[0] == "permanent" or selected is None:
+            selected = failure
+    if (
+        selected is not None
+        and selected[0] == "transient"
+        and bridge._promote_pending_teacher_failure()
+    ):
+        return None
+    return selected
+
+
 def _raise_verl_failure(
     return_code: int,
     teacher_failure: tuple[str, str] | None,
     mutation_failure: tuple[str, str] | None = None,
+    cycle_commit_failure: tuple[str, str] | None = None,
+    no_signal_failure: tuple[str, str] | None = None,
+    score_delivery_failure: tuple[str, str] | None = None,
 ) -> None:
     if return_code == 0:
         return
@@ -1552,6 +1765,29 @@ def _raise_verl_failure(
         if classification == "transient":
             raise _w.RetriableInfraError(f"optimizer marker failure: {message}")
         raise RuntimeError(f"permanent optimizer marker failure: {message}")
+    if cycle_commit_failure is not None:
+        classification, message = cycle_commit_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(
+                f"pre-update cycle commitment failure: {message}"
+            )
+        raise RuntimeError(
+            f"permanent pre-update cycle commitment failure: {message}"
+        )
+    if no_signal_failure is not None:
+        classification, message = no_signal_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(
+                f"transient no-signal notification failure: {message}"
+            )
+        raise RuntimeError(f"permanent no-signal notification failure: {message}")
+    if score_delivery_failure is not None:
+        classification, message = score_delivery_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(
+                f"transient teacher score delivery failure: {message}"
+            )
+        raise RuntimeError(f"permanent teacher score delivery failure: {message}")
     if teacher_failure is not None:
         classification, message = teacher_failure
         if classification == "transient":
@@ -1919,6 +2155,11 @@ def run_opd_verl(spec=None) -> None:
     shim_dir = os.path.join(workdir, "shim")
     local_dir = os.path.join(workdir, "checkpoints")
     export_root = os.path.join(workdir, "checkpoint-adapters")
+    mutation_failure_path = os.path.join(workdir, "mutation-failure")
+    score_delivery_failure_path = os.path.join(workdir, "score-delivery-failure")
+    abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
+    resample_failure_path = os.path.join(workdir, "resample-failure")
+    cycle_commit_failure_path = os.path.join(workdir, "cycle-commit-failure")
     for path in (data_dir, shim_dir, local_dir, export_root):
         os.makedirs(path, exist_ok=True)
 
@@ -2088,6 +2329,11 @@ def run_opd_verl(spec=None) -> None:
             multi_turn=multi_turn,
             max_turns=max_turns,
             max_model_len=max_model_len,
+            mutation_failure_path=mutation_failure_path,
+            score_delivery_failure_path=score_delivery_failure_path,
+            abandonment_failure_path=abandonment_failure_path,
+            resample_failure_path=resample_failure_path,
+            cycle_commit_failure_path=cycle_commit_failure_path,
         )
         command = [python_bin, entry_path, *overrides]
         progress = {"step": resume_step, "loss": None}
@@ -2143,10 +2389,32 @@ def run_opd_verl(spec=None) -> None:
         finally:
             watcher.stop(require_complete=training_completed)
         peak_gpu_gb = gpu_sampler.stop_gb()
+        score_delivery_failure = _reconcile_score_delivery_failure(
+            bridge,
+            _read_score_delivery_failure_fallback(score_delivery_failure_path),
+        )
+        no_signal_failure = _reconcile_no_signal_notification_failure(
+            bridge,
+            (
+                _read_resample_failure_fallback(resample_failure_path),
+                _read_abandonment_failure_fallback(abandonment_failure_path),
+            ),
+        )
+        fallback_mutation_failure = _read_mutation_failure_fallback(
+            mutation_failure_path
+        )
+        if fallback_mutation_failure is not None:
+            bridge._record_mutation_failure(*fallback_mutation_failure)
+        cycle_commit_failure = _read_cycle_commit_failure_fallback(
+            cycle_commit_failure_path
+        )
         _raise_verl_failure(
             return_code,
             bridge.teacher_failure,
             bridge.mutation_failure,
+            cycle_commit_failure,
+            no_signal_failure,
+            score_delivery_failure,
         )
         final_accounting = progress_state.final_state(bridge)
         train_wall = float(final_accounting["train_wall_seconds"])
