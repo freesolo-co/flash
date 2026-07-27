@@ -2084,6 +2084,10 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", fake_undeploy)
     monkeypatch.setattr(runner, "mark_deployment_revocation_failed", mark_pending_then_release)
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    # cancel_run consults the live serving alias when the activation outcome is unknown; left
+    # unstubbed that is a REAL https call to the serving backend (60s timeout) and the 5s thread
+    # joins below then race prod latency. no alias exists for this synthetic run.
+    monkeypatch.setattr(deploy_mod, "adapter_alias_target", lambda _run_id: None)
 
     deploy_thread = threading.Thread(
         target=lambda: results.setdefault(
