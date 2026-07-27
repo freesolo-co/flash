@@ -349,6 +349,7 @@ def _structured_ids(vocab, text: str, *, eos: bool = True) -> list[int]:
     ],
 )
 def test_xgrammar_replay_accepts_every_flash_constraint_kind(spec, text):
+    pytest.importorskip("xgrammar")
     tokenizer, vocab = _structured_test_tokenizer()
     replay = StructuredOutputReplay(tokenizer, len(vocab))
     response_ids = _structured_ids(vocab, text)
@@ -375,6 +376,7 @@ def test_xgrammar_bit_count_distinguishes_forced_and_free_positions():
 
 
 def test_xgrammar_replay_fails_closed_when_generated_token_is_rejected():
+    pytest.importorskip("xgrammar")
     tokenizer, vocab = _structured_test_tokenizer()
     replay = StructuredOutputReplay(tokenizer, len(vocab))
 
@@ -388,6 +390,7 @@ def test_xgrammar_replay_fails_closed_when_generated_token_is_rejected():
 
 
 def test_xgrammar_replay_masks_only_positions_after_thinking_boundary():
+    pytest.importorskip("xgrammar")
     tokenizer, vocab = _structured_test_tokenizer()
     replay = StructuredOutputReplay(tokenizer, len(vocab))
     answer_ids = _structured_ids(vocab, "a")
@@ -429,6 +432,7 @@ def test_xgrammar_replay_masks_only_positions_after_thinking_boundary():
     ],
 )
 def test_xgrammar_replay_uses_real_qwen_padded_model_vocab(spec, text):
+    pytest.importorskip("xgrammar")
     from transformers import AutoConfig, AutoTokenizer
 
     model_id = "Qwen/Qwen3.5-0.8B"

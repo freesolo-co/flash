@@ -174,9 +174,15 @@ def _multi_modal_image_count(multi_modal_data) -> int:
         return 0
     if not isinstance(multi_modal_data, dict):
         raise TypeError("verl multimodal data must be a mapping")
+    # verl's rollout carries the payload under "image" (singular) for single-image rows and
+    # "images" for lists; count whichever is present.
     images = multi_modal_data.get("images")
     if images is None:
+        images = multi_modal_data.get("image")
+    if images is None:
         return 0
+    if not isinstance(images, (list, tuple)):
+        return 1
     try:
         return len(images)
     except TypeError as error:
