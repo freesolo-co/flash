@@ -89,7 +89,7 @@ def _internal_spec_from_status(status: RunStatus) -> JobSpec:
 
 
 def _adapter_ref_for_status(status: RunStatus) -> str | None:
-    """The public short adapter reference (`<run_id>`) shown by `flash status` once a run's trained
+    """The public short adapter reference (`<run_id>`) shown by `flash runs status` once a run's trained
     adapter is registered; exactly what users paste into train.init_from_adapter (`<run_id>/step-N`
     targets a saved checkpoint).
 
@@ -797,7 +797,7 @@ def _prepare_init_from_adapter(
     if parsed is None:
         raise ValueError(
             "train.init_from_adapter must be `<run_id>` or `<run_id>/step-N` "
-            f"(a checkpoint listed by `flash checkpoints`); got {ref!r}"
+            f"(a checkpoint listed by `flash runs checkpoint`); got {ref!r}"
         )
     src_run_id, step = parsed
     try:
@@ -1060,9 +1060,7 @@ def prepare_job(
             if provider not in configured:
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
         elif not any(name in configured for name in providers_for(spec.gpu.type)):
-            raise ValueError(
-                f"no configured provider can provision gpu.type {spec.gpu.type!r}"
-            )
+            raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
     preflight_gpu = spec.gpu.type
     if not preflight_gpu and spec.model_policy == "allow":
         # open-model auto runs size this fit preflight against the provisional class the schema
@@ -1434,9 +1432,7 @@ def _sanitize_status_value(value, *, depth: int = 0, field: str = ""):
                 out["truncated"] = True
                 break
             sanitized_key = str(k)[:120]
-            out[sanitized_key] = _sanitize_status_value(
-                v, depth=depth + 1, field=sanitized_key
-            )
+            out[sanitized_key] = _sanitize_status_value(v, depth=depth + 1, field=sanitized_key)
         return out
     return str(value)[:500]
 
@@ -1673,9 +1669,7 @@ def _compare_and_complete_remote(
         _save_status_unlocked(status)
         report_status = status
     confirmed = get_status(run_id)
-    if confirmed.state != "done" or not _expected_remote_matches(
-        confirmed.remote, expected_remote
-    ):
+    if confirmed.state != "done" or not _expected_remote_matches(confirmed.remote, expected_remote):
         raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:
         _report_status(report_status)

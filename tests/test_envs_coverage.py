@@ -39,7 +39,13 @@ def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> N
     from argparse import Namespace
 
     from flash.cli import cmd_env_setup
+    from flash.cli import env_setup as env_setup_mod
 
+    monkeypatch.setattr(
+        env_setup_mod,
+        "_require_setup_project",
+        lambda _args: "11111111-1111-4111-8111-111111111111",
+    )
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
 
@@ -75,7 +81,13 @@ def test_scaffolded_env_scores_through_real_task_example(tmp_path, monkeypatch) 
     from freesolo.datasets.records import load_task_examples
 
     from flash.cli import cmd_env_setup
+    from flash.cli import env_setup as env_setup_mod
 
+    monkeypatch.setattr(
+        env_setup_mod,
+        "_require_setup_project",
+        lambda _args: "11111111-1111-4111-8111-111111111111",
+    )
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
 

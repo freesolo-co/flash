@@ -16,8 +16,16 @@ from flash.cli import env_setup, traces
 from flash.client import ApiError, ClientError
 
 _PROJECTS = [
-    {"id": "proj-1", "name": "support triage", "updated_at": "2026-07-02T00:00:00Z"},
-    {"id": "proj-2", "name": "docs qa", "updated_at": "2026-07-01T00:00:00Z"},
+    {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "name": "support triage",
+        "updated_at": "2026-07-02T00:00:00Z",
+    },
+    {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "name": "docs qa",
+        "updated_at": "2026-07-01T00:00:00Z",
+    },
 ]
 _RECORDS = [
     {"input": "What is 2 + 2?", "output": "4"},
@@ -55,6 +63,12 @@ def fake_traces(monkeypatch):
     monkeypatch.setattr(traces, "list_trace_projects", list_projects)
     monkeypatch.setattr(traces, "export_trace_records", export_records)
     monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr("flash.client.list_projects", lambda api_key: _PROJECTS)
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda project_id, api_key: {"id": project_id, "name": "selected"},
+    )
     return calls
 
 
@@ -69,7 +83,7 @@ def _reject_traces_prompt(why: str):
     the traces one by title."""
 
     def select(title, options, default=0):
-        if title.startswith("Start from"):
+        if title.startswith("Use this project"):
             pytest.fail(f"must not offer traces: {why}")
         return options[default][0]
 
@@ -80,11 +94,11 @@ def test_traces_export_writes_env_records(fake_traces, monkeypatch, tmp_path, ca
     """The exported file is a drop-in dataset: one {"input","output"} object per line."""
     monkeypatch.chdir(tmp_path)
 
-    assert cli.main(["traces", "export", "--project", "proj-1"]) == 0
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     out = tmp_path / "dataset/train.jsonl"
     assert _rows(out) == _RECORDS
-    assert fake_traces["records"] == ["proj-1"]
+    assert fake_traces["records"] == ["11111111-1111-4111-8111-111111111111"]
     # no project listing needed when --project names one
     assert fake_traces["projects"] == []
     printed = capsys.readouterr().out
@@ -95,7 +109,19 @@ def test_traces_export_writes_env_records(fake_traces, monkeypatch, tmp_path, ca
 def test_traces_export_honours_output_flag(fake_traces, monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
 
-    assert cli.main(["traces", "export", "--project", "proj-1", "-o", "rows/mine.jsonl"]) == 0
+    assert (
+        cli.main(
+            [
+                "traces",
+                "export",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "-o",
+                "rows/mine.jsonl",
+            ]
+        )
+        == 0
+    )
 
     assert _rows(tmp_path / "rows/mine.jsonl") == _RECORDS  # parent dir created
 
@@ -106,10 +132,15 @@ def test_traces_export_refuses_to_clobber_without_force(fake_traces, monkeypatch
     existing.parent.mkdir()
     existing.write_text("keep me\n")
 
-    assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
     assert existing.read_text() == "keep me\n"
 
-    assert cli.main(["traces", "export", "--project", "proj-1", "--force"]) == 0
+    assert (
+        cli.main(
+            ["traces", "export", "--project", "11111111-1111-4111-8111-111111111111", "--force"]
+        )
+        == 0
+    )
     assert _rows(existing) == _RECORDS
 
 
@@ -123,27 +154,28 @@ def test_traces_export_without_project_is_actionable_when_scripted(
     assert cli.main(["traces", "export"]) == 1
     err = capsys.readouterr().err
     assert "--project" in err
-    assert "proj-1" in err
-    assert "proj-2" in err
+    assert "11111111-1111-4111-8111-111111111111" in err
+    assert "22222222-2222-4222-8222-222222222222" in err
 
 
-def test_traces_export_picks_the_only_project_without_prompting(
-    fake_traces, monkeypatch, tmp_path
+def test_traces_export_requires_the_only_project_explicitly(
+    fake_traces, monkeypatch, tmp_path, capsys
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(traces, "list_trace_projects", lambda *a, **k: [_PROJECTS[0]])
     monkeypatch.setattr(traces, "_interactive", lambda: False)
 
-    assert cli.main(["traces", "export"]) == 0
+    assert cli.main(["traces", "export"]) == 1
 
-    assert fake_traces["records"] == ["proj-1"]
+    assert "--project" in capsys.readouterr().err
+    assert fake_traces["records"] == []
 
 
 def test_traces_export_requires_login(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", None))
 
-    assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
     assert "flash login" in capsys.readouterr().err
 
 
@@ -155,7 +187,7 @@ def test_traces_export_reports_a_project_with_no_usable_traces(
         traces, "export_trace_records", lambda *a, **k: {"records": [], "traces": 0, "skipped": 0}
     )
 
-    assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
     assert "no exportable traces" in capsys.readouterr().err
     assert not (tmp_path / "dataset/train.jsonl").exists()  # nothing written on failure
 
@@ -170,15 +202,15 @@ def test_env_setup_can_start_from_a_projects_traces(
 
     def fake_select(title, options, default=0):
         asked.append(title)
-        return options[0][0] if title.startswith("Start from") else options[default][0]
+        return options[0][0] if title.startswith("Use this project") else options[default][0]
 
     monkeypatch.setattr(env_setup.render, "select", fake_select)
 
-    assert cli.main(["env", "setup"]) == 0
+    assert cli.main(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
-    assert asked[0] == "Start from a project's traces?"  # the data question comes first
+    assert asked[0] == "Use this project's recorded traces as starter rows?"
     assert _rows(tmp_path / "dataset/train.jsonl") == _RECORDS
-    assert fake_traces["records"] == ["proj-1"]
+    assert fake_traces["records"] == ["11111111-1111-4111-8111-111111111111"]
     # max_examples tracks the rows actually written, so a run trains on all of them
     for config in ("configs/sft.toml", "configs/rl.toml", "configs/opd.toml"):
         text = (tmp_path / config).read_text()
@@ -195,7 +227,7 @@ def test_env_setup_scaffolds_starter_rows_when_declined(fake_traces, monkeypatch
         env_setup.render, "select", lambda title, options, default=0: options[default][0]
     )
 
-    assert cli.main(["env", "setup"]) == 0
+    assert cli.main(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     assert '"input":"What is 2 + 2?"' in (tmp_path / "dataset/train.jsonl").read_text()
     assert fake_traces["records"] == []
@@ -210,42 +242,50 @@ def test_env_setup_scaffolds_starter_rows_when_declined(fake_traces, monkeypatch
         OSError("connection reset"),
     ],
 )
-def test_env_setup_falls_back_silently_when_traces_are_unreachable(
-    monkeypatch, tmp_path, capsys, failure
+def test_env_setup_falls_back_to_starter_rows_when_selected_project_has_no_traces(
+    fake_traces, monkeypatch, tmp_path, capsys, failure
 ) -> None:
-    """Being offline or unauthenticated must never block scaffolding a working environment."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(env_setup, "_setup_interactive", lambda args: True)
-    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(
+        traces, "export_trace_records", lambda *a, **k: (_ for _ in ()).throw(failure)
+    )
+    monkeypatch.setattr(
+        env_setup.render,
+        "select",
+        lambda title, options, default=0: (
+            options[0][0] if title.startswith("Use this project") else options[default][0]
+        ),
+    )
 
-    def boom(*args, **kwargs):
-        raise failure
-
-    monkeypatch.setattr(traces, "list_trace_projects", boom)
-    monkeypatch.setattr(env_setup.render, "select", _reject_traces_prompt("no projects to offer"))
-
-    assert cli.main(["env", "setup"]) == 0
-
+    assert cli.main(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
     assert '"input":"What is 2 + 2?"' in (tmp_path / "dataset/train.jsonl").read_text()
-    assert capsys.readouterr().err == ""  # a silent fallback, not a scary warning
+    assert "using the starter dataset" in capsys.readouterr().err
 
 
-def test_env_setup_does_not_offer_traces_when_logged_out(monkeypatch, tmp_path) -> None:
+def test_env_setup_does_not_fallback_when_project_listing_fails(
+    monkeypatch, tmp_path, capsys
+) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(env_setup, "_setup_interactive", lambda args: True)
-    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", None))
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("https://flash", "fs-key"))
     monkeypatch.setattr(
-        traces,
-        "list_trace_projects",
-        lambda *a, **k: pytest.fail("must not call the backend without a key"),
-    )
-    monkeypatch.setattr(
-        env_setup.render, "select", lambda title, options, default=0: options[default][0]
+        "flash.client.list_projects",
+        lambda api_key: (_ for _ in ()).throw(ClientError("project service offline")),
     )
 
-    assert cli.main(["env", "setup"]) == 0
+    assert cli.main(["env", "setup"]) == 1
+    assert "project service offline" in capsys.readouterr().err
+    assert not (tmp_path / "environment.py").exists()
 
-    assert '"input":"What is 2 + 2?"' in (tmp_path / "dataset/train.jsonl").read_text()
+
+def test_env_setup_requires_login_for_project_validation(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("https://flash", None))
+
+    assert cli.main(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
+    assert "not logged in" in capsys.readouterr().err
+    assert not (tmp_path / "environment.py").exists()
 
 
 def test_env_setup_keeps_an_existing_dataset(fake_traces, monkeypatch, tmp_path) -> None:
@@ -257,7 +297,7 @@ def test_env_setup_keeps_an_existing_dataset(fake_traces, monkeypatch, tmp_path)
     monkeypatch.setattr(env_setup, "_setup_interactive", lambda args: True)
     monkeypatch.setattr(env_setup.render, "select", _reject_traces_prompt("existing dataset"))
 
-    assert cli.main(["env", "setup"]) == 0
+    assert cli.main(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     assert dataset.read_text() == '{"input":"mine","output":"kept"}\n'
     assert fake_traces["records"] == []
@@ -271,7 +311,10 @@ def test_env_setup_never_prompts_for_traces_under_yes(fake_traces, monkeypatch, 
         lambda *a, **k: pytest.fail("--yes must not reach the backend"),
     )
 
-    assert cli.main(["env", "setup", "--yes"]) == 0
+    assert (
+        cli.main(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--yes"])
+        == 0
+    )
 
     assert '"input":"What is 2 + 2?"' in (tmp_path / "dataset/train.jsonl").read_text()
 
@@ -284,9 +327,13 @@ def test_records_to_jsonl_round_trips() -> None:
 
 def test_project_options_label_by_name_and_skip_id_less_rows() -> None:
     options = traces.project_options([*_PROJECTS, {"name": "no id"}])
-    assert [(value, label) for value, label, _hint in options] == [
-        ("proj-1", "support triage"),
-        ("proj-2", "docs qa"),
+    assert [(value, label, hint) for value, label, hint in options] == [
+        (
+            "11111111-1111-4111-8111-111111111111",
+            "support triage",
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        ("22222222-2222-4222-8222-222222222222", "docs qa", "22222222-2222-4222-8222-222222222222"),
     ]
 
 
@@ -294,9 +341,21 @@ def test_traces_export_defaults_to_env_records(fake_traces, monkeypatch, tmp_pat
     """No --format keeps the shape every existing caller already gets."""
     monkeypatch.chdir(tmp_path)
 
-    assert cli.main(["traces", "export", "--project", "proj-1"]) == 0
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     assert fake_traces["formats"] == [traces.RECORDS_FORMAT]
+
+
+def test_records_export_hint_includes_required_project(
+    fake_traces, monkeypatch, tmp_path, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+
+    assert "flash env push --project <project-uuid> --name my-env ." in capsys.readouterr().out
 
 
 def test_traces_export_prompts_shape_keeps_reply_less_calls(
@@ -305,7 +364,19 @@ def test_traces_export_prompts_shape_keeps_reply_less_calls(
     """GRPO samples its own completions, so a call with no reply is still a prompt."""
     monkeypatch.chdir(tmp_path)
 
-    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "prompts"]) == 0
+    assert (
+        cli.main(
+            [
+                "traces",
+                "export",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--format",
+                "prompts",
+            ]
+        )
+        == 0
+    )
 
     rows = _rows(tmp_path / "dataset/train.jsonl")
     assert rows == _PROMPTS
@@ -324,7 +395,19 @@ def test_traces_export_raw_shape_is_not_called_training_rows(
     """Raw rows are for taking away; calling them training rows would mislead."""
     monkeypatch.chdir(tmp_path)
 
-    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 0
+    assert (
+        cli.main(
+            [
+                "traces",
+                "export",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--format",
+                "raw",
+            ]
+        )
+        == 0
+    )
 
     # raw defaults off the training dataset path; see the dedicated test below.
     assert _rows(tmp_path / "traces.raw.jsonl") == _RAW
@@ -339,7 +422,16 @@ def test_traces_export_rejects_an_algorithm_as_a_format(fake_traces, monkeypatch
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(SystemExit) as exit_info:
-        cli.main(["traces", "export", "--project", "proj-1", "--format", "sft"])
+        cli.main(
+            [
+                "traces",
+                "export",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--format",
+                "sft",
+            ]
+        )
 
     # argparse rejects an out-of-choices value before any request is made.
     assert exit_info.value.code == 2
@@ -357,7 +449,7 @@ def test_traces_export_empty_records_points_at_the_prompts_shape(
         lambda *a, **k: {"records": [], "traces": 2, "skipped": 2, "format": "records"},
     )
 
-    assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
 
     assert "--format prompts" in capsys.readouterr().err
 
@@ -380,7 +472,19 @@ def test_traces_export_skip_note_names_the_right_missing_half(
         },
     )
 
-    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "prompts"]) == 0
+    assert (
+        cli.main(
+            [
+                "traces",
+                "export",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--format",
+                "prompts",
+            ]
+        )
+        == 0
+    )
 
     printed = capsys.readouterr().out
     assert "1 traces skipped: no usable request)" in printed
@@ -403,7 +507,19 @@ def test_traces_export_refuses_a_format_the_backend_ignored(monkeypatch, tmp_pat
         lambda *a, **k: {"records": _RECORDS, "traces": 2, "skipped": 0},
     )
 
-    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 1
+    assert (
+        cli.main(
+            [
+                "traces",
+                "export",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--format",
+                "raw",
+            ]
+        )
+        == 1
+    )
 
     assert "did not honour --format raw" in capsys.readouterr().err
     # nothing may be written when the shape could not be trusted.
@@ -422,7 +538,7 @@ def test_traces_export_default_records_works_against_a_format_blind_backend(
         lambda *a, **k: {"records": _RECORDS, "traces": 2, "skipped": 0},
     )
 
-    assert cli.main(["traces", "export", "--project", "proj-1"]) == 0
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     assert _rows(tmp_path / "dataset/train.jsonl") == _RECORDS
 
@@ -447,7 +563,7 @@ def test_traces_export_refuses_an_explicit_mismatch_on_the_default_format(
         lambda *a, **k: {"records": _RAW, "traces": 2, "skipped": 0, "format": "raw"},
     )
 
-    assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
 
     assert "did not honour --format records" in capsys.readouterr().err
     # nothing may be written when the shape could not be trusted
@@ -459,7 +575,19 @@ def test_raw_export_stays_off_the_training_dataset_path(fake_traces, monkeypatch
     are not trainable, so raw must default somewhere else."""
     monkeypatch.chdir(tmp_path)
 
-    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 0
+    assert (
+        cli.main(
+            [
+                "traces",
+                "export",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--format",
+                "raw",
+            ]
+        )
+        == 0
+    )
 
     assert _rows(tmp_path / "traces.raw.jsonl") == _RAW
     assert not (tmp_path / "dataset/train.jsonl").exists()
@@ -469,6 +597,18 @@ def test_prompts_export_keeps_the_training_dataset_path(fake_traces, monkeypatch
     """Prompts are training input for GRPO, so they belong on the default path."""
     monkeypatch.chdir(tmp_path)
 
-    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "prompts"]) == 0
+    assert (
+        cli.main(
+            [
+                "traces",
+                "export",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--format",
+                "prompts",
+            ]
+        )
+        == 0
+    )
 
     assert _rows(tmp_path / "dataset/train.jsonl") == _PROMPTS

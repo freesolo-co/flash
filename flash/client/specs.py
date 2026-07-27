@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from flash.spec import JobSpec
+from flash.spec import JobSpec, require_project_id
 
 
 def spec_payload(
     spec: JobSpec, authored_train_keys: frozenset[str] | set[str] | None = None
 ) -> dict:
     out = spec.to_dict()
+    out["project"] = require_project_id(spec.project)
     if not spec.environment.pip:
         from flash.envs.registry import worker_pip_for_env
 

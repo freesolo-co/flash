@@ -13,6 +13,8 @@ import pytest
 
 import flash.cli as cli
 
+_HIDDEN_ROOT_RUN_ALIASES = {"status", "log", "cancel", "checkpoints"}
+
 
 def _registered_subcommands() -> set[str]:
     """The subcommand names argparse actually registers on the root parser."""
@@ -52,7 +54,7 @@ def _catalog_env_rows() -> set[str]:
 def test_help_catalog_matches_registered_subcommands() -> None:
     """Every real subcommand appears once in the themed help, and the help lists no command that
     isn't real — so the grouped `flash --help` can't drift from the actual CLI surface."""
-    registered = _registered_subcommands()
+    registered = _registered_subcommands() - _HIDDEN_ROOT_RUN_ALIASES
     catalog = _catalog_commands()
     assert catalog == registered, (
         f"themed help is out of sync with the CLI:\n"
@@ -68,10 +70,32 @@ def test_help_catalog_matches_registered_env_subcommands() -> None:
     assert _catalog_env_rows() == _registered_env_subcommands()
 
 
-def test_deployments_json_argparse_flag() -> None:
-    args = cli._build_parser().parse_args(["deployments", "--json"])
+def test_grouped_command_argparse_contracts() -> None:
+    parser = cli._build_parser()
+    args = parser.parse_args(["models", "deployments", "--json"])
     assert args.json is True
     assert args.func is cli.cmd_deployments
+
+    args = parser.parse_args(["runs", "status", "run-1", "-f"])
+    assert args.run_id == "run-1"
+    assert args.follow is True
+    assert args.func is cli.cmd_status
+
+    args = parser.parse_args(["models", "chat", "run-1", "-m", "hello"])
+    assert args.run_id == "run-1"
+    assert args.message == "hello"
+    assert args.func is cli.cmd_chat
+
+    args = parser.parse_args(["projects", "list"])
+    assert args.func is cli.cmd_projects_list
+
+    args = parser.parse_args(["projects", "create", "my project"])
+    assert args.name == "my project"
+    assert args.func is cli.cmd_projects_create
+
+
+def test_root_model_commands_are_not_registered() -> None:
+    assert not {"deploy", "chat", "deployments", "undeploy", "export"} & _registered_subcommands()
 
 
 def test_help_styled_is_themed_and_exits_zero(monkeypatch, capsys) -> None:
@@ -89,7 +113,7 @@ def test_help_styled_is_themed_and_exits_zero(monkeypatch, capsys) -> None:
     for cmd in _catalog_rows():
         assert cmd in out
     assert f"{cli.CLI_NAME} env setup" in out
-    assert f"{cli.CLI_NAME} env push --name my-env ." in out
+    assert f"{cli.CLI_NAME} env push --project PROJECT_UUID --name my-env ." in out
     assert "usage:" in out
     assert f"{cli.CLI_NAME} <command> --help" in out  # next-step hint
 
@@ -105,6 +129,8 @@ def test_help_plain_when_piped(monkeypatch, capsys) -> None:
     # argparse's own section, never emitted by the themed page
     assert "positional arguments:" in out
     assert "getting started" not in out  # themed group titles absent on the plain path
+    for alias in _HIDDEN_ROOT_RUN_ALIASES:
+        assert f"\n    {alias} " not in out
 
 
 def test_help_page_is_ascii_locale_safe(monkeypatch) -> None:

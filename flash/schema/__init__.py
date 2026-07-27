@@ -42,6 +42,7 @@ from flash.spec import (
     JobSpec,
     TrainSpec,
     parse_seed,
+    require_project_id,
 )
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
@@ -151,12 +152,15 @@ def spec_from_file(
     run_id: str | None = None,
     overrides: list[str] | None = None,
     extra_configs: list[str] | None = None,
+    *,
+    project_required: bool = False,
 ) -> JobSpec:
     spec, _ = spec_and_train_keys_from_file(
         path,
         run_id=run_id,
         overrides=overrides,
         extra_configs=extra_configs,
+        project_required=project_required,
     )
     return spec
 
@@ -166,6 +170,8 @@ def spec_and_train_keys_from_file(
     run_id: str | None = None,
     overrides: list[str] | None = None,
     extra_configs: list[str] | None = None,
+    *,
+    project_required: bool = False,
 ) -> tuple[JobSpec, frozenset[str]]:
     """parse a config and retain the raw authored [train] keys for schema preflights."""
     raw = load_toml(path)
@@ -175,7 +181,10 @@ def spec_and_train_keys_from_file(
         _apply_override(raw, item)
     train_raw = raw.get("train")
     authored_train_keys = frozenset(train_raw) if isinstance(train_raw, dict) else frozenset()
-    return spec_from_dict(raw, run_id=run_id), authored_train_keys
+    return (
+        spec_from_dict(raw, run_id=run_id, project_required=project_required),
+        authored_train_keys,
+    )
 
 
 def _deep_merge(base: dict, extra: dict) -> None:
@@ -229,7 +238,7 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
         return ref
     raise ConfigError(
         "train.init_from_adapter must be `<run_id>` (continue that run's trained adapter) or "
-        "`<run_id>/step-N` (warm-start from a checkpoint listed by `flash checkpoints`)"
+        "`<run_id>/step-N` (warm-start from a checkpoint listed by `flash runs checkpoint`)"
     )
 
 
@@ -259,7 +268,9 @@ _GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED
 # [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
 # is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
 _ENV_MANAGED_KEYS = frozenset({"resolved_sha"})
-_ENVIRONMENT_KEYS = frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
+_ENVIRONMENT_KEYS = (
+    frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
+)
 TRAIN_KEY_MIN_VERSIONS = {
     item.name: str(item.metadata["introduced_in"])
     for item in dataclass_fields(TrainSpec)
@@ -283,7 +294,9 @@ def validate_train_keys(keys: Collection[str]) -> None:
         )
 
 
-def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
+def spec_from_dict(
+    raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
+) -> JobSpec:
     unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
@@ -310,9 +323,19 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError("model_revision must be a string")
     model_revision = model_revision_raw.strip()
     project_raw = raw.get("project", "")
-    if not isinstance(project_raw, str):
-        raise ConfigError("project must be a string (the project id from your dashboard)")
-    project = project_raw.strip()
+    try:
+        if project_required:
+            project = require_project_id(project_raw)
+        elif "project" not in raw:
+            project = ""
+        elif not isinstance(project_raw, str):
+            raise TypeError("project must be a string")
+        elif not project_raw.strip():
+            project = ""
+        else:
+            project = require_project_id(project_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
 
     try:
         algorithm = normalize_algorithm(raw.get("algorithm"))
@@ -404,9 +427,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             raise ConfigError(f"gpu.type: {exc}") from exc
         gpu_info = GPU_INFO.get(gpu_type)
         if gpu_info is None or not gpu_info.validated:
-            raise ConfigError(
-                f"gpu.type {gpu_type!r} must name an active validated GPU class"
-            )
+            raise ConfigError(f"gpu.type {gpu_type!r} must name an active validated GPU class")
         if gpu_provider and gpu_provider not in providers_for(gpu_type):
             raise ConfigError(
                 f"gpu.provider {gpu_provider!r} cannot provision gpu.type {gpu_type!r}"
@@ -437,13 +458,15 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     try:
-        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type or provisional_type)
+        info = resolve_model(
+            model, algorithm, policy=model_policy, gpu=gpu_type or provisional_type
+        )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if thinking and info.thinking == "none":
         raise ConfigError(
             f"{model} does not support thinking mode (its chat template has no "
-            f"<think> support); pick a thinking-capable model — `flash models` lists "
+            f"<think> support); pick a thinking-capable model — `flash models list` lists "
             f"each model's thinking capability"
         )
     if not thinking and info.thinking == "always":
@@ -497,9 +520,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
             advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
-            entropy_quantile=_train_float(
-                train_raw, "entropy_quantile", minimum=0.0, maximum=1.0
-            ),
+            entropy_quantile=_train_float(train_raw, "entropy_quantile", minimum=0.0, maximum=1.0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
@@ -608,9 +629,13 @@ def _validate_opd(spec: JobSpec) -> None:
 def _validate_opsd(spec: JobSpec) -> None:
     """validate phase-1 opsd training constraints."""
     if spec.train.group_size not in (None, 1):
-        raise ConfigError("opsd samples exactly one on-policy rollout per prompt; group_size must be 1")
+        raise ConfigError(
+            "opsd samples exactly one on-policy rollout per prompt; group_size must be 1"
+        )
     if spec.train.teacher_model:
-        raise ConfigError("opsd uses the local frozen base teacher; train.teacher_model is not supported")
+        raise ConfigError(
+            "opsd uses the local frozen base teacher; train.teacher_model is not supported"
+        )
     _validate_on_policy_prompt_budget(spec, "opsd")
 
 
@@ -644,7 +669,7 @@ def _validate_spec(spec: JobSpec) -> None:
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "
-            '`flash env push --name <name>` and paste the returned id, e.g. "your-name/your-env"); '
+            '`flash env push --project <project-uuid> --name <name>` and paste the returned id, e.g. "your-name/your-env"); '
             "there is no local path mode"
         )
     _require_environment_ref(

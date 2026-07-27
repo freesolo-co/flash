@@ -127,9 +127,11 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     # `flash train --background` posts the locally-validated spec and prints the handle.
     toml = tmp_path / "run.toml"
     toml.write_text(
-        'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
+        'model = "Qwen/Qwen3.5-4B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
+        'algorithm = "grpo"\n'
         '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-        '[train]\nepochs = 1\nmax_examples = 1\n'
+        "[train]\nepochs = 1\nmax_examples = 1\n"
     )
     proc = _run(["train", str(toml), "--background"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr
