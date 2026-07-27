@@ -47,6 +47,9 @@ def resolve_verl_python(workdir: str) -> str:
                 "bitsandbytes>=0.49",
                 "qwen-vl-utils",
                 "torchvision",
+                "xgrammar==0.1.25",
+                "tqdm",
+                "pyarrow",
             ],
             check=True,
         )
