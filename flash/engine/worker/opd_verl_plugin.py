@@ -391,11 +391,12 @@ def _write_cycle_commit_failure_fallback(classification: str, message: str) -> N
 
 
 def _exit_for_score_failure(error: FlashTeacherBridgeError) -> None:
+    classification = "transient" if error.delivery_unknown else error.classification
     if error.delivery_unknown:
-        _write_score_delivery_failure_fallback(error.classification, str(error))
+        _write_score_delivery_failure_fallback(classification, str(error))
     exit_code = (
         _PERMANENT_TEACHER_EXIT
-        if error.classification == "permanent"
+        if classification == "permanent"
         else _TRANSIENT_TEACHER_EXIT
     )
     os._exit(exit_code)

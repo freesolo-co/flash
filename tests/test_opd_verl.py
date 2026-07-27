@@ -81,6 +81,16 @@ def _send_truncated_json_response(handler, status, payload):
     handler.close_connection = True
 
 
+def _send_malformed_json_response(handler, status, _payload):
+    encoded = b"{"
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(encoded)))
+    handler.end_headers()
+    handler.wfile.write(encoded)
+    handler.wfile.flush()
+
+
 def _capture_client_only_score_delivery_loss(bridge, monkeypatch, tmp_path):
     import flash.engine.worker.opd_verl_plugin as plugin
     from flash.engine.worker.opd_verl import _read_score_delivery_failure_fallback
@@ -1037,6 +1047,120 @@ def test_client_only_score_loss_preserves_authoritative_permanent_failure(
             bridge.teacher_failure,
             score_delivery_failure=score_delivery_failure,
         )
+
+
+def test_malformed_score_success_is_transient_delivery_unknown(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import (
+        _read_score_delivery_failure_fallback,
+        _reconcile_score_delivery_failure,
+    )
+    from flash.engine.worker.perf import RetriableInfraError
+
+    failure_path = str(tmp_path / "score-delivery-failure")
+    monkeypatch.setenv("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", failure_path)
+
+    class ChildExit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    monkeypatch.setattr(plugin.os, "_exit", child_exit)
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+    handler._send_json = _send_malformed_json_response
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as transport_error:
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+            )
+        with pytest.raises(ChildExit) as actor_exit:
+            plugin._exit_for_score_failure(transport_error.value)
+        fallback = _read_score_delivery_failure_fallback(failure_path)
+    finally:
+        bridge.close()
+
+    score_delivery_failure = _reconcile_score_delivery_failure(bridge, fallback)
+    assert transport_error.value.classification == "permanent"
+    assert transport_error.value.delivery_unknown
+    assert actor_exit.value.code == 87
+    assert fallback == (
+        "transient",
+        "flash OPD bridge returned malformed success JSON",
+    )
+    assert score_delivery_failure == fallback
+    assert bridge.teacher_failure is None
+    assert bridge.score_requests == 1
+    assert bridge.teacher_ok == 1
+    assert bridge.teacher_transient == 0
+    assert bridge.teacher_error == 0
+    with pytest.raises(RetriableInfraError, match="teacher score delivery failure"):
+        _raise_verl_failure(
+            1,
+            bridge.teacher_failure,
+            score_delivery_failure=score_delivery_failure,
+        )
+
+
+def test_explicit_score_rejection_keeps_classification_without_delivery_fallback(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_score_delivery_failure_fallback
+    from flash.engine.worker.teacher import TeacherError
+
+    class PermanentTeacher:
+        def score(self, _prompt_text, _completion_text):
+            raise TeacherError("bad credentials", permanent=True)
+
+    failure_path = str(tmp_path / "score-delivery-failure")
+    monkeypatch.setenv("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", failure_path)
+
+    class ChildExit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    monkeypatch.setattr(plugin.os, "_exit", child_exit)
+    bridge = _text_bridge(PermanentTeacher())
+    bridge.start()
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as rejection:
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+            )
+        with pytest.raises(ChildExit) as actor_exit:
+            plugin._exit_for_score_failure(rejection.value)
+    finally:
+        bridge.close()
+
+    assert rejection.value.classification == "permanent"
+    assert not rejection.value.delivery_unknown
+    assert actor_exit.value.code == 86
+    assert _read_score_delivery_failure_fallback(failure_path) is None
+    assert not list(tmp_path.iterdir())
+    assert bridge.teacher_failure == ("permanent", "bad credentials")
+    assert bridge.score_requests == 1
+    assert bridge.teacher_ok == 0
+    assert bridge.teacher_transient == 0
+    assert bridge.teacher_error == 1
+    with pytest.raises(RuntimeError, match="permanent teacher failure: bad credentials"):
+        _raise_verl_failure(1, bridge.teacher_failure)
 
 
 @pytest.mark.parametrize(
