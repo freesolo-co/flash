@@ -1416,6 +1416,55 @@ def test_bridge_transport_failure_is_typed_retriable(monkeypatch):
     assert error.value.classification == "transient"
 
 
+@pytest.mark.parametrize(
+    ("classification", "expected_exit"),
+    [("transient", 87), ("permanent", 86)],
+)
+def test_repeated_mutation_notice_maps_later_bridge_failure_to_child_exit(
+    monkeypatch, classification, expected_exit
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.perf import RetriableInfraError
+
+    posts = []
+
+    def post_json(url, token, path, payload):
+        posts.append((url, token, path, payload))
+        if len(posts) == 2:
+            raise FlashTeacherBridgeError(
+                "mutation bridge failed",
+                classification=classification,
+            )
+        return {"ok": True}
+
+    class ChildExit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    monkeypatch.setattr(plugin, "_post_json", post_json)
+    monkeypatch.setattr(plugin.os, "_exit", child_exit)
+
+    plugin._post_mutation_notice("http://bridge", "token")
+    with pytest.raises(ChildExit) as exit_error:
+        plugin._post_mutation_notice("http://bridge", "token")
+
+    assert posts == [
+        ("http://bridge", "token", "/mutation", {}),
+        ("http://bridge", "token", "/mutation", {}),
+    ]
+    assert exit_error.value.code == expected_exit
+    if classification == "transient":
+        with pytest.raises(RetriableInfraError, match="transient teacher bridge failure"):
+            _raise_verl_failure(exit_error.value.code, None)
+    else:
+        with pytest.raises(RuntimeError, match="permanent teacher bridge failure"):
+            _raise_verl_failure(exit_error.value.code, None)
+
+
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
     from flash.engine.worker.perf import RetriableInfraError
 

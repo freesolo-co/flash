@@ -293,6 +293,20 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
         ) from error
 
 
+def _post_mutation_notice(url: str, token: str) -> None:
+    try:
+        _post_json(url, token, "/mutation", {})
+    except FlashTeacherBridgeError as error:
+        exit_code = (
+            _PERMANENT_TEACHER_EXIT
+            if error.classification == "permanent"
+            else _TRANSIENT_TEACHER_EXIT
+        )
+        os._exit(exit_code)
+    except Exception:
+        os._exit(_PERMANENT_TEACHER_EXIT)
+
+
 def _install_verl_extensions() -> None:
     import numpy as np
     import ray
@@ -717,11 +731,9 @@ def _install_verl_extensions() -> None:
 
         @functools.wraps(original_step)
         def step_with_notice(*args, **kwargs):
-            _post_json(
+            _post_mutation_notice(
                 os.environ["FLASH_OPD_BRIDGE_URL"],
                 os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-                "/mutation",
-                {},
             )
             return original_step(*args, **kwargs)
 
