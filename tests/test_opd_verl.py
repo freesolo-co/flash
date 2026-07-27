@@ -719,12 +719,19 @@ def _batching_bridge(teacher, prompt_texts):
 
 
 class _BatchingTeacher:
-    def __init__(self, prompt_texts, *, failure: str | None = None):
+    def __init__(
+        self,
+        prompt_texts,
+        *,
+        failure: str | None = None,
+        token_logprob: float | None = None,
+    ):
         self.logprobs = {
             f"User: {prompt_text}\nAssistant: ": -float(index + 1)
             for index, prompt_text in enumerate(dict.fromkeys(prompt_texts))
         }
         self.failure = failure
+        self.token_logprob = token_logprob
         self.batches = []
         self.called = threading.Event()
         self._lock = threading.Lock()
@@ -754,7 +761,11 @@ class _BatchingTeacher:
             [
                 TeacherToken(
                     text=completion_text,
-                    logprob=self.logprobs[prompt_text],
+                    logprob=(
+                        self.token_logprob
+                        if self.token_logprob is not None
+                        else self.logprobs[prompt_text]
+                    ),
                     start=0,
                     end=len(completion_text),
                 )
@@ -923,6 +934,63 @@ def test_text_teacher_batcher_keeps_nonidentical_inputs_separate_and_ordered(mon
         teacher_prompt = f"User: distinct-{index}\nAssistant: "
         assert status == "ok"
         assert _teacher_logsum(result) == teacher.logprobs[teacher_prompt]
+
+
+def test_text_teacher_batch_accepts_positive_rounding_for_every_logical_waiter(monkeypatch):
+    from flash.engine.worker import opd_verl as opd_verl_mod
+
+    monkeypatch.setattr(opd_verl_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    prompt_texts = ["rounding"] * 8
+    teacher = _BatchingTeacher(prompt_texts, token_logprob=1e-9)
+    bridge = _batching_bridge(teacher, prompt_texts)
+    bridge.start()
+    try:
+        outcomes = _concurrent_bridge_scores(bridge, range(8))
+    finally:
+        bridge.close()
+
+    assert teacher.batches
+    assert all(
+        batch == [("User: rounding\nAssistant: ", "AB")]
+        for batch in teacher.batches
+    )
+    assert all(status == "ok" for status, _result in outcomes)
+    assert [_teacher_logsum(result) for _status, result in outcomes] == [1e-9] * 8
+    assert bridge.score_requests == 8
+    assert bridge.teacher_ok == 8
+    assert bridge.teacher_error == 0
+    assert bridge.teacher_transient == 0
+
+
+def test_text_teacher_batch_rejects_positive_value_above_tolerance_for_every_waiter(
+    monkeypatch,
+):
+    from flash.engine.worker import opd_verl as opd_verl_mod
+
+    monkeypatch.setattr(opd_verl_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    prompt_texts = ["invalid rounding"] * 8
+    teacher = _BatchingTeacher(prompt_texts, token_logprob=2e-6)
+    bridge = _batching_bridge(teacher, prompt_texts)
+    bridge.start()
+    try:
+        outcomes = _concurrent_bridge_scores(bridge, range(8))
+    finally:
+        bridge.close()
+
+    assert teacher.batches
+    assert all(
+        batch == [("User: invalid rounding\nAssistant: ", "AB")]
+        for batch in teacher.batches
+    )
+    assert all(status == "error" for status, _error in outcomes)
+    errors = [error for _status, error in outcomes]
+    assert all(isinstance(error, FlashTeacherBridgeError) for error in errors)
+    assert all(error.classification == "permanent" for error in errors)
+    assert all("invalid logprob" in str(error) for error in errors)
+    assert bridge.score_requests == 8
+    assert bridge.teacher_ok == 0
+    assert bridge.teacher_error == 8
+    assert bridge.teacher_transient == 0
 
 
 def test_text_teacher_batch_transient_failure_recovers_each_logical_sample_once(monkeypatch):

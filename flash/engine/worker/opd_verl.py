@@ -59,7 +59,7 @@ from flash.engine.worker.sft_verl import (
     _VerlCheckpointWatcher,
     _warmstart_adapter_path,
 )
-from flash.engine.worker.teacher import TeacherError
+from flash.engine.worker.teacher import _MAX_LOGPROB_ROUNDING_ERROR, TeacherError
 from flash.engine.worker.tokenizer_align import (
     TeacherToken,
     groupwise_alignment,
@@ -154,7 +154,7 @@ def _validate_text_teacher_batch(
                 isinstance(token.logprob, bool)
                 or not isinstance(token.logprob, int | float)
                 or not math.isfinite(token.logprob)
-                or token.logprob > 0
+                or token.logprob > _MAX_LOGPROB_ROUNDING_ERROR
             ):
                 raise TeacherError(
                     f"teacher text batch result {result_index} token {token_index} has invalid logprob",
