@@ -7,6 +7,7 @@ import http.client
 import importlib.metadata
 import importlib.util
 import json
+import math
 import multiprocessing
 import os
 import sys
@@ -23,6 +24,7 @@ from flash.engine.worker.opd import _gkd_loss_from_logps
 from flash.engine.worker.opd_verl import (
     _BridgePrompt,
     _build_opd_child_env,
+    _failure_accounting_metadata,
     _OpdProgressState,
     _OpdVerlCheckpointWatcher,
     _processed_resume_steps,
@@ -748,6 +750,98 @@ def _resume_accounting(step=2):
         "empty_alignments": 2,
         "coverage_sum": 3.5,
     }
+
+
+def test_failure_accounting_metadata_uses_canonical_train_meta_contract():
+    accounting = {
+        "teacher_transient": 3,
+        "teacher_error": 2,
+        "no_signal_resamples": 5,
+        "no_signal_skipped_steps": 1,
+        "skip_counts": {
+            "truncated_rollout": 4,
+            "empty_alignment": 2,
+            "empty_completion": 3,
+        },
+    }
+
+    metadata = _failure_accounting_metadata(accounting)
+
+    assert metadata == {
+        "teacher_transient_failures": 3,
+        "teacher_errors": 2,
+        "no_signal_resamples": 5,
+        "no_signal_skipped_steps": 1,
+        "skip_reasons": {
+            "alignment_empty": 2,
+            "empty_completion": 3,
+            "truncated_rollout": 4,
+        },
+    }
+    assert list(metadata["skip_reasons"]) == [
+        "alignment_empty",
+        "empty_completion",
+        "truncated_rollout",
+    ]
+    counters = [
+        metadata["teacher_transient_failures"],
+        metadata["teacher_errors"],
+        metadata["no_signal_resamples"],
+        metadata["no_signal_skipped_steps"],
+        *metadata["skip_reasons"].values(),
+    ]
+    assert all(type(counter) is int and math.isfinite(counter) for counter in counters)
+    assert not {
+        "teacher_transient",
+        "teacher_error",
+        "mean_align_granularity",
+    } & metadata.keys()
+
+
+def test_failure_accounting_metadata_omits_zero_skip_reasons():
+    # the verl snapshot always injects empty_alignment, but trl's counter only
+    # records reasons that occurred, so a clean run must persist no reasons.
+    metadata = _failure_accounting_metadata(
+        {
+            "teacher_transient": 0,
+            "teacher_error": 0,
+            "no_signal_resamples": 0,
+            "no_signal_skipped_steps": 0,
+            "skip_counts": {"empty_alignment": 0, "truncated_rollout": 2},
+        }
+    )
+
+    assert metadata["skip_reasons"] == {"truncated_rollout": 2}
+
+
+def test_failure_accounting_metadata_uses_trl_skip_reason_names():
+    # trl publishes this condition as alignment_empty via _sample_skip_reason,
+    # so consumers aggregating across backends see one category, not two.
+    metadata = _failure_accounting_metadata(
+        {
+            "teacher_transient": 0,
+            "teacher_error": 0,
+            "no_signal_resamples": 0,
+            "no_signal_skipped_steps": 0,
+            "skip_counts": {"empty_alignment": 3},
+        }
+    )
+
+    assert metadata["skip_reasons"] == {"alignment_empty": 3}
+
+
+def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
+    import inspect
+
+    from flash.engine.worker.opd_verl import run_opd_verl
+
+    source = inspect.getsource(run_opd_verl)
+    write_train_meta_source = source[source.index("_w.write_train_meta(") :]
+
+    assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
+    assert '"teacher_transient":' not in write_train_meta_source
+    assert '"teacher_error":' not in write_train_meta_source
+    assert '"mean_align_granularity":' not in write_train_meta_source
 
 
 class _BridgeTeacher:
