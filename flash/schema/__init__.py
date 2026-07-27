@@ -56,7 +56,7 @@ _ADAPTER_REVISION_RE = re.compile(
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
-    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl|opd|opsd)/"
+    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl|opd)/"
     rf"(?P<run_id>{_RUN_ID_RE})(?P<checkpoint>/checkpoints/step-\d+)?$"
 )
 
@@ -287,7 +287,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
-        if {"grpo", "sft", "opd", "opsd"} & set(unknown):
+        if {"grpo", "sft", "opd"} & set(unknown):
             hint = (
                 " - algorithm knobs (group_size, batch_size, max_completion_tokens, ...) "
                 "belong under [train], not a per-algorithm table"
@@ -322,15 +322,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
-    # opsd is a reasoning-reconstruction objective: the student samples on-policy and must derive the
-    # privileged answer's reasoning itself, so it is only meaningful in thinking mode. reject nonthink
-    # opsd up front (default thinking is off), before any model resolution or gpu sizing.
-    if algorithm == "opsd" and not thinking:
-        raise ConfigError(
-            "opsd requires thinking = true: on-policy self-distillation trains the student to "
-            "reconstruct the reasoning that reaches a privileged answer, so it runs only in "
-            "reasoning mode. set `thinking = true` and use a thinking-capable model."
-        )
 
     # Use `is None` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
     env_raw = raw.get("environment")
@@ -605,21 +596,11 @@ def _validate_opd(spec: JobSpec) -> None:
     _validate_on_policy_prompt_budget(spec, "opd")
 
 
-def _validate_opsd(spec: JobSpec) -> None:
-    """validate phase-1 opsd training constraints."""
-    if spec.train.group_size not in (None, 1):
-        raise ConfigError("opsd samples exactly one on-policy rollout per prompt; group_size must be 1")
-    if spec.train.teacher_model:
-        raise ConfigError("opsd uses the local frozen base teacher; train.teacher_model is not supported")
-    _validate_on_policy_prompt_budget(spec, "opsd")
-
-
 # each algorithm's spec-level contract lives in one validator, dispatched by name.
 _ALGO_VALIDATORS = {
     "sft": _validate_sft,
     "grpo": _validate_grpo,
     "opd": _validate_opd,
-    "opsd": _validate_opsd,
 }
 
 
