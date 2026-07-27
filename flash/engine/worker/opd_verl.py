@@ -1666,6 +1666,19 @@ def _metric_value(line: str, name: str) -> float | None:
     return None
 
 
+def _failure_accounting_metadata(accounting: dict) -> dict:
+    return {
+        "teacher_transient_failures": int(accounting["teacher_transient"]),
+        "teacher_errors": int(accounting["teacher_error"]),
+        "no_signal_resamples": int(accounting["no_signal_resamples"]),
+        "no_signal_skipped_steps": int(accounting["no_signal_skipped_steps"]),
+        "skip_reasons": {
+            reason: int(count)
+            for reason, count in sorted(accounting["skip_counts"].items())
+        },
+    }
+
+
 def _read_failure_fallback_records(base_path: str) -> list[tuple[str, str]]:
     if not base_path:
         return []
@@ -2496,8 +2509,7 @@ def run_opd_verl(spec=None) -> None:
                 "aligned_sequences": int(final_accounting["aligned_sequences"]),
                 "empty_alignments": int(final_accounting["empty_alignments"]),
                 "teacher_ok": int(final_accounting["teacher_ok"]),
-                "teacher_transient": int(final_accounting["teacher_transient"]),
-                "teacher_error": int(final_accounting["teacher_error"]),
+                **_failure_accounting_metadata(final_accounting),
                 "temperature": knobs.temperature,
                 "group_size": knobs.group_size,
                 "prompts_per_step": prompts_per_step,
