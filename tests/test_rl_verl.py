@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import urllib.request
 from types import SimpleNamespace
 
@@ -57,9 +58,9 @@ def _overrides_cfg(**over):
         "prompts_per_step": 16, "micro_batch": 2, "max_prompt_len": 2048,
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "num_iterations": 2,
-        "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "loggers": "console",
-        "reward_path": "/w/reward.py", "reward_name": "compute_score", "total_epochs": 1,
-        "save_freq": 20, "local_dir": "/w/ckpt",
+        "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "loggers": "console", "fp8_kv": False,
+        "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
+        "total_epochs": 1, "save_freq": 20, "local_dir": "/w/ckpt",
     }
     cfg.update(over)
     return cfg
@@ -85,11 +86,30 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "trainer.max_actor_ckpt_to_keep=1" in o
     assert "trainer.logger=[console]" in o
     assert "data.train_batch_size=16" in o
+    # truncated importance sampling: token-level, cap 2.0 (matches flash's tis recipe).
+    assert "algorithm.rollout_correction.rollout_is=token" in o
+    assert "algorithm.rollout_correction.rollout_is_threshold=2.0" in o
 
 
 def test_build_verl_overrides_wandb_logger_when_enabled():
     o = rl_verl.build_verl_overrides(_overrides_cfg(loggers="console,wandb"))
     assert "trainer.logger=[console,wandb]" in o
+
+
+def test_build_verl_overrides_warmstart_adapter_path():
+    # fresh run: no lora_adapter_path override.
+    fresh = rl_verl.build_verl_overrides(_overrides_cfg(warmstart_adapter=""))
+    assert not any("lora_adapter_path" in x for x in fresh)
+    # warm-start: point verl's lora init at the downloaded source adapter dir.
+    warm = rl_verl.build_verl_overrides(_overrides_cfg(warmstart_adapter="/tmp/sft_adapter"))
+    assert "actor_rollout_ref.model.lora_adapter_path=/tmp/sft_adapter" in warm
+
+
+def test_build_verl_overrides_fp8_kv_gated_on_hardware():
+    off = rl_verl.build_verl_overrides(_overrides_cfg(fp8_kv=False))
+    assert not any("kv_cache_dtype" in x for x in off)
+    on = rl_verl.build_verl_overrides(_overrides_cfg(fp8_kv=True))
+    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8" in on
 
 
 def test_resolve_verl_loggers_console_when_no_api_key(monkeypatch):
@@ -208,3 +228,53 @@ def test_reward_server_round_trip():
         assert got["score"] == 7.0  # 3 + len("abcd")
     finally:
         server.shutdown()
+
+
+def test_reward_server_scorer_can_capture_samples():
+    # the #607 per-step dump relies on the scoring closure capturing recent completions; verify the
+    # reward-server -> scorer -> rolling-buffer path populates in order.
+    captured: list = []
+    lock = threading.Lock()
+
+    def scorer(idx, sol):
+        with lock:
+            captured.append((sol, float(len(sol))))
+            del captured[:-64]
+        return float(len(sol))
+
+    server, url = rl_verl.start_reward_server(scorer)
+    try:
+        for i in range(3):
+            body = json.dumps({"index": i, "solution_str": f"c{i}"}).encode()
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10).read()
+        assert [c[0] for c in captured] == ["c0", "c1", "c2"]
+    finally:
+        server.shutdown()
+
+
+def test_resolve_single_turn_inputs_guards_entropy_quantile(monkeypatch):
+    # entropy_quantile<1.0 has no verl equivalent (trl top-entropy masking); the single-turn resolver
+    # must fail loud rather than silently train without the requested masking.
+    import pytest
+
+    import flash.engine.worker.rl_verl as rlv
+    from flash.engine.worker._pkg import W
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict(
+        {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo", "train": {"entropy_quantile": 0.2}}
+    )
+
+    class _Env:
+        is_tool_env = False
+        multi_turn = False
+
+    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(W, "SEED", 42, raising=False)
+    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
+    # the resolver seeds rngs (torch) before validating; stub it so this stays cpu/offline-runnable.
+    monkeypatch.setattr(rlv, "seed_training_rngs", lambda seed: None)
+
+    with pytest.raises(RuntimeError, match="entropy_quantile"):
+        rlv._resolve_single_turn_inputs()

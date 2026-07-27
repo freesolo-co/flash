@@ -31,6 +31,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.rollout_samples import sanitize_rollout_text
 
 DATA_SOURCE = "flash_env"
 
@@ -81,6 +82,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         "algorithm.norm_adv_by_std_in_grpo=False",
         f"actor_rollout_ref.actor.loss_agg_mode={cfg['loss_agg_mode']}",
         "algorithm.use_kl_in_reward=False",
+        # truncated importance sampling (token-level, cap 2.0): corrects the vllm-rollout vs
+        # fsdp-train policy mismatch. matches the trl path's tis recipe (token_truncate, c_max=2.0);
+        # verl otherwise defaults to sequence-level tis, so pin token to match flash.
+        "algorithm.rollout_correction.rollout_is=token",
+        "algorithm.rollout_correction.rollout_is_threshold=2.0",
         f"data.train_files={cfg['train_files']}",
         f"data.val_files={cfg['val_files']}",
         f"data.train_batch_size={cfg['prompts_per_step']}",
@@ -94,6 +100,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
         # memory: match the trl path's gradient checkpointing.
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+        *(
+            [f"actor_rollout_ref.model.lora_adapter_path={cfg['warmstart_adapter']}"]
+            if cfg.get("warmstart_adapter")
+            else []
+        ),
         f"actor_rollout_ref.actor.optim.lr={cfg['lr']}",
         # 0 warmup -> verl's warmup+constant scheduler holds lr flat, matching the trl constant recipe.
         "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0",
@@ -113,6 +124,10 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={cfg['micro_batch']}",
         f"custom_reward_function.path={cfg['reward_path']}",
         f"custom_reward_function.name={cfg['reward_name']}",
+        # verl trainer-v1 reward loop reads reward.custom_reward_function (the legacy top-level key
+        # is migrated in the main process but not visible to the RewardLoopWorker actor); emit both.
+        f"reward.custom_reward_function.path={cfg['reward_path']}",
+        f"reward.custom_reward_function.name={cfg['reward_name']}",
         "trainer.n_gpus_per_node=1",
         "trainer.nnodes=1",
         f"trainer.total_epochs={cfg['total_epochs']}",
@@ -137,6 +152,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     else:
         # flash default: dr-grpo with no kl term, so no reference policy.
         o.append("actor_rollout_ref.actor.use_kl_loss=False")
+    if cfg.get("fp8_kv"):
+        # fp8 kv cache on ada/hopper+ (cc>=8.9), matching the trl colocate path; tis (above) covers
+        # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
+        # engine_kwargs.vllm struct (it is not a default field).
+        o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
     return o
 
 
@@ -397,11 +417,6 @@ def _resolve_single_turn_inputs():
             "train.structured_outputs is not yet supported on the verl backend; use the trl backend "
             "(unset FLASH_RL_BACKEND) until guided-decoding parity lands."
         )
-    if _t and getattr(_t, "init_from_adapter", ""):
-        raise RuntimeError(
-            "train.init_from_adapter (warm-start) is not yet supported on the verl backend; use the "
-            "trl backend (unset FLASH_RL_BACKEND) for warm-start runs."
-        )
     if _t and getattr(_t, "stop_sequences", ()):
         raise RuntimeError(
             "train.stop_sequences is not yet supported on the verl backend (verl's vllm rollout has "
@@ -416,6 +431,15 @@ def _resolve_single_turn_inputs():
         raise RuntimeError(
             "model_revision pinning is not yet supported on the verl backend (verl loads the model "
             "at its default revision); use the trl backend for revision-pinned runs."
+        )
+    # entropy_quantile drives trl GRPOTrainer's internal top-entropy token masking (top_entropy_quantile);
+    # verl has no equivalent, so honoring the flash default (1.0 = no masking) is fine but any customer
+    # value < 1.0 must fail loud rather than train without the requested masking (silent drift).
+    _eq = getattr(_t, "entropy_quantile", None) if _t else None
+    if _eq is not None and float(_eq) < 1.0:
+        raise RuntimeError(
+            f"train.entropy_quantile={_eq} is not yet supported on the verl backend (trl's top-entropy "
+            "token masking has no verl equivalent); use the trl backend (unset FLASH_RL_BACKEND) for it."
         )
     # flash's lora dropout is fixed at 0.0; verl matches (peft default). guard defensively so a future
     # non-zero recipe value can never be silently ignored.
@@ -456,6 +480,32 @@ def _resolve_single_turn_inputs():
     # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
     lora_rank = int(_t.lora_rank) if (_t and _t.lora_rank) else int(RECIPE.lora.rank)
     lora_alpha = int(_t.lora_alpha) if (_t and _t.lora_alpha) else int(RECIPE.lora.alpha)
+    # warm-start: continue the sft adapter in place (verl lora_adapter_path). uses the SOURCE
+    # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
+    warmstart_adapter = ""
+    if _t and getattr(_t, "init_from_adapter", ""):
+        if kl_coef > 0:
+            raise RuntimeError(
+                "warm-start (init_from_adapter) with kl_penalty_coef>0 anchors the kl reference to "
+                "the sft adapter; the verl backend's reference is the base, so this is not yet "
+                "supported. set kl_penalty_coef=0, or use the trl backend for kl-anchored warm-start."
+            )
+        from flash.engine.worker.adapter import _download_adapter
+
+        warmstart_adapter = _download_adapter(_t.init_from_adapter)
+        if not warmstart_adapter:
+            raise RuntimeError(
+                "warm-start source adapter could not be downloaded; refusing to start from the base."
+            )
+        with open(os.path.join(warmstart_adapter, "adapter_config.json")) as f:
+            _src_cfg = json.load(f)
+        lora_rank = int(_src_cfg.get("r", lora_rank))
+        lora_alpha = int(_src_cfg.get("lora_alpha", lora_alpha))
+        print(
+            f"[rl-verl] warm-start: continuing source adapter (r={lora_rank}, alpha={lora_alpha}) "
+            f"from {_t.init_from_adapter}",
+            flush=True,
+        )
 
     train = env.dataset()
     _max_examples = getattr(_t, "max_examples", None) if _t else None
@@ -526,6 +576,7 @@ def _resolve_single_turn_inputs():
         "lr": learning_rate,
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
+        "warmstart_adapter": warmstart_adapter,
         "epochs": epochs,
         "steps": int(steps),
         "save_every": save_every,
@@ -543,7 +594,7 @@ def run_rl_verl():
     _w.heartbeat("rl_start", gpu=gpu_diagnostics())
     wait_for_gpu(
         _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
-        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+        gpu_type=_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else "",
     )
     setup_perf_backends()
 
@@ -580,15 +631,24 @@ def run_rl_verl():
     with open(reward_py, "w") as f:
         f.write(render_reward_module())
 
-    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring.
+    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. also keep a
+    # rolling buffer of recent (completion, score) so the training loop can dump one sample per step
+    # to the flash log, matching the trl path's #607 per-step completion dump.
+    recent_samples: list[tuple[str, float]] = []
+    _samples_lock = threading.Lock()
+
     def _score(index: int, solution_str: str) -> float:
         ex = rollout_examples[int(index)]
-        return score_single_turn(
+        score = score_single_turn(
             env, solution_str, ex,
             tok=tok, thinking=bool(_w.THINKING),
             prompt_opened_thinking=inp["prompt_opened_thinking"],
             think_penalty=inp["think_penalty"],
         )
+        with _samples_lock:
+            recent_samples.append((solution_str, score))
+            del recent_samples[:-64]
+        return score
 
     server, reward_url = start_reward_server(_score)
     try:
@@ -598,6 +658,20 @@ def run_rl_verl():
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).
         loggers = _resolve_verl_loggers(python_bin)
+        # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path — but NOT for
+        # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
+        # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
+        try:
+            import torch as _torch_cc
+
+            from flash.engine.worker.packing import model_is_gdn_hybrid
+
+            _cc_ok = bool(
+                _torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9)
+            )
+            fp8_kv = _cc_ok and not model_is_gdn_hybrid(inp["model_id"])
+        except Exception:  # no cuda / probe failure -> conservative bf16 kv
+            fp8_kv = False
         cfg = {
             "train_files": train_pq, "val_files": val_pq,
             "model_id": inp["model_id"], "lora_rank": inp["lora_rank"],
@@ -608,7 +682,8 @@ def run_rl_verl():
             "temperature": inp["temperature"], "top_p": inp["top_p"], "kl_coef": inp["kl_coef"],
             "loss_agg_mode": "seq-mean-token-sum-norm", "seed": inp["seed"],
             "num_iterations": inp["num_iterations"], "steps": expected_steps,
-            "gpu_mem_util": 0.5, "tp_size": 1, "loggers": loggers,
+            "warmstart_adapter": inp["warmstart_adapter"],
+            "gpu_mem_util": 0.5, "tp_size": 1, "loggers": loggers, "fp8_kv": fp8_kv,
             "reward_path": reward_py, "reward_name": "compute_score",
             "total_epochs": inp["epochs"], "save_freq": inp["save_every"], "local_dir": local_dir,
         }
@@ -637,6 +712,7 @@ def run_rl_verl():
         loss_re = re.compile(r"actor/pg_loss:([-\d.eE+]+)")
         reward_history: list[float] = []
         loss_curve: list[float] = []
+        last_dump_step = [-1]
         with liveness_heartbeat("rl_verl_training", progress=_progress, progress_step=True):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
@@ -647,6 +723,17 @@ def run_rl_verl():
                 m = step_re.search(line)
                 if m:
                     step_box[0] = int(m.group(1))
+                    # dump one sample completion per new step to the flash log (matches trl #607).
+                    if step_box[0] != last_dump_step[0]:
+                        with _samples_lock:
+                            samp = recent_samples[-1] if recent_samples else None
+                        if samp:
+                            last_dump_step[0] = step_box[0]
+                            preview = " ".join(sanitize_rollout_text(samp[0])[:300].split())
+                            print(
+                                f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
+                                flush=True,
+                            )
                 # capture verl's per-step reward + policy loss for train_meta observability parity.
                 for pat, sink in ((reward_re, reward_history), (loss_re, loss_curve)):
                     hit = pat.search(line)
