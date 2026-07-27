@@ -877,7 +877,9 @@ def _submit_seed_supervised(
         last_detail = f"{res.failure}: {res.detail}"
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
-            oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)
+            oom_vram_floor = max(
+                oom_vram_floor, getattr(chosen, "gpu_count", 1) * chosen.vram_gb
+            )
         run_had_cache = bool(
             chosen is not None
             and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
