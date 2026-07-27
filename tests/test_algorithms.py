@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import pytest
 
-from flash.catalog import ALGORITHMS
+from flash.catalog import ALGORITHMS, normalize_algorithm
 from flash.schema import ConfigError, spec_from_dict
 
 
 def test_algorithms_registry():
     assert set(ALGORITHMS) == {"sft", "grpo", "opd"}
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_algorithm_names_normalize_case_insensitively(algorithm):
+    # config values reach the catalog verbatim from user toml, so every supported algorithm must
+    # survive an uppercase spelling.
+    assert normalize_algorithm(algorithm.upper()) == algorithm
 
 
 def test_unknown_algorithm_rejected():
