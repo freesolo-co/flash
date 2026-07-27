@@ -285,7 +285,7 @@ class _TeacherAlignmentBridge:
         self.opd_phase_counts = dict(state.get("opd_phase_counts", {}))
         self._teacher_failure: tuple[str, str] | None = None
         self._pending_teacher_transient: tuple[str, str] | None = None
-        self._pending_teacher_nontransient = False
+        self._pending_teacher_success = False
 
     def _record_teacher_failure(self, classification: str, message: str) -> None:
         with self._stats_lock:
@@ -296,10 +296,6 @@ class _TeacherAlignmentBridge:
             else:
                 self.teacher_error += 1
                 self._teacher_failure = (classification, message)
-
-    def _record_nontransient_score(self) -> None:
-        with self._stats_lock:
-            self._pending_teacher_nontransient = True
 
     @property
     def teacher_failure(self) -> tuple[str, str] | None:
@@ -375,7 +371,6 @@ class _TeacherAlignmentBridge:
             self.generated_tokens += len(response_ids)
             self.forced_tokens += sum(forced)
         if not response_ids:
-            self._record_nontransient_score()
             return self._empty(prompt_length, 0)
         stop_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
         if not _rollout_terminated(
@@ -383,7 +378,6 @@ class _TeacherAlignmentBridge:
         ):
             with self._stats_lock:
                 self.truncated_rollouts += 1
-            self._record_nontransient_score()
             return self._empty(prompt_length, len(response_ids))
         kept_ids, completion_text, kept_forced = _trim_response_and_forced(
             self.tokenizer,
@@ -393,7 +387,6 @@ class _TeacherAlignmentBridge:
             forced,
         )
         if not completion_text.strip() or "�" in completion_text:
-            self._record_nontransient_score()
             return self._empty(prompt_length, len(response_ids))
         teacher_prompt = _teacher_prompt_text(prompt.teacher_messages, self.thinking_prefill)
         teacher_images = None
@@ -422,7 +415,7 @@ class _TeacherAlignmentBridge:
             teacher_input_tokens = 0
         with self._stats_lock:
             self.teacher_ok += 1
-            self._pending_teacher_nontransient = True
+            self._pending_teacher_success = True
         student_ids, student_tokens = student_tokens_with_offsets(
             self.tokenizer, kept_ids, completion_text
         )
@@ -802,17 +795,17 @@ class _TeacherAlignmentBridge:
             if (
                 self._teacher_failure is None
                 and self._pending_teacher_transient is not None
-                and not self._pending_teacher_nontransient
+                and not self._pending_teacher_success
             ):
                 self._teacher_failure = self._pending_teacher_transient
             self._pending_teacher_transient = None
-            self._pending_teacher_nontransient = False
+            self._pending_teacher_success = False
         return {"ok": True}
 
     def notify_mutation(self) -> None:
         with self._stats_lock:
             self._pending_teacher_transient = None
-            self._pending_teacher_nontransient = False
+            self._pending_teacher_success = False
         with self._mutation_lock:
             if self._mutation_notified:
                 return

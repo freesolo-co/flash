@@ -1381,6 +1381,87 @@ def test_all_transient_teacher_samples_exhaust_replacements_as_retriable():
     assert mutations == []
 
 
+def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
+    from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.teacher import TeacherError
+
+    class TransientTeacher:
+        def score(self, _prompt_text, _completion_text):
+            raise TeacherError("teacher unavailable", permanent=False)
+
+    bridge = _text_bridge(TransientTeacher())
+
+    def run_attempt(attempt_ordinal):
+        transient = _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+        )
+        truncated = _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66]),
+        )
+        assert transient["teacher_ids"] == [-1, -1, -1, -1, -1]
+        assert truncated["teacher_ids"] == [-1, -1, -1, -1]
+        raise _AllNoSignalBatch(attempt_ordinal)
+
+    bridge.start()
+    try:
+        with pytest.raises(RuntimeError, match="after 3 rollout attempts"):
+            _run_with_no_signal_replacements(
+                run_attempt,
+                lambda _batch: None,
+                lambda: None,
+                lambda: _post_json(
+                    bridge.url, bridge.token, "/no-signal/resample", {}
+                ),
+                lambda: _post_json(
+                    bridge.url, bridge.token, "/no-signal/abandoned", {}
+                ),
+            )
+        with pytest.raises(RetriableInfraError, match="after bounded retries"):
+            _raise_verl_failure(1, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert bridge.score_requests == 6
+    assert bridge.teacher_transient == 3
+    assert bridge.teacher_ok == 0
+    assert bridge.truncated_rollouts == 3
+
+
+def test_mixed_transient_and_teacher_empty_alignment_exhaustion_remains_permanent():
+    from flash.engine.worker.teacher import TeacherError
+
+    class AlternatingTeacher:
+        def __init__(self):
+            self.calls = 0
+
+        def score(self, _prompt_text, _completion_text):
+            self.calls += 1
+            if self.calls % 2:
+                raise TeacherError("teacher unavailable", permanent=False)
+            return []
+
+    bridge = _text_bridge(AlternatingTeacher())
+    bridge.start()
+    try:
+        with pytest.raises(RuntimeError, match="after 3 rollout attempts"):
+            _exhaust_bridge_no_signal(bridge)
+        with pytest.raises(RuntimeError, match="subprocess exited with status 1"):
+            _raise_verl_failure(1, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert bridge.teacher_failure is None
+    assert bridge.teacher_transient == 2
+    assert bridge.teacher_ok == 1
+    assert bridge.empty_alignments == 1
+
+
 def test_deterministic_empty_alignment_exhaustion_remains_permanent():
     class EmptyAlignmentTeacher:
         def score(self, _prompt_text, _completion_text):
