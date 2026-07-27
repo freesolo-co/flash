@@ -8,12 +8,14 @@ single-turn sampling, and removes the otherwise mandatory local teacher GPU pool
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import importlib.metadata
 import importlib.util
 import json
 import os
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -297,21 +299,37 @@ def _write_mutation_failure_fallback(classification: str, message: str) -> None:
     base_path = os.environ.get("FLASH_OPD_MUTATION_FAILURE_PATH", "")
     if not base_path:
         return
-    path = f"{base_path}.{classification}"
-    encoded = str(message).encode("utf-8", errors="replace")[:4096]
+    process_id = os.getpid()
+    record_path = f"{base_path}.{process_id}.{classification}.json"
+    directory = os.path.dirname(base_path) or "."
+    prefix = f".{os.path.basename(base_path)}.{process_id}.{classification}."
+    payload = json.dumps(
+        {"classification": classification, "message": str(message)[:4096]},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    temporary_path = ""
     try:
-        descriptor = os.open(
-            path,
-            os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
-            0o600,
+        descriptor, temporary_path = tempfile.mkstemp(
+            dir=directory,
+            prefix=prefix,
+            suffix=".tmp",
         )
         try:
-            os.write(descriptor, encoded)
+            remaining = payload
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("mutation failure fallback write did not progress")
+                remaining = remaining[written:]
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        os.replace(temporary_path, record_path)
+        temporary_path = ""
     except OSError:
-        return
+        if temporary_path:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_path)
 
 
 def _post_mutation_notice(url: str, token: str) -> None:

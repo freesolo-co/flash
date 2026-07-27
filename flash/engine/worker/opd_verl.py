@@ -1313,19 +1313,30 @@ def _metric_value(line: str, name: str) -> float | None:
 def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
     if not base_path:
         return None
-    for classification in ("permanent", "transient"):
-        path = f"{base_path}.{classification}"
-        if not os.path.isfile(path):
-            continue
+    base = Path(base_path)
+    failures: list[tuple[str, str]] = []
+    for path in sorted(base.parent.glob(f"{base.name}.*.json")):
         try:
-            with open(path, encoding="utf-8", errors="replace") as file:
-                message = file.read(4096).strip()
-        except OSError as error:
-            return (
-                "permanent",
-                f"could not read mutation failure fallback: {type(error).__name__}",
-            )
-        return classification, message or "mutation bridge failure"
+            with path.open(encoding="utf-8") as file:
+                encoded = file.read(8193)
+            if len(encoded) > 8192:
+                continue
+            record = json.loads(encoded)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        classification = record.get("classification")
+        message = record.get("message")
+        if classification not in {"permanent", "transient"}:
+            continue
+        if not isinstance(message, str) or not message.strip():
+            continue
+        failures.append((classification, message.strip()))
+    for classification in ("permanent", "transient"):
+        for failure_classification, message in failures:
+            if failure_classification == classification:
+                return classification, message
     return None
 
 

@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import multiprocessing
 import os
 import sys
 import types
@@ -57,6 +58,13 @@ from flash.engine.worker.opd_verl_structured import (
 )
 from flash.engine.worker.tokenizer_align import TeacherToken
 from flash.opd_verl_validation import validate_opd_verl_structured_outputs
+
+
+def _write_mutation_failure_after_start(start, classification, message):
+    from flash.engine.worker.opd_verl_plugin import _write_mutation_failure_fallback
+
+    start.wait()
+    _write_mutation_failure_fallback(classification, message)
 
 
 def _load_verl_rl_dataset(monkeypatch):
@@ -1623,12 +1631,81 @@ def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_statu
         _raise_verl_failure(1, None, mutation_failure)
 
 
-def test_mutation_failure_fallback_preserves_permanent_precedence(tmp_path):
+def test_mutation_failure_fallback_publishes_one_atomic_record_per_process(
+    monkeypatch, tmp_path
+):
     from flash.engine.worker.opd_verl import _read_mutation_failure_fallback
 
     failure_path = str(tmp_path / "mutation-failure")
-    Path(f"{failure_path}.transient").write_text("bridge timeout")
-    Path(f"{failure_path}.permanent").write_text("invalid marker configuration")
+    messages = [f"bridge timeout {index}" for index in range(4)]
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+
+    monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
+    processes = [
+        context.Process(
+            target=_write_mutation_failure_after_start,
+            args=(start, "transient", message),
+        )
+        for message in messages
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    records = sorted(tmp_path.glob("mutation-failure.*.transient.json"))
+    assert len(records) == len(messages)
+    assert {
+        json.loads(record.read_text())["message"] for record in records
+    } == set(messages)
+    selected = _read_mutation_failure_fallback(failure_path)
+    expected_message = json.loads(records[0].read_text())["message"]
+    assert selected == ("transient", expected_message)
+    assert not [path for path in tmp_path.iterdir() if path.name.endswith(".tmp")]
+
+
+def test_mutation_failure_fallback_removes_temp_when_publication_fails(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    failure_path = str(tmp_path / "mutation-failure")
+
+    def fail_publication(_source, _destination):
+        raise OSError("publication failed")
+
+    monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
+    monkeypatch.setattr(plugin.os, "replace", fail_publication)
+
+    plugin._write_mutation_failure_fallback("transient", "bridge timeout")
+
+    assert not list(tmp_path.iterdir())
+
+
+def test_mutation_failure_fallback_selects_permanent_and_ignores_incomplete_records(
+    tmp_path,
+):
+    from flash.engine.worker.opd_verl import _read_mutation_failure_fallback
+
+    failure_path = str(tmp_path / "mutation-failure")
+    Path(f"{failure_path}.100.transient.json").write_text(
+        json.dumps({"classification": "transient", "message": "bridge timeout"})
+    )
+    Path(f"{failure_path}.200.permanent.json").write_text(
+        json.dumps(
+            {
+                "classification": "permanent",
+                "message": "invalid marker configuration",
+            }
+        )
+    )
+    Path(f"{failure_path}.300.permanent.json").write_text("{")
+    Path(f"{failure_path}.400.transient.json.tmp").write_text(
+        json.dumps({"classification": "transient", "message": "incomplete"})
+    )
 
     assert _read_mutation_failure_fallback(failure_path) == (
         "permanent",
