@@ -1459,9 +1459,7 @@ def test_combo_replicated_floor_excludes_tiny_cards(monkeypatch):
     cands = [Candidate(provider="runpod", gpu="TINY 8GB", hourly_usd=0.1, vram_gb=8)]
     _stub_provider(monkeypatch, allocator, cands)
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
-    import pytest as _pytest
-
-    with _pytest.raises(UnsupportedGpuError):
+    with pytest.raises(UnsupportedGpuError):
         allocator.allocate("m", "sft", max_gpu_count=4)
 
 
