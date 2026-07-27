@@ -273,6 +273,8 @@ def test_resolve_single_turn_inputs_guards_entropy_quantile(monkeypatch):
     monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
     monkeypatch.setattr(W, "SEED", 42, raising=False)
     monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
+    # the resolver seeds rngs (torch) before validating; stub it so this stays cpu/offline-runnable.
+    monkeypatch.setattr(rlv, "seed_training_rngs", lambda seed: None)
 
     with pytest.raises(RuntimeError, match="entropy_quantile"):
         rlv._resolve_single_turn_inputs()
