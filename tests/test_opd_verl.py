@@ -797,6 +797,41 @@ def test_transient_teacher_sample_returns_no_signal_while_following_peer_trains(
     assert bridge.teacher_failure is None
 
 
+def test_recovered_transient_lost_response_promotes_transient_terminal_cause():
+    from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.teacher import TeacherError
+
+    class TransientTeacher:
+        def score(self, _prompt_text, _completion_text):
+            raise TeacherError("teacher unavailable", permanent=False)
+
+    bridge = _text_bridge(TransientTeacher())
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+
+    def disconnect_during_response(_handler, _status, _payload):
+        raise BrokenPipeError("client disconnected")
+
+    handler._send_json = disconnect_during_response
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as transport_error:
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                _bridge_score_payload(0, [10, 11], [65, 66, 99]),
+            )
+        with pytest.raises(RetriableInfraError, match="after bounded retries"):
+            _raise_verl_failure(1, bridge.teacher_failure)
+    finally:
+        bridge.close()
+
+    assert transport_error.value.classification == "transient"
+    assert bridge.teacher_failure == ("transient", "teacher unavailable")
+    assert bridge.teacher_transient == 1
+    assert bridge.teacher_error == 0
+
+
 def test_recovered_transient_does_not_make_later_deterministic_exhaustion_retriable():
     from flash.engine.worker.teacher import TeacherError
 
@@ -1548,6 +1583,59 @@ def test_bridge_transport_failure_is_typed_retriable(monkeypatch):
     assert error.value.classification == "transient"
 
 
+def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_status(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_mutation_failure_fallback
+    from flash.engine.worker.perf import RetriableInfraError
+
+    failure_path = str(tmp_path / "mutation-failure")
+
+    def fail_post(*_args, **_kwargs):
+        raise FlashTeacherBridgeError(
+            "flash OPD bridge transport failed: ConnectionRefusedError",
+            classification="transient",
+        )
+
+    class ChildExit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
+    monkeypatch.setattr(plugin, "_post_json", fail_post)
+    monkeypatch.setattr(plugin.os, "_exit", child_exit)
+
+    with pytest.raises(ChildExit) as actor_exit:
+        plugin._post_mutation_notice("http://bridge", "token")
+
+    mutation_failure = _read_mutation_failure_fallback(failure_path)
+    assert actor_exit.value.code == 87
+    assert mutation_failure == (
+        "transient",
+        "flash OPD bridge transport failed: ConnectionRefusedError",
+    )
+    with pytest.raises(RetriableInfraError, match="optimizer marker failure"):
+        _raise_verl_failure(1, None, mutation_failure)
+
+
+def test_mutation_failure_fallback_preserves_permanent_precedence(tmp_path):
+    from flash.engine.worker.opd_verl import _read_mutation_failure_fallback
+
+    failure_path = str(tmp_path / "mutation-failure")
+    Path(f"{failure_path}.transient").write_text("bridge timeout")
+    Path(f"{failure_path}.permanent").write_text("invalid marker configuration")
+
+    assert _read_mutation_failure_fallback(failure_path) == (
+        "permanent",
+        "invalid marker configuration",
+    )
+
+
 @pytest.mark.parametrize(
     ("classification", "expected_exit"),
     [("transient", 87), ("permanent", 86)],
@@ -1916,9 +2004,11 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
         structured_outputs=None,
         model_vocab_size=248320,
         thinking=False,
+        mutation_failure_path=str(tmp_path / "mutation-failure"),
     )
     assert child["FLASH_OPD_BRIDGE_URL"] == "http://127.0.0.1:4444"
     assert child["FLASH_OPD_BRIDGE_TOKEN"] == "bridge-token"
+    assert child["FLASH_OPD_MUTATION_FAILURE_PATH"] == str(tmp_path / "mutation-failure")
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_verl_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "FIREWORKS_API_KEY" not in child

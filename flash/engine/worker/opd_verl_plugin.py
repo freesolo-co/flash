@@ -293,17 +293,43 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
         ) from error
 
 
+def _write_mutation_failure_fallback(classification: str, message: str) -> None:
+    base_path = os.environ.get("FLASH_OPD_MUTATION_FAILURE_PATH", "")
+    if not base_path:
+        return
+    path = f"{base_path}.{classification}"
+    encoded = str(message).encode("utf-8", errors="replace")[:4096]
+    try:
+        descriptor = os.open(
+            path,
+            os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return
+
+
 def _post_mutation_notice(url: str, token: str) -> None:
     try:
         _post_json(url, token, "/mutation", {})
     except FlashTeacherBridgeError as error:
+        _write_mutation_failure_fallback(error.classification, str(error))
         exit_code = (
             _PERMANENT_TEACHER_EXIT
             if error.classification == "permanent"
             else _TRANSIENT_TEACHER_EXIT
         )
         os._exit(exit_code)
-    except Exception:
+    except Exception as error:
+        _write_mutation_failure_fallback(
+            "permanent",
+            f"unexpected mutation bridge failure: {type(error).__name__}",
+        )
         os._exit(_PERMANENT_TEACHER_EXIT)
 
 

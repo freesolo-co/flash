@@ -311,6 +311,11 @@ class _TeacherAlignmentBridge:
         with self._stats_lock:
             return self._teacher_failure
 
+    def _promote_recovered_teacher_failure(self, failure: tuple[str, str]) -> None:
+        with self._stats_lock:
+            if self._teacher_failure is None:
+                self._teacher_failure = failure
+
     def _record_mutation_failure(self, classification: str, message: str) -> None:
         with self._stats_lock:
             if classification == "permanent" or self._mutation_failure is None:
@@ -362,6 +367,8 @@ class _TeacherAlignmentBridge:
         sequence_ids: list[int],
         image_count: int = 0,
         forced=None,
+        *,
+        recovered_failure: list[tuple[str, str]] | None = None,
     ) -> dict:
         with self._stats_lock:
             self.score_requests += 1
@@ -425,7 +432,10 @@ class _TeacherAlignmentBridge:
         except TeacherError as error:
             if error.permanent:
                 raise
-            self._record_teacher_failure("transient", str(error))
+            failure = ("transient", str(error))
+            self._record_teacher_failure(*failure)
+            if recovered_failure is not None:
+                recovered_failure.append(failure)
             return self._empty(prompt_length, len(response_ids))
         if teacher_images is not None:
             teacher_tokens = teacher_batches[0]
@@ -856,19 +866,24 @@ class _TeacherAlignmentBridge:
                 self.wfile.write(encoded)
 
             def do_POST(self):
+                recovered_teacher_failure = None
                 try:
                     if self.headers.get("Authorization") != f"Bearer {bridge.token}":
                         raise PermissionError("flash OPD bridge authorization failed")
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                     if self.path == "/score":
+                        recovered_failures: list[tuple[str, str]] = []
                         result = bridge.score(
                             payload["index"],
                             payload["prompt_length"],
                             payload["sequence_ids"],
                             payload.get("image_count", 0),
                             payload.get("forced"),
+                            recovered_failure=recovered_failures,
                         )
+                        if recovered_failures:
+                            recovered_teacher_failure = recovered_failures[0]
                     elif self.path == "/multiturn/start":
                         result = bridge.start_multiturn(
                             index=payload["index"],
@@ -900,7 +915,12 @@ class _TeacherAlignmentBridge:
                         else "permanent"
                     )
                     if self.path == "/score":
-                        bridge._record_teacher_failure(classification, str(error))
+                        if recovered_teacher_failure is not None:
+                            bridge._promote_recovered_teacher_failure(
+                                recovered_teacher_failure
+                            )
+                        else:
+                            bridge._record_teacher_failure(classification, str(error))
                     elif self.path == "/multiturn/score":
                         bridge._record_teacher_failure(
                             classification,
@@ -1211,6 +1231,7 @@ def _build_opd_child_env(
     multi_turn: bool = False,
     max_turns: int = 0,
     max_model_len: int = 32768,
+    mutation_failure_path: str = "",
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -1223,6 +1244,8 @@ def _build_opd_child_env(
             "FLASH_OPD_EOS_TOKEN_IDS": json.dumps(sorted(eos_token_ids)),
         }
     )
+    if mutation_failure_path:
+        child["FLASH_OPD_MUTATION_FAILURE_PATH"] = mutation_failure_path
     if multi_turn:
         child.update(
             {
@@ -1284,6 +1307,25 @@ def _metric_value(line: str, name: str) -> float | None:
             return float(match.group("value"))
         except ValueError:
             return None
+    return None
+
+
+def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    if not base_path:
+        return None
+    for classification in ("permanent", "transient"):
+        path = f"{base_path}.{classification}"
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as file:
+                message = file.read(4096).strip()
+        except OSError as error:
+            return (
+                "permanent",
+                f"could not read mutation failure fallback: {type(error).__name__}",
+            )
+        return classification, message or "mutation bridge failure"
     return None
 
 
@@ -1666,6 +1708,7 @@ def run_opd_verl(spec=None) -> None:
     shim_dir = os.path.join(workdir, "shim")
     local_dir = os.path.join(workdir, "checkpoints")
     export_root = os.path.join(workdir, "checkpoint-adapters")
+    mutation_failure_path = os.path.join(workdir, "mutation-failure")
     for path in (data_dir, shim_dir, local_dir, export_root):
         os.makedirs(path, exist_ok=True)
 
@@ -1835,6 +1878,7 @@ def run_opd_verl(spec=None) -> None:
             multi_turn=multi_turn,
             max_turns=max_turns,
             max_model_len=max_model_len,
+            mutation_failure_path=mutation_failure_path,
         )
         command = [python_bin, entry_path, *overrides]
         progress = {"step": resume_step, "loss": None}
@@ -1890,6 +1934,11 @@ def run_opd_verl(spec=None) -> None:
         finally:
             watcher.stop(require_complete=training_completed)
         peak_gpu_gb = gpu_sampler.stop_gb()
+        fallback_mutation_failure = _read_mutation_failure_fallback(
+            mutation_failure_path
+        )
+        if fallback_mutation_failure is not None:
+            bridge._record_mutation_failure(*fallback_mutation_failure)
         _raise_verl_failure(
             return_code,
             bridge.teacher_failure,
