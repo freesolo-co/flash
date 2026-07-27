@@ -586,8 +586,10 @@ def test_initial_rl_step_persists_through_throttle_and_bills_cancel(monkeypatch)
     import flash.runner as runner
 
     persisted = []
+    required_flags = []
 
     def upload(local, *args, **kwargs):
+        required_flags.append(kwargs.get("required"))
         with open(local) as f:
             persisted.append(json.load(f))
         return True
@@ -599,6 +601,7 @@ def test_initial_rl_step_persists_through_throttle_and_bills_cancel(monkeypatch)
     committed = ne.heartbeat("rl_step", step=0, initial=True)
 
     assert committed is True
+    assert required_flags == [True]
     assert persisted[-1]["stage"] == "rl_step"
     assert persisted[-1]["step"] == 0
     status = runner.RunStatus(

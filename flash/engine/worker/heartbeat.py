@@ -219,7 +219,10 @@ def heartbeat(
                 with open(up, "w") as f:
                     f.write(snapshot)
                 try:
-                    committed = _w.hf_upload_file(up, "heartbeat.json")
+                    if initial:
+                        committed = _w.hf_upload_file(up, "heartbeat.json", required=True)
+                    else:
+                        committed = _w.hf_upload_file(up, "heartbeat.json")
                 finally:
                     with contextlib.suppress(OSError):
                         os.remove(up)
