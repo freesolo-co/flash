@@ -34,6 +34,7 @@ except ImportError:
 
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
+_FAILURE_FALLBACK_MAX_CHARS = 8192
 _STRUCTURED_RUNTIME_VERSIONS = {
     "verl": "0.8.0",
     "vllm": "0.11.0",
@@ -310,6 +311,30 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
         ) from error
 
 
+def _serialize_failure_fallback(classification: str, message: str) -> bytes:
+    message = str(message)
+    lower = 0
+    upper = min(len(message), _FAILURE_FALLBACK_MAX_CHARS)
+    serialized = json.dumps(
+        {"classification": classification, "message": ""},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    while lower <= upper:
+        length = (lower + upper) // 2
+        candidate = json.dumps(
+            {"classification": classification, "message": message[:length]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(candidate) <= _FAILURE_FALLBACK_MAX_CHARS:
+            serialized = candidate
+            lower = length + 1
+        else:
+            upper = length - 1
+    return serialized.encode("utf-8")
+
+
 def _write_failure_fallback(
     base_path: str,
     classification: str,
@@ -321,10 +346,7 @@ def _write_failure_fallback(
     record_path = f"{base_path}.{process_id}.{classification}.json"
     directory = os.path.dirname(base_path) or "."
     prefix = f".{os.path.basename(base_path)}.{process_id}.{classification}."
-    payload = json.dumps(
-        {"classification": classification, "message": str(message)[:4096]},
-        separators=(",", ":"),
-    ).encode("utf-8")
+    payload = _serialize_failure_fallback(classification, message)
     temporary_path = ""
     try:
         descriptor, temporary_path = tempfile.mkstemp(
@@ -390,8 +412,12 @@ def _write_cycle_commit_failure_fallback(classification: str, message: str) -> N
     )
 
 
+def _fallback_classification(error: FlashTeacherBridgeError) -> str:
+    return "transient" if error.delivery_unknown else error.classification
+
+
 def _exit_for_score_failure(error: FlashTeacherBridgeError) -> None:
-    classification = "transient" if error.delivery_unknown else error.classification
+    classification = _fallback_classification(error)
     if error.delivery_unknown:
         _write_score_delivery_failure_fallback(classification, str(error))
     exit_code = (
@@ -466,7 +492,7 @@ def _post_no_signal_resample(url: str, token: str) -> None:
     try:
         _post_json(url, token, "/no-signal/resample", {})
     except FlashTeacherBridgeError as error:
-        _write_resample_failure_fallback(error.classification, str(error))
+        _write_resample_failure_fallback(_fallback_classification(error), str(error))
         raise
     except Exception as error:
         _write_resample_failure_fallback(
@@ -480,7 +506,10 @@ def _post_no_signal_abandoned(url: str, token: str) -> None:
     try:
         _post_json(url, token, "/no-signal/abandoned", {})
     except FlashTeacherBridgeError as error:
-        _write_abandonment_failure_fallback(error.classification, str(error))
+        _write_abandonment_failure_fallback(
+            _fallback_classification(error),
+            str(error),
+        )
         raise
     except Exception as error:
         _write_abandonment_failure_fallback(
@@ -508,7 +537,10 @@ def _post_teacher_cycle_committed(url: str, token: str) -> None:
     try:
         _post_json(url, token, "/teacher-cycle/committed", {})
     except FlashTeacherBridgeError as error:
-        _write_cycle_commit_failure_fallback(error.classification, str(error))
+        _write_cycle_commit_failure_fallback(
+            _fallback_classification(error),
+            str(error),
+        )
         raise
     except Exception as error:
         _write_cycle_commit_failure_fallback(
@@ -800,6 +832,7 @@ def _install_verl_extensions() -> None:
         agent_loop_base=AgentLoopBase,
         agent_loop_output=AgentLoopOutput,
         post_json=_post_json,
+        score_failure_handler=_exit_for_score_failure,
         deterministic_seed=deterministic_rollout_seed,
         permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
         transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,

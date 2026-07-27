@@ -2256,6 +2256,215 @@ def test_authoritative_teacher_failure_precedes_transient_no_signal_evidence(
             _raise_verl_failure(1, bridge.teacher_failure, no_signal_failure=failure)
 
 
+@pytest.mark.parametrize(
+    ("channel", "environment_key", "reader_name", "counter_name"),
+    [
+        (
+            "resample",
+            "FLASH_OPD_RESAMPLE_FAILURE_PATH",
+            "_read_resample_failure_fallback",
+            "no_signal_resamples",
+        ),
+        (
+            "abandoned",
+            "FLASH_OPD_ABANDONMENT_FAILURE_PATH",
+            "_read_abandonment_failure_fallback",
+            "no_signal_skipped_steps",
+        ),
+    ],
+)
+def test_malformed_accepted_no_signal_notification_is_transient_once(
+    monkeypatch,
+    tmp_path,
+    channel,
+    environment_key,
+    reader_name,
+    counter_name,
+):
+    import flash.engine.worker.opd_verl as opd_verl
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    failure_path = str(tmp_path / f"{channel}-failure")
+    monkeypatch.setenv(environment_key, failure_path)
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+    sends = []
+
+    def malformed_response(request_handler, status, payload):
+        sends.append(status)
+        return _send_malformed_json_response(request_handler, status, payload)
+
+    handler._send_json = malformed_response
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as error:
+            getattr(plugin, f"_post_no_signal_{channel}")(bridge.url, bridge.token)
+        fallback = getattr(opd_verl, reader_name)(failure_path)
+    finally:
+        bridge.close()
+
+    assert error.value.classification == "permanent"
+    assert error.value.delivery_unknown
+    assert sends == [200]
+    assert getattr(bridge, counter_name) == 1
+    assert fallback == (
+        "transient",
+        "flash OPD bridge returned malformed success JSON",
+    )
+
+
+def test_malformed_accepted_cycle_commit_exhaustion_is_transient(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.perf import RetriableInfraError
+
+    failure_path = str(tmp_path / "cycle-commit-failure")
+    monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", failure_path)
+    bridge = _text_bridge(_BridgeTeacher())
+    accounting_before = bridge.accounting_snapshot()
+    commit_calls = []
+    original_commit = bridge.commit_teacher_cycle
+
+    def record_commit():
+        commit_calls.append(True)
+        return original_commit()
+
+    bridge.commit_teacher_cycle = record_commit
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+    sends = []
+
+    def malformed_response(request_handler, status, payload):
+        sends.append(status)
+        return _send_malformed_json_response(request_handler, status, payload)
+
+    handler._send_json = malformed_response
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as error:
+            plugin._post_teacher_cycle_committed(bridge.url, bridge.token)
+        fallback = _read_cycle_commit_failure_fallback(failure_path)
+    finally:
+        bridge.close()
+
+    assert error.value.classification == "permanent"
+    assert error.value.delivery_unknown
+    assert sends == [200, 200]
+    assert commit_calls == [True, True]
+    assert bridge.accounting_snapshot() == accounting_before
+    assert fallback == (
+        "transient",
+        "flash OPD bridge returned malformed success JSON",
+    )
+    with pytest.raises(RetriableInfraError, match="pre-update cycle commitment"):
+        _raise_verl_failure(1, None, cycle_commit_failure=fallback)
+
+
+@pytest.mark.parametrize(
+    ("poster_name", "environment_key", "reader_name"),
+    [
+        (
+            "_post_no_signal_resample",
+            "FLASH_OPD_RESAMPLE_FAILURE_PATH",
+            "_read_resample_failure_fallback",
+        ),
+        (
+            "_post_no_signal_abandoned",
+            "FLASH_OPD_ABANDONMENT_FAILURE_PATH",
+            "_read_abandonment_failure_fallback",
+        ),
+        (
+            "_post_teacher_cycle_committed",
+            "FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH",
+            "_read_cycle_commit_failure_fallback",
+        ),
+    ],
+)
+def test_explicit_notification_rejection_remains_permanent(
+    monkeypatch,
+    tmp_path,
+    poster_name,
+    environment_key,
+    reader_name,
+):
+    import flash.engine.worker.opd_verl as opd_verl
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    attempts = []
+    failure_path = str(tmp_path / "notification-failure")
+
+    def reject_notification(*_args, **_kwargs):
+        attempts.append(True)
+        raise FlashTeacherBridgeError(
+            "notification rejected",
+            classification="permanent",
+        )
+
+    monkeypatch.setenv(environment_key, failure_path)
+    monkeypatch.setattr(plugin, "_post_json", reject_notification)
+
+    with pytest.raises(FlashTeacherBridgeError, match="notification rejected"):
+        getattr(plugin, poster_name)("http://bridge", "token")
+
+    assert attempts == [True]
+    assert getattr(opd_verl, reader_name)(failure_path) == (
+        "permanent",
+        "notification rejected",
+    )
+
+
+@pytest.mark.parametrize(
+    ("poster_name", "environment_key", "reader_name", "message_prefix"),
+    [
+        (
+            "_post_no_signal_resample",
+            "FLASH_OPD_RESAMPLE_FAILURE_PATH",
+            "_read_resample_failure_fallback",
+            "unexpected resample bridge failure",
+        ),
+        (
+            "_post_no_signal_abandoned",
+            "FLASH_OPD_ABANDONMENT_FAILURE_PATH",
+            "_read_abandonment_failure_fallback",
+            "unexpected abandonment bridge failure",
+        ),
+        (
+            "_post_teacher_cycle_committed",
+            "FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH",
+            "_read_cycle_commit_failure_fallback",
+            "unexpected cycle commitment bridge failure",
+        ),
+    ],
+)
+def test_unexpected_local_notification_error_remains_permanent(
+    monkeypatch,
+    tmp_path,
+    poster_name,
+    environment_key,
+    reader_name,
+    message_prefix,
+):
+    import flash.engine.worker.opd_verl as opd_verl
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    failure_path = str(tmp_path / "notification-failure")
+
+    def fail_locally(*_args, **_kwargs):
+        raise ValueError("local failure")
+
+    monkeypatch.setenv(environment_key, failure_path)
+    monkeypatch.setattr(plugin, "_post_json", fail_locally)
+
+    with pytest.raises(ValueError, match="local failure"):
+        getattr(plugin, poster_name)("http://bridge", "token")
+
+    fallback = getattr(opd_verl, reader_name)(failure_path)
+    assert fallback is not None
+    assert fallback[0] == "permanent"
+    assert fallback[1] == f"{message_prefix}: ValueError"
+
+
 def test_transient_no_signal_notification_without_pending_is_retriable():
     from flash.engine.worker.opd_verl import _reconcile_no_signal_notification_failure
     from flash.engine.worker.perf import RetriableInfraError
@@ -2575,6 +2784,39 @@ def test_persistent_cycle_commit_failure_aborts_before_actor_update(
         _raise_verl_failure(1, None, cycle_commit_failure=fallback)
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "é" * 9000,
+        '"' * 9000,
+        "\\" * 9000,
+        ("\x00\n\r\t") * 3000,
+    ],
+    ids=["non-ascii", "quotes", "backslashes", "controls"],
+)
+def test_failure_fallback_serialization_is_valid_and_within_reader_limit(
+    tmp_path, message
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import _read_cycle_commit_failure_fallback
+
+    failure_path = str(tmp_path / "cycle-commit-failure")
+    plugin._write_failure_fallback(failure_path, "transient", message)
+
+    records = list(tmp_path.glob("cycle-commit-failure.*.transient.json"))
+    assert len(records) == 1
+    serialized = records[0].read_text()
+    record = json.loads(serialized)
+    assert len(serialized) <= 8192
+    assert record["classification"] == "transient"
+    assert record["message"]
+    assert message.startswith(record["message"])
+    assert _read_cycle_commit_failure_fallback(failure_path) == (
+        "transient",
+        record["message"].strip(),
+    )
+
+
 def test_cycle_commit_fallback_reader_ignores_incomplete_records(
     monkeypatch, tmp_path
 ):
@@ -2679,6 +2921,95 @@ def test_multiturn_transient_bridge_failure_latches_terminal_cause():
         "multi-turn teacher unavailable",
     )
     assert bridge.teacher_transient == 1
+
+
+def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(
+    monkeypatch, tmp_path
+):
+    import flash.engine.worker.opd_verl_plugin as plugin
+    from flash.engine.worker.opd_verl import (
+        _read_score_delivery_failure_fallback,
+        _reconcile_score_delivery_failure,
+    )
+    from flash.engine.worker.opd_verl_multiturn import _post_multiturn_score
+    from flash.engine.worker.perf import RetriableInfraError
+
+    failure_path = str(tmp_path / "score-delivery-failure")
+    monkeypatch.setenv("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", failure_path)
+
+    class ChildExit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    score_calls = []
+    bridge = _text_bridge(_BridgeTeacher())
+
+    def score_multiturn(session_id):
+        score_calls.append(session_id)
+        return {"turns": []}
+
+    bridge.score_multiturn = score_multiturn
+    accounting_before = bridge.accounting_snapshot()
+    monkeypatch.setattr(plugin.os, "_exit", child_exit)
+    bridge.start()
+    handler = bridge._server.RequestHandlerClass
+    handler._send_json = _send_truncated_json_response
+    try:
+        with pytest.raises(ChildExit) as actor_exit:
+            _post_multiturn_score(
+                _post_json,
+                plugin._exit_for_score_failure,
+                bridge.url,
+                bridge.token,
+                "session-1",
+            )
+        fallback = _read_score_delivery_failure_fallback(failure_path)
+    finally:
+        bridge.close()
+
+    score_delivery_failure = _reconcile_score_delivery_failure(bridge, fallback)
+    assert actor_exit.value.code == 87
+    assert score_calls == ["session-1"]
+    assert bridge.accounting_snapshot() == accounting_before
+    assert fallback is not None
+    assert fallback[0] == "transient"
+    assert http.client.IncompleteRead.__name__ in fallback[1]
+    assert score_delivery_failure == fallback
+    with pytest.raises(RetriableInfraError, match="teacher score delivery failure"):
+        _raise_verl_failure(
+            1,
+            bridge.teacher_failure,
+            score_delivery_failure=score_delivery_failure,
+        )
+
+
+def test_explicit_multiturn_score_rejection_bypasses_delivery_handler():
+    from flash.engine.worker.opd_verl_multiturn import _post_multiturn_score
+
+    rejection = FlashTeacherBridgeError(
+        "multi-turn score rejected",
+        classification="permanent",
+    )
+    handled = []
+
+    def reject_score(*_args, **_kwargs):
+        raise rejection
+
+    with pytest.raises(FlashTeacherBridgeError) as error:
+        _post_multiturn_score(
+            reject_score,
+            handled.append,
+            "http://bridge",
+            "token",
+            "session-1",
+        )
+
+    assert error.value is rejection
+    assert handled == []
 
 
 def test_bridge_transport_failure_is_typed_retriable(monkeypatch):
