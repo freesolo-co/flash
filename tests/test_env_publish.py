@@ -271,6 +271,78 @@ def test_record_published_environment_posts_to_backend(monkeypatch):
     }
 
 
+def test_record_published_environment_sends_project_id(monkeypatch):
+    """A push naming a project carries it to the backend as `projectId`.
+
+    The sibling test above asserts the whole body dict for a push with no project, which is
+    what pins the other half of this contract: the key is absent, not defaulted. The backend
+    upserts on (org, slug), so an omitted key leaves an existing grouping alone."""
+    from flash.server import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
+
+    ok = environment_registry.record_published_environment(
+        slug="acme/my-env",
+        name="My Env",
+        key={"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"},
+        project_id="  proj-1  ",
+    )
+
+    assert ok is True
+    # whitespace around a pasted id is stripped, not sent through to the resolver.
+    assert json.loads(seen["body"])["projectId"] == "proj-1"
+
+
+def test_record_published_environment_omits_blank_project_id(monkeypatch):
+    """A blank --project is "no project", not a request to clear the grouping."""
+    from flash.server import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
+
+    environment_registry.record_published_environment(
+        slug="acme/my-env",
+        name="My Env",
+        key={"org_id": "org-1"},
+        project_id="   ",
+    )
+
+    assert "projectId" not in json.loads(seen["body"])
+
+
 def test_record_published_environment_is_best_effort(monkeypatch):
     from flash.server import environment_registry
 

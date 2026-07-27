@@ -6,6 +6,10 @@ import inspect
 import math
 import time
 
+# Minimum a provider create needs left on the run deadline. Best-effort work that runs before a
+# create must yield this much, or it becomes the reason the create is rejected.
+CREATE_ALLOWANCE_S = 60.0
+
 
 def deadline_kwargs(call, deadline_at: float | None) -> dict[str, float | None]:
     """Return a deadline keyword only when the callable accepts it."""
@@ -44,7 +48,7 @@ def remaining_seconds(deadline_at: object, *, now: float | None = None) -> float
 
 def require_create_allowance(deadline_at: object, *, now: float | None = None) -> float:
     remaining = remaining_seconds(deadline_at, now=now)
-    if remaining < 60.0:
+    if remaining < CREATE_ALLOWANCE_S:
         raise RuntimeError(
             "run wall deadline has less than the 60-second minimum provider allowance remaining"
         )

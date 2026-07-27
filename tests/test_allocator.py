@@ -1374,3 +1374,106 @@ def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
     assert captured["max_wall_seconds"] == 0.0
     vast.live_candidates(16, AllocationConstraints(max_wall_seconds=7200.0))  # long run threads its wall cap
     assert captured["max_wall_seconds"] == 7200.0
+
+
+def _stub_provider(monkeypatch, allocator, candidates_by_need):
+    """stub a single provider whose live_candidates returns fixed candidates filtered by per-card need."""
+    from flash.providers.base import Candidate
+
+    class _P:
+        name = "runpod"
+
+        def live_candidates(self, need, constraints):
+            return [c for c in candidates_by_need if c.vram_gb >= need]
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    monkeypatch.setattr(allocator, "get_provider", lambda name: _P())
+    return Candidate
+
+
+def test_combo_default_single_gpu_behavior_unchanged(monkeypatch):
+    # max_gpu_count=1 (default): identical to classic cheapest single-class allocation.
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    cands = [
+        Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80),
+        Candidate(provider="runpod", gpu="H200", hourly_usd=4.0, vram_gb=141),
+    ]
+    _stub_provider(monkeypatch, allocator, cands)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
+    a = allocator.allocate("m", "sft")
+    assert (a.gpu, a.gpu_count) == ("H200", 1)  # only class fitting 100 GB alone
+
+
+def test_combo_two_cheap_cards_beat_one_expensive(monkeypatch):
+    # 2 x A100 ($3.00 total, 160 GB * 0.85 = 136 GB effective) beats 1 x H200 ($4.00) for a 100 GB need.
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    cands = [
+        Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80),
+        Candidate(provider="runpod", gpu="H200", hourly_usd=4.0, vram_gb=141),
+    ]
+    _stub_provider(monkeypatch, allocator, cands)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
+    a = allocator.allocate("m", "sft", max_gpu_count=4)
+    assert (a.gpu, a.gpu_count) == ("A100 PCIe", 2)
+    assert a.hourly_usd == 1.5  # per-card rate preserved
+    assert a.candidates[0].total_hourly_usd == 3.0
+
+
+def test_combo_single_kept_when_cheaper_than_combination(monkeypatch):
+    # 1 x H200 ($2.00) beats 2 x A100 ($3.00): combinations only win on total cost.
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    cands = [
+        Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80),
+        Candidate(provider="runpod", gpu="H200", hourly_usd=2.0, vram_gb=141),
+    ]
+    _stub_provider(monkeypatch, allocator, cands)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
+    a = allocator.allocate("m", "sft", max_gpu_count=4)
+    assert (a.gpu, a.gpu_count) == ("H200", 1)
+
+
+def test_combo_uses_smallest_fitting_count_and_shard_margin(monkeypatch):
+    # 200 GB need on 80 GB cards with the replicated-floor model:
+    # usable/card = (80-8)*0.85 = 61.2 -> 3 cards = 191.6 GB (too small), 4 cards = 252.8 (fits).
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    cands = [Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80)]
+    _stub_provider(monkeypatch, allocator, cands)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
+    a = allocator.allocate("m", "sft", max_gpu_count=4)
+    assert (a.gpu, a.gpu_count) == ("A100 PCIe", 4)
+
+
+def test_combo_replicated_floor_excludes_tiny_cards(monkeypatch):
+    # cards at/below the replicated floor can never combine, regardless of count.
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, UnsupportedGpuError
+
+    cands = [Candidate(provider="runpod", gpu="TINY 8GB", hourly_usd=0.1, vram_gb=8)]
+    _stub_provider(monkeypatch, allocator, cands)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
+    with pytest.raises(UnsupportedGpuError):
+        allocator.allocate("m", "sft", max_gpu_count=4)
+
+
+def test_combo_summary_shows_count_and_total(monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    cands = [
+        Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80),
+        Candidate(provider="runpod", gpu="H200", hourly_usd=4.0, vram_gb=141),
+    ]
+    _stub_provider(monkeypatch, allocator, cands)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
+    a = allocator.allocate("m", "sft", max_gpu_count=2)
+    s = allocator.allocation_summary(a)
+    assert "2x A100 PCIe" in s
+    assert "$3.00/hr" in s
