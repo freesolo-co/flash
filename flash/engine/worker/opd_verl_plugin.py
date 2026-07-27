@@ -133,9 +133,16 @@ def _set_current_global_batch_info(config, data) -> None:
 
 
 class FlashTeacherBridgeError(RuntimeError):
-    def __init__(self, message: str, *, classification: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        classification: str,
+        delivery_unknown: bool = False,
+    ) -> None:
         super().__init__(message)
         self.classification = classification
+        self.delivery_unknown = delivery_unknown
 
 
 class _AllNoSignalBatch(RuntimeError):
@@ -285,6 +292,7 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
         raise FlashTeacherBridgeError(
             f"flash OPD bridge transport failed: {type(error).__name__}",
             classification="transient",
+            delivery_unknown=True,
         ) from error
     try:
         return json.loads(body.decode("utf-8"))
@@ -292,11 +300,15 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
         raise FlashTeacherBridgeError(
             "flash OPD bridge returned malformed success JSON",
             classification="permanent",
+            delivery_unknown=True,
         ) from error
 
 
-def _write_mutation_failure_fallback(classification: str, message: str) -> None:
-    base_path = os.environ.get("FLASH_OPD_MUTATION_FAILURE_PATH", "")
+def _write_failure_fallback(
+    base_path: str,
+    classification: str,
+    message: str,
+) -> None:
     if not base_path:
         return
     process_id = os.getpid()
@@ -332,23 +344,99 @@ def _write_mutation_failure_fallback(classification: str, message: str) -> None:
                 os.unlink(temporary_path)
 
 
+def _write_mutation_failure_fallback(classification: str, message: str) -> None:
+    _write_failure_fallback(
+        os.environ.get("FLASH_OPD_MUTATION_FAILURE_PATH", ""),
+        classification,
+        message,
+    )
+
+
+def _write_abandonment_failure_fallback(classification: str, message: str) -> None:
+    _write_failure_fallback(
+        os.environ.get("FLASH_OPD_ABANDONMENT_FAILURE_PATH", ""),
+        classification,
+        message,
+    )
+
+
+def _exit_for_mutation_failure(error: FlashTeacherBridgeError) -> None:
+    _write_mutation_failure_fallback(error.classification, str(error))
+    exit_code = (
+        _PERMANENT_TEACHER_EXIT
+        if error.classification == "permanent"
+        else _TRANSIENT_TEACHER_EXIT
+    )
+    os._exit(exit_code)
+
+
 def _post_mutation_notice(url: str, token: str) -> None:
+    payload = {"process_id": os.getpid()}
     try:
-        _post_json(url, token, "/mutation", {})
+        _post_json(url, token, "/mutation", payload)
+        return
     except FlashTeacherBridgeError as error:
-        _write_mutation_failure_fallback(error.classification, str(error))
-        exit_code = (
-            _PERMANENT_TEACHER_EXIT
-            if error.classification == "permanent"
-            else _TRANSIENT_TEACHER_EXIT
-        )
-        os._exit(exit_code)
+        if not error.delivery_unknown:
+            _exit_for_mutation_failure(error)
+            return
     except Exception as error:
         _write_mutation_failure_fallback(
             "permanent",
             f"unexpected mutation bridge failure: {type(error).__name__}",
         )
         os._exit(_PERMANENT_TEACHER_EXIT)
+        return
+
+    try:
+        _post_json(url, token, "/mutation", payload)
+    except FlashTeacherBridgeError as retry_error:
+        _exit_for_mutation_failure(retry_error)
+    except Exception as retry_error:
+        _write_mutation_failure_fallback(
+            "permanent",
+            f"unexpected mutation bridge failure: {type(retry_error).__name__}",
+        )
+        os._exit(_PERMANENT_TEACHER_EXIT)
+
+
+def _post_no_signal_abandoned(url: str, token: str) -> None:
+    try:
+        _post_json(url, token, "/no-signal/abandoned", {})
+    except FlashTeacherBridgeError as error:
+        _write_abandonment_failure_fallback(error.classification, str(error))
+        raise
+    except Exception as error:
+        _write_abandonment_failure_fallback(
+            "permanent",
+            f"unexpected abandonment bridge failure: {type(error).__name__}",
+        )
+        raise
+
+
+def _post_teacher_cycle_committed(url: str, token: str) -> None:
+    try:
+        _post_json(url, token, "/teacher-cycle/committed", {})
+        return
+    except FlashTeacherBridgeError as error:
+        if not error.delivery_unknown:
+            raise
+    _post_json(url, token, "/teacher-cycle/committed", {})
+
+
+def _wrap_optimizer_with_mutation_notice(optimizer, url: str, token: str):
+    original_step = optimizer.step
+    mutation_acknowledged = False
+
+    @functools.wraps(original_step)
+    def step_with_notice(*args, **kwargs):
+        nonlocal mutation_acknowledged
+        if not mutation_acknowledged:
+            _post_mutation_notice(url, token)
+            mutation_acknowledged = True
+        return original_step(*args, **kwargs)
+
+    optimizer.step = step_with_notice
+    return optimizer
 
 
 def _install_verl_extensions() -> None:
@@ -652,13 +740,21 @@ def _install_verl_extensions() -> None:
                     {},
                 )
 
-            return _run_with_no_signal_replacements(
+            result = _run_with_no_signal_replacements(
                 run_attempt,
                 cleanup_attempt,
                 prepare_replacement,
                 lambda: record("/no-signal/resample"),
-                lambda: record("/no-signal/abandoned"),
+                lambda: _post_no_signal_abandoned(
+                    os.environ["FLASH_OPD_BRIDGE_URL"],
+                    os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+                ),
             )
+            _post_teacher_cycle_committed(
+                os.environ["FLASH_OPD_BRIDGE_URL"],
+                os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+            )
+            return result
 
         def _compute_reward_colocate(self, batch, metrics):
             data = tq.kv_batch_get(
@@ -771,18 +867,11 @@ def _install_verl_extensions() -> None:
     @functools.wraps(original_build_optimizer)
     def build_optimizer_with_mutation_notice(self, module):
         optimizer = original_build_optimizer(self, module)
-        original_step = optimizer.step
-
-        @functools.wraps(original_step)
-        def step_with_notice(*args, **kwargs):
-            _post_mutation_notice(
-                os.environ["FLASH_OPD_BRIDGE_URL"],
-                os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-            )
-            return original_step(*args, **kwargs)
-
-        optimizer.step = step_with_notice
-        return optimizer
+        return _wrap_optimizer_with_mutation_notice(
+            optimizer,
+            os.environ["FLASH_OPD_BRIDGE_URL"],
+            os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+        )
 
     FSDPEngine._build_optimizer = build_optimizer_with_mutation_notice
 

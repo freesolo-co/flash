@@ -74,6 +74,12 @@ _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 
 
+class _RecordedMutationCallbackFailure(RuntimeError):
+    def __init__(self, classification: str, message: str) -> None:
+        super().__init__(message)
+        self.classification = classification
+
+
 @dataclass(frozen=True)
 class _BridgePrompt:
     student_messages: list[dict]
@@ -285,6 +291,8 @@ class _TeacherAlignmentBridge:
         self.opd_phase_counts = dict(state.get("opd_phase_counts", {}))
         self._teacher_failure: tuple[str, str] | None = None
         self._mutation_failure: tuple[str, str] | None = None
+        self._mutation_callback_failure: tuple[str, str] | None = None
+        self._mutation_callback_succeeded = False
         self._pending_teacher_transient: tuple[str, str] | None = None
         self._pending_teacher_success = False
 
@@ -318,13 +326,47 @@ class _TeacherAlignmentBridge:
 
     def _record_mutation_failure(self, classification: str, message: str) -> None:
         with self._stats_lock:
+            if self._mutation_callback_failure is not None:
+                return
+            if self._mutation_callback_succeeded:
+                return
             if classification == "permanent" or self._mutation_failure is None:
                 self._mutation_failure = (classification, message)
+
+    def _record_mutation_callback_failure(
+        self,
+        classification: str,
+        message: str,
+    ) -> tuple[str, str]:
+        with self._stats_lock:
+            if self._mutation_callback_failure is None:
+                self._mutation_callback_failure = (classification, message)
+            return self._mutation_callback_failure
+
+    @staticmethod
+    def _raise_recorded_mutation_failure(failure: tuple[str, str]) -> None:
+        classification, message = failure
+        raise _RecordedMutationCallbackFailure(classification, message)
 
     @property
     def mutation_failure(self) -> tuple[str, str] | None:
         with self._stats_lock:
+            if self._mutation_callback_failure is not None:
+                return self._mutation_callback_failure
+            if self._mutation_callback_succeeded:
+                return None
             return self._mutation_failure
+
+    def _promote_abandoned_teacher_failure(self) -> None:
+        with self._stats_lock:
+            if (
+                self._teacher_failure is None
+                and self._pending_teacher_transient is not None
+                and not self._pending_teacher_success
+            ):
+                self._teacher_failure = self._pending_teacher_transient
+                self._pending_teacher_transient = None
+                self._pending_teacher_success = False
 
     def accounting_snapshot(self) -> dict:
         with self._stats_lock:
@@ -831,13 +873,20 @@ class _TeacherAlignmentBridge:
             self._pending_teacher_success = False
         return {"ok": True}
 
-    def notify_mutation(self) -> None:
+    def commit_teacher_cycle(self) -> dict:
         with self._stats_lock:
             self._pending_teacher_transient = None
             self._pending_teacher_success = False
+        return {"ok": True}
+
+    def notify_mutation(self) -> None:
         with self._mutation_lock:
             if self._mutation_notified:
                 return
+            with self._stats_lock:
+                callback_failure = self._mutation_callback_failure
+            if callback_failure is not None:
+                self._raise_recorded_mutation_failure(callback_failure)
             try:
                 self.mutation_callback()
             except Exception as error:
@@ -846,8 +895,13 @@ class _TeacherAlignmentBridge:
                     if isinstance(error, _w.RetriableInfraError)
                     else "permanent"
                 )
-                self._record_mutation_failure(classification, str(error))
-                raise
+                callback_failure = self._record_mutation_callback_failure(
+                    classification,
+                    str(error),
+                )
+                self._raise_recorded_mutation_failure(callback_failure)
+            with self._stats_lock:
+                self._mutation_callback_succeeded = True
             self._mutation_notified = True
 
     def start(self) -> None:
@@ -901,6 +955,8 @@ class _TeacherAlignmentBridge:
                         result = bridge.record_no_signal_resample()
                     elif self.path == "/no-signal/abandoned":
                         result = bridge.record_no_signal_abandoned()
+                    elif self.path == "/teacher-cycle/committed":
+                        result = bridge.commit_teacher_cycle()
                     elif self.path == "/mutation":
                         bridge.notify_mutation()
                         result = {"ok": True}
@@ -908,12 +964,15 @@ class _TeacherAlignmentBridge:
                         raise ValueError("flash OPD bridge path is unknown")
                     self._send_json(200, result)
                 except Exception as error:
-                    classification = (
-                        "transient"
-                        if isinstance(error, _w.RetriableInfraError)
-                        or (isinstance(error, TeacherError) and not error.permanent)
-                        else "permanent"
-                    )
+                    if isinstance(error, _RecordedMutationCallbackFailure):
+                        classification = error.classification
+                    else:
+                        classification = (
+                            "transient"
+                            if isinstance(error, _w.RetriableInfraError)
+                            or (isinstance(error, TeacherError) and not error.permanent)
+                            else "permanent"
+                        )
                     if self.path == "/score":
                         if recovered_teacher_failure is not None:
                             bridge._promote_recovered_teacher_failure(
@@ -1232,6 +1291,7 @@ def _build_opd_child_env(
     max_turns: int = 0,
     max_model_len: int = 32768,
     mutation_failure_path: str = "",
+    abandonment_failure_path: str = "",
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -1246,6 +1306,8 @@ def _build_opd_child_env(
     )
     if mutation_failure_path:
         child["FLASH_OPD_MUTATION_FAILURE_PATH"] = mutation_failure_path
+    if abandonment_failure_path:
+        child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] = abandonment_failure_path
     if multi_turn:
         child.update(
             {
@@ -1310,9 +1372,9 @@ def _metric_value(line: str, name: str) -> float | None:
     return None
 
 
-def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
+def _read_failure_fallback_records(base_path: str) -> list[tuple[str, str]]:
     if not base_path:
-        return None
+        return []
     base = Path(base_path)
     failures: list[tuple[str, str]] = []
     for path in sorted(base.parent.glob(f"{base.name}.*.json")):
@@ -1333,11 +1395,20 @@ def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
         if not isinstance(message, str) or not message.strip():
             continue
         failures.append((classification, message.strip()))
+    return failures
+
+
+def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
+    failures = _read_failure_fallback_records(base_path)
     for classification in ("permanent", "transient"):
         for failure_classification, message in failures:
             if failure_classification == classification:
                 return classification, message
     return None
+
+
+def _read_abandonment_failure_fallback(base_path: str) -> bool:
+    return bool(_read_failure_fallback_records(base_path))
 
 
 def _raise_verl_failure(
@@ -1720,6 +1791,7 @@ def run_opd_verl(spec=None) -> None:
     local_dir = os.path.join(workdir, "checkpoints")
     export_root = os.path.join(workdir, "checkpoint-adapters")
     mutation_failure_path = os.path.join(workdir, "mutation-failure")
+    abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
     for path in (data_dir, shim_dir, local_dir, export_root):
         os.makedirs(path, exist_ok=True)
 
@@ -1890,6 +1962,7 @@ def run_opd_verl(spec=None) -> None:
             max_turns=max_turns,
             max_model_len=max_model_len,
             mutation_failure_path=mutation_failure_path,
+            abandonment_failure_path=abandonment_failure_path,
         )
         command = [python_bin, entry_path, *overrides]
         progress = {"step": resume_step, "loss": None}
@@ -1945,6 +2018,8 @@ def run_opd_verl(spec=None) -> None:
         finally:
             watcher.stop(require_complete=training_completed)
         peak_gpu_gb = gpu_sampler.stop_gb()
+        if _read_abandonment_failure_fallback(abandonment_failure_path):
+            bridge._promote_abandoned_teacher_failure()
         fallback_mutation_failure = _read_mutation_failure_fallback(
             mutation_failure_path
         )
