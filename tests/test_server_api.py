@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
+    "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 1, "max_examples": 1},
@@ -40,7 +41,10 @@ _counter = itertools.count()
 
 
 def _bearer(key: str) -> dict:
-    return {"Authorization": f"Bearer {key}"}
+    headers = {"Authorization": f"Bearer {key}"}
+    if key.startswith("fslo-internal"):
+        headers["X-Freesolo-Org-Id"] = "org-test"
+    return headers
 
 
 def _login() -> str:
@@ -78,6 +82,8 @@ def api(tmp_path, monkeypatch):
     import flash.runner as runner
     import flash.server.auth as auth_mod
     import flash.server.db as db_mod
+    import flash.server.environment_registry as environment_registry_mod
+    import flash.server.projects as projects_mod
 
     importlib.reload(runner)
     # The storage roots are fixed constants (not env-configurable); redirect them to tmp for
@@ -120,6 +126,27 @@ def api(tmp_path, monkeypatch):
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+
+    def validate_project(*, project_id, key, authorization, org_id=None):
+        assert isinstance(project_id, str)
+        assert project_id.strip()
+        assert str(authorization or "").startswith("Bearer ")
+        if key.get("auth_kind") == "internal":
+            assert org_id == "org-test"
+        return project_id.strip()
+
+    monkeypatch.setattr(projects_mod, "require_project_access", validate_project)
+    monkeypatch.setattr(
+        environment_registry_mod,
+        "require_environment_project",
+        lambda **_kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        environment_registry_mod,
+        "record_published_environment",
+        lambda **_kwargs: True,
+    )
     with TestClient(app_mod.create_app()) as client:
         yield client
 
@@ -142,6 +169,284 @@ def test_requests_without_key_are_rejected(api):
     health = api.get("/v1/health")
     assert health.status_code == 200  # health stays open
     assert "chat_step_selector_v1" in health.json()["capabilities"]
+
+
+def test_project_validation_blocks_before_run_preparation(api, monkeypatch) -> None:
+    from fastapi import HTTPException
+
+    import flash.server.projects as projects_mod
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        projects_mod,
+        "require_project_access",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=403, detail="project denied")
+        ),
+    )
+    monkeypatch.setattr(
+        runs_route._app,
+        "prepare_job",
+        lambda *_args, **_kwargs: pytest.fail("project validation must run before preparation"),
+    )
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": SPEC},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "project denied"
+
+
+@pytest.mark.parametrize(
+    "environment_id",
+    [
+        "acme/my-env",
+        "github:freesolo-co/environment-hub@main:acme/my-env/environment.py",
+        "github:FREESOLO-CO/ENVIRONMENT-HUB@main:acme/my-env/environment.py",
+    ],
+)
+def test_environment_project_validation_blocks_before_run_preparation(
+    api, monkeypatch, environment_id
+) -> None:
+    from fastapi import HTTPException
+
+    import flash.server.environment_registry as registry
+    import flash.server.routes.runs as runs_route
+
+    def reject_environment(**kwargs):
+        assert kwargs["slug"] == "acme/my-env"
+        raise HTTPException(status_code=409, detail="flash environment belongs to another project")
+
+    monkeypatch.setattr(registry, "require_environment_project", reject_environment)
+    monkeypatch.setattr(
+        runs_route._app,
+        "prepare_job",
+        lambda *_args, **_kwargs: pytest.fail(
+            "environment project validation must run before preparation"
+        ),
+    )
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": {**SPEC, "environment": {"id": environment_id}}},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "flash environment belongs to another project"
+
+
+def test_non_hub_github_environment_skips_project_ownership_validation(api, monkeypatch) -> None:
+    import flash.server.environment_registry as registry
+
+    monkeypatch.setattr(
+        registry,
+        "require_environment_project",
+        lambda **_kwargs: pytest.fail("non-hub environment must not reach project validation"),
+    )
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": SPEC, "dry_run": True},
+    )
+
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize(
+    "environment_id",
+    [
+        "github:freesolo-co/environment-hub@dev:acme/my-env/environment.py",
+        "github:freesolo-co/environment-hub@main:acme/my-env/other.py",
+    ],
+)
+def test_malformed_managed_hub_reference_fails_closed(api, monkeypatch, environment_id) -> None:
+    import flash.server.environment_registry as registry
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        registry,
+        "require_environment_project",
+        lambda **_kwargs: pytest.fail("malformed hub reference must not reach project validation"),
+    )
+    monkeypatch.setattr(
+        runs_route._app,
+        "prepare_job",
+        lambda *_args, **_kwargs: pytest.fail("malformed hub reference must block preparation"),
+    )
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": {**SPEC, "environment": {"id": environment_id}}},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "managed environment GitHub reference must be "
+        "github:freesolo-co/environment-hub@main:<namespace>/<name>/environment.py"
+    )
+
+
+@pytest.mark.parametrize("environment_id", ["Acme/My-Env", " acme/my-env "])
+def test_run_rejects_noncanonical_managed_environment_before_registry(
+    api, monkeypatch, environment_id
+) -> None:
+    import flash.server.environment_registry as registry
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        registry,
+        "require_environment_project",
+        lambda **_kwargs: pytest.fail(
+            "noncanonical environment must not reach registry validation"
+        ),
+    )
+    monkeypatch.setattr(
+        runs_route._app,
+        "prepare_job",
+        lambda *_args, **_kwargs: pytest.fail("noncanonical environment must block preparation"),
+    )
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": {**SPEC, "environment": {"id": environment_id}}},
+    )
+
+    assert response.status_code == 400
+    assert "invalid env id segment" in response.json()["detail"]
+
+
+def test_project_validation_blocks_before_environment_publication(api, monkeypatch) -> None:
+    from fastapi import HTTPException
+
+    import flash.server.envs as envs_mod
+    import flash.server.projects as projects_mod
+
+    monkeypatch.setattr(
+        projects_mod,
+        "require_project_access",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=403, detail="project denied")
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        lambda **_kwargs: pytest.fail("project validation must run before publication"),
+    )
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={
+            "name": "env",
+            "package_b64": "payload",
+            "project_id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "project denied"
+
+
+def _install_real_internal_project_validation(monkeypatch):
+    import flash.server.projects as projects_mod
+
+    importlib.reload(projects_mod)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://api.freesolo.co")
+    requests: list[dict] = []
+
+    class _Response:
+        status = 200
+
+        def __init__(self, body: dict):
+            self._body = json.dumps(body).encode()
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        body = json.loads(request.data)
+        requests.append(
+            {
+                "method": request.get_method(),
+                "url": request.full_url,
+                "authorization": request.get_header("Authorization"),
+                "body": body,
+            }
+        )
+        return _Response({"ok": True, **body})
+
+    monkeypatch.setattr(projects_mod.urllib.request, "urlopen", urlopen)
+    return requests
+
+
+def _assert_internal_project_request(requests: list[dict]) -> None:
+    assert requests == [
+        {
+            "method": "POST",
+            "url": "https://api.freesolo.co/api/flash/projects/validate/internal",
+            "authorization": "Bearer fslo-internal-test",
+            "body": {"orgId": "org-test", "projectId": SPEC["project"]},
+        }
+    ]
+
+
+def test_internal_run_uses_internal_project_validation_endpoint(api, monkeypatch) -> None:
+    requests = _install_real_internal_project_validation(monkeypatch)
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": SPEC, "dry_run": True},
+    )
+
+    assert response.status_code == 200, response.text
+    _assert_internal_project_request(requests)
+
+
+def test_internal_publish_uses_internal_project_validation_endpoint(api, monkeypatch) -> None:
+    import flash.server.environment_registry as registry
+    import flash.server.envs as envs_mod
+
+    requests = _install_real_internal_project_validation(monkeypatch)
+    monkeypatch.setattr(envs_mod, "publish_package", lambda **_kwargs: "org-test/env")
+    monkeypatch.setattr(registry, "record_published_environment", lambda **_kwargs: True)
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer("fslo-internal-test"),
+        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 200, response.text
+    _assert_internal_project_request(requests)
+
+
+def test_internal_delete_uses_internal_project_validation_endpoint(api, monkeypatch) -> None:
+    import flash.server.environment_registry as registry
+    import flash.server.envs as envs_mod
+
+    requests = _install_real_internal_project_validation(monkeypatch)
+    monkeypatch.setattr(envs_mod, "delete_package", lambda **_kwargs: True)
+    monkeypatch.setattr(registry, "record_deleted_environment", lambda **_kwargs: True)
+
+    response = api.delete(
+        "/v1/envs/org-test/env",
+        headers={
+            **_bearer("fslo-internal-test"),
+            "X-Freesolo-Project-Id": SPEC["project"],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    _assert_internal_project_request(requests)
 
 
 def test_dry_run_reports_schema_agreement_without_persisting_it(api) -> None:
@@ -379,6 +684,7 @@ def test_warmstart_dry_run_preserves_context_preflight_error(api) -> None:
     # context error, not the generic warm-start "could not be prepared" mask (the context guard
     # runs ahead of adapter resolution, so its ValueError must propagate like structured runs do)
     spec = {
+        "project": "11111111-1111-4111-8111-111111111111",
         **SPEC,
         "model": "Qwen/Qwen3.5-0.8B",
         "train": {
@@ -470,6 +776,7 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
             lambda *_a, **_k: pytest.fail("invalid context must fail before allocation"),
         )
     spec = {
+        "project": "11111111-1111-4111-8111-111111111111",
         **SPEC,
         "model": "Qwen/Qwen3.6-35B-A3B",
         "algorithm": "opd",
@@ -780,6 +1087,7 @@ def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(ap
     monkeypatch.setattr(app_mod, "prepare_job", prepare)
     normalized = JobSpec.from_dict(
         {
+            "project": "11111111-1111-4111-8111-111111111111",
             **SPEC,
             "train": {**SPEC["train"], "init_from_adapter": "source-run"},
         }
@@ -854,6 +1162,7 @@ def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch)
         {
             "run_id": "source-run",
             "model": "Qwen/Qwen3.5-4B",
+            "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "sft",
             "train": {"epochs": 1, "hf_repo": "Freesolo-Co/source"},
         }
@@ -905,6 +1214,7 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
         {
             "run_id": "source-run",
             "model": "Qwen/Qwen3.5-4B",
+            "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "sft",
             "train": {"epochs": 1, "hf_repo": "Freesolo-Co/source"},
         }
@@ -2081,6 +2391,7 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
 
     monkeypatch.setattr(serving, "_run_deployment_smoke", blocked_smoke)
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(deploy_mod, "adapter_alias_target", lambda target: previous_revision)
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", fake_undeploy)
     monkeypatch.setattr(runner, "mark_deployment_revocation_failed", mark_pending_then_release)
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
@@ -3101,7 +3412,7 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
 def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkeypatch):
     """A run whose finalize never published the run-level <prefix>/adapter (but which streamed
     per-step deployable checkpoints) must not fail run-level deploy with an opaque 502 rank
-    error: it returns a 409 telling the caller to `flash deploy <run>/step-N`."""
+    error: it returns a 409 telling the caller to `flash models deploy <run>/step-N`."""
     import flash.runner as runner
     import flash.server.app as app_mod
     from flash.serve.deploy import AdapterConfigMissing
@@ -3127,7 +3438,7 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
     assert resp.json()["state"] == "failed"
     detail = resp.json()["error"]
     assert "no run-level adapter" in detail
-    assert f"flash deploy {run_id}/step-40" in detail
+    assert f"flash models deploy {run_id}/step-40" in detail
     assert "10, 40" in detail
 
 
@@ -3396,7 +3707,7 @@ def test_chat_step_selector_rejects_multiple_verified_revisions(api, monkeypatch
     assert response.status_code == 409
     detail = response.json()["detail"]
     assert "multiple verified revisions at step 20" in detail
-    assert "flash deployments" in detail
+    assert "flash models deployments" in detail
 
 
 def test_chat_step_selector_requires_a_verified_deployment(api, monkeypatch):
@@ -3428,7 +3739,7 @@ def test_chat_step_selector_requires_a_verified_deployment(api, monkeypatch):
     assert response.status_code == 409
     detail = response.json()["detail"]
     assert "deploy it first" in detail
-    assert f"flash deploy {run_id}/step-40" in detail
+    assert f"flash models deploy {run_id}/step-40" in detail
     assert "currently deployed steps: 20, final" in detail
 
 
@@ -3981,7 +4292,12 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
-    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-1"}
+    spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
+        "algorithm": "grpo",
+        "run_id": "dep-1",
+    }
     runner._save_status(runner.RunStatus(run_id="dep-1", state="done", spec=spec, remote=None))
     deployment = {
         "state": "ready",
@@ -4017,7 +4333,12 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
-    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-3"}
+    spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
+        "algorithm": "grpo",
+        "run_id": "dep-3",
+    }
     runner._save_status(
         runner.RunStatus(
             run_id="dep-3",
@@ -4044,7 +4365,12 @@ def test_mark_checkpoint_deployed_refuses_dry_run(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
-    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-dry"}
+    spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
+        "algorithm": "grpo",
+        "run_id": "dep-dry",
+    }
     runner._save_status(runner.RunStatus(run_id="dep-dry", state="dry_run", spec=spec, remote=None))
     out = runner.mark_checkpoint_deployed("dep-dry", {"endpoint_name": "e"})
     assert out.state == "dry_run"
@@ -4063,7 +4389,12 @@ def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monke
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
-    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-leg"}
+    spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
+        "algorithm": "grpo",
+        "run_id": "dep-leg",
+    }
 
     # (1) done -> deployed: legacy run, finished_at=None, updated_at == teardown -> backfilled.
     teardown = 1_000.0
@@ -4184,6 +4515,7 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
@@ -4257,7 +4589,11 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
         "attempt": 1,
     }
     runner._save_status(
-        runner.RunStatus(run_id=run_id, state="cancelled", spec={"run_id": run_id}),
+        runner.RunStatus(
+            run_id=run_id,
+            state="cancelled",
+            spec={"run_id": run_id, "project": "11111111-1111-4111-8111-111111111111"},
+        ),
         _cleanup_remotes=[remote],
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": run_id}])
@@ -4291,6 +4627,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     spec = JobSpec(
         run_id="blocked-expired",
         model="Qwen/Qwen3.5-4B",
+        project="11111111-1111-4111-8111-111111111111",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
@@ -4349,6 +4686,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
@@ -4414,6 +4752,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
@@ -4474,6 +4813,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
@@ -4541,6 +4881,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
@@ -4591,6 +4932,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
@@ -4654,6 +4996,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
@@ -4714,6 +5057,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
@@ -4774,6 +5118,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
 
     public_spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {
             "epochs": 1,
@@ -4858,6 +5203,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
     importlib.reload(app_mod)
     public_spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"init_from_adapter": "source-run", "lora_rank": 8},
         "run_id": "drifted-warm",
@@ -4957,6 +5303,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
     # Run #1: a malformed spec — local `environment.path` makes from_dict raise.
     bad_spec = {
+        "project": "11111111-1111-4111-8111-111111111111",
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "environment": {"path": "/legacy/local/env"},
@@ -4967,6 +5314,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # Run #2: a valid no-handle spec — must still be recovered (resubmitted) despite run #1.
     good_spec = {
         "model": "Qwen/Qwen3.5-4B",
+        "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
@@ -5093,7 +5441,11 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     resp = api.post(
         "/v1/envs",
         headers=_bearer(key),
-        json={"name": "MyEnv", "package_b64": pkg},
+        json={
+            "name": "MyEnv",
+            "package_b64": pkg,
+            "project_id": "11111111-1111-4111-8111-111111111111",
+        },
     )
     assert resp.status_code == 200
     ref = resp.json()["id"]
@@ -5134,7 +5486,12 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
     resp = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "e", "package_b64": pkg, "is_new": False},
+        json={
+            "name": "e",
+            "package_b64": pkg,
+            "project_id": "11111111-1111-4111-8111-111111111111",
+            "is_new": False,
+        },
     )
     assert resp.status_code == 200, resp.text
     assert seen["name"] == "e"
@@ -5152,15 +5509,13 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
     import flash.server.environment_registry as registry_mod
     import flash.server.envs as envs_mod
 
-    monkeypatch.setattr(
-        envs_mod, "publish_package", lambda *, package_b64, name, key: "key-1/e"
-    )
+    monkeypatch.setattr(envs_mod, "publish_package", lambda *, package_b64, name, key: "key-1/e")
 
     recorded: list[dict] = []
     monkeypatch.setattr(
         registry_mod,
         "record_published_environment",
-        lambda **kwargs: recorded.append(kwargs),
+        lambda **kwargs: recorded.append(kwargs) or True,
     )
 
     buf = io.BytesIO()
@@ -5177,20 +5532,127 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
     resp = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "e", "package_b64": pkg, "project_id": "proj-1"},
+        json={
+            "name": "e",
+            "package_b64": pkg,
+            "project_id": "11111111-1111-4111-8111-111111111111",
+        },
     )
     assert resp.status_code == 200, resp.text
-    assert recorded[0]["project_id"] == "proj-1"
+    assert recorded[0]["project_id"] == "11111111-1111-4111-8111-111111111111"
 
-    # a publish with no project forwards None, so the mirror leaves the grouping alone.
+    # direct callers cannot bypass explicit project validation.
     recorded.clear()
     resp = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
         json={"name": "e", "package_b64": pkg},
     )
-    assert resp.status_code == 200, resp.text
-    assert recorded[0]["project_id"] is None
+    assert resp.status_code == 400, resp.text
+    assert "project_id is required" in resp.text
+    assert recorded == []
+
+
+def test_publish_env_returns_502_when_association_record_returns_false(api, monkeypatch):
+    import flash.server.environment_registry as registry
+    import flash.server.envs as envs_mod
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        lambda **_kwargs: events.append("uploaded") or "acme/env",
+    )
+    monkeypatch.setattr(
+        registry,
+        "record_published_environment",
+        lambda **_kwargs: events.append("association-false") or False,
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("uploaded package must not be rolled back"),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 502
+    assert "package may already be uploaded" in response.json()["detail"]
+    assert "retry the same publish" in response.json()["detail"]
+    assert events == ["uploaded", "association-false"]
+
+
+def test_publish_env_returns_502_when_association_record_raises(api, monkeypatch):
+    import flash.server.environment_registry as registry
+    import flash.server.envs as envs_mod
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        lambda **_kwargs: events.append("uploaded") or "acme/env",
+    )
+
+    def fail_association(**_kwargs):
+        events.append("association-error")
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(registry, "record_published_environment", fail_association)
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("uploaded package must not be rolled back"),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+    )
+
+    assert response.status_code == 502
+    assert "package may already be uploaded" in response.json()["detail"]
+    assert "retry the same publish" in response.json()["detail"]
+    assert events == ["uploaded", "association-error"]
+
+
+def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch):
+    import flash.server.environment_registry as registry
+    import flash.server.envs as envs_mod
+
+    uploads: list[str] = []
+    acknowledgements = iter((False, True))
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        lambda **_kwargs: uploads.append("acme/env") or "acme/env",
+    )
+    monkeypatch.setattr(
+        registry,
+        "record_published_environment",
+        lambda **_kwargs: next(acknowledgements),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("retry must not roll back the uploaded package"),
+    )
+    request = {
+        "headers": _bearer(_login()),
+        "json": {"name": "env", "package_b64": "payload", "project_id": SPEC["project"]},
+    }
+
+    first = api.post("/v1/envs", **request)
+    second = api.post("/v1/envs", **request)
+
+    assert first.status_code == 502
+    assert second.status_code == 200, second.text
+    assert second.json() == {"id": "acme/env"}
+    assert uploads == ["acme/env", "acme/env"]
 
 
 def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
@@ -5198,11 +5660,23 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     reach publish_package's type check and yield the *type* 400 — not be `or ""`-coerced to an
     empty string first (which would surface a different/misleading 400)."""
     # name = 0 -> hits the name type check, not "missing env name".
-    r = api.post("/v1/envs", headers=_bearer(_login()), json={"name": 0, "package_b64": "x"})
+    r = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": 0, "package_b64": "x", "project_id": "11111111-1111-4111-8111-111111111111"},
+    )
     assert r.status_code == 400, r.text
     assert "name must be a string" in r.text.lower()
     # package_b64 = False (valid string name) -> hits the package type check.
-    r2 = api.post("/v1/envs", headers=_bearer(_login()), json={"name": "e", "package_b64": False})
+    r2 = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={
+            "name": "e",
+            "package_b64": False,
+            "project_id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
     assert r2.status_code == 400, r2.text
     assert "must be a base64 string" in r2.text.lower()
 
@@ -5223,22 +5697,110 @@ def test_delete_env_endpoint_removes_package(api, monkeypatch):
     monkeypatch.setattr(
         environment_registry,
         "record_deleted_environment",
-        lambda *, slug, key, org_id=None: recorded.update(slug=slug, org_id=org_id) or True,
+        lambda *, slug, project_id, key, org_id=None: (
+            recorded.update(slug=slug, project_id=project_id, org_id=org_id) or True
+        ),
     )
 
     resp = api.delete(
         "/v1/envs/acme/my-env",
-        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-acme"},
+        headers={
+            **_bearer(_login()),
+            "X-Freesolo-Org-Id": "org-acme",
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"id": "acme/my-env", "deleted": True}
     assert seen["slug"] == "acme/my-env"
     assert recorded["slug"] == "acme/my-env"
-    # the caller-supplied org (web UI delete) reaches the metadata-mirror drop.
+    assert recorded["project_id"] == "11111111-1111-4111-8111-111111111111"
+    # the caller-supplied org (web ui delete) reaches the metadata-mirror drop.
     assert recorded["org_id"] == "org-acme"
 
-    # Unauthenticated requests are rejected.
+    # unauthenticated requests are rejected.
     assert api.delete("/v1/envs/acme/my-env").status_code in (401, 403)
+
+
+def test_delete_env_endpoint_requires_project_header_before_storage(api, monkeypatch):
+    import flash.server.envs as envs_mod
+
+    monkeypatch.setattr(
+        envs_mod, "delete_package", lambda **_k: pytest.fail("storage must not be touched")
+    )
+    response = api.delete("/v1/envs/acme/my-env", headers=_bearer(_login()))
+    assert response.status_code == 400
+    assert "X-Freesolo-Project-Id is required" in response.text
+
+
+def test_delete_env_validates_project_and_environment_before_storage(api, monkeypatch):
+    import flash.server.envs as envs_mod
+    import flash.server.projects as projects_mod
+    from flash.server import environment_registry
+
+    events: list[tuple[str, dict]] = []
+
+    def require_project(**kwargs):
+        events.append(("project", kwargs))
+        return kwargs["project_id"]
+
+    def require_environment(**kwargs):
+        events.append(("environment", kwargs))
+
+    def delete_package(**kwargs):
+        events.append(("storage", kwargs))
+        return True
+
+    monkeypatch.setattr(projects_mod, "require_project_access", require_project)
+    monkeypatch.setattr(environment_registry, "require_environment_project", require_environment)
+    monkeypatch.setattr(envs_mod, "delete_package", delete_package)
+    monkeypatch.setattr(environment_registry, "record_deleted_environment", lambda **_kwargs: True)
+
+    response = api.delete(
+        "/v1/envs/acme/my-env",
+        headers={
+            **_bearer(_login()),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert [name for name, _kwargs in events] == ["project", "environment", "storage"]
+    assert events[0][1]["authorization"].startswith("Bearer ")
+    environment_call = events[1][1]
+    assert environment_call["slug"] == "acme/my-env"
+    assert environment_call["project_id"] == "11111111-1111-4111-8111-111111111111"
+    assert environment_call["key"]["org_id"].startswith("org-")
+    assert environment_call["org_id"] is None
+
+
+def test_delete_env_project_mismatch_blocks_storage(api, monkeypatch):
+    from fastapi import HTTPException
+
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(
+        environment_registry,
+        "require_environment_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=409, detail="flash environment belongs to another project")
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod, "delete_package", lambda **_kwargs: pytest.fail("storage must not be touched")
+    )
+
+    response = api.delete(
+        "/v1/envs/acme/my-env",
+        headers={
+            **_bearer(_login()),
+            "X-Freesolo-Project-Id": "22222222-2222-4222-8222-222222222222",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "flash environment belongs to another project"
 
 
 def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
@@ -5249,7 +5811,13 @@ def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
         raise envs_mod.EnvPublishError("not your namespace", status=403)
 
     monkeypatch.setattr(envs_mod, "delete_package", fake_delete_package)
-    resp = api.delete("/v1/envs/someone-else/env", headers=_bearer(_login()))
+    resp = api.delete(
+        "/v1/envs/someone-else/env",
+        headers={
+            **_bearer(_login()),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
     assert resp.status_code == 403, resp.text
 
 
@@ -5260,11 +5828,17 @@ def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
 
     monkeypatch.setattr(envs_mod, "delete_package", lambda *, slug, key: True)
 
-    def boom(*, slug, key, org_id=None):
+    def boom(*, slug, project_id, key, org_id=None):
         raise RuntimeError("backend down")
 
     monkeypatch.setattr(environment_registry, "record_deleted_environment", boom)
-    resp = api.delete("/v1/envs/acme/my-env", headers=_bearer(_login()))
+    resp = api.delete(
+        "/v1/envs/acme/my-env",
+        headers={
+            **_bearer(_login()),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
     assert resp.status_code == 200, resp.text
     assert resp.json()["deleted"] is True
 
@@ -5283,7 +5857,13 @@ def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
         lambda **_k: pytest.fail("mirror must not be touched"),
     )
     for bad in ("Acme/My-Env", "acme/my-env/"):
-        resp = api.delete(f"/v1/envs/{bad}", headers=_bearer(_login()))
+        resp = api.delete(
+            f"/v1/envs/{bad}",
+            headers={
+                **_bearer(_login()),
+                "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+            },
+        )
         assert resp.status_code == 400, resp.text
 
 
@@ -5646,8 +6226,30 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert calls
     assert calls[0]["slug"] == "acme/my-env"
+    assert calls[0]["project_id"] == "11111111-1111-4111-8111-111111111111"
     assert calls[0]["run_id"] == resp.json()["run_id"]
     assert calls[0]["key"]["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
+
+
+def test_internal_run_environment_use_merges_header_org(api, monkeypatch):
+    import flash.server.environment_registry as registry
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_environment_use",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert calls[0]["key"]["org_id"] == "org-test"
 
 
 def test_create_run_records_flash_training_run(api, monkeypatch):
@@ -5674,6 +6276,7 @@ def test_create_run_records_flash_training_run(api, monkeypatch):
     # Org attribution rides on the persisted platform_context (org_id/user_id/api_key_id),
     # which submit_job reports for us — create_run no longer double-POSTs with an explicit key.
     assert last["status"].platform_context["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
+    assert last["status"].platform_context["project_id"] == "11111111-1111-4111-8111-111111111111"
 
 
 # --- export: copy a trained adapter to a user-owned HuggingFace repo ----------------------
@@ -6036,7 +6639,10 @@ def test_record_model_exported_posts_allowlisted_event(monkeypatch):
             self.run_id = "run-9"
             self.platform_context = {"org_id": "org-A", "user_id": "user-1"}
             self.billing_context = None
-            self.spec = {"model": "Qwen/Qwen3.5-0.8B"}
+            self.spec = {
+                "project": "11111111-1111-4111-8111-111111111111",
+                "model": "Qwen/Qwen3.5-0.8B",
+            }
 
     ok = run_registry.record_model_exported(
         status=_Status(),
@@ -6051,6 +6657,7 @@ def test_record_model_exported_posts_allowlisted_event(monkeypatch):
     assert posted["body"]["event"] == "flash_model_exported"
     props = posted["body"]["properties"]
     assert props == {
+        "project": "11111111-1111-4111-8111-111111111111",
         "run_id": "run-9",
         "repository": "me/adapters",
         "url": "https://huggingface.co/me/adapters",

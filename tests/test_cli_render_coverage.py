@@ -168,6 +168,21 @@ def test_select_valid_digit_and_out_of_range_then_retry(monkeypatch, capsys) -> 
     assert "enter 1-3" in capsys.readouterr().out  # the retry hint was shown
 
 
+def test_select_required_rejects_empty_and_requires_numeric_choice(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    opts = [("a", "Alpha", "uuid-a"), ("b", "Beta", "uuid-b")]
+    _feed_input(monkeypatch, ["", "x", "2"])
+    assert render.select_required("pick", opts) == "b"
+    assert "empty input is not accepted" in capsys.readouterr().out
+
+
+def test_select_required_rejects_eof(monkeypatch) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": (_ for _ in ()).throw(EOFError()))
+    with pytest.raises(ValueError, match="explicit numeric project choice"):
+        render.select_required("pick", [("a", "Alpha", "uuid-a")])
+
+
 def test_select_eof_returns_default(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "0")
     opts = [("a", "Alpha", ""), ("b", "Beta", "")]
@@ -272,7 +287,11 @@ def test_run_status_shows_realized_cost_and_artifacts(styled_plain) -> None:
     obj = {
         "run_id": "flash-1",
         "state": "done",
-        "spec": {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo"},
+        "spec": {
+            "project": "11111111-1111-4111-8111-111111111111",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+        },
         "cost_usd": 0.10,
         "realized_cost_usd": 0.42,
         "artifacts_dir": "/tmp/run/artifacts",
@@ -371,6 +390,15 @@ def test_env_list_with_local_sources(styled_plain) -> None:
     assert "local sources" in out
     assert "envs/one" in out
     assert "envs/two" in out
+    assert "flash env push --project <project-uuid> --name <name> <path>" in out
+
+
+def test_projects_table_lists_name_and_id(styled_plain) -> None:
+    out = render.projects_table(
+        [{"id": "11111111-1111-4111-8111-111111111111", "name": "Test project"}]
+    )
+    assert "Test project" in out
+    assert "11111111-1111-4111-8111-111111111111" in out
 
 
 def test_env_published_and_pulled(styled_plain) -> None:

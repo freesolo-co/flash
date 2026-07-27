@@ -106,7 +106,12 @@ def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) 
 
 
 @router.post("/v1/runs")
-def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
+def create_run(
+    payload: dict,
+    key: Annotated[dict, Depends(require_key)],
+    authorization: Annotated[str | None, Header()] = None,
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+):
     dry_run = _require_bool(payload, "dry_run", False)
     schema = _client_train_schema(payload)
     submitted = payload.get("spec")
@@ -137,6 +142,34 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
             )
             raise HTTPException(status_code=400, detail=detail) from exc
         raise
+    from flash.server.projects import require_project_access
+
+    project_id = require_project_access(
+        project_id=spec.project,
+        key=key,
+        authorization=authorization,
+        org_id=x_freesolo_org_id,
+    )
+    reporting_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
+    from flash.envs.adapter import canonical_managed_environment_slug
+
+    try:
+        environment_slug = canonical_managed_environment_slug(spec.environment.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if environment_slug is not None:
+        from flash.server import envs as managed_envs
+        from flash.server.environment_registry import require_environment_project
+
+        try:
+            environment_slug = managed_envs.canonical_env_id(environment_slug)
+        except managed_envs.EnvPublishError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        require_environment_project(
+            slug=environment_slug,
+            project_id=project_id,
+            key=reporting_key,
+        )
     runtime_secrets = _runtime_secrets(payload, spec)
     affordability_org_id = str(key.get("org_id") or "").strip()
     bill_on_completion = not dry_run and key.get("auth_kind") != "internal"
@@ -151,9 +184,10 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
     platform_context = {
         field: value
         for field, value in {
-            "org_id": key.get("org_id"),
+            "org_id": key.get("org_id") or x_freesolo_org_id,
             "user_id": key.get("user_id"),
             "api_key_id": key.get("api_key_id"),
+            "project_id": project_id,
         }.items()
         if value
     }
@@ -212,14 +246,14 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
             raise
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
-        from flash.envs.adapter import is_managed_environment_slug
         from flash.server.environment_registry import record_environment_use
 
-        if is_managed_environment_slug(prepared.public_spec.environment.id):
+        if environment_slug is not None:
             record_environment_use(
-                slug=prepared.public_spec.environment.id,
+                slug=environment_slug,
+                project_id=project_id,
                 run_id=run_id,
-                key=key,
+                key=reporting_key,
             )
     except Exception:
         _LOG.warning(
