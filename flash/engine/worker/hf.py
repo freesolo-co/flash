@@ -683,11 +683,19 @@ def write_base_model_provenance(adapter_dir: str, model_id: str, model_revision:
 
 
 def _snapshot_has_weights(snapshot_dir: str) -> bool:
-    """True when a downloaded snapshot contains at least one model weight file."""
-    weight_suffixes = (".safetensors", ".bin")
+    """True when a downloaded snapshot contains at least one resolvable model weight file."""
+    weight_names = ("model", "pytorch_model", "tf_model", "flax_model")
     try:
         for name in os.listdir(snapshot_dir):
-            if name.endswith(weight_suffixes) and "adapter" not in name:
+            if not name.endswith((".safetensors", ".bin")):
+                continue
+            # exclude non-weight .bin artifacts (tokenizer.bin, training_args.bin, adapters)
+            if not name.startswith(weight_names):
+                continue
+            # HF cache entries are symlinks into blobs/: a dangling link (partial download) must
+            # not count as weights present.
+            path = os.path.join(snapshot_dir, name)
+            if os.path.isfile(os.path.realpath(path)):
                 return True
     except OSError:
         return False
@@ -752,7 +760,14 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
         else:
             try:
                 _download()
+            except RuntimeError:
+                # the stale-cache repair path raises RuntimeError only after a FORCED re-download
+                # still had no weights — swallowing it would let the trainer fail later with a
+                # far more confusing offline error. propagate.
+                raise
             except Exception as e:
+                # transient fetch errors stay non-fatal on the default revision: the trainer's own
+                # cache lookup may still succeed (warm cache), and prefetch is best-effort there.
                 print("prefetch_model warn:", e)
     secs = round(time.time() - t0, 1)
     _w.heartbeat(

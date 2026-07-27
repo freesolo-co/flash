@@ -252,13 +252,15 @@ def apply_image_override_constraints(config) -> None:
 
 def apply_disk_gb(config, disk_gb: int | None) -> None:
     """Raise the worker's container disk on a built endpoint config. Raise-only (SDK default is 64 GB)."""
-    if not disk_gb:
+    from flash.providers._worker import worker_image_override
+
+    _override = worker_image_override()
+    if not disk_gb and not (_override and _override.min_disk_gb):
         return
     template = getattr(config, "template", None)
     if template is None:
         logger.warning("disk_gb=%s requested but endpoint config has no template", disk_gb)
         return
-    from flash.providers._worker import worker_image_override
 
     floors = [int(disk_gb), int(template.containerDiskInGb or 0)]
     override = worker_image_override()
