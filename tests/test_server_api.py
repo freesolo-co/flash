@@ -2998,6 +2998,43 @@ def test_concurrent_deploy_returns_409_without_queueing_duplicate(api, monkeypat
     assert len(starts) == 1
 
 
+@pytest.mark.parametrize("deployment_state", ["ready", None])
+def test_concurrent_non_deploy_operation_returns_generic_409(api, monkeypatch, deployment_state):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    starts: list[dict] = []
+
+    def fake_start(_target, *_args, **kwargs):
+        starts.append(kwargs)
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.deployment = {"state": deployment_state} if deployment_state else None
+    runner._save_status(status)
+
+    deploy_lock = app_mod._deploy_lock(run_id)
+    assert deploy_lock.acquire(blocking=False) is True
+    try:
+        response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    finally:
+        deploy_lock.release()
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail == f"another operation is in progress for run {run_id}; retry shortly"
+    assert "deployment in" not in detail
+    assert "flash models deployments" not in detail
+    assert starts == []
+
+
 def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
     import queue
     import threading

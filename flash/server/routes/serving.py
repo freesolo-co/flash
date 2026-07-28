@@ -1002,14 +1002,18 @@ def deploy(
     if not deploy_lock.acquire(blocking=False):
         status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
         current_deployment = status.deployment or {}
-        raise HTTPException(
-            status_code=409,
-            detail=(
+        current_deployment_state = current_deployment.get("state")
+        if current_deployment_state in _DEPLOYMENT_BUSY_STATES:
+            detail = (
                 f"run {run_id} already has a deployment in "
-                f"{current_deployment.get('state')} state; run `flash models deployments` "
+                f"{current_deployment_state} state; run `flash models deployments` "
                 "to check progress"
-            ),
-        )
+            )
+        else:
+            # the per-run lock is shared with undeploy, export, and startup recovery, so a
+            # contended acquire cannot claim a deployment is running unless the state says so.
+            detail = f"another operation is in progress for run {run_id}; retry shortly"
+        raise HTTPException(status_code=409, detail=detail)
     job_owns_lock = False
     try:
         status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
