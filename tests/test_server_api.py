@@ -16,6 +16,7 @@ import os
 import sqlite3
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -2055,6 +2056,396 @@ def test_deploy_dry_run(api):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    revision = f"{run_id}@final." + "a" * 40
+    status = runner.get_status(run_id)
+    status.deployment = {
+        "state": "ready",
+        "endpoint_name": "https://serve.example",
+        "adapter_revision": revision,
+        "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
+        "verification_generation": 7,
+        "url": "https://stale.example/v1",
+    }
+    runner._save_status(status)
+    monkeypatch.setattr(
+        app_mod,
+        "undeploy_adapter",
+        lambda target: {
+            "run_id": target,
+            "disabled_aliases": [target],
+            "disabled_revisions": [revision],
+            "serving_deregistered": True,
+        },
+    )
+
+    response = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body == {
+        "state": "undeployed",
+        "endpoint_name": "https://serve.example",
+        "adapter_revision": revision,
+        "run_id": run_id,
+        "checkpoint_step": None,
+        "verified_at": None,
+        "openai_model": run_id,
+        "disabled_aliases": [run_id],
+        "disabled_revisions": [revision],
+        "serving_deregistered": True,
+    }
+    persisted = runner.get_status(run_id)
+    assert persisted.state == "done"
+    assert persisted.deployment["state"] == "undeployed"
+    for field in ("disabled_aliases", "disabled_revisions", "serving_deregistered"):
+        body.pop(field)
+    assert body == api.get(f"/v1/runs/{run_id}/deploy", headers=_bearer(key)).json()
+
+
+def test_internal_org_undeploy_returns_public_persisted_deployment(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    owner = _login()
+    org = f"org-{owner.removeprefix(_USER_PREFIX)}"
+    project = "22222222-2222-4222-8222-222222222222"
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": {**SPEC, "project": project}, "dry_run": True},
+        headers=_bearer(owner),
+    ).json()["run_id"]
+    revision = f"{run_id}@step-40." + "b" * 40
+    status = runner.get_status(run_id)
+    status.state = "deployed"
+    status.deployment = {
+        "state": "ready",
+        "endpoint_name": "https://serve.example",
+        "adapter_revision": revision,
+        "checkpoint_step": 40,
+        "verified_at": 123.0,
+        "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
+        "verification_generation": 9,
+    }
+    runner._save_status(status)
+    monkeypatch.setattr(
+        app_mod,
+        "undeploy_adapter",
+        lambda target: {
+            "run_id": target,
+            "disabled_aliases": [target],
+            "disabled_revisions": [revision],
+            "serving_deregistered": True,
+        },
+    )
+    headers = {
+        **_bearer("fslo-internal-test"),
+        "X-Freesolo-Org-Id": org,
+        "X-Freesolo-Project-Id": project,
+    }
+
+    response = api.delete(f"/v1/runs/{run_id}/deploy", headers=headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body == {
+        "state": "undeployed",
+        "endpoint_name": "https://serve.example",
+        "adapter_revision": revision,
+        "checkpoint_step": 40,
+        "verified_at": 123.0,
+        "run_id": run_id,
+        "openai_model": run_id,
+        "disabled_aliases": [run_id],
+        "disabled_revisions": [revision],
+        "serving_deregistered": True,
+    }
+    persisted = runner.get_status(run_id)
+    assert persisted.state == "done"
+    assert persisted.deployment["state"] == "undeployed"
+    for field in ("disabled_aliases", "disabled_revisions", "serving_deregistered"):
+        body.pop(field)
+    assert body == api.get(f"/v1/runs/{run_id}/deploy", headers=headers).json()
+
+
+def test_deployment_management_allows_matching_internal_scope_and_redacts_polling(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    owner = _login()
+    org = f"org-{owner.removeprefix(_USER_PREFIX)}"
+    project = "22222222-2222-4222-8222-222222222222"
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": {**SPEC, "project": project}, "dry_run": True},
+        headers=_bearer(owner),
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.deployment = {
+        "state": "ready",
+        "endpoint_name": "https://serve.example",
+        "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
+        "verification_generation": 7,
+        "url": "https://stale.example/v1",
+    }
+    runner._save_status(status)
+
+    calls = {"deploy": 0, "undeploy": 0}
+
+    def fake_deploy(**kwargs):
+        calls["deploy"] += 1
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    def fake_undeploy(target):
+        calls["undeploy"] += 1
+        return {"run_id": target}
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(app_mod, "undeploy_adapter", fake_undeploy)
+
+    matched = {
+        **_bearer("fslo-internal-test"),
+        "X-Freesolo-Org-Id": org,
+        "X-Freesolo-Project-Id": project,
+    }
+    for headers in (_bearer(owner), matched):
+        response = api.get(f"/v1/runs/{run_id}/deploy", headers=headers)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["run_id"] == run_id
+        assert body["state"] == "ready"
+        assert "previous_deployment" not in body
+        assert "verification_generation" not in body
+        assert "url" not in body
+
+    deployed = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=matched,
+    )
+    assert deployed.status_code == 200, deployed.text
+    removed = api.delete(f"/v1/runs/{run_id}/deploy", headers=matched)
+    assert removed.status_code == 200, removed.text
+    assert calls == {"deploy": 1, "undeploy": 1}
+
+    intruder = _login()
+    internal = _bearer("fslo-internal-test")
+    rejected_headers = (
+        {
+            **_bearer(intruder),
+            "X-Freesolo-Org-Id": org,
+            "X-Freesolo-Project-Id": project,
+        },
+        {
+            **internal,
+            "X-Freesolo-Org-Id": "org-wrong",
+            "X-Freesolo-Project-Id": project,
+        },
+        {**internal, "X-Freesolo-Org-Id": "", "X-Freesolo-Project-Id": project},
+        {**internal, "X-Freesolo-Org-Id": org},
+        {
+            **internal,
+            "X-Freesolo-Org-Id": org,
+            "X-Freesolo-Project-Id": "project-wrong",
+        },
+        {**internal, "X-Freesolo-Org-Id": org, "X-Freesolo-Project-Id": "   "},
+        internal,
+    )
+    unknown = {"detail": f"unknown run_id: {run_id}"}
+    for headers in rejected_headers:
+        get_response = api.get(f"/v1/runs/{run_id}/deploy", headers=headers)
+        post_response = api.post(
+            f"/v1/runs/{run_id}/deploy",
+            json={"dry_run": True},
+            headers=headers,
+        )
+        delete_response = api.delete(f"/v1/runs/{run_id}/deploy", headers=headers)
+        for response in (get_response, post_response, delete_response):
+            assert response.status_code == 404
+            assert response.json() == unknown
+    missing = "/v1/runs/flash-run-missing/deploy"
+    assert api.get(missing, headers=matched).status_code == 404
+    assert api.post(missing, json={"dry_run": True}, headers=matched).status_code == 404
+    assert api.delete(missing, headers=matched).status_code == 404
+    assert calls == {"deploy": 1, "undeploy": 1}
+
+
+def test_internal_deployment_management_rejects_malformed_persisted_projects(api):
+    import flash.runner as runner
+
+    owner = _login()
+    org = f"org-{owner.removeprefix(_USER_PREFIX)}"
+    project = "22222222-2222-4222-8222-222222222222"
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": {**SPEC, "project": project}, "dry_run": True},
+        headers=_bearer(owner),
+    ).json()["run_id"]
+    internal = {
+        **_bearer("fslo-internal-test"),
+        "X-Freesolo-Org-Id": org,
+        "X-Freesolo-Project-Id": project,
+    }
+    unknown = {"detail": f"unknown run_id: {run_id}"}
+    missing = object()
+
+    for persisted_project in (
+        123,
+        [project],
+        {"id": project},
+        None,
+        "",
+        "   ",
+        f" {project} ",
+        missing,
+    ):
+        status = runner.get_status(run_id)
+        if persisted_project is missing:
+            status.spec.pop("project", None)
+        else:
+            status.spec["project"] = persisted_project
+        runner._save_status(status)
+
+        responses = (
+            api.get(f"/v1/runs/{run_id}/deploy", headers=internal),
+            api.post(
+                f"/v1/runs/{run_id}/deploy",
+                json={"dry_run": True},
+                headers=internal,
+            ),
+            api.delete(f"/v1/runs/{run_id}/deploy", headers=internal),
+        )
+        for response in responses:
+            assert response.status_code == 404
+            assert response.json() == unknown
+
+
+def test_internal_deployment_management_rejects_missing_run_org(api):
+    import flash.runner as runner
+
+    owner = _login()
+    project = "22222222-2222-4222-8222-222222222222"
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": {**SPEC, "project": project}, "dry_run": True},
+        headers=_bearer(owner),
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.platform_context = None
+    status.billing_context = None
+    runner._save_status(status)
+
+    internal = {
+        **_bearer("fslo-internal-test"),
+        "X-Freesolo-Org-Id": "org-anything",
+        "X-Freesolo-Project-Id": project,
+    }
+    assert api.get(f"/v1/runs/{run_id}/deploy", headers=internal).status_code == 404
+    assert (
+        api.post(
+            f"/v1/runs/{run_id}/deploy",
+            json={"dry_run": True},
+            headers=internal,
+        ).status_code
+        == 404
+    )
+    assert api.delete(f"/v1/runs/{run_id}/deploy", headers=internal).status_code == 404
+    assert api.get(f"/v1/runs/{run_id}/deploy", headers=_bearer(owner)).status_code == 200
+
+
+def test_internal_owned_run_still_requires_matching_org_for_deployment_management(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    internal = _bearer("fslo-internal-test")
+    project = "33333333-3333-4333-8333-333333333333"
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": {**SPEC, "project": project}, "dry_run": True},
+        headers=internal,
+    ).json()["run_id"]
+    internal_key = _db_mod.lookup_key("fslo-internal-test")
+    assert internal_key is not None
+    assert _db_mod.run_owner(run_id) == internal_key["id"]
+
+    org = "org-internal-owner"
+    status = runner.get_status(run_id)
+    status.platform_context = {"org_id": org}
+    status.billing_context = None
+    runner._save_status(status)
+
+    with open(os.path.join(_orch.RUNS_DIR, f"{run_id}.log"), "w") as f:
+        f.write("internal owner log\n")
+    monkeypatch.setattr(
+        app_mod,
+        "_worker_artifacts",
+        lambda _spec: {"console_sft.txt": "internal owner worker\n"},
+    )
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=internal).status_code == 200
+    assert api.get(f"/v1/runs/{run_id}/worker", headers=internal).status_code == 200
+
+    calls = {"deploy": 0, "undeploy": 0}
+
+    def fake_deploy(**kwargs):
+        calls["deploy"] += 1
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    def fake_undeploy(target):
+        calls["undeploy"] += 1
+        return {"run_id": target}
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(app_mod, "undeploy_adapter", fake_undeploy)
+
+    for headers in (
+        internal,
+        {
+            **internal,
+            "X-Freesolo-Org-Id": "org-wrong",
+            "X-Freesolo-Project-Id": project,
+        },
+        {**internal, "X-Freesolo-Org-Id": org},
+        {
+            **internal,
+            "X-Freesolo-Org-Id": org,
+            "X-Freesolo-Project-Id": "project-wrong",
+        },
+    ):
+        assert api.get(f"/v1/runs/{run_id}/deploy", headers=headers).status_code == 404
+        assert (
+            api.post(
+                f"/v1/runs/{run_id}/deploy",
+                json={"dry_run": True},
+                headers=headers,
+            ).status_code
+            == 404
+        )
+        assert api.delete(f"/v1/runs/{run_id}/deploy", headers=headers).status_code == 404
+    assert calls == {"deploy": 0, "undeploy": 0}
+
+    matched = {
+        **internal,
+        "X-Freesolo-Org-Id": org,
+        "X-Freesolo-Project-Id": project,
+    }
+    assert api.get(f"/v1/runs/{run_id}/deploy", headers=matched).status_code == 200
+    assert (
+        api.post(
+            f"/v1/runs/{run_id}/deploy",
+            json={"dry_run": True},
+            headers=matched,
+        ).status_code
+        == 200
+    )
+    assert api.delete(f"/v1/runs/{run_id}/deploy", headers=matched).status_code == 200
+    assert calls == {"deploy": 1, "undeploy": 1}
+
+
 def test_deploy_rejects_revision_pinned_base_model(api):
     import flash.runner as runner
 
@@ -2236,6 +2627,242 @@ def test_deploy_serving_error_is_recorded_as_failed_deployment(api, monkeypatch)
     assert "serving backend unreachable" in deployments[0]["deployment"]["error"]
 
 
+def test_deployment_failure_persisted_matches_default_error():
+    from flash.server.routes import serving
+
+    previous = {"state": "ready", "endpoint_name": "https://serve.example"}
+    failed = {"state": "failed", "error": "", "previous_deployment": previous}
+    status = SimpleNamespace(
+        deployment={
+            **previous,
+            "last_deploy_error": "deployment failed",
+            "last_deploy_failed_at": time.time(),
+        }
+    )
+
+    assert serving._deployment_failure_persisted(status, failed)
+
+
+def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, monkeypatch):
+    import flash.server.app as app_mod
+    import flash.server.run_registry as registry
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    revision = f"{run_id}@final." + "a" * 40
+    calls = []
+    monkeypatch.setattr(
+        registry,
+        "record_training_run",
+        lambda **kwargs: calls.append(kwargs["status"]) or True,
+    )
+
+    def fake_deploy(**kwargs):
+        if not kwargs["dry_run"]:
+            kwargs["before_activate"](revision, run_id)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: _smoke_chat_result(revision, run_id),
+    )
+
+    dry_run = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=_bearer(key),
+    )
+    assert dry_run.status_code == 200, dry_run.text
+    assert calls == []
+
+    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert response.status_code == 200, response.text
+    assert [status.deployment["state"] for status in calls] == [
+        "queued",
+        "smoke_testing",
+        "reconciling",
+        "ready",
+    ]
+
+
+def test_deployment_reporting_skips_failed_cas_and_reports_failure(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.run_registry as registry
+    from flash.serve.deploy import ServingError
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    calls = []
+    monkeypatch.setattr(
+        registry,
+        "record_training_run",
+        lambda **kwargs: calls.append(kwargs["status"]) or True,
+    )
+
+    real_mark_pending = serving.mark_deployment_pending
+    monkeypatch.setattr(
+        serving, "mark_deployment_pending", lambda *_a, **_k: runner.get_status(run_id)
+    )
+    rejected = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert rejected.status_code == 409, rejected.text
+    assert calls == []
+
+    monkeypatch.setattr(serving, "mark_deployment_pending", real_mark_pending)
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_kwargs: (_ for _ in ()).throw(ServingError("serving unavailable")),
+    )
+    failed = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert failed.status_code == 200, failed.text
+    assert [status.deployment["state"] for status in calls] == ["queued", "failed"]
+
+
+def test_undeploy_reports_revocation_failure_and_undeployed(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.run_registry as registry
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    status = runner.get_status(run_id)
+    status.deployment = {"run_id": run_id, "state": "ready"}
+    runner._save_status(status)
+    calls = []
+    monkeypatch.setattr(
+        registry,
+        "record_training_run",
+        lambda **kwargs: calls.append(kwargs["status"]) or True,
+    )
+
+    monkeypatch.setattr(
+        app_mod,
+        "undeploy_adapter",
+        lambda _run_id: (_ for _ in ()).throw(ServingError("backend unavailable")),
+    )
+    failed = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+    assert failed.status_code == 502, failed.text
+    failed_deployment = runner.get_status(run_id).deployment
+    assert failed_deployment["error"] == "backend unavailable"
+    assert failed_deployment["retryable"] is True
+    assert "updated_at" in failed_deployment
+
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda target: {"run_id": target})
+    removed = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+    assert removed.status_code == 200, removed.text
+    assert [status.deployment["state"] for status in calls] == [
+        "revocation_failed",
+        "undeployed",
+    ]
+    for deployment in (removed.json(), runner.get_status(run_id).deployment, calls[-1].deployment):
+        assert deployment["state"] == "undeployed"
+        assert "error" not in deployment
+        assert "retryable" not in deployment
+        assert "updated_at" not in deployment
+
+
+def test_deployment_job_shutdown_closes_producers(monkeypatch):
+    from threading import Event
+
+    import flash.server.app as app_mod
+
+    monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
+    app_mod._open_deployment_jobs()
+    started = Event()
+    release = Event()
+
+    def job():
+        started.set()
+        assert release.wait(2)
+
+    assert app_mod.start_deployment_job(job) is False
+    assert started.wait(1)
+    assert app_mod._wait_for_deployment_jobs(0.01) is False
+    with pytest.raises(RuntimeError, match="shutting down"):
+        app_mod.start_deployment_job(lambda: None)
+    release.set()
+    assert app_mod._wait_for_deployment_jobs(1) is True
+    app_mod._open_deployment_jobs()
+
+
+def test_recover_deployments_recovers_fresh_busy_states_on_startup(monkeypatch):
+    from flash.server.routes import serving
+
+    now = time.time()
+    statuses = {
+        state: SimpleNamespace(
+            run_id=f"run-{state}",
+            state="done",
+            deployment={"state": state, "updated_at": now},
+        )
+        for state in ("smoke_testing", "reconciling")
+    }
+    marked = []
+    reported = []
+    monkeypatch.setattr(
+        serving.db,
+        "all_runs",
+        lambda: [{"run_id": status.run_id} for status in statuses.values()],
+    )
+    monkeypatch.setattr(
+        serving._app,
+        "get_status",
+        lambda run_id: statuses[run_id.removeprefix("run-")],
+    )
+
+    def mark_failed(run_id, deployment):
+        marked.append((run_id, deployment))
+        return SimpleNamespace(run_id=run_id, state="done", deployment=deployment)
+
+    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(
+        serving,
+        "_report_persisted_transition",
+        lambda previous, current, *, persisted: reported.append(
+            (previous.run_id, current.deployment, persisted)
+        ),
+    )
+
+    assert serving.recover_deployments() == 2
+    assert [run_id for run_id, _deployment in marked] == [
+        "run-smoke_testing",
+        "run-reconciling",
+    ]
+    assert all(deployment["state"] == "failed" for _run_id, deployment in marked)
+    assert all("control-plane restart" in deployment["error"] for _run_id, deployment in marked)
+    assert [run_id for run_id, _deployment, persisted in reported if persisted] == [
+        "run-smoke_testing",
+        "run-reconciling",
+    ]
+
+
+def test_deployment_job_is_started_before_waiters_can_observe_it(monkeypatch):
+    import flash.server.app as app_mod
+
+    started_while_locked = []
+
+    class ThreadStub:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            started_while_locked.append(app_mod._DEPLOYMENT_JOBS_LOCK.locked())
+
+    monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
+    monkeypatch.setattr(app_mod.threading, "Thread", ThreadStub)
+    app_mod._open_deployment_jobs()
+
+    assert app_mod.start_deployment_job(lambda: None) is False
+    assert started_while_locked == [True]
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        app_mod._DEPLOYMENT_JOBS.clear()
+
+
 def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -2248,13 +2875,16 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     status.state = "done"
     runner._save_status(status)
 
-    started: dict = {}
+    monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
+    started: list[tuple[object, tuple, dict]] = []
+    reported = []
 
-    def fake_start(target, **kwargs):
-        started.update({"target": target, **kwargs})
+    def fake_start(target, *args, **kwargs):
+        started.append((target, args, kwargs))
         return False
 
     monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
+    monkeypatch.setattr(runner, "_report_status_async", reported.append)
     monkeypatch.setattr(
         app_mod,
         "deploy_adapter",
@@ -2265,13 +2895,1067 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "queued"
     assert resp.json()["verify"] is True
-    assert started["run_id"] == run_id
-    assert started["deploy_kwargs"]["adapter_prefix"].endswith(run_id)
+    assert len(started) == 1
+    deployment_target, deployment_args, deployment_kwargs = started[0]
+    assert deployment_target.__name__ == "_finish_deployment"
+    assert deployment_args == ()
+    assert deployment_kwargs["run_id"] == run_id
+    assert deployment_kwargs["deploy_kwargs"]["adapter_prefix"].endswith(run_id)
+    assert [status.deployment["state"] for status in reported] == ["queued"]
 
     deployment = runner.get_status(run_id).deployment
     assert deployment["state"] == "queued"
     deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
     assert deployments[0]["deployment"]["state"] == "queued"
+
+
+def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    reported = []
+
+    def reject_job(*_args, **_kwargs):
+        raise app_mod.DeploymentJobStartError("deployment jobs are shutting down")
+
+    monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
+    monkeypatch.setattr(app_mod, "start_deployment_job", reject_job)
+    monkeypatch.setattr(runner, "_report_status_async", reported.append)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"]["code"] == "deployment_job_unavailable"
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "failed"
+    assert deployment["retryable"] is True
+    assert "shutting down" in deployment["error"]
+    assert [item.deployment["state"] for item in reported] == ["queued", "failed"]
+
+
+def test_sync_deploy_execution_error_keeps_specific_persisted_outcome(api, monkeypatch):
+    import flash.runner as runner
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    def fail_after_start(**_kwargs):
+        current = runner.get_status(run_id)
+        failed = {
+            **current.deployment,
+            "state": "failed",
+            "error": "specific inline deployment failure",
+        }
+        runner.mark_deployment_failed(run_id, failed)
+        raise RuntimeError("late status mirror failure")
+
+    monkeypatch.setattr(serving, "_finish_deployment", fail_after_start)
+
+    with pytest.raises(RuntimeError, match="late status mirror failure"):
+        api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "failed"
+    assert deployment["error"] == "specific inline deployment failure"
+
+
+def test_replay_status_reports_mirrors_all_persisted_outcomes_sequentially(monkeypatch):
+    from flash.server.routes import serving
+
+    ready = SimpleNamespace(run_id="run-ready", deployment={"state": "ready"})
+    complete = SimpleNamespace(run_id="run-complete", deployment=None)
+    reported = []
+    monkeypatch.setattr(
+        serving.db, "all_runs", lambda: [{"run_id": "run-ready"}, {"run_id": "run-complete"}]
+    )
+    monkeypatch.setattr(
+        serving._app,
+        "get_status",
+        lambda run_id: ready if run_id == "run-ready" else complete,
+    )
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "_report_status", reported.append)
+
+    assert serving.replay_status_reports() == 2
+    assert reported == [ready, complete]
+
+
+def test_replay_status_reports_skips_unreadable_records_and_continues(monkeypatch):
+    import flash.runner as runner
+    from flash.server.routes import serving
+
+    first = SimpleNamespace(run_id="run-first")
+    last = SimpleNamespace(run_id="run-last")
+    outcomes = {
+        "run-first": first,
+        "run-missing": FileNotFoundError("missing"),
+        "run-os-error": OSError("unreadable"),
+        "run-type-error": TypeError("invalid type"),
+        "run-value-error": ValueError("invalid value"),
+        "run-last": last,
+    }
+    reported = []
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": run_id} for run_id in outcomes])
+
+    def get_status(run_id):
+        outcome = outcomes[run_id]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(serving._app, "get_status", get_status)
+    monkeypatch.setattr(runner, "_report_status", reported.append)
+
+    assert serving.replay_status_reports() == 2
+    assert reported == [first, last]
+
+
+def test_replay_status_reports_repairs_malformed_report_sequence_and_continues(monkeypatch):
+    import flash.runner as runner
+    from flash.server.routes import serving
+
+    malformed = runner._runstatus_from_json(
+        {
+            "run_id": "run-malformed-sequence",
+            "state": "done",
+            "spec": SPEC,
+            "report_sequence": "not-an-integer",
+        }
+    )
+    valid = runner._runstatus_from_json(
+        {
+            "run_id": "run-valid-sequence",
+            "state": "done",
+            "spec": SPEC,
+            "report_sequence": 1,
+        }
+    )
+    statuses = {status.run_id: status for status in (malformed, valid)}
+    delivered = []
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": key} for key in statuses])
+    monkeypatch.setattr(serving._app, "get_status", statuses.__getitem__)
+    monkeypatch.setattr(runner, "_send_status_report", delivered.append)
+
+    runner._shutdown_status_reporter()
+    runner._open_status_reporter()
+    try:
+        assert serving.replay_status_reports() == 2
+        assert delivered == [malformed, valid]
+    finally:
+        runner._shutdown_status_reporter()
+
+
+def test_replay_status_reports_stops_between_items(monkeypatch):
+    from threading import Event
+
+    import flash.runner as runner
+    from flash.server.routes import serving
+
+    stop = Event()
+    statuses = {
+        "run-a": SimpleNamespace(run_id="run-a"),
+        "run-b": SimpleNamespace(run_id="run-b"),
+    }
+    reported = []
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": key} for key in statuses])
+    monkeypatch.setattr(serving._app, "get_status", statuses.__getitem__)
+
+    def report(status):
+        reported.append(status)
+        stop.set()
+
+    monkeypatch.setattr(runner, "_report_status", report)
+
+    assert serving.replay_status_reports(stop) == 1
+    assert reported == [statuses["run-a"]]
+
+
+def test_replay_status_reports_continues_after_report_failure(monkeypatch):
+    import flash.runner as runner
+    from flash.server.routes import serving
+
+    failing = SimpleNamespace(run_id="run-failing", report_sequence=1)
+    valid = SimpleNamespace(run_id="run-valid", report_sequence=2)
+    statuses = {status.run_id: status for status in (failing, valid)}
+    reported = []
+    monkeypatch.setattr(
+        serving.db,
+        "all_runs",
+        lambda: [{"run_id": run_id} for run_id in statuses],
+    )
+    monkeypatch.setattr(serving._app, "get_status", statuses.__getitem__)
+
+    def report(status):
+        if status.run_id == "run-failing":
+            raise ValueError("invalid stored report")
+        runner._status_report_sequence_unlocked(status)
+        reported.append(status)
+
+    monkeypatch.setattr(runner, "_report_status", report)
+
+    assert serving.replay_status_reports() == 1
+    assert reported == [valid]
+
+
+def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
+    from threading import Event
+
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.billing_retry as billing_retry
+    import flash.server.reconcile as reconcile
+    import flash.server.repo_cleanup as repo_cleanup
+    from flash.providers import preflight
+    from flash.providers.runpod.train import endpoints
+    from flash.server.routes import serving
+
+    replay_started = Event()
+    shutdown_steps = []
+
+    def fail_replay(_stop):
+        replay_started.set()
+        raise ValueError("invalid stored run status")
+
+    def wait_for_deployments(_timeout):
+        shutdown_steps.append("deployment_jobs")
+        return True
+
+    def flush_status_reports(_timeout, *, close=False):
+        shutdown_steps.append(("status_reports", close))
+        return True
+
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.setattr(preflight, "check_run_preflight", lambda: None)
+    monkeypatch.setattr(app_mod, "_open_deployment_jobs", lambda: None)
+    monkeypatch.setattr(runner, "_open_status_reporter", lambda: None)
+    monkeypatch.setattr(app_mod, "recover_runs", lambda: None)
+    monkeypatch.setattr(serving, "recover_deployments", lambda: 0)
+    monkeypatch.setattr(serving, "replay_status_reports", fail_replay)
+    monkeypatch.setattr(billing_retry, "charge_retry_enabled", lambda: False)
+    monkeypatch.setattr(reconcile, "reconcile_enabled", lambda: False)
+    monkeypatch.setattr(endpoints, "reconcile_endpoint_slots", lambda: None)
+    monkeypatch.setattr(repo_cleanup, "repo_cleanup_enabled", lambda: False)
+    monkeypatch.setattr(app_mod, "_instance_providers_configured", lambda: False)
+    monkeypatch.setattr(app_mod, "_wait_for_deployment_jobs", wait_for_deployments)
+    monkeypatch.setattr(runner, "_shutdown_status_reporter", flush_status_reports)
+
+    with TestClient(app_mod.create_app()):
+        assert replay_started.wait(1)
+
+    assert shutdown_steps == ["deployment_jobs", ("status_reports", True)]
+
+
+def test_status_report_sequence_is_persisted_and_private(api):
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    initial_sequence = status.report_sequence
+
+    status.updated_at = time.time()
+    runner._save_status(status)
+    persisted = runner.get_status(run_id)
+
+    assert persisted.report_sequence == initial_sequence + 1
+    public = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert "report_sequence" not in public
+
+
+def test_save_status_repairs_wrong_typed_report_sequence(api):
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    path = runner.runs_file_path(run_id, ".json")
+    with open(path) as f:
+        stored = json.load(f)
+    stored["report_sequence"] = {"corrupt": True}
+    with open(path, "w") as f:
+        json.dump(stored, f)
+
+    status = runner.get_status(run_id)
+    runner._save_status(status)
+
+    assert runner.get_status(run_id).report_sequence == 1
+
+
+def test_legacy_replay_sequence_advances_first_post_restart_save(api, monkeypatch):
+    import flash.runner as runner
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    path = runner.runs_file_path(run_id, ".json")
+    with open(path) as f:
+        stored = json.load(f)
+    stored["report_sequence"] = 0
+    with open(path, "w") as f:
+        json.dump(stored, f)
+
+    runner._shutdown_status_reporter()
+    runner._open_status_reporter()
+    for values in (
+        runner._STATUS_REPORT_LAST_SENT,
+        runner._STATUS_REPORT_LAST_ATTEMPTED,
+        runner._STATUS_REPORT_LAST_QUEUED,
+    ):
+        values.pop(run_id, None)
+    reported = []
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(
+        runner, "_send_status_report", lambda status: reported.append(status) or True
+    )
+
+    try:
+        assert serving.replay_status_reports() == 1
+        assert runner._STATUS_REPORT_LAST_SENT[run_id] == 1
+
+        updated = runner.get_status(run_id)
+        runner._save_status(updated)
+        assert updated.report_sequence == 2
+        runner._report_status(updated)
+
+        assert runner._STATUS_REPORT_LAST_SENT[run_id] == 2
+        assert len(reported) == 2
+    finally:
+        runner._shutdown_status_reporter()
+
+
+def test_completed_status_report_worker_restarts_orphaned_queue(monkeypatch):
+    from collections import deque
+    from concurrent.futures import Future
+    from threading import Event
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_id = "run-orphaned-report"
+    completed = Future()
+    completed.set_result(None)
+    queued = SimpleNamespace(run_id=run_id)
+    with runner._STATUS_REPORT_CONDITION:
+        runner._STATUS_REPORT_QUEUES[run_id] = deque([(queued, 1, Event(), 1)])
+        runner._STATUS_REPORT_WORKERS[run_id] = completed
+        runner._STATUS_REPORT_ACTIVE.add(run_id)
+
+    started = []
+
+    def start_worker(current_run_id):
+        started.append(current_run_id)
+        runner._STATUS_REPORT_ACTIVE.add(current_run_id)
+        return True
+
+    monkeypatch.setattr(runner, "_start_status_report_worker_unlocked", start_worker)
+    runner._discard_status_report_worker(run_id, completed)
+
+    assert started == [run_id]
+    assert run_id in runner._STATUS_REPORT_ACTIVE
+    with runner._STATUS_REPORT_CONDITION:
+        runner._STATUS_REPORT_QUEUES.pop(run_id, None)
+        runner._STATUS_REPORT_WORKERS.pop(run_id, None)
+        runner._STATUS_REPORT_ACTIVE.discard(run_id)
+
+
+def test_drained_status_worker_does_not_clear_replacement_marker(monkeypatch):
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_id = "run-replacement-report"
+    injected = False
+    original_notify_all = runner._STATUS_REPORT_CONDITION.notify_all
+
+    def inject_replacement():
+        nonlocal injected
+        original_notify_all()
+        if not injected and run_id not in runner._STATUS_REPORT_ACTIVE:
+            runner._STATUS_REPORT_ACTIVE.add(run_id)
+            injected = True
+
+    monkeypatch.setattr(runner._STATUS_REPORT_CONDITION, "notify_all", inject_replacement)
+    with runner._STATUS_REPORT_CONDITION:
+        runner._STATUS_REPORT_ACTIVE.add(run_id)
+
+    runner._drain_status_report_run(run_id)
+
+    assert injected is True
+    assert run_id in runner._STATUS_REPORT_ACTIVE
+    with runner._STATUS_REPORT_CONDITION:
+        runner._STATUS_REPORT_ACTIVE.discard(run_id)
+
+
+def test_status_reports_preserve_run_order_without_cross_run_blocking(monkeypatch):
+    from threading import Event
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_a = "run-ordered-report-a"
+    run_b = "run-ordered-report-b"
+    for run_id in (run_a, run_b):
+        runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+        runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+        runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    started = Event()
+    release = Event()
+    run_b_reported = Event()
+    reported = []
+
+    def send(status):
+        if status.run_id == run_a and status.report_sequence == 1:
+            started.set()
+            assert release.wait(2)
+        reported.append((status.run_id, status.deployment["state"]))
+        if status.run_id == run_b:
+            run_b_reported.set()
+
+    monkeypatch.setattr(runner, "_send_status_report", send)
+
+    def status(run_id, state, sequence):
+        return SimpleNamespace(
+            run_id=run_id,
+            state="done",
+            updated_at=1.0,
+            report_sequence=sequence,
+            deployment={"state": state, "updated_at": 1.0},
+        )
+
+    runner._report_status_async(status(run_a, "queued", 1))
+    assert started.wait(1)
+    for sequence in range(2, 7):
+        runner._report_status_async(status(run_a, f"state-{sequence}", sequence))
+    runner._report_status_async(status(run_b, "running", 1))
+    try:
+        assert run_b_reported.wait(1)
+        assert reported == [(run_b, "running")]
+    finally:
+        release.set()
+
+    assert runner._wait_for_status_reports(2)
+    assert [state for run_id, state in reported if run_id == run_a] == [
+        "queued",
+        "state-2",
+        "state-3",
+        "state-4",
+        "state-5",
+        "state-6",
+    ]
+    runner._shutdown_status_reporter()
+
+
+def test_status_report_workers_recover_and_use_persisted_sequence(monkeypatch):
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_id = "run-stale-report"
+    runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    reported = []
+
+    def send(status):
+        if status.deployment["state"] == "broken":
+            raise RuntimeError("report failed")
+        reported.append(status)
+
+    monkeypatch.setattr(runner, "_send_status_report", send)
+
+    def status(state, sequence, updated_at):
+        return SimpleNamespace(
+            run_id=run_id,
+            state="done",
+            updated_at=updated_at,
+            report_sequence=sequence,
+            deployment={"state": state, "updated_at": updated_at},
+        )
+
+    runner._report_status_async(status("broken", 1, 10.0))
+    runner._report_status(status("ready", 3, 1.0))
+    runner._report_status_async(status("queued", 2, 20.0))
+    runner._report_status(status("undeployed", 4, -1.0))
+    assert runner._wait_for_status_reports(2)
+
+    assert [item.deployment["state"] for item in reported] == ["ready", "undeployed"]
+    runner._shutdown_status_reporter()
+
+
+def test_sync_older_status_report_skips_newer_in_flight_sequence(monkeypatch):
+    from threading import Event
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_id = "run-report-race"
+    runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    newer_started = Event()
+    release_newer = Event()
+    attempted = []
+
+    def send(status):
+        attempted.append(status.report_sequence)
+        if len(attempted) == 1:
+            newer_started.set()
+            assert release_newer.wait(2)
+        return False
+
+    def status(sequence):
+        return SimpleNamespace(
+            run_id=run_id,
+            state="done",
+            updated_at=float(sequence),
+            report_sequence=sequence,
+            deployment={"state": f"state-{sequence}", "updated_at": float(sequence)},
+        )
+
+    monkeypatch.setattr(runner, "_send_status_report", send)
+    runner._report_status_async(status(2))
+    assert newer_started.wait(1)
+    try:
+        runner._report_status(status(1))
+        assert attempted == [2]
+    finally:
+        release_newer.set()
+
+    assert runner._wait_for_status_reports(2)
+    assert attempted == [2, 2]
+    runner._shutdown_status_reporter()
+
+
+def test_sync_equal_status_report_waits_for_async_success_without_duplicate(monkeypatch):
+    from threading import Event, Thread
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_id = "run-report-equal-success"
+    runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    async_started = Event()
+    release_async = Event()
+    sync_done = Event()
+    attempts = []
+
+    def send(status):
+        attempts.append(status.report_sequence)
+        async_started.set()
+        assert release_async.wait(2)
+        return True
+
+    status = SimpleNamespace(
+        run_id=run_id,
+        state="done",
+        updated_at=1.0,
+        report_sequence=1,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+    monkeypatch.setattr(runner, "_send_status_report", send)
+    runner._report_status_async(status)
+    assert async_started.wait(1)
+
+    def report_sync():
+        runner._report_status(status)
+        sync_done.set()
+
+    sync = Thread(target=report_sync)
+    sync.start()
+    try:
+        assert not sync_done.wait(0.05)
+    finally:
+        release_async.set()
+    sync.join(2)
+
+    assert not sync.is_alive()
+    assert sync_done.is_set()
+    assert attempts == [1]
+    assert runner._STATUS_REPORT_LAST_SENT[run_id] == 1
+    runner._shutdown_status_reporter()
+
+
+def test_sync_equal_status_report_retries_once_after_async_failure(monkeypatch):
+    from threading import Event, Thread
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_id = "run-report-equal-failure"
+    runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    async_started = Event()
+    release_async = Event()
+    sync_done = Event()
+    attempts = []
+
+    def send(status):
+        attempts.append(status.report_sequence)
+        if len(attempts) == 1:
+            async_started.set()
+            assert release_async.wait(2)
+        return len(attempts) == 3
+
+    status = SimpleNamespace(
+        run_id=run_id,
+        state="done",
+        updated_at=1.0,
+        report_sequence=1,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+    monkeypatch.setattr(runner, "_send_status_report", send)
+    runner._report_status_async(status)
+    assert async_started.wait(1)
+
+    def report_sync():
+        runner._report_status(status)
+        sync_done.set()
+
+    sync = Thread(target=report_sync)
+    sync.start()
+    try:
+        assert not sync_done.wait(0.05)
+    finally:
+        release_async.set()
+    sync.join(2)
+
+    assert not sync.is_alive()
+    assert sync_done.is_set()
+    assert attempts == [1, 1, 1]
+    assert runner._STATUS_REPORT_LAST_SENT[run_id] == 1
+    runner._shutdown_status_reporter()
+
+
+def test_failed_sync_status_report_sequence_can_be_retried(monkeypatch):
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_id = "run-report-retry"
+    runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    attempts = []
+
+    def send(status):
+        attempts.append(status.report_sequence)
+        return len(attempts) > 1
+
+    monkeypatch.setattr(runner, "_send_status_report", send)
+    status = SimpleNamespace(
+        run_id=run_id,
+        state="done",
+        updated_at=1.0,
+        report_sequence=1,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+
+    runner._report_status(status)
+    assert attempts == [1]
+    assert run_id not in runner._STATUS_REPORT_LAST_SENT
+
+    runner._report_status(status)
+    assert attempts == [1, 1]
+    assert runner._STATUS_REPORT_LAST_SENT[run_id] == 1
+    runner._shutdown_status_reporter()
+
+
+def test_wait_for_status_reports_includes_work_queued_while_waiting(monkeypatch):
+    from threading import Event, Thread
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_id = "run-report-wait"
+    runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    first_started = Event()
+    first_release = Event()
+    second_started = Event()
+    second_release = Event()
+    wait_done = Event()
+    wait_result = []
+
+    def send(status):
+        if status.report_sequence == 1:
+            first_started.set()
+            assert first_release.wait(2)
+        else:
+            second_started.set()
+            assert second_release.wait(2)
+
+    monkeypatch.setattr(runner, "_send_status_report", send)
+
+    def status(sequence):
+        return SimpleNamespace(
+            run_id=run_id,
+            state="done",
+            updated_at=float(sequence),
+            report_sequence=sequence,
+            deployment={"state": f"state-{sequence}", "updated_at": float(sequence)},
+        )
+
+    runner._report_status_async(status(1))
+    assert first_started.wait(1)
+
+    def wait_for_reports():
+        wait_result.append(runner._wait_for_status_reports(2))
+        wait_done.set()
+
+    waiter = Thread(target=wait_for_reports)
+    waiter.start()
+    runner._report_status_async(status(2))
+    first_release.set()
+    assert second_started.wait(1)
+    assert not wait_done.is_set()
+    second_release.set()
+    waiter.join(2)
+
+    assert wait_result == [True]
+    runner._shutdown_status_reporter()
+
+
+def test_duplicate_status_drains_preserve_per_run_serialization(monkeypatch):
+    from collections import deque
+    from threading import Event, Thread
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_id = "run-duplicate-drain"
+    for state in (
+        runner._STATUS_REPORT_LAST_SENT,
+        runner._STATUS_REPORT_LAST_ATTEMPTED,
+        runner._STATUS_REPORT_LAST_QUEUED,
+    ):
+        state.pop(run_id, None)
+    first_started = Event()
+    release_first = Event()
+    second_started = Event()
+    attempts = []
+
+    def send(status):
+        attempts.append(status.report_sequence)
+        if status.report_sequence == 1:
+            first_started.set()
+            assert release_first.wait(2)
+        else:
+            second_started.set()
+        return True
+
+    def status(sequence):
+        return SimpleNamespace(
+            run_id=run_id,
+            state="done",
+            updated_at=float(sequence),
+            report_sequence=sequence,
+            deployment={"state": f"state-{sequence}", "updated_at": float(sequence)},
+        )
+
+    monkeypatch.setattr(runner, "_send_status_report", send)
+    first_done = Event()
+    with runner._STATUS_REPORT_CONDITION:
+        runner._STATUS_REPORT_QUEUES[run_id] = deque([(status(1), 1, first_done, 2)])
+        runner._STATUS_REPORT_LAST_QUEUED[run_id] = 1
+        runner._STATUS_REPORT_PENDING += 1
+        runner._STATUS_REPORT_ACTIVE.add(run_id)
+
+    first_drain = Thread(target=runner._drain_status_report_run, args=(run_id,))
+    first_drain.start()
+    assert first_started.wait(1)
+    duplicate_drain = Thread(target=runner._drain_status_report_run, args=(run_id,))
+    duplicate_drain.start()
+    duplicate_drain.join(1)
+    assert not duplicate_drain.is_alive()
+
+    runner._report_status_async(status(2))
+    try:
+        assert not second_started.wait(0.05)
+    finally:
+        release_first.set()
+    first_drain.join(2)
+
+    assert not first_drain.is_alive()
+    assert runner._wait_for_status_reports(2)
+    assert attempts == [1, 2]
+    runner._shutdown_status_reporter()
+
+
+def test_async_status_report_drops_when_executor_cannot_start(monkeypatch):
+    import flash.runner as runner
+
+    class BrokenExecutor:
+        def __init__(self):
+            self.shutdown_calls = []
+
+        def submit(self, *_args, **_kwargs):
+            raise RuntimeError("worker start failed")
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    runner._shutdown_status_reporter()
+    run_id = "run-report-fallback"
+    runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    reported = []
+    executor = BrokenExecutor()
+    monkeypatch.setattr(runner, "_STATUS_REPORT_EXECUTOR", executor)
+    monkeypatch.setattr(runner, "_send_status_report", reported.append)
+    status = SimpleNamespace(
+        run_id=run_id,
+        state="done",
+        updated_at=1.0,
+        report_sequence=1,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+
+    runner._report_status_async(status)
+
+    assert reported == []
+    assert runner._STATUS_REPORT_PENDING == 0
+    assert run_id not in runner._STATUS_REPORT_ACTIVE
+    assert runner._STATUS_REPORT_EXECUTOR is None
+    assert executor.shutdown_calls == []
+
+    runner._report_status(status)
+    assert reported == [status]
+    runner._shutdown_status_reporter()
+
+
+def test_failed_executor_submission_preserves_queued_peer_work(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    runner._open_status_reporter()
+    peer_run_id = "run-report-peer"
+    failed_run_id = "run-report-submit-failed"
+    for run_id in (peer_run_id, failed_run_id):
+        for values in (
+            runner._STATUS_REPORT_LAST_SENT,
+            runner._STATUS_REPORT_LAST_ATTEMPTED,
+            runner._STATUS_REPORT_LAST_QUEUED,
+        ):
+            values.pop(run_id, None)
+    occupied = Event()
+    release = Event()
+    peer_ran = Event()
+    report_ran = Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    def block_worker():
+        occupied.set()
+        assert release.wait(2)
+
+    busy = executor.submit(block_worker)
+    assert occupied.wait(1)
+    peer = executor.submit(peer_ran.set)
+    monkeypatch.setattr(
+        executor,
+        "_adjust_thread_count",
+        lambda: (_ for _ in ()).throw(RuntimeError("worker start failed")),
+    )
+    monkeypatch.setattr(runner, "_STATUS_REPORT_EXECUTOR", executor)
+    monkeypatch.setattr(runner, "_send_status_report", lambda _status: report_ran.set() or True)
+    status = SimpleNamespace(
+        run_id=run_id,
+        state="done",
+        updated_at=1.0,
+        report_sequence=1,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+
+    runner._report_status_async(status)
+    assert runner._STATUS_REPORT_EXECUTOR is executor
+    assert runner._STATUS_REPORT_PENDING == 1
+
+    release.set()
+    busy.result(2)
+    peer.result(2)
+    assert peer_ran.is_set()
+    assert report_ran.wait(1)
+    assert runner._wait_for_status_reports(2)
+    assert runner._STATUS_REPORT_EXECUTOR is executor
+    runner._shutdown_status_reporter()
+
+
+def test_sync_status_report_falls_back_when_executor_cannot_start(monkeypatch):
+    import flash.runner as runner
+
+    class BrokenExecutor:
+        def __init__(self):
+            self.shutdown_calls = []
+
+        def submit(self, *_args, **_kwargs):
+            raise RuntimeError("worker start failed")
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    runner._shutdown_status_reporter()
+    run_id = "run-sync-report-fallback"
+    runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+    runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    reported = []
+    executor = BrokenExecutor()
+    monkeypatch.setattr(runner, "_STATUS_REPORT_EXECUTOR", executor)
+    monkeypatch.setattr(runner, "_send_status_report", reported.append)
+    status = SimpleNamespace(
+        run_id=run_id,
+        state="done",
+        updated_at=1.0,
+        report_sequence=1,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+
+    runner._report_status(status)
+
+    assert reported == [status]
+    assert runner._STATUS_REPORT_PENDING == 0
+    assert runner._STATUS_REPORT_EXECUTOR is None
+    assert executor.shutdown_calls == []
+
+
+def test_closed_status_reporter_drops_late_work_until_reopened(monkeypatch):
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter(close=True)
+    reported = []
+    monkeypatch.setattr(runner, "_send_status_report", reported.append)
+    status = SimpleNamespace(
+        run_id="run-closed-reporter",
+        state="done",
+        updated_at=1.0,
+        report_sequence=1,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+
+    runner._report_status_async(status)
+    assert reported == []
+    assert runner._STATUS_REPORT_PENDING == 0
+
+    runner._open_status_reporter()
+    runner._report_status(status)
+    assert reported == [status]
+    runner._shutdown_status_reporter()
+
+
+def test_status_report_shutdown_is_bounded_and_cancels_queued_work(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    run_a = "run-report-shutdown-a"
+    run_b = "run-report-shutdown-b"
+    for run_id in (run_a, run_b):
+        runner._STATUS_REPORT_LAST_SENT.pop(run_id, None)
+        runner._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+        runner._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    started = Event()
+    release = Event()
+    reported = []
+
+    def send(status):
+        reported.append(status.run_id)
+        if status.run_id == run_a:
+            started.set()
+            assert release.wait(2)
+
+    def status(run_id):
+        return SimpleNamespace(
+            run_id=run_id,
+            state="done",
+            updated_at=1.0,
+            report_sequence=1,
+            deployment={"state": "ready", "updated_at": 1.0},
+        )
+
+    monkeypatch.setattr(runner, "_send_status_report", send)
+    monkeypatch.setattr(runner, "_STATUS_REPORT_EXECUTOR", ThreadPoolExecutor(max_workers=1))
+    runner._report_status_async(status(run_a))
+    assert started.wait(1)
+    runner._report_status_async(status(run_b))
+
+    assert runner._shutdown_status_reporter(0.01, close=True) is False
+    assert run_a in runner._STATUS_REPORT_ACTIVE
+    release.set()
+    assert runner._wait_for_status_reports(2)
+    assert reported == [run_a]
+
+    runner._open_status_reporter()
+    runner._report_status(status(run_b))
+    assert reported == [run_a, run_b]
+    runner._shutdown_status_reporter()
+
+
+def test_status_report_shutdown_stops_retry_after_active_attempt(monkeypatch):
+    from threading import Event
+
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter()
+    runner._open_status_reporter()
+    run_id = "run-report-stop-retry"
+    for values in (
+        runner._STATUS_REPORT_LAST_SENT,
+        runner._STATUS_REPORT_LAST_ATTEMPTED,
+        runner._STATUS_REPORT_LAST_QUEUED,
+    ):
+        values.pop(run_id, None)
+    started = Event()
+    release = Event()
+    attempts = []
+
+    def send(status):
+        attempts.append(status.report_sequence)
+        started.set()
+        assert release.wait(2)
+        return False
+
+    status = SimpleNamespace(
+        run_id=run_id,
+        state="done",
+        updated_at=1.0,
+        report_sequence=1,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+    monkeypatch.setattr(runner, "_send_status_report", send)
+    runner._report_status_async(status)
+    assert started.wait(1)
+
+    assert runner._shutdown_status_reporter(0.01, close=True) is False
+    release.set()
+    assert runner._wait_for_status_reports(2)
+    assert attempts == [1]
+    runner._open_status_reporter()
+    runner._shutdown_status_reporter()
 
 
 def test_deploy_rejects_verify_false_before_anything_registers(api, monkeypatch):
@@ -2902,7 +4586,7 @@ def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):
 
     seen: dict = {}
 
-    def fake_start(target, **kwargs):
+    def fake_start(target, *args, **kwargs):
         seen.update({"target": target, **kwargs})
         return False
 
@@ -3061,6 +4745,49 @@ def test_failed_redeploy_restores_previous_ready_deployment(api, monkeypatch):
     assert resp.json()["endpoint_name"] == "old"
 
 
+def test_consecutive_failed_redeployments_each_report_restored_ready_state(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.run_registry as registry
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    status = runner.get_status(run_id)
+    status.deployment = {
+        "state": "ready",
+        "endpoint_name": "old",
+        "adapter_hf_prefix": "rl/old/adapter",
+    }
+    runner._save_status(status)
+
+    errors = iter(("first redeploy failed", "second redeploy failed"))
+
+    def fail_deploy(**_kwargs):
+        raise ServingError(next(errors))
+
+    reported = []
+    monkeypatch.setattr(app_mod, "deploy_adapter", fail_deploy)
+    monkeypatch.setattr(
+        registry,
+        "record_training_run",
+        lambda **kwargs: reported.append(kwargs["status"]) or True,
+    )
+
+    for expected in ("first redeploy failed", "second redeploy failed"):
+        response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+        assert response.status_code == 200, response.text
+        assert response.json()["state"] == "ready"
+        assert response.json()["last_deploy_error"] == expected
+
+    restored_failures = [
+        item.deployment["last_deploy_error"]
+        for item in reported
+        if item.deployment and item.deployment.get("last_deploy_error")
+    ]
+    assert restored_failures == ["first redeploy failed", "second redeploy failed"]
+
+
 @pytest.mark.parametrize("deployment_state", ["undeployed", "revocation_failed"])
 def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, deployment_state):
     import flash.runner as runner
@@ -3186,11 +4913,12 @@ def test_unknown_reconciliation_allows_one_retry_then_blocks_overlap(api, monkey
         "adapter_alias_target",
         lambda target: alias_reads.append(target) or None,
     )
-    monkeypatch.setattr(
-        app_mod,
-        "start_deployment_job",
-        lambda target, **kwargs: jobs.append((target, kwargs)) or False,
-    )
+
+    def fake_start(target, *args, **kwargs):
+        jobs.append((target, kwargs))
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
 
     first = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
 
@@ -3396,7 +5124,7 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     runner._save_status(status)
     seen: dict = {}
 
-    def fake_start(target, **kwargs):
+    def fake_start(target, *args, **kwargs):
         seen.update({"target": target, **kwargs})
         return False
 
@@ -4257,6 +5985,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
 def test_undeploy_without_status_projection_invalidates_orphaned_ledger(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
+    import flash.server.run_registry as registry
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -4273,6 +6002,12 @@ def test_undeploy_without_status_projection_invalidates_orphaned_ledger(api, mon
         "undeploy_adapter",
         lambda target: {"run_id": target, "serving_deregistered": False},
     )
+    reports = []
+    monkeypatch.setattr(
+        registry,
+        "record_training_run",
+        lambda **kwargs: reports.append(kwargs["status"]) or True,
+    )
 
     response = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
 
@@ -4280,6 +6015,7 @@ def test_undeploy_without_status_projection_invalidates_orphaned_ledger(api, mon
     assert runner.verified_adapter_revision_generation(run_id) == generation + 1
     assert runner.read_verified_adapter_revisions(run_id) == frozenset()
     assert runner.get_status(run_id).deployment is None
+    assert reports == []
 
 
 def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
