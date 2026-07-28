@@ -119,6 +119,22 @@ def require_environment_project(
         if exc.code == 404 and repair_missing:
             from flash.server import envs
 
+            not_found_detail = detail or "environment does not belong to the requested project"
+            if key.get("auth_kind") == "internal":
+                ownership_exc = envs.EnvPublishError(
+                    "caller organization namespace is unavailable", status=403
+                )
+                raise HTTPException(status_code=404, detail=not_found_detail) from ownership_exc
+            try:
+                caller_namespace = envs.namespace_for(key)
+            except envs.EnvPublishError as namespace_exc:
+                raise HTTPException(status_code=404, detail=not_found_detail) from namespace_exc
+            if slug.split("/", 1)[0] != caller_namespace:
+                ownership_exc = envs.EnvPublishError(
+                    "environment namespace does not match caller organization", status=403
+                )
+                raise HTTPException(status_code=404, detail=not_found_detail) from ownership_exc
+
             # only a missing mirror row reaches the hub clone; normal and conflicting rows stay cheap.
             try:
                 envs.download_package(slug=slug, key=key)
@@ -126,7 +142,7 @@ def require_environment_project(
                 if download_exc.status == 403:
                     raise HTTPException(
                         status_code=404,
-                        detail=detail or "environment does not belong to the requested project",
+                        detail=not_found_detail,
                     ) from download_exc
                 raise HTTPException(
                     status_code=download_exc.status,

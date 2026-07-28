@@ -2936,6 +2936,9 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
 
 
 def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
+    import queue
+    import threading
+
     import flash.runner as runner
     import flash.server.app as app_mod
     from flash.server.routes import serving
@@ -2947,13 +2950,50 @@ def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
     status = runner.get_status(run_id)
     status.state = "done"
     runner._save_status(status)
-    recovered = []
 
-    monkeypatch.setattr(serving, "_finish_deployment_unlocked", lambda **_kwargs: None)
+    observations: queue.Queue[str] = queue.Queue()
+    allow_lifecycle = threading.Event()
+    lifecycle_started = threading.Event()
+    phases: list[str] = []
+    recovered: list[int] = []
+    observed_states: list[str] = []
+    worker_errors: list[BaseException] = []
+
+    def hold_lifecycle(**_kwargs):
+        lifecycle_started.set()
+        observations.put("lifecycle-started")
+        assert allow_lifecycle.wait(timeout=5)
+
+    monkeypatch.setattr(serving, "_finish_deployment_unlocked", hold_lifecycle)
+
+    class ObservedDeployLock:
+        def __init__(self, lock):
+            self._lock = lock
+
+        def release(self):
+            self._lock.release()
+            if not lifecycle_started.is_set():
+                observations.put("released-before-lifecycle")
+                assert allow_lifecycle.wait(timeout=5)
 
     def fake_start(target, *args, **kwargs):
+        kwargs["deploy_lock"] = ObservedDeployLock(kwargs["deploy_lock"])
+
+        def run_target():
+            try:
+                target(*args, **kwargs)
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        worker = threading.Thread(target=run_target)
+        worker.start()
+        phases.append(observations.get(timeout=5))
         recovered.append(serving.recover_deployments())
-        target(*args, **kwargs)
+        observed_states.append(runner.get_status(run_id).deployment["state"])
+        allow_lifecycle.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert worker_errors == []
         return False
 
     monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
@@ -2962,6 +3002,8 @@ def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert recovered == [0]
+    assert observed_states == ["queued"]
+    assert phases == ["lifecycle-started"]
     assert runner.get_status(run_id).deployment["state"] == "queued"
 
 
@@ -7519,6 +7561,89 @@ def test_delete_env_endpoint_removes_package(api, monkeypatch):
 
     # unauthenticated requests are rejected.
     assert api.delete("/v1/envs/acme/my-env").status_code in (401, 403)
+
+
+def test_delete_env_missing_mirror_and_package_is_idempotent(api, monkeypatch):
+    from fastapi import HTTPException
+
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    key = _login()
+    namespace = _identity_for_token(key)["org_slug"]
+    mirror_error = HTTPException(status_code=404, detail="flash environment not found")
+    monkeypatch.setattr(
+        environment_registry,
+        "require_environment_project",
+        lambda **_kwargs: (_ for _ in ()).throw(mirror_error),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "download_package",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            envs_mod.EnvPublishError("environment package not found", status=404)
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("an absent package must remain a no-op"),
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_kwargs: True,
+    )
+
+    response = api.delete(
+        f"/v1/envs/{namespace}/my-env",
+        headers={
+            **_bearer(key),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": f"{namespace}/my-env", "deleted": False}
+
+
+def test_delete_env_missing_mirror_does_not_delete_existing_package(api, monkeypatch):
+    from fastapi import HTTPException
+
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    key = _login()
+    namespace = _identity_for_token(key)["org_slug"]
+    monkeypatch.setattr(
+        environment_registry,
+        "require_environment_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=404, detail="flash environment not found")
+        ),
+    )
+    monkeypatch.setattr(envs_mod, "download_package", lambda **_kwargs: b"package")
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("an unassociated package must not be deleted"),
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_kwargs: pytest.fail("a failed delete must not touch the mirror"),
+    )
+
+    response = api.delete(
+        f"/v1/envs/{namespace}/my-env",
+        headers={
+            **_bearer(key),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "flash environment not found"
 
 
 def test_delete_env_endpoint_requires_project_header_before_storage(api, monkeypatch):

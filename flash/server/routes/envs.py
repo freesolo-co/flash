@@ -131,16 +131,35 @@ def delete_env(
         env_id = envs.canonical_env_id(env_id)
     except envs.EnvPublishError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-    require_environment_project(
-        slug=env_id,
-        project_id=project_id,
-        key=key,
-        org_id=x_freesolo_org_id,
-    )
     try:
-        deleted = envs.delete_package(slug=env_id, key=key)
-    except envs.EnvPublishError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        require_environment_project(
+            slug=env_id,
+            project_id=project_id,
+            key=key,
+            org_id=x_freesolo_org_id,
+        )
+    except HTTPException as validation_exc:
+        if validation_exc.status_code != 404:
+            raise
+        try:
+            caller_namespace = envs.namespace_for(key)
+        except envs.EnvPublishError as namespace_exc:
+            raise validation_exc from namespace_exc
+        if env_id.split("/", 1)[0] != caller_namespace:
+            raise validation_exc
+        try:
+            envs.download_package(slug=env_id, key=key)
+        except envs.EnvPublishError as package_exc:
+            if package_exc.status != 404:
+                raise validation_exc from package_exc
+            deleted = False
+        else:
+            raise validation_exc
+    else:
+        try:
+            deleted = envs.delete_package(slug=env_id, key=key)
+        except envs.EnvPublishError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
     # github (the package store) is the source of truth and is already updated; dropping the
     # web-ui metadata mirror remains best-effort and must never turn a successful delete into a 500.

@@ -694,6 +694,57 @@ def test_require_environment_project_cross_namespace_repair_preserves_404(monkey
     assert excinfo.value.__cause__.status == 403
 
 
+@pytest.mark.parametrize("package_exists", [True, False], ids=["exists", "missing"])
+def test_internal_repair_without_org_namespace_preserves_404(monkeypatch, package_exists):
+    import urllib.error
+
+    from fastapi import HTTPException
+
+    from flash.server import environment_registry
+
+    error = urllib.error.HTTPError(
+        "https://backend.test/api/flash/environments/validate/internal",
+        404,
+        "not found",
+        {},
+        io.BytesIO(b'{"detail":"flash environment not found"}'),
+    )
+    downloads: list[str] = []
+    records: list[dict] = []
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    def download_package(*, slug, key):
+        downloads.append(slug)
+        if package_exists:
+            return b"package"
+        raise envs.EnvPublishError("environment package not found", status=404)
+
+    monkeypatch.setattr(envs, "download_package", download_package)
+    monkeypatch.setattr(
+        environment_registry,
+        "record_published_environment",
+        lambda **kwargs: records.append(kwargs) or True,
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        environment_registry.require_environment_project(
+            slug="foreign-org/example",
+            project_id="11111111-1111-4111-8111-111111111111",
+            key={"auth_kind": "internal", "org_id": "org-caller"},
+            repair_missing=True,
+        )
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.detail == "flash environment not found"
+    assert downloads == []
+    assert records == []
+
+
 def test_require_environment_project_backfill_failure_is_502(monkeypatch):
     import urllib.error
 

@@ -1165,36 +1165,36 @@ def deploy(
             "prev_state": prev_state,
             "deploy_lock": deploy_lock,
         }
+        # the job owns the lock from here on and releases it when the lifecycle ends, so a
+        # booting replica's non-blocking probe keeps failing for the whole deploy. a start
+        # failure means the job never ran, so ownership stays with this request.
         job_owns_lock = True
-        if os.environ.get("FLASH_DEPLOY_SYNC") == "1":
+        try:
             ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
-        else:
-            try:
-                ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
-            except _app.DeploymentJobStartError as exc:
-                job_owns_lock = False
-                error = f"deployment job could not start: {exc}"
-                failed = _deployment_state(
-                    dep_dict,
-                    "failed",
-                    error=error,
-                    detail="deployment was not started; retry when the control plane is available",
-                    retryable=True,
-                )
-                previous = _app.get_status(run_id)
-                marked = mark_deployment_failed(run_id, failed)
-                _report_persisted_transition(
-                    previous, marked, persisted=_deployment_failure_persisted(marked, failed)
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "code": "deployment_job_unavailable",
-                        "run_id": run_id,
-                        "retryable": True,
-                        "message": error,
-                    },
-                ) from exc
+        except _app.DeploymentJobStartError as exc:
+            job_owns_lock = False
+            error = f"deployment job could not start: {exc}"
+            failed = _deployment_state(
+                dep_dict,
+                "failed",
+                error=error,
+                detail="deployment was not started; retry when the control plane is available",
+                retryable=True,
+            )
+            previous = _app.get_status(run_id)
+            marked = mark_deployment_failed(run_id, failed)
+            _report_persisted_transition(
+                previous, marked, persisted=_deployment_failure_persisted(marked, failed)
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "deployment_job_unavailable",
+                    "run_id": run_id,
+                    "retryable": True,
+                    "message": error,
+                },
+            ) from exc
         if ran_sync:
             return _public_deployment(_app.get_status(run_id).deployment or dep_dict)
         return _public_deployment(dep_dict)
