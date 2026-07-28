@@ -157,6 +157,20 @@ def test_auto_gpu_effective_spec_is_transient_and_keeps_base_auto(orch) -> None:
     assert second_attempt is not base
 
 
+def test_effective_spec_carries_the_allocated_card_count(orch) -> None:
+    base = _spec(type="")
+
+    # the allocator can satisfy a run with n cards of a smaller class; the count it chose has to reach
+    # the spec, because the worker sizes its rank count from gpu.count and the payload rents gpu.count.
+    combo = orch._spec_with_gpu(base, "A100 PCIe", 4)
+    assert (combo.gpu.type, combo.gpu.count) == ("A100 PCIe", 4)
+    assert base.gpu.count == 1
+
+    # omitted/zero count preserves the spec's own count (the historical single-card call shape).
+    single = orch._spec_with_gpu(base, "A100 PCIe")
+    assert single.gpu.count == 1
+
+
 def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import PollResult
@@ -168,8 +182,8 @@ def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, mo
 
     original_spec_with_gpu = orch._spec_with_gpu
 
-    def cancel_after_allocation(run_spec, gpu_type):
-        selected = original_spec_with_gpu(run_spec, gpu_type)
+    def cancel_after_allocation(run_spec, gpu_type, gpu_count=0):
+        selected = original_spec_with_gpu(run_spec, gpu_type, gpu_count)
         assert orch._update(run_spec.run_id, "cancelled")
         return selected
 

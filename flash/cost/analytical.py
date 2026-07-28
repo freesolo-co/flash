@@ -311,14 +311,23 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
             provider=("" if config.provider == "auto" else config.provider),
             gpu_type=config.gpu_type,
             model_revision=config.model_revision,
+            # quote the same card ceiling launch allocates under, so a multi-card run is estimated on
+            # the combination it will actually rent rather than on a single-class search that ignores it.
+            max_gpu_count=config.gpu_count,
         )
         gpu = allocation.gpu
         quote_provider = allocation.provider
         hourly = allocation.hourly_usd
         need = allocation.min_vram_gb
+        # max_gpu_count is a CEILING, so the allocator may fit the run on fewer cards than requested
+        # (e.g. 2x of a class when 4 was allowed). bill the count it actually chose, not the ceiling.
+        billed_gpu_count = getattr(allocation, "gpu_count", 1) or 1
     else:
         gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
         quote_provider = config.provider
+        # no gpu_type pin means no allocate() call and so no combination search; this branch picks a
+        # single class that fits alone, and the run occupies the requested count of it.
+        billed_gpu_count = config.gpu_count
         # quote the same vram-floored vast market pick_gpu selected under (min_vram_gb=need): without the
         # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
         # crowd a high-vram selection off the limited page -> it silently falls back to the static rate.
@@ -376,11 +385,11 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         train_seconds=train,
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
-        gpu_count=config.gpu_count,
+        gpu_count=billed_gpu_count,
         # total_usd is the customer gpu charge. the platform-owned teacher spend is itemized
         # only as a diagnostic and is not passed through to the customer. an n-card job occupies
         # n cards for the billed training wall, so the charge scales linearly with gpu_count.
-        total_usd=train / 3600.0 * hourly * config.gpu_count,
+        total_usd=train / 3600.0 * hourly * billed_gpu_count,
         teacher_api_usd=teacher_api_usd,
         notes=_notes(config, raw_train, wall_capped, cap_s),
     )

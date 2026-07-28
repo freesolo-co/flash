@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.providers._deadline import deadline_kwargs
-from flash.spec import JobSpec, require_matching_seed
+from flash.spec import JobSpec, gpu_count_of, require_matching_seed
 
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
 # max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
@@ -98,12 +98,19 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
             _gc_run_endpoints(spec)
 
 
-def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
-    """The spec the workers/loggers see for THIS attempt's allocated class."""
-    if spec.gpu.type == gpu_type:
+def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
+    """The spec the workers/loggers see for THIS attempt's allocated class and card count.
+
+    The allocator may satisfy the run with a multi-card combination of a smaller class than the spec
+    named, so the count it CHOSE has to land on the spec too: the worker sizes its rank count from
+    gpu.count, and the provider payload rents gpu.count cards. Letting those diverge would either
+    strand rented cards or launch more ranks than were rented.
+    """
+    count = gpu_count if gpu_count >= 1 else gpu_count_of(spec)
+    if spec.gpu.type == gpu_type and gpu_count_of(spec) == count:
         return spec
     d = spec.to_internal_dict()
-    d["gpu"] = {**d["gpu"], "type": gpu_type}
+    d["gpu"] = {**d["gpu"], "type": gpu_type, "count": count}
     return JobSpec.from_dict(d)
 
 
@@ -733,6 +740,11 @@ def _submit_seed_supervised(
                 provider=getattr(attempt_spec.gpu, "provider", ""),
                 gpu_type=getattr(attempt_spec.gpu, "type", ""),
                 model_revision=attempt_spec.model_revision,
+                # the run's own gpu.count is the ceiling on cards the allocator may combine. at the
+                # default 1 this is exactly the historical cheapest-single-class search; above 1 the
+                # gate has already confirmed a sharding backend on a provider that rents n cards, so
+                # combinations of smaller classes become fair game when they price below one big card.
+                max_gpu_count=gpu_count_of(attempt_spec),
             )
         except Exception as exc:
             from flash.providers.base import UnsupportedGpuError
@@ -778,7 +790,7 @@ def _submit_seed_supervised(
                     file=log,
                     flush=True,
                 )
-            effective_spec = _spec_with_gpu(spec, chosen.gpu)
+            effective_spec = _spec_with_gpu(spec, chosen.gpu, getattr(chosen, "gpu_count", 1))
             if drop_weight_cache:
                 effective_spec = _drop_weight_cache(effective_spec)
             try:

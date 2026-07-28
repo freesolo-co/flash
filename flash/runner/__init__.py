@@ -1176,25 +1176,57 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     )
 
 
-# algorithms whose trainer can shard a single job across gpu.count > 1 cards. empty until the
-# per-algorithm multi-gpu trainers land (the sft/opd verl migrations add themselves here). keeping
-# this empty makes the multi-gpu *plumbing* landable now while multi-gpu *training* stays impossible
-# to trigger, so a count > 1 job can never silently provision and bill idle cards.
-_MULTI_GPU_ALGORITHMS: frozenset[str] = frozenset()
+# backends whose trainer shards one job across gpu.count > 1 cards. the verl workers launch
+# nproc-per-node == gpu.count ranks and set ulysses sequence parallelism; the trl workers are
+# single-process and never read gpu.count, so a count > 1 trl job would bill n cards to train on 1.
+_MULTI_GPU_BACKENDS: frozenset[str] = frozenset({"verl"})
+
+# providers that actually provision gpu.count cards on ONE machine. runpod forwards gpu_count into
+# its endpoint payload; vast's num_gpus search filter has no caller and every lambda instance type is
+# hardcoded gpu_1x_*, so a count > 1 spec there rents a SINGLE card while the trainer spawns n ranks.
+_MULTI_GPU_PROVIDERS: frozenset[str] = frozenset({"runpod"})
+
+
+def _effective_backend(spec: JobSpec) -> str:
+    """the training backend this spec will actually run, as the worker resolves it.
+
+    the worker reads FLASH_{SFT,RL,OPD}_BACKEND (default "trl"), and on the runpod path the only
+    route into the worker env is the spec's own [worker_env] table -- build_worker_env starts from an
+    empty dict and forwards a fixed credential allowlist, never the ambient control-plane env. so the
+    backend is a property of the SPEC and the gate can read it here rather than guessing.
+    """
+    key = f"FLASH_{spec.phase.upper()}_BACKEND"
+    worker_env = getattr(spec, "worker_env", None) or {}
+    for name, value in worker_env.items():
+        if str(name).upper() == key:
+            return str(value).strip().lower()
+    return "trl"
 
 
 def _require_supported_gpu_count(spec: JobSpec) -> None:
-    """reject gpu.count > 1 until the job's algorithm has a multi-gpu trainer.
+    """reject gpu.count > 1 unless this spec's backend shards AND its provider rents n cards.
 
-    gpu.count already provisions and bills n cards (runpod/vast payloads + cost), but every trainer
-    is single-process today, so a count > 1 job would overbill for idle cards. later prs add each
-    algorithm to _MULTI_GPU_ALGORITHMS as its trainer gains sharding.
+    gpu.count provisions and bills n cards, so both halves must hold or the run overbills: a trl
+    backend spawns one process and leaves n-1 cards idle, and vast/lambda ignore the count entirely
+    so an n-rank verl trainer would land on a single rented card and fail or thrash.
     """
     count = getattr(spec.gpu, "count", 1)
-    if count > 1 and spec.algorithm not in _MULTI_GPU_ALGORITHMS:
+    if count <= 1:
+        return
+    backend = _effective_backend(spec)
+    if backend not in _MULTI_GPU_BACKENDS:
         raise ValueError(
-            f"multi-gpu training (gpu.count={count}) is not yet supported for algorithm "
-            f"{spec.algorithm!r}; set gpu.count to 1"
+            f"multi-gpu training (gpu.count={count}) is not supported by the {backend!r} backend "
+            f"for algorithm {spec.algorithm!r}; it trains in a single process and would leave "
+            f"{count - 1} rented card(s) idle. set gpu.count to 1"
+        )
+    provider = (getattr(spec.gpu, "provider", "") or "").strip().lower()
+    if provider not in _MULTI_GPU_PROVIDERS:
+        supported = ", ".join(sorted(_MULTI_GPU_PROVIDERS))
+        raise ValueError(
+            f"multi-gpu training (gpu.count={count}) requires an explicit gpu.provider that "
+            f"provisions multiple cards on one machine ({supported}); got "
+            f"{provider or 'unset'}. set gpu.count to 1 or pin gpu.provider"
         )
 
 

@@ -1,4 +1,5 @@
-"""CPU tests for the multi-gpu submit gate: gpu.count > 1 is rejected until a trainer supports it."""
+"""CPU tests for the multi-gpu submit gate: gpu.count > 1 needs a sharding backend AND a provider
+that actually rents n cards on one machine."""
 
 from __future__ import annotations
 
@@ -7,23 +8,26 @@ import tempfile
 
 import pytest
 
+_BACKEND_ENV = {"sft": "FLASH_SFT_BACKEND", "grpo": "FLASH_RL_BACKEND", "opd": "FLASH_OPD_BACKEND"}
 
-def _spec(count: int, algorithm: str = "sft"):
+
+def _spec(count: int, algorithm: str = "sft", backend: str = "", provider: str = "runpod"):
     from flash.spec import JobSpec
 
-    return JobSpec.from_dict(
-        {
-            "model": "test/gate",
-            "algorithm": algorithm,
-            "gpu": {"type": "RTX 5090", "count": count},
-        }
-    )
+    gpu: dict = {"type": "RTX 5090", "count": count}
+    if provider:
+        gpu["provider"] = provider
+    body: dict = {"model": "test/gate", "algorithm": algorithm, "gpu": gpu}
+    if backend:
+        body["worker_env"] = {_BACKEND_ENV[algorithm]: backend}
+    return JobSpec.from_dict(body)
 
 
-def test_gate_helper_rejects_multi_gpu():
+def test_gate_helper_rejects_multi_gpu_on_default_trl_backend():
     from flash import runner
 
-    with pytest.raises(ValueError, match="multi-gpu training"):
+    # no [worker_env] backend override means the worker resolves trl, which trains in one process.
+    with pytest.raises(ValueError, match="single process"):
         runner._require_supported_gpu_count(_spec(2))
 
 
@@ -34,14 +38,39 @@ def test_gate_helper_allows_single_gpu():
     assert runner._require_supported_gpu_count(_spec(1)) is None
 
 
-def test_gate_is_extensible_per_algorithm(monkeypatch):
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_gate_allows_multi_gpu_for_verl_backend(algorithm):
     from flash import runner
 
-    # opting an algorithm in lifts the gate for it; this is how the sft/opd verl prs enable count > 1.
-    monkeypatch.setattr(runner, "_MULTI_GPU_ALGORITHMS", frozenset({"sft"}))
-    assert runner._require_supported_gpu_count(_spec(2, "sft")) is None
-    with pytest.raises(ValueError, match="multi-gpu training"):
-        runner._require_supported_gpu_count(_spec(2, "opd"))
+    # every verl worker launches nproc-per-node == gpu.count ranks, so all three shard.
+    assert runner._require_supported_gpu_count(_spec(4, algorithm, backend="verl")) is None
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_gate_rejects_multi_gpu_for_explicit_trl_backend(algorithm):
+    from flash import runner
+
+    # same algorithm, non-sharding backend: the gate must key on the backend, not the algorithm.
+    with pytest.raises(ValueError, match="single process"):
+        runner._require_supported_gpu_count(_spec(4, algorithm, backend="trl"))
+
+
+def test_gate_rejects_multi_gpu_on_providers_that_ignore_count():
+    from flash import runner
+
+    # vast's num_gpus filter has no caller and lambda instance types are hardcoded gpu_1x_*, so a
+    # 4-rank verl trainer would land on ONE rented card. unset is rejected for the same reason.
+    for provider in ("vast", "lambda", ""):
+        with pytest.raises(ValueError, match=r"gpu\.provider"):
+            runner._require_supported_gpu_count(_spec(4, backend="verl", provider=provider))
+
+
+def test_effective_backend_reads_the_phase_env_key():
+    from flash import runner
+
+    # grpo's worker env key is FLASH_RL_BACKEND (spec.phase maps grpo -> rl), not FLASH_GRPO_BACKEND.
+    assert runner._effective_backend(_spec(1, "grpo", backend="verl")) == "verl"
+    assert runner._effective_backend(_spec(1, "sft")) == "trl"
 
 
 def test_submit_job_rejects_multi_gpu_at_boundary(monkeypatch):
