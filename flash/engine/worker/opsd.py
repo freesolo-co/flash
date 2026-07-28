@@ -8,6 +8,7 @@ full-vocabulary forward KL with gradients through the student only.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import random
 import time
@@ -309,9 +310,7 @@ def run_opsd():
     model, rollout_model_source = _student_model(model_id, model_init_kwargs, device)
     seq_cap = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
     if grad_checkpointing_on(model_id, seq_cap, revision=model_revision):
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()
     model.config.use_cache = False
     free_gpu()
@@ -345,6 +344,13 @@ def run_opsd():
         lr=knobs.learning_rate,
     )
     rollout.sync_from_model(model)
+
+    # initialize w&b if configured ([wandb] config + WANDB_API_KEY). wandb_report_to() creates the
+    # run as a side effect; sft/rl get that for free by passing report_to into the hf trainer, but
+    # opsd's custom loop has no trainer, so without this the spec accepts and echoes [wandb] while
+    # wandb.run stays None: nothing on the dashboard, and wandb_run_info() in train_meta returns {}.
+    # same shape as the opd worker; the worker exit path calls wandb_finish.
+    wandb_on = bool(_w.wandb_report_to())
 
     out_dir = f"/tmp/opsd_seed{_w.SEED}"
     adapter_dir = f"{out_dir}/adapter"
@@ -408,6 +414,15 @@ def run_opsd():
             rollout.sync_from_model(model)
             loss_curve.append(step_loss)
             _w.heartbeat("opsd_step", step=step + 1, loss=loss_curve[-1])
+            if wandb_on:
+                # best-effort: a w&b network hiccup must never abort a paid training run.
+                with contextlib.suppress(Exception):
+                    import wandb
+
+                    wandb.log(
+                        {"opsd/loss": step_loss, "opsd/usable_rollouts": usable_count},
+                        step=step + 1,
+                    )
 
         if not loss_curve:
             # every step skipped: all student rollouts truncated on every step, so no optimizer
@@ -452,6 +467,7 @@ def run_opsd():
                 "prompts_per_step": prompts_per_step,
                 "max_completion_len": knobs.max_completion,
                 "rollout_backend": "vllm",
+                **_w.wandb_run_info(),
             },
         )
     finally:

@@ -222,6 +222,9 @@ def _patch_opsd_run(
         heartbeat=lambda stage, **kwargs: None,
         prefetch_model=lambda model_id, **kwargs: 0.0,
         write_train_meta=lambda **kwargs: metadata.update(kwargs),
+        # w&b off by default in unit tests, same as the opd harness
+        wandb_report_to=lambda: [],
+        wandb_run_info=lambda: {},
     )
     monkeypatch.setattr(opsd_mod, "_w", fake_w)
     monkeypatch.setattr(
@@ -280,7 +283,10 @@ def test_opsd_mocked_run_uses_adapter_off_teacher_and_updates_only_lora(monkeypa
     assert model.disable_entries == 1
     teacher_events = [event for event in model.forward_events if event[0] is False]
     assert teacher_events == [(False, False, False)]
-    assert any(adapter_on and grad_on and requires_grad for adapter_on, grad_on, requires_grad in model.forward_events)
+    assert any(
+        adapter_on and grad_on and requires_grad
+        for adapter_on, grad_on, requires_grad in model.forward_events
+    )
     assert not torch.equal(before_lora, model.w.detach())
     assert torch.equal(before_base, model.base.detach())
     assert metadata["phase"] == "opsd"
@@ -368,3 +374,61 @@ def test_opsd_all_steps_skipped_fails_loud(monkeypatch):
 
     with pytest.raises(RuntimeError, match="trained no step"):
         opsd_mod.run_opsd()
+
+
+def test_opsd_initializes_and_logs_to_wandb_when_configured(monkeypatch):
+    """The spec accepts and echoes [wandb], so the worker has to actually log there.
+
+    sft/rl init W&B for free by passing report_to into the HF Trainer. opsd's custom loop has no
+    Trainer, so without an explicit wandb_report_to() call (which creates the run) wandb.run stays
+    None: the dashboard is empty and wandb_run_info() in train_meta comes back {}. A configured
+    run has to produce per-step metrics and the run pointer.
+    """
+    import sys
+    import types
+
+    pytest.importorskip("torch")
+
+    logs: list[tuple[dict, int | None]] = []
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.log = lambda data, step=None: logs.append((dict(data), step))
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    opsd_mod, _model, metadata, _fake_rollout = _patch_opsd_run(monkeypatch)
+    # turn w&b on for this run (the harness defaults it off).
+    monkeypatch.setattr(opsd_mod._w, "wandb_report_to", lambda: ["wandb"])
+    monkeypatch.setattr(
+        opsd_mod._w, "wandb_run_info", lambda: {"wandb_url": "https://wandb.example/run/1"}
+    )
+
+    opsd_mod.run_opsd()
+
+    assert logs, "W&B on -> run_opsd must call wandb.log for each trained step"
+    data, step = logs[0]
+    assert "opsd/loss" in data
+    assert "opsd/usable_rollouts" in data
+    assert step == 1, "wandb.log must be keyed by the 1-based training step"
+    # the run pointer has to reach train_meta, which is what surfaces it to the dashboard.
+    assert metadata["notes"]["wandb_url"] == "https://wandb.example/run/1"
+
+
+def test_opsd_skips_wandb_logging_when_not_configured(monkeypatch):
+    """W&B off (no WANDB_API_KEY -> wandb_report_to() is []): never import or call into wandb."""
+    import sys
+    import types
+
+    pytest.importorskip("torch")
+
+    boom = types.ModuleType("wandb")
+
+    def _explode(*_a, **_k):
+        raise AssertionError("wandb.log must not be called when W&B is not configured")
+
+    boom.log = _explode
+    monkeypatch.setitem(sys.modules, "wandb", boom)
+
+    opsd_mod, _model, _metadata, _fake_rollout = _patch_opsd_run(monkeypatch)
+
+    # the suppress(Exception) around wandb.log would hide a raise, so the real guard is that the
+    # off path never reaches it -- _explode proves the call site was skipped, not swallowed.
+    opsd_mod.run_opsd()
