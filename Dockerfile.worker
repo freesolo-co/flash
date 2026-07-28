@@ -261,7 +261,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 #
 # Two pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
 # PyExtensionType) and TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()).
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@0f821c22325a1a51384431d57b899cc5dcf3d837
+ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
