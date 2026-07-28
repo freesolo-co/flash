@@ -682,3 +682,27 @@ def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
     finally:
         mod._w.upload_resume_checkpoint = original
     assert 2 in uploader.processed_steps
+
+
+def test_train_notes_report_whether_the_run_resumed():
+    # without this a resumed run is indistinguishable from a fresh one in train_meta (trl reports it).
+    inp = {
+        "epochs": 2,
+        "group_size": 4,
+        "kl_coef": 0.0,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "ppo_epochs": 1,
+        "verl_total_epochs": 3,
+        "seed": 7,
+    }
+    common = {
+        "steps_run": 3,
+        "retained_prompts": 8,
+        "reward_history": [0.5],
+        "loss_curve": [0.1],
+    }
+    fresh = rl_verl._build_verl_train_notes(inp, **common)
+    assert fresh["resumed"] is False
+    resumed = rl_verl._build_verl_train_notes(inp, **common, resumed=True)
+    assert resumed["resumed"] is True
