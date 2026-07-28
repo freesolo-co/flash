@@ -97,6 +97,7 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
 
 
 def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
+    # this guards only against flash emitting a misleading no-op; it does not prove verl reads the key.
     o = rl_verl.build_verl_overrides(_overrides_cfg())
     assert not any("drop_last" in override for override in o)
 
@@ -128,24 +129,106 @@ def test_verl_epoch_capacity_reaches_update_horizon(
     assert (prompt_count // prompts_per_step) * resolved_epochs >= steps
 
 
-@pytest.mark.parametrize("prompt_count", [5, 0])
-def test_verl_epoch_capacity_handles_degenerate_prompt_counts(prompt_count):
-    # the resolver rejects zero prompts and clamps undersized batches before this helper is reached;
-    # keep the helper itself total so direct or future callers cannot divide by zero.
-    assert rl_verl._verl_epochs_for_horizon(
-        epochs=2, prompt_count=prompt_count, prompts_per_step=16, steps=1
-    ) == 2
+@pytest.mark.parametrize(
+    ("prompt_count", "prompts_per_step", "message"),
+    [
+        pytest.param(0, 16, "prompt_count must be positive", id="no-prompts"),
+        pytest.param(5, 0, "prompts_per_step must be positive", id="zero-batch"),
+        pytest.param(5, 16, "prompt_count must be at least", id="batch-exceeds-prompts"),
+    ],
+)
+def test_verl_epoch_capacity_rejects_invalid_batch_inputs(
+    prompt_count, prompts_per_step, message
+):
+    with pytest.raises(ValueError, match=message):
+        rl_verl._verl_epochs_for_horizon(
+            epochs=2,
+            prompt_count=prompt_count,
+            prompts_per_step=prompts_per_step,
+            steps=3,
+        )
 
 
-def test_verl_keeps_configured_epochs_separate_from_capacity_metadata():
-    resolver_src = inspect.getsource(rl_verl._resolve_single_turn_inputs)
-    assert '"epochs": epochs' in resolver_src
-    assert '"verl_total_epochs": verl_total_epochs' in resolver_src
+def test_verl_epoch_capacity_invariant_across_valid_inputs():
+    for prompt_count in range(1, 34):
+        for prompts_per_step in range(1, prompt_count + 1):
+            for epochs in (1, 2, 4):
+                for steps in (1, epochs, epochs + 5):
+                    resolved_epochs = rl_verl._verl_epochs_for_horizon(
+                        epochs=epochs,
+                        prompt_count=prompt_count,
+                        prompts_per_step=prompts_per_step,
+                        steps=steps,
+                    )
+                    assert (prompt_count // prompts_per_step) * resolved_epochs >= steps
 
-    run_src = inspect.getsource(rl_verl.run_rl_verl)
-    assert '"total_epochs": inp["verl_total_epochs"]' in run_src
-    assert '"epochs": inp["epochs"]' in run_src
-    assert '"verl_total_epochs": inp["verl_total_epochs"]' in run_src
+
+def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeypatch):
+    from flash.engine.worker._pkg import W
+    from flash.spec import JobSpec
+
+    class _Env:
+        multi_turn = False
+        is_tool_env = False
+
+        def dataset(self):
+            return [{"index": i} for i in range(33)]
+
+        def prompt_messages(self, ex):
+            return [{"role": "user", "content": f"question {ex['index']}"}]
+
+    class _Tokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return messages[0]["content"]
+
+        def __call__(self, text, **kwargs):
+            return SimpleNamespace(input_ids=[1])
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "train": {"batch_size": 16, "epochs": 2},
+        }
+    )
+    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(W, "SEED", 42, raising=False)
+    monkeypatch.setattr(W, "THINKING", False, raising=False)
+    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
+    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
+    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
+    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
+    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
+
+    inp = rl_verl._resolve_single_turn_inputs()
+    cfg = rl_verl._build_verl_training_cfg(
+        inp,
+        train_files="/w/train.parquet",
+        val_files="/w/val.parquet",
+        model_id=inp["model_id"],
+        micro_batch=1,
+        thinking=False,
+        loggers="console",
+        fp8_kv=False,
+        reward_path="/w/reward.py",
+        local_dir="/w/ckpt",
+    )
+    overrides = rl_verl.build_verl_overrides(cfg)
+    notes = rl_verl._build_verl_train_notes(
+        inp,
+        steps_run=5,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+    )
+
+    assert "trainer.total_training_steps=5" in overrides
+    assert "trainer.total_epochs=3" in overrides
+    assert notes["epochs"] == 2
+    assert notes["grpo_recipe"]["verl_total_epochs"] == 3
 
 
 def test_build_verl_overrides_wandb_logger_when_enabled():
