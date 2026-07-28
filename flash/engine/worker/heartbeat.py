@@ -52,7 +52,7 @@ _HB_UPLOAD_LIVENESS_STAGES = frozenset({"checkpoint_uploading"})
 _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAGES
 
 # latest per-step GRPO backlog, exposed so a top-level error heartbeat can preserve it
-# for `flash log -f` when a short run raises before the throttled rl_step ping committed
+# for `flash runs log -f` when a short run raises before the throttled rl_step ping committed
 LATEST_GRPO_METRICS_LAST: list = []
 # Throttled to avoid blowing the 128/hr HF commit cap; terminal transitions are never throttled. Every
 # tight-liveness stage is throttled (⊂) PLUS the per-step training stages: opd_filtering_prompts alone

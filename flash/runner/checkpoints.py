@@ -3,8 +3,8 @@
 The GPU worker publishes each trainer save's LoRA adapter to a stable, NON-pruned path
 (``<adapter_prefix>/checkpoints/step-<N>/adapter``; see
 ``flash.engine.worker.publish_deployable_checkpoint``). This module is the control-plane
-reader: it enumerates those snapshots so ``flash checkpoints`` can list them and
-``flash deploy <run-id>/step-N`` can serve a specific one — including for a run that was cancelled or
+reader: it enumerates those snapshots so ``flash runs checkpoint`` can list them and
+``flash models deploy <run-id>/step-N`` can serve a specific one — including for a run that was cancelled or
 failed mid-training and so never sealed a final adapter. HF (not the backend DB) is the source of
 truth for what's deployable; backend persistence is a mirror (see
 ``flash.server.checkpoints``)."""

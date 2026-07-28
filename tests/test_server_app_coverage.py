@@ -13,28 +13,44 @@ import flash.server.app as app_mod
 
 
 def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> None:
-    """Asynchronous deployment work must start exactly once on a daemon thread."""
+    """Asynchronous deployment work must run through the daemon wrapper and clear its registry."""
     calls = []
+    current = {}
 
     class FakeThread:
-        def __init__(self, *, target, args, kwargs, daemon):
-            calls.append(("init", target, args, kwargs, daemon))
+        def __init__(self, *, target, args, daemon):
+            calls.append(("init", target, args, daemon))
             self.target = target
             self.args = args
-            self.kwargs = kwargs
+            current["thread"] = self
 
         def start(self):
             calls.append(("start",))
-            self.target(*self.args, **self.kwargs)
 
     monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
     monkeypatch.setattr(app_mod.threading, "Thread", FakeThread)
+    monkeypatch.setattr(app_mod.threading, "current_thread", lambda: current["thread"])
+    app_mod._open_deployment_jobs()
     observed = []
 
-    assert app_mod.start_deployment_job(observed.append, "done") is False
-    assert observed == ["done"]
-    assert calls[0][-1] is True
-    assert calls[1] == ("start",)
+    def record(value, *, final):
+        observed.append((value, final))
+
+    assert app_mod.start_deployment_job(record, "done", final=True) is False
+    thread = current["thread"]
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        assert thread in app_mod._DEPLOYMENT_JOBS
+        assert len(app_mod._DEPLOYMENT_JOBS) == 1
+
+    thread.target(*thread.args)
+
+    assert observed == [("done", True)]
+    assert calls == [
+        ("init", app_mod._run_deployment_job, (record, ("done",), {"final": True}), True),
+        ("start",),
+    ]
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        assert not app_mod._DEPLOYMENT_JOBS
 
 
 def _run_loop_once(monkeypatch, loop, worker):
@@ -65,7 +81,9 @@ def test_idle_endpoint_loop_logs_successful_deletion(monkeypatch) -> None:
     monkeypatch.setattr(app_mod, "_log", logger)
     monkeypatch.setattr(app_mod, "_reap_idle_endpoints_once", lambda minimum: 2)
 
-    _run_loop_once(monkeypatch, app_mod._reap_idle_endpoints_loop, lambda function, *args: function(*args))
+    _run_loop_once(
+        monkeypatch, app_mod._reap_idle_endpoints_loop, lambda function, *args: function(*args)
+    )
 
     assert any("reaped 2 idle RunPod endpoint" in message for message in messages)
 
@@ -89,6 +107,7 @@ def test_idle_endpoint_loop_retries_after_a_sweep_failure(monkeypatch) -> None:
 
 def test_idle_endpoint_loop_propagates_cancellation_from_worker(monkeypatch) -> None:
     """Cancellation raised during the offloaded sweep must escape immediately for clean shutdown."""
+
     async def sleep(_seconds):
         return None
 

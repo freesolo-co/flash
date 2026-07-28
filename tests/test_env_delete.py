@@ -12,15 +12,20 @@ def _fake_client(capture: dict, *, deleted: bool = True):
     """A stand-in ApiClient that records the delete_env call and returns the server payload."""
 
     class _C:
-        def delete_env(self, env_id):
-            capture["env_id"] = env_id
+        def delete_env(self, env_id, *, project_id):
+            capture.update(env_id=env_id, project_id=project_id)
             return {"id": env_id, "deleted": deleted}
 
     return lambda: _C()
 
 
-def _args(env_id: str = "acme/env", *, yes: bool = True):
-    return argparse.Namespace(env_id=env_id, yes=yes)
+def _args(
+    env_id: str = "acme/env",
+    *,
+    project: str = "11111111-1111-4111-8111-111111111111",
+    yes: bool = True,
+):
+    return argparse.Namespace(env_id=env_id, project=project, yes=yes)
 
 
 def test_delete_calls_client_and_returns_zero(monkeypatch, capsys):
@@ -29,6 +34,7 @@ def test_delete_calls_client_and_returns_zero(monkeypatch, capsys):
     rc = cmd_env_delete(_args("acme/my-env"))
     assert rc == 0
     assert cap["env_id"] == "acme/my-env"
+    assert cap["project_id"] == "11111111-1111-4111-8111-111111111111"
     assert "deleted acme/my-env" in capsys.readouterr().out
 
 
@@ -44,7 +50,7 @@ def test_delete_rejects_non_env_id(monkeypatch):
     called = {"n": 0}
 
     class _C:
-        def delete_env(self, env_id):  # pragma: no cover - must not be reached
+        def delete_env(self, env_id, *, project_id):  # pragma: no cover - must not be reached
             called["n"] += 1
             return {}
 
@@ -64,7 +70,7 @@ def test_delete_rejects_non_env_id(monkeypatch):
 
 
 def test_delete_strips_and_sends_canonical_id(monkeypatch, capsys):
-    # Surrounding whitespace is stripped so the id sent to the server is canonical.
+    # surrounding whitespace is stripped so the id sent to the server is canonical.
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
     rc = cmd_env_delete(_args("  acme/my-env  "))
@@ -72,11 +78,19 @@ def test_delete_strips_and_sends_canonical_id(monkeypatch, capsys):
     assert cap["env_id"] == "acme/my-env"
 
 
+def test_delete_requires_project_before_network(monkeypatch, capsys):
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cmd_env_delete(_args(project="")) == 1
+    assert "project id is required" in capsys.readouterr().err
+    assert cap == {}
+
+
 def test_delete_aborts_on_declined_confirmation(monkeypatch):
     called = {"n": 0}
 
     class _C:
-        def delete_env(self, env_id):  # pragma: no cover - must not be reached
+        def delete_env(self, env_id, *, project_id):  # pragma: no cover - must not be reached
             called["n"] += 1
             return {"deleted": True}
 
@@ -98,7 +112,7 @@ def test_delete_surfaces_api_error(monkeypatch, capsys):
     from flash.client import ApiError
 
     class _C:
-        def delete_env(self, env_id):
+        def delete_env(self, env_id, *, project_id):
             raise ApiError(403, "you can only delete environments in your own namespace")
 
     monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
@@ -108,9 +122,27 @@ def test_delete_surfaces_api_error(monkeypatch, capsys):
 
 def test_delete_subcommand_dispatches_to_handler():
     parser = cli._build_parser()
-    args = parser.parse_args(["env", "delete", "acme/my-env"])
+    args = parser.parse_args(
+        [
+            "env",
+            "delete",
+            "--project",
+            "11111111-1111-4111-8111-111111111111",
+            "acme/my-env",
+        ]
+    )
     assert args.func is cmd_env_delete
     assert args.env_id == "acme/my-env"
+    assert args.project == "11111111-1111-4111-8111-111111111111"
     assert args.yes is False
-    args_yes = parser.parse_args(["env", "delete", "-y", "acme/my-env"])
+    args_yes = parser.parse_args(
+        [
+            "env",
+            "delete",
+            "--project",
+            "11111111-1111-4111-8111-111111111111",
+            "-y",
+            "acme/my-env",
+        ]
+    )
     assert args_yes.yes is True

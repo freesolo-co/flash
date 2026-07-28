@@ -40,6 +40,7 @@ from flash.client.http import ApiClient, ApiError
 # submits: catalog model, Freesolo environment id, and an HF repo for artifacts.
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
+    "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     "environment": {"id": "freesolo/gsm8k", "params": {"max_examples": 8}},
     "train": {"epochs": 1, "max_examples": 1},
@@ -128,13 +129,23 @@ def make_client(tmp_path, monkeypatch):
     # until AFTER create_app() runs. Stub the provider set to empty so startup stays hermetic.
     import flash.providers as providers_mod
     import flash.providers.runpod.train.endpoints as rp_endpoints
+    import flash.server.environment_registry as environment_registry
+    import flash.server.projects as projects_mod
     import flash.server.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(environment_registry, "require_environment_project", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        projects_mod,
+        "require_project_access",
+        lambda *, project_id, **_kwargs: project_id,
+    )
     # FREESOLO_INTERNAL_KEY also makes startup run the RunPod slot-store reconcile
     # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST) BEFORE the urllib->
     # TestClient shim below is installed, so it would hit real network. No-op it at the entry.
-    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
+    )
     # And the same key makes each run-status update best-effort report via run_registry._post(); with
     # the urllib shim that POST would otherwise route into THIS app (no such route) and log a 404 warn
     # on every status change. Stub it (as the other server fixtures do) to keep output clean.
@@ -259,7 +270,12 @@ def test_bad_spec_maps_to_api_error_400(make_client) -> None:
     # A spec missing ``model`` must be rejected by the server's validator and the
     # client must surface the server's ``detail`` message, not a bare 500.
     with pytest.raises(ApiError) as exc:
-        client.create_run({"algorithm": "grpo"})
+        client.create_run(
+            {
+                "project": "11111111-1111-4111-8111-111111111111",
+                "algorithm": "grpo",
+            }
+        )
     assert exc.value.status == 400
     assert "model" in str(exc.value).lower()
 
