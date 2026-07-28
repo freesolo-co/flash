@@ -242,9 +242,24 @@ and over-counts if the file has blank lines. Count the way the loader reads it:
 python -c "print(sum(1 for l in open('dataset/train.jsonl') if l.strip()))"
 ```
 
+That line is right only when your environment serves exactly that file unmodified. The
+worker never reads `dataset/train.jsonl` — it calls `env.dataset()` and slices the result
+(`train[:max_examples]`). If `[environment.params]` selects a different split, or
+`load_environment()` filters, dedupes, or generates rows, the file count is the wrong
+number: too low and you silently train on a subset, too high and you have mispriced the
+run. Count what the worker will actually get, with the **same params as the submitted
+config**:
+
+```python
+from flash.envs.registry import load_environment
+
+env = load_environment("<your-env-id>", params={...})  # the [environment.params] you submit
+print(len(env.dataset()))
+```
+
 There is no "all" sentinel, so this number is duplicated from the data into the config and
 **can drift**: if the dataset later grows, a stale `max_examples` silently trains on a
-subset instead of erroring. Re-check it whenever the dataset changes.
+subset instead of erroring. Re-check it whenever the dataset or the params change.
 
 GPU allocation and HF artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
@@ -594,9 +609,16 @@ spending another GPU run:
     one-right/other-wrong counts. Pairing cancels the shared row-difficulty noise, so it
     resolves smaller real differences than either unpaired band.
 
-  Either way, `N` here is the number of independent eval rows, not the number of samples: at
-  `k` samples per row, drawing more samples from the same rows narrows nothing about how the
-  model does on new rows.
+  Either way, the independent unit is the **row**, not the sample. With `k` samples per row,
+  extra samples do help — they average out the model's own sampling noise — but only down to
+  a floor set by how much the rows themselves differ. Simulating `N = 200` rows: going from
+  `k = 1` to `k = 16` shrinks the metric's sd from `0.035` to `0.009` when every row is
+  equally hard, but only from `0.035` to `0.018` once rows vary in difficulty (sd `0.25`).
+  The remaining half is between-row variance, and no amount of resampling the same 200 rows
+  removes it. So `k` buys you a bounded improvement; **more rows** is what actually buys
+  precision. To use the `k > 1` gain rather than throwing it away, resample _rows_ (a cluster
+  bootstrap: draw rows with replacement, keep each drawn row's `k` samples together) instead
+  of assuming the simple `√(p(1-p)/N)` forms above.
 
 ---
 
@@ -994,11 +1016,37 @@ Emit the list from `score_episode`, and derive the episode scalar from that same
 two cannot disagree:
 
 ```python
+import math
+
+# exactly one finite reward per GENERATED assistant turn - assert it here, because
+# nothing downstream checks the length and both mismatch directions are bad (see below).
+assistant_turns = sum(1 for m in episode.messages if m.get("role") == "assistant")
+assert len(turn_scores) == assistant_turns, (len(turn_scores), assistant_turns)
+assert all(math.isfinite(s) for s in turn_scores)
+
 return RewardResult(
     score=episode_score,                                  # unchanged episode scalar
     metadata={"per_turn_rewards": [float(s) for s in turn_scores]},
 )
 ```
+
+**The length is a hard contract, and it is checked nowhere.** The extractor validates only
+that the value is a non-string iterable of floats; it never compares the count to the
+rollout's turns. The trainer then walks `range(len(turn_rewards))` and indexes
+`spans[turn_index]` for each one, so the two mismatch directions fail differently and
+neither is a safe fallback:
+
+- **Too many rewards** — `IndexError: list index out of range`, mid-training, after you have
+  already paid for the rollouts.
+- **Too few rewards** — no error at all. The unmatched turns keep the zero they were
+  initialized with, so those tokens train on **zero advantage**: that part of the episode
+  silently contributes no learning signal, and the run looks healthy throughout.
+
+The easiest way to get this wrong is the hard turn cap. The rollout loop breaks out before
+the final `env_reply`, so the last assistant turn is generated and recorded **without** a
+matching `step_episode` call — an environment that appends one reward per `step_episode`
+comes up exactly one short on precisely the episodes that hit the cap. Count the assistant
+turns in the episode, not the number of steps you took.
 
 **Do not verify this by the absence of a warning** — a missing key produces no output at
 all. There are three distinct silent-fallback layers on this path, two of which emit
