@@ -1482,6 +1482,14 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size={_hydra_val(config['ulysses_sequence_parallel_size'])}",
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.mode=async",
+        # safetensors load format is required for lora rollout on vllm, exactly as on the grpo path.
+        # the default is `dummy`, which makes verl set base_sync_done=False and push base weights to
+        # vllm itself. that path routes every name through replace_lora_wrapper, which appends
+        # `.base_layer` to anything matching the all-linear target set, including the vision tower.
+        # plain vllm has no `visual.blocks.N.attn.qkv.base_layer.weight` slot, so the first weight
+        # sync dies with a KeyError before a rollout is ever produced. loading the base from
+        # safetensors keeps vllm authoritative for base weights and transfers only lora deltas.
+        "actor_rollout_ref.rollout.load_format=safetensors",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={_hydra_val(config['n_gpus_per_node'])}",
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
         # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
