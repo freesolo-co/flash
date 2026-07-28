@@ -192,8 +192,9 @@ epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 # max_steps = 100           # positive values set the exact optimizer-update horizon
 # save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
-# multi-turn GRPO defaults to one reward per rollout; choose "per_turn" for turn-level credit.
-# credit_assignment = "per_episode"   # "per_turn" ALSO requires per_turn_rewards metadata — see below
+# multi-turn GRPO defaults to one reward per rollout; "per_turn" gives turn-level credit.
+# credit_assignment = "per_episode"   # "per_turn" needs per_turn_rewards metadata and is
+                                      # unsupported for tool-calling envs — see below
 lora_rank = 32              # lora_alpha is managed: always derived as 2 x lora_rank
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 
@@ -652,9 +653,12 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
     a held-out split exactly as you would a student. Read the score _and_ a sample of trajectories —
     a teacher that is right for the wrong reasons transfers the wrong reasons.
   - _Cheapest, always available:_ run a deliberately short OPD probe (a small `max_steps` on a
-    slice of the data), deploy that adapter, and evaluate it against the same student baseline. If
-    a short run moves the student the wrong way, a long one will move it further the wrong way —
-    stop and change teacher or algorithm rather than buying more steps.
+    slice of the data), deploy that adapter, and evaluate it against the same student baseline. A
+    short run that moves the student the wrong way is a warning, not a verdict — trajectories dip
+    before recovering, and a slice need not represent the eval distribution. Treat it as a signal
+    to spend a little more evidence, not a lot more steps: evaluate two or three checkpoints from
+    that probe on the full split before deciding. A dip that deepens across checkpoints is the
+    teacher or the algorithm; a single down reading is noise until it repeats.
 
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
   the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
@@ -806,9 +810,13 @@ watch `truncation_rate`, which counts completions not ending in EOS and is not s
 > `steps x prompts_per_step x group_size x max_completion_tokens`, so when the step count
 > is _derived_ from the data, lowering `batch_size` raises it and leaves the token bill
 > roughly flat — the spend that buys 5 steps at the default batching buys ~80 at
-> `batch_size = 4`. Five GRPO steps cannot plausibly move a model off its starting point, so
-> if your budget only affords single-digit steps at the default, you are probably not
-> under-funded — you are mis-batched.
+> `batch_size = 4`. A single-digit-step run is weak evidence either way: usually too few
+> updates to show that a setup works, but — as the `temperature` row above notes — not too
+> few to destabilize one. Read a flat result at 5 steps as "not measured yet" rather than
+> "no effect," and check your batching before concluding you are under-funded. When you do
+> lengthen the horizon, evaluate the checkpoints along the way rather than only the last
+> one; jumping straight to ~80 steps without reading the short run trades one uninformative
+> run for a longer, more expensive one.
 >
 > Two things break the flat-cost approximation, so treat it as a hypothesis to check, not a
 > rule. **`[train] max_steps` overrides the derived horizon**: with it set the step count is
@@ -835,7 +843,18 @@ environment calls.
 
 ### `credit_assignment = "per_turn"` is inert unless your environment emits `per_turn_rewards`
 
-Setting `credit_assignment = "per_turn"` is only _half_ the request. The trainer reads the
+**First, check that per-turn credit is available to you at all.** It is supported on the
+pure multi-turn rollout path — an `EnvironmentMultiTurn` that drives its own turn loop. A
+multi-turn environment that exposes **tools** runs on TRL's native tool loop instead, and
+there `per_turn` is not implemented: the worker raises
+`credit_assignment='per_turn' is not supported for tool-calling multi-turn environments`
+and the run dies at startup. Nothing catches this earlier — `flash train --dry-run` accepts
+the config, because the trainer choice depends on the environment object, not the spec. If
+your environment exposes tools, stay on `per_episode`; emitting `per_turn_rewards` does not
+unlock it.
+
+On the pure multi-turn path, setting `credit_assignment = "per_turn"` is only _half_ the
+request. The trainer reads the
 turn-level signal from `RewardResult.metadata["per_turn_rewards"]`; **when that key is
 missing it silently falls back to episode-level credit.** The config validates, `flash runs
 status` echoes `per_turn` back, and nothing in the CLI, the status output, or the worker log
@@ -988,9 +1007,15 @@ kind because the run itself looks fine.
   three times, then require a gap larger than it. Write each result to a distinct path —
   two jobs writing the same output file silently overwrite each other.
 - **Sanity-check a metric against its neighbours.** A metrics dict reading `accuracy: 0.0`
-  next to `mean_shaped_score: 0.979` is internally contradictory and is telling you the
-  _reader_ is broken, not the model. (`RewardMetric` carries its number in `.score`;
-  `.value` is a separate optional field and is often `None`.)
+  next to `mean_shaped_score: 0.979` is worth stopping on — but it is not proof of a bug.
+  If success requires the shaped score to _reach_ 1.0, then a run of consistent near misses
+  produces exactly that pair, and it is real evidence (of near misses, or of reward hacking
+  that farms partial credit without solving). Resolve it before acting: check a couple of
+  rows individually and see whether the per-row pass/fail agrees with the per-row shaped
+  score. Only a row that is marked failed while its own shaped score clears the success
+  threshold proves the reader is broken. One common cause of a genuinely broken read here:
+  `RewardMetric` carries its number in `.score`, while `.value` is a separate optional field
+  that is often `None` — pulling `.value` yields zeros for every row.
 - **Verify the split you evaluate is the split you think.** Confirm gold answers score
   1.0 through your own scorer before trusting any number derived from it, and re-check for
   overlap between train and eval rows.
