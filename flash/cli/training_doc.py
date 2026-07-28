@@ -36,6 +36,44 @@ flash models list                     # supported base model ids
 flash gpus                           # managed GPU classes with estimated $/hr
 ```
 
+**Install the CLI and the `freesolo` SDK into the *same* interpreter.** Your
+`environment.py` imports `freesolo`, and the CLI loads that module in **its own**
+interpreter — so an isolated install (`pipx`, `uv tool install`) can run `flash` fine
+while `flash env test` fails with *"the 'freesolo' package is required to run Freesolo
+environments"* even though `python -c "import freesolo"` works in your shell. The
+message names the package, not the interpreter that is missing it, so the obvious fix
+appears to do nothing. Two ways to keep them together:
+
+```bash
+uv pip install freesolo-flash freesolo          # same venv; then use ./.venv/bin/flash
+uv tool install freesolo-flash --with freesolo  # isolated tool venv, SDK injected
+```
+
+If you use the `uv tool` form, note that `freesolo-flash` does **not** declare `freesolo`
+as a dependency — it is injected. **Upgrading rebuilds the tool venv and silently drops
+it**, so `flash env test` starts failing right after an upgrade that reported success.
+Re-inject on every upgrade: `uv tool install freesolo-flash --with freesolo --force`.
+
+**`flash whoami` before you create anything.** `flash login` writes a machine-wide
+credential to `~/.flash`, but `FREESOLO_API_KEY` in your environment — including one
+picked up from a `.env` file you sourced — **silently overrides it**. Because both
+credentials are valid, a mismatch does not surface as an auth failure; it surfaces later
+as `project '<uuid>' does not belong to the authenticated organization`, or as a project
+quietly created in the wrong org. Pin the key explicitly for a run rather than relying on
+ambient state:
+
+```bash
+flash whoami                                    # which org/key am I actually using?
+FREESOLO_API_KEY=fslo_... flash train ...       # pin this run's identity
+env -u FREESOLO_API_KEY flash train ...         # or force the `flash login` credential
+```
+
+**Run visibility follows the key that submitted the run, not the org.** If you rotate API
+keys, runs submitted by the old key return `unknown run_id` from the new one — same
+account, same org, same user. You cannot re-serve, re-deploy, or re-evaluate those runs
+from the new key, so **archive baseline results to disk** rather than planning to
+regenerate them. (`init_from_adapter` is unaffected: it resolves server-side at submit.)
+
 ### The project layout (`flash env setup` created this)
 
 ```text
@@ -46,6 +84,25 @@ configs/rl.toml         # a GRPO (RL) run config
 configs/opd.toml        # an on-policy distillation run config
 TRAINING.md             # this file
 ```
+
+`flash env setup` scaffolds into the **current directory** and takes no positional name —
+`flash env setup my-env` is an error. The name is supplied later, at `flash env push
+--name`. It also bakes `--project` into every generated config, so **create the project
+first**, then `cd` into an empty folder and scaffold:
+
+```bash
+mkdir my-env && cd my-env
+flash env setup --project <project-uuid>
+```
+
+**Dataset rows: put per-example state under `metadata`.** A `TaskExample` exposes `input`,
+`output`, `metadata`, and the untouched source row as `.record`. Extra top-level keys do
+survive to the worker on `.record`, but `id`/`_id` are always **ignored and replaced** with
+an auto-generated positional handle, and individual consumers may project a row onto the
+canonical columns. Reading `example.metadata["board"]` (or `example.record["board"]`) is
+stable; assuming an `example.board` attribute is not. Assert the shape in your own test so
+the constraint is enforced rather than remembered — an environment that reads a field the
+worker does not carry fails **remotely, on a paid run**, long after `flash env test` passed.
 
 ### 1. Author the environment
 
@@ -90,6 +147,28 @@ no separate step is needed. Paste the returned id into `[environment] id` in **b
 Re-push after any
 edit to `environment.py` or `dataset/` so the managed run uses your change.
 
+**Validate locally before you push** — but know what the local gate does and does not
+cover:
+
+```bash
+flash env test .                     # imports environment.py, loads the dataset, runs the scorer
+flash env pull your-org/my-env -o ./pulled   # -o must be a FILE for a single file, a DIR for a
+                                             # whole env, and the directory must already exist
+```
+
+`flash env test` loads the environment with **no `[environment.params]`**, so an env whose
+split (or any other kwarg) is selected through `params` is validated at its *defaults* —
+i.e. potentially a different dataset file than the one your run will train on. If your SFT
+and RL configs point at different splits, the local gate can pass while the real training
+path is broken, or fail while the real path is fine. Make the default the split you
+actually train on, or exercise `load_environment(**params)` directly in your own test.
+
+**A hash comparison against the published env is not a valid staleness check.** `flash env
+push` injects a small `sys.path` import shim into `environment.py` at publish time, so
+`environment.py` **always** hashes differently after a round-trip while `dataset/` files
+pass through byte-identical. Diff the content — the reward logic, constants, and episode
+contract should be identical — and hash the dataset files for the data half.
+
 ### 3. Configure the run (TOML)
 
 ```toml
@@ -102,6 +181,8 @@ algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-poli
 
 [environment]
 id = "your-org/my-env"      # the id printed by `flash env push`
+# params = { split = "train" }    # kwargs passed to load_environment(); the table is
+                                   # `params` — NOT `args`
 # secrets = ["SERPAPI_API_KEY"]   # only the NAMES of env vars your environment reads;
                                    # values are pulled from your shell/.env at submit time,
                                    # never stored in the spec
@@ -112,10 +193,37 @@ max_examples = 2            # rows to train on (the starter dataset has 2)
 # max_steps = 100           # positive values set the exact optimizer-update horizon
 # save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
 # multi-turn GRPO defaults to one reward per rollout; choose "per_turn" for turn-level credit.
-# credit_assignment = "per_episode"
+# credit_assignment = "per_episode"   # "per_turn" ALSO requires per_turn_rewards metadata — see below
 lora_rank = 32              # lora_alpha is managed: always derived as 2 x lora_rank
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
+
+[wandb]
+# project  = "my-project"   # the table allows exactly `project` and `run_name`;
+# run_name = "sft-run-1"    # `name` is rejected
 ```
+
+**Key placement that is easy to get wrong.** Every one of these is a real submit-time
+error or a wrong-config-that-still-runs; `--dry-run` catches the loud ones for free.
+
+| You might write | The schema wants | What happens |
+| --- | --- | --- |
+| `[environment] args = {...}` | `[environment] params = {...}` | rejected as an unknown `[environment]` key |
+| `[wandb] name = "..."` | `[wandb] run_name = "..."` | `[wandb] unknown key(s): name` |
+| `[train] thinking = true` | top-level `thinking = true` | rejected under `[train]`; misplacing it trains the wrong mode |
+| `[train] lora_alpha = 64` | omit it | rejected — alpha is managed as `2 x lora_rank` |
+| `[train] max_tokens = 512` | `max_completion_tokens` / `max_context_tokens` | rejected as an unknown `[train]` key |
+| `[sft]` / `[grpo]` tables | `[train]` | rejected — allowed tables are `environment`, `train`, `gpu`, `wandb`, `worker_env` |
+
+`WANDB_API_KEY` is a default runtime secret, but it is only read from the process
+environment or a `.env` **next to your CWD or the config** — not from a `.env` one
+directory up. Verify what the server actually recorded rather than trusting the file: the
+submitted spec is echoed back, so confirm e.g. `"thinking": false` there before you spend.
+
+**SFT requires an explicit `[train] max_examples`**, even for an uncapped run — set it to
+the dataset's exact row count (`wc -l dataset/train.jsonl`). There is no "all" sentinel, so
+this number is duplicated from the data into the config and **can drift**: if the dataset
+later grows, a stale `max_examples` silently trains on a subset instead of erroring. Re-check
+it whenever the dataset changes.
 
 GPU allocation and HF artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
@@ -134,6 +242,21 @@ flash train configs/sft.toml               # submit and follow logs (Ctrl-C deta
 flash train configs/sft.toml --background  # submit and return immediately
 ```
 
+> **Killing `flash train` does NOT cancel the run.** Submission happens server-side; the
+> command then merely *streams* status. Interrupting it — or wrapping it in `timeout` —
+> kills only the client-side stream while the run keeps billing on its GPU, and re-running
+> the command creates a **second** run. Two GPUs then bill in parallel for the same
+> experiment.
+>
+> - Never wrap `flash train` in `timeout`, and use `--background` when you do not want to
+>   watch.
+> - After any interrupted submit, reconcile with `flash runs list` **before** re-running,
+>   grouping by `max_examples` / `[wandb] run_name` to spot the duplicate.
+> - Probe affordability with `--dry-run` (which creates no run), never by submitting real
+>   runs in a loop.
+> - Cancels settle differently by stage — a run still in setup goes `cancelled`, one
+>   already training goes `failed`. Both stop billing.
+
 ### 5. Monitor
 
 ```bash
@@ -147,6 +270,29 @@ flash runs cancel <run-id>            # stop a run
 Live GRPO metrics update at the managed HEARTBEAT cadence, not after every optimizer step.
 The terminal heartbeat carries the latest bounded metric backlog so short runs still surface data.
 
+**A run that looks frozen usually is not.** Reporting is on a fixed multi-minute cycle, and
+some stages are announced once and then do un-instrumented work — so an unchanging stage
+label, a flat step counter, or an idle GPU **prove nothing on their own**. Two distinct
+situations produce an identical-looking `status`:
+
+- *Normal quiet.* The last heartbeat is recent; the worker is simply between reports.
+- *Preemption.* The worker died mid-stage and stopped heartbeating. The control plane keeps
+  serving the **last** heartbeat it received, so `status` still reports `running` at
+  whatever stage was announced, with a stale GPU snapshot attached.
+
+**The decisive signal is heartbeat *age*, not GPU utilization or the stage label.** A live
+worker heartbeats continuously; a frozen timestamp means the worker is gone. Pair heartbeat
+age with GPU busy/idle before acting, and never derive seconds-per-step from total elapsed
+time (early steps include one-time warmup that can dominate a short run).
+
+> **On a frozen heartbeat, do NOT cancel.** Flash **auto-retries a preempted job from its
+> last checkpoint**, and the provider's `job_preempted` notice can lag the freeze by ~10
+> minutes. Cancelling races that retry and kills a run that was recovering on its own.
+> Wait for either the automatic retry or a genuine terminal state. Cancel only when a run
+> is confirmed dead with no retry pending, or is burning money on a definite unrecoverable
+> fault. An idle GPU during model load is also not evidence of a hang — and it is not
+> evidence that your GPU class is unhealthy, so do not "fix" it by pinning another one.
+
 ### 6. Deploy & chat
 
 ```bash
@@ -158,6 +304,26 @@ flash models deployments                # active serving endpoints
 flash models undeploy <run-id>          # tear the endpoint down
 flash models export --adapter-id <run-id> --repository <you>/<repo>  # copy adapter weights to your HF repo
 ```
+
+> **`flash models deploy` returns before the revision is servable.** It returns
+> `state: queued`, and while the new revision reconciles, `flash models deployments` can
+> still show `ready` for the **previous** one. An eval harness that polls for `ready` and
+> starts immediately will hit an endpoint that rejects its requests with *"deployment is
+> reconciling"* — and if the harness records per-row errors but still prints an aggregate,
+> you get a confident, entirely wrong number. This exact race turned a healthy checkpoint
+> into an apparent catastrophic regression (mean 0.07 vs its true 0.68).
+>
+> Before evaluating: poll until `state == ready` **and** the reported step equals the step
+> you are evaluating. After evaluating: **check the error count before reading any
+> aggregate**, and discard a result file that has a non-trivial one rather than
+> interpreting it.
+
+**Before exporting, confirm your HF token can write to the target namespace.** A token that
+is valid — and that works everywhere else — may resolve to a different account or org than
+the `--repository` you pass, so the export fails on permissions or silently lands in the
+wrong namespace. Check with `huggingface_hub.whoami()` (compare the resolved name and its
+writable orgs against your destination) *before* the run finishes, not after. If several
+tokens are in play, identify them by fingerprint rather than by printing them.
 
 ### Loading an exported adapter locally (transformers + peft)
 
@@ -267,6 +433,9 @@ spending another GPU run:
 | Output is truncated | Correct-looking answers cut off mid-response or JSON is incomplete | Increase `max_completion_tokens` for GRPO/OPD rollouts or `max_context_tokens` for total prompt+completion context only after seeing truncation. Oversizing them by default just burns memory/cost. |
 | Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash runs log <run-id>`, reduce footprint (`max_context_tokens`, `max_completion_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
 | Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash runs log <run-id> --follow` to reattach, `flash runs log <run-id>` for the console/error output, or `flash runs cancel <run-id>` if you intentionally want to stop it. |
+| Two runs training the same thing | `flash runs list` shows a live run you thought you had killed, on top of the one you just submitted | Killing the `flash train` client only detaches; it never cancels. Always `flash runs list` and cancel the stale run *before* re-submitting, and never wrap `flash train` in `timeout`. |
+| Wrong identity spends the money | Push/train lands in an org you did not expect, or a run id you know is valid comes back "unknown" | `FREESOLO_API_KEY` in the environment silently overrides `flash login`. Run `flash whoami` first. Run visibility is scoped to the key that created the run, so archive result baselines to disk rather than relying on `flash runs list` to find them later. |
+| `flash env test` passes but the run trains on the wrong data | Local validation is green; the remote run loads a different split | `flash env test` loads `environment.py` with **no** `[environment.params]`, so a params-driven split selection is not exercised. Assert the split inside your own test, or default to the split you actually train on. |
 | Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash runs checkpoint <run-id>`, deploy a specific step with `flash models deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter. |
 | Export fails before upload | CLI says no HuggingFace token | Pass `flash models export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`. |
 | Exported adapter is a silent no-op locally | peft warns about missing adapter keys and local eval matches the bare base model | The adapter's key namespace does not match the loaded model class. `model.layers.*` keys pair with `AutoModelForCausalLM`; `model.language_model.layers.*` keys pair with `Qwen3_5ForConditionalGeneration` / `Qwen3_5MoeForConditionalGeneration` (via `AutoModelForImageTextToText`). See "Loading an exported adapter locally". |
@@ -604,6 +773,17 @@ answer or action, so undersizing it can truncate the action and teach the model 
 watch `truncation_rate`, which counts completions not ending in EOS and is not strictly
 `finish_reason=length` when stop sequences or multi-turn rollouts are involved.
 
+> **On a fixed budget, `batch_size` buys optimizer steps almost for free.** `batch_size`
+> overrides the tuned prompts-per-step. Total generated tokens are
+> `steps x prompts_per_step x group_size x max_completion_tokens`, so **lowering
+> `batch_size` raises the step count and leaves the token bill — hence the cost —
+> essentially flat.** The same spend that buys 5 steps at the default batching buys ~80 at
+> `batch_size = 4`. Five GRPO steps cannot plausibly move a model off its starting point, so
+> if your budget only affords single-digit steps at the default, you are not under-funded —
+> you are mis-batched. Smaller batches do mean noisier per-step gradients, so this is a real
+> trade, not free money; but at a fixed budget, 5 steps is not a viable operating point.
+> Verify with `--cost` before and after the change.
+
 For pure multi-turn GRPO, Flash gives each Flash-owned vLLM generation request a managed
 10-to-60-minute absolute deadline and at most two physical attempts. A timed-out request is
 aborted before retry. Enforcement is cooperative between engine polls, and there is no total
@@ -613,6 +793,57 @@ environment calls.
 > **The reward-hacking signature:** a smoothed reward rising while mean generated
 > length collapses. Whenever any shortness or format pressure is active, verify the
 > gate by scoring a few truncated or opener-only probe responses — they should score low.
+
+---
+
+## Multi-turn environments — two silent traps
+
+### `credit_assignment = "per_turn"` is inert unless your environment emits `per_turn_rewards`
+
+Setting `credit_assignment = "per_turn"` is only *half* the request. The trainer reads the
+turn-level signal from `RewardResult.metadata["per_turn_rewards"]`; **when that key is
+missing it silently falls back to episode-level credit.** The config validates, `flash runs
+status` echoes `per_turn` back, and nothing in the CLI, the status output, or the worker log
+says the setting was dropped. You get a full-price run of the default scheme wearing the
+label of the one you asked for — and the natural reading of that result ("per-turn credit
+doesn't help") is a wrong conclusion drawn from a setting that never applied.
+
+Emit the list from `score_episode`, and derive the episode scalar from that same list so the
+two cannot disagree:
+
+```python
+return RewardResult(
+    score=episode_score,                                  # unchanged episode scalar
+    metadata={"per_turn_rewards": [float(s) for s in turn_scores]},
+)
+```
+
+**Do not verify this by the absence of a warning** — a missing key produces no output at
+all. There are three distinct silent-fallback layers on this path, two of which emit
+nothing. The positive marker is the one-shot log line `[rl] multi-turn per-turn
+group-relative credit is active`, but `flash runs log` returns only a bounded tail window,
+so a marker printed early in training scrolls out of reach and its absence proves nothing.
+The reliable check is local: feed a `RewardResult` through the extractor and confirm you get
+per-turn values rather than `None`.
+
+### Scoring must not depend on state accumulated in `step_episode`
+
+The worker's turn loop breaks out **before** the final `env_reply` when an episode hits the
+hard turn cap. An environment that accumulates state inside `step_episode` therefore scores
+the second-to-last position on exactly those episodes, silently under- or over-crediting the
+model — and only on the capped ones, which is a hard bias to spot in aggregate.
+
+Make scoring a pure function of the transcript: re-derive state from the assistant turns on
+every hook call. That is correct whether the episode ended by succeeding, by an env-signalled
+done, or by hitting the cap, and it also means concurrent rollouts sharing one environment
+instance cannot corrupt each other.
+
+**Measure efficiency against each example's own optimum, not the turn budget.** A reward
+like `1 - turns_taken / max_turns` makes perfect play unreachable: an example whose best
+solution needs 5 turns caps at `1 - 5/12 = 0.58` even when played perfectly, so "perfect
+across the dataset" is undefined and your gold trajectories never score 1.0. Use
+`minimal_steps / turns_used` instead — a minimal solve scores exactly 1.0 and detours
+degrade smoothly. Assert gold == 1.0 in a local test.
 
 ---
 
@@ -687,6 +918,48 @@ on a beyond-noise improvement.
 
 ---
 
+## Don't let your own harness lie to you
+
+Every item here produced a confident, *wrong* conclusion that survived until someone went
+looking. None were Flash defects — they are analysis bugs, and they are the most expensive
+kind because the run itself looks fine.
+
+- **Never join eval results to your dataset by index.** If the harness *samples* rows
+  (`random.sample`, a shuffled loader) the output order is neither a prefix nor file order.
+  Zipping `results[i]` to `dataset` line `i` mismatched **78 of 150** rows and produced a
+  detailed, entirely wrong root-cause analysis of where the model was failing. Carry an
+  explicit row id through scoring and join on it.
+- **Check the error count before you read any aggregate.** A harness that records per-row
+  errors and still averages over what is left will happily print a number computed from a
+  handful of rows. Discard a result file with a non-trivial error count instead of
+  interpreting it.
+- **Served evals are not reproducible even at temperature 0.** Re-evaluating the same
+  checkpoint yields a small spread, so a "best checkpoint" chosen on a gap narrower than
+  that spread is choosing noise. Establish the spread by evaluating one checkpoint two or
+  three times, then require a gap larger than it. Write each result to a distinct path —
+  two jobs writing the same output file silently overwrite each other.
+- **Sanity-check a metric against its neighbours.** A metrics dict reading `accuracy: 0.0`
+  next to `mean_shaped_score: 0.979` is internally contradictory and is telling you the
+  *reader* is broken, not the model. (`RewardMetric` carries its number in `.score`;
+  `.value` is a separate optional field and is often `None`.)
+- **Verify the split you evaluate is the split you think.** Confirm gold answers score
+  1.0 through your own scorer before trusting any number derived from it, and re-check for
+  overlap between train and eval rows.
+- **Re-grade stored completions instead of resampling** when you fix a parser or scorer.
+  That keeps old and new numbers apples-to-apples; resampling confounds the parser change
+  with sampling noise. Archive the pre-fix results rather than overwriting them.
+- **A judge that is itself a reasoning model breaks naive parsing.** Its `<think>` block can
+  consume the token budget and truncate the verdict, and it often floats a candidate score
+  mid-reasoning before settling on a different one — so a regex taking the *first* match
+  reads a discarded intermediate as the verdict and mis-grades silently. Strip the reasoning
+  block, search the post-reasoning answer, take the **last** match, and give the judge
+  enough tokens to finish.
+- **State the noise band before you compare.** With a small eval split, differences of a few
+  points are not distinguishable from noise; see the noise-band formula above, and treat an
+  in-band difference as *no change* rather than a weak win.
+
+---
+
 ## Treat crashes as infra, not model size
 
 > A CUDA / OOM / vLLM / kernel / infrastructure error is an **infrastructure** problem, not a
@@ -700,7 +973,9 @@ on a beyond-noise improvement.
 ## Command reference
 
 ```bash
+flash whoami                          # confirm which identity/org you are about to spend money as
 flash env setup                       # scaffold environment.py, dataset/, configs/, this file
+flash env test .                      # load + run the environment locally, before any GPU spend
 flash env push --project <project-uuid> --name my-env .        # publish the environment; paste the returned id into [environment]
 flash env pull your-org/my-env        # download a published environment into the current folder
 flash env delete --project <project-uuid> your-org/my-env -y   # delete a published environment
