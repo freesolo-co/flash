@@ -611,6 +611,81 @@ def test_log_snapshot_reads_one_offset_page_without_status(fake_client, capsys) 
     assert calls == [0]
 
 
+def _interrupt_the_stream(monkeypatch, fake_client) -> None:
+    """Make the next poll raise KeyboardInterrupt, i.e. the user pressed ctrl-c mid-stream."""
+
+    def _boom(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fake_client, "get_logs", _boom, raising=False)
+    monkeypatch.setattr(fake_client, "get_run", _boom, raising=False)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["train", "CONFIG"],
+        ["runs", "log", "flash-1", "--follow"],
+        ["runs", "status", "flash-1", "--follow"],
+    ],
+)
+def test_ctrl_c_while_following_says_the_run_is_still_billing(
+    argv, fake_client, monkeypatch, tmp_path, capsys
+) -> None:
+    """Ctrl-C stops the stream, not the run, and the output has to say so.
+
+    The generic handler printed "aborted", which reads as "the run stopped". It did not: the
+    remote run keeps going and keeps billing, so the next thing a user does is re-run
+    `flash train` and pay for a duplicate. Name the run and the command that actually stops it.
+    """
+    config = tmp_path / "sft.toml"
+    config.write_text(
+        "model = 'Qwen/Qwen3.5-0.8B'\nalgorithm = 'sft'\n"
+        "project = '11111111-1111-4111-8111-111111111111'\n"
+        "[environment]\nid = 'github:owner/repo@main:env/environment.py'\n"
+        "[train]\nepochs = 1\nmax_examples = 8\n"
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "create_run",
+        lambda *a, **k: {"run_id": "flash-1", "state": "queued"},
+        raising=False,
+    )
+    _interrupt_the_stream(monkeypatch, fake_client)
+
+    assert _run([str(config) if a == "CONFIG" else a for a in argv]) == 130
+    err = capsys.readouterr().err
+    assert "still going and still billing" in err
+    assert "flash runs cancel flash-1" in err
+    assert "flash runs log flash-1 --follow" in err
+    # the run was never cancelled on the user's behalf -- detaching is not stopping.
+    assert not any(c[0] == "cancel" for c in fake_client.calls)
+
+
+def test_train_submit_note_warns_that_ctrl_c_keeps_billing(
+    fake_client, monkeypatch, tmp_path, capsys
+) -> None:
+    """The hand-off note has to carry the same warning, before anyone reaches for ctrl-c."""
+    config = tmp_path / "sft.toml"
+    config.write_text(
+        "model = 'Qwen/Qwen3.5-0.8B'\nalgorithm = 'sft'\n"
+        "project = '11111111-1111-4111-8111-111111111111'\n"
+        "[environment]\nid = 'github:owner/repo@main:env/environment.py'\n"
+        "[train]\nepochs = 1\nmax_examples = 8\n"
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "create_run",
+        lambda *a, **k: {"run_id": "flash-1", "state": "queued"},
+        raising=False,
+    )
+
+    assert _run(["train", str(config)]) == 0
+    err = capsys.readouterr().err
+    assert "keeps billing" in err
+    assert "flash runs cancel flash-1" in err
+
+
 def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> None:
     class _TTYBuffer(io.StringIO):
         def isatty(self) -> bool:
