@@ -56,12 +56,26 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     the preset is returned as-is: flash does not own that interpreter and must not mutate it. it can
     hold a verl without the fork's rollout fields, so callers emitting a fork-only override gate it
     on verl_supports_rollout_field.
+
+    a self-provisioned venv is flash's own, and is rebuilt whenever it does not record the current
+    VERL_REQUIREMENT, so unsetting FLASH_VERL_PYTHON always yields the pinned verl.
     """
     preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
     if preset:
         return preset
     venv = os.path.join(workdir, "verl-venv")
     py = os.path.join(venv, "bin", "python")
+    stamp = os.path.join(venv, "flash-verl-requirement")
+    installed = ""
+    if os.path.exists(stamp):
+        with open(stamp) as f:
+            installed = f.read().strip()
+    if os.path.exists(py) and installed != VERL_REQUIREMENT:
+        # a retry reuses the pod workdir, so this venv can be from an earlier attempt or an earlier
+        # flash release pinning a different verl. it would satisfy the exists check below and train on
+        # the wrong verl, so rebuild it. an install that died partway also lands here: the stamp is
+        # written only after the install succeeds, so a half-populated venv is never reused.
+        shutil.rmtree(venv, ignore_errors=True)
     if not os.path.exists(py):
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
         # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
@@ -84,6 +98,8 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
             ],
             check=True,
         )
+        with open(stamp, "w") as f:
+            f.write(VERL_REQUIREMENT)
         if install_wandb:
             # verl does not pull wandb; install it best-effort so logger setup can fall back to console.
             subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
