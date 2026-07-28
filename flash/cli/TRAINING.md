@@ -168,6 +168,14 @@ and RL configs point at different splits, the local gate can pass while the real
 path is broken, or fail while the real path is fine. Make the default the split you
 actually train on, or exercise `load_environment(**params)` directly in your own test.
 
+**It is also a three-example smoke test, not a dataset audit.** `flash env test` runs the
+contract checks against the **first 3 rows only** (`_DEFAULT_EPISODES = 3`, and it iterates
+`dataset[:episode_count]`), so a malformed prompt, a scorer that raises, or a bad episode
+shape anywhere past row 3 sails through a green local gate and is first exercised by the
+paid worker. On a heterogeneous dataset — mixed sources, mixed difficulty, a long tail of
+odd rows — loop your own scorer over **every** row before you pay for a run. The local pass
+means "this env imports and the contract holds for a sample", not "every row is safe".
+
 **A hash comparison against the published env is not a valid staleness check.** `flash env
 push` injects a small `sys.path` import shim into `environment.py` at publish time, so
 `environment.py` **always** hashes differently after a round-trip while `dataset/` files
@@ -369,15 +377,37 @@ from huggingface_hub import create_repo
 
 # creating (or touching) the destination IS the write test - it exercises the same
 # permission the export needs, and raises if the token cannot write there.
-create_repo("<you>/<repo>", repo_type="model", exist_ok=True)
+# private=True matches what `flash models export` does: it always creates the repo
+# private first so the destination is never transiently public.
+create_repo(
+    "<you>/<repo>",
+    repo_type="model",
+    exist_ok=True,
+    private=True,
+    token="<the same token the export will use>",
+)
 ```
+
+Two details that make the difference between a probe and a placebo:
+
+- **Pass the same token the export will use.** Flash resolves the export token as
+  `--api-key` > `HF_TOKEN` in the environment > a local `.env` / `.env.local`, and forwards
+  exactly that value. `huggingface_hub` does none of that — with no `token=` it falls back to
+  your ambient cached login, so the probe can pass on one credential while the export fails
+  on a different one. If you are exporting with `--api-key`, or with a token that lives only
+  in `.env`, pass that literal value here.
+- **Ask for `private=True`.** The real export creates the repo private and only flips it
+  public afterwards if you passed `--public`. A probe that omits this can leave a brand-new
+  repo publicly visible until the export catches up, and it fails outright under an org
+  policy that permits private repos but not public ones.
 
 `create_repo` works on every `huggingface-hub` version Flash supports. There is also
 `auth_check("<you>/<repo>", write=True)`, which checks write access without creating
 anything — but the `write=` argument only exists in **hub ≥ 1.5.0** (Flash's floor is
 1.2.0). On an older hub it raises `TypeError: ... unexpected keyword argument 'write'`,
 and dropping the argument to silence that turns it back into a read-only check that a
-token with no write access still passes. Verify your version before relying on it.
+token with no write access still passes. Verify your version before relying on it. It takes
+`token=` too, and needs it for the same reason.
 
 Do this _before_ the run finishes, not after. If several tokens are in play, identify them
 by fingerprint rather than by printing them.
@@ -706,6 +736,18 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
     to spend a little more evidence, not a lot more steps: evaluate two or three checkpoints from
     that probe on the full split before deciding. A dip that deepens across checkpoints is the
     teacher or the algorithm; a single down reading is noise until it repeats.
+
+    **Schedule those checkpoints before you submit, or they will not exist.** OPD saves every
+    **20** optimizer steps by default, so a probe short enough to be cheap (under 20 updates)
+    publishes only its final step and there is nothing to compare. Name the steps explicitly:
+
+    ```toml
+    [train]
+    max_steps    = 12
+    save_at_steps = [4, 8, 12]   # exact steps; overrides the periodic save_every entirely
+    ```
+
+    Every entry must land within `max_steps` — a step you never reach is simply never saved.
 
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
   the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
