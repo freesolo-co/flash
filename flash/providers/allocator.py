@@ -13,11 +13,14 @@ from flash.providers.base import (
     Candidate,
     CapacityLookupError,
     UnsupportedGpuError,
+    _run_cost_key,
     canonical_gpu,
     providers_for,
+    run_config_for_ranking,
 )
 
 logger = get_logger(__name__)
+
 
 def vram_headroom() -> float:
     """Sizing headroom multiplier; shared by submit-time allocator and parse-time provisional_gpu."""
@@ -56,6 +59,40 @@ _REPLICATED_PER_CARD_GB = 8
 # combinations larger than this are never proposed: shard-efficiency loss and inter-card overhead
 # grow with count, and cost estimates get less reliable.
 _MAX_COMBINATION_CARDS = 4
+
+
+def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
+    """``candidate -> dollars for one optimizer step``, or None when the run cannot be priced.
+
+    Wraps the shared per-step cost key with the multi-card speedup, which is the one thing the
+    single-card paths (parse-time provisional, cost estimate) have no notion of: a combination
+    bills every card but only the gpu-bound half of a step is divided among them.
+    """
+    cost_key = _run_cost_key(
+        model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
+    )
+    if cost_key is None:
+        logger.debug("total-cost ranking unavailable; ranking on $/hr")
+        return None
+
+    from flash.cost.analytical import multi_card_speedup, step_seconds_split
+
+    # the same one-step config the cost key was built from, so the single- and multi-card branches
+    # below cannot price a run off different knobs.
+    config = run_config_for_ranking(
+        model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
+    )
+
+    def cost_per_step(candidate: Candidate) -> float:
+        if candidate.gpu_count <= 1:
+            # identical to the single-card key the preview and estimate use, so the three paths
+            # agree exactly whenever one card is enough.
+            return cost_key(candidate.gpu, candidate.hourly_usd)
+        gpu_bound, fixed = step_seconds_split(config, candidate.gpu)
+        seconds = gpu_bound / multi_card_speedup(candidate.gpu_count) + fixed
+        return candidate.total_hourly_usd * seconds / 3600.0
+
+    return cost_per_step
 
 
 def _combination_candidates(
@@ -130,9 +167,7 @@ def allocate(
         exact = canonical_gpu(gpu_type)
         exact_info = GPU_INFO.get(exact)
         if exact_info is None or not exact_info.validated:
-            raise UnsupportedGpuError(
-                f"exact GPU {exact!r} is not an active validated GPU class"
-            )
+            raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
         if exact_info.vram_gb < need and max_gpu_count <= 1:
             raise UnsupportedGpuError(
                 f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
@@ -140,7 +175,9 @@ def allocate(
             )
         _max_cards = min(max_gpu_count, _MAX_COMBINATION_CARDS)
         _pin_usable = (
-            _max_cards * max(0, exact_info.vram_gb - _REPLICATED_PER_CARD_GB) * _SHARD_VRAM_EFFICIENCY
+            _max_cards
+            * max(0, exact_info.vram_gb - _REPLICATED_PER_CARD_GB)
+            * _SHARD_VRAM_EFFICIENCY
             + _REPLICATED_PER_CARD_GB
         )
         if exact_info.vram_gb < need and max_gpu_count > 1 and _pin_usable < need:
@@ -150,9 +187,7 @@ def allocate(
             )
         exact_providers = providers_for(exact)
         if provider and provider not in exact_providers:
-            raise UnsupportedGpuError(
-                f"provider {provider!r} cannot provision exact GPU {exact!r}"
-            )
+            raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
         available = tuple(name for name in available if name in exact_providers)
 
     constraints = AllocationConstraints(
@@ -184,7 +219,9 @@ def allocate(
             ]
         except CapacityLookupError as exc:
             lookup_failed = True
-            logger.warning("%s capacity lookup failed (%s); allocating without it", name, exc.__cause__)
+            logger.warning(
+                "%s capacity lookup failed (%s); allocating without it", name, exc.__cause__
+            )
     if allow_combos:
         fit_alone = [c for c in candidates if c.vram_gb >= need]
         undersized = [c for c in candidates if c.vram_gb < need]
@@ -213,12 +250,16 @@ def allocate(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
             f"({', '.join(available) or '(none)'}); the run genuinely exceeds every active GPU class"
         )
-    # cheapest TOTAL cost first (count * per-card rate; == per-card rate for singles); ties prefer
-    # fewer cards (less inter-card overhead), then combined VRAM, then class name. sorting is stable,
-    # so provider and provider-local order apply only when all key fields match.
+    # cheapest JOB first, not cheapest rental: rank on the dollars one step costs on each candidate
+    # (rate x how long that hardware takes), so a faster card wins whenever it finishes enough sooner
+    # to pay for itself. ties prefer fewer cards (less inter-card overhead), then combined VRAM, then
+    # class name. sorting is stable, so provider and provider-local order apply only when all key
+    # fields match. a run the cost model cannot price falls back to total $/hr.
+    cost_per_step = _step_cost_ranker(model_id, algorithm, train, thinking, model_revision)
+    primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
     ranked = sorted(
         candidates,
-        key=lambda c: (c.total_hourly_usd, c.gpu_count, c.total_vram_gb, c.gpu),
+        key=lambda c: (primary(c), c.total_hourly_usd, c.gpu_count, c.total_vram_gb, c.gpu),
     )
     best = ranked[0]
     return Allocation(
@@ -234,10 +275,7 @@ def allocate(
 def allocation_summary(a: Allocation) -> str:
     shape = f"{a.gpu_count}x {a.gpu}" if a.gpu_count > 1 else a.gpu
     total = a.gpu_count * a.hourly_usd
-    head = (
-        f"allocated {shape} on {a.provider} at ${total:.2f}/hr "
-        f"(need >= {a.min_vram_gb} GB VRAM)"
-    )
+    head = f"allocated {shape} on {a.provider} at ${total:.2f}/hr (need >= {a.min_vram_gb} GB VRAM)"
     if len(a.candidates) > 1:
         nxt = a.candidates[1]
         nxt_shape = f"{nxt.gpu_count}x {nxt.gpu}" if nxt.gpu_count > 1 else nxt.gpu

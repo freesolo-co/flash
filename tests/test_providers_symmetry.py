@@ -235,7 +235,10 @@ def test_vast_competes_purely_on_price(monkeypatch):
     assert a.provider == "vast"
     assert a.hourly_usd == pytest.approx(0.47)
 
-    # When Vast is the pricier offer it does NOT win -> no structural advantage either way.
+    # When Vast is the pricier offer for the SAME class it does NOT win -> no structural advantage
+    # either way. RunPod's 4090 beats Lambda's nominally-cheaper A10 here because ranking is on
+    # what the JOB costs: the A10 sustains ~125 TFLOPS against the 4090's ~165, so the run takes
+    # long enough on it to more than erase the $0.09/hr saving.
     _stub_candidates(
         monkeypatch,
         runpod=[("runpod", "RTX 4090", 0.69, 24)],
@@ -243,8 +246,8 @@ def test_vast_competes_purely_on_price(monkeypatch):
         vast=[("vast", "RTX 4090", 0.80, 24)],
     )
     b = allocate("Qwen/Qwen3.5-0.8B", "sft")
-    assert b.provider == "lambda"
-    assert b.hourly_usd == pytest.approx(0.60)
+    assert b.provider == "runpod"
+    assert b.hourly_usd == pytest.approx(0.69)
 
 
 def test_gpu_name_breaks_price_vram_tie_before_provider_order(monkeypatch):
