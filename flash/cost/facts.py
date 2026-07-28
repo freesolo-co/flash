@@ -8,16 +8,34 @@ from flash.providers.base import GPU_INFO, GpuClass, providers_for
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
     # A10: 125 TFLOPS dense bf16 tensor (NVIDIA spec); Lambda-only 24 GB class, else defaults to 100.
     "A10": 125.0,
+    # MEASURED on a rented RunPod RTX 4090 (sm89, torch 2.10+cu128): 162.2-162.7 TFLOPS sustained
+    # on large square bf16 matmuls, against the 165 vendor spec -- within 1.5%, so the spec number
+    # is a fair proxy for this class and is kept.
     "RTX 4090": 165.0,
     "RTX 5090": 210.0,
-    "A100 PCIe": 312.0,
-    "A100 SXM": 312.0,
-    # A100 SXM 40GB: same SMs/tensor cores as the 80GB A100 SXM, less HBM only.
-    # Without this, 33-40 GB Lambda/Vast quotes fall back to _DEFAULT_TFLOPS.
-    "A100 SXM 40GB": 312.0,
-    "H100": 990.0,
-    # H200: same SMs/tensor cores as H100, more HBM only.
-    "H200": 990.0,
+    # MEASURED on a rented RunPod A100 80GB PCIe (sm80, torch 2.10+cu128): 242-259 TFLOPS sustained
+    # across repeated trials at full clocks (1410 MHz) and 31C, i.e. neither thermal- nor
+    # power-limited. The 312 figure is the vendor dense-bf16 spec, which real matmul kernels do not
+    # reach; using it overstated A100 throughput by ~20% and made the class look faster (and so
+    # cheaper per job) than it is. Set to the measured sustained rate.
+    "A100 PCIe": 250.0,
+    # MEASURED on a rented RunPod A100-SXM4-80GB (sm80, torch 2.10+cu128): 263-265 TFLOPS across
+    # repeated trials. Same 108 SMs as the PCIe part but a 400 W envelope against 300 W, which is
+    # what the ~6% gain over the measured PCIe rate reflects. Both are far below the shared 312
+    # vendor spec.
+    "A100 SXM": 264.0,
+    # A100 SXM 40GB: same SMs/tensor cores as the 80GB A100 SXM, less HBM only, so it inherits the
+    # measured SXM rate. Without an entry, 33-40 GB Lambda/Vast quotes fall back to _DEFAULT_TFLOPS.
+    "A100 SXM 40GB": 264.0,
+    # MEASURED on a rented RunPod H100 PCIe (sm90, torch 2.10+cu128): 490-504 TFLOPS sustained
+    # across repeated trials at full clocks (1755 MHz), 310 W board. The 990 figure is the SXM
+    # part's spec; the PCIe board this class actually provisions delivers about half of it. Using
+    # 990 made H100 look twice as fast as it is and let it win nearly every ranking decision on
+    # throughput it cannot deliver. Set to the measured sustained rate.
+    "H100": 500.0,
+    # H200: same SM/tensor-core configuration as H100 with more HBM and a higher power envelope.
+    # Scaled from the H100 measurement rather than the SXM spec. Not directly measured.
+    "H200": 550.0,
     "RTX Pro 6000": 250.0,
     # B200: 2.25 PFLOPS bf16 dense (NVIDIA spec); prevents ~10x cost over-estimate vs _DEFAULT_TFLOPS.
     "B200": 2250.0,
@@ -40,7 +58,9 @@ def gpu_tflops(name: str) -> float:
 # refine per-workload once real b200 training samples exist. the vram/serving paths keep the true
 # peak via gpu_tflops; only the training-time model uses this.
 _TRAIN_TFLOPS_CAP: dict[str, float] = {
-    "B200": 990.0,  # h200-class realized training throughput, not the 2250 dense-bf16 peak
+    # h200-class realized training throughput, not the 2250 dense-bf16 peak. tracks the H200 entry,
+    # which is itself now anchored to a measured H100 PCIe rate rather than a vendor spec.
+    "B200": 550.0,
 }
 
 
@@ -104,9 +124,13 @@ def gpu_vram_gb(name: str) -> int:
 
 
 def pick_gpu(
-    required_vram_gb: int, *, provider: str | None = None, max_wall_seconds: float = 0.0
+    required_vram_gb: int,
+    *,
+    provider: str | None = None,
+    max_wall_seconds: float = 0.0,
+    cost_key=None,
 ) -> str:
-    """Cheapest GPU class that fits ``required_vram_gb``, ranked by static $/hr.
+    """Cheapest GPU class that fits ``required_vram_gb``.
 
     No pin; every fitting class is eligible, validated or not. NOTE this is intentionally
     gate-free: the submit-time allocator restricts to the validated pool, so the
@@ -114,6 +138,13 @@ def pick_gpu(
     candidates to what it can provision. ``max_wall_seconds`` (>0) prices the Vast market against
     offers that outlast the run, so a long-run quote doesn't SELECT a class on the strength of a
     short-lived offer that won't survive to launch.
+
+    ``cost_key`` is ``(gpu_name, hourly_rate) -> comparable``: pass it to rank on what the JOB
+    costs rather than what the CARD costs, so a faster class wins when it finishes soon enough to
+    pay for its higher rate. It is injected rather than imported because the step model lives in
+    ``analytical``, which imports this module -- building the key there keeps the dependency
+    one-way. Omitted (the default) ranks on $/hr, which is correct for callers that have no run to
+    price and is the honest fallback for a model outside the cost catalog.
     """
 
     def _selectable(g: GpuClass) -> bool:
@@ -146,7 +177,14 @@ def pick_gpu(
         def _rate(g: GpuClass) -> float:
             return gpu_hourly_usd(g.name, provider=provider, max_wall_seconds=max_wall_seconds)
 
-    best = min(candidates, key=lambda g: (_rate(g), g.vram_gb, g.name))
+    if cost_key is not None:
+        # rank on job cost, tie-breaking on rate then the same vram/name order as the $/hr path so
+        # the two bases stay comparable when a run is unpriceable in only one of them.
+        best = min(
+            candidates, key=lambda g: (cost_key(g.name, _rate(g)), _rate(g), g.vram_gb, g.name)
+        )
+    else:
+        best = min(candidates, key=lambda g: (_rate(g), g.vram_gb, g.name))
     return best.name
 
 
