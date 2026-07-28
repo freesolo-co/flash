@@ -25,6 +25,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 
 from flash import __version__
 from flash.runner import get_status, prepare_job, submit_job
@@ -56,6 +57,14 @@ _DEPLOYABLE_STATES = {"done", "deployed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 _log = logging.getLogger("flash.server")
+_DEPLOYMENT_JOBS_LOCK = threading.Lock()
+_DEPLOYMENT_JOBS: set[threading.Thread] = set()
+_DEPLOYMENT_JOBS_ACCEPTING = True
+
+
+class DeploymentJobStartError(RuntimeError):
+    pass
+
 
 # Symbols re-exported through this module. The route handlers look these up on
 # ``flash.server.app`` at call time (``_app.<name>``) so a test that patches ``app.<name>``
@@ -63,6 +72,7 @@ _log = logging.getLogger("flash.server")
 __all__ = [
     "_DEPLOY_LOCKS",
     "_RECOVERABLE",
+    "DeploymentJobStartError",
     "_charge_retry_loop",
     "_charge_retry_startup",
     "_deploy_lock",
@@ -133,6 +143,36 @@ def _known_train_endpoint_names() -> set[str]:
     return _train_endpoint_names(include_terminal=True)
 
 
+def _open_deployment_jobs() -> None:
+    global _DEPLOYMENT_JOBS_ACCEPTING
+    with _DEPLOYMENT_JOBS_LOCK:
+        _DEPLOYMENT_JOBS_ACCEPTING = True
+
+
+def _run_deployment_job(target, args, kwargs) -> None:
+    try:
+        target(*args, **kwargs)
+    finally:
+        with _DEPLOYMENT_JOBS_LOCK:
+            _DEPLOYMENT_JOBS.discard(threading.current_thread())
+
+
+def _wait_for_deployment_jobs(timeout: float) -> bool:
+    global _DEPLOYMENT_JOBS_ACCEPTING
+    deadline = time.monotonic() + timeout
+    with _DEPLOYMENT_JOBS_LOCK:
+        _DEPLOYMENT_JOBS_ACCEPTING = False
+    while True:
+        with _DEPLOYMENT_JOBS_LOCK:
+            jobs = tuple(_DEPLOYMENT_JOBS)
+        if not jobs:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        jobs[0].join(remaining)
+
+
 def start_deployment_job(target, *args, **kwargs) -> bool:
     """Start a deployment lifecycle job.
 
@@ -142,8 +182,20 @@ def start_deployment_job(target, *args, **kwargs) -> bool:
     if os.environ.get("FLASH_DEPLOY_SYNC") == "1":
         target(*args, **kwargs)
         return True
-    thread = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True)
-    thread.start()
+    thread = threading.Thread(
+        target=_run_deployment_job,
+        args=(target, args, kwargs),
+        daemon=True,
+    )
+    with _DEPLOYMENT_JOBS_LOCK:
+        if not _DEPLOYMENT_JOBS_ACCEPTING:
+            raise DeploymentJobStartError("deployment jobs are shutting down")
+        _DEPLOYMENT_JOBS.add(thread)
+        try:
+            thread.start()
+        except Exception as exc:
+            _DEPLOYMENT_JOBS.discard(thread)
+            raise DeploymentJobStartError(str(exc)) from exc
     return False
 
 
@@ -322,12 +374,21 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app):
         from flash.providers.preflight import check_run_preflight
+        from flash.runner import _open_status_reporter
         from flash.server.billing_retry import charge_retry_enabled
         from flash.server.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
+        _open_deployment_jobs()
+        _open_status_reporter()
         recover_runs()
         serving.recover_deployments()
+        # replay one persisted status at a time in the background. synchronous per-item delivery
+        # prevents a historical backlog from filling the shared reporter ahead of live updates.
+        startup_report_stop = threading.Event()
+        startup_report_task = asyncio.create_task(
+            asyncio.to_thread(serving.replay_status_reports, startup_report_stop)
+        )
         # Recover completion-time customer charges left pending/failed by a transient blip or a
         # crash between the `done` write and the charge. recover_runs deliberately excludes terminal
         # `done`, so those would otherwise leak revenue; this startup sweep catches them promptly.
@@ -376,6 +437,10 @@ def create_app():
         try:
             yield
         finally:
+            startup_report_stop.set()
+            startup_report_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await startup_report_task
             for task in (
                 startup_charge_task,
                 cost_task,
@@ -388,6 +453,15 @@ def create_app():
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
+            shutdown_deadline = time.monotonic() + 15.0
+            with contextlib.suppress(Exception):
+                if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):
+                    _log.warning("deployment jobs still running at shutdown deadline")
+            with contextlib.suppress(Exception):
+                from flash.runner import _shutdown_status_reporter
+
+                remaining = max(0.0, shutdown_deadline - time.monotonic())
+                await asyncio.to_thread(_shutdown_status_reporter, remaining, close=True)
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
     app.include_router(meta.router)

@@ -96,6 +96,46 @@ def managed_slug_to_github_ref(value: str) -> str:
     )
 
 
+def canonical_managed_environment_slug(value: str) -> str | None:
+    if _parse_managed_environment_slug(value) is not None:
+        return value
+
+    parsed = _parse_github_environment_ref(value)
+    if parsed is None:
+        if _targets_managed_environment_repo(value):
+            raise ValueError(_managed_environment_ref_error())
+        return None
+    if parsed.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
+        return None
+
+    parts = parsed.path.split("/")
+    if (
+        parsed.ref != _DEFAULT_GITHUB_REF
+        or len(parts) != 3
+        or parts[2] != _DEFAULT_ENVIRONMENT_PATH
+        or not _is_safe_github_path_parts(tuple(parts[:2]))
+    ):
+        raise ValueError(_managed_environment_ref_error())
+    return "/".join(parts[:2])
+
+
+def _targets_managed_environment_repo(value: str) -> bool:
+    text = (value or "").strip()
+    if not text.startswith("github:"):
+        return False
+    repo_ref = text[len("github:") :].partition(":")[0]
+    repo = repo_ref.partition("@")[0]
+    return repo.lower() == _DEFAULT_MANAGED_ENV_REPO.lower()
+
+
+def _managed_environment_ref_error() -> str:
+    return (
+        "managed environment GitHub reference must be "
+        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
+        f"<namespace>/<name>/{_DEFAULT_ENVIRONMENT_PATH}"
+    )
+
+
 def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
     text = (value or "").strip()
     if not text or ":" in text:

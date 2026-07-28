@@ -346,18 +346,32 @@ def test_resolve_deploy_step_branches(monkeypatch):
         assert exc.value.status_code == 400, bad
 
 
-def test_recover_deployments_fails_stale_and_skips_fresh_and_missing(monkeypatch):
+def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     import time
 
-    rows = [{"run_id": "r-stale"}, {"run_id": "r-fresh"}, {"run_id": "r-missing"}]
+    rows = [
+        {"run_id": "r-stale"},
+        {"run_id": "r-fresh"},
+        {"run_id": "r-held"},
+        {"run_id": "r-missing"},
+    ]
     monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
 
     statuses = {
-        # Busy with no timestamp -> stale.
-        "r-stale": types.SimpleNamespace(run_id="r-stale", deployment={"state": "queued"}),
-        # Busy but freshly updated -> not stale.
+        # busy with no timestamp
+        "r-stale": types.SimpleNamespace(
+            run_id="r-stale", state="done", deployment={"state": "queued"}
+        ),
+        # busy and freshly updated
         "r-fresh": types.SimpleNamespace(
-            run_id="r-fresh", deployment={"state": "queued", "updated_at": time.time()}
+            run_id="r-fresh",
+            state="done",
+            deployment={"state": "queued", "updated_at": time.time()},
+        ),
+        "r-held": types.SimpleNamespace(
+            run_id="r-held",
+            state="done",
+            deployment={"state": "reconciling", "updated_at": time.time()},
         ),
     }
 
@@ -368,17 +382,89 @@ def test_recover_deployments_fails_stale_and_skips_fresh_and_missing(monkeypatch
 
     monkeypatch.setattr(serving._app, "get_status", fake_get_status)
 
+    import flash.runner as runner
+
     marked: list[tuple[str, dict]] = []
+    reported = []
+
+    def mark_failed(run_id, failed):
+        marked.append((run_id, failed))
+        return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
+
+    monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
+    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner, "_report_status", reported.append)
+
+    from flash.server._locks import _RunLock
+
+    held_lock = _RunLock("r-held")
+    assert held_lock.acquire(blocking=False) is True
+    try:
+        assert serving.recover_deployments() == 1
+    finally:
+        held_lock.release()
+    assert [run_id for run_id, _failed in marked] == ["r-stale"]
+    assert all(failed["state"] == "failed" for _run_id, failed in marked)
+    assert all("control-plane restart" in failed["error"] for _run_id, failed in marked)
+    assert [status.run_id for status in reported] == ["r-stale"]
+    assert all(status.deployment["state"] == "failed" for status in reported)
+
+
+def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
+    statuses = [
+        types.SimpleNamespace(run_id="r-settled", deployment={"state": "queued"}),
+        types.SimpleNamespace(run_id="r-settled", deployment={"state": "ready"}),
+    ]
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: statuses.pop(0))
     monkeypatch.setattr(
-        serving, "mark_deployment_failed", lambda run_id, failed: marked.append((run_id, failed))
+        serving,
+        "mark_deployment_failed",
+        lambda *_args: pytest.fail("a deployment that settled under the lock must not be failed"),
     )
 
+    assert serving.recover_deployments() == 0
+    assert statuses == []
+
+
+def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
+    import flash.runner as runner
+
+    previous = {
+        "state": "ready",
+        "endpoint_name": "https://serve.example",
+        "adapter_revision": "r-stale@final." + "a" * 40,
+    }
+    status = types.SimpleNamespace(
+        run_id="r-stale",
+        state="deployed",
+        deployment={"state": "queued", "previous_deployment": previous},
+    )
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-stale"}])
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+
+    def mark_failed(run_id, failed):
+        assert run_id == "r-stale"
+        return types.SimpleNamespace(
+            run_id=run_id,
+            state="deployed",
+            deployment={
+                **previous,
+                "last_deploy_error": failed["error"],
+                "last_deploy_failed_at": time.time(),
+            },
+        )
+
+    reported = []
+
+    monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
+    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner, "_report_status", reported.append)
+
     assert serving.recover_deployments() == 1
-    assert len(marked) == 1
-    run_id, failed = marked[0]
-    assert run_id == "r-stale"
-    assert failed["state"] == "failed"
-    assert "control-plane restart" in failed["error"]
+    assert len(reported) == 1
+    assert reported[0].deployment["state"] == "ready"
+    assert "control-plane restart" in reported[0].deployment["last_deploy_error"]
 
 
 def _smoke_spec(
