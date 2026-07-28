@@ -437,17 +437,55 @@ def test_env_test_multi_turn_stops_on_empty_env_reply(monkeypatch, tmp_path, cap
     assert "overall: PASS" in out
 
 
-def test_env_test_replay_low_reward_warns_but_passes(monkeypatch, tmp_path, capsys):
+def test_env_test_all_replays_scoring_zero_fails(monkeypatch, tmp_path, capsys):
+    # a grader that cannot score its own gold answers is broken (or its runtime deps are
+    # missing). the contract checks still pass, so this must fail on the reward signal itself,
+    # otherwise a flat-zero reward reaches a gpu and the run can never learn.
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0))
 
-    assert cmd_env_test(_args(env_dir)) == 0
+    assert cmd_env_test(_args(env_dir)) == 1
     captured = capsys.readouterr()
     assert "episode 1: policy=replay turns=1 reward=0.000000" in captured.out
     assert "1/1 episodes passed contract checks" in captured.out
+    assert "overall: PASS" not in captured.out
+    assert "all 1 replayed gold answer(s) scored 0.0" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_partial_replay_zeros_warn_but_pass(monkeypatch, tmp_path, capsys):
+    # only some gold answers scoring zero is a hard dataset, not a broken grader: warn, but
+    # keep passing so a strict reward function is not blocked from training.
+    env_dir = _environment_dir(tmp_path)
+    rows = [{"input": "q1", "output": "4"}, {"input": "q2", "output": "8"}]
+
+    class _FirstRowOnlyEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            return 1.0 if example["output"] == "4" else 0.0
+
+    _patch_loader(monkeypatch, _FirstRowOnlyEnv(rows=rows))
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "2/2 episodes passed contract checks" in captured.out
     assert "overall: PASS" in captured.out
-    assert "warning:" in captured.err
     assert "check the reward function" in captured.err
+    assert "all 2 replayed gold answer(s) scored 0.0" not in captured.err
+
+
+def test_env_test_echo_policy_zero_reward_still_passes(monkeypatch, tmp_path, capsys):
+    # an echo episode has no gold answer to score, so a zero reward says nothing about the
+    # grader. the zero-reward gate must only judge replayed gold answers.
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "say anything", "output": ""}], reward=0.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=echo turns=1 reward=0.000000" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "scored 0.0" not in captured.err
 
 
 def test_env_test_systemexit_from_reward_fails_contract(monkeypatch, tmp_path, capsys):

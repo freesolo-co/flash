@@ -230,6 +230,8 @@ def cmd_env_test(args) -> int:
 
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0
+    replayed = 0
+    scored_zero = 0
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
         failure: str | None = None
@@ -257,17 +259,31 @@ def cmd_env_test(args) -> int:
             continue
 
         passed += 1
-        if record["policy"] == "replay" and reward is not None and reward <= 0.0:
-            message = (
-                f"replay gold answer scored low (reward={reward:.6f}); check the reward function"
-            )
-            print(
-                render.warn(message) if render.styled() else f"warning: {message}",
-                file=sys.stderr,
-            )
+        if record["policy"] == "replay" and reward is not None:
+            replayed += 1
+            if reward <= 0.0:
+                scored_zero += 1
+                message = (
+                    f"replay gold answer scored low (reward={reward:.6f}); "
+                    "check the reward function"
+                )
+                print(
+                    render.warn(message) if render.styled() else f"warning: {message}",
+                    file=sys.stderr,
+                )
 
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
+        return _err("overall: FAIL")
+    # every replayed gold answer scoring 0 means the grader cannot recognize its own reference
+    # answers: a broken reward function or a missing runtime dependency, not a hard dataset. that
+    # must fail the gate, since passing here sends a run to a gpu that can only see flat-zero reward.
+    if replayed and scored_zero == replayed:
+        _err(
+            f"all {replayed} replayed gold answer(s) scored 0.0; the reward function cannot score "
+            "its own reference answers. check the grader and that its runtime dependencies are "
+            "installed in this environment."
+        )
         return _err("overall: FAIL")
     print(render.ok("overall: PASS") if render.styled() else "overall: PASS")
     return 0
