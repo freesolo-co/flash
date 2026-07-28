@@ -33,6 +33,11 @@ from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import sanitize_rollout_text
+from flash.engine.worker.verl_common import (
+    VERL_REQUIREMENT,
+    resolve_verl_python,
+    verl_supports_rollout_field,
+)
 
 DATA_SOURCE = "flash_env"
 
@@ -150,6 +155,17 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.actor.ppo_epochs={cfg['ppo_epochs']}",
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
+        # fork-only rollout field, so `++` (append-or-override): it exists in the fork's rollout.yaml
+        # but not in stock verl 0.8.0's, where a bare key or `+` would break. omitted entirely when
+        # false, since not masking is already stock behavior and stock verl rejects the unknown key.
+        *(
+            [
+                "++actor_rollout_ref.rollout.mask_truncated_completions="
+                f"{str(bool(cfg['mask_truncated_completions'])).lower()}"
+            ]
+            if cfg["mask_truncated_completions"]
+            else []
+        ),
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
         f"actor_rollout_ref.rollout.gpu_memory_utilization={cfg['gpu_mem_util']}",
@@ -219,6 +235,7 @@ def _build_verl_training_cfg(
         "lr": inp["lr"],
         "group_size": inp["group_size"],
         "prompts_per_step": inp["prompts_per_step"],
+        "mask_truncated_completions": inp["mask_truncated_completions"],
         "micro_batch": micro_batch,
         "max_prompt_len": inp["max_prompt_len"],
         "max_completion": inp["max_completion"],
@@ -407,29 +424,6 @@ def start_reward_server(score_by_index, *, example_count: int):
 # --------------------------------------------------------------------------------------------
 # verl interpreter + checkpoint export.
 # --------------------------------------------------------------------------------------------
-def _resolve_verl_python(workdir: str) -> str:
-    """return an interpreter that can import verl.
-
-    prefers FLASH_VERL_PYTHON (set by the caller when verl is preinstalled, e.g. on a verl image).
-    otherwise provisions an isolated venv on the pod so verl's torch/vllm never touch flash's env.
-    """
-    preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
-    if preset:
-        return preset
-    venv = os.path.join(workdir, "verl-venv")
-    py = os.path.join(venv, "bin", "python")
-    if not os.path.exists(py):
-        # isolated env: verl brings its own torch/vllm; --no-deps would miss runtime deps, so a
-        # full install is used. exact pins are validated on the gpu pod before paid launch.
-        subprocess.run(["uv", "venv", venv], check=True)
-        subprocess.run(["uv", "pip", "install", "--python", py, "verl"], check=True)
-        if os.environ.get("WANDB_API_KEY"):
-            # verl does not pull wandb; add it (best-effort) so verl's wandb logger can import it in
-            # this isolated interpreter instead of aborting. a failure here -> console logger below.
-            subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
-    return py
-
-
 def _resolve_verl_loggers(python_bin: str) -> str:
     """verl's ``trainer.logger`` list. verl logs from its own interpreter, so enable the wandb
     logger only when WANDB_API_KEY is set AND wandb is importable in that interpreter; otherwise
@@ -591,18 +585,7 @@ def _resolve_single_turn_inputs():
             "advantages (no value clip), matching the trl path",
             flush=True,
         )
-    # trl drops truncated (non-eos) completions from the grpo loss (mask_truncated_completions,
-    # default True); verl 0.8.0 cannot express this through config. its vllm server discards the
-    # finish_reason length/stop distinction, and its rollout schemas and trainer masks never apply
-    # finish-reason-dependent response-loss masking anyway. stop_sequences (the only case that turns
-    # masking off) already fails loudly above, so this is always the default-True case. a real fix needs
-    # finish-reason propagation plus explicit zeroing of the truncated response loss mask.
-    if _w.grpo_mask_truncated_completions(_t):
-        print(
-            "[rl-verl] mask_truncated_completions=True; verl keeps truncated completions in the "
-            "grpo loss (no verl truncation-mask knob) -- recorded parity caveat, not applied",
-            flush=True,
-        )
+    mask_truncated_completions = _w.grpo_mask_truncated_completions(_t)
     learning_rate = float(_t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate)
     # warm-start forbids lora_rank, so a set init_from_adapter already raised above; read rank/alpha
     # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
@@ -709,6 +692,7 @@ def _resolve_single_turn_inputs():
         "prompts": prompts,
         "prompts_per_step": prompts_per_step,
         "group_size": group_size,
+        "mask_truncated_completions": mask_truncated_completions,
         "temperature": temperature,
         "top_p": float(rl.sampling_top_p),
         "think_penalty": think_penalty,
@@ -819,7 +803,20 @@ def run_rl_verl():
 
     server, reward_url = start_reward_server(_score, example_count=len(rollout_examples))
     try:
-        python_bin = _resolve_verl_python(workdir)
+        python_bin = resolve_verl_python(
+            workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+        )
+        # masking truncated completions is a fork-only rollout field. FLASH_VERL_PYTHON can point at a
+        # stock verl, and hydra would compose the unknown key only to abort in dataclass conversion.
+        # fail here with the cause instead, and never silently train on truncated completions.
+        if inp["mask_truncated_completions"] and not verl_supports_rollout_field(
+            python_bin, "mask_truncated_completions"
+        ):
+            raise RuntimeError(
+                f"grpo requested mask_truncated_completions but the verl at {python_bin} does not "
+                "support it. that verl predates the freesolo fork; point FLASH_VERL_PYTHON at an "
+                f"interpreter with '{VERL_REQUIREMENT}' installed, or unset it to provision one."
+            )
         micro_batch = 1
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).
