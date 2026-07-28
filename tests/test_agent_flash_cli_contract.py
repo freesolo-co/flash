@@ -1,6 +1,7 @@
 """Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the CLI
 and consumes its run-id / run-state / metrics outputs. This asserts that the flash
-side provides what the agent depends on.
+side provides what the agent depends on, and pins the one surface deliberately taken
+away from it (the root run-management aliases).
 
 The agent package lives in a sibling folder (../agent/src) that is NOT installed in
 the flash venv, so we add it to sys.path here (mirroring how the existing
@@ -68,6 +69,13 @@ def test_agent_required_subcommands_exist(command: tuple[str, ...]) -> None:
 
 @pytest.mark.parametrize("command", ["status", "log", "cancel", "checkpoints"])
 def test_deployed_agent_root_run_shims_are_not_registered(command: str, capsys) -> None:
+    """The root run-management forms are gone; only the grouped `flash runs ...` forms remain.
+
+    these were kept registered-but-hidden so deployed agents could migrate. that grace period is
+    over, so pin the removal to keep the shims from creeping back. agent-side prompts still naming
+    them are tracked in freesolo-co/freesolo#618 -- note `checkpoints` became `runs checkpoint`
+    (singular), so a plain `flash ` -> `flash runs ` rewrite gets that one wrong.
+    """
     with pytest.raises(SystemExit) as excinfo:
         main([command, "--help"])
     assert excinfo.value.code == 2
