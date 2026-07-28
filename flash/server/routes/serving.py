@@ -10,12 +10,14 @@ import contextlib
 import json
 import math
 import multiprocessing
+import os
 import re
 import time
+from threading import Event
 from typing import Annotated
 
 import regex as safe_regex
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from jsonschema import SchemaError, ValidationError
 from jsonschema.validators import validator_for
@@ -55,7 +57,7 @@ from flash.serve.preflight import (
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
 from flash.server import db
-from flash.server._deps import _require_bool, owned_run, require_key
+from flash.server._deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server._internal_client import run_org_id
 from flash.spec import JobSpec
 
@@ -248,6 +250,43 @@ def _public_deployment(deployment: dict) -> dict:
     return out
 
 
+def _enqueue_deployment_report(status) -> None:
+    from flash.runner import _report_status, _report_status_async
+
+    if os.environ.get("FLASH_DEPLOY_SYNC") == "1":
+        _report_status(status)
+    else:
+        _report_status_async(status)
+
+
+def _report_persisted_transition(previous, current, *, persisted: bool) -> None:
+    if not persisted or (
+        previous.state == current.state and previous.deployment == current.deployment
+    ):
+        return
+    _enqueue_deployment_report(current)
+
+
+def _deployment_failure_persisted(status, failed: dict) -> bool:
+    if status.deployment == failed:
+        return True
+    previous = failed.get("previous_deployment")
+    deployment = status.deployment
+    failure_fields = {"last_deploy_error", "last_deploy_failed_at"}
+    expected_error = failed.get("error") or "deployment failed"
+    return bool(
+        isinstance(previous, dict)
+        and isinstance(deployment, dict)
+        and all(
+            deployment.get(key) == value
+            for key, value in previous.items()
+            if key not in failure_fields
+        )
+        and deployment.get("last_deploy_error") == expected_error
+        and deployment.get("last_deploy_failed_at") is not None
+    )
+
+
 def _deployment_attempt_is_stale(deployment: dict, *, now: float | None = None) -> bool:
     if deployment.get("state") not in _DEPLOYMENT_BUSY_STATES:
         return False
@@ -386,14 +425,14 @@ def _resolve_explicit_chat_revision(
                 status_code=409,
                 detail=(
                     f"run {run_id} has multiple verified revisions at step {want}; chat the full "
-                    "immutable adapter revision from `flash deployments`"
+                    "immutable adapter revision from `flash models deployments`"
                 ),
             )
         raise HTTPException(
             status_code=409,
             detail=(
                 f"run {run_id} has no deployed checkpoint at step {want}; deploy it first with "
-                f"`flash deploy {run_id}/step-{want}` "
+                f"`flash models deploy {run_id}/step-{want}` "
                 f"(currently deployed steps: {_format_deployed_steps(index)})"
             ),
         )
@@ -408,19 +447,56 @@ def recover_deployments() -> int:
             status = _app.get_status(row["run_id"])
         except FileNotFoundError:
             continue
-        deployment = status.deployment or {}
-        if not _deployment_attempt_is_stale(deployment):
+        if (status.deployment or {}).get("state") not in _DEPLOYMENT_BUSY_STATES:
             continue
-        failed = _deployment_state(
-            deployment,
-            "failed",
-            error="deployment lifecycle interrupted by control-plane restart",
-            detail="deployment interrupted; retry `flash deploy`",
-            recovered_at=time.time(),
-        )
-        mark_deployment_failed(status.run_id, failed)
-        recovered += 1
+        lock = _app._deploy_lock(row["run_id"])
+        # another replica mid-deploy holds the flock, so a non-blocking miss proves live ownership.
+        if not lock.acquire(blocking=False):
+            continue
+        try:
+            try:
+                status = _app.get_status(row["run_id"])
+            except FileNotFoundError:
+                continue
+            deployment = status.deployment or {}
+            if deployment.get("state") not in _DEPLOYMENT_BUSY_STATES:
+                continue
+            if not _deployment_attempt_is_stale(deployment):
+                continue
+            failed = _deployment_state(
+                deployment,
+                "failed",
+                error="deployment lifecycle interrupted by control-plane restart",
+                detail="deployment interrupted; retry `flash models deploy`",
+                recovered_at=time.time(),
+            )
+            marked = mark_deployment_failed(status.run_id, failed)
+            _report_persisted_transition(
+                status,
+                marked,
+                persisted=_deployment_failure_persisted(marked, failed),
+            )
+            recovered += 1
+        finally:
+            lock.release()
     return recovered
+
+
+def replay_status_reports(stop: Event | None = None) -> int:
+    """Sequentially mirror persisted statuses that may have been dropped during shutdown."""
+    from flash.runner import _report_status
+
+    replayed = 0
+    for row in db.all_runs():
+        if stop is not None and stop.is_set():
+            break
+        try:
+            status = _app.get_status(row["run_id"])
+            _report_status(status)
+        except (OSError, TypeError, ValueError):
+            continue
+        replayed += 1
+    return replayed
 
 
 def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> tuple[str, object]:
@@ -627,7 +703,9 @@ def _finish_deployment_unlocked(
             "smoke_testing",
             detail="running bounded fixed-prompt smoke",
         )
-        mark_deployment_pending(run_id, current, owner_deployment=deployment)
+        previous = _app.get_status(run_id)
+        marked = mark_deployment_pending(run_id, current, owner_deployment=deployment)
+        _report_persisted_transition(previous, marked, persisted=marked.deployment == current)
         smoke_result.update(
             _run_deployment_smoke(
                 run_id,
@@ -642,7 +720,9 @@ def _finish_deployment_unlocked(
             detail="activating alias and reconciling the authoritative target",
             activation_outcome_unknown=True,
         )
-        mark_deployment_pending(run_id, current, owner_deployment=deployment)
+        previous = _app.get_status(run_id)
+        marked = mark_deployment_pending(run_id, current, owner_deployment=deployment)
+        _report_persisted_transition(previous, marked, persisted=marked.deployment == current)
         # cancellation can revoke the ledger while smoke is blocked, so fence again immediately
         # before deploy_adapter issues the activation request.
         _assert_activation_fence()
@@ -663,6 +743,7 @@ def _finish_deployment_unlocked(
         current = _public_deployment(current)
 
         def _commit_ready() -> bool:
+            previous = _app.get_status(run_id)
             state_guard = prev_state
             if is_checkpoint:
                 state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
@@ -672,14 +753,20 @@ def _finish_deployment_unlocked(
                     expect_state=state_guard,
                     verification_generation=verification_generation,
                 )
-                return marked.deployment == current
-            marked = mark_deployed(
-                run_id,
-                current,
-                expect_state=prev_state,
-                verification_generation=verification_generation,
-            )
-            return marked.state == "deployed" and marked.deployment == current
+                persisted = marked.deployment == current
+            else:
+                marked = mark_deployed(
+                    run_id,
+                    current,
+                    expect_state=prev_state,
+                    verification_generation=verification_generation,
+                )
+                persisted = marked.state == "deployed" and marked.deployment == current
+            if persisted:
+                _report_persisted_transition(
+                    previous, marked, persisted=marked.deployment == current
+                )
+            return persisted
 
         def _reconcile_commit_miss() -> None:
             # deploy_adapter already flipped the serving alias when this runs, so a lost
@@ -692,6 +779,7 @@ def _finish_deployment_unlocked(
             if owned and latest_deployment.get("state") in _DEPLOYMENT_BUSY_STATES:
                 # this attempt still owns the record; only the run state moved under the
                 # guard. retry the write once against the fresh state.
+                previous = latest
                 if is_checkpoint:
                     marked = mark_checkpoint_deployed(
                         run_id,
@@ -706,6 +794,9 @@ def _finish_deployment_unlocked(
                         verification_generation=verification_generation,
                     )
                 if marked.deployment == current:
+                    _report_persisted_transition(
+                        previous, marked, persisted=marked.deployment == current
+                    )
                     return
                 latest = marked
                 latest_deployment = latest.deployment or {}
@@ -733,7 +824,11 @@ def _finish_deployment_unlocked(
                 detail="alias activation outcome is unknown; authoritative reconciliation required",
                 activation_outcome_unknown=True,
             )
-            mark_deployment_failed(run_id, reconciling)
+            previous = _app.get_status(run_id)
+            marked = mark_deployment_failed(run_id, reconciling)
+            _report_persisted_transition(
+                previous, marked, persisted=marked.deployment == reconciling
+            )
             return
         if activated:
             try:
@@ -761,7 +856,7 @@ def _finish_deployment_unlocked(
                 error = (
                     f"run {run_id} has no run-level adapter at "
                     f"{deployment.get('adapter_hf_prefix')} (the run likely never finalized); "
-                    f"deploy a saved checkpoint instead, e.g. `flash deploy "
+                    f"deploy a saved checkpoint instead, e.g. `flash models deploy "
                     f"{run_id}/step-{steps[-1]}` (available steps: "
                     f"{', '.join(str(step) for step in steps)})"
                 )
@@ -774,12 +869,18 @@ def _finish_deployment_unlocked(
             error=error,
             detail="deployment failed; previous working alias was preserved",
         )
-        mark_deployment_failed(run_id, failed)
+        previous = _app.get_status(run_id)
+        marked = mark_deployment_failed(run_id, failed)
+        _report_persisted_transition(
+            previous, marked, persisted=_deployment_failure_persisted(marked, failed)
+        )
 
 
-def _finish_deployment(**kwargs) -> None:
-    with _app._deploy_lock(kwargs["run_id"]):
+def _finish_deployment(*, deploy_lock, **kwargs) -> None:
+    try:
         _finish_deployment_unlocked(**kwargs)
+    finally:
+        deploy_lock.release()
 
 
 def _chat_messages_from_payload(payload: dict) -> list[dict]:
@@ -874,11 +975,48 @@ def _resolve_deployable_target(
     return checkpoint_step, is_checkpoint, prefix
 
 
+@router.get("/v1/runs/{run_id}/deploy")
+def deployment(
+    run_id: str,
+    key: Annotated[dict, Depends(require_key)],
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
+    status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+    persisted = (
+        status.deployment if isinstance(status.deployment, dict) else {"state": "undeployed"}
+    )
+    return _public_deployment({**persisted, "run_id": run_id})
+
+
 @router.post("/v1/runs/{run_id}/deploy")
-def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
+def deploy(
+    run_id: str,
+    key: Annotated[dict, Depends(require_key)],
+    payload: dict | None = None,
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
     payload = payload or {}
-    with _app._deploy_lock(run_id):
-        status = owned_run(run_id, key)
+    deploy_lock = _app._deploy_lock(run_id)
+    if not deploy_lock.acquire(blocking=False):
+        status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+        current_deployment = status.deployment or {}
+        current_deployment_state = current_deployment.get("state")
+        if current_deployment_state in _DEPLOYMENT_BUSY_STATES:
+            detail = (
+                f"run {run_id} already has a deployment in "
+                f"{current_deployment_state} state; run `flash models deployments` "
+                "to check progress"
+            )
+        else:
+            # the per-run lock is shared with undeploy, export, and startup recovery, so a
+            # contended acquire cannot claim a deployment is running unless the state says so.
+            detail = f"another operation is in progress for run {run_id}; retry shortly"
+        raise HTTPException(status_code=409, detail=detail)
+    job_owns_lock = False
+    try:
+        status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
         spec = JobSpec.from_dict(status.spec)
         if spec.model_revision:
             raise HTTPException(
@@ -921,12 +1059,17 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 status_code=409,
                 detail=(
                     f"run {run_id} already has a deployment in "
-                    f"{current_deployment.get('state')} state; run `flash deployments` "
+                    f"{current_deployment.get('state')} state; run `flash models deployments` "
                     "to check progress"
                 ),
             )
         checkpoint_step, is_checkpoint, deploy_prefix = _resolve_deployable_target(
-            run_id, effective_spec, status, payload.get("step"), action="deploy", enforce_state=not dry_run
+            run_id,
+            effective_spec,
+            status,
+            payload.get("step"),
+            action="deploy",
+            enforce_state=not dry_run,
         )
         if not dry_run and not effective_spec.train.hf_repo:
             raise HTTPException(
@@ -1026,6 +1169,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 status_code=409,
                 detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
             )
+        _report_persisted_transition(status, marked, persisted=True)
 
         job_kwargs = {
             "run_id": run_id,
@@ -1035,21 +1179,64 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "deploy_kwargs": deploy_kwargs,
             "deployment": dep_dict,
             "prev_state": prev_state,
+            "deploy_lock": deploy_lock,
         }
-    ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
-    if ran_sync:
-        return _public_deployment(_app.get_status(run_id).deployment or dep_dict)
-    return _public_deployment(dep_dict)
+        # the job owns the lock from here on and releases it when the lifecycle ends, so a
+        # booting replica's non-blocking probe keeps failing for the whole deploy. a start
+        # failure means the job never ran, so ownership stays with this request.
+        job_owns_lock = True
+        try:
+            ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
+        except _app.DeploymentJobStartError as exc:
+            job_owns_lock = False
+            error = f"deployment job could not start: {exc}"
+            failed = _deployment_state(
+                dep_dict,
+                "failed",
+                error=error,
+                detail="deployment was not started; retry when the control plane is available",
+                retryable=True,
+            )
+            previous = _app.get_status(run_id)
+            marked = mark_deployment_failed(run_id, failed)
+            _report_persisted_transition(
+                previous, marked, persisted=_deployment_failure_persisted(marked, failed)
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "deployment_job_unavailable",
+                    "run_id": run_id,
+                    "retryable": True,
+                    "message": error,
+                },
+            ) from exc
+        if ran_sync:
+            return _public_deployment(_app.get_status(run_id).deployment or dep_dict)
+        return _public_deployment(dep_dict)
+    finally:
+        if not job_owns_lock:
+            deploy_lock.release()
 
 
 @router.delete("/v1/runs/{run_id}/deploy")
-def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
+def undeploy(
+    run_id: str,
+    key: Annotated[dict, Depends(require_key)],
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
     with _app._deploy_lock(run_id):
-        owned_run(run_id, key)
+        status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
         try:
             result = _app.undeploy_adapter(run_id)
         except ServingError as exc:
-            mark_deployment_revocation_failed(run_id, str(exc))
+            marked = mark_deployment_revocation_failed(run_id, str(exc))
+            persisted = isinstance(marked.deployment, dict) and (
+                marked.deployment.get("state") == "revocation_failed"
+                and marked.deployment.get("error") == str(exc)
+            )
+            _report_persisted_transition(status, marked, persisted=persisted)
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -1059,8 +1246,23 @@ def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
                     "message": str(exc),
                 },
             ) from exc
-        mark_undeployed(run_id)
-        return result
+        marked = mark_undeployed(run_id)
+        persisted = isinstance(marked.deployment, dict) and (
+            marked.deployment.get("state") == "undeployed"
+        )
+        _report_persisted_transition(status, marked, persisted=persisted)
+        deployment = (
+            marked.deployment if isinstance(marked.deployment, dict) else {"state": "undeployed"}
+        )
+        response = _public_deployment({**deployment, "run_id": run_id})
+        response.update(
+            {
+                field: result[field]
+                for field in ("disabled_aliases", "disabled_revisions", "serving_deregistered")
+                if field in result
+            }
+        )
+        return response
 
 
 @router.post("/v1/runs/{run_id}/export")
@@ -1172,7 +1374,9 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     verified_revisions = _verified_adapter_revisions(status)
     deployment = status.deployment or {}
     ready_deployment = _previous_ready_deployment(deployment)
-    ready_revision = ready_deployment.get("adapter_revision") if ready_deployment is not None else None
+    ready_revision = (
+        ready_deployment.get("adapter_revision") if ready_deployment is not None else None
+    )
     pinned_revision = _resolve_explicit_chat_revision(
         run_id,
         adapter_revision,
@@ -1207,7 +1411,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                 status_code=409,
                 detail=(
                     f"run {run_id} deployment is {deployment_state}; run "
-                    "`flash deployments` to check progress"
+                    "`flash models deployments` to check progress"
                 ),
             )
         if deployment_state == "failed":
@@ -1221,11 +1425,11 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             raise HTTPException(
                 status_code=409,
                 detail=f"run {run_id} was cancelled; deploy a checkpoint with "
-                f"`flash deploy {run_id}/step-<N>` first",
+                f"`flash models deploy {run_id}/step-<N>` first",
             )
         raise HTTPException(
             status_code=409,
-            detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
+            detail=f"run {run_id} has no active deployment; `flash models deploy {run_id}` first",
         )
     if not effective_spec.train.hf_repo:
         raise HTTPException(

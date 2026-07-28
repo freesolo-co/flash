@@ -22,7 +22,11 @@ class _Client:
             "state": "done",
             "cost_usd": 0.25,
             "error": None,
-            "spec": {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo"},
+            "spec": {
+                "project": "11111111-1111-4111-8111-111111111111",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "grpo",
+            },
         }
 
 
@@ -44,7 +48,7 @@ def test_plain_path_stays_machine_readable(monkeypatch, fake_client, capsys) -> 
     assert cli.main(["version"]) == 0
     assert capsys.readouterr().out.strip() == f"flash {__version__}"
 
-    assert cli.main(["models"]) == 0
+    assert cli.main(["models", "list"]) == 0
     out = capsys.readouterr().out
     # plain output is bare model ids, one per line, with no themed header or detail columns
     assert "Qwen/Qwen3.5-0.8B" in out
@@ -52,7 +56,7 @@ def test_plain_path_stays_machine_readable(monkeypatch, fake_client, capsys) -> 
     assert "Qwen/Qwen3.5-9B" in out
     assert "\t" not in out
 
-    assert cli.main(["status", "flash-1"]) == 0
+    assert cli.main(["runs", "status", "flash-1"]) == 0
     payload = json.loads(capsys.readouterr().out)  # must stay parseable JSON
     assert payload["state"] == "done"
     assert payload["cost_usd"] == 0.25
@@ -64,13 +68,13 @@ def test_styled_path_is_themed_but_lossless(monkeypatch, fake_client, capsys) ->
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
 
-    assert cli.main(["models"]) == 0
+    assert cli.main(["models", "list"]) == 0
     out = capsys.readouterr().out
     assert "supported base models" in out  # themed header
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "PARAMS" not in out  # ids only — no reintroduced detail columns
 
-    assert cli.main(["status", "flash-1"]) == 0
+    assert cli.main(["runs", "status", "flash-1"]) == 0
     out = capsys.readouterr().out
     # curated panel up top, but the full JSON is still emitted below (no data dropped)
     assert "details" in out
@@ -87,7 +91,11 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
     run = {
         "run_id": "flash-1",
         "state": "done",
-        "spec": {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo"},
+        "spec": {
+            "project": "11111111-1111-4111-8111-111111111111",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+        },
         "remote": {"allocated_gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
     }
     runs = render.runs_table([run])
@@ -108,6 +116,7 @@ def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
         "run_id": "flash-allocated",
         "state": "done",
         "spec": {
+            "project": "11111111-1111-4111-8111-111111111111",
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
             "gpu": {"type": "RTX Pro 6000"},
@@ -187,7 +196,10 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
         render.gpus_table([("RTX 5090", 32, 0.99)], "Tip: selection is automatic — no pinning"),
         render.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
         render.deployments_table([{"run_id": "r", "deployment": {"state": "ready"}}]),
-        render.env_setup(["environment.py", "dataset/train.jsonl", "configs/rl.toml"]),
+        render.env_setup(
+            ["environment.py", "dataset/train.jsonl", "configs/rl.toml"],
+            "11111111-1111-4111-8111-111111111111",
+        ),
         render.env_list([]),
         render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"),
         render.submitted("flash-xyz"),
@@ -246,7 +258,7 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
 
 
 def test_cancel_noop_on_terminal_run_is_not_a_false_confirmation(monkeypatch) -> None:
-    """`flash cancel` against an already-terminal run is a server-side no-op that returns the
+    """`flash runs cancel` against an already-terminal run is a server-side no-op that returns the
     unchanged state. The themed card must not flash a green "cancel requested" for that case —
     only a real transition to `cancelled` earns the confirmation; otherwise it stays honest."""
     monkeypatch.setenv("FLASH_STYLE", "1")
@@ -342,14 +354,14 @@ def test_error_path_themed_on_tty_plain_on_machine(monkeypatch, capsys) -> None:
 
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
-    assert cli.main(["runs"]) == 1
+    assert cli.main(["runs", "list"]) == 1
     err = capsys.readouterr().err
     assert err.startswith("✗")  # ✗ leads the themed line
     assert "error:" in err
     assert "bad [environment] id" in err
 
     monkeypatch.setenv("FLASH_STYLE", "0")
-    assert cli.main(["runs"]) == 1
+    assert cli.main(["runs", "list"]) == 1
     assert capsys.readouterr().err.startswith("error:")  # machine path unchanged
 
 
@@ -393,7 +405,7 @@ def test_unexpected_error_themed_on_tty_traceback_on_machine(monkeypatch, capsys
 
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
-    assert cli.main(["runs"]) == 1
+    assert cli.main(["runs", "list"]) == 1
     err = capsys.readouterr().err
     assert err.startswith("✗")  # red ✗ idiom, not a raw traceback
     assert "disk full" in err
@@ -403,7 +415,7 @@ def test_unexpected_error_themed_on_tty_traceback_on_machine(monkeypatch, capsys
     # machine path: the raw exception propagates (a traceback), exactly as before this handler
     monkeypatch.setenv("FLASH_STYLE", "0")
     with pytest.raises(OSError, match="disk full"):
-        cli.main(["runs"])
+        cli.main(["runs", "list"])
 
 
 def test_invalid_command_suggests_closest_match(monkeypatch, capsys) -> None:
@@ -413,7 +425,7 @@ def test_invalid_command_suggests_closest_match(monkeypatch, capsys) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["deploly"])  # a typo of `deploy`
+        cli.main(["models", "deploly"])  # a typo of canonical `models deploy`
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
     assert "did you mean 'deploy'?" in err
@@ -466,7 +478,11 @@ def test_run_status_surfaces_heartbeat_stage_and_age(monkeypatch) -> None:
     fresh = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {
+            "project": "11111111-1111-4111-8111-111111111111",
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "sft",
+        },
         "last_heartbeat": {"stage": "sft_step", "step": 42, "ts": _time.time() - 125},
     }
     out = render.run_status(fresh)
@@ -511,7 +527,11 @@ def test_run_status_explains_rl_warmup(monkeypatch, stage: str) -> None:
     status = {
         "run_id": "flash-warmup",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {
+            "project": "11111111-1111-4111-8111-111111111111",
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+        },
         "last_heartbeat": {"stage": stage, "ts": _time.time()},
     }
 
@@ -535,7 +555,11 @@ def test_run_status_omits_warmup_claim_for_stale_heartbeat(monkeypatch, stage: s
     status = {
         "run_id": "flash-warmup",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {
+            "project": "11111111-1111-4111-8111-111111111111",
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+        },
         "last_heartbeat": {"stage": stage, "ts": _time.time() - 1201},
     }
 
@@ -560,7 +584,11 @@ def test_run_status_omits_warmup_claim_for_prior_attempt_heartbeat(monkeypatch, 
     status = {
         "run_id": "flash-warmup",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {
+            "project": "11111111-1111-4111-8111-111111111111",
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+        },
         "remote": {"attempt": 1},
         "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 0},
     }
@@ -582,7 +610,11 @@ def test_run_status_explains_warmup_when_heartbeat_matches_attempt(monkeypatch, 
     status = {
         "run_id": "flash-warmup",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {
+            "project": "11111111-1111-4111-8111-111111111111",
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+        },
         "remote": {"attempt": 2},
         "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 2},
     }

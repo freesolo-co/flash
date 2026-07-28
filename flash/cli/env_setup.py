@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tomllib
 from pathlib import Path
 
 from . import render, traces
@@ -13,10 +15,10 @@ _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
 Edit dataset/train.jsonl and the reward code, then upload with
-`flash env push --name my-env .`.
+`flash env push --project PROJECT_UUID --name my-env .`.
 
 A managed run should use the returned [environment] id from
-`flash env push --name my-env .`.
+`flash env push --project PROJECT_UUID --name my-env .`.
 
 This starter keeps a tiny smoke-test dataset in dataset/train.jsonl. Replace it
 with your real training rows before a real run.
@@ -82,10 +84,10 @@ message), and the loop repeats until `done` or `max_episode_turns`. The finished
 transcript is graded by `score_episode`.
 
 Edit dataset/train.jsonl and the episode logic, then upload with
-`flash env push --name my-env .`.
+`flash env push --project PROJECT_UUID --name my-env .`.
 
 A managed run should use the returned [environment] id from
-`flash env push --name my-env .`.
+`flash env push --project PROJECT_UUID --name my-env .`.
 
 This starter implements a tiny "guess the secret number" game so you can see the
 episode hooks wired end-to-end. Replace it with your real task before a real run.
@@ -227,25 +229,85 @@ _REASONING_OPTIONS = [
 _SKIP_TRACES = ""  # sentinel option value: scaffold the starter rows instead of importing
 
 
-def _traces_dataset(args) -> str | None:
-    """JSONL exported from a project's traces, or None to use the starter rows.
+def _require_setup_project(args) -> str:
+    """Resolve and validate the one explicit project used by the whole scaffold."""
+    from flash.client import ApiError, ClientError, get_project, list_projects
+    from flash.client.config import load_credentials
 
-    Traces are offered as a head start, never a requirement: the prompt only appears on a terminal
-    when a stored API key turns up projects, and any failure past that point falls back to the
-    starter dataset with a warning, so `env setup` still scaffolds a working environment offline."""
+    _api_url, api_key = load_credentials()
+    if not api_key:
+        raise ClientError(
+            "not logged in. Run `flash login` before `flash env setup` so the project can be validated"
+        )
+
+    def resolve_project(project_id: str) -> str:
+        try:
+            return str(get_project(project_id, api_key)["id"])
+        except ApiError as exc:
+            if exc.status not in {403, 404}:
+                raise
+            raise ClientError(
+                f"project {project_id!r} is not accessible; run `flash projects list` "
+                "and pass a project UUID from the current organization"
+            ) from exc
+
+    supplied = str(getattr(args, "project", "") or "").strip()
+    if supplied:
+        return resolve_project(supplied)
+    if not _setup_interactive(args):
+        raise ClientError(
+            "--project PROJECT_UUID is required in noninteractive mode, with redirected stdin, or with --yes"
+        )
+
+    projects = list_projects(api_key)
+    options = traces.project_options(projects)
+    if not options:
+        raise ClientError(
+            "no Freesolo projects are available for this organization; create one with `flash projects create NAME`"
+        )
+    selected = render.select_required("Choose the Freesolo project for this environment", options)
+    return resolve_project(selected)
+
+
+def _validate_existing_config_projects(project_id: str) -> None:
+    """Reject projectless or conflicting generated configs without rewriting them."""
+    from flash.client import ClientError
+    from flash.spec import require_project_id
+
+    for path in (Path("configs/sft.toml"), Path("configs/rl.toml"), Path("configs/opd.toml")):
+        if not path.exists():
+            continue
+        try:
+            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise ClientError(f"cannot read existing {path}: {exc}") from exc
+        try:
+            existing = require_project_id(raw.get("project"))
+        except (TypeError, ValueError) as exc:
+            raise ClientError(f"existing {path} has no valid top-level project UUID") from exc
+        if existing != project_id:
+            raise ClientError(
+                f"existing {path} project {existing!r} does not match selected project {project_id!r}"
+            )
+
+
+def _traces_dataset(args, project_id: str) -> str | None:
+    """Optionally export traces from the already-selected project."""
     if not _setup_interactive(args):
         return None
-    projects = traces.offer_projects()
-    if not projects:
-        return None
-    options = traces.project_options(projects)
-    options.append((_SKIP_TRACES, "start from scratch", "a tiny starter dataset you edit"))
-    project_id = render.select("Start from a project's traces?", options, default=len(options) - 1)
-    if project_id == _SKIP_TRACES:
+    use_traces = render.select(
+        "Use this project's recorded traces as starter rows?",
+        [
+            ("yes", "use traces", project_id),
+            (_SKIP_TRACES, "start from scratch", "a tiny starter dataset you edit"),
+        ],
+        default=1,
+    )
+    if use_traces == _SKIP_TRACES:
         return None
     try:
         exported = traces.fetch_records(project_id)
-    except Exception as exc:  # any export failure falls back to the starter rows
+    except Exception as exc:  # trace import is optional after project validation succeeds
         _warn(f"could not export traces from {project_id} ({exc}); using the starter dataset")
         return None
     records = exported.get("records") or []
@@ -283,12 +345,13 @@ def _setup_interactive(args) -> bool:
 
 
 def cmd_env_setup(args) -> int:
+    project_id = _require_setup_project(args)
+    _validate_existing_config_projects(project_id)
     starter_env = Path("environment.py")
     dataset = Path("dataset/train.jsonl")
-    # Offer the user's own traces as the training rows. Only when the dataset is still missing:
-    # an existing one is never overwritten, so importing into it would be a silently discarded
-    # download. Asked first because it is the data question the rest of the scaffold wraps.
-    traces_jsonl = None if dataset.exists() else _traces_dataset(args)
+    # trace import is optional and can only read the selected project. an existing dataset is never
+    # overwritten, so importing into it would be a silently discarded download.
+    traces_jsonl = None if dataset.exists() else _traces_dataset(args, project_id)
     # An existing environment.py is the authoritative signal for which turn mode this
     # scaffold already uses (the dataset is plain JSONL with no reliable mode marker).
     # Anchor to it so a re-run never leaves a single-turn env beside a multi-turn
@@ -355,7 +418,9 @@ def cmd_env_setup(args) -> int:
     else:
         reasoning = False
 
-    env_py = _STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY
+    env_py = (_STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY).replace(
+        "PROJECT_UUID", project_id
+    )
     dataset_jsonl = traces_jsonl or (
         _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
     )
@@ -373,9 +438,10 @@ def cmd_env_setup(args) -> int:
     )
     if not starter_env.exists():
         starter_env.write_text(env_py)
+    project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
         "# Environment: upload this project folder with\n"
-        "# `flash env push --name my-env .`, then paste the returned id below.\n"
+        f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
         "# If the environment reads secrets with os.environ, list only the env var names here.\n"
         "# Values are read from your shell or .env at submit time and are not stored in the spec.\n"
         "[environment]\n"
@@ -400,6 +466,7 @@ def cmd_env_setup(args) -> int:
     if not rl.exists():
         rl.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
+            f"{project_line}"
             'algorithm = "grpo"\n'
             f"{thinking_line}"
             "\n"
@@ -418,6 +485,7 @@ def cmd_env_setup(args) -> int:
     if not sft.exists():
         sft.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
+            f"{project_line}"
             'algorithm = "sft"\n'
             f"{thinking_line}"
             "\n"
@@ -444,9 +512,10 @@ def cmd_env_setup(args) -> int:
         opd.write_text(
             f"{opd_multiturn_note}"
             'model = "Qwen/Qwen3.5-4B"\n'
+            f"{project_line}"
             'algorithm = "opd"   # on-policy distillation from a managed Fireworks teacher (default GLM 5.2)\n\n'
             "# Environment: upload this project folder with\n"
-            "# `flash env push --name my-env .`, then paste the returned id below.\n"
+            f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
             "# The teacher and its Fireworks key are platform-managed — nothing to set up or export.\n"
             "[environment]\n"
             'id = ""\n\n'
@@ -462,7 +531,10 @@ def cmd_env_setup(args) -> int:
     training = Path("TRAINING.md")
     if not training.exists():
         # Explicit UTF-8: TRAINING_MD has non-ASCII chars that raise UnicodeEncodeError under a non-UTF-8 locale.
-        training.write_text(TRAINING_MD, encoding="utf-8")
+        training.write_text(
+            TRAINING_MD.replace("PROJECT_UUID", project_id).replace("<project-uuid>", project_id),
+            encoding="utf-8",
+        )
     scaffolded = [
         "environment.py",
         "dataset/train.jsonl",
@@ -472,7 +544,8 @@ def cmd_env_setup(args) -> int:
         "TRAINING.md",
     ]
     if render.styled():
-        print(render.env_setup(scaffolded))
+        print(render.env_setup(scaffolded, project_id))
         return 0
     print(f"ensured {', '.join(scaffolded)}")
+    print(f"next: flash env push --project {project_id} --name my-env .")
     return 0

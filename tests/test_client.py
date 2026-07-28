@@ -14,6 +14,8 @@ from flash.client.http import _parse_chat_target, _prepare_chat_request
 from flash.client.specs import spec_payload
 from flash.schema import spec_from_dict
 
+_PROJECT_ID = "11111111-1111-4111-8111-111111111111"
+
 
 @pytest.fixture
 def stub():
@@ -85,6 +87,7 @@ def stub():
 
         def do_DELETE(self):
             seen["auth"] = self.headers.get("Authorization")
+            seen["project_id"] = self.headers.get("X-Freesolo-Project-Id")
             seen["path"] = self.path
             seen["method"] = "DELETE"
             if self.path.startswith("/v1/envs/"):
@@ -108,18 +111,21 @@ def stub():
 def test_bearer_header_and_payload(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    out = client.create_run({"model": "m"})
+    out = client.create_run({"model": "m", "project": f" {_PROJECT_ID.upper()} "})
     assert out["run_id"] == "r1"
     assert seen["auth"] == "Bearer fslo-user-test"
-    assert seen["body"] == {"spec": {"model": "m"}}
+    assert seen["body"] == {"spec": {"model": "m", "project": _PROJECT_ID}}
 
 
 def test_create_run_sends_runtime_secrets_outside_spec(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.create_run({"model": "m"}, runtime_secrets={"WANDB_API_KEY": "wb-user"})
+    client.create_run(
+        {"model": "m", "project": _PROJECT_ID},
+        runtime_secrets={"WANDB_API_KEY": "wb-user"},
+    )
     assert seen["body"] == {
-        "spec": {"model": "m"},
+        "spec": {"model": "m", "project": _PROJECT_ID},
         "runtime_secrets": {"WANDB_API_KEY": "wb-user"},
     }
 
@@ -127,17 +133,35 @@ def test_create_run_sends_runtime_secrets_outside_spec(stub):
 def test_create_run_dry_run_flag_travels_in_body(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.create_run({"model": "m"}, dry_run=True)
-    assert seen["body"] == {"spec": {"model": "m"}, "dry_run": True}
-    # Default omits it, so existing (non-dry-run) callers send an unchanged body.
-    client.create_run({"model": "m"})
-    assert seen["body"] == {"spec": {"model": "m"}}
+    client.create_run({"model": "m", "project": _PROJECT_ID}, dry_run=True)
+    assert seen["body"] == {
+        "spec": {"model": "m", "project": _PROJECT_ID},
+        "dry_run": True,
+    }
+    # default omits dry_run, so live submissions keep the same validated spec payload.
+    client.create_run({"model": "m", "project": _PROJECT_ID})
+    assert seen["body"] == {"spec": {"model": "m", "project": _PROJECT_ID}}
+
+
+@pytest.mark.parametrize("project", [None, "", "   ", "not-a-uuid", 7])
+def test_create_run_rejects_missing_or_invalid_project_before_request(stub, project) -> None:
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    spec = {"model": "m"}
+    if project is not None:
+        spec["project"] = project
+
+    with pytest.raises(ClientError, match="project"):
+        client.create_run(spec)
+
+    assert "body" not in seen
 
 
 def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None:
     spec = spec_from_dict(
         {
             "model": "Qwen/Qwen3.5-4B",
+            "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "opd",
             "environment": {"id": "owner/env"},
             "train": {
@@ -181,7 +205,7 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
 def test_create_run_sends_schema_metadata_for_dry_run_and_live_submit(stub) -> None:
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    spec = {"model": "m", "train": {"epochs": 1}}
+    spec = {"project": "11111111-1111-4111-8111-111111111111", "model": "m", "train": {"epochs": 1}}
     metadata = {
         "version": "0.2.56",
         "fields": {"epochs": "0.2.0"},
@@ -419,39 +443,58 @@ def test_chat_stream_accepts_json_fallback(stub):
 def test_publish_env_plain_without_progress(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    out = client.publish_env(name="e", package_b64="QQ==")
+    out = client.publish_env(
+        name="e", package_b64="QQ==", project_id="11111111-1111-4111-8111-111111111111"
+    )
     assert out["id"] == "freesolo-co/e"
     assert seen["path"] == "/v1/envs"
-    assert seen["body"] == {"name": "e", "package_b64": "QQ=="}
+    assert seen["body"] == {
+        "name": "e",
+        "package_b64": "QQ==",
+        "project_id": "11111111-1111-4111-8111-111111111111",
+    }
 
 
 def test_publish_env_sends_project_id_when_given(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    out = client.publish_env(name="e", package_b64="QQ==", project_id="proj-1")
+    out = client.publish_env(
+        name="e", package_b64="QQ==", project_id="11111111-1111-4111-8111-111111111111"
+    )
     assert out["id"] == "freesolo-co/e"
-    assert seen["body"] == {"name": "e", "package_b64": "QQ==", "project_id": "proj-1"}
+    assert seen["body"] == {
+        "name": "e",
+        "package_b64": "QQ==",
+        "project_id": "11111111-1111-4111-8111-111111111111",
+    }
 
 
-def test_publish_env_omits_project_id_when_absent(stub):
-    # the backend upserts on (org, slug), so a key present in the body overwrites the stored
-    # grouping. a publish that names no project must leave the key out entirely rather than
-    # send a default, or a republish would move the env out of a dashboard-assigned project.
+def test_publish_env_rejects_blank_project_id_before_request(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.publish_env(name="e", package_b64="QQ==", project_id="")
-    assert "project_id" not in seen["body"]
+    with pytest.raises(ClientError, match="project id is required"):
+        client.publish_env(name="e", package_b64="QQ==", project_id="   ")
+    assert "body" not in seen
 
 
 def test_delete_env_sends_delete_to_slug_path(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    out = client.delete_env("acme/my-env")
+    out = client.delete_env("acme/my-env", project_id="11111111-1111-4111-8111-111111111111")
     assert out == {"id": "acme/my-env", "deleted": True}
     assert seen["method"] == "DELETE"
     # the namespace/name slug (with its slash) goes straight into the path
     assert seen["path"] == "/v1/envs/acme/my-env"
     assert seen["auth"] == "Bearer fslo-user-test"
+    assert seen["project_id"] == "11111111-1111-4111-8111-111111111111"
+
+
+def test_delete_env_rejects_blank_project_before_request(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    with pytest.raises(ClientError, match="project id is required"):
+        client.delete_env("acme/my-env", project_id="   ")
+    assert "method" not in seen
 
 
 def test_delete_env_percent_encodes_reserved_chars(stub):
@@ -460,7 +503,7 @@ def test_delete_env_percent_encodes_reserved_chars(stub):
     # A programmatic caller passing reserved characters must NOT be able to truncate the request
     # target: `?` becomes %3F (not a query string), `#` becomes %23 (not a dropped fragment), while
     # the namespace/name separator `/` is preserved so the server still routes the :path param.
-    client.delete_env("team/env?x=1#frag")
+    client.delete_env("team/env?x=1#frag", project_id="11111111-1111-4111-8111-111111111111")
     assert seen["method"] == "DELETE"
     assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag"
 
@@ -517,10 +560,13 @@ def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
     # a payload large enough to span several 8192-byte http.client send chunks, so the
     # callback fires repeatedly with a growing count instead of one all-at-once call.
     big = "A" * 30000
-    body = {"name": "e", "package_b64": big}
+    body = {"name": "e", "package_b64": big, "project_id": "11111111-1111-4111-8111-111111111111"}
     calls: list[tuple[int, int]] = []
     out = client.publish_env(
-        name="e", package_b64=big, progress=lambda sent, total: calls.append((sent, total))
+        name="e",
+        package_b64=big,
+        project_id="11111111-1111-4111-8111-111111111111",
+        progress=lambda sent, total: calls.append((sent, total)),
     )
     assert out["id"] == "freesolo-co/e"
     # the server reads exactly Content-Length bytes, so a correct multi-chunk stream
@@ -542,9 +588,18 @@ def test_publish_env_progress_errors_do_not_abort_upload(stub):
         raise RuntimeError("render failed")
 
     # a raising progress widget must never abort an in-flight upload (contextlib.suppress).
-    out = client.publish_env(name="e", package_b64="QQ==", progress=boom)
+    out = client.publish_env(
+        name="e",
+        package_b64="QQ==",
+        project_id="11111111-1111-4111-8111-111111111111",
+        progress=boom,
+    )
     assert out["id"] == "freesolo-co/e"
-    assert seen["body"] == {"name": "e", "package_b64": "QQ=="}
+    assert seen["body"] == {
+        "name": "e",
+        "package_b64": "QQ==",
+        "project_id": "11111111-1111-4111-8111-111111111111",
+    }
 
 
 def test_unreachable_server_is_actionable():
