@@ -198,6 +198,10 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"trainer.total_training_steps={cfg['steps']}",
         f"trainer.save_freq={cfg['save_freq']}",
         "trainer.max_actor_ckpt_to_keep=1",
+        # resume from whatever _restore_verl_resume staged into default_local_dir. auto is a no-op
+        # when nothing was staged, so a fresh run is unaffected; without it a preempted run silently
+        # restarts at step 0 and re-bills the whole budget.
+        "trainer.resume_mode=auto",
         "trainer.test_freq=-1",
         "trainer.val_before_train=False",
         f"trainer.logger=[{cfg['loggers']}]",
@@ -278,12 +282,15 @@ def _build_verl_train_notes(
     retained_prompts: int,
     reward_history: list[float],
     loss_curve: list[float],
+    resumed: bool = False,
 ) -> dict:
     return {
         "backend": "verl",
         "steps": steps_run,
         "epochs": inp["epochs"],
         "retained_prompts": retained_prompts,
+        # matches the trl path: without it a resumed run is indistinguishable from a fresh one.
+        "resumed": resumed,
         "group_size": inp["group_size"],
         "reward_history": reward_history,
         "loss_curve": loss_curve,
@@ -490,6 +497,93 @@ def _export_peft_adapter(
     for name in os.listdir(lora_dir):
         shutil.copy2(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
     shutil.rmtree(merge_out, ignore_errors=True)
+
+
+class _VerlResumeUploader:
+    """stream each completed verl checkpoint to hf so a preempted grpo run can resume from it.
+
+    grpo publishes only a final deployable adapter (both backends), so unlike sft this uploads the
+    resume state alone. verl writes global_step_N under default_local_dir and only then advances
+    latest_checkpointed_iteration.txt, so gating on that marker never uploads a half-written dir.
+    """
+
+    def __init__(self, local_dir: str, *, resume_step: int) -> None:
+        self.local_dir = local_dir
+        # whatever this run resumed from is already durable; re-uploading it would waste the
+        # upload slot on state hf already holds.
+        self.processed_steps: set[int] = {resume_step} if resume_step else set()
+        self._error: BaseException | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=600)
+        if self._thread.is_alive():
+            raise RuntimeError("verl resume uploader did not stop")
+
+    def _completed_step(self) -> int:
+        tracker = os.path.join(self.local_dir, "latest_checkpointed_iteration.txt")
+        try:
+            with open(tracker) as file:
+                return int(file.read().strip())
+        except (FileNotFoundError, OSError, ValueError):
+            return 0
+
+    def _pending(self, completed_step: int) -> list[tuple[int, str]]:
+        found: list[tuple[int, str]] = []
+        try:
+            names = os.listdir(self.local_dir)
+        except OSError:
+            return found
+        for name in names:
+            match = re.fullmatch(r"global_step_(\d+)", name)
+            if match is None:
+                continue
+            step = int(match.group(1))
+            path = os.path.join(self.local_dir, name)
+            if step <= completed_step and step not in self.processed_steps and os.path.isdir(path):
+                found.append((step, path))
+        return sorted(found)
+
+    def _run(self) -> None:
+        # a failed resume upload must not fail the run: the policy is still trained and published at
+        # the end, and the only loss is having to restart from an earlier step after a preemption.
+        while True:
+            for step, path in self._pending(self._completed_step()):
+                try:
+                    _w.upload_resume_checkpoint(step, path)
+                except Exception as error:
+                    print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
+                self.processed_steps.add(step)
+            if self._stop.is_set() and not self._pending(self._completed_step()):
+                return
+            time.sleep(0.5)
+
+
+def _restore_verl_resume(local_dir: str) -> int:
+    """stage this run's streamed resume checkpoint into local_dir; return the step it resumes at.
+
+    the resume artifact is keyed on the run prefix, not the job type, so the control plane hands
+    grpo the same ``checkpoint-N`` layout it hands sft. verl finds it via
+    latest_checkpointed_iteration.txt under trainer.default_local_dir once resume_mode=auto.
+    returns 0 when there is nothing to resume, which is the ordinary fresh-run path.
+    """
+    resume = _w.hf_resume_checkpoint()
+    if not resume:
+        return 0
+    match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume))
+    if match is None:
+        raise RuntimeError(f"invalid GRPO resume checkpoint path {resume!r}")
+    step = int(match.group(1))
+    target = os.path.join(local_dir, f"global_step_{step}")
+    shutil.copytree(resume, target, dirs_exist_ok=True)
+    with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
+        file.write(str(step))
+    return step
 
 
 def _latest_global_step_dir(local_dir: str) -> tuple[str, int]:
@@ -783,6 +877,10 @@ def run_rl_verl():
     # a retry reuses the pod workdir; stale global_step_N dirs from a prior attempt would satisfy
     # _latest_global_step_dir and publish an old policy as if this attempt trained it.
     shutil.rmtree(local_dir, ignore_errors=True)
+    # restore after the wipe, never before: the wipe is what makes a stale local dir safe, and the
+    # resume checkpoint is the one global_step_N this attempt is entitled to start from.
+    os.makedirs(local_dir, exist_ok=True)
+    resume_step = _restore_verl_resume(local_dir)
     train_pq = os.path.join(workdir, "train.parquet")
     val_pq = os.path.join(workdir, "val.parquet")
     reward_py = os.path.join(workdir, "reward.py")
@@ -813,6 +911,8 @@ def run_rl_verl():
         return score
 
     server, reward_url = start_reward_server(_score, example_count=len(rollout_examples))
+    # bound before the try so the finally can always ask whether it was started.
+    resume_uploader: _VerlResumeUploader | None = None
     try:
         python_bin = resolve_verl_python(
             workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
@@ -866,6 +966,8 @@ def run_rl_verl():
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
         _w.heartbeat("rl_step", step=0, initial=True)
         t_train = time.time()
+        resume_uploader = _VerlResumeUploader(local_dir, resume_step=resume_step)
+        resume_uploader.start()
         step_box = [0]
 
         def _progress():
@@ -930,6 +1032,11 @@ def run_rl_verl():
         if rc != 0:
             raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
     finally:
+        # drain before the reward server goes down: on a cancel or crash the last completed
+        # checkpoint is exactly the one a retry needs, so it is worth uploading on the way out.
+        if resume_uploader is not None:
+            with contextlib.suppress(Exception):
+                resume_uploader.stop()
         server.shutdown()
 
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
@@ -981,5 +1088,6 @@ def run_rl_verl():
             retained_prompts=len(prompts),
             reward_history=reward_history,
             loss_curve=loss_curve,
+            resumed=bool(resume_step),
         ),
     )
