@@ -80,7 +80,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert calls[0][:2] == ["uv", "venv"]
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@0f821c22325a1a51384431d57b899cc5dcf3d837"
+        "verl @ git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
     )
     assert vc.VERL_REQUIREMENT in install
     assert "liger-kernel" in install
@@ -158,11 +158,12 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
 
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
     # asserting the constant alone would let a newer-base commit land silently, so bind the pinned
-    # commit itself to that version. this is the sha of the truncation-mask commit cherry-picked onto
-    # the v0.8.0 tag; moving the pin must be a deliberate edit here, with the base re-verified.
+    # commit itself to that version. this is the sha of the truncation-mask and 3d position id
+    # commits cherry-picked onto the v0.8.0 tag; moving the pin must be a deliberate edit here, with
+    # the base re-verified.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
-    assert commit == "0f821c22325a1a51384431d57b899cc5dcf3d837"
+    assert commit == "b7492fa3b7ab843294d06dbf754e887950f559c7"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(
