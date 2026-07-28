@@ -60,7 +60,7 @@ def _overrides_cfg(**over):
         "target_modules": "all-linear", "lr": 1e-5, "group_size": 8,
         "prompts_per_step": 16, "micro_batch": 2, "max_prompt_len": 2048,
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
-        "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "num_iterations": 2,
+        "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
         "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "loggers": "console", "fp8_kv": False,
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
         "total_epochs": 1, "save_freq": 20, "local_dir": "/w/ckpt",
@@ -79,9 +79,10 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "actor_rollout_ref.rollout.n=8" in o
     assert "actor_rollout_ref.rollout.load_format=safetensors" in o
     assert "actor_rollout_ref.rollout.top_p=0.95" in o
-    # constant lr, num_iterations, gradient checkpointing, seed, max-steps horizon, save schedule.
+    # constant lr, on-policy updates, gradient checkpointing, seed, max-steps horizon, save schedule.
+    assert "actor_rollout_ref.actor.optim.weight_decay=0.0" in o
     assert "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0" in o
-    assert "actor_rollout_ref.actor.ppo_epochs=2" in o
+    assert "actor_rollout_ref.actor.ppo_epochs=1" in o
     assert "actor_rollout_ref.model.enable_gradient_checkpointing=True" in o
     assert "data.seed=42" in o
     assert "actor_rollout_ref.rollout.seed=42" in o
@@ -93,6 +94,58 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     # truncated importance sampling: token-level, cap 2.0 (matches flash's tis recipe).
     assert "algorithm.rollout_correction.rollout_is=token" in o
     assert "algorithm.rollout_correction.rollout_is_threshold=2.0" in o
+
+
+def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
+    o = rl_verl.build_verl_overrides(_overrides_cfg())
+    assert not any("drop_last" in override for override in o)
+
+
+@pytest.mark.parametrize(
+    ("prompt_count", "prompts_per_step", "epochs", "max_steps", "expected_steps", "expected_epochs"),
+    [
+        pytest.param(33, 16, 2, None, 5, 3, id="partial-batch-derived-horizon"),
+        pytest.param(32, 16, 2, 7, 7, 4, id="explicit-horizon-beyond-derived"),
+        pytest.param(32, 16, 2, None, 4, 2, id="exactly-divisible"),
+    ],
+)
+def test_verl_epoch_capacity_reaches_update_horizon(
+    prompt_count, prompts_per_step, epochs, max_steps, expected_steps, expected_epochs
+):
+    derived_steps = rl_verl.on_policy_steps(
+        epochs=epochs, prompt_count=prompt_count, prompts_per_step=prompts_per_step
+    )
+    steps = rl_verl.resolve_update_horizon(derived_steps, max_steps)
+    resolved_epochs = rl_verl._verl_epochs_for_horizon(
+        epochs=epochs,
+        prompt_count=prompt_count,
+        prompts_per_step=prompts_per_step,
+        steps=steps,
+    )
+
+    assert steps == expected_steps
+    assert resolved_epochs == expected_epochs
+    assert (prompt_count // prompts_per_step) * resolved_epochs >= steps
+
+
+@pytest.mark.parametrize("prompt_count", [5, 0])
+def test_verl_epoch_capacity_handles_degenerate_prompt_counts(prompt_count):
+    # the resolver rejects zero prompts and clamps undersized batches before this helper is reached;
+    # keep the helper itself total so direct or future callers cannot divide by zero.
+    assert rl_verl._verl_epochs_for_horizon(
+        epochs=2, prompt_count=prompt_count, prompts_per_step=16, steps=1
+    ) == 2
+
+
+def test_verl_keeps_configured_epochs_separate_from_capacity_metadata():
+    resolver_src = inspect.getsource(rl_verl._resolve_single_turn_inputs)
+    assert '"epochs": epochs' in resolver_src
+    assert '"verl_total_epochs": verl_total_epochs' in resolver_src
+
+    run_src = inspect.getsource(rl_verl.run_rl_verl)
+    assert '"total_epochs": inp["verl_total_epochs"]' in run_src
+    assert '"epochs": inp["epochs"]' in run_src
+    assert '"verl_total_epochs": inp["verl_total_epochs"]' in run_src
 
 
 def test_build_verl_overrides_wandb_logger_when_enabled():
