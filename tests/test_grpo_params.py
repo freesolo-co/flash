@@ -301,7 +301,7 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
 
 
 def test_init_from_adapter_accepts_checkpoint_step_ref() -> None:
-    """`<run_id>/step-N` (exactly what `flash checkpoints` lists) warm-starts from that saved
+    """`<run_id>/step-N` (exactly what `flash runs checkpoint` lists) warm-starts from that saved
     step instead of the run-level adapter — e.g. continuing GRPO from the best checkpoint."""
     spec = spec_from_dict(_spec_raw("run-x/step-40"), run_id="grpo-x")
     assert spec.train.init_from_adapter == "run-x/step-40"

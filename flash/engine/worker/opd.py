@@ -1184,7 +1184,7 @@ def run_opd():
                 nseq = 0
                 step_skip_counts: Counter[str] = Counter()
                 # Distilled (prompt_messages, completion_text, loss) captured this attempt so the
-                # post-update opd_step heartbeat can surface a few student completions in `flash log`
+                # post-update opd_step heartbeat can surface a few student completions in `flash runs log`
                 # (parity with GRPO's reward samples). Reset per attempt so a resampled rollout does
                 # not carry the discarded attempt's completions. Loss is stored as a plain float, never
                 # the graph-holding tensor.
@@ -1500,7 +1500,7 @@ def run_opd():
             loss_curve.append(avg_loss)
             coverage_curve.append(avg_cov)
             # Surface up to three distilled student completions (with their per-sample distillation
-            # loss) on this step's heartbeat so `flash log` shows what the student generated — the OPD
+            # loss) on this step's heartbeat so `flash runs log` shows what the student generated — the OPD
             # analog of GRPO's reward samples, catching a collapsed/degenerate student early. Each is
             # labelled with the pre-update step whose policy generated it (generated_at_opt_steps).
             sampled_completions = select_rollout_samples(

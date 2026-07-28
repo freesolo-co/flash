@@ -7,6 +7,8 @@ import urllib.request
 from datetime import UTC, datetime
 from typing import Any
 
+from flash.spec import require_project_id
+
 from ._internal_client import org_id_of, post_internal_json
 
 _LOG = logging.getLogger("flash.server.runs")
@@ -69,6 +71,10 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         return False
 
     spec = _spec_from_status(status)
+    try:
+        project_id = require_project_id(spec.get("project"))
+    except (TypeError, ValueError):
+        return False
     gpu = spec.get("gpu") if isinstance(spec.get("gpu"), dict) else {}
     body = {
         "orgId": org_id,
@@ -76,7 +82,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "status": status.state,
         "userId": context.get("user_id"),
         "apiKeyId": context.get("api_key_id"),
-        "projectId": (spec.get("project") or None) if isinstance(spec.get("project"), str) else None,
+        "projectId": project_id,
         "environmentSlug": _managed_environment_slug(spec),
         "model": spec.get("model") if isinstance(spec.get("model"), str) else None,
         "algorithm": spec.get("algorithm") if isinstance(spec.get("algorithm"), str) else None,
@@ -117,11 +123,16 @@ def record_model_exported(
     if not org_id:
         return False
     spec = _spec_from_status(status)
+    try:
+        project_id = require_project_id(spec.get("project"))
+    except (TypeError, ValueError):
+        return False
     body = {
         "orgId": org_id,
         "userId": context.get("user_id"),
         "event": "flash_model_exported",
         "properties": {
+            "project": project_id,
             "run_id": status.run_id,
             "repository": repository,
             "url": url,
@@ -151,8 +162,14 @@ def record_training_checkpoint(
     org_id = org_id_of(context)
     if not org_id:
         return False
+    persisted_spec = _spec_from_status(status)
+    try:
+        project_id = require_project_id(persisted_spec.get("project"))
+    except (TypeError, ValueError):
+        return False
     body = {
         "orgId": org_id,
+        "projectId": project_id,
         "runId": spec.run_id,
         "checkpointId": "final",
         "phase": getattr(spec, "phase", None),

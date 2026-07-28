@@ -17,6 +17,7 @@ from flash.schema import (
     ConfigError,
     parse_adapter_revision,
     spec_from_dict,
+    spec_from_file,
     train_schema_metadata,
     validate_train_keys,
 )
@@ -25,6 +26,7 @@ from flash.spec import GpuSpec, JobSpec, TrainSpec, load_job_spec_from_env
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
+    "project": "11111111-1111-4111-8111-111111111111",
     "environment": {"id": "freesolo/gsm8k"},
     "train": {"epochs": 1, "max_examples": 10, "lora_rank": 8},
     "gpu": {},
@@ -40,6 +42,10 @@ def _raw(**overrides) -> dict:
         else:
             raw[section] = value
     return raw
+
+
+def _job_from_dict(data: dict) -> JobSpec:
+    return JobSpec.from_dict({"project": "11111111-1111-4111-8111-111111111111", **data})
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +101,7 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         ({"gpu.count": 9}, "gpu.count must be between 1 and 8"),
         ({"gpu.count": True}, "gpu.count must be an integer"),
         ({"gpu.count": "two"}, "gpu.count must be an integer"),
-        # `project` (the dashboard grouping id) must be a plain string: a table/array/number is a
-        # clean 400, never a 500. Empty/whitespace stays allowed (means "ungrouped", tested below).
+        # `project` is the required canonical freesolo project id and must be a plain string.
         ({"project": ["p"]}, "project must be a string"),
         ({"project": 5}, "project must be a string"),
         ({"project": {"id": "p"}}, "project must be a string"),
@@ -161,18 +166,44 @@ def test_credit_assignment_defaults_accepts_and_roundtrips() -> None:
     assert JobSpec.from_json(per_turn.to_json()).train.credit_assignment == "per_turn"
 
 
-def test_project_id_parses_strips_and_roundtrips() -> None:
-    # the flash `project` toml field is the dashboard grouping id: it parses to a trimmed
-    # string, defaults to "" (ungrouped) when omitted, and must survive the control-plane ->
-    # worker JobSpec boundary so run_registry can report it as projectId.
-    assert spec_from_dict(_raw()).project == ""
-    assert spec_from_dict(_raw(project="   ")).project == ""
+def test_toml_config_requires_project(tmp_path) -> None:
+    config = tmp_path / "train.toml"
+    config.write_text(
+        'model = "Qwen/Qwen3.5-0.8B"\n'
+        'algorithm = "sft"\n'
+        '[environment]\nid = "freesolo/gsm8k"\n'
+        "[train]\nepochs = 1\nmax_examples = 1\n"
+    )
 
-    grouped = spec_from_dict(_raw(project="  proj-123  "))
-    assert grouped.project == "proj-123"
-    assert grouped.to_dict()["project"] == "proj-123"
-    assert JobSpec.from_dict(grouped.to_dict()).project == "proj-123"
-    assert JobSpec.from_json(grouped.to_json()).project == "proj-123"
+    with pytest.raises(ConfigError, match="project is required and must be nonblank"):
+        spec_from_file(str(config), project_required=True)
+
+
+def test_project_id_is_required_canonicalized_and_roundtrips() -> None:
+    missing = _raw()
+    missing.pop("project")
+    with pytest.raises(ConfigError, match="project is required and must be nonblank"):
+        spec_from_dict(missing, project_required=True)
+    with pytest.raises(ConfigError, match="project is required and must be nonblank"):
+        spec_from_dict(_raw(project="   "), project_required=True)
+    with pytest.raises(ConfigError, match="project must be a valid UUID"):
+        spec_from_dict(_raw(project="not-a-uuid"))
+    assert JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B"}).project == ""
+
+    synthetic = JobSpec(model="Qwen/Qwen3.5-0.8B")
+    assert synthetic.project == ""
+    assert synthetic.to_dict()["project"] == ""
+    from flash.client.specs import spec_payload
+
+    with pytest.raises(ValueError, match="project is required and must be nonblank"):
+        spec_payload(synthetic)
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    grouped = spec_from_dict(_raw(project=f"  {project_id.upper()}  "))
+    assert grouped.project == project_id
+    assert grouped.to_dict()["project"] == project_id
+    assert _job_from_dict(grouped.to_dict()).project == project_id
+    assert JobSpec.from_json(grouped.to_json()).project == project_id
 
 
 @pytest.mark.parametrize("invalid", ["per_step", 1])
@@ -188,14 +219,14 @@ def test_job_spec_from_dict_credit_assignment_validates_worker_boundary() -> Non
     # the worker-side deserialization boundary must round-trip valid modes, default a missing value,
     # and reject a malformed persisted/tampered value rather than silently downgrading to per-episode.
     payload = spec_from_dict(_raw(**{"train.credit_assignment": "per_turn"})).to_dict()
-    assert JobSpec.from_dict(payload).train.credit_assignment == "per_turn"
+    assert _job_from_dict(payload).train.credit_assignment == "per_turn"
 
     payload["train"].pop("credit_assignment", None)
-    assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
+    assert _job_from_dict(payload).train.credit_assignment == "per_episode"
 
     payload["train"]["credit_assignment"] = "per_step"
     with pytest.raises(ValueError, match="credit_assignment must be one of"):
-        JobSpec.from_dict(payload)
+        _job_from_dict(payload)
 
 
 def test_train_key_validator_rejects_unknown_names_only() -> None:
@@ -302,7 +333,7 @@ def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> Non
 
 
 def test_public_warmstart_serialization_omits_resolved_internal_fields() -> None:
-    spec = JobSpec.from_dict(
+    spec = _job_from_dict(
         {
             **BASE_RAW,
             "train": {
@@ -322,7 +353,7 @@ def test_public_warmstart_serialization_omits_resolved_internal_fields() -> None
     assert "lora_rank" not in public["train"]
     assert internal["train"]["init_from_adapter_revision"] == "a" * 40
     assert internal["train"]["lora_rank"] == 64
-    assert JobSpec.from_dict(internal) == spec
+    assert _job_from_dict(internal) == spec
 
 
 def test_public_warmstart_status_spec_round_trips_through_schema() -> None:
@@ -376,7 +407,7 @@ def test_sft_requires_positive_max_examples() -> None:
 
 def test_missing_model_is_rejected() -> None:
     with pytest.raises(ConfigError, match="must set `model`"):
-        spec_from_dict({"algorithm": "sft"})
+        spec_from_dict({"project": "11111111-1111-4111-8111-111111111111", "algorithm": "sft"})
 
 
 def test_hf_repo_is_managed_not_user_set() -> None:
@@ -620,11 +651,12 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
 def test_jobspec_from_dict_rejects_path() -> None:
     # Defense-in-depth: a stale worker payload carrying a local path must be rejected.
     data = {
+        "project": "11111111-1111-4111-8111-111111111111",
         "model": "Qwen/Qwen3-0.6B",
         "environment": {"id": "gsm8k", "path": "./environment.py"},
     }
     with pytest.raises(ValueError, match="local environment paths are no longer supported"):
-        JobSpec.from_dict(data)
+        _job_from_dict(data)
 
 
 # ---------------------------------------------------------------------------
@@ -725,17 +757,17 @@ def test_removed_gpu_pin_key_is_rejected_as_unknown() -> None:
     with pytest.raises(ConfigError, match=r"\[gpu\] unknown key"):
         spec_from_dict(raw)
     with pytest.raises(ValueError, match=r"gpu has unknown key"):
-        JobSpec.from_dict({"gpu": {removed_key: "H100"}})
+        _job_from_dict({"gpu": {removed_key: "H100"}})
 
 
 def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
-    assert JobSpec.from_dict({"gpu": {"type": " h100 "}}).gpu.type == "H100"
+    assert _job_from_dict({"gpu": {"type": " h100 "}}).gpu.type == "H100"
     with pytest.raises(TypeError, match=r"gpu\.type must be a string"):
-        JobSpec.from_dict({"gpu": {"type": 1}})
+        _job_from_dict({"gpu": {"type": 1}})
     with pytest.raises(ValueError, match=r"gpu\.type: unsupported gpu 'H10O'"):
-        JobSpec.from_dict({"gpu": {"type": "H10O"}})
+        _job_from_dict({"gpu": {"type": "H10O"}})
     with pytest.raises(ValueError, match=r"unsupported gpu 'RTX A6000'"):
-        JobSpec.from_dict({"gpu": {"type": "RTX A6000"}})
+        _job_from_dict({"gpu": {"type": "RTX A6000"}})
 
 
 def test_model_revision_strips_round_trips_and_rejects_non_strings() -> None:
@@ -751,7 +783,7 @@ def test_model_revision_strips_round_trips_and_rejects_non_strings() -> None:
         with pytest.raises(ConfigError, match="model_revision must be a string"):
             spec_from_dict(_raw(model_revision=value))
         with pytest.raises(TypeError, match="model_revision must be a string"):
-            JobSpec.from_dict({"model_revision": value})
+            _job_from_dict({"model_revision": value})
 
 
 def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
@@ -760,21 +792,21 @@ def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
 
     for gpu in (False, "H100", ["H100"]):
         with pytest.raises(TypeError, match="gpu must be an object"):
-            JobSpec.from_dict({"gpu": gpu})
+            _job_from_dict({"gpu": gpu})
     with pytest.raises(ValueError, match=r"gpu has unknown key\(s\): exact_typ"):
-        JobSpec.from_dict({"gpu": {"exact_typ": "H100"}})
+        _job_from_dict({"gpu": {"exact_typ": "H100"}})
     with pytest.raises(TypeError, match=r"gpu\.provider must be a string"):
-        JobSpec.from_dict({"gpu": {"provider": 1}})
+        _job_from_dict({"gpu": {"provider": 1}})
     with pytest.raises(TypeError, match=r"gpu\.type must be a string"):
-        JobSpec.from_dict({"gpu": {"type": 1}})
+        _job_from_dict({"gpu": {"type": 1}})
     with pytest.raises(ValueError, match="cannot provision"):
-        JobSpec.from_dict({"gpu": {"provider": "lambda", "type": "RTX 4090"}})
+        _job_from_dict({"gpu": {"provider": "lambda", "type": "RTX 4090"}})
 
-    restored = JobSpec.from_dict({"gpu": {"provider": " LAMBDA ", "type": "h100"}})
+    restored = _job_from_dict({"gpu": {"provider": " LAMBDA ", "type": "h100"}})
     assert restored.gpu.provider == "lambda"
     assert restored.gpu.type == "H100"
-    assert JobSpec.from_dict({}).gpu.provider == ""
-    assert JobSpec.from_dict({}).gpu.type == ""
+    assert _job_from_dict({}).gpu.provider == ""
+    assert _job_from_dict({}).gpu.type == ""
 
 
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
@@ -834,7 +866,12 @@ def test_programmatic_sft_submit_requires_max_examples(tmp_path, monkeypatch) ->
     from flash.spec import JobSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
-    spec = JobSpec(run_id="sft-no-examples", model="Qwen/Qwen3.5-0.8B", algorithm="sft")
+    spec = JobSpec(
+        run_id="sft-no-examples",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        project="11111111-1111-4111-8111-111111111111",
+    )
     with pytest.raises(ValueError, match=r"max_examples.*positive"):
         orch.submit_job(spec, dry_run=True)
 
@@ -847,6 +884,7 @@ def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypa
         run_id="sft-warmstart",
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
+        project="11111111-1111-4111-8111-111111111111",
         train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
     )
     with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
@@ -864,7 +902,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     # (to_internal_dict -> from_dict), which is what the worker/control plane use, not to_dict().
     d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
-    spec_with_repo = JobSpec.from_dict(d)
+    spec_with_repo = _job_from_dict(d)
     assert orch.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
 
 
@@ -1034,7 +1072,7 @@ def test_gpu_count_parses_and_roundtrips() -> None:
     parsed = spec_from_dict(_raw(**{"gpu.count": 4}))
     assert parsed.gpu.count == 4
     # count survives both serialization hops (asdict-based to_dict / to_json).
-    assert JobSpec.from_dict(parsed.to_dict()).gpu.count == 4
+    assert _job_from_dict(parsed.to_dict()).gpu.count == 4
     assert JobSpec.from_json(parsed.to_json()).gpu.count == 4
 
 
@@ -1062,5 +1100,10 @@ def test_gpu_count_of_reads_spec_and_defaults() -> None:
     from flash.spec import gpu_count_of
 
     assert gpu_count_of(None) == 1  # no spec -> single gpu
-    assert gpu_count_of(JobSpec()) == 1  # default spec
-    assert gpu_count_of(JobSpec(gpu=GpuSpec(count=3))) == 3
+    assert (
+        gpu_count_of(JobSpec(project="11111111-1111-4111-8111-111111111111")) == 1
+    )  # default gpu count
+    assert (
+        gpu_count_of(JobSpec(project="11111111-1111-4111-8111-111111111111", gpu=GpuSpec(count=3)))
+        == 3
+    )

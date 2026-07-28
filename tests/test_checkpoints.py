@@ -288,7 +288,7 @@ def test_on_train_end_flushes_final_deployable_checkpoint(
 ):
     """on_train_end is the safety net for a final checkpoint the trainer wrote WITHOUT an on_save
     (e.g. an end-of-training / load_best_model_at_end save). It must publish the latest on-disk
-    checkpoint as a deployable — otherwise `flash checkpoints` is empty even though the run trained
+    checkpoint as a deployable — otherwise `flash runs checkpoint` is empty even though the run trained
     fine. (on_save uploads synchronously, so every step it sees is already up by this point.)"""
     import flash.engine.worker as worker
 
@@ -657,6 +657,7 @@ def test_register_run_checkpoints_body_shape(monkeypatch):
     assert body["baseModel"] == "Qwen/Qwen3.5-4B"
     assert body["repoId"] == "org/test-runs"
     assert body["repoType"] == "dataset"
+    assert "projectId" not in body
     assert body["checkpoints"] == [
         {"step": 40, "subfolder": "rl/flash-ckpt-1/checkpoints/step-40/adapter"},
         {"step": 80, "subfolder": "rl/flash-ckpt-1/checkpoints/step-80/adapter"},
