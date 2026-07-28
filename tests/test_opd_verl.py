@@ -4539,6 +4539,50 @@ def test_remote_distillation_config_declares_every_field_post_init_assigns():
     )
 
 
+def test_agent_loops_are_registered_under_an_importable_qualname():
+    # verl's `register` (agent_loop.py) stores f"{cls.__module__}.{cls.__qualname__}" into the agent
+    # loop registry at decoration time, and hydra resolves that string later with a plain dotted-path
+    # import. both flash loops are defined inside a function, so their natural qualname carries
+    # `<locals>` and NOTHING can import it: the run dies at first rollout with
+    # "Error locating target ... <locals>.FlashSingleTurnAgentLoop". the fix is ordering-sensitive --
+    # rewriting __qualname__ after the decorator already ran does not help, because the registry
+    # captured the broken string. so assert both dunders are rewritten BEFORE the register call.
+    #
+    # AST rather than import, for the same reason as the config test above: verl is not installed in
+    # CI, so an importorskip guard would silently skip on the machine that gates the merge.
+    import ast
+    import inspect
+
+    from flash.engine.worker import opd_verl_multiturn, opd_verl_plugin
+
+    sources = {
+        "flash_single_turn": inspect.getsource(opd_verl_plugin._install_verl_extensions),
+        "flash_multi_turn": inspect.getsource(
+            opd_verl_multiturn.build_flash_multi_turn_agent_loop
+        ),
+    }
+
+    for agent_name, source in sources.items():
+        body = ast.unparse(ast.parse(source))
+        cls = "FlashSingleTurnAgentLoop" if "single" in agent_name else "FlashMultiTurnAgentLoop"
+
+        # a decorator would register the class before either dunder can be corrected
+        assert f"@register('{agent_name}')" not in body, (
+            f"{cls} is registered by decorator; verl freezes the `<locals>` qualname at that point"
+        )
+
+        register_at = body.find(f"register('{agent_name}')")
+        assert register_at != -1, f"{cls} is no longer registered as {agent_name}"
+
+        for dunder in ("__module__", "__qualname__"):
+            set_at = body.find(f"{cls}.{dunder} =")
+            assert set_at != -1, f"{cls}.{dunder} is not rewritten; hydra cannot locate the class"
+            assert set_at < register_at, (
+                f"{cls}.{dunder} is rewritten after register(); the registry already captured "
+                "the unimportable name"
+            )
+
+
 def test_structured_overrides_pin_xgrammar_and_thinking_parser():
     overrides = dict(
         value.split("=", 1)

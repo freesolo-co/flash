@@ -804,7 +804,6 @@ def _install_verl_extensions() -> None:
     AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
     teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
 
-    @register("flash_single_turn")
     class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
             params = dict(sampling_params)
@@ -844,8 +843,15 @@ def _install_verl_extensions() -> None:
             output.reward_score = 0.0
             return output
 
+    # verl's `register` freezes `f"{__module__}.{__qualname__}"` into the agent-loop registry at
+    # decoration time, and hydra later resolves that string with a plain dotted-path lookup. this
+    # class is defined inside a function, so its qualname carries `<locals>` and no lookup can
+    # reach it. rewrite both dunders to the importable module-level name first, publish the class
+    # there, and only then register, exactly as the multi-turn loop already does.
     FlashSingleTurnAgentLoop.__module__ = __name__
+    FlashSingleTurnAgentLoop.__qualname__ = "FlashSingleTurnAgentLoop"
     globals()["FlashSingleTurnAgentLoop"] = FlashSingleTurnAgentLoop
+    register("flash_single_turn")(FlashSingleTurnAgentLoop)
 
     FlashMultiTurnAgentLoop = build_flash_multi_turn_agent_loop(
         register=register,
