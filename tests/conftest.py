@@ -37,6 +37,14 @@ def _offline(monkeypatch):
     monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
     monkeypatch.delenv("VAST_API_KEY", raising=False)
 
+    # RUNPOD_API_KEY gets deleted rather than merely reset. Importing ``runpod_flash`` runs
+    # ``load_dotenv(find_dotenv(usecwd=True))`` at module scope, which walks UP out of the repo
+    # and loads whatever .env it finds -- so on an operator box a real key appears in os.environ
+    # partway through the suite, as soon as some test imports that package. Tests that seed a key
+    # only when none is set would then run against the operator's live credential. Delete it so
+    # the starting state is the same everywhere; tests that need one set it with ``setenv``.
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
     # it to a single active key never loses the rest of the pool). Reset it around every
     # test so a key set/collapsed by one test can't leak into the next.

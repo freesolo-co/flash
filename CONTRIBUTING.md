@@ -14,12 +14,16 @@ credentials:
 
 ```bash
 uv sync --extra server --dev
-uv run pytest
+uv run pytest -q
 uv run ruff check .
 ```
 
 That is the same set of checks CI runs (`.github/workflows/ci.yml`), so a green local run
 usually means a green CI run.
+
+To run the CLI from a dev checkout, use `uv run python -m flash.cli --help`. The `--dev`
+group installs `runpod-flash`, which also declares a `flash` console script, so plain
+`uv run flash` may resolve to RunPod's CLI instead of this one.
 
 Formatting is not yet enforced across the whole tree: `ruff format .` would rewrite a large
 number of files unrelated to your change. Format only the files you touched

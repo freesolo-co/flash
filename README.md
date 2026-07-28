@@ -6,13 +6,14 @@ serves the resulting adapter.
 
 ```bash
 pip install freesolo-flash
+export FREESOLO_API_KEY=fslo_...
 flash login
 flash train run.toml
 ```
 
-The allocator picks the cheapest validated GPU class that fits the run, one dedicated GPU
-per run, supervised server-side (stall watchdog, bounded auto-retry resuming from the last
-streamed checkpoint, endpoint GC).
+The allocator picks the cheapest validated GPU class that fits the run — one dedicated
+worker allocation per run, on one or more GPUs — supervised server-side (stall watchdog,
+bounded auto-retry resuming from the last streamed checkpoint, endpoint GC).
 
 ## What this repository is
 
@@ -42,11 +43,13 @@ possible but requires replacing the components above — see [Self-hosting](#sel
 
 ## Using the hosted service
 
-Install the client and authenticate with a freesolo API key:
+Install the client and authenticate with a freesolo API key. `flash login` is not
+interactive — pass the key explicitly or export `FREESOLO_API_KEY` first:
 
 ```bash
 pip install freesolo-flash
-flash login          # stores your key
+export FREESOLO_API_KEY=fslo_...
+flash login          # validates the key and stores it in ~/.flash/config.json
 flash whoami         # confirm the identity behind it
 ```
 
@@ -54,14 +57,14 @@ Every run names an environment, which supplies the task data and the reward or S
 Environments are published under a project, which scopes them to an organization:
 
 ```bash
-flash env setup                                   # scaffold environment.py + dataset/train.jsonl
-flash env push --project <uuid> --name my-env .   # returns an environment id
+flash env setup                                       # scaffold environment.py + dataset/train.jsonl
+flash env push --project PROJECT_UUID --name my-env .  # returns an environment id
 ```
 
 Project ids come from your Freesolo dashboard. Then describe the run and submit it:
 
 ```toml
-project = "<project-uuid>"
+project = "your-project-uuid"
 model = "Qwen/Qwen3.5-4B"
 algorithm = "sft"
 
@@ -75,10 +78,10 @@ lora_rank = 32
 ```
 
 ```bash
-flash train run.toml     # submit
-flash status <run-id>    # follow it
-flash deploy <run-id>    # serve the trained adapter
-flash chat <run-id>      # talk to it
+flash train run.toml               # submit, prints a run id
+flash status RUN_ID                # follow it
+flash deploy RUN_ID                # serve the trained adapter
+flash chat RUN_ID -m "hello"       # talk to it
 ```
 
 `flash models` lists supported base models, `flash gpus` lists GPU classes with estimated
@@ -124,15 +127,25 @@ The test suite is CPU-only and offline by default. No GPU, no network, no creden
 
 ```bash
 uv sync --extra server --dev
-uv run pytest                            # ~180 test files, offline
+uv run pytest -q                         # ~170 test files, offline
 uv run ruff check .                      # lint
-uv run flash --help
 ```
 
-That is what CI runs (`.github/workflows/ci.yml`). Formatting is not enforced
-repo-wide yet, so run `ruff format` on the files you touched rather than the whole
-tree. See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching model —
-in short, **pull requests go into `dev`**.
+Those three are exactly what CI runs (`.github/workflows/ci.yml`).
+
+To exercise the CLI from a dev checkout, invoke the module rather than the `flash` script:
+
+```bash
+uv run python -m flash.cli --help
+```
+
+The `--dev` group installs `runpod-flash`, which also declares a `flash` console script,
+so `uv run flash` in this environment may launch RunPod's CLI instead of this one.
+`python -m flash.cli` is unambiguous. Installed users are unaffected.
+
+Formatting is not enforced repo-wide yet, so run `ruff format` on the files you touched
+rather than the whole tree. See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching
+model — in short, **pull requests go into `dev`**.
 
 ### Layout
 
@@ -184,8 +197,12 @@ fully independent deployment:
    it elsewhere with `FREESOLO_SERVING_URL`, but this repository does not include a
    serving backend.
 
-The GPU worker image (`ghcr.io/freesolo-co/flash-worker`) is public and can be pulled
-directly.
+The GPU worker image is public and can be pulled directly. It is published under an
+explicit CUDA tag, not `latest`:
+
+```bash
+docker pull ghcr.io/freesolo-co/flash-worker:cu128
+```
 
 ## Release channels
 
@@ -202,9 +219,15 @@ Each environment holds exactly **one** channel: both packages ship the same impo
 makes the later install win for _both_ CLIs. For side-by-side prod and staging, install
 each channel in its own virtualenv (or via `pipx`, which isolates per tool). The dev build
 is produced by `scripts/build_dev_dist.py`, which renames the package/CLI and flips
-`CHANNEL` to `dev` before `uv build`. Both channels ship at the **same version**:
+`CHANNEL` to `dev` before `uv build`.
+
+Within any single commit the two version fields are locked together:
 `[project].version` and `[tool.flash-dev].version` must match (CI enforces this via
 `.github/workflows/version-parity.yml`), so cutting a release means bumping both together.
+The **published** channels can still differ, because dev publishes on merge to `dev` while
+prod only publishes once `dev` is promoted to `main` — so `freesolo-flash-dev` is normally
+one or more versions ahead of `freesolo-flash`.
+
 Either CLI still honours an explicit `FLASH_API_URL` / the `login --api-url` flag; the
 channel only sets the default.
 
