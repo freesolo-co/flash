@@ -3791,6 +3791,43 @@ def test_optimizer_rank_posts_marker_once_across_multiple_steps(monkeypatch):
     assert updates == [True, True]
 
 
+def test_wrapped_optimizer_step_survives_the_lr_scheduler_rebind(monkeypatch):
+    # verl builds a warmup lr scheduler immediately after the optimizer, and torch's
+    # LRScheduler.__init__ patches optimizer.step through step_fn.__func__ followed by
+    # func.__get__(opt, opt.__class__). both only exist on a bound method, so wrapping step with a
+    # plain function crashed every opd run at engine construction, before any gpu work, with
+    # "'function' object has no attribute '__func__'". this replays that exact sequence rather
+    # than importing torch so it gates on machines without the training extras installed.
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    coordination = []
+    updates = []
+
+    class Optimizer:
+        def step(self, scale=1):
+            updates.append(scale)
+            return len(updates)
+
+    monkeypatch.setattr(
+        plugin,
+        "_coordinate_first_mutation_notice",
+        lambda url, token: coordination.append((url, token)),
+        raising=False,
+    )
+    optimizer = plugin._wrap_optimizer_with_mutation_notice(
+        Optimizer(),
+        "http://bridge",
+        "token",
+    )
+
+    function = optimizer.step.__func__
+    optimizer.step = function.__get__(optimizer, type(optimizer))
+
+    assert optimizer.step(scale=2) == 1
+    assert updates == [2]
+    assert coordination == [("http://bridge", "token")]
+
+
 def test_each_optimizer_rank_acknowledges_marker_while_parent_publishes_once(
     monkeypatch,
 ):
@@ -4394,6 +4431,7 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["++actor_rollout_ref.rollout.limit_images"] == "8"
     assert overrides["++actor_rollout_ref.rollout.engine_kwargs.vllm.seed"] == "42"
     assert "actor_rollout_ref.rollout.seed" not in overrides
+    assert overrides["actor_rollout_ref.rollout.load_format"] == "safetensors"
     assert "actor.engine.ulysses_sequence_parallel_size" not in overrides
     assert "ref_log_prob" not in " ".join(overrides)
     assert not any("structured_outputs_config" in key for key in overrides)
@@ -4410,6 +4448,169 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     )
     assert multi_turn_overrides["actor_rollout_ref.rollout.prompt_length"] == "1536"
     assert multi_turn_overrides["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"] == "1536"
+
+
+def test_overrides_size_agent_loop_workers_to_the_opd_rollout_batch():
+    # opd runs async rollout through verl's AgentLoopManager, which chunks
+    # train_batch_size * group_size across agent.num_workers and asserts the split is exact.
+    # verl's default of 8 aborts before the first step on e.g. 2 x 2 = 4.
+    small = dict(
+        value.split("=", 1)
+        for value in build_opd_verl_overrides(_config(train_batch_size=2, group_size=2))
+    )
+    assert small["actor_rollout_ref.rollout.agent.num_workers"] == "4"
+    # the common case still gets the full worker pool.
+    big = dict(
+        value.split("=", 1)
+        for value in build_opd_verl_overrides(_config(train_batch_size=64, group_size=8))
+    )
+    assert big["actor_rollout_ref.rollout.agent.num_workers"] == "8"
+
+
+def test_overrides_bound_transfer_queue_storage_to_one_unit():
+    # verl force-enables TransferQueue on the opd entry point and defaults SimpleStorage to 8
+    # storage units. tq.init reserves them with a SPREAD placement group and blocks in
+    # ray.get(pg.ready()) with no timeout, so any cluster with fewer free cpus than units hangs
+    # the run forever before a gpu is touched. flash's trainer is single-node: one unit.
+    overrides = dict(value.split("=", 1) for value in build_opd_verl_overrides(_config()))
+    assert overrides["transfer_queue.backend.SimpleStorage.num_data_storage_units"] == "1"
+
+
+def test_remote_distillation_config_declares_every_field_post_init_assigns():
+    # verl's BaseConfig.__setattr__ (base_config.py) raises FrozenInstanceError for any assignment to
+    # an already-set field that is not in _mutable_fields. FlashRemoteDistillationConfig's __post_init__
+    # normalizes distillation_loss and clears teacher_models, so BOTH must be declared mutable -- else
+    # hydra's instantiate of distillation._target_ dies at worker startup, i.e. only on GPU, after the
+    # run is already paid for. That is exactly how this shipped: the only other coverage of this class
+    # asserts the _target_ STRING and never constructs it.
+    #
+    # Checked by AST rather than by instantiating: verl is not installed in CI (it lives in a separate
+    # baked venv), so an importorskip test would skip here and prove nothing on the machine that gates
+    # the merge. Reading the source needs no verl at runtime and still fails on a new unlisted field.
+    import ast
+    import inspect
+
+    from flash.engine.worker import opd_verl_plugin as plugin
+
+    installer = ast.parse(inspect.getsource(plugin._install_verl_extensions))
+    class_defs = [
+        node
+        for node in ast.walk(installer)
+        if isinstance(node, ast.ClassDef) and node.name == "FlashRemoteDistillationConfig"
+    ]
+    assert len(class_defs) == 1, "expected exactly one FlashRemoteDistillationConfig definition"
+    class_def = class_defs[0]
+
+    declared: set[str] = set()
+    post_init = None
+    for node in class_def.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_mutable_fields" for t in node.targets
+        ):
+            # the value is `<Parent>._mutable_fields | {...}`; only the literal half is readable here,
+            # so union in the parent's own set below rather than guessing at its contents.
+            declared |= {
+                el.value
+                for el in ast.walk(node.value)
+                if isinstance(el, ast.Constant) and isinstance(el.value, str)
+            }
+        if isinstance(node, ast.FunctionDef) and node.name == "__post_init__":
+            post_init = node
+
+    assert post_init is not None, "__post_init__ disappeared; this guard no longer covers anything"
+
+    # verl's DistillationConfig already declares these, so flash's literal need not repeat them.
+    inherited = {"teacher_models", "n_gpus_per_node", "nnodes"}
+    assigned = {
+        target.attr
+        for node in ast.walk(post_init)
+        for target in getattr(node, "targets", [])
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    }
+    assert assigned, "no self.<field> assignments found; the AST walk is not seeing the body"
+    assert "distillation_loss" in assigned  # pin the specific field that broke
+
+    undeclared = assigned - declared - inherited
+    assert not undeclared, (
+        f"__post_init__ assigns {sorted(undeclared)} but they are not in _mutable_fields; "
+        "verl will raise FrozenInstanceError at worker startup"
+    )
+
+
+def test_agent_loops_are_registered_under_an_importable_qualname():
+    # verl's `register` (agent_loop.py) stores f"{cls.__module__}.{cls.__qualname__}" into the agent
+    # loop registry at decoration time, and hydra resolves that string later with a plain dotted-path
+    # import. both flash loops are defined inside a function, so their natural qualname carries
+    # `<locals>` and NOTHING can import it: the run dies at first rollout with
+    # "Error locating target ... <locals>.FlashSingleTurnAgentLoop". the fix is ordering-sensitive --
+    # rewriting __qualname__ after the decorator already ran does not help, because the registry
+    # captured the broken string. so assert both dunders are rewritten BEFORE the register call.
+    #
+    # AST rather than import, for the same reason as the config test above: verl is not installed in
+    # CI, so an importorskip guard would silently skip on the machine that gates the merge.
+    import ast
+    import inspect
+
+    from flash.engine.worker import opd_verl_multiturn, opd_verl_plugin
+
+    sources = {
+        "flash_single_turn": inspect.getsource(opd_verl_plugin._install_verl_extensions),
+        "flash_multi_turn": inspect.getsource(
+            opd_verl_multiturn.build_flash_multi_turn_agent_loop
+        ),
+    }
+
+    for agent_name, source in sources.items():
+        body = ast.unparse(ast.parse(source))
+        cls = "FlashSingleTurnAgentLoop" if "single" in agent_name else "FlashMultiTurnAgentLoop"
+
+        # a decorator would register the class before either dunder can be corrected
+        assert f"@register('{agent_name}')" not in body, (
+            f"{cls} is registered by decorator; verl freezes the `<locals>` qualname at that point"
+        )
+
+        register_at = body.find(f"register('{agent_name}')")
+        assert register_at != -1, f"{cls} is no longer registered as {agent_name}"
+
+        for dunder in ("__module__", "__qualname__"):
+            set_at = body.find(f"{cls}.{dunder} =")
+            assert set_at != -1, f"{cls}.{dunder} is not rewritten; hydra cannot locate the class"
+            assert set_at < register_at, (
+                f"{cls}.{dunder} is rewritten after register(); the registry already captured "
+                "the unimportable name"
+            )
+
+
+def test_teacher_logprobs_patch_precedes_the_main_ppo_sync_import():
+    # `@ray.remote` copies inherited methods onto the actor class it decorates, so
+    # `AgentLoopWorkerTQ(AgentLoopWorker)` in verl.trainer.main_ppo_sync freezes whatever
+    # `_compute_teacher_logprobs` resolves to at import time. importing that module before flash
+    # patches AgentLoopWorker snapshots verl's original, which calls the teacher manager with
+    # `sequence_ids=` while FlashBridgeTeacherManager takes prompt_ids/response_ids -- the first
+    # rollout then dies with "unexpected keyword argument 'sequence_ids'". patching the parent is
+    # only visible to the actor when it happens BEFORE the import, so assert that order.
+    #
+    # AST rather than import, for the same reason as the test above: verl is not installed in CI.
+    import ast
+    import inspect
+
+    from flash.engine.worker import opd_verl_plugin
+
+    body = ast.unparse(ast.parse(inspect.getsource(opd_verl_plugin._install_verl_extensions)))
+
+    patch_at = body.find("AgentLoopWorker._compute_teacher_logprobs = ")
+    assert patch_at != -1, "AgentLoopWorker._compute_teacher_logprobs is no longer patched"
+
+    import_at = body.find("from verl.trainer.main_ppo_sync import")
+    assert import_at != -1, "main_ppo_sync is no longer imported inside _install_verl_extensions"
+
+    assert patch_at < import_at, (
+        "main_ppo_sync is imported before AgentLoopWorker._compute_teacher_logprobs is patched; "
+        "AgentLoopWorkerTQ froze verl's original method and will call the flash teacher manager "
+        "with sequence_ids="
+    )
 
 
 def test_structured_overrides_pin_xgrammar_and_thinking_parser():
