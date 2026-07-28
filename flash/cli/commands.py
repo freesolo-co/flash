@@ -330,6 +330,26 @@ def _print_train_schema_compatibility(result: object) -> None:
     print(render.note(text) if render.styled() else text, file=sys.stderr)
 
 
+def _warn_if_wandb_requested_without_key(spec, runtime_secrets: dict | None) -> None:
+    """Warn when a config asks for W&B but no ``WANDB_API_KEY`` was found locally.
+
+    ``WANDB_API_KEY`` is an optional runtime secret, and discovery only looks at the process env and
+    the ``.env``/``.env.local`` files beside the cwd and the config. A key one directory up is not
+    found, and an absent optional secret is not an error, so the run trains to completion with
+    logging silently off, which is only discoverable after the GPU spend, when the curve is gone.
+    """
+    if not (spec.wandb.project or spec.wandb.run_name):
+        return
+    if (runtime_secrets or {}).get("WANDB_API_KEY"):
+        return
+    message = (
+        "[wandb] is configured but no WANDB_API_KEY was found in the environment, "
+        "./.env(.local), or the .env(.local) beside the config; this run will train with W&B "
+        "logging DISABLED. Export WANDB_API_KEY or put it in a .env next to the config."
+    )
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
 def cmd_train(args) -> int:
     if getattr(args, "cost", False):
         return _cmd_train_cost(args)
@@ -350,6 +370,7 @@ def cmd_train(args) -> int:
     runtime_secrets = (
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
+    _warn_if_wandb_requested_without_key(spec, runtime_secrets)
     if args.dry_run:
         # dry-run runs submit-time server preflights without importing user code, allocating a gpu,
         # or charging anything. a rejection surfaces as the server's error with exit status 1.
