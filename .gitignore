@@ -29,5 +29,13 @@ results/
 uv-cache/
 .flash/
 
-# Operator credentials (use .env.example as the template)
+# Operator credentials (use .env.example as the template). The glob covers .env.local
+# and .env.production too: flash/client/runtime_secrets.py reads .env.local by design,
+# so it holds real keys and must never be committable. .env.example is the one file
+# here that carries no values, so it is re-included.
 .env
+.env.*
+!.env.example
+
+# Local agent/assistant tooling: developer-specific, not part of the project
+.claude/

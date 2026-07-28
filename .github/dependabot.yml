@@ -1,0 +1,45 @@
+version: 2
+updates:
+  # Keep the CI actions current; pinned action majors go stale silently otherwise.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+
+  # Security-relevant python deps. Grouped so a routine bump is one PR, not ten.
+  #
+  # `uv`, not `pip`: the resolved versions CI actually installs live in the committed uv.lock
+  # (ci.yml runs `uv sync`), and the pip ecosystem does not read a lockfile. Most of pyproject
+  # is unconstrained or lower-bound-only, so under pip there is little in the manifest to bump
+  # and the versions that matter would never move. Caveat: with a [dependency-groups] table
+  # present (pyproject.toml), the uv ecosystem updates uv.lock but not pyproject.toml
+  # (dependabot-core#12788), so expect lockfile bumps rather than manifest bumps.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+    groups:
+      python-deps:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Worker-side ML stack: pinned deliberately to match the baked worker images and
+      # kernel cache. Bumping these needs a GPU re-bake, not an automated PR.
+      - dependency-name: torch
+      - dependency-name: vllm
+      - dependency-name: transformers
+      - dependency-name: trl
+      - dependency-name: peft
+      - dependency-name: bitsandbytes
+      - dependency-name: accelerate
