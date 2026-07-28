@@ -141,12 +141,13 @@ def delete_env(
     except HTTPException as validation_exc:
         if validation_exc.status_code != 404:
             raise
-        try:
-            caller_namespace = envs.namespace_for(key)
-        except envs.EnvPublishError as namespace_exc:
-            raise validation_exc from namespace_exc
-        if env_id.split("/", 1)[0] != caller_namespace:
-            raise validation_exc
+        if key.get("auth_kind") != "internal":
+            try:
+                caller_namespace = envs.namespace_for(key)
+            except envs.EnvPublishError as namespace_exc:
+                raise validation_exc from namespace_exc
+            if env_id.split("/", 1)[0] != caller_namespace:
+                raise validation_exc
         try:
             envs.download_package(slug=env_id, key=key)
         except envs.EnvPublishError as package_exc:

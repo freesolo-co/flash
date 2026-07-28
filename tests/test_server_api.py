@@ -7607,6 +7607,129 @@ def test_delete_env_missing_mirror_and_package_is_idempotent(api, monkeypatch):
     assert response.json() == {"id": f"{namespace}/my-env", "deleted": False}
 
 
+def test_delete_env_internal_key_missing_mirror_and_package_is_idempotent(api, monkeypatch):
+    from fastapi import HTTPException
+
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(
+        environment_registry,
+        "require_environment_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=404, detail="flash environment not found")
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "download_package",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            envs_mod.EnvPublishError("environment package not found", status=404)
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("an absent package must remain a no-op"),
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_kwargs: True,
+    )
+
+    response = api.delete(
+        "/v1/envs/acme/my-env",
+        headers={
+            **_bearer("fslo-internal-test"),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": "acme/my-env", "deleted": False}
+
+
+def test_delete_env_internal_key_missing_mirror_does_not_delete_existing_package(
+    api, monkeypatch
+):
+    from fastapi import HTTPException
+
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    mirror_error = HTTPException(status_code=404, detail="flash environment not found")
+    monkeypatch.setattr(
+        environment_registry,
+        "require_environment_project",
+        lambda **_kwargs: (_ for _ in ()).throw(mirror_error),
+    )
+    monkeypatch.setattr(envs_mod, "download_package", lambda **_kwargs: b"package")
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("an unassociated package must not be deleted"),
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_kwargs: pytest.fail("a failed delete must not touch the mirror"),
+    )
+
+    response = api.delete(
+        "/v1/envs/acme/my-env",
+        headers={
+            **_bearer("fslo-internal-test"),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "flash environment not found"
+
+
+def test_delete_env_user_key_missing_mirror_requires_matching_namespace(api, monkeypatch):
+    from fastapi import HTTPException
+
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    key = _login()
+    monkeypatch.setattr(
+        environment_registry,
+        "require_environment_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=404, detail="flash environment not found")
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "download_package",
+        lambda **_kwargs: pytest.fail("a foreign package must not be probed"),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("a foreign package must not be deleted"),
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_kwargs: pytest.fail("a failed delete must not touch the mirror"),
+    )
+
+    response = api.delete(
+        "/v1/envs/someone-else/my-env",
+        headers={
+            **_bearer(key),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "flash environment not found"
+
+
 def test_delete_env_missing_mirror_surfaces_hub_outage_status(api, monkeypatch):
     from fastapi import HTTPException
 
