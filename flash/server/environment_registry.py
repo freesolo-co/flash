@@ -26,6 +26,9 @@ _VALIDATE_PATH = "/api/flash/environments/validate/internal"
 _USE_PATH = "/api/flash/environments/use/internal"
 _DEFAULT_HUB_REPO = "freesolo-co/environment-hub"
 _DEFAULT_HUB_REF = "main"
+_REPAIR_FAILURE_DETAIL = (
+    "environment package exists, but its project association could not be repaired"
+)
 
 
 def _post(path: str, body: dict, *, subject: str) -> bool:
@@ -75,7 +78,12 @@ def _validation_error_detail(exc: urllib.error.HTTPError) -> str:
 
 
 def require_environment_project(
-    *, slug: str, project_id: str, key: dict, org_id: str | None = None
+    *,
+    slug: str,
+    project_id: str,
+    key: dict,
+    org_id: str | None = None,
+    repair_missing: bool = False,
 ) -> None:
     """require the environment mirror to belong to the explicit project."""
     try:
@@ -108,6 +116,34 @@ def require_environment_project(
             raw = response.read()
     except urllib.error.HTTPError as exc:
         detail = _validation_error_detail(exc)
+        if exc.code == 404 and repair_missing:
+            from flash.server import envs
+
+            # only a missing mirror row reaches the hub clone; normal and conflicting rows stay cheap.
+            try:
+                envs.download_package(slug=slug, key=key)
+            except envs.EnvPublishError as download_exc:
+                if download_exc.status == 403:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=detail or "environment does not belong to the requested project",
+                    ) from exc
+                raise HTTPException(
+                    status_code=download_exc.status,
+                    detail=str(download_exc),
+                ) from download_exc
+            try:
+                recorded = record_published_environment(
+                    slug=slug,
+                    name=slug.rsplit("/", 1)[-1],
+                    key={**key, "org_id": resolved_org_id},
+                    project_id=resolved_project_id,
+                )
+            except Exception as record_exc:
+                raise HTTPException(status_code=502, detail=_REPAIR_FAILURE_DETAIL) from record_exc
+            if recorded is not True:
+                raise HTTPException(status_code=502, detail=_REPAIR_FAILURE_DETAIL) from None
+            return
         if exc.code in {404, 409}:
             raise HTTPException(
                 status_code=exc.code,

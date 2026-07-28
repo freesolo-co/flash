@@ -10,7 +10,7 @@ from fastapi import Header, HTTPException
 
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.schema import ConfigError, spec_from_dict
-from flash.spec import JobSpec
+from flash.spec import JobSpec, require_project_id
 
 from . import app as _app
 from . import auth, db
@@ -83,15 +83,15 @@ def manageable_run(
     """Load a run for deployment management by its exact owner or matching internal scope."""
     if key.get("auth_kind") == "internal":
         status = _internal_org_run(run_id, key, org_id)
-        project = (project_id or "").strip()
         persisted_project = status.spec.get("project") if isinstance(status.spec, dict) else None
-        if (
-            project
-            and isinstance(persisted_project, str)
-            and persisted_project.strip()
-            and persisted_project == project
-        ):
-            return status
+        try:
+            project = require_project_id(project_id)
+            persisted_project = require_project_id(persisted_project)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if persisted_project == project:
+                return status
         raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
     return owned_run(run_id, key)
 

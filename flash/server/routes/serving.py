@@ -447,23 +447,36 @@ def recover_deployments() -> int:
             status = _app.get_status(row["run_id"])
         except FileNotFoundError:
             continue
-        deployment = status.deployment or {}
-        if deployment.get("state") not in _DEPLOYMENT_BUSY_STATES:
+        if (status.deployment or {}).get("state") not in _DEPLOYMENT_BUSY_STATES:
             continue
-        failed = _deployment_state(
-            deployment,
-            "failed",
-            error="deployment lifecycle interrupted by control-plane restart",
-            detail="deployment interrupted; retry `flash models deploy`",
-            recovered_at=time.time(),
-        )
-        marked = mark_deployment_failed(status.run_id, failed)
-        _report_persisted_transition(
-            status,
-            marked,
-            persisted=_deployment_failure_persisted(marked, failed),
-        )
-        recovered += 1
+        lock = _app._deploy_lock(row["run_id"])
+        # another replica mid-deploy holds the flock, so a non-blocking miss proves live ownership.
+        if not lock.acquire(blocking=False):
+            continue
+        try:
+            try:
+                status = _app.get_status(row["run_id"])
+            except FileNotFoundError:
+                continue
+            deployment = status.deployment or {}
+            if deployment.get("state") not in _DEPLOYMENT_BUSY_STATES:
+                continue
+            failed = _deployment_state(
+                deployment,
+                "failed",
+                error="deployment lifecycle interrupted by control-plane restart",
+                detail="deployment interrupted; retry `flash models deploy`",
+                recovered_at=time.time(),
+            )
+            marked = mark_deployment_failed(status.run_id, failed)
+            _report_persisted_transition(
+                status,
+                marked,
+                persisted=_deployment_failure_persisted(marked, failed),
+            )
+            recovered += 1
+        finally:
+            lock.release()
     return recovered
 
 

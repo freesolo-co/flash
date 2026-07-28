@@ -217,6 +217,7 @@ def test_environment_project_validation_blocks_before_run_preparation(
 
     def reject_environment(**kwargs):
         assert kwargs["slug"] == "acme/my-env"
+        assert kwargs["repair_missing"] is True
         raise HTTPException(status_code=409, detail="flash environment belongs to another project")
 
     monkeypatch.setattr(registry, "require_environment_project", reject_environment)
@@ -2195,6 +2196,25 @@ def test_deployment_management_allows_matching_internal_scope_and_redacts_pollin
     }
     runner._save_status(status)
 
+    equivalent = {
+        **_bearer("fslo-internal-test"),
+        "X-Freesolo-Org-Id": org,
+        "X-Freesolo-Project-Id": project.replace("-", "").upper(),
+    }
+    response = api.get(f"/v1/runs/{run_id}/deploy", headers=equivalent)
+    assert response.status_code == 200, response.text
+
+    status.spec["project"] = f" {project} "
+    runner._save_status(status)
+    response = api.get(
+        f"/v1/runs/{run_id}/deploy",
+        headers={**equivalent, "X-Freesolo-Project-Id": project},
+    )
+    assert response.status_code == 200, response.text
+
+    status.spec["project"] = project.replace("-", "").upper()
+    runner._save_status(status)
+
     calls = {"deploy": 0, "undeploy": 0}
 
     def fake_deploy(**kwargs):
@@ -2251,6 +2271,11 @@ def test_deployment_management_allows_matching_internal_scope_and_redacts_pollin
         {
             **internal,
             "X-Freesolo-Org-Id": org,
+            "X-Freesolo-Project-Id": "33333333-3333-4333-8333-333333333333",
+        },
+        {
+            **internal,
+            "X-Freesolo-Org-Id": org,
             "X-Freesolo-Project-Id": "project-wrong",
         },
         {**internal, "X-Freesolo-Org-Id": org, "X-Freesolo-Project-Id": "   "},
@@ -2301,7 +2326,7 @@ def test_internal_deployment_management_rejects_malformed_persisted_projects(api
         None,
         "",
         "   ",
-        f" {project} ",
+        "project-wrong",
         missing,
     ):
         status = runner.get_status(run_id)

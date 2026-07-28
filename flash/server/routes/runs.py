@@ -169,6 +169,7 @@ def create_run(
             slug=environment_slug,
             project_id=project_id,
             key=reporting_key,
+            repair_missing=True,
         )
     runtime_secrets = _runtime_secrets(payload, spec)
     affordability_org_id = str(key.get("org_id") or "").strip()

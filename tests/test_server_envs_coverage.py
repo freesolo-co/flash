@@ -349,7 +349,12 @@ def test_resolve_deploy_step_branches(monkeypatch):
 def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     import time
 
-    rows = [{"run_id": "r-stale"}, {"run_id": "r-fresh"}, {"run_id": "r-missing"}]
+    rows = [
+        {"run_id": "r-stale"},
+        {"run_id": "r-fresh"},
+        {"run_id": "r-held"},
+        {"run_id": "r-missing"},
+    ]
     monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
 
     statuses = {
@@ -362,6 +367,11 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
             run_id="r-fresh",
             state="done",
             deployment={"state": "queued", "updated_at": time.time()},
+        ),
+        "r-held": types.SimpleNamespace(
+            run_id="r-held",
+            state="done",
+            deployment={"state": "reconciling", "updated_at": time.time()},
         ),
     }
 
@@ -385,12 +395,36 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
     monkeypatch.setattr(runner, "_report_status", reported.append)
 
-    assert serving.recover_deployments() == 2
+    from flash.server._locks import _RunLock
+
+    held_lock = _RunLock("r-held")
+    assert held_lock.acquire(blocking=False) is True
+    try:
+        assert serving.recover_deployments() == 2
+    finally:
+        held_lock.release()
     assert [run_id for run_id, _failed in marked] == ["r-stale", "r-fresh"]
     assert all(failed["state"] == "failed" for _run_id, failed in marked)
     assert all("control-plane restart" in failed["error"] for _run_id, failed in marked)
     assert [status.run_id for status in reported] == ["r-stale", "r-fresh"]
     assert all(status.deployment["state"] == "failed" for status in reported)
+
+
+def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
+    statuses = [
+        types.SimpleNamespace(run_id="r-settled", deployment={"state": "queued"}),
+        types.SimpleNamespace(run_id="r-settled", deployment={"state": "ready"}),
+    ]
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: statuses.pop(0))
+    monkeypatch.setattr(
+        serving,
+        "mark_deployment_failed",
+        lambda *_args: pytest.fail("a deployment that settled under the lock must not be failed"),
+    )
+
+    assert serving.recover_deployments() == 0
+    assert statuses == []
 
 
 def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
