@@ -373,22 +373,43 @@ the right account and org memberships for a token that cannot write anything, so
 establish the precondition:
 
 ```python
-from huggingface_hub import create_repo
+from huggingface_hub import HfApi
 
-# creating (or touching) the destination IS the write test - it exercises the same
-# permission the export needs, and raises if the token cannot write there.
-# private=True matches what `flash models export` does: it always creates the repo
-# private first so the destination is never transiently public.
-create_repo(
-    "<you>/<repo>",
+api = HfApi(token="<the same token the export will use>")
+
+# 1. create the destination if it is missing. private=True matches what
+#    `flash models export` does: it always creates the repo private first, so the
+#    destination is never transiently public.
+api.create_repo("<you>/<repo>", repo_type="model", exist_ok=True, private=True)
+
+# 2. THEN actually write. Step 1 alone does not prove write access on a repo that
+#    already exists (see below); a real commit does.
+api.upload_file(
+    path_or_fileobj=b"ok",
+    path_in_repo=".flash-write-probe",
+    repo_id="<you>/<repo>",
     repo_type="model",
-    exist_ok=True,
-    private=True,
-    token="<the same token the export will use>",
+    commit_message="write probe",
 )
 ```
 
-Two details that make the difference between a probe and a placebo:
+**Why the second step is not redundant.** On an existing repo, `create_repo(exist_ok=True)`
+is not a write test. The server rejects the create, and `exist_ok` is precisely the flag that
+swallows the rejection — by two different routes, neither of which checks whether you can
+write:
+
+- **409 (already exists):** swallowed unconditionally and returned as success. No permission
+  is consulted at all.
+- **403 (no write permission on the namespace):** swallowed too, then retried as
+  `repo_info()` — a _read_. If the read succeeds, the call returns a repo URL and looks like
+  it passed.
+
+So a read-only or wrongly-scoped token sails through against any destination that already
+exists, which is the normal case for a repo you export to more than once. Only the upload
+exercises the permission the export actually needs. (Verified on the 1.2.0 floor and on
+current hub — both swallow paths are present in every version Flash supports.)
+
+Two more details that make the difference between a probe and a placebo:
 
 - **Pass the same token the export will use.** Flash resolves the export token as
   `--api-key` > `HF_TOKEN` in the environment > a local `.env` / `.env.local`, and forwards
@@ -401,7 +422,11 @@ Two details that make the difference between a probe and a placebo:
   repo publicly visible until the export catches up, and it fails outright under an org
   policy that permits private repos but not public ones.
 
-`create_repo` works on every `huggingface-hub` version Flash supports. There is also
+The probe leaves a `.flash-write-probe` file behind; delete it with
+`api.delete_file(".flash-write-probe", "<you>/<repo>", repo_type="model")` once it passes, or
+just let the export overwrite the repo contents around it.
+
+`create_repo` and `upload_file` work on every `huggingface-hub` version Flash supports. There is also
 `auth_check("<you>/<repo>", write=True)`, which checks write access without creating
 anything — but the `write=` argument only exists in **hub ≥ 1.5.0** (Flash's floor is
 1.2.0). On an older hub it raises `TypeError: ... unexpected keyword argument 'write'`,
@@ -554,10 +579,24 @@ spending another GPU run:
   flash models deploy <run-id>            # serve the adapter, then `flash models chat` it to read real outputs
   ```
 
-- **Decide with the noise band.** When comparing two runs or two checkpoints, record
-  the eval-split size `N` and the metric's approximate sampling noise — about
-  `1.96·√(p(1-p)/N)` for a rate metric `p`. Treat a difference _inside_ that band as
-  **no change** — neither improvement nor regression. A within-noise gain is not a win.
+- **Decide with the noise band — and size it for a _difference_.** Record the eval-split
+  size `N` and the metric's sampling noise, then treat a gap _inside_ the band as **no
+  change** — neither improvement nor regression. A within-noise gain is not a win. But use
+  the right band: `1.96·√(p(1-p)/N)` is the error bar on **one** measurement, and comparing
+  two runs involves two noisy measurements, so the band for their difference is wider.
+
+  - _Two runs evaluated separately:_ `1.96·√(2p(1-p)/N)` — a factor of √2 ≈ 1.41 wider. Using
+    the single-run band here is not a rounding error: simulating two identical models at
+    `N = 200, p = 0.6`, a pure-noise gap clears the single-run band **~17%** of the time
+    versus ~5% for the correct one. That is one in six "improvements" being nothing at all.
+  - _Both evaluated on the same rows_ (the usual case, and the better one): compare **per-row**
+    and use a paired method — a paired bootstrap over rows, or McNemar on the
+    one-right/other-wrong counts. Pairing cancels the shared row-difficulty noise, so it
+    resolves smaller real differences than either unpaired band.
+
+  Either way, `N` here is the number of independent eval rows, not the number of samples: at
+  `k` samples per row, drawing more samples from the same rows narrows nothing about how the
+  model does on new rows.
 
 ---
 
