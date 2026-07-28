@@ -11,6 +11,8 @@ also break the client tests, which talk to a real loopback server.)
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 
@@ -41,9 +43,25 @@ def _offline(monkeypatch):
     # ``load_dotenv(find_dotenv(usecwd=True))`` at module scope, which walks UP out of the repo
     # and loads whatever .env it finds -- so on an operator box a real key appears in os.environ
     # partway through the suite, as soon as some test imports that package. Tests that seed a key
-    # only when none is set would then run against the operator's live credential. Delete it so
-    # the starting state is the same everywhere; tests that need one set it with ``setenv``.
+    # only when none is set would then run against the operator's live credential.
+    #
+    # Deleting it is only sound if that dotenv load has ALREADY happened: a lazy first import
+    # partway through a test would otherwise re-populate everything we just deleted (load_dotenv
+    # does not overwrite what is set, but these names are unset by then, so it fills them in).
+    # Import the package here, before scrubbing, so its module-scope load is a no-op afterwards.
+    with contextlib.suppress(Exception):  # package absent in a client-only checkout
+        import runpod_flash  # noqa: F401
+
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+
+    # Secrets flash forwards AUTOMATICALLY (no per-job declaration) are the dangerous ones: a
+    # submit-path test asserting on the outgoing payload picks them up from the operator's ambient
+    # env and fails, and a less careful test would ship a real key into a fixture. Derive the list
+    # from the production constant so a key added there is scrubbed here without touching this file.
+    from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+
+    for _key in DEFAULT_RUNTIME_SECRET_KEYS:
+        monkeypatch.delenv(_key, raising=False)
 
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
     # it to a single active key never loses the rest of the pool). Reset it around every

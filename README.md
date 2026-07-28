@@ -12,7 +12,7 @@ flash train run.toml
 ```
 
 The allocator picks the cheapest validated GPU class that fits the run — one dedicated
-worker allocation per run, on one or more GPUs — supervised server-side (stall watchdog,
+worker allocation per run, on a single GPU today — supervised server-side (stall watchdog,
 bounded auto-retry resuming from the last streamed checkpoint, endpoint GC).
 
 ## What this repository is
@@ -20,7 +20,8 @@ bounded auto-retry resuming from the last streamed checkpoint, endpoint GC).
 Flash is the **client and control plane** for Freesolo's hosted post-training service.
 This repository contains:
 
-- the `flash` CLI (`flash/cli/`) — pure standard library, no dependencies,
+- the `flash` CLI (`flash/cli/`) — no declared runtime dependencies (commands that run
+  an environment locally, such as `flash env test`, need the `freesolo` SDK),
 - the FastAPI control plane (`flash/server/`) — run submission, auth, project scoping,
 - the GPU worker and training recipes (`flash/engine/`) — TRL plus colocated vLLM
   rollouts,

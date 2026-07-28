@@ -77,6 +77,13 @@ fi
 # git-filter-repo is a single python script; uv fetches it without a global install.
 FILTER_REPO=(uv run --with git-filter-repo git-filter-repo)
 
+cat <<'EOF'
+==> FREEZE THE REPOSITORY FIRST
+    The rewrite is computed from a snapshot taken now. Anything pushed after this
+    point is absent from the snapshot, and the publishing push would delete it.
+    Tell every collaborator to stop pushing before you continue.
+EOF
+
 echo "==> cloning a fresh mirror of $REMOTE"
 # --mirror: filter-repo must see every ref (main, dev, tags, and any other branch).
 # Rewriting a single-branch clone would leave the other branches on the old shas.
@@ -84,6 +91,15 @@ git clone --mirror "$REMOTE" "$WORKDIR"
 cd "$WORKDIR"
 # absolute from here on: WORKDIR may have been relative, and we have just cd'd into it
 WORKDIR="$PWD"
+
+# Record what the remote looked like at snapshot time. The publish step re-reads the
+# remote and diffs against this file: a rewrite pushed over a remote that moved in the
+# meantime silently destroys whatever was pushed during the run, and --force gives no
+# warning. Keeping the map lets the operator verify instead of hoping.
+REFMAP="$WORKDIR/../flash-scrub-refmap-at-clone.txt"
+git for-each-ref --format='%(objectname) %(refname)' > "$REFMAP"
+REFMAP="$(cd "$(dirname "$REFMAP")" && printf '%s/%s' "$PWD" "$(basename "$REFMAP")")"
+echo "    snapshot ref map: $REFMAP"
 
 count_pattern() {
   # commits (not lines) whose message matches $1, counted by git itself so the
@@ -198,16 +214,39 @@ rm -f "$MAILMAP"
 # The counts above are printed for a human, but a human reading past a stray "2" is
 # exactly how a half-scrubbed history gets published. Re-check them mechanically and
 # refuse to print publication instructions unless every one is zero.
+#
+# Each count is taken in its own CHECKED assignment, never inline in `echo "$(...)"`
+# or as a `for` word. `set -e` does not fire on a command substitution that fails
+# inside a successful enclosing command, so an inline count whose git/awk died would
+# expand to the empty string, arithmetic would read it as 0, and the gate would report
+# a clean history it never actually verified. Assignment makes the failure fatal, and
+# the integer test catches a command that "succeeded" while printing something else.
+checked_count() {
+  local label="$1" value
+  shift
+  if ! value="$("$@")"; then
+    echo "error: leak check '$label' FAILED to run; cannot certify this history" >&2
+    exit 1
+  fi
+  if ! printf '%s' "$value" | grep -qE '^[0-9]+$'; then
+    echo "error: leak check '$label' returned a non-count: ${value:-<empty>}" >&2
+    exit 1
+  fi
+  printf '%s' "$value"
+}
+
 residual=0
-for n in \
-  "$(count_pattern 'Co-Authored-By:[ \t]*Claude')" \
-  "$(count_pattern 'Claude-Session:')" \
-  "$(count_pattern 'Generated with .*Claude Code')" \
-  "$(count_pattern 'internal[.]cloudapp[.]net')" \
-  "$(count_identities)"
+for spec in \
+  "co-authored-by:Co-Authored-By:[ \t]*Claude" \
+  "claude-session:Claude-Session:" \
+  "generated-with:Generated with .*Claude Code" \
+  "leaked-hostname:internal[.]cloudapp[.]net"
 do
+  n="$(checked_count "${spec%%:*}" count_pattern "${spec#*:}")"
   residual=$((residual + n))
 done
+n="$(checked_count identities count_identities)"
+residual=$((residual + n))
 
 if [ "$residual" -ne 0 ]; then
   cat >&2 <<EOF
@@ -239,17 +278,34 @@ Keeping just main, dev, and any live release branches is the safe default.
 
 To publish the rewritten history:
 
-  1. Tell every collaborator to stop pushing and to re-clone afterwards. Their
-     existing clones point at shas that will no longer exist.
-  2. Temporarily disable branch protection on main and dev (a rewrite is a
+  1. Confirm the freeze held. The rewrite was computed from a snapshot taken at
+     clone time; anything pushed since is NOT in it and the push below would
+     delete it. Diff the remote against the snapshot and expect no output:
+
+       git ls-remote $REMOTE 'refs/heads/*' 'refs/tags/*' \\
+         | awk '{print \$1, \$2}' | sort > /tmp/flash-remote-now.txt
+       grep -E ' refs/(heads|tags)/' $REFMAP \\
+         | sort > /tmp/flash-remote-at-clone.txt
+       diff /tmp/flash-remote-at-clone.txt /tmp/flash-remote-now.txt
+
+     Any difference means someone pushed during the run. STOP: re-run the scrub
+     from a fresh clone rather than overwriting their work.
+  2. Tell every collaborator to re-clone afterwards. Their existing clones point
+     at shas that will no longer exist.
+  3. Temporarily disable branch protection on main and dev (a rewrite is a
      force-push; protection will otherwise reject it).
-  3. From $WORKDIR:
+  4. From $WORKDIR, push branches and tags EXPLICITLY. Not --mirror: a mirror
+     clone also holds GitHub's read-only refs/pull/* (727 of them here), which
+     --mirror tries to push and the server rejects.
 
        git remote add origin $REMOTE
-       git push --force --mirror origin
+       git push --force --atomic origin 'refs/heads/*:refs/heads/*' \\
+                                       'refs/tags/*:refs/tags/*'
 
-  4. Re-enable branch protection, then flip the repository to public.
-  5. Re-clone locally. Do not reuse an old clone.
+     --atomic so a rejected ref fails the whole push, rather than leaving the
+     remote half-rewritten.
+  5. Re-enable branch protection, then flip the repository to public.
+  6. Re-clone locally. Do not reuse an old clone.
 
 Open pull requests will show as rewritten and are best closed and reopened from
 fresh branches.
