@@ -4412,6 +4412,23 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert multi_turn_overrides["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"] == "1536"
 
 
+def test_overrides_size_agent_loop_workers_to_the_opd_rollout_batch():
+    # opd runs async rollout through verl's AgentLoopManager, which chunks
+    # train_batch_size * group_size across agent.num_workers and asserts the split is exact.
+    # verl's default of 8 aborts before the first step on e.g. 2 x 2 = 4.
+    small = dict(
+        value.split("=", 1)
+        for value in build_opd_verl_overrides(_config(train_batch_size=2, group_size=2))
+    )
+    assert small["actor_rollout_ref.rollout.agent.num_workers"] == "4"
+    # the common case still gets the full worker pool.
+    big = dict(
+        value.split("=", 1)
+        for value in build_opd_verl_overrides(_config(train_batch_size=64, group_size=8))
+    )
+    assert big["actor_rollout_ref.rollout.agent.num_workers"] == "8"
+
+
 def test_remote_distillation_config_declares_every_field_post_init_assigns():
     # verl's BaseConfig.__setattr__ (base_config.py) raises FrozenInstanceError for any assignment to
     # an already-set field that is not in _mutable_fields. FlashRemoteDistillationConfig's __post_init__

@@ -67,6 +67,7 @@ from flash.engine.worker.tokenizer_align import (
     groupwise_coverage,
 )
 from flash.engine.worker.verl_common import (
+    agent_loop_workers,
     latest_global_step_dir,
     resolve_verl_python,
     run_verl_training,
@@ -1495,6 +1496,12 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={_hydra_val(max_tokens)}",
         "actor_rollout_ref.rollout.agent.default_agent_loop="
         + ("flash_multi_turn" if config.get("multi_turn") else "flash_single_turn"),
+        # opd runs async rollout through verl's AgentLoopManager, which chunks the rollout batch
+        # across agent.num_workers and asserts an exact split. the batch is
+        # train_batch_size * group_size, so verl's default of 8 aborts the run before the first step
+        # whenever that product is not a multiple of 8. size the pool to the batch instead.
+        "actor_rollout_ref.rollout.agent.num_workers="
+        f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}",
         "critic.enable=false",
         "reward.reward_model.enable=false",
         "distillation._target_=flash_opd_verl_plugin.FlashRemoteDistillationConfig",
