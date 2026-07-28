@@ -311,6 +311,14 @@ So treat age as a threshold, not a verdict:
   independently of the heartbeat upload cycle. A retry that has already started will show a
   new attempt.
 
+**Exception — startup is exempt from all of the above.** While the run is warming up
+(`status` shows a `warmup` row: initializing the model, vLLM, and training kernels) a long
+quiet stretch at 0% GPU is the normal case, not a stall. `status` itself calls this out and
+says _"setup is not billed; do not cancel"_. It can run far longer than the panel's
+"typically several minutes, sometimes 15-20 min" — 40+ minutes before the first step is
+something we have measured on a real run. Do not start the ~15 min clock until you have seen
+step 0 advance to step 1; before that, the only thing worth watching is `flash runs log -f`.
+
 Never derive seconds-per-step from total elapsed time (early steps include one-time warmup
 that can dominate a short run).
 
@@ -357,14 +365,22 @@ the right account and org memberships for a token that cannot write anything, so
 establish the precondition:
 
 ```python
-from huggingface_hub import auth_check
+from huggingface_hub import create_repo
 
-auth_check("<you>/<repo>", write=True)   # raises unless the token can write THIS repo
+# creating (or touching) the destination IS the write test - it exercises the same
+# permission the export needs, and raises if the token cannot write there.
+create_repo("<you>/<repo>", repo_type="model", exist_ok=True)
 ```
 
-Do this _before_ the run finishes, not after. If the repo does not exist yet, create it
-first (`create_repo(..., exist_ok=True)`) — that is itself a write test. If several tokens
-are in play, identify them by fingerprint rather than by printing them.
+`create_repo` works on every `huggingface-hub` version Flash supports. There is also
+`auth_check("<you>/<repo>", write=True)`, which checks write access without creating
+anything — but the `write=` argument only exists in **hub ≥ 1.5.0** (Flash's floor is
+1.2.0). On an older hub it raises `TypeError: ... unexpected keyword argument 'write'`,
+and dropping the argument to silence that turns it back into a read-only check that a
+token with no write access still passes. Verify your version before relying on it.
+
+Do this _before_ the run finishes, not after. If several tokens are in play, identify them
+by fingerprint rather than by printing them.
 
 ### Loading an exported adapter locally (transformers + peft)
 
