@@ -461,6 +461,8 @@ def recover_deployments() -> int:
             deployment = status.deployment or {}
             if deployment.get("state") not in _DEPLOYMENT_BUSY_STATES:
                 continue
+            if not _deployment_attempt_is_stale(deployment):
+                continue
             failed = _deployment_state(
                 deployment,
                 "failed",
@@ -997,7 +999,17 @@ def deploy(
 ):
     payload = payload or {}
     deploy_lock = _app._deploy_lock(run_id)
-    deploy_lock.acquire()
+    if not deploy_lock.acquire(blocking=False):
+        status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+        current_deployment = status.deployment or {}
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"run {run_id} already has a deployment in "
+                f"{current_deployment.get('state')} state; run `flash models deployments` "
+                "to check progress"
+            ),
+        )
     job_owns_lock = False
     try:
         status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)

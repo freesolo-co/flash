@@ -2815,17 +2815,26 @@ def test_deployment_job_shutdown_closes_producers(monkeypatch):
     app_mod._open_deployment_jobs()
 
 
-def test_recover_deployments_recovers_fresh_busy_states_on_startup(monkeypatch):
+def test_recover_deployments_recovers_stale_and_skips_fresh_busy_states_on_startup(
+    monkeypatch,
+):
     from flash.server.routes import serving
 
     now = time.time()
     statuses = {
-        state: SimpleNamespace(
-            run_id=f"run-{state}",
+        "run-smoke_testing": SimpleNamespace(
+            run_id="run-smoke_testing",
             state="done",
-            deployment={"state": state, "updated_at": now},
-        )
-        for state in ("smoke_testing", "reconciling")
+            deployment={
+                "state": "smoke_testing",
+                "updated_at": now - serving._DEPLOYMENT_STALE_SECONDS - 1,
+            },
+        ),
+        "run-reconciling": SimpleNamespace(
+            run_id="run-reconciling",
+            state="done",
+            deployment={"state": "reconciling", "updated_at": now},
+        ),
     }
     marked = []
     reported = []
@@ -2834,11 +2843,7 @@ def test_recover_deployments_recovers_fresh_busy_states_on_startup(monkeypatch):
         "all_runs",
         lambda: [{"run_id": status.run_id} for status in statuses.values()],
     )
-    monkeypatch.setattr(
-        serving._app,
-        "get_status",
-        lambda run_id: statuses[run_id.removeprefix("run-")],
-    )
+    monkeypatch.setattr(serving._app, "get_status", lambda run_id: statuses[run_id])
 
     def mark_failed(run_id, deployment):
         marked.append((run_id, deployment))
@@ -2853,16 +2858,12 @@ def test_recover_deployments_recovers_fresh_busy_states_on_startup(monkeypatch):
         ),
     )
 
-    assert serving.recover_deployments() == 2
-    assert [run_id for run_id, _deployment in marked] == [
-        "run-smoke_testing",
-        "run-reconciling",
-    ]
+    assert serving.recover_deployments() == 1
+    assert [run_id for run_id, _deployment in marked] == ["run-smoke_testing"]
     assert all(deployment["state"] == "failed" for _run_id, deployment in marked)
     assert all("control-plane restart" in deployment["error"] for _run_id, deployment in marked)
     assert [run_id for run_id, _deployment, persisted in reported if persisted] == [
-        "run-smoke_testing",
-        "run-reconciling",
+        "run-smoke_testing"
     ]
 
 
@@ -2933,6 +2934,68 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployment["state"] == "queued"
     deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
     assert deployments[0]["deployment"]["state"] == "queued"
+
+
+def test_concurrent_deploy_returns_409_without_queueing_duplicate(api, monkeypatch):
+    import threading
+
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
+    starts: list[dict] = []
+
+    def fake_start(_target, *_args, **kwargs):
+        starts.append(kwargs)
+        if len(starts) > 1:
+            kwargs["deploy_lock"].release()
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
+
+    first = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert first.status_code == 200, first.text
+    assert first.json()["state"] == "queued"
+    assert len(starts) == 1
+
+    responses = []
+    errors: list[BaseException] = []
+
+    def deploy_again():
+        try:
+            responses.append(api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key)))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=deploy_again)
+    worker.start()
+    worker.join(timeout=1)
+    blocked = worker.is_alive()
+
+    settled = runner.get_status(run_id)
+    settled.deployment = {**settled.deployment, "state": "ready", "updated_at": time.time()}
+    runner._save_status(settled)
+    starts[0]["deploy_lock"].release()
+    worker.join(timeout=5)
+
+    assert worker.is_alive() is False
+    assert errors == []
+    assert blocked is False
+    assert len(responses) == 1
+    assert responses[0].status_code == 409, responses[0].text
+    assert responses[0].json()["detail"] == (
+        f"run {run_id} already has a deployment in queued state; "
+        "run `flash models deployments` to check progress"
+    )
+    assert len(starts) == 1
 
 
 def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):

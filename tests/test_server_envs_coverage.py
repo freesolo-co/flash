@@ -400,13 +400,13 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     held_lock = _RunLock("r-held")
     assert held_lock.acquire(blocking=False) is True
     try:
-        assert serving.recover_deployments() == 2
+        assert serving.recover_deployments() == 1
     finally:
         held_lock.release()
-    assert [run_id for run_id, _failed in marked] == ["r-stale", "r-fresh"]
+    assert [run_id for run_id, _failed in marked] == ["r-stale"]
     assert all(failed["state"] == "failed" for _run_id, failed in marked)
     assert all("control-plane restart" in failed["error"] for _run_id, failed in marked)
-    assert [status.run_id for status in reported] == ["r-stale", "r-fresh"]
+    assert [status.run_id for status in reported] == ["r-stale"]
     assert all(status.deployment["state"] == "failed" for status in reported)
 
 
