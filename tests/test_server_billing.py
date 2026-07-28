@@ -404,22 +404,25 @@ def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
     ] == [res.json()["run_id"]]
 
 
-def test_dry_run_skips_affordability_precheck_and_still_persists(api, monkeypatch):
+def test_dry_run_verifies_affordability_and_still_persists(api, monkeypatch):
+    # a dry run is the pre-submit validation gate, so it must also answer "can this org afford
+    # this run". the precheck is verify-only (moves no money), so running it here costs nothing
+    # and stops a config from passing --dry-run only to be rejected 402 on real submission.
     import flash.server.billing as billing_mod
     import flash.server.db as db_mod
 
     events = []
     original_record_run = db_mod.record_run
 
-    def unexpected_precheck(**kwargs):
+    def capture_precheck(**kwargs):
         events.append(("precheck", kwargs["org_id"]))
-        raise AssertionError("dry-run must not authorize budget")
+        return {"ok": True}
 
     def capture_record_run(*args, **kwargs):
         events.append(("record", args[0]))
         return original_record_run(*args, **kwargs)
 
-    monkeypatch.setattr(billing_mod, "precheck_training_run", unexpected_precheck)
+    monkeypatch.setattr(billing_mod, "precheck_training_run", capture_precheck)
     monkeypatch.setattr(db_mod, "record_run", capture_record_run)
     res = api.post(
         "/v1/runs",
@@ -429,7 +432,47 @@ def test_dry_run_skips_affordability_precheck_and_still_persists(api, monkeypatc
 
     assert res.status_code == 200, res.text
     assert res.json()["state"] == "dry_run"
-    assert events == [("record", res.json()["run_id"])]
+    # verified before the run is recorded, and it stays a dry run: no billing context is attached
+    assert events == [("precheck", "org-1"), ("record", res.json()["run_id"])]
+    assert res.json()["billing_state"] is None
+    assert res.json()["billing_context"] is None
+
+
+def test_dry_run_blocked_when_org_cannot_afford_the_estimate(api, monkeypatch):
+    # the whole point of validating billing on --dry-run: an unaffordable config fails here
+    # instead of passing validation and being rejected only when the user really submits.
+    import flash.server.billing as billing_mod
+
+    def _block(**k):
+        raise billing_mod.BillingError(402, "insufficient balance")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 402, res.text
+    assert "insufficient" in res.text
+
+
+def test_dry_run_fails_open_when_billing_backend_is_unreachable(api, monkeypatch):
+    # a billing-infra blip must not block local validation, matching real submission's behavior.
+    import flash.server.billing as billing_mod
+
+    def _unreachable(**k):
+        raise billing_mod.BillingError(503, "billing service unavailable")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _unreachable)
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["state"] == "dry_run"
 
 
 def test_internal_submit_skips_affordability_precheck_before_persistence(api, monkeypatch):
