@@ -1,0 +1,38 @@
+version: 2
+updates:
+  # Keep the CI actions current; pinned action majors go stale silently otherwise.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+
+  # Security-relevant python deps. Grouped so a routine bump is one PR, not ten.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+    groups:
+      python-deps:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Worker-side ML stack: pinned deliberately to match the baked worker images and
+      # kernel cache. Bumping these needs a GPU re-bake, not an automated PR.
+      - dependency-name: torch
+      - dependency-name: vllm
+      - dependency-name: transformers
+      - dependency-name: trl
+      - dependency-name: peft
+      - dependency-name: bitsandbytes
+      - dependency-name: accelerate

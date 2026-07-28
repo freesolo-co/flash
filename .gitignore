@@ -31,3 +31,6 @@ uv-cache/
 
 # Operator credentials (use .env.example as the template)
 .env
+
+# Local agent/assistant tooling: developer-specific, not part of the project
+.claude/
