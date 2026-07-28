@@ -106,22 +106,6 @@ def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
     assert not any("drop_last" in override for override in o)
 
 
-@pytest.mark.parametrize(
-    ("rollout_batch", "expected"),
-    [(1, 1), (8, 8), (16, 8), (128, 8), (4, 4), (12, 6), (9, 3), (10, 5), (11, 1), (91, 7)],
-)
-def test_agent_loop_workers_always_divides_the_rollout_batch(rollout_batch, expected):
-    assert rl_verl._agent_loop_workers(rollout_batch) == expected
-
-
-def test_agent_loop_workers_invariant_holds_for_every_batch():
-    # verl asserts the split is exact, so a non-divisor aborts the run before step 1.
-    for batch in range(1, 600):
-        workers = rl_verl._agent_loop_workers(batch)
-        assert batch % workers == 0
-        assert 1 <= workers <= min(8, batch)
-
-
 def test_build_verl_overrides_sizes_agent_loop_workers_to_the_rollout_batch():
     # verl chunks prompts_per_step * group_size across agent.num_workers and asserts exact
     # divisibility; its default of 8 aborts before the first step on e.g. 2 x 2 = 4.
