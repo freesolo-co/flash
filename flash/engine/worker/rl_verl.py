@@ -114,7 +114,13 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # thread flash's thinking mode so the rollout sees the same prompt as the trl path.
         f"+data.apply_chat_template_kwargs.enable_thinking={str(bool(cfg.get('thinking', False))).lower()}",
         f"data.seed={cfg['seed']}",
-        f"actor_rollout_ref.rollout.seed={cfg['seed']}",
+        # rollout sampling seed. NOT `rollout.seed`: verl 0.8.0's RolloutConfig declares no such
+        # field, so a bare key fails hydra composition and a `+`/`++` prefix composes but then dies
+        # in omega_conf_to_dataclass with an unexpected-kwarg TypeError. engine_kwargs is a declared
+        # dict on both 0.8.0 and 0.9.x and is spread into the vllm engine args *after* verl's own
+        # "seed" entry, so it wins. `++` because the sub-key is absent from the composed node.
+        # single replica here (tp == n_gpus, nnodes=1), so verl's replica_rank offset is always 0.
+        f"++actor_rollout_ref.rollout.engine_kwargs.vllm.seed={cfg['seed']}",
         f"actor_rollout_ref.model.path={cfg['model_id']}",
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
