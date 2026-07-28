@@ -158,8 +158,9 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
 
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
     # asserting the constant alone would let a newer-base commit land silently, so bind the pinned
-    # commit itself to that version. this is the sha of the truncation-mask commit cherry-picked onto
-    # the v0.8.0 tag; moving the pin must be a deliberate edit here, with the base re-verified.
+    # commit itself to that version. this is the sha of the truncation-mask and 3d position id
+    # commits cherry-picked onto the v0.8.0 tag; moving the pin must be a deliberate edit here, with
+    # the base re-verified.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
     assert commit == "b7492fa3b7ab843294d06dbf754e887950f559c7"
