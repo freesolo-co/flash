@@ -150,8 +150,12 @@ def delete_env(
         try:
             envs.download_package(slug=env_id, key=key)
         except envs.EnvPublishError as package_exc:
+            # only a genuinely absent package is an idempotent no-op; a hub outage must keep its
+            # own status so callers retry instead of reading a masked 404 as already-deleted.
             if package_exc.status != 404:
-                raise validation_exc from package_exc
+                raise HTTPException(
+                    status_code=package_exc.status, detail=str(package_exc)
+                ) from package_exc
             deleted = False
         else:
             raise validation_exc

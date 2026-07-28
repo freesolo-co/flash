@@ -7607,6 +7607,54 @@ def test_delete_env_missing_mirror_and_package_is_idempotent(api, monkeypatch):
     assert response.json() == {"id": f"{namespace}/my-env", "deleted": False}
 
 
+def test_delete_env_missing_mirror_surfaces_hub_outage_status(api, monkeypatch):
+    from fastapi import HTTPException
+
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    key = _login()
+    namespace = _identity_for_token(key)["org_slug"]
+    monkeypatch.setattr(
+        environment_registry,
+        "require_environment_project",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=404, detail="flash environment not found")
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "download_package",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            envs_mod.EnvPublishError(
+                "Flash control plane is missing its GitHub environment-hub credential", status=503
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        envs_mod,
+        "delete_package",
+        lambda **_kwargs: pytest.fail("a hub outage must not reach the package store"),
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_kwargs: pytest.fail("a failed delete must not touch the mirror"),
+    )
+
+    response = api.delete(
+        f"/v1/envs/{namespace}/my-env",
+        headers={
+            **_bearer(key),
+            "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    # a masked 404 would tell the client "already deleted" and stop it retrying a transient outage.
+    assert response.status_code == 503, response.text
+    assert "environment-hub credential" in response.json()["detail"]
+
+
 def test_delete_env_missing_mirror_does_not_delete_existing_package(api, monkeypatch):
     from fastapi import HTTPException
 
