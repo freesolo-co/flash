@@ -282,12 +282,15 @@ def _build_verl_train_notes(
     retained_prompts: int,
     reward_history: list[float],
     loss_curve: list[float],
+    resumed: bool = False,
 ) -> dict:
     return {
         "backend": "verl",
         "steps": steps_run,
         "epochs": inp["epochs"],
         "retained_prompts": retained_prompts,
+        # matches the trl path: without it a resumed run is indistinguishable from a fresh one.
+        "resumed": resumed,
         "group_size": inp["group_size"],
         "reward_history": reward_history,
         "loss_curve": loss_curve,
@@ -1085,5 +1088,6 @@ def run_rl_verl():
             retained_prompts=len(prompts),
             reward_history=reward_history,
             loss_curve=loss_curve,
+            resumed=bool(resume_step),
         ),
     )
