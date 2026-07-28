@@ -33,9 +33,7 @@ def _read_config() -> dict:
 def load_credentials_with_source() -> tuple[str, str | None, str | None]:
     """Resolve (api_url, api_key, key_source); key/source are None when logged out."""
     cfg = _read_config()
-    api_url = (os.environ.get("FLASH_API_URL") or cfg.get("api_url") or DEFAULT_API_URL).rstrip(
-        "/"
-    )
+    api_url = (os.environ.get("FLASH_API_URL") or cfg.get("api_url") or DEFAULT_API_URL).rstrip("/")
     env_key = os.environ.get("FREESOLO_API_KEY")
     if env_key:
         return api_url, env_key, "FREESOLO_API_KEY"
@@ -48,6 +46,28 @@ def load_credentials() -> tuple[str, str | None]:
     """Resolve (api_url, api_key); the key is None when the user hasn't logged in."""
     api_url, api_key, _source = load_credentials_with_source()
     return api_url, api_key
+
+
+def shadowed_login_warning() -> str | None:
+    """Warn when ``FREESOLO_API_KEY`` shadows a *different* saved login, else None.
+
+    ``~/.flash/config.json`` is shared mutable state and the env var silently wins over it, so an
+    inherited or exported key can point a command at a different organization than the one the user
+    logged into. Both keys are valid, so nothing fails to authenticate: projects, runs, and
+    deployments simply land in the other org. Only flag a genuine mismatch: an env var equal to the
+    saved key is the common `source .env` case and warning on it would train users to ignore this.
+    """
+    env_key = os.environ.get("FREESOLO_API_KEY")
+    if not env_key:
+        return None
+    saved = _read_config().get("api_key")
+    if not saved or saved == env_key:
+        return None
+    return (
+        f"FREESOLO_API_KEY is set and overrides the login saved in {CONFIG_PATH}; "
+        "this command runs against the env var's organization. "
+        "Run `flash whoami` to confirm the org, or unset FREESOLO_API_KEY to use the saved login."
+    )
 
 
 def save_credentials(api_key: str, api_url: str | None = None) -> Path:

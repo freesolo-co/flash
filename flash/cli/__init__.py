@@ -51,6 +51,7 @@ from flash.cli.traces import (
     RECORDS_FORMAT,
     cmd_traces_export,
 )
+from flash.client.config import shadowed_login_warning
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -574,6 +575,33 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# commands that create or mutate organization-scoped state. a shadowed login silently puts these in
+# the wrong org, so they warn; read-only commands stay quiet, and `flash whoami` already shows the
+# key source in its own output.
+_ORG_MUTATING_COMMANDS = frozenset(
+    {
+        cmd_train,
+        cmd_deploy,
+        cmd_undeploy,
+        cmd_export,
+        cmd_cancel,
+        cmd_projects_create,
+        cmd_env_push,
+        cmd_env_delete,
+    }
+)
+
+
+def _warn_if_login_shadowed(args) -> None:
+    """Surface an ambient FREESOLO_API_KEY that redirects a mutating command to another org."""
+    if getattr(args, "func", None) not in _ORG_MUTATING_COMMANDS:
+        return
+    message = shadowed_login_warning()
+    if not message:
+        return
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
@@ -581,6 +609,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
     update_check = maybe_start_update_check()
+    _warn_if_login_shadowed(args)
     try:
         return args.func(args)
     except _USER_ERRORS as exc:
