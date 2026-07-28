@@ -8,7 +8,7 @@ Report it privately through either channel:
 
 - GitHub private vulnerability reporting: use the **Security** tab on this repository,
   then **Report a vulnerability**.
-- Email: security@freesolo.co
+- Email: founders@freesolo.co
 
 Please include:
 

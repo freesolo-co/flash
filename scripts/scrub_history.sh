@@ -49,8 +49,16 @@ fi
 # Matching is deliberately NOT a "^Claude" prefix test: that would also match a real
 # contributor whose first name happens to be Claude and silently rewrite their
 # authorship. Instead an identity is rewritten only when it is an exact known
-# assistant name, or when its EMAIL carries the leaked internal hostname.
+# assistant name, when its EMAIL is on an assistant-owned domain, or when its EMAIL
+# carries the leaked internal hostname.
+#
+# The name list alone is not enough: history also carries versioned identities like
+# "Claude Opus 4.8 (1M context)", which no fixed name list can enumerate (the version
+# and the parenthetical change per release). The email test catches those, and it is
+# the SAFE half of the pair -- a human contributor named Claude commits under their own
+# address, never under the assistant's noreply domain.
 ASSISTANT_NAMES_RE='^(Claude|Claude Code|Claude Bot|claude)$'
+ASSISTANT_EMAIL_RE='@anthropic[.]com$'
 # "." as a wildcard is harmless here (it only widens the match to a near-identical
 # string) and keeps the pattern usable verbatim in both awk and git --grep, which
 # disagree about how to escape a literal dot inside a shell-passed variable.
@@ -91,11 +99,12 @@ count_identities() {
   # looser thing (say, any identity containing "claude") would flag a real contributor
   # named Claude as an unscrubbed leak and block publication over nothing.
   git log --all --format='%H%x09%an <%ae>%x09%cn <%ce>' \
-    | awk -F'\t' -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" '
+    | awk -F'\t' -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" \
+          -v bot_mail_re="$ASSISTANT_EMAIL_RE" '
         function leaks(ident,   name, email) {
           name = ident; sub(/ *<.*/, "", name)
           email = ident; sub(/^[^<]*</, "", email); sub(/>.*$/, "", email)
-          return (name ~ names_re || email ~ mail_re)
+          return (name ~ names_re || email ~ bot_mail_re || email ~ mail_re)
         }
         leaks($2) || leaks($3) { n++ }
         END { print n + 0 }
@@ -127,13 +136,14 @@ echo "==> rewriting commit messages and identities"
 MAILMAP="$WORKDIR/flash-scrub-mailmap"
 git log --all --format='%an <%ae>%n%cn <%ce>' \
   | sort -u \
-  | awk -v canon="$CANONICAL_IDENTITY" -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" '
+  | awk -v canon="$CANONICAL_IDENTITY" -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" \
+        -v bot_mail_re="$ASSISTANT_EMAIL_RE" '
       {
         name = $0
         sub(/ *<.*/, "", name)          # identity name, minus the address
         email = $0
         sub(/^[^<]*</, "", email); sub(/>.*$/, "", email)
-        if (name ~ names_re || email ~ mail_re) print canon " " $0
+        if (name ~ names_re || email ~ bot_mail_re || email ~ mail_re) print canon " " $0
       }
     ' > "$MAILMAP"
 
