@@ -4583,6 +4583,36 @@ def test_agent_loops_are_registered_under_an_importable_qualname():
             )
 
 
+def test_teacher_logprobs_patch_precedes_the_main_ppo_sync_import():
+    # `@ray.remote` copies inherited methods onto the actor class it decorates, so
+    # `AgentLoopWorkerTQ(AgentLoopWorker)` in verl.trainer.main_ppo_sync freezes whatever
+    # `_compute_teacher_logprobs` resolves to at import time. importing that module before flash
+    # patches AgentLoopWorker snapshots verl's original, which calls the teacher manager with
+    # `sequence_ids=` while FlashBridgeTeacherManager takes prompt_ids/response_ids -- the first
+    # rollout then dies with "unexpected keyword argument 'sequence_ids'". patching the parent is
+    # only visible to the actor when it happens BEFORE the import, so assert that order.
+    #
+    # AST rather than import, for the same reason as the test above: verl is not installed in CI.
+    import ast
+    import inspect
+
+    from flash.engine.worker import opd_verl_plugin
+
+    body = ast.unparse(ast.parse(inspect.getsource(opd_verl_plugin._install_verl_extensions)))
+
+    patch_at = body.find("AgentLoopWorker._compute_teacher_logprobs = ")
+    assert patch_at != -1, "AgentLoopWorker._compute_teacher_logprobs is no longer patched"
+
+    import_at = body.find("from verl.trainer.main_ppo_sync import")
+    assert import_at != -1, "main_ppo_sync is no longer imported inside _install_verl_extensions"
+
+    assert patch_at < import_at, (
+        "main_ppo_sync is imported before AgentLoopWorker._compute_teacher_logprobs is patched; "
+        "AgentLoopWorkerTQ froze verl's original method and will call the flash teacher manager "
+        "with sequence_ids="
+    )
+
+
 def test_structured_overrides_pin_xgrammar_and_thinking_parser():
     overrides = dict(
         value.split("=", 1)

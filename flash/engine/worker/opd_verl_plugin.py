@@ -636,7 +636,6 @@ def _install_verl_extensions() -> None:
         DistillationLossSettings,
         register_distillation_loss,
     )
-    from verl.trainer.main_ppo_sync import PPOTrainer
     from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
     from verl.utils.config import omega_conf_to_dataclass
     from verl.utils.metric import AggregationType, Metric, reduce_metrics
@@ -803,6 +802,13 @@ def _install_verl_extensions() -> None:
 
     AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
     teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
+
+    # import main_ppo_sync only after the patch above. applying `@ray.remote` to a class copies the
+    # methods it inherits onto the actor class, so `AgentLoopWorkerTQ(AgentLoopWorker)` freezes
+    # whatever `_compute_teacher_logprobs` resolves to at decoration time. importing this module
+    # earlier snapshots verl's original, which then calls the flash teacher manager with
+    # `sequence_ids=` instead of prompt_ids/response_ids and kills the first rollout.
+    from verl.trainer.main_ppo_sync import PPOTrainer
 
     class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
