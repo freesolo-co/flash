@@ -258,7 +258,7 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
 
 
 def test_cancel_noop_on_terminal_run_is_not_a_false_confirmation(monkeypatch) -> None:
-    """`flash cancel` against an already-terminal run is a server-side no-op that returns the
+    """`flash runs cancel` against an already-terminal run is a server-side no-op that returns the
     unchanged state. The themed card must not flash a green "cancel requested" for that case —
     only a real transition to `cancelled` earns the confirmation; otherwise it stays honest."""
     monkeypatch.setenv("FLASH_STYLE", "1")

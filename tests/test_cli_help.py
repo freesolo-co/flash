@@ -13,8 +13,6 @@ import pytest
 
 import flash.cli as cli
 
-_HIDDEN_ROOT_RUN_ALIASES = {"status", "log", "cancel", "checkpoints"}
-
 
 def _registered_subcommands() -> set[str]:
     """The subcommand names argparse actually registers on the root parser."""
@@ -54,7 +52,7 @@ def _catalog_env_rows() -> set[str]:
 def test_help_catalog_matches_registered_subcommands() -> None:
     """Every real subcommand appears once in the themed help, and the help lists no command that
     isn't real — so the grouped `flash --help` can't drift from the actual CLI surface."""
-    registered = _registered_subcommands() - _HIDDEN_ROOT_RUN_ALIASES
+    registered = _registered_subcommands()
     catalog = _catalog_commands()
     assert catalog == registered, (
         f"themed help is out of sync with the CLI:\n"
@@ -117,6 +115,10 @@ def test_root_model_commands_are_not_registered() -> None:
     assert not {"deploy", "chat", "deployments", "undeploy", "export"} & _registered_subcommands()
 
 
+def test_root_run_aliases_are_not_registered() -> None:
+    assert not {"status", "log", "cancel", "checkpoints"} & _registered_subcommands()
+
+
 def test_help_styled_is_themed_and_exits_zero(monkeypatch, capsys) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")  # layout kept, color dropped — assert on contiguous text
@@ -148,8 +150,6 @@ def test_help_plain_when_piped(monkeypatch, capsys) -> None:
     # argparse's own section, never emitted by the themed page
     assert "positional arguments:" in out
     assert "getting started" not in out  # themed group titles absent on the plain path
-    for alias in _HIDDEN_ROOT_RUN_ALIASES:
-        assert f"\n    {alias} " not in out
 
 
 def test_help_page_is_ascii_locale_safe(monkeypatch) -> None:

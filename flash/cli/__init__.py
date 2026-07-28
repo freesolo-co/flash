@@ -478,26 +478,6 @@ def _build_parser() -> argparse.ArgumentParser:
     runs_checkpoint.add_argument("run_id")
     runs_checkpoint.set_defaults(func=cmd_checkpoints)
 
-    # deployed freesolo agents still invoke these root run-management forms. keep them callable but
-    # omit them from all help and docs while consumers migrate to `flash runs ...`.
-    legacy_status = sub.add_parser("status", help=argparse.SUPPRESS)
-    legacy_status.add_argument("run_id")
-    legacy_status.add_argument("-f", "--follow", action="store_true")
-    legacy_status.set_defaults(func=cmd_status)
-
-    legacy_log = sub.add_parser("log", help=argparse.SUPPRESS)
-    legacy_log.add_argument("run_id")
-    legacy_log.add_argument("-f", "--follow", action="store_true")
-    legacy_log.set_defaults(func=cmd_log)
-
-    legacy_cancel = sub.add_parser("cancel", help=argparse.SUPPRESS)
-    legacy_cancel.add_argument("run_id")
-    legacy_cancel.set_defaults(func=cmd_cancel)
-
-    legacy_checkpoints = sub.add_parser("checkpoints", help=argparse.SUPPRESS)
-    legacy_checkpoints.add_argument("run_id")
-    legacy_checkpoints.set_defaults(func=cmd_checkpoints)
-
     deploy = models_sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
     deploy.add_argument(
         "run_id",
@@ -563,11 +543,6 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--max-tokens", type=int, default=512)
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
-
-    hidden_run_aliases = {"status", "log", "cancel", "checkpoints"}
-    sub._choices_actions[:] = [
-        action for action in sub._choices_actions if action.dest not in hidden_run_aliases
-    ]
 
     # The control plane is operator-only and run as a separate one-off service via the
     # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.

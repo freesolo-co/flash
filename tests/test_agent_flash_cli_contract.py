@@ -66,16 +66,12 @@ def test_agent_required_subcommands_exist(command: tuple[str, ...]) -> None:
     assert excinfo.value.code == 0, f"`flash {rendered}` is missing from the CLI"
 
 
-def test_deployed_agent_root_run_shims_remain_callable_but_hidden(capsys) -> None:
-    for command in ("status", "log", "cancel", "checkpoints"):
-        with pytest.raises(SystemExit) as excinfo:
-            main([command, "--help"])
-        assert excinfo.value.code == 0
-    with pytest.raises(SystemExit):
-        main(["--help"])
-    help_text = capsys.readouterr().out
-    for command in ("status", "log", "cancel", "checkpoints"):
-        assert f"\n    {command} " not in help_text
+@pytest.mark.parametrize("command", ["status", "log", "cancel", "checkpoints"])
+def test_deployed_agent_root_run_shims_are_not_registered(command: str, capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main([command, "--help"])
+    assert excinfo.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_env_push_subcommand_exists() -> None:

@@ -81,7 +81,7 @@ def test_config_pointed_at_a_directory_is_friendly():
 
 def test_debug_flag_shows_traceback():
     with tempfile.TemporaryDirectory() as tmp:
-        proc = _run(["--debug", "status", "does-not-exist"], env=_logged_out_env(tmp))
+        proc = _run(["--debug", "runs", "status", "does-not-exist"], env=_logged_out_env(tmp))
     assert proc.returncode != 0
     assert "Traceback (most recent call last)" in proc.stderr
 

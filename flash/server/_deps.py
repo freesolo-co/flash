@@ -60,7 +60,7 @@ def readable_run(run_id: str, key: dict, org_id: str | None = None):
 
     Mirrors the env-delete posture (a user key carries its own identity; the org-agnostic
     internal key is the trusted platform caller):
-      * exact-key owner -- the API key that created the run. This is the `flash log` CLI path.
+      * exact-key owner -- the API key that created the run. This is the `flash runs log` CLI path.
       * internal/service key + matching ``X-Freesolo-Org-Id`` -- the platform web proxy. The
         browser has no per-run API key, so the platform authenticates the user, checks org
         membership on the mirror row, then calls with the internal key and the run's org here.

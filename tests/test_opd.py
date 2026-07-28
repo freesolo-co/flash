@@ -1783,7 +1783,7 @@ def test_opd_vllm_generation_uses_keepalive_heartbeat(monkeypatch):
 
 def test_opd_step_heartbeat_carries_distilled_sample_completions(monkeypatch):
     """The forced post-update opd_step heartbeat surfaces the distilled student completions (with each
-    sample's distillation loss) so `flash log` shows what the student generated -- the OPD analog of
+    sample's distillation loss) so `flash runs log` shows what the student generated -- the OPD analog of
     GRPO's reward samples. The default rollout stub emits completion text "x" for the one prompt."""
     pytest.importorskip("torch")
 
