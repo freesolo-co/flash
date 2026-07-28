@@ -84,12 +84,15 @@ RUN pip install --no-cache-dir \
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC
 # (see .github/workflows/worker-image.yml). Installing a wheel takes seconds and gives full arch
 # coverage. Compiling FA2 from source instead is enormous (tens of GB RAM, ~1h for 5 arches) and
-# OOM-killed/starved every CI runner we tried — so the source path is only a LOCAL fallback.
-# FLASH_ATTN_SPEC is a pip spec: a wheel URL (preferred), a pinned "flash-attn==X", or the default
-# unpinned "flash-attn" (source build). Best-effort either way: on failure the image still works via
-# the SDPA fallback, so the layer never blocks the cold-start win.
-ARG FLASH_ATTN_SPEC=flash-attn
-# Source-build fallback only (ignored when FLASH_ATTN_SPEC is a wheel): bound the compile so it
+# OOM-killed/starved every CI runner we tried — so a source spec is only viable on a big-RAM host.
+# FLASH_ATTN_SPEC is a pip spec: a wheel URL (preferred) or a pinned "flash-attn==X". It DEFAULTS to
+# the same validated cu128/torch2.10/cp312 wheel CI passes, like FLASH_ATTN_3_SPEC below, because the
+# verl venv further down hard-REQUIRES flash_attn (verl's remove-padding path imports it unguarded,
+# with no SDPA fallback). A source-build default would hard-fail that layer on any builder without
+# tens of GB of RAM, including the hand-build command in this file's header.
+# NOTE: keep this default in sync with .github/workflows/worker-image.yml's FA2_SPEC.
+ARG FLASH_ATTN_SPEC=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
+# Source-build only (ignored when FLASH_ATTN_SPEC is a wheel, i.e. by default): bound the compile so it
 # doesn't OOM. TORCH_CUDA_ARCH_LIST restricts to the catalog's arches — Ampere (8.0 A100 / 8.6
 # 3090/A40), Ada (8.9 4090), Hopper (9.0 H100), Blackwell datacenter (10.0 B200; sm100) + workstation (12.0 RTX 5090/Pro 6000; sm120); MAX_JOBS bounds
 # peak compile memory. (A from-source build still needs a big-RAM host; the wheel avoids all of it.)
