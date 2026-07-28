@@ -80,9 +80,7 @@ def _margs(**kw) -> Namespace:
 def test_cmd_env_pull_single_file(monkeypatch, tmp_path):
     _patch_client(
         monkeypatch,
-        _package_tarball(
-            {"environment.py": b"# env\n", "datasets/train.jsonl": b"line1\nline2\n"}
-        ),
+        _package_tarball({"environment.py": b"# env\n", "datasets/train.jsonl": b"line1\nline2\n"}),
     )
     out = tmp_path / "train.jsonl"
 
@@ -149,6 +147,24 @@ def test_cmd_env_pull_single_file_refuses_real_dir(monkeypatch, tmp_path):
     rc = cmd_env_pull(_margs(path="datasets/train.jsonl", output=str(out), force=True))
 
     assert rc == 1
+
+
+def test_cmd_env_pull_positional_dir_names_the_destination_form(monkeypatch, tmp_path, capsys):
+    """`flash env pull ns/env ./dir` must say how to ask for a destination directory.
+
+    The second positional is a path inside the env, so passing a directory there reads as
+    "fetch this file" and fails on the overwrite check. The error has to name the -o form.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into-here").mkdir()
+
+    rc = cmd_env_pull(_margs(path="into-here", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "-o into-here" in err
+    assert "david-freesolo-co/stuff" in err
 
 
 def test_cmd_env_pull_whole_env(monkeypatch, tmp_path):

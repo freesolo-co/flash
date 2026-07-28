@@ -96,9 +96,20 @@ def cmd_env_pull(args) -> int:
             default_name = Path(args.path.replace("\\", "/")).name
             out = Path(args.output) if args.output else Path(default_name)
             if out.is_dir() and not out.is_symlink():
+                # the common way to land here is `flash env pull ns/env ./somedir`, meaning
+                # "put the env in ./somedir". but the second positional is a path INSIDE the
+                # env, not a destination -- so ./somedir became the file to fetch, and its
+                # basename became the output, which happens to be that same directory. saying
+                # only "refusing to overwrite" leaves the user to guess that; name the
+                # destination form instead.
+                hint = (
+                    f"\nhint: to download the whole environment into {out}{os.sep}, "
+                    f"drop the second positional and pass it as the destination: "
+                    f"flash env pull {env_id} -o {out}"
+                )
                 print(
                     f"refusing to overwrite directory {out} with a file "
-                    "(a single-file pull needs -o to be a FILE path, not a directory)",
+                    "(a single-file pull needs -o to be a FILE path, not a directory)" + hint,
                     file=sys.stderr,
                 )
                 return 1
