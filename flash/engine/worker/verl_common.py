@@ -22,7 +22,7 @@ from collections.abc import Callable
 # plugin patches 0.8.0 internals and imports verl.trainer.main_ppo_sync, which verl deleted after
 # 0.8.0, and opd's exact-version gate reads the version file this branch pins to the release value.
 VERL_REQUIREMENT = (
-    "verl @ git+https://github.com/freesolo-co/verl@0f821c22325a1a51384431d57b899cc5dcf3d837"
+    "verl @ git+https://github.com/freesolo-co/verl@15199917aad5eb472306f42f2d85663e2eb3833a"
 )
 
 
