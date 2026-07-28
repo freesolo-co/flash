@@ -234,9 +234,13 @@ import pandas as pd
 
 class FlashTokenizedSFTDataset:
     def __init__(self, parquet_files, tokenizer, config, processor=None, max_samples=-1):
-        if not isinstance(parquet_files, (list, tuple)):
+        # verl hands data.train_files straight through from hydra, so this arrives as an omegaconf
+        # ListConfig, not a list. an isinstance (list, tuple) check misses it and wraps the sequence
+        # into [ListConfig([...])], which pandas rejects with "cannot construct a FileSource from
+        # [...]" before the first step. branch on str instead: a bare path is the only scalar shape.
+        if isinstance(parquet_files, str):
             parquet_files = [parquet_files]
-        frames = [pd.read_parquet(path, dtype_backend="pyarrow") for path in parquet_files]
+        frames = [pd.read_parquet(str(path), dtype_backend="pyarrow") for path in parquet_files]
         self.dataframe = pd.concat(frames, ignore_index=True)
         if max_samples > 0:
             self.dataframe = self.dataframe.iloc[:max_samples]

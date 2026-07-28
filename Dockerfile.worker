@@ -84,12 +84,15 @@ RUN pip install --no-cache-dir \
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC
 # (see .github/workflows/worker-image.yml). Installing a wheel takes seconds and gives full arch
 # coverage. Compiling FA2 from source instead is enormous (tens of GB RAM, ~1h for 5 arches) and
-# OOM-killed/starved every CI runner we tried — so the source path is only a LOCAL fallback.
-# FLASH_ATTN_SPEC is a pip spec: a wheel URL (preferred), a pinned "flash-attn==X", or the default
-# unpinned "flash-attn" (source build). Best-effort either way: on failure the image still works via
-# the SDPA fallback, so the layer never blocks the cold-start win.
-ARG FLASH_ATTN_SPEC=flash-attn
-# Source-build fallback only (ignored when FLASH_ATTN_SPEC is a wheel): bound the compile so it
+# OOM-killed/starved every CI runner we tried — so a source spec is only viable on a big-RAM host.
+# FLASH_ATTN_SPEC is a pip spec: a wheel URL (preferred) or a pinned "flash-attn==X". It DEFAULTS to
+# the same validated cu128/torch2.10/cp312 wheel CI passes, like FLASH_ATTN_3_SPEC below, because the
+# verl venv further down hard-REQUIRES flash_attn (verl's remove-padding path imports it unguarded,
+# with no SDPA fallback). A source-build default would hard-fail that layer on any builder without
+# tens of GB of RAM, including the hand-build command in this file's header.
+# NOTE: keep this default in sync with .github/workflows/worker-image.yml's FA2_SPEC.
+ARG FLASH_ATTN_SPEC=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
+# Source-build only (ignored when FLASH_ATTN_SPEC is a wheel, i.e. by default): bound the compile so it
 # doesn't OOM. TORCH_CUDA_ARCH_LIST restricts to the catalog's arches — Ampere (8.0 A100 / 8.6
 # 3090/A40), Ada (8.9 4090), Hopper (9.0 H100), Blackwell datacenter (10.0 B200; sm100) + workstation (12.0 RTX 5090/Pro 6000; sm120); MAX_JOBS bounds
 # peak compile memory. (A from-source build still needs a big-RAM host; the wheel avoids all of it.)
@@ -213,6 +216,104 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 [print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
 'accelerate','wandb','flash-linear-attention','bitsandbytes', \
 'hf-transfer','freesolo','runpod']]"
+
+# ---------------------------------------------------------------------------------------------
+# verl venv (GRPO/OPD/SFT verl backends): ISOLATED from the main interpreter on purpose.
+#
+# verl's dependency set CONFLICTS with the worker stack above. verl and TransferQueue declare
+# numpy<2.0.0 while this image's stack resolves numpy>=2, and verl's structured-OPD gate pins
+# xgrammar to exactly 0.1.25 against vLLM's declared >=0.1.32 floor. Resolving verl into the main
+# interpreter would move shared pins under every other worker path (trl/peft/transformers/vllm all
+# live there), so verl gets its own venv and flash launches it out-of-process via FLASH_VERL_PYTHON.
+# The venv deliberately re-resolves its own numpy independent of the base interpreter's.
+#
+# Without this venv the runtime falls back to resolve_verl_python(), which builds a venv from the
+# verl requirement ALONE. verl's install_requires omits vllm/uvicorn/fastapi/cachetools, so that
+# fallback yields an interpreter where `verl.trainer.main_ppo` dies on ModuleNotFoundError:
+# cachetools and `main_ppo_sync` dies on uvicorn. Baking the full set here is what makes the verl
+# backends actually runnable.
+#
+# vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
+# That deliberately exceeds verl's declared vllm<=0.12.0 ceiling. The metadata-clean alternative
+# (0.11.2, which satisfies the ceiling and makes `uv pip check` green) was rejected on a model-
+# contract fact: Qwen/Qwen3.5-4B is flash's DEFAULT_MODEL and enables GRPO+OPD, both of which set
+# rollout.name=vllm, and 0.11.2 registers neither Qwen3_5ForConditionalGeneration nor
+# Qwen3_5MoeForConditionalGeneration, so it cannot run rollouts for the default model at all.
+# The ceiling is stale for the async rollout path regardless: verl 0.8.0's own stable Dockerfile
+# defaults to vllm 0.20.2, its Qwen3.5 GRPO examples require 0.18.0, and vllm_async_server.py
+# branches explicitly on 0.13+/0.17+/0.20+ behavior.
+#
+# Three metadata violations are DELIBERATE, and `uv pip check` stays red in here by design:
+#   verl + transferqueue declare numpy<2.0.0   -> vLLM 0.19.1 needs numpy>=2 (declarations are stale)
+#   verl declares vllm>=0.8.5,<=0.12.0         -> we ship 0.19.1 (see the ceiling discussion above)
+#   vllm declares xgrammar>=0.1.32             -> structured OPD gates on EXACTLY 0.1.25
+# xgrammar 0.1.25 was exercised against vLLM 0.19.1's own XgrammarBackend (schema compile, grammar
+# build, token-mask fill+apply) so the floor is not required to drive the API.
+#
+# Those three violations are why this uses `uv pip install --override` and NOT plain pip. pip has no
+# escape hatch for a deliberate metadata violation: it either resolves or it refuses, and here it
+# refuses with `ResolutionImpossible: Cannot install numpy==2.2.6 and verl` (verl 0.8.0 pins
+# numpy<2.0.0). uv's --override is the mechanism this pin set was validated with. All three violated
+# pins must appear in the override file: dropping the vllm line alone is still unsatisfiable
+# (verl[vllm] depends on vllm<=0.12.0 while we require 0.19.1).
+#
+# `uv venv` rather than `python -m venv` because the pytorch base image ships no ensurepip, so
+# `python -m venv` fails outright ("The virtual environment was not created successfully because
+# ensurepip is not available"). --seed puts pip in the venv anyway. uv itself is already in the base
+# image at /usr/local/bin/uv.
+#
+# Two pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
+# PyExtensionType) and TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()).
+ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7
+ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
+RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-overrides.txt \
+    && uv venv --seed /opt/verl-venv \
+    && VIRTUAL_ENV=/opt/verl-venv uv pip install --python /opt/verl-venv/bin/python \
+        --override /tmp/verl-overrides.txt \
+        "${VERL_SPEC}" \
+        "vllm==0.19.1" \
+        "xgrammar==0.1.25" \
+        "numpy==2.2.6" \
+        "datasets>=4.7,<6" \
+        "TransferQueue==0.1.7" \
+        liger-kernel "bitsandbytes>=0.49" qwen-vl-utils \
+    && rm -f /tmp/verl-overrides.txt \
+    && uv cache clean
+
+# flash-attn is REQUIRED in here, not best-effort like it is in the main interpreter above. All three
+# backends hard-enable remove-padding (rl_verl.py:138, sft_verl.py:145, opd_verl.py:1458), and verl's
+# CUDA remove-padding path imports flash_attn.bert_padding UNGUARDED
+# (verl/utils/attention_utils.py:30, torch_functional.py:627,657). There is no SDPA fallback on that
+# path: without the module the run dies at the first training batch, which the import-only assert
+# below would not catch. Reuses FLASH_ATTN_SPEC so the venv gets the same wheel as the main
+# interpreter instead of a second source build.
+RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
+    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${FLASH_ATTN_SPEC}" \
+    && uv cache clean
+
+# Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
+# have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
+# (rl_verl -> main_ppo, opd_verl_plugin -> main_ppo_sync, sft_verl -> sft_trainer; note it is
+# sft_trainer, NOT fsdp_sft_trainer, which does not exist in this pin), the vLLM rollout modules
+# where a version mismatch would surface, and the fork-only rollout field the GRPO path emits as a
+# hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
+# venv carries 0.19.1 instead of 0.11.2.
+RUN /opt/verl-venv/bin/python -c "import importlib.metadata as M; \
+import importlib; \
+[importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.main_ppo_sync','verl.trainer.sft_trainer')]; \
+[importlib.import_module(m) for m in ('verl.workers.rollout.vllm_rollout.vllm_rollout','verl.workers.rollout.vllm_rollout.vllm_async_server')]; \
+from verl.workers.config.rollout import RolloutConfig; \
+assert 'mask_truncated_completions' in RolloutConfig.__dataclass_fields__, 'verl is not the freesolo fork (no mask_truncated_completions)'; \
+importlib.import_module('flash_attn.bert_padding'); \
+assert M.version('verl') == '0.8.0', 'opd structured gate requires verl exactly 0.8.0, got ' + M.version('verl'); \
+assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
+from vllm import ModelRegistry; \
+archs = set(ModelRegistry.get_supported_archs()); \
+missing = {'Qwen3_5ForConditionalGeneration','Qwen3_5MoeForConditionalGeneration'} - archs; \
+assert not missing, 'vllm cannot serve the default-model archs: ' + repr(sorted(missing)); \
+print('verl venv OK | verl', M.version('verl'), '| vllm', M.version('vllm'), '| torch', M.version('torch'), '| numpy', M.version('numpy'), '| xgrammar', M.version('xgrammar')); \
+print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)'); \
+print('  qwen3.5 archs registered; mask_truncated_completions present')"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
 # from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;
