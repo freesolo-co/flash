@@ -48,6 +48,20 @@ def load_credentials() -> tuple[str, str | None]:
     return api_url, api_key
 
 
+def api_url_source() -> str:
+    """Name where the control-plane URL came from, for display alongside the key source.
+
+    A config holding only an api_key resolves to the channel default, which on the release
+    channel is production. Nothing in the output says so, so a user who believes they are
+    pointed somewhere else gets no signal until a run has already been created there.
+    """
+    if os.environ.get("FLASH_API_URL"):
+        return "FLASH_API_URL"
+    if _read_config().get("api_url"):
+        return str(CONFIG_PATH)
+    return f"default for the {CHANNEL} channel"
+
+
 def shadowed_login_warning() -> str | None:
     """Warn when ``FREESOLO_API_KEY`` shadows a *different* saved login, else None.
 

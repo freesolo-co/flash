@@ -21,7 +21,7 @@ from flash.client import (
     save_credentials,
     verify_freesolo_key,
 )
-from flash.client.config import load_credentials, load_credentials_with_source
+from flash.client.config import api_url_source, load_credentials, load_credentials_with_source
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
@@ -136,8 +136,9 @@ def _identity_or_none(api_key: str, api_url: str) -> dict | None:
 
 
 def cmd_whoami(args) -> int:
-    _, _, key_source = load_credentials_with_source()
-    print(render.whoami(client_from_config().me(), key_source))
+    api_url, _, key_source = load_credentials_with_source()
+    me = client_from_config().me()
+    print(render.whoami(me, key_source, api_url, api_url_source()))
     return 0
 
 

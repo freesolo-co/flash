@@ -108,3 +108,54 @@ def test_whoami_reports_the_key_source(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "FREESOLO_API_KEY" in out
     assert "me@x.co" in out
+
+
+def test_api_url_source_names_the_channel_default(monkeypatch):
+    # a config holding only an api_key resolves to the channel default, which on the release
+    # channel is production. the source string has to say so rather than look configured.
+    monkeypatch.delenv("FLASH_API_URL", raising=False)
+    _patch_saved_key(monkeypatch, "fslo-saved-login")
+
+    source = client_config.api_url_source()
+    assert "default" in source
+    assert client_config.CHANNEL in source
+
+
+def test_api_url_source_names_the_env_override(monkeypatch):
+    monkeypatch.setenv("FLASH_API_URL", "http://127.0.0.1:8000")
+
+    assert client_config.api_url_source() == "FLASH_API_URL"
+
+
+def test_api_url_source_names_the_config_file(monkeypatch):
+    monkeypatch.delenv("FLASH_API_URL", raising=False)
+    monkeypatch.setattr(
+        client_config, "_read_config", lambda: {"api_key": "k", "api_url": "https://custom"}
+    )
+
+    assert client_config.api_url_source() == str(client_config.CONFIG_PATH)
+
+
+def test_whoami_names_the_control_plane_it_resolved(monkeypatch, capsys):
+    """The destination has two halves: which key, and which control plane.
+
+    Naming only the key still lets someone believe they are pointed at a local or dev plane
+    while every command lands in production.
+    """
+    monkeypatch.setattr(
+        cli.commands,
+        "load_credentials_with_source",
+        lambda: ("https://flash.freesolo.co", "fslo-key", "FREESOLO_API_KEY"),
+    )
+    monkeypatch.setattr(cli.commands, "api_url_source", lambda: "default for the release channel")
+
+    class _FakeClient:
+        def me(self):
+            return {"kind": "freesolo_api_key", "key_prefix": "fslo-ke", "email": "me@x.co"}
+
+    monkeypatch.setattr(cli.commands, "client_from_config", lambda: _FakeClient())
+
+    assert cmd_whoami(argparse.Namespace()) == 0
+    out = capsys.readouterr().out
+    assert "https://flash.freesolo.co" in out
+    assert "default for the release channel" in out
