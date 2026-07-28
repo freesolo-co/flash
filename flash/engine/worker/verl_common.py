@@ -18,11 +18,12 @@ import subprocess
 import time
 from collections.abc import Callable
 
-# verl 0.8.0 exactly, plus the truncation-mask commit. it must stay on the 0.8.0 base: the opd
+# verl 0.8.0 exactly, plus the truncation-mask and 3d position id commits. it must stay on the
+# 0.8.0 base: the opd
 # plugin patches 0.8.0 internals and imports verl.trainer.main_ppo_sync, which verl deleted after
 # 0.8.0, and opd's exact-version gate reads the version file this branch pins to the release value.
 VERL_REQUIREMENT = (
-    "verl @ git+https://github.com/freesolo-co/verl@0f821c22325a1a51384431d57b899cc5dcf3d837"
+    "verl @ git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
 )
 
 
