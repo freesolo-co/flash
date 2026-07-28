@@ -63,6 +63,7 @@ def _overrides_cfg(**over):
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
         "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "loggers": "console", "fp8_kv": False,
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
+        "mask_truncated_completions": True,
         "total_epochs": 1, "save_freq": 20, "local_dir": "/w/ckpt",
     }
     cfg.update(over)
@@ -103,6 +104,15 @@ def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
     # this guards only against flash emitting a misleading no-op; it does not prove verl reads the key.
     o = rl_verl.build_verl_overrides(_overrides_cfg())
     assert not any("drop_last" in override for override in o)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_build_verl_overrides_sets_truncation_mask(enabled):
+    o = rl_verl.build_verl_overrides(
+        _overrides_cfg(mask_truncated_completions=enabled)
+    )
+    expected = str(enabled).lower()
+    assert f"++actor_rollout_ref.rollout.mask_truncated_completions={expected}" in o
 
 
 @pytest.mark.parametrize(

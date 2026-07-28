@@ -4,8 +4,8 @@ verl pins its own torch/vllm, incompatible with flash's, so flash never imports 
 runs a verl trainer entrypoint as a subprocess against a separate interpreter and merges the
 fsdp-sharded lora checkpoint back into a flash-servable peft adapter. these are the framework- and
 algorithm-neutral pieces (interpreter resolution, checkpoint export, provenance, progress
-streaming); the sft/opd modules layer their own dataset rows, hydra overrides, and orchestration on
-top. the grpo verl path uses the same pattern and will consolidate onto this module once it lands.
+streaming); the sft/opd/grpo modules layer their own dataset rows, hydra overrides, and orchestration
+on top.
 """
 
 from __future__ import annotations
@@ -18,12 +18,17 @@ import subprocess
 import time
 from collections.abc import Callable
 
+VERL_REQUIREMENT = (
+    "verl @ git+https://github.com/freesolo-co/verl@c1962bdee57310aaed7db28992fb16dcb75d3e95"
+)
 
-def resolve_verl_python(workdir: str) -> str:
+
+def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     """return an interpreter that can import verl.
 
     prefers FLASH_VERL_PYTHON (set by the caller when verl is preinstalled, e.g. on a verl image).
     otherwise provisions an isolated venv on the pod so verl's torch/vllm never touch flash's env.
+    optionally installs wandb best-effort for callers that enable verl's wandb logger.
     """
     preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
     if preset:
@@ -32,8 +37,7 @@ def resolve_verl_python(workdir: str) -> str:
     py = os.path.join(venv, "bin", "python")
     if not os.path.exists(py):
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
-        # its own torch/vllm; a full install (not --no-deps) so runtime deps are present. unpinned so
-        # it tracks the current verl (vllm 0.23/0.24, Qwen3.5-capable) rather than a stale release.
+        # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
         subprocess.run(["uv", "venv", venv], check=True)
         subprocess.run(
             [
@@ -42,7 +46,7 @@ def resolve_verl_python(workdir: str) -> str:
                 "install",
                 "--python",
                 py,
-                "verl",
+                VERL_REQUIREMENT,
                 "liger-kernel",
                 "bitsandbytes>=0.49",
                 "qwen-vl-utils",
@@ -53,6 +57,9 @@ def resolve_verl_python(workdir: str) -> str:
             ],
             check=True,
         )
+        if install_wandb:
+            # verl does not pull wandb; install it best-effort so logger setup can fall back to console.
+            subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
     return py
 
 

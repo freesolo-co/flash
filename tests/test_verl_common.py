@@ -58,9 +58,10 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert python_bin.endswith("/verl-venv/bin/python")
     assert calls[0][:2] == ["uv", "venv"]
     install = calls[1]
-    # unpinned so the dev fallback tracks current verl (vllm 0.23/0.24, Qwen3.5-capable)
-    assert "verl" in install
-    assert not any(x.startswith("verl==") for x in install)
+    assert vc.VERL_REQUIREMENT == (
+        "verl @ git+https://github.com/freesolo-co/verl@c1962bdee57310aaed7db28992fb16dcb75d3e95"
+    )
+    assert vc.VERL_REQUIREMENT in install
     assert "liger-kernel" in install
     assert "bitsandbytes>=0.49" in install
     assert "qwen-vl-utils" in install
@@ -68,6 +69,27 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "xgrammar==0.1.25" in install
     assert "tqdm" in install
     assert "pyarrow" in install
+    assert len(calls) == 2
+
+
+def test_resolve_verl_python_installs_wandb_best_effort_when_requested(
+    monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(
+        vc.subprocess,
+        "run",
+        lambda command, check: calls.append((command, check)),
+    )
+
+    vc.resolve_verl_python(str(tmp_path), install_wandb=True)
+
+    assert vc.VERL_REQUIREMENT in calls[1][0]
+    assert calls[2] == (
+        ["uv", "pip", "install", "--python", str(tmp_path / "verl-venv/bin/python"), "wandb"],
+        False,
+    )
 
 
 def test_run_verl_training_streams_steps_and_returns_code():
