@@ -4412,6 +4412,69 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert multi_turn_overrides["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"] == "1536"
 
 
+def test_remote_distillation_config_declares_every_field_post_init_assigns():
+    # verl's BaseConfig.__setattr__ (base_config.py) raises FrozenInstanceError for any assignment to
+    # an already-set field that is not in _mutable_fields. FlashRemoteDistillationConfig's __post_init__
+    # normalizes distillation_loss and clears teacher_models, so BOTH must be declared mutable -- else
+    # hydra's instantiate of distillation._target_ dies at worker startup, i.e. only on GPU, after the
+    # run is already paid for. That is exactly how this shipped: the only other coverage of this class
+    # asserts the _target_ STRING and never constructs it.
+    #
+    # Checked by AST rather than by instantiating: verl is not installed in CI (it lives in a separate
+    # baked venv), so an importorskip test would skip here and prove nothing on the machine that gates
+    # the merge. Reading the source needs no verl at runtime and still fails on a new unlisted field.
+    import ast
+    import inspect
+
+    from flash.engine.worker import opd_verl_plugin as plugin
+
+    installer = ast.parse(inspect.getsource(plugin._install_verl_extensions))
+    class_defs = [
+        node
+        for node in ast.walk(installer)
+        if isinstance(node, ast.ClassDef) and node.name == "FlashRemoteDistillationConfig"
+    ]
+    assert len(class_defs) == 1, "expected exactly one FlashRemoteDistillationConfig definition"
+    class_def = class_defs[0]
+
+    declared: set[str] = set()
+    post_init = None
+    for node in class_def.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_mutable_fields" for t in node.targets
+        ):
+            # the value is `<Parent>._mutable_fields | {...}`; only the literal half is readable here,
+            # so union in the parent's own set below rather than guessing at its contents.
+            declared |= {
+                el.value
+                for el in ast.walk(node.value)
+                if isinstance(el, ast.Constant) and isinstance(el.value, str)
+            }
+        if isinstance(node, ast.FunctionDef) and node.name == "__post_init__":
+            post_init = node
+
+    assert post_init is not None, "__post_init__ disappeared; this guard no longer covers anything"
+
+    # verl's DistillationConfig already declares these, so flash's literal need not repeat them.
+    inherited = {"teacher_models", "n_gpus_per_node", "nnodes"}
+    assigned = {
+        target.attr
+        for node in ast.walk(post_init)
+        for target in getattr(node, "targets", [])
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    }
+    assert assigned, "no self.<field> assignments found; the AST walk is not seeing the body"
+    assert "distillation_loss" in assigned  # pin the specific field that broke
+
+    undeclared = assigned - declared - inherited
+    assert not undeclared, (
+        f"__post_init__ assigns {sorted(undeclared)} but they are not in _mutable_fields; "
+        "verl will raise FrozenInstanceError at worker startup"
+    )
+
+
 def test_structured_overrides_pin_xgrammar_and_thinking_parser():
     overrides = dict(
         value.split("=", 1)

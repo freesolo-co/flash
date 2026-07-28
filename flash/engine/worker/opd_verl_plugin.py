@@ -669,6 +669,12 @@ def _install_verl_extensions() -> None:
 
     @dataclass
     class FlashRemoteDistillationConfig(DistillationConfig):
+        # verl's BaseConfig.__setattr__ rejects any assignment to a field that is not listed here
+        # (base_config.py:33-38), so __post_init__ below can only normalize distillation_loss if the
+        # field is declared mutable. verl's own DistillationConfig declares teacher_models for exactly
+        # the same reason; it never reassigns distillation_loss, so it did not need to.
+        _mutable_fields = DistillationConfig._mutable_fields | {"distillation_loss"}
+
         bridge_url: str = ""
         bridge_token: str = ""
         kl_penalty_coef: float = 1.0
