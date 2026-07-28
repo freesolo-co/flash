@@ -214,6 +214,71 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 'accelerate','wandb','flash-linear-attention','bitsandbytes', \
 'hf-transfer','freesolo','runpod']]"
 
+# ---------------------------------------------------------------------------------------------
+# verl venv (GRPO/OPD/SFT verl backends) — ISOLATED from the main interpreter on purpose.
+#
+# verl pins a stack that CONFLICTS with the worker stack above: it wants torch 2.9 where the base is
+# 2.10, and it drives vLLM through APIs that moved. Installing verl into the main interpreter would
+# downgrade the serving/training stack every other worker path depends on, so it gets its own venv
+# and flash launches it out-of-process via FLASH_VERL_PYTHON.
+#
+# Without this venv the runtime falls back to resolve_verl_python(), which builds a venv from the
+# verl requirement ALONE. verl's install_requires omits vllm/uvicorn/fastapi/cachetools, so that
+# fallback yields an interpreter where `verl.trainer.main_ppo` dies on ModuleNotFoundError:
+# cachetools and `main_ppo_sync` dies on uvicorn. Baking the full set here is what makes the verl
+# backends actually runnable.
+#
+# vLLM 0.19.1, NOT the metadata-clean 0.11.2: Qwen/Qwen3.5-4B is flash's DEFAULT_MODEL and enables
+# GRPO+OPD, both of which set rollout.name=vllm. vLLM 0.11.2 registers neither
+# Qwen3_5ForConditionalGeneration nor Qwen3_5MoeForConditionalGeneration, so it cannot run rollouts
+# for the default model. verl's declared vllm<=0.12.0 ceiling is stale for the async rollout path:
+# verl 0.8.0's own stable Dockerfile defaults to vllm 0.20.2, its Qwen3.5 GRPO examples require
+# 0.18.0, and vllm_async_server.py branches explicitly on 0.13+/0.17+/0.20+ behavior.
+#
+# Three metadata violations are DELIBERATE, and `uv pip check` stays red in here by design:
+#   verl + transferqueue declare numpy<2.0.0   -> vLLM 0.19.1 needs numpy>=2 (declarations are stale)
+#   vllm declares xgrammar>=0.1.32             -> structured OPD gates on EXACTLY 0.1.25
+# xgrammar 0.1.25 was exercised against vLLM 0.19.1's own XgrammarBackend (schema compile, grammar
+# build, token-mask fill+apply) so the floor is not required to drive the API.
+#
+# Two pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
+# PyExtensionType) and TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()).
+ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@0f821c22325a1a51384431d57b899cc5dcf3d837
+ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
+RUN python -m venv /opt/verl-venv \
+    && /opt/verl-venv/bin/pip install --no-cache-dir -U pip \
+    && /opt/verl-venv/bin/pip install --no-cache-dir \
+        "${VERL_SPEC}" \
+        "vllm==0.19.1" \
+        "xgrammar==0.1.25" \
+        "numpy==2.2.6" \
+        "datasets>=4.7,<6" \
+        "TransferQueue==0.1.7" \
+        liger-kernel "bitsandbytes>=0.49" qwen-vl-utils
+
+# Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
+# have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
+# (rl_verl -> main_ppo, opd_verl_plugin -> main_ppo_sync, sft_verl -> sft_trainer; note it is
+# sft_trainer, NOT fsdp_sft_trainer, which does not exist in this pin), the vLLM rollout modules
+# where a version mismatch would surface, and the fork-only rollout field the GRPO path emits as a
+# hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
+# venv carries 0.19.1 instead of 0.11.2.
+RUN /opt/verl-venv/bin/python -c "import importlib.metadata as M; \
+import importlib; \
+[importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.main_ppo_sync','verl.trainer.sft_trainer')]; \
+[importlib.import_module(m) for m in ('verl.workers.rollout.vllm_rollout.vllm_rollout','verl.workers.rollout.vllm_rollout.vllm_async_server')]; \
+from verl.workers.config.rollout import RolloutConfig; \
+assert 'mask_truncated_completions' in RolloutConfig.__dataclass_fields__, 'verl is not the freesolo fork (no mask_truncated_completions)'; \
+assert M.version('verl') == '0.8.0', 'opd structured gate requires verl exactly 0.8.0, got ' + M.version('verl'); \
+assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
+from vllm import ModelRegistry; \
+archs = set(ModelRegistry.get_supported_archs()); \
+missing = {'Qwen3_5ForConditionalGeneration','Qwen3_5MoeForConditionalGeneration'} - archs; \
+assert not missing, 'vllm cannot serve the default-model archs: ' + repr(sorted(missing)); \
+print('verl venv OK | verl', M.version('verl'), '| vllm', M.version('vllm'), '| torch', M.version('torch'), '| numpy', M.version('numpy'), '| xgrammar', M.version('xgrammar')); \
+print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)'); \
+print('  qwen3.5 archs registered; mask_truncated_completions present')"
+
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
 # from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;
 # _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
