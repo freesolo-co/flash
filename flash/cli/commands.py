@@ -407,8 +407,9 @@ def cmd_train(args) -> int:
         print(render.submitted(run_id), file=sys.stderr)
     else:
         print(
-            f"run {run_id} submitted; following logs "
-            f"(Ctrl-C detaches, `flash runs log {run_id} --follow` resumes)",
+            f"run {run_id} submitted; following logs (Ctrl-C detaches and the run keeps "
+            f"billing, `{CLI_NAME} runs log {run_id} --follow` resumes, "
+            f"`{CLI_NAME} runs cancel {run_id}` stops it)",
             file=sys.stderr,
         )
     return _follow_run(client, run_id)
@@ -547,9 +548,33 @@ def _render_status(status: dict) -> str:
     return render.run_status(status) if render.styled() else json.dumps(status, indent=2)
 
 
+def _print_detached_note(run_id: str) -> None:
+    """Say what ctrl-c actually did: detached the stream, left the paid run running.
+
+    The generic handler prints "aborted", which reads as "the run stopped". It did not, so the
+    next thing a user does is re-run `flash train` and pay for a duplicate. Name the run and both
+    commands that act on it.
+    """
+    detached = f"detached from {run_id}; the run is still going and still billing"
+    resume = f"resume with `{CLI_NAME} runs log {run_id} --follow`"
+    stop = f"stop it with `{CLI_NAME} runs cancel {run_id}`"
+    if render.styled():
+        print(render.warn(detached), file=sys.stderr)
+        print(render.arrow(resume), file=sys.stderr)
+        print(render.arrow(stop), file=sys.stderr)
+    else:
+        print(f"warning: {detached}", file=sys.stderr)
+        print(f"note: {resume}", file=sys.stderr)
+        print(f"note: {stop}", file=sys.stderr)
+
+
 def _follow_run(client: ApiClient, run_id: str) -> int:
     """Poll logs until the run reaches a terminal state, then print the final status."""
-    state, _ = _poll_logs(client, run_id, interval=2.0)
+    try:
+        state, _ = _poll_logs(client, run_id, interval=2.0)
+    except KeyboardInterrupt:
+        _print_detached_note(run_id)
+        return 130
     print(_render_status(client.get_run(run_id)))
     return 0 if state in _OK_STATES else 1
 
@@ -557,16 +582,20 @@ def _follow_run(client: ApiClient, run_id: str) -> int:
 def _follow_status(client: ApiClient, run_id: str, interval: float = 2.0) -> int:
     """Poll run status until terminal, without replaying worker logs."""
     last_rendered: str | None = None
-    while True:
-        status = client.get_run(run_id)
-        rendered = _render_status(status)
-        if rendered != last_rendered:
-            print(rendered)
-            last_rendered = rendered
-        state = str(status.get("state") or "")
-        if state in _CLI_DONE_STATES:
-            return 0 if state in _OK_STATES else 1
-        time.sleep(interval)
+    try:
+        while True:
+            status = client.get_run(run_id)
+            rendered = _render_status(status)
+            if rendered != last_rendered:
+                print(rendered)
+                last_rendered = rendered
+            state = str(status.get("state") or "")
+            if state in _CLI_DONE_STATES:
+                return 0 if state in _OK_STATES else 1
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        _print_detached_note(run_id)
+        return 130
 
 
 def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
@@ -586,7 +615,11 @@ def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = 
 def cmd_log(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
-        state, printed_any = _poll_logs(client, args.run_id, interval=2.0)
+        try:
+            state, printed_any = _poll_logs(client, args.run_id, interval=2.0)
+        except KeyboardInterrupt:
+            _print_detached_note(args.run_id)
+            return 130
         _print_worker_output(client, args.run_id, printed_any=printed_any)
         return 0 if state in _OK_STATES else 1
     text = str(client.get_logs(args.run_id, offset=0).get("logs") or "")
