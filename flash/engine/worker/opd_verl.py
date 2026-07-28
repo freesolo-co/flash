@@ -1437,12 +1437,22 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         "data.truncation=error",
         "data.shuffle=false",
         f"data.seed={_hydra_val(config.get('seed', 42))}",
-        f"actor_rollout_ref.rollout.seed={_hydra_val(config.get('seed', 42))}",
+        # rollout engine seed. NOT `rollout.seed`: verl 0.8.0's RolloutConfig declares no such field,
+        # so a bare key fails hydra composition and a `+`/`++` prefix composes but then dies in
+        # omega_conf_to_dataclass with an unexpected-kwarg TypeError. engine_kwargs is a declared
+        # dict on both 0.8.0 and 0.9.x and is spread into the vllm engine args *after* verl's own
+        # "seed" entry, so it wins. `++` because the sub-key is absent from the composed node.
+        # per-request sampling is seeded separately by the plugin's deterministic_rollout_seed.
+        f"++actor_rollout_ref.rollout.engine_kwargs.vllm.seed={_hydra_val(config.get('seed', 42))}",
         "data.dataloader_num_workers=0",
         "data.image_key=images",
         "data.return_raw_chat=true",
         "data.return_multi_modal_inputs=false",
-        "data.apply_chat_template_kwargs={enable_thinking:" + _hydra_val(config.get("thinking", False)) + "}",
+        # `++`, not a bare key: data.apply_chat_template_kwargs exists but holds an empty struct
+        # dict, so assigning a whole dict to it is rejected as an unknown sub-key.
+        "++data.apply_chat_template_kwargs={enable_thinking:"
+        + _hydra_val(config.get("thinking", False))
+        + "}",
         f"actor_rollout_ref.model.path={_hydra_val(config['model_path'])}",
         "actor_rollout_ref.model.trust_remote_code=true",
         "actor_rollout_ref.model.use_remove_padding=true",
@@ -1473,7 +1483,9 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         "actor_rollout_ref.rollout.mode=async",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={_hydra_val(config['n_gpus_per_node'])}",
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
-        "actor_rollout_ref.rollout.limit_images=8",
+        # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
+        # composed rollout node, so hydra rejects a bare assignment.
+        "++actor_rollout_ref.rollout.limit_images=8",
         f"actor_rollout_ref.rollout.max_model_len={_hydra_val(config.get('max_model_len', 32768))}",
         f"actor_rollout_ref.rollout.temperature={_hydra_val(config.get('temperature', 1.0))}",
         f"actor_rollout_ref.rollout.top_p={_hydra_val(config.get('top_p', 1.0))}",
