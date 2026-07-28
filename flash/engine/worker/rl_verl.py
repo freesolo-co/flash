@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import random
 import re
@@ -39,6 +40,21 @@ DATA_SOURCE = "flash_env"
 # --------------------------------------------------------------------------------------------
 # pure helpers (no verl, no gpu, no network) -- unit tested directly.
 # --------------------------------------------------------------------------------------------
+def _verl_epochs_for_horizon(
+    *, epochs: int, prompt_count: int, prompts_per_step: int, steps: int
+) -> int:
+    if prompt_count <= 0:
+        raise ValueError("prompt_count must be positive")
+    if prompts_per_step <= 0:
+        raise ValueError("prompts_per_step must be positive")
+    if prompt_count < prompts_per_step:
+        raise ValueError("prompt_count must be at least prompts_per_step")
+    # verl hardcodes drop_last=True, so each epoch serves floor(prompt_count / batch_size) steps.
+    # the flag cannot be configured off, and ceil here would still under-serve the requested horizon.
+    steps_per_epoch = prompt_count // prompts_per_step
+    return max(epochs, math.ceil(steps / steps_per_epoch))
+
+
 def build_verl_dataset_rows(
     message_prompts: list[list[dict]],
     example_indices: list[int],
@@ -70,8 +86,9 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     """build the hydra override list for `python -m verl.trainer.main_ppo` (grpo + lora + vllm).
 
     carries the flash grpo recipe: dr-grpo advantages (no std norm, constant-length loss), the
-    job's kl coefficient (flash default 0 = no kl term), constant lr, seed, sampling top_p,
-    num_iterations (ppo_epochs), the max-steps horizon, and the save schedule.
+    job's kl coefficient (flash default 0 = no kl term), constant lr, seed, sampling top_p, and one
+    ppo epoch so total_training_steps counts optimizer updates. unlike trl's generation-batch reuse,
+    verl samples a fresh rollout per update, so rollout volume and policy staleness still differ.
     """
     kl_on = float(cfg["kl_coef"]) > 0
     o = [
@@ -116,12 +133,15 @@ def build_verl_overrides(cfg: dict) -> list[str]:
             else []
         ),
         f"actor_rollout_ref.actor.optim.lr={cfg['lr']}",
+        # only the lora adapter is trainable; decaying its weights toward zero is not part of grpo.
+        "actor_rollout_ref.actor.optim.weight_decay=0.0",
         # 0 warmup -> verl's warmup+constant scheduler holds lr flat, matching the trl constant recipe.
         "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={cfg['prompts_per_step']}",
         f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={cfg['micro_batch']}",
-        # num_iterations: amortize each generation batch over N optimizer passes.
-        f"actor_rollout_ref.actor.ppo_epochs={cfg['num_iterations']}",
+        # ppo_epochs multiplies verl's update loop, so its default of 1 preserves the requested update
+        # count and on-policy baseline. unlike trl reuse, verl samples a fresh rollout for every update.
+        f"actor_rollout_ref.actor.ppo_epochs={cfg['ppo_epochs']}",
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
         # safetensors load format is required for lora rollout on vllm.
@@ -168,6 +188,82 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # engine_kwargs.vllm struct (it is not a default field).
         o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
     return o
+
+
+def _build_verl_training_cfg(
+    inp: dict,
+    *,
+    train_files: str,
+    val_files: str,
+    model_id: str,
+    micro_batch: int,
+    thinking: bool,
+    loggers: str,
+    fp8_kv: bool,
+    reward_path: str,
+    local_dir: str,
+) -> dict:
+    return {
+        "train_files": train_files,
+        "val_files": val_files,
+        "model_id": model_id,
+        "lora_rank": inp["lora_rank"],
+        "lora_alpha": inp["lora_alpha"],
+        "target_modules": "all-linear",
+        "lr": inp["lr"],
+        "group_size": inp["group_size"],
+        "prompts_per_step": inp["prompts_per_step"],
+        "micro_batch": micro_batch,
+        "max_prompt_len": inp["max_prompt_len"],
+        "max_completion": inp["max_completion"],
+        "temperature": inp["temperature"],
+        "top_p": inp["top_p"],
+        "kl_coef": inp["kl_coef"],
+        "thinking": thinking,
+        "loss_agg_mode": "seq-mean-token-sum-norm",
+        "seed": inp["seed"],
+        "ppo_epochs": inp["ppo_epochs"],
+        "steps": int(inp["steps"]),
+        "warmstart_adapter": inp["warmstart_adapter"],
+        "gpu_mem_util": 0.5,
+        "tp_size": 1,
+        "loggers": loggers,
+        "fp8_kv": fp8_kv,
+        "reward_path": reward_path,
+        "reward_name": "compute_score",
+        "total_epochs": inp["verl_total_epochs"],
+        "save_freq": inp["save_every"],
+        "local_dir": local_dir,
+    }
+
+
+def _build_verl_train_notes(
+    inp: dict,
+    *,
+    steps_run: int,
+    retained_prompts: int,
+    reward_history: list[float],
+    loss_curve: list[float],
+) -> dict:
+    return {
+        "backend": "verl",
+        "steps": steps_run,
+        "epochs": inp["epochs"],
+        "retained_prompts": retained_prompts,
+        "group_size": inp["group_size"],
+        "reward_history": reward_history,
+        "loss_curve": loss_curve,
+        "grpo_recipe": {
+            "kl_coef": inp["kl_coef"],
+            "temperature": inp["temperature"],
+            "top_p": inp["top_p"],
+            "ppo_epochs": inp["ppo_epochs"],
+            "verl_total_epochs": inp["verl_total_epochs"],
+            "seed": inp["seed"],
+            "loss_agg_mode": "seq-mean-token-sum-norm",
+            "norm_adv_by_std_in_grpo": False,
+        },
+    }
 
 
 def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
@@ -490,10 +586,11 @@ def _resolve_single_turn_inputs():
             flush=True,
         )
     # trl drops truncated (non-eos) completions from the grpo loss (mask_truncated_completions,
-    # default True); verl's vllm rollout here has no per-completion truncation-mask knob, so verl
-    # keeps them. stop_sequences (the only case that turns masking off) already fails loudly above,
-    # so this is always the default-True case. record the divergence for parity observability
-    # rather than silently ignoring it; adding verl-side masking is a tracked follow-up.
+    # default True); verl 0.8.0 cannot express this through config. its vllm server discards the
+    # finish_reason length/stop distinction, and its rollout schemas and trainer masks never apply
+    # finish-reason-dependent response-loss masking anyway. stop_sequences (the only case that turns
+    # masking off) already fails loudly above, so this is always the default-True case. a real fix needs
+    # finish-reason propagation plus explicit zeroing of the truncated response loss mask.
     if _w.grpo_mask_truncated_completions(_t):
         print(
             "[rl-verl] mask_truncated_completions=True; verl keeps truncated completions in the "
@@ -587,16 +684,15 @@ def _resolve_single_turn_inputs():
         epochs=epochs, prompt_count=len(prompts), prompts_per_step=prompts_per_step
     )
     steps = resolve_update_horizon(derived_steps, getattr(_t, "max_steps", None) if _t else None)
-    # verl stops at BOTH total_epochs and total_training_steps; when an explicit max_steps exceeds
-    # the epoch-derived count, raise epochs so the dataloader can actually serve the horizon
-    # (otherwise verl exits early at total_epochs and the run under-trains).
-    if int(steps) > int(derived_steps) and len(prompts) > 0:
-        import math as _math
-
-        # verl's dataloader drops the last partial batch: floor, not ceil, else the bumped
-        # epoch count still under-serves the requested horizon.
-        steps_per_epoch = max(1, len(prompts) // prompts_per_step)
-        epochs = max(epochs, _math.ceil(int(steps) / steps_per_epoch))
+    # verl stops at both total_epochs and total_training_steps. give its hardcoded drop_last
+    # dataloader enough epoch capacity to serve the horizon, but preserve the configured epoch count
+    # for user-facing metadata. total_training_steps prevents the capacity headroom from over-training.
+    verl_total_epochs = _verl_epochs_for_horizon(
+        epochs=epochs,
+        prompt_count=len(prompts),
+        prompts_per_step=prompts_per_step,
+        steps=int(steps),
+    )
     save_every = int(_t.save_every) if (_t and _t.save_every) else 20
 
     return {
@@ -619,10 +715,12 @@ def _resolve_single_turn_inputs():
         "lora_alpha": lora_alpha,
         "warmstart_adapter": warmstart_adapter,
         "epochs": epochs,
+        "verl_total_epochs": verl_total_epochs,
         "steps": int(steps),
         "save_every": save_every,
-        # flash amortizes each generation batch over 2 optimizer passes (num_iterations=2).
-        "num_iterations": 2,
+        # verl's default preserves the update horizon and on-policy baseline; unlike trl reuse, each
+        # update gets a fresh rollout batch.
+        "ppo_epochs": 1,
         "seed": int(backend_seed(_w.SEED)),
     }
 
@@ -736,22 +834,18 @@ def run_rl_verl():
             )
         except Exception:  # no cuda / probe failure -> conservative bf16 kv
             fp8_kv = False
-        cfg = {
-            "train_files": train_pq, "val_files": val_pq,
-            "model_id": model_path_for_verl, "lora_rank": inp["lora_rank"],
-            "lora_alpha": inp["lora_alpha"], "target_modules": "all-linear",
-            "lr": inp["lr"], "group_size": inp["group_size"],
-            "prompts_per_step": inp["prompts_per_step"], "micro_batch": micro_batch,
-            "max_prompt_len": inp["max_prompt_len"], "max_completion": inp["max_completion"],
-            "temperature": inp["temperature"], "top_p": inp["top_p"], "kl_coef": inp["kl_coef"],
-            "thinking": bool(_w.THINKING),
-            "loss_agg_mode": "seq-mean-token-sum-norm", "seed": inp["seed"],
-            "num_iterations": inp["num_iterations"], "steps": expected_steps,
-            "warmstart_adapter": inp["warmstart_adapter"],
-            "gpu_mem_util": 0.5, "tp_size": 1, "loggers": loggers, "fp8_kv": fp8_kv,
-            "reward_path": reward_py, "reward_name": "compute_score",
-            "total_epochs": inp["epochs"], "save_freq": inp["save_every"], "local_dir": local_dir,
-        }
+        cfg = _build_verl_training_cfg(
+            inp,
+            train_files=train_pq,
+            val_files=val_pq,
+            model_id=model_path_for_verl,
+            micro_batch=micro_batch,
+            thinking=bool(_w.THINKING),
+            loggers=loggers,
+            fp8_kv=fp8_kv,
+            reward_path=reward_py,
+            local_dir=local_dir,
+        )
         overrides = build_verl_overrides(cfg)
 
         setup_seconds = time.time() - t_start
@@ -867,22 +961,11 @@ def run_rl_verl():
         )
         if resp_len_history
         else 0,
-        notes={
-            "backend": "verl",
-            "steps": steps_run,
-            "epochs": inp["epochs"],
-            "retained_prompts": len(prompts),
-            "group_size": inp["group_size"],
-            "reward_history": reward_history,
-            "loss_curve": loss_curve,
-            "grpo_recipe": {
-                "kl_coef": inp["kl_coef"],
-                "temperature": inp["temperature"],
-                "top_p": inp["top_p"],
-                "num_iterations": inp["num_iterations"],
-                "seed": inp["seed"],
-                "loss_agg_mode": "seq-mean-token-sum-norm",
-                "norm_adv_by_std_in_grpo": False,
-            },
-        },
+        notes=_build_verl_train_notes(
+            inp,
+            steps_run=steps_run,
+            retained_prompts=len(prompts),
+            reward_history=reward_history,
+            loss_curve=loss_curve,
+        ),
     )
