@@ -690,6 +690,8 @@ def test_require_environment_project_cross_namespace_repair_preserves_404(monkey
 
     assert excinfo.value.status_code == 404
     assert excinfo.value.detail == "flash environment not found"
+    assert isinstance(excinfo.value.__cause__, envs.EnvPublishError)
+    assert excinfo.value.__cause__.status == 403
 
 
 def test_require_environment_project_backfill_failure_is_502(monkeypatch):

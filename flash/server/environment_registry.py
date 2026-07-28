@@ -127,7 +127,7 @@ def require_environment_project(
                     raise HTTPException(
                         status_code=404,
                         detail=detail or "environment does not belong to the requested project",
-                    ) from exc
+                    ) from download_exc
                 raise HTTPException(
                     status_code=download_exc.status,
                     detail=str(download_exc),

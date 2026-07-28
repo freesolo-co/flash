@@ -2906,6 +2906,7 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
 
     def fake_start(target, *args, **kwargs):
         started.append((target, args, kwargs))
+        kwargs["deploy_lock"].release()
         return False
 
     monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
@@ -2932,6 +2933,36 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployment["state"] == "queued"
     deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
     assert deployments[0]["deployment"]["state"] == "queued"
+
+
+def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    recovered = []
+
+    monkeypatch.setattr(serving, "_finish_deployment_unlocked", lambda **_kwargs: None)
+
+    def fake_start(target, *args, **kwargs):
+        recovered.append(serving.recover_deployments())
+        target(*args, **kwargs)
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
+
+    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    assert recovered == [0]
+    assert runner.get_status(run_id).deployment["state"] == "queued"
 
 
 def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
@@ -2987,7 +3018,7 @@ def test_sync_deploy_execution_error_keeps_specific_persisted_outcome(api, monke
         runner.mark_deployment_failed(run_id, failed)
         raise RuntimeError("late status mirror failure")
 
-    monkeypatch.setattr(serving, "_finish_deployment", fail_after_start)
+    monkeypatch.setattr(serving, "_finish_deployment_unlocked", fail_after_start)
 
     with pytest.raises(RuntimeError, match="late status mirror failure"):
         api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
@@ -4617,6 +4648,7 @@ def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):
 
     def fake_start(target, *args, **kwargs):
         seen.update({"target": target, **kwargs})
+        kwargs["deploy_lock"].release()
         return False
 
     monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
@@ -4945,6 +4977,7 @@ def test_unknown_reconciliation_allows_one_retry_then_blocks_overlap(api, monkey
 
     def fake_start(target, *args, **kwargs):
         jobs.append((target, kwargs))
+        kwargs["deploy_lock"].release()
         return False
 
     monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
@@ -5155,6 +5188,7 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
 
     def fake_start(target, *args, **kwargs):
         seen.update({"target": target, **kwargs})
+        kwargs["deploy_lock"].release()
         return False
 
     monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)

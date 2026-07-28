@@ -874,9 +874,11 @@ def _finish_deployment_unlocked(
         )
 
 
-def _finish_deployment(**kwargs) -> None:
-    with _app._deploy_lock(kwargs["run_id"]):
+def _finish_deployment(*, deploy_lock, **kwargs) -> None:
+    try:
         _finish_deployment_unlocked(**kwargs)
+    finally:
+        deploy_lock.release()
 
 
 def _chat_messages_from_payload(payload: dict) -> list[dict]:
@@ -994,7 +996,10 @@ def deploy(
     x_freesolo_project_id: Annotated[str | None, Header()] = None,
 ):
     payload = payload or {}
-    with _app._deploy_lock(run_id):
+    deploy_lock = _app._deploy_lock(run_id)
+    deploy_lock.acquire()
+    job_owns_lock = False
+    try:
         status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
         spec = JobSpec.from_dict(status.spec)
         if spec.model_revision:
@@ -1158,35 +1163,44 @@ def deploy(
             "deploy_kwargs": deploy_kwargs,
             "deployment": dep_dict,
             "prev_state": prev_state,
+            "deploy_lock": deploy_lock,
         }
-    try:
-        ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
-    except _app.DeploymentJobStartError as exc:
-        error = f"deployment job could not start: {exc}"
-        failed = _deployment_state(
-            dep_dict,
-            "failed",
-            error=error,
-            detail="deployment was not started; retry when the control plane is available",
-            retryable=True,
-        )
-        previous = _app.get_status(run_id)
-        marked = mark_deployment_failed(run_id, failed)
-        _report_persisted_transition(
-            previous, marked, persisted=_deployment_failure_persisted(marked, failed)
-        )
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "deployment_job_unavailable",
-                "run_id": run_id,
-                "retryable": True,
-                "message": error,
-            },
-        ) from exc
-    if ran_sync:
-        return _public_deployment(_app.get_status(run_id).deployment or dep_dict)
-    return _public_deployment(dep_dict)
+        job_owns_lock = True
+        if os.environ.get("FLASH_DEPLOY_SYNC") == "1":
+            ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
+        else:
+            try:
+                ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
+            except _app.DeploymentJobStartError as exc:
+                job_owns_lock = False
+                error = f"deployment job could not start: {exc}"
+                failed = _deployment_state(
+                    dep_dict,
+                    "failed",
+                    error=error,
+                    detail="deployment was not started; retry when the control plane is available",
+                    retryable=True,
+                )
+                previous = _app.get_status(run_id)
+                marked = mark_deployment_failed(run_id, failed)
+                _report_persisted_transition(
+                    previous, marked, persisted=_deployment_failure_persisted(marked, failed)
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "deployment_job_unavailable",
+                        "run_id": run_id,
+                        "retryable": True,
+                        "message": error,
+                    },
+                ) from exc
+        if ran_sync:
+            return _public_deployment(_app.get_status(run_id).deployment or dep_dict)
+        return _public_deployment(dep_dict)
+    finally:
+        if not job_owns_lock:
+            deploy_lock.release()
 
 
 @router.delete("/v1/runs/{run_id}/deploy")
