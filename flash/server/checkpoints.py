@@ -21,6 +21,7 @@ import json
 import urllib.request
 
 from flash.runner.checkpoints import list_checkpoints
+from flash.spec import require_project_id
 
 from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, internal_key, run_org_id
 
@@ -42,8 +43,9 @@ def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dic
     """Upsert ``checkpoints`` for one run into the backend store (idempotent by run_id+step).
 
     Pulls the org id from the run's persisted context (``billing_context`` then
-    ``platform_context``, via :func:`run_org_id`). Raises ``ValueError`` when there's nothing
-    to record or no org id; raises ``urllib`` errors through on a backend failure —
+    ``platform_context``, via :func:`run_org_id`) and the project from the run's persisted
+    spec. Raises ``ValueError`` when there's nothing to record, no org id, or no valid
+    project; raises ``urllib`` errors through on a backend failure —
     ``register_checkpoints_best_effort`` is the guarded wrapper most callers use."""
     if not checkpoints:
         raise ValueError("no checkpoints to record")
@@ -51,9 +53,16 @@ def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dic
     if not org_id:
         raise ValueError("missing org id for run checkpoints")
     spec = status.spec or {}
+    # the receiver requires an explicit project and rejects the batch without one, so
+    # resolve it from the run's own spec rather than letting the post fail as a 422.
+    try:
+        project_id = require_project_id(spec.get("project"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"missing project id for run checkpoints: {exc}") from exc
     first = checkpoints[0]
     body = {
         "orgId": org_id,
+        "projectId": project_id,
         "runId": status.run_id,
         "baseModel": spec.get("model"),
         "repoId": first.get("repo_id"),
