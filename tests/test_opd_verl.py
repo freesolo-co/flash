@@ -4389,7 +4389,11 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["data.image_key"] == "images"
     assert overrides["data.return_raw_chat"] == "true"
     assert overrides["data.return_multi_modal_inputs"] == "false"
-    assert overrides["actor_rollout_ref.rollout.limit_images"] == "8"
+    # `++`-prefixed: these keys are absent from the composed node, so a bare assignment would abort
+    # the run at hydra composition. see build_opd_verl_overrides for the per-key reasoning.
+    assert overrides["++actor_rollout_ref.rollout.limit_images"] == "8"
+    assert overrides["++actor_rollout_ref.rollout.engine_kwargs.vllm.seed"] == "42"
+    assert "actor_rollout_ref.rollout.seed" not in overrides
     assert "actor.engine.ulysses_sequence_parallel_size" not in overrides
     assert "ref_log_prob" not in " ".join(overrides)
     assert not any("structured_outputs_config" in key for key in overrides)

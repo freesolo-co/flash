@@ -85,7 +85,10 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "actor_rollout_ref.actor.ppo_epochs=1" in o
     assert "actor_rollout_ref.model.enable_gradient_checkpointing=True" in o
     assert "data.seed=42" in o
-    assert "actor_rollout_ref.rollout.seed=42" in o
+    # the rollout engine seed rides engine_kwargs, not `rollout.seed`, which verl 0.8.0's
+    # RolloutConfig does not declare. see build_verl_overrides for the full reasoning.
+    assert "++actor_rollout_ref.rollout.engine_kwargs.vllm.seed=42" in o
+    assert "actor_rollout_ref.rollout.seed=42" not in o
     assert "trainer.total_training_steps=60" in o
     assert "trainer.save_freq=20" in o
     assert "trainer.max_actor_ckpt_to_keep=1" in o
