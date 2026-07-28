@@ -22,6 +22,8 @@ from flash.runner.checkpoints import (
 )
 from flash.spec import JobSpec
 
+_PROJECT_ID = "11111111-1111-4111-8111-111111111111"
+
 SPEC_DICT = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
@@ -29,6 +31,7 @@ SPEC_DICT = {
     "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
     "run_id": "flash-ckpt-1",
+    "project": _PROJECT_ID,
 }
 
 
@@ -657,11 +660,29 @@ def test_register_run_checkpoints_body_shape(monkeypatch):
     assert body["baseModel"] == "Qwen/Qwen3.5-4B"
     assert body["repoId"] == "org/test-runs"
     assert body["repoType"] == "dataset"
-    assert "projectId" not in body
+    # the receiver requires an explicit project and 422s the batch without one.
+    assert body["projectId"] == _PROJECT_ID
     assert body["checkpoints"] == [
         {"step": 40, "subfolder": "rl/flash-ckpt-1/checkpoints/step-40/adapter"},
         {"step": 80, "subfolder": "rl/flash-ckpt-1/checkpoints/step-80/adapter"},
     ]
+
+
+def test_register_run_checkpoints_requires_a_project(monkeypatch):
+    # a run whose spec carries no project must fail loudly here rather than posting a body the
+    # backend rejects as a 422 that the best-effort wrapper would swallow.
+    import flash.server.checkpoints as ck
+
+    posted = []
+    monkeypatch.setattr(ck, "_post_checkpoints", lambda **kw: posted.append(kw) or {})
+    spec_without_project = {k: v for k, v in SPEC_DICT.items() if k != "project"}
+    with pytest.raises(ValueError, match="project id"):
+        ck.register_run_checkpoints(
+            internal_key="k",
+            status=_status(spec=spec_without_project),
+            checkpoints=_CKPTS,
+        )
+    assert posted == []
 
 
 def test_register_run_checkpoints_requires_org():
