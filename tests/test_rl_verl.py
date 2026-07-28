@@ -62,7 +62,7 @@ def _overrides_cfg(**over):
         "prompts_per_step": 16, "micro_batch": 2, "max_prompt_len": 2048,
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
-        "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "loggers": "console", "fp8_kv": False,
+        "steps": 60, "gpu_mem_util": 0.5, "n_gpus": 1, "loggers": "console", "fp8_kv": False,
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
         "mask_truncated_completions": True,
         "total_epochs": 1, "save_freq": 20, "local_dir": "/w/ckpt",
@@ -115,6 +115,62 @@ def test_build_verl_overrides_sizes_agent_loop_workers_to_the_rollout_batch():
     # the common case still gets the full worker pool.
     big = rl_verl.build_verl_overrides(_overrides_cfg(prompts_per_step=64, group_size=8))
     assert "actor_rollout_ref.rollout.agent.num_workers=8" in big
+
+
+@pytest.mark.parametrize(("count", "expected"), [(None, 1), (1, 1), (2, 2), (8, 8)])
+def test_run_rl_verl_sizes_the_run_from_the_spec_gpu_count(count, expected):
+    # the wiring, not just the builder: a spec that rents N cards must configure verl for N.
+    # gpu_count_of is the same reader the runpod rental path uses, so the rented shape and the
+    # trained shape cannot drift apart.
+    from flash.spec import GpuSpec, JobSpec, gpu_count_of
+
+    project = "11111111-1111-4111-8111-111111111111"
+    spec = (
+        JobSpec(project=project)
+        if count is None
+        else JobSpec(project=project, gpu=GpuSpec(count=count))
+    )
+    assert gpu_count_of(spec) == expected
+
+
+def test_build_verl_overrides_single_gpu_is_the_unchanged_default():
+    o = rl_verl.build_verl_overrides(_overrides_cfg(n_gpus=1))
+    assert "trainer.n_gpus_per_node=1" in o
+    assert "trainer.nnodes=1" in o
+    assert "actor_rollout_ref.rollout.tensor_model_parallel_size=1" in o
+    assert "actor_rollout_ref.actor.ulysses_sequence_parallel_size=1" in o
+
+
+@pytest.mark.parametrize("n_gpus", [2, 4, 8])
+def test_build_verl_overrides_shards_every_card_along_the_sequence(n_gpus):
+    # verl builds mesh_shape=(dp, sp), so sp == n_gpus pins dp == 1: the optimizer keeps seeing one
+    # global batch of prompts_per_step * group_size. sharding the BATCH instead would change the
+    # gradient, which is why sp/tp track the card count rather than leaving dp to absorb it.
+    o = rl_verl.build_verl_overrides(_overrides_cfg(n_gpus=n_gpus))
+    assert f"trainer.n_gpus_per_node={n_gpus}" in o
+    assert f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={n_gpus}" in o
+    assert f"actor_rollout_ref.rollout.tensor_model_parallel_size={n_gpus}" in o
+    # one worker, many cards: nnodes stays 1 so verl's replica_rank offset (and the rollout seed)
+    # is unaffected by the card count.
+    assert "trainer.nnodes=1" in o
+    # sequence parallelism is only legal with padding removed; verl raises otherwise.
+    assert "actor_rollout_ref.model.use_remove_padding=True" in o
+
+
+def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():
+    # the guard that matters: adding cards must not change what the optimizer sees. anything that
+    # would alter the effective batch (or the per-gpu micro batch) is a silent recipe change.
+    batch_keys = (
+        "data.train_batch_size=",
+        "actor_rollout_ref.rollout.n=",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=",
+    )
+    one = rl_verl.build_verl_overrides(_overrides_cfg(n_gpus=1))
+    for n_gpus in (2, 4, 8):
+        many = rl_verl.build_verl_overrides(_overrides_cfg(n_gpus=n_gpus))
+        for key in batch_keys:
+            assert [o for o in one if o.startswith(key)] == [o for o in many if o.startswith(key)]
 
 
 def test_build_verl_overrides_sets_truncation_mask_when_enabled():
@@ -257,6 +313,9 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
     assert "trainer.total_epochs=3" in overrides
     assert notes["epochs"] == 2
     assert notes["grpo_recipe"]["verl_total_epochs"] == 3
+    # the builder is called without n_gpus here, exactly as a single-gpu job does: the default must
+    # stay 1 so a spec with no gpu.count keeps the historical shape.
+    assert cfg["n_gpus"] == 1
 
 
 def test_build_verl_overrides_wandb_logger_when_enabled():
