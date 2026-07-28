@@ -4604,16 +4604,31 @@ def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
 
 
 
-def test_structured_runtime_version_mismatch_fails_before_generation(monkeypatch):
-    versions = {"verl": "0.8.0", "vllm": "0.11.1", "xgrammar": "0.1.25"}
+def test_structured_runtime_rejects_vllm_below_minimum(monkeypatch):
+    versions = {"verl": "0.8.0", "vllm": "0.9.0", "xgrammar": "0.1.25"}
     monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
 
-    with pytest.raises(RuntimeError, match=r"vllm 0\.11\.0 exactly"):
+    with pytest.raises(RuntimeError, match=r"vllm 0\.11\.0 or newer; found 0\.9\.0"):
+        _require_structured_runtime_versions()
+
+
+def test_structured_runtime_accepts_shipped_versions(monkeypatch):
+    versions = {"verl": "0.8.0", "vllm": "0.19.1", "xgrammar": "0.1.25"}
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+
+    _require_structured_runtime_versions()
+
+
+def test_structured_runtime_rejects_wrong_verl_version(monkeypatch):
+    versions = {"verl": "0.8.1", "vllm": "0.19.1", "xgrammar": "0.1.25"}
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+
+    with pytest.raises(RuntimeError, match=r"verl 0\.8\.0 exactly"):
         _require_structured_runtime_versions()
 
 
 def test_structured_runtime_rejects_wrong_xgrammar_version(monkeypatch):
-    versions = {"verl": "0.8.0", "vllm": "0.11.0", "xgrammar": "0.1.26"}
+    versions = {"verl": "0.8.0", "vllm": "0.19.1", "xgrammar": "0.1.26"}
     monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
 
     with pytest.raises(RuntimeError, match=r"xgrammar 0\.1\.25 exactly"):
@@ -4625,7 +4640,7 @@ def test_plugin_initialization_checks_structured_versions_before_verl_install(mo
 
     from flash.engine.worker import opd_verl_plugin as plugin
 
-    versions = {"verl": "0.8.0", "vllm": "0.11.0", "xgrammar": "0.1.26"}
+    versions = {"verl": "0.8.0", "vllm": "0.19.1", "xgrammar": "0.1.26"}
     monkeypatch.setenv("FLASH_OPD_STRUCTURED_OUTPUTS", '{"choice":["4"]}')
     monkeypatch.setattr(plugin.importlib.metadata, "version", versions.__getitem__)
     monkeypatch.setattr(

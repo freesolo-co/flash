@@ -4,8 +4,8 @@ verl pins its own torch/vllm, incompatible with flash's, so flash never imports 
 runs a verl trainer entrypoint as a subprocess against a separate interpreter and merges the
 fsdp-sharded lora checkpoint back into a flash-servable peft adapter. these are the framework- and
 algorithm-neutral pieces (interpreter resolution, checkpoint export, provenance, progress
-streaming); the sft/opd modules layer their own dataset rows, hydra overrides, and orchestration on
-top. the grpo verl path uses the same pattern and will consolidate onto this module once it lands.
+streaming); the sft/opd/grpo modules layer their own dataset rows, hydra overrides, and orchestration
+on top.
 """
 
 from __future__ import annotations
@@ -18,22 +18,66 @@ import subprocess
 import time
 from collections.abc import Callable
 
+# verl 0.8.0 exactly, plus the truncation-mask commit. it must stay on the 0.8.0 base: the opd
+# plugin patches 0.8.0 internals and imports verl.trainer.main_ppo_sync, which verl deleted after
+# 0.8.0, and opd's exact-version gate reads the version file this branch pins to the release value.
+VERL_REQUIREMENT = (
+    "verl @ git+https://github.com/freesolo-co/verl@0f821c22325a1a51384431d57b899cc5dcf3d837"
+)
 
-def resolve_verl_python(workdir: str) -> str:
+
+def verl_supports_rollout_field(python_bin: str, field: str) -> bool:
+    """report whether python_bin's verl declares `field` on RolloutConfig.
+
+    the fork adds rollout fields stock verl does not have. hydra composes an unknown key happily and
+    only fails later in omega_conf_to_dataclass, so callers ask here before emitting a fork-only
+    override rather than letting the run abort at dataclass conversion.
+    """
+    probe = (
+        "from verl.workers.config.rollout import RolloutConfig;"
+        f"print('1' if {field!r} in RolloutConfig.__dataclass_fields__ else '0')"
+    )
+    try:
+        done = subprocess.run(
+            [python_bin, "-c", probe], capture_output=True, text=True, timeout=300
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip().endswith("1")
+
+
+def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     """return an interpreter that can import verl.
 
     prefers FLASH_VERL_PYTHON (set by the caller when verl is preinstalled, e.g. on a verl image).
     otherwise provisions an isolated venv on the pod so verl's torch/vllm never touch flash's env.
+    optionally installs wandb best-effort for callers that enable verl's wandb logger.
+
+    the preset is returned as-is: flash does not own that interpreter and must not mutate it. it can
+    hold a verl without the fork's rollout fields, so callers emitting a fork-only override gate it
+    on verl_supports_rollout_field.
+
+    a self-provisioned venv is flash's own, and is rebuilt whenever it does not record the current
+    VERL_REQUIREMENT, so unsetting FLASH_VERL_PYTHON always yields the pinned verl.
     """
     preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
     if preset:
         return preset
     venv = os.path.join(workdir, "verl-venv")
     py = os.path.join(venv, "bin", "python")
-    if not os.path.exists(py):
+    stamp = os.path.join(venv, "flash-verl-requirement")
+    installed = ""
+    if os.path.exists(stamp):
+        with open(stamp) as f:
+            installed = f.read().strip()
+    if installed != VERL_REQUIREMENT or not os.path.exists(py):
+        # a retry reuses the pod workdir, so this venv can be from an earlier attempt, from an earlier
+        # flash release pinning a different verl, or from an install that died partway. remove it and
+        # start clean: reusing it would train on the wrong verl, and `uv venv` refuses to write into a
+        # directory that already holds a pyvenv.cfg, so a half-built venv wedges every later retry.
+        shutil.rmtree(venv, ignore_errors=True)
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
-        # its own torch/vllm; a full install (not --no-deps) so runtime deps are present. unpinned so
-        # it tracks the current verl (vllm 0.23/0.24, Qwen3.5-capable) rather than a stale release.
+        # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
         subprocess.run(["uv", "venv", venv], check=True)
         subprocess.run(
             [
@@ -42,7 +86,7 @@ def resolve_verl_python(workdir: str) -> str:
                 "install",
                 "--python",
                 py,
-                "verl",
+                VERL_REQUIREMENT,
                 "liger-kernel",
                 "bitsandbytes>=0.49",
                 "qwen-vl-utils",
@@ -53,6 +97,11 @@ def resolve_verl_python(workdir: str) -> str:
             ],
             check=True,
         )
+        with open(stamp, "w") as f:
+            f.write(VERL_REQUIREMENT)
+        if install_wandb:
+            # verl does not pull wandb; install it best-effort so logger setup can fall back to console.
+            subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
     return py
 
 
