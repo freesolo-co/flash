@@ -215,12 +215,14 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 'hf-transfer','freesolo','runpod']]"
 
 # ---------------------------------------------------------------------------------------------
-# verl venv (GRPO/OPD/SFT verl backends) — ISOLATED from the main interpreter on purpose.
+# verl venv (GRPO/OPD/SFT verl backends): ISOLATED from the main interpreter on purpose.
 #
-# verl pins a stack that CONFLICTS with the worker stack above: it wants torch 2.9 where the base is
-# 2.10, and it drives vLLM through APIs that moved. Installing verl into the main interpreter would
-# downgrade the serving/training stack every other worker path depends on, so it gets its own venv
-# and flash launches it out-of-process via FLASH_VERL_PYTHON.
+# verl's dependency set CONFLICTS with the worker stack above. verl and TransferQueue declare
+# numpy<2.0.0 while this image's stack resolves numpy>=2, and verl's structured-OPD gate pins
+# xgrammar to exactly 0.1.25 against vLLM's declared >=0.1.32 floor. Resolving verl into the main
+# interpreter would move shared pins under every other worker path (trl/peft/transformers/vllm all
+# live there), so verl gets its own venv and flash launches it out-of-process via FLASH_VERL_PYTHON.
+# The venv deliberately re-resolves its own numpy independent of the base interpreter's.
 #
 # Without this venv the runtime falls back to resolve_verl_python(), which builds a venv from the
 # verl requirement ALONE. verl's install_requires omits vllm/uvicorn/fastapi/cachetools, so that
@@ -228,12 +230,15 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # cachetools and `main_ppo_sync` dies on uvicorn. Baking the full set here is what makes the verl
 # backends actually runnable.
 #
-# vLLM 0.19.1, NOT the metadata-clean 0.11.2: Qwen/Qwen3.5-4B is flash's DEFAULT_MODEL and enables
-# GRPO+OPD, both of which set rollout.name=vllm. vLLM 0.11.2 registers neither
-# Qwen3_5ForConditionalGeneration nor Qwen3_5MoeForConditionalGeneration, so it cannot run rollouts
-# for the default model. verl's declared vllm<=0.12.0 ceiling is stale for the async rollout path:
-# verl 0.8.0's own stable Dockerfile defaults to vllm 0.20.2, its Qwen3.5 GRPO examples require
-# 0.18.0, and vllm_async_server.py branches explicitly on 0.13+/0.17+/0.20+ behavior.
+# vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
+# That deliberately exceeds verl's declared vllm<=0.12.0 ceiling. The metadata-clean alternative
+# (0.11.2, which satisfies the ceiling and makes `uv pip check` green) was rejected on a model-
+# contract fact: Qwen/Qwen3.5-4B is flash's DEFAULT_MODEL and enables GRPO+OPD, both of which set
+# rollout.name=vllm, and 0.11.2 registers neither Qwen3_5ForConditionalGeneration nor
+# Qwen3_5MoeForConditionalGeneration, so it cannot run rollouts for the default model at all.
+# The ceiling is stale for the async rollout path regardless: verl 0.8.0's own stable Dockerfile
+# defaults to vllm 0.20.2, its Qwen3.5 GRPO examples require 0.18.0, and vllm_async_server.py
+# branches explicitly on 0.13+/0.17+/0.20+ behavior.
 #
 # Three metadata violations are DELIBERATE, and `uv pip check` stays red in here by design:
 #   verl + transferqueue declare numpy<2.0.0   -> vLLM 0.19.1 needs numpy>=2 (declarations are stale)
