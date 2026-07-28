@@ -1502,6 +1502,14 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         # whenever that product is not a multiple of 8. size the pool to the batch instead.
         "actor_rollout_ref.rollout.agent.num_workers="
         f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}",
+        # verl force-enables TransferQueue on the opd entry point (main_ppo_sync.main sets
+        # transfer_queue.enable = True with no opt-out), and its SimpleStorage default asks for 8
+        # storage units sized for a multi-node cluster. tq.init reserves them through a SPREAD
+        # placement group and blocks in ray.get(pg.ready()) until every 1-cpu bundle is placed,
+        # with no timeout: any ray cluster with fewer free cpus than units hangs the run forever
+        # before a single gpu is touched. one unit is correct for flash's single-node trainer and
+        # keeps the reservation satisfiable regardless of how ray sized the cluster.
+        "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
         "critic.enable=false",
         "reward.reward_model.enable=false",
         "distillation._target_=flash_opd_verl_plugin.FlashRemoteDistillationConfig",

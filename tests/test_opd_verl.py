@@ -4429,6 +4429,15 @@ def test_overrides_size_agent_loop_workers_to_the_opd_rollout_batch():
     assert big["actor_rollout_ref.rollout.agent.num_workers"] == "8"
 
 
+def test_overrides_bound_transfer_queue_storage_to_one_unit():
+    # verl force-enables TransferQueue on the opd entry point and defaults SimpleStorage to 8
+    # storage units. tq.init reserves them with a SPREAD placement group and blocks in
+    # ray.get(pg.ready()) with no timeout, so any cluster with fewer free cpus than units hangs
+    # the run forever before a gpu is touched. flash's trainer is single-node: one unit.
+    overrides = dict(value.split("=", 1) for value in build_opd_verl_overrides(_config()))
+    assert overrides["transfer_queue.backend.SimpleStorage.num_data_storage_units"] == "1"
+
+
 def test_remote_distillation_config_declares_every_field_post_init_assigns():
     # verl's BaseConfig.__setattr__ (base_config.py) raises FrozenInstanceError for any assignment to
     # an already-set field that is not in _mutable_fields. FlashRemoteDistillationConfig's __post_init__
