@@ -41,9 +41,14 @@ message names the package, not the interpreter that is missing it, so the obviou
 appears to do nothing. Two ways to keep them together:
 
 ```bash
+uv venv                                         # uv pip install needs an environment to install INTO
 uv pip install freesolo-flash freesolo          # same venv; then use ./.venv/bin/flash
 uv tool install freesolo-flash --with freesolo  # isolated tool venv, SDK injected
 ```
+
+`uv venv` first is not optional: with no virtual environment active, `uv pip install`
+installs nothing and exits with _"No virtual environment found; run `uv venv` to create an
+environment"_. (The `uv tool install` line manages its own venv and needs no `uv venv`.)
 
 If you use the `uv tool` form, note that `freesolo-flash` does **not** declare `freesolo`
 as a dependency — it is injected, so it survives only as long as uv remembers the `--with`.
@@ -291,12 +296,25 @@ situations produce an identical-looking `status`:
   serving the **last** heartbeat it received, so `status` still reports `running` at
   whatever stage was announced, with a stale GPU snapshot attached.
 
-**The decisive signal is heartbeat _age_, not GPU utilization or the stage label.** A live
-worker heartbeats continuously; a frozen timestamp means the worker is gone. Pair heartbeat
-age with GPU busy/idle before acting, and never derive seconds-per-step from total elapsed
-time (early steps include one-time warmup that can dominate a short run).
+**Heartbeat _age_ is the useful signal — but it is not proof on its own, and quiet is
+normal.** Uploads are deliberately throttled: during training the worker publishes at most
+about once every **900 s** (15 min), so a timestamp that has not moved for several minutes
+is the _expected_ steady state, not a symptom. Upload failures can stretch the gap further.
+`flash runs status` says so itself once the heartbeat passes 5 minutes — _"heartbeat uploads
+are throttled; quiet is not dead"_.
 
-> **On a frozen heartbeat, do NOT cancel.** Flash **auto-retries a preempted job from its
+So treat age as a threshold, not a verdict:
+
+- _Under ~15 min:_ tells you nothing is wrong. Do not act.
+- _Well past ~15 min:_ suspicious, still not conclusive. Corroborate before deciding —
+  check the provider/attempt state and follow `flash runs log <run-id> -f`, which streams
+  independently of the heartbeat upload cycle. A retry that has already started will show a
+  new attempt.
+
+Never derive seconds-per-step from total elapsed time (early steps include one-time warmup
+that can dominate a short run).
+
+> **Even on a genuinely stale heartbeat, do NOT cancel.** Flash **auto-retries a preempted job from its
 > last checkpoint**, and the provider's `job_preempted` notice can lag the freeze by ~10
 > minutes. Cancelling races that retry and kills a run that was recovering on its own.
 > Wait for either the automatic retry or a genuine terminal state. Cancel only when a run
@@ -328,12 +346,25 @@ flash models export --adapter-id <run-id> --repository <you>/<repo>  # copy adap
 > you are evaluating. After evaluating, apply the error-count check from "Don't let your own
 > harness lie to you" below.
 
-**Before exporting, confirm your HF token can write to the target namespace.** A token that
+**Before exporting, confirm your HF token can write to the target repository.** A token that
 is valid — and that works everywhere else — may resolve to a different account or org than
-the `--repository` you pass, so the export fails on permissions or silently lands in the
-wrong namespace. Check with `huggingface_hub.whoami()` (compare the resolved name and its
-writable orgs against your destination) _before_ the run finishes, not after. If several
-tokens are in play, identify them by fingerprint rather than by printing them.
+the `--repository` you pass, or may simply be read-only or a fine-grained token scoped to
+other repos. Either way the export fails on permissions, or silently lands in the wrong
+namespace.
+
+Check **write access to the exact destination**, not identity. `whoami()` happily returns
+the right account and org memberships for a token that cannot write anything, so it does not
+establish the precondition:
+
+```python
+from huggingface_hub import auth_check
+
+auth_check("<you>/<repo>", write=True)   # raises unless the token can write THIS repo
+```
+
+Do this _before_ the run finishes, not after. If the repo does not exist yet, create it
+first (`create_repo(..., exist_ok=True)`) — that is itself a write test. If several tokens
+are in play, identify them by fingerprint rather than by printing them.
 
 ### Loading an exported adapter locally (transformers + peft)
 
