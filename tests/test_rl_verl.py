@@ -59,7 +59,8 @@ def _overrides_cfg(**over):
         "train_files": "/w/train.parquet", "val_files": "/w/val.parquet",
         "model_id": "Qwen/Qwen3-4B", "lora_rank": 32, "lora_alpha": 64,
         "target_modules": "all-linear", "lr": 1e-5, "group_size": 8,
-        "prompts_per_step": 16, "micro_batch": 2, "max_prompt_len": 2048,
+        "prompts_per_step": 16, "max_prompt_len": 2048,
+        "max_model_len": 2368, "max_token_len_per_gpu": 2368,
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
         "steps": 60, "gpu_mem_util": 0.5, "n_gpus": 1, "loggers": "console", "fp8_kv": False,
@@ -164,7 +165,9 @@ def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():
         "data.train_batch_size=",
         "actor_rollout_ref.rollout.n=",
         "actor_rollout_ref.actor.ppo_mini_batch_size=",
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=",
+        # the per-gpu token budget is part of the shape too: verl scales it by sp_size itself, so
+        # emitting a card-dependent value would shrink each micro-batch as cards are added.
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=",
     )
     one = rl_verl.build_verl_overrides(_overrides_cfg(n_gpus=1))
     for n_gpus in (2, 4, 8):
@@ -184,6 +187,73 @@ def test_build_verl_overrides_omits_truncation_mask_when_disabled():
     # behavior, so emitting `=false` would break stock runs while changing nothing.
     o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=False))
     assert not any("mask_truncated_completions" in override for override in o)
+
+
+def test_build_verl_overrides_sizes_engine_to_the_job_not_the_architecture():
+    # left unset, verl substitutes the model's full max_position_embeddings and hands it to vllm,
+    # so a short job on a long-context model reserves kv cache it can never use. the emitted length
+    # must be the job's own engine length.
+    o = rl_verl.build_verl_overrides(_overrides_cfg(max_model_len=2368))
+    assert "actor_rollout_ref.rollout.max_model_len=2368" in o
+
+
+def test_engine_len_clamped_to_model_limit():
+    # verl raises ValueError when max_model_len exceeds max_position_embeddings, so a job asking
+    # for more context than the architecture has must train shorter, not die at rollout startup.
+    assert rl_verl.clamp_engine_len(32768, 8192) == 8192
+    # under the limit is untouched, and an unknown limit leaves verl's own resolution in charge.
+    assert rl_verl.clamp_engine_len(4096, 40960) == 4096
+    assert rl_verl.clamp_engine_len(32768, None) == 32768
+    assert rl_verl.clamp_engine_len(32768, 0) == 32768
+
+
+def test_token_budget_admits_a_full_length_sequence():
+    # dynamic bsz packs micro-batches up to this budget. below one full sequence, the longest
+    # rollout the engine can produce fits in no micro-batch at all.
+    cfg = _overrides_cfg(max_prompt_len=31744, max_completion=1024, max_token_len_per_gpu=32768)
+    o = rl_verl.build_verl_overrides(cfg)
+    assert "actor_rollout_ref.actor.use_dynamic_bsz=true" in o
+    assert "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true" in o
+    key = "actor_rollout_ref.actor.ppo_max_token_len_per_gpu="
+    budget = int(next(x for x in o if x.startswith(key)).split("=")[1])
+    assert budget >= cfg["max_prompt_len"] + cfg["max_completion"]
+    # the engine asserts the actor and log-prob flags match, so both budgets move together.
+    assert f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={budget}" in o
+
+
+def test_dynamic_bsz_replaces_sequence_count_micro_batches():
+    # with use_dynamic_bsz on, verl's actor config validation skips the micro-batch checks entirely
+    # and asserts the TOKEN budgets are set instead. a leftover sequence-count key would be dead
+    # config claiming to bound memory.
+    o = rl_verl.build_verl_overrides(_overrides_cfg())
+    assert not any("ppo_micro_batch_size_per_gpu" in x for x in o)
+    assert not any("log_prob_micro_batch_size_per_gpu" in x for x in o)
+
+
+def test_build_verl_training_cfg_derives_engine_len_and_budget():
+    inp = {
+        "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
+        "prompts_per_step": 16, "mask_truncated_completions": True,
+        "max_prompt_len": 3072, "max_completion": 1024,
+        "engine_len": 4096, "max_position_embeddings": 40960,
+        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "seed": 42,
+        "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
+        "verl_total_epochs": 2, "save_every": 20,
+    }
+    common = {
+        "train_files": "/w/t.parquet", "val_files": "/w/v.parquet", "model_id": "Qwen/Qwen3-4B",
+        "thinking": False, "loggers": "console", "fp8_kv": False,
+        "reward_path": "/w/r.py", "local_dir": "/w/ckpt",
+    }
+    cfg = rl_verl._build_verl_training_cfg(inp, **common)
+    # the engine gets the full prompt+completion length, not the prompt budget alone.
+    assert cfg["max_model_len"] == 4096
+    assert cfg["max_token_len_per_gpu"] == 4096
+    # and a job that overshoots the architecture is clamped rather than rejected by verl.
+    clamped = rl_verl._build_verl_training_cfg(
+        {**inp, "engine_len": 65536, "max_position_embeddings": 32768}, **common
+    )
+    assert clamped["max_model_len"] == 32768
 
 
 @pytest.mark.parametrize(
@@ -286,6 +356,8 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
     monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
     monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
     monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
+    # the context-limit probe reads the model config off the hub; keep this unit test offline.
+    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 40960)
 
     inp = rl_verl._resolve_single_turn_inputs()
     cfg = rl_verl._build_verl_training_cfg(
@@ -293,7 +365,6 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
         model_id=inp["model_id"],
-        micro_batch=1,
         thinking=False,
         loggers="console",
         fp8_kv=False,
@@ -351,7 +422,10 @@ def test_build_verl_overrides_kl_on_when_requested():
     o = rl_verl.build_verl_overrides(_overrides_cfg(kl_coef=0.02))
     assert "actor_rollout_ref.actor.use_kl_loss=True" in o
     assert "actor_rollout_ref.actor.kl_loss_coef=0.02" in o
-    assert "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2" in o
+    # the ref worker carries no batching keys of its own: ref.yaml resolves
+    # log_prob_use_dynamic_bsz / log_prob_max_token_len_per_gpu through oc.select on the actor keys
+    # the block above sets, so emitting a sequence-count micro batch here would contradict them.
+    assert not any("ref.log_prob_micro_batch" in x for x in o)
 
 
 def test_verl_uses_canonical_heartbeat_stage_contracts():

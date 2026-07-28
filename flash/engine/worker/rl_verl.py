@@ -62,6 +62,44 @@ def _verl_epochs_for_horizon(
     return max(epochs, math.ceil(steps / steps_per_epoch))
 
 
+def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
+    """the engine length verl will accept: the job's context, capped at the model's own limit.
+
+    verl raises ValueError when rollout.max_model_len exceeds the model's max_position_embeddings,
+    so a job whose max_context_tokens overshoots the architecture would die at rollout startup
+    rather than train on a shorter context. clamp instead. an unknown limit (probe failed) passes
+    through untouched, leaving verl's own resolution in charge.
+    """
+    if max_position_embeddings is None or max_position_embeddings <= 0:
+        return int(engine_len)
+    return min(int(engine_len), int(max_position_embeddings))
+
+
+def model_max_position_embeddings(model_id: str, revision: str = "") -> int | None:
+    """the model's architectural context limit, or None when it cannot be determined.
+
+    mirrors verl's own lookup: the top-level attribute, falling back to the nested text_config that
+    multimodal architectures use. None on any probe failure, so a config that cannot be read never
+    blocks a run that works today.
+    """
+    try:
+        from transformers import AutoConfig
+
+        from flash.engine.worker.hf import model_revision_kwargs
+
+        cfg = AutoConfig.from_pretrained(
+            model_id, trust_remote_code=True, **model_revision_kwargs(revision)
+        )
+        limit = getattr(cfg, "max_position_embeddings", None)
+        if limit is None:
+            text_cfg = getattr(cfg, "text_config", None)
+            limit = getattr(text_cfg, "max_position_embeddings", None) if text_cfg else None
+        return int(limit) if limit else None
+    except Exception as e:  # an unreadable config must not fail the run
+        print(f"[rl-verl] max_position_embeddings probe failed for {model_id!r}: {e}", flush=True)
+        return None
+
+
 def build_verl_dataset_rows(
     message_prompts: list[list[dict]],
     example_indices: list[int],
@@ -151,7 +189,15 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # 0 warmup -> verl's warmup+constant scheduler holds lr flat, matching the trl constant recipe.
         "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={cfg['prompts_per_step']}",
-        f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={cfg['micro_batch']}",
+        # 32k contexts: bound the backward pass by TOKENS, not by sequence count. a fixed
+        # micro_batch_size_per_gpu of N sequences is N*engine_len tokens in the worst case, so the
+        # only count that is safe at 32k is 1 -- which then wastes most of the budget on the short
+        # sequences that make up a typical batch. dynamic bsz packs each micro-batch up to
+        # max_token_len instead, so long sequences get their own pass and short ones share.
+        # verl's engine multiplies this per-gpu budget by sp_size itself, so it must NOT be
+        # pre-divided by the ulysses width.
+        "actor_rollout_ref.actor.use_dynamic_bsz=true",
+        f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={cfg['max_token_len_per_gpu']}",
         # ppo_epochs multiplies verl's update loop, so its default of 1 preserves the requested update
         # count and on-policy baseline. unlike trl reuse, verl samples a fresh rollout for every update.
         f"actor_rollout_ref.actor.ppo_epochs={cfg['ppo_epochs']}",
@@ -193,8 +239,17 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg['n_gpus']}",
         f"actor_rollout_ref.rollout.temperature={cfg['temperature']}",
         f"actor_rollout_ref.rollout.top_p={cfg['top_p']}",
+        # size vllm's kv cache for the job's context, not the architecture's. left unset, verl
+        # substitutes the model's full max_position_embeddings and hands that straight to the
+        # engine, so a 4k job on a 40k-capable model reserves ten times the kv cache it can ever
+        # use -- and on a long-context model that reservation alone can exhaust the
+        # gpu_memory_utilization budget before a single rollout runs.
+        f"actor_rollout_ref.rollout.max_model_len={cfg['max_model_len']}",
         # verl recomputes rollout log-probs for the importance ratio regardless of the kl term.
-        f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={cfg['micro_batch']}",
+        # the engine asserts actor.use_dynamic_bsz == rollout.log_prob_use_dynamic_bsz, so the
+        # log-prob pass switches to token budgeting with the actor, never independently.
+        "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true",
+        f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={cfg['max_token_len_per_gpu']}",
         f"custom_reward_function.path={cfg['reward_path']}",
         f"custom_reward_function.name={cfg['reward_name']}",
         # verl trainer-v1 reward loop reads reward.custom_reward_function (the legacy top-level key
@@ -220,11 +275,13 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"trainer.default_local_dir={cfg['local_dir']}",
     ]
     if kl_on:
-        # a reference policy is active -> add the token-level kl loss + the ref log-prob micro batch.
+        # a reference policy is active -> add the token-level kl loss. the ref worker needs no
+        # batching keys of its own: ref.yaml defaults log_prob_use_dynamic_bsz and
+        # log_prob_max_token_len_per_gpu to oc.select on the matching actor keys, which the actor
+        # block above sets, and the engine pops them onto the ref's own config.
         o += [
             "actor_rollout_ref.actor.use_kl_loss=True",
             f"actor_rollout_ref.actor.kl_loss_coef={cfg['kl_coef']}",
-            f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={cfg['micro_batch']}",
         ]
     else:
         # flash default: dr-grpo with no kl term, so no reference policy.
@@ -243,7 +300,6 @@ def _build_verl_training_cfg(
     train_files: str,
     val_files: str,
     model_id: str,
-    micro_batch: int,
     thinking: bool,
     loggers: str,
     fp8_kv: bool,
@@ -251,6 +307,7 @@ def _build_verl_training_cfg(
     local_dir: str,
     n_gpus: int = 1,
 ) -> dict:
+    engine_len = int(inp["engine_len"])
     return {
         "train_files": train_files,
         "val_files": val_files,
@@ -262,7 +319,11 @@ def _build_verl_training_cfg(
         "group_size": inp["group_size"],
         "prompts_per_step": inp["prompts_per_step"],
         "mask_truncated_completions": inp["mask_truncated_completions"],
-        "micro_batch": micro_batch,
+        "max_model_len": clamp_engine_len(engine_len, inp.get("max_position_embeddings")),
+        # one full-length sequence is the floor: a budget below engine_len cannot schedule the
+        # longest sequence the engine will ever produce, and verl would fail to place it in any
+        # micro-batch. this is the same sequence_length-derived budget sft and opd use.
+        "max_token_len_per_gpu": engine_len,
         "max_prompt_len": inp["max_prompt_len"],
         "max_completion": inp["max_completion"],
         "temperature": inp["temperature"],
@@ -815,6 +876,10 @@ def _resolve_single_turn_inputs():
         "kl_coef": kl_coef,
         "max_completion": max_completion,
         "max_prompt_len": prompt_budget,
+        # the engine's full sequence length (prompt + completion), which sizes both vllm's kv cache
+        # and the training token budget. prompt_budget alone would under-size both.
+        "engine_len": vllm_max_len,
+        "max_position_embeddings": model_max_position_embeddings(model_id, model_revision),
         "prompt_opened_thinking": prompt_opened_thinking,
         "lr": learning_rate,
         "lora_rank": lora_rank,
@@ -939,7 +1004,6 @@ def run_rl_verl():
                 "support it. that verl predates the freesolo fork; point FLASH_VERL_PYTHON at an "
                 f"interpreter with '{VERL_REQUIREMENT}' installed, or unset it to provision one."
             )
-        micro_batch = 1
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).
         loggers = _resolve_verl_loggers(python_bin)
@@ -964,7 +1028,6 @@ def run_rl_verl():
             train_files=train_pq,
             val_files=val_pq,
             model_id=model_path_for_verl,
-            micro_batch=micro_batch,
             thinking=bool(_w.THINKING),
             loggers=loggers,
             fp8_kv=fp8_kv,
