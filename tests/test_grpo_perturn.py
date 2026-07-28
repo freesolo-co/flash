@@ -429,3 +429,65 @@ def test_per_turn_extracts_signal_that_per_episode_discards(tmp_path):
     assert float(per_episode.abs().max()) < 1e-4
     # the +/-0.5 per-turn magnitude is exactly the turn-level signal per-episode discards
     assert float(per_turn.abs().max()) > 0.4
+
+
+# --------------------------------------------------------------------------- AS-028
+
+
+@pytest.fixture
+def reset_fallback_warning(monkeypatch):
+    """The warn-once latch is module state; isolate it so tests do not mask each other."""
+    monkeypatch.setattr(
+        "flash.engine.worker.grpo_perturn_trainer._WARNED_EPISODE_FALLBACK",
+        False,
+        raising=False,
+    )
+
+
+def test_missing_per_turn_rewards_warns_instead_of_silently_using_episode_credit(
+    reset_fallback_warning, capsys
+):
+    """per_turn is accepted and echoed in status; falling back to episode credit must not be silent."""
+    spans = [[(0, 1)], [(0, 1)]]
+    scalar = torch.tensor([1.0, -1.0], dtype=torch.float64)
+
+    build_per_turn_advantages(
+        spans,
+        [None, None],  # environment emitted no per_turn_rewards
+        num_generations=2,
+        completion_len=2,
+        episode_advantages=scalar,
+    )
+
+    out = capsys.readouterr().out
+    assert "per_turn" in out
+    assert "episode credit" in out
+    assert "per_turn_rewards" in out
+
+
+def test_episode_fallback_warning_is_emitted_once_per_run(reset_fallback_warning, capsys):
+    # the condition is a property of the environment, so a per-group warning would flood the log.
+    spans = [[(0, 1)], [(0, 1)]]
+    scalar = torch.tensor([1.0, -1.0], dtype=torch.float64)
+    for _ in range(3):
+        build_per_turn_advantages(
+            spans,
+            [None, None],
+            num_generations=2,
+            completion_len=2,
+            episode_advantages=scalar,
+        )
+    assert capsys.readouterr().out.count("[grpo][warn]") == 1
+
+
+def test_complete_per_turn_rewards_do_not_warn(reset_fallback_warning, capsys):
+    spans = [[(0, 1)], [(0, 1)]]
+    scalar = torch.tensor([1.0, -1.0], dtype=torch.float64)
+    build_per_turn_advantages(
+        spans,
+        [[1.0], [3.0]],
+        num_generations=2,
+        completion_len=2,
+        episode_advantages=scalar,
+    )
+    assert "[grpo][warn]" not in capsys.readouterr().out

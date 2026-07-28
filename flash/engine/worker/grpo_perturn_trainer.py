@@ -15,6 +15,31 @@ class TurnCreditRow:
     turns: tuple[float, ...] | None
 
 
+# one line per run, not one per group per step: the condition is a property of the environment, so it
+# is either true for most groups or none of them, and a per-group warning would bury the training log.
+_WARNED_EPISODE_FALLBACK = False
+
+
+def _warn_episode_fallback() -> None:
+    """Say that the requested per-turn credit is not actually being applied.
+
+    ``credit_assignment = "per_turn"`` is accepted by the spec and echoed back in run status, so a
+    user who sets it believes it took effect. When the environment returns no ``per_turn_rewards``
+    this silently trains on episode credit instead -- the configured setting is inert, the run looks
+    healthy, and nothing distinguishes it from a run that never asked for per-turn credit.
+    """
+    global _WARNED_EPISODE_FALLBACK
+    if _WARNED_EPISODE_FALLBACK:
+        return
+    _WARNED_EPISODE_FALLBACK = True
+    print(
+        '[grpo][warn] credit_assignment="per_turn" was requested, but the environment returned no '
+        "per_turn_rewards for at least one group; those groups train on episode credit. have "
+        "score_episodes() put a per-turn reward list in result.metadata['per_turn_rewards'] to "
+        "apply per-turn credit."
+    )
+
+
 def build_per_turn_advantages(
     turn_spans_per_completion: list[list[tuple[int, int]]],
     turn_rewards_per_completion: list[list[float] | None],
@@ -57,6 +82,7 @@ def build_per_turn_advantages(
         group_end = group_start + num_generations
         group = rows[group_start:group_end]
         if any(row.turns is None for row in group):
+            _warn_episode_fallback()
             for row_index in range(group_start, group_end):
                 completion_end = rows[row_index].spans[-1][1] if rows[row_index].spans else 0
                 advantages[row_index, :completion_end] = episode_advantages[row_index]
