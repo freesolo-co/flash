@@ -14,9 +14,7 @@ class _SingleTurnEnv:
     max_turns = 8
 
     def __init__(self, *, rows=None, reward=1.0):
-        self.rows = (
-            [{"input": "what is 2 + 2?", "output": "4"}] if rows is None else rows
-        )
+        self.rows = [{"input": "what is 2 + 2?", "output": "4"}] if rows is None else rows
         self.reward_value = reward
         self.completions: list[str] = []
 
@@ -198,16 +196,20 @@ def _environment_dir(tmp_path):
 def _patch_loader(monkeypatch, env, seen=None):
     seen = {} if seen is None else seen
 
-    def load(reference):
+    def load(reference, **kwargs):
         seen["reference"] = reference
+        seen["kwargs"] = kwargs
         return env
 
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", load)
     return seen
 
 
-def _args(path):
-    return argparse.Namespace(path=str(path))
+def _args(path, **overrides):
+    namespace = argparse.Namespace(path=str(path), split=None, param=[])
+    for key, value in overrides.items():
+        setattr(namespace, key, value)
+    return namespace
 
 
 def test_env_test_single_turn_replays_reference_and_passes(monkeypatch, tmp_path, capsys):
@@ -226,9 +228,7 @@ def test_env_test_single_turn_replays_reference_and_passes(monkeypatch, tmp_path
     assert "overall: PASS" in out
 
 
-def test_env_test_auto_falls_back_to_echo_for_empty_reference(
-    monkeypatch, tmp_path, capsys
-):
+def test_env_test_auto_falls_back_to_echo_for_empty_reference(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "say anything", "output": ""}], reward=0.0)
     _patch_loader(monkeypatch, env)
@@ -320,9 +320,7 @@ def test_env_test_multi_turn_terminates_and_scores(monkeypatch, tmp_path, capsys
     assert "1/1 episodes passed contract checks" in out
 
 
-def test_env_test_multi_turn_replays_text_free_turn_positionally(
-    monkeypatch, tmp_path, capsys
-):
+def test_env_test_multi_turn_replays_text_free_turn_positionally(monkeypatch, tmp_path, capsys):
     # dropping the null tool-call turn would shift "third" into its slot and misgrade; the
     # driver must replay ["first", "", "third"] positionally.
     env_dir = _environment_dir(tmp_path)
@@ -411,9 +409,7 @@ def test_env_test_malformed_prompt_fails_contract(monkeypatch, tmp_path, capsys)
     assert "overall: FAIL" in captured.err
 
 
-def test_env_test_multi_turn_malformed_env_reply_fails_contract(
-    monkeypatch, tmp_path, capsys
-):
+def test_env_test_multi_turn_malformed_env_reply_fails_contract(monkeypatch, tmp_path, capsys):
     # a non-empty but malformed env reply must fail the episode: those messages become
     # chat-template input for the next turn in the real rollout and would break remotely
     env_dir = _environment_dir(tmp_path)
@@ -462,4 +458,58 @@ def test_env_test_systemexit_from_reward_fails_contract(monkeypatch, tmp_path, c
     captured = capsys.readouterr()
     assert "0/1 episodes passed contract checks" in captured.out
     assert "failed contract checks" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_split_flag_reaches_loader(monkeypatch, tmp_path):
+    # the gate must validate the split a run actually trains on; without --split it always
+    # loaded the environment's default split and could pass while the configured one was
+    # never exercised.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+    args = cli._build_parser().parse_args(["env", "test", str(env_dir), "--split", "validation"])
+
+    assert args.func(args) == 0
+    assert seen["kwargs"] == {"split": "validation"}
+
+
+def test_env_test_param_flag_parses_toml_scalars(monkeypatch, tmp_path):
+    # --param mirrors [environment.params], so values keep the types the config would give
+    # them rather than arriving as strings.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+    args = cli._build_parser().parse_args(
+        [
+            "env",
+            "test",
+            str(env_dir),
+            "--param",
+            "max_rows=5",
+            "--param",
+            "strict=true",
+            "--param",
+            "name=hard",
+        ]
+    )
+
+    assert args.func(args) == 0
+    assert seen["kwargs"] == {"max_rows": 5, "strict": True, "name": "hard"}
+
+
+def test_env_test_split_flag_overrides_param_split(monkeypatch, tmp_path):
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, split="eval", param=["split=train"])) == 0
+    assert seen["kwargs"] == {"split": "eval"}
+
+
+def test_env_test_malformed_param_fails_before_loading(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=["justakey"])) == 1
+    assert "kwargs" not in seen
+    captured = capsys.readouterr()
+    assert "--param must be KEY=VALUE" in captured.err
     assert "overall: FAIL" in captured.err
