@@ -64,6 +64,14 @@ ASSISTANT_EMAIL_RE='@anthropic[.]com$'
 # disagree about how to escape a literal dot inside a shell-passed variable.
 LEAKED_EMAIL_RE='internal[.]cloudapp[.]net'
 
+# Message patterns, shared by the counters and (in spirit) the rewrite callback below.
+# Each is LINE-ANCHORED and trailer-shaped so that counting and removing agree: a commit
+# that merely mentions a trailer in prose is neither rewritten nor counted as a leak.
+CO_AUTHORED_RE='^[[:space:]]*Co-Authored-By:[[:space:]]*Claude'
+SESSION_RE='^[[:space:]]*Claude-Session:'
+GENERATED_RE='^[[:space:]]*.*Generated with .*Claude Code'
+HOSTNAME_RE='internal[.]cloudapp[.]net'
+
 CANONICAL_IDENTITY="${FLASH_CANONICAL_IDENTITY:-David Shan <78061174+DavidBShan@users.noreply.github.com>}"
 
 # A malformed override silently produces a mailmap git reads differently, which can
@@ -104,6 +112,13 @@ echo "    snapshot ref map: $REFMAP"
 count_pattern() {
   # commits (not lines) whose message matches $1, counted by git itself so the
   # number means commits on every platform.
+  #
+  # Callers pass a LINE-ANCHORED expression, matching what the rewrite callback
+  # actually removes. An unanchored count would deadlock the script: a commit whose
+  # message legitimately DISCUSSES a trailer ("Document the Claude-Session: trailer
+  # format") is correctly left alone by the callback, but an unanchored counter still
+  # counts it, so residual never reaches zero and the gate refuses to publish forever.
+  # git's --grep is line-oriented, so "^" anchors to a line, not to the message.
   git rev-list --all --count --grep="$1" --regexp-ignore-case --extended-regexp
 }
 
@@ -129,10 +144,10 @@ count_identities() {
 
 report_counts() {
   echo "    total commits:         $(git rev-list --count --all)"
-  echo "    Co-Authored-By Claude: $(count_pattern 'Co-Authored-By:[ \t]*Claude')"
-  echo "    Claude-Session:        $(count_pattern 'Claude-Session:')"
-  echo "    Generated with Claude: $(count_pattern 'Generated with .*Claude Code')"
-  echo "    leaked hostname:       $(count_pattern 'internal[.]cloudapp[.]net')"
+  echo "    Co-Authored-By Claude: $(count_pattern "$CO_AUTHORED_RE")"
+  echo "    Claude-Session:        $(count_pattern "$SESSION_RE")"
+  echo "    Generated with Claude: $(count_pattern "$GENERATED_RE")"
+  echo "    leaked hostname:       $(count_pattern "$HOSTNAME_RE")"
   echo "    leaking identities:    $(count_identities)"
 }
 
@@ -236,13 +251,13 @@ checked_count() {
 }
 
 residual=0
-for spec in \
-  "co-authored-by:Co-Authored-By:[ \t]*Claude" \
-  "claude-session:Claude-Session:" \
-  "generated-with:Generated with .*Claude Code" \
-  "leaked-hostname:internal[.]cloudapp[.]net"
+for label_and_re in \
+  "co-authored-by|$CO_AUTHORED_RE" \
+  "claude-session|$SESSION_RE" \
+  "generated-with|$GENERATED_RE" \
+  "leaked-hostname|$HOSTNAME_RE"
 do
-  n="$(checked_count "${spec%%:*}" count_pattern "${spec#*:}")"
+  n="$(checked_count "${label_and_re%%|*}" count_pattern "${label_and_re#*|}")"
   residual=$((residual + n))
 done
 n="$(checked_count identities count_identities)"
@@ -274,7 +289,9 @@ ones you do not want public from the mirror before pushing:
 
   git branch -D <branch>          # repeat, or script it against a keep-list
 
-Keeping just main, dev, and any live release branches is the safe default.
+Keeping just main, dev, and any live release branches is the safe default. Deleting
+here only removes the branch from THIS mirror; the push in step 4 needs --prune to
+delete it from the remote as well (it is there, and it is spelled out below).
 
 To publish the rewritten history:
 
@@ -299,8 +316,15 @@ To publish the rewritten history:
      --mirror tries to push and the server rejects.
 
        git remote add origin $REMOTE
-       git push --force --atomic origin 'refs/heads/*:refs/heads/*' \\
-                                       'refs/tags/*:refs/tags/*'
+       git push --force --atomic --prune origin 'refs/heads/*:refs/heads/*' \\
+                                               'refs/tags/*:refs/tags/*'
+
+     --prune is what makes the branch pruning above real. A wildcard refspec only UPDATES
+     refs that still exist locally; without --prune, every branch you deleted above
+     stays on the remote carrying its ORIGINAL UNSCRUBBED history, which defeats the
+     entire scrub. Verify afterwards that the remote holds only what you kept:
+
+       git ls-remote --heads origin | wc -l
 
      --atomic so a rejected ref fails the whole push, rather than leaving the
      remote half-rewritten.
