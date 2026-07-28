@@ -35,6 +35,7 @@ from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import sanitize_rollout_text
 from flash.engine.worker.verl_common import (
     VERL_REQUIREMENT,
+    agent_loop_workers,
     resolve_verl_python,
     verl_supports_rollout_field,
 )
@@ -58,18 +59,6 @@ def _verl_epochs_for_horizon(
     # the flag cannot be configured off, and ceil here would still under-serve the requested horizon.
     steps_per_epoch = prompt_count // prompts_per_step
     return max(epochs, math.ceil(steps / steps_per_epoch))
-
-
-def _agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
-    """largest divisor of ``rollout_batch`` that is <= ``cap`` (verl's default worker count).
-
-    verl's AgentLoopManager chunks the rollout batch across its workers and asserts the split is
-    exact, so the worker count must divide the batch. returning a divisor keeps the run alive for
-    any batch size while preserving parallelism whenever the batch permits it.
-    """
-    if rollout_batch <= 0:
-        raise ValueError("rollout_batch must be positive")
-    return next(n for n in range(min(cap, rollout_batch), 0, -1) if rollout_batch % n == 0)
 
 
 def build_verl_dataset_rows(
@@ -176,7 +165,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # constrains a user's [train].batch_size or group_size to keep that true. size the worker
         # pool to the batch instead: the largest divisor of the rollout batch that is <= 8, which is
         # always valid and still parallelizes whenever the batch allows it.
-        f"actor_rollout_ref.rollout.agent.num_workers={_agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']))}",
+        f"actor_rollout_ref.rollout.agent.num_workers={agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']))}",
         # fork-only rollout field, so `++` (append-or-override): it exists in the fork's rollout.yaml
         # but not in stock verl 0.8.0's, where a bare key or `+` would break. omitted entirely when
         # false, since not masking is already stock behavior and stock verl rejects the unknown key.

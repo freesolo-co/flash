@@ -4,10 +4,32 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import pytest
 
 from flash.engine.worker import verl_common as vc
+
+
+@pytest.mark.parametrize(
+    ("rollout_batch", "expected"),
+    [(1, 1), (8, 8), (16, 8), (128, 8), (4, 4), (12, 6), (9, 3), (10, 5), (11, 1), (91, 7)],
+)
+def test_agent_loop_workers_always_divides_the_rollout_batch(rollout_batch, expected):
+    assert vc.agent_loop_workers(rollout_batch) == expected
+
+
+def test_agent_loop_workers_invariant_holds_for_every_batch():
+    # verl asserts the split is exact, so a non-divisor aborts the run before step 1.
+    for batch in range(1, 600):
+        workers = vc.agent_loop_workers(batch)
+        assert batch % workers == 0
+        assert 1 <= workers <= min(8, batch)
+
+
+def test_agent_loop_workers_rejects_a_nonpositive_batch():
+    with pytest.raises(ValueError, match="rollout_batch must be positive"):
+        vc.agent_loop_workers(0)
 
 
 def test_latest_global_step_dir_picks_highest(tmp_path):
@@ -262,3 +284,40 @@ def test_run_verl_training_terminates_child_when_callback_fails():
             env=dict(os.environ),
             on_line=fail,
         )
+
+
+def test_run_verl_training_kills_the_grandchild_not_just_the_direct_child(tmp_path):
+    # verl spawns vllm's EngineCore as a grandchild. killing only the direct child reparents it to
+    # init with its cuda context intact, stranding the gpu for every later run. the child here traps
+    # SIGTERM and exits without touching its own child, so only a process-group signal reaches the
+    # grandchild -- exactly the shape of the real leak.
+    marker = tmp_path / "grandchild.pid"
+    # "ready" is withheld until the grandchild has recorded its pid, so teardown -- which on_line
+    # triggers -- can never race ahead of the marker write.
+    script = (
+        "trap 'exit 0' TERM; "
+        f"bash -c 'echo $$ > {marker}; sleep 30' & "
+        f"for _ in $(seq 1 500); do [ -s {marker} ] && break; sleep 0.02; done; "
+        "echo ready; "
+        "sleep 30"
+    )
+
+    def fail(_line):
+        raise RuntimeError("stream died")
+
+    with pytest.raises(RuntimeError, match="stream died"):
+        vc.run_verl_training(["bash", "-c", script], env=dict(os.environ), on_line=fail)
+
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), "grandchild never recorded its pid"
+    grandchild = int(marker.read_text().strip())
+
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    pytest.fail(f"grandchild {grandchild} survived teardown and is still holding the gpu")
