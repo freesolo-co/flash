@@ -73,7 +73,15 @@ LEAKED_EMAIL_RE='internal[.]cloudapp[.]net'
 # leak, residual never reaches zero, and the gate blocks publication forever. The
 # generated-with footer is usually emoji-prefixed, so allow leading NON-SPACE punctuation
 # explicitly rather than with a blanket ".*".
-CO_AUTHORED_RE='^[[:space:]]*Co-Authored-By:[[:space:]]*Claude'
+# "Claude" is a HUMAN NAME as well as the assistant's. A bare prefix match would delete
+# the attribution of a contributor named e.g. "Claude Dupont" -- stripping a real person's
+# credit is worse than leaving an assistant trailer in. So require "Claude" to be either
+# the COMPLETE name (next non-space is "<") or followed by a model family. Matching on the
+# assistant's EMAIL instead would be wrong here: a handful of trailers in this history were
+# committed under an operator address rather than the assistant's noreply domain, and because
+# this same pattern drives the residual gate, an email test would report a CLEAN history while
+# those survived -- a false clean certificate, the worst failure this script has.
+CO_AUTHORED_RE='^[[:space:]]*Co-Authored-By:[[:space:]]*Claude([[:space:]]+(Code|Bot|Opus|Sonnet|Haiku|Fable)[^<]*)?[[:space:]]*<'
 SESSION_RE='^[[:space:]]*Claude-Session:'
 GENERATED_RE='^[[:space:]]*[^[:alnum:]]*[[:space:]]*Generated with .*Claude Code'
 # The hostname leaks through a Co-authored-by TRAILER, so anchor on the trailer, not on
@@ -204,7 +212,10 @@ fi
 import re
 
 patterns = [
-    rb"(?im)^[ \t]*Co-Authored-By:[ \t]*Claude[^\n]*\n?",
+    # "Claude" must be the complete name or carry a model family -- see CO_AUTHORED_RE
+    # above. Kept in sync with it: if the strip is wider than the gate, a human named
+    # Claude loses credit; if narrower, the gate blocks publication forever.
+    rb"(?im)^[ \t]*Co-Authored-By:[ \t]*Claude(?:[ \t]+(?:Code|Bot|Opus|Sonnet|Haiku|Fable)[^<\n]*)?[ \t]*<[^\n]*\n?",
     rb"(?im)^[ \t]*Co-authored-by:[^\n]*internal\.cloudapp\.net[^\n]*\n?",
     rb"(?im)^[ \t]*Claude-Session:[^\n]*\n?",
     # the generated-with footer, anchored to its own line and to "Claude Code", so
