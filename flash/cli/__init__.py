@@ -243,7 +243,8 @@ def _build_parser() -> argparse.ArgumentParser:
     projects_list.set_defaults(func=cmd_projects_list)
 
     models = sub.add_parser("models", help="work with models and deployments")
-    models_sub = models.add_subparsers(dest="models_cmd", required=True)
+    models.set_defaults(func=cmd_models)  # hidden bare `flash models` shim, mirrors `flash runs`
+    models_sub = models.add_subparsers(dest="models_cmd", required=False)
     models_list = models_sub.add_parser("list", help="list supported base models")
     models_list.set_defaults(func=cmd_models)
 

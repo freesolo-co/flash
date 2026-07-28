@@ -94,6 +94,25 @@ def test_grouped_command_argparse_contracts() -> None:
     assert args.func is cli.cmd_projects_create
 
 
+def test_bare_group_commands_keep_their_pre_grouping_behavior() -> None:
+    """`flash models` and `flash runs` predate the grouping and must still run bare.
+
+    deployed agents invoke bare `flash runs`, and `flash models` was the model catalog before it
+    became a group, so requiring a subcommand would break both callers.
+    """
+    parser = cli._build_parser()
+
+    args = parser.parse_args(["models"])
+    assert args.func is cli.cmd_models
+
+    args = parser.parse_args(["runs"])
+    assert args.func is cli.cmd_runs
+
+    # the grouped forms still resolve to the same handlers.
+    assert parser.parse_args(["models", "list"]).func is cli.cmd_models
+    assert parser.parse_args(["runs", "list"]).func is cli.cmd_runs
+
+
 def test_root_model_commands_are_not_registered() -> None:
     assert not {"deploy", "chat", "deployments", "undeploy", "export"} & _registered_subcommands()
 
