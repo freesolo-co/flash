@@ -10,10 +10,12 @@ on top.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from collections.abc import Callable
@@ -219,10 +221,21 @@ def run_verl_training(
     receives every line, ``on_step`` receives each parsed training step, and ``heartbeat`` is called
     at most once per ``heartbeat_interval_s``. callback failures terminate the child before they are
     re-raised so a failed required checkpoint upload cannot leave paid training running unattended.
+
+    the child gets its own session so teardown can signal the whole process group. verl spawns vllm's
+    EngineCore as a grandchild, and terminating only the direct child reparents that grandchild to
+    init with its cuda context intact, so the gpu stays allocated and the next run waits forever on
+    device memory that nothing will release.
     """
     step_re = re.compile(step_pattern)
     proc = subprocess.Popen(
-        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
     )
     last_hb = 0.0
     try:
@@ -240,14 +253,28 @@ def run_verl_training(
                     heartbeat()
                     last_hb = now
     except BaseException:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        _kill_process_group(proc)
         raise
     finally:
         if proc.poll() is None:
             proc.wait()
     return int(proc.returncode)
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """signal the child's whole process group, escalating to SIGKILL if it does not exit.
+
+    signalling the group rather than the pid is what reaches vllm's EngineCore grandchild; a survivor
+    holds its cuda context and strands the gpu for every later run.
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=10)
