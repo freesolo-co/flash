@@ -2,8 +2,8 @@
 
 > **If you are an AI agent asked to train a model here, read this first.**
 > `flash env setup` dropped this file next to your `environment.py` and `configs/`.
-> It is the playbook Freesolo's own training agents follow to turn a *finished*
-> run into a model that *measurably improved*. The mechanics live in the hosted
+> It is the playbook Freesolo's own training agents follow to turn a _finished_
+> run into a model that _measurably improved_. The mechanics live in the hosted
 > docs (https://docs.freesolo.co); this file is the judgment that sits on top of them.
 
 A run that reaches `done` is **not** the same as a run that worked. Submitting a run
@@ -32,11 +32,11 @@ flash models list                     # supported base model ids
 flash gpus                           # managed GPU classes with estimated $/hr
 ```
 
-**Install the CLI and the `freesolo` SDK into the *same* interpreter.** Your
+**Install the CLI and the `freesolo` SDK into the _same_ interpreter.** Your
 `environment.py` imports `freesolo`, and the CLI loads that module in **its own**
 interpreter — so an isolated install (`pipx`, `uv tool install`) can run `flash` fine
-while `flash env test` fails with *"the 'freesolo' package is required to run Freesolo
-environments"* even though `python -c "import freesolo"` works in your shell. The
+while `flash env test` fails with _"the 'freesolo' package is required to run Freesolo
+environments"_ even though `python -c "import freesolo"` works in your shell. The
 message names the package, not the interpreter that is missing it, so the obvious fix
 appears to do nothing. Two ways to keep them together:
 
@@ -46,9 +46,12 @@ uv tool install freesolo-flash --with freesolo  # isolated tool venv, SDK inject
 ```
 
 If you use the `uv tool` form, note that `freesolo-flash` does **not** declare `freesolo`
-as a dependency — it is injected. **Upgrading rebuilds the tool venv and silently drops
-it**, so `flash env test` starts failing right after an upgrade that reported success.
-Re-inject on every upgrade: `uv tool install freesolo-flash --with freesolo --force`.
+as a dependency — it is injected, so it survives only as long as uv remembers the `--with`.
+`uv tool upgrade freesolo-flash` does remember it and keeps the SDK. Re-running
+`uv tool install freesolo-flash` **without** `--with freesolo` does not: it rewrites the
+tool venv from the new command and the SDK disappears, so `flash env test` starts failing
+right after a reinstall that reported success. Always carry the flag through a reinstall:
+`uv tool install freesolo-flash --with freesolo --force`.
 
 **`flash whoami` before you create anything.** `flash login` writes a machine-wide
 credential to `~/.flash`, but `FREESOLO_API_KEY` in your environment — including one
@@ -104,7 +107,7 @@ worker does not carry fails **remotely, on a paid run**, long after `flash env t
 
 `environment.py` defines the task. A single-turn env subclasses
 `EnvironmentSingleTurn`, turns a row into a prompt, and scores the model's response
-with a `RewardResult` (see *Reward design* below). `load_environment()` is the entry
+with a `RewardResult` (see _Reward design_ below). `load_environment()` is the entry
 point Flash calls:
 
 ```python
@@ -149,11 +152,12 @@ cover:
 ```bash
 flash env test .                     # imports environment.py, loads the dataset, runs the scorer
 flash env pull your-org/my-env -o ./pulled   # -o must be a FILE for a single file, a DIR for a
-                                             # whole env, and the directory must already exist
+                                             # whole env; a new path is created for you, but an
+                                             # existing non-empty dir is refused
 ```
 
 `flash env test` loads the environment with **no `[environment.params]`**, so an env whose
-split (or any other kwarg) is selected through `params` is validated at its *defaults* —
+split (or any other kwarg) is selected through `params` is validated at its _defaults_ —
 i.e. potentially a different dataset file than the one your run will train on. If your SFT
 and RL configs point at different splits, the local gate can pass while the real training
 path is broken, or fail while the real path is fine. Make the default the split you
@@ -201,14 +205,14 @@ lora_rank = 32              # lora_alpha is managed: always derived as 2 x lora_
 **Key placement that is easy to get wrong.** Every one of these is a real submit-time
 error or a wrong-config-that-still-runs; `--dry-run` catches the loud ones for free.
 
-| You might write | The schema wants | What happens |
-| --- | --- | --- |
-| `[environment] args = {...}` | `[environment] params = {...}` | rejected as an unknown `[environment]` key |
-| `[wandb] name = "..."` | `[wandb] run_name = "..."` | `[wandb] unknown key(s): name` |
-| `[train] thinking = true` | top-level `thinking = true` | rejected under `[train]`; misplacing it trains the wrong mode |
-| `[train] lora_alpha = 64` | omit it | rejected — alpha is managed as `2 x lora_rank` |
-| `[train] max_tokens = 512` | `max_completion_tokens` / `max_context_tokens` | rejected as an unknown `[train]` key |
-| `[sft]` / `[grpo]` tables | `[train]` | rejected — allowed tables are `environment`, `train`, `gpu`, `wandb`, `worker_env` |
+| You might write              | The schema wants                               | What happens                                                                       |
+| ---------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `[environment] args = {...}` | `[environment] params = {...}`                 | rejected as an unknown `[environment]` key                                         |
+| `[wandb] name = "..."`       | `[wandb] run_name = "..."`                     | `[wandb] unknown key(s): name`                                                     |
+| `[train] thinking = true`    | top-level `thinking = true`                    | rejected under `[train]`; misplacing it trains the wrong mode                      |
+| `[train] lora_alpha = 64`    | omit it                                        | rejected — alpha is managed as `2 x lora_rank`                                     |
+| `[train] max_tokens = 512`   | `max_completion_tokens` / `max_context_tokens` | rejected as an unknown `[train]` key                                               |
+| `[sft]` / `[grpo]` tables    | `[train]`                                      | rejected — allowed tables are `environment`, `train`, `gpu`, `wandb`, `worker_env` |
 
 `WANDB_API_KEY` is a default runtime secret, but it is only read from the process
 environment or a `.env` **next to your CWD or the config** — not from a `.env` one
@@ -216,10 +220,17 @@ directory up. Verify what the server actually recorded rather than trusting the 
 submitted spec is echoed back, so confirm e.g. `"thinking": false` there before you spend.
 
 **SFT requires an explicit `[train] max_examples`**, even for an uncapped run — set it to
-the dataset's exact row count (`wc -l dataset/train.jsonl`). There is no "all" sentinel, so
-this number is duplicated from the data into the config and **can drift**: if the dataset
-later grows, a stale `max_examples` silently trains on a subset instead of erroring. Re-check
-it whenever the dataset changes.
+the dataset's exact row count. Count records, not newlines: `wc -l` is off by one when the
+final JSON object has no trailing newline (silently dropping that last row from training)
+and over-counts if the file has blank lines. Count the way the loader reads it:
+
+```bash
+python -c "print(sum(1 for l in open('dataset/train.jsonl') if l.strip()))"
+```
+
+There is no "all" sentinel, so this number is duplicated from the data into the config and
+**can drift**: if the dataset later grows, a stale `max_examples` silently trains on a
+subset instead of erroring. Re-check it whenever the dataset changes.
 
 GPU allocation and HF artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
@@ -239,19 +250,22 @@ flash train configs/sft.toml --background  # submit and return immediately
 ```
 
 > **Killing `flash train` does NOT cancel the run.** Submission happens server-side; the
-> command then merely *streams* status. Interrupting it — or wrapping it in `timeout` —
+> command then merely _streams_ status. Interrupting it — or wrapping it in `timeout` —
 > kills only the client-side stream while the run keeps billing on its GPU, and re-running
 > the command creates a **second** run. Two GPUs then bill in parallel for the same
 > experiment.
 >
 > - Never wrap `flash train` in `timeout`, and use `--background` when you do not want to
 >   watch.
-> - After any interrupted submit, reconcile with `flash runs list` **before** re-running,
->   grouping by `max_examples` / `[wandb] run_name` to spot the duplicate.
-> - Probe affordability with `--dry-run` (which creates no run), never by submitting real
->   runs in a loop.
-> - Cancels settle differently by stage — a run still in setup goes `cancelled`, one
->   already training goes `failed`. Both stop billing.
+> - After any interrupted submit, reconcile with `flash runs list` **before** re-running.
+>   The list shows only run id, state, algorithm, cost, GPU and model — not `max_examples`
+>   or `[wandb] run_name` — so identify the live duplicate by running `flash runs status`
+>   on each recent candidate id, and cancel the one you did not mean to keep.
+> - Probe affordability with `--dry-run`: it starts no GPU job and incurs no training
+>   charge. It _does_ persist a run record, so expect a `dry_run` entry to appear in
+>   `flash runs list` — don't mistake it for a live duplicate during that reconcile.
+> - A cancel lands in `cancelled` whether the run was still in setup or already training;
+>   it is not reclassified as `failed`. Either way billing stops.
 
 ### 5. Monitor
 
@@ -271,12 +285,12 @@ some stages are announced once and then do un-instrumented work — so an unchan
 label, a flat step counter, or an idle GPU **prove nothing on their own**. Two distinct
 situations produce an identical-looking `status`:
 
-- *Normal quiet.* The last heartbeat is recent; the worker is simply between reports.
-- *Preemption.* The worker died mid-stage and stopped heartbeating. The control plane keeps
+- _Normal quiet._ The last heartbeat is recent; the worker is simply between reports.
+- _Preemption._ The worker died mid-stage and stopped heartbeating. The control plane keeps
   serving the **last** heartbeat it received, so `status` still reports `running` at
   whatever stage was announced, with a stale GPU snapshot attached.
 
-**The decisive signal is heartbeat *age*, not GPU utilization or the stage label.** A live
+**The decisive signal is heartbeat _age_, not GPU utilization or the stage label.** A live
 worker heartbeats continuously; a frozen timestamp means the worker is gone. Pair heartbeat
 age with GPU busy/idle before acting, and never derive seconds-per-step from total elapsed
 time (early steps include one-time warmup that can dominate a short run).
@@ -304,8 +318,8 @@ flash models export --adapter-id <run-id> --repository <you>/<repo>  # copy adap
 > **`flash models deploy` returns before the revision is servable.** It returns
 > `state: queued`, and while the new revision reconciles, `flash models deployments` can
 > still show `ready` for the **previous** one. An eval harness that polls for `ready` and
-> starts immediately will hit an endpoint that rejects its requests with *"deployment is
-> reconciling"* — and if the harness records per-row errors but still prints an aggregate,
+> starts immediately will hit an endpoint that rejects its requests with _"deployment is
+> reconciling"_ — and if the harness records per-row errors but still prints an aggregate,
 > you get a confident, entirely wrong number. This exact race turned a healthy checkpoint
 > into an apparent catastrophic regression (mean 0.07 vs its true 0.68).
 >
@@ -317,7 +331,7 @@ flash models export --adapter-id <run-id> --repository <you>/<repo>  # copy adap
 is valid — and that works everywhere else — may resolve to a different account or org than
 the `--repository` you pass, so the export fails on permissions or silently lands in the
 wrong namespace. Check with `huggingface_hub.whoami()` (compare the resolved name and its
-writable orgs against your destination) *before* the run finishes, not after. If several
+writable orgs against your destination) _before_ the run finishes, not after. If several
 tokens are in play, identify them by fingerprint rather than by printing them.
 
 ### Loading an exported adapter locally (transformers + peft)
@@ -341,7 +355,7 @@ model = PeftModel.from_pretrained(base, "<you>/<repo>")
 
 **Before you trust any local eval, check the key namespace matches the model class you
 loaded.** peft does NOT error on mismatched keys — it emits a `UserWarning` about missing
-adapter keys and silently applies *nothing*, so you would benchmark the bare base model
+adapter keys and silently applies _nothing_, so you would benchmark the bare base model
 believing it is your adapter. If the inspected keys carry the `language_model.` infix,
 load the base with the multimodal class whose parameters live under that namespace instead:
 
@@ -361,7 +375,7 @@ the JSON header of `adapter_model.safetensors` lists every tensor key. Rule of t
 keys pair with the `*ForConditionalGeneration` class. After loading, confirm the adapter
 actually applied: outputs (or a probe metric) must differ from the bare base model.
 
-The rest of this file is about doing the above *well* — designing a reward that teaches,
+The rest of this file is about doing the above _well_ — designing a reward that teaches,
 and deciding honestly whether a run improved.
 
 ---
@@ -402,7 +416,7 @@ A run is only evidence of improvement when **all** of these hold:
 - [ ] The SFT loss fell or the reward trend rose (GRPO `reward`) — **beyond the noise band**, not within it.
 - [ ] You **probed the trained adapter on real inputs** (`flash models deploy` + `flash models chat`), including cases it should fail — not just the metrics.
 - [ ] The score is real behavior, not empty/truncated/templated outputs, skipped rows, leakage, a swallowed exception, or a format-only win.
-- [ ] If you track a clean success signal separately from the shaped reward (an explicit `RewardMetric`), *that* moved too.
+- [ ] If you track a clean success signal separately from the shaped reward (an explicit `RewardMetric`), _that_ moved too.
 
 If any box is unchecked, the run is not done improving — keep training, don't declare success.
 
@@ -413,29 +427,29 @@ If any box is unchecked, the run is not done improving — keep training, don't 
 Most bad Flash runs fail in a small number of predictable ways. Check these before
 spending another GPU run:
 
-| Issue | Symptom | Mitigation |
-| --- | --- | --- |
-| Environment id is blank or stale | A blank id fails config validation. A stale published id can pass `flash train --dry-run` because dry-run does not import or run `environment.py`; the worker then uses old reward/data. | Run `flash env push --project <project-uuid> --name my-env .` after every environment/data edit and paste the returned id into every config you submit. |
-| Local-only env path in config | Config validation says there is no local path mode | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths. |
-| Config knobs are in the wrong table | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`. |
-| GPU selection is not what you expected | Leaving `[gpu] type` unset may select a different fitting class as prices or capacity change | Set `[gpu] type` to an active validated class to hard-pin it, or leave it unset for managed cheapest-fit allocation. `train.hf_repo` and `model_policy` remain platform-managed. |
-| Secrets are not available on the worker | Reward code works locally but remote logs show missing API keys or auth failures | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never put secret values in `[worker_env]` or hard-code them in the config. |
-| Wrong model / thinking setting | Config validation fails, or chat behavior does not match the run | Config validation is authoritative for model and thinking compatibility. Thinking is a run-level choice, and `flash models chat` does not expose an override flag. |
-| Thinking reward grades the wrong text | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields. |
-| All-zero or flat GRPO reward | `reward` stays near 0 and outputs do not improve | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward. |
-| Reward rises but behavior is worse | Short, templated, malformed, or reward-hacked outputs score well | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string. |
-| OPD makes the student worse, not better | The distilled adapter scores *below* its SFT/base start even though the per-token loss fell | The teacher, not a knob, is the ceiling. Reverse-KL only pulls the student toward the managed GLM-5.2 teacher, so a teacher that is weak or wrong on *your* task transfers its mistakes. Vet it first: roll GLM-5.2 through your own environment on a held-out split and confirm it clearly beats your student before submitting. If it doesn't, use GRPO or SFT instead — OPD cannot exceed a teacher that can't do the task. |
-| Output is truncated | Correct-looking answers cut off mid-response or JSON is incomplete | Increase `max_completion_tokens` for GRPO/OPD rollouts or `max_context_tokens` for total prompt+completion context only after seeing truncation. Oversizing them by default just burns memory/cost. |
-| Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash runs log <run-id>`, reduce footprint (`max_context_tokens`, `max_completion_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
-| Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash runs log <run-id> --follow` to reattach, `flash runs log <run-id>` for the console/error output, or `flash runs cancel <run-id>` if you intentionally want to stop it. |
-| Two runs training the same thing | `flash runs list` shows a live run you thought you had killed, on top of the one you just submitted | Killing the `flash train` client only detaches; it never cancels. Always `flash runs list` and cancel the stale run *before* re-submitting, and never wrap `flash train` in `timeout`. |
-| Wrong identity spends the money | Push/train lands in an org you did not expect, or a run id you know is valid comes back "unknown" | `FREESOLO_API_KEY` in the environment silently overrides `flash login`. Run `flash whoami` first. Run visibility is scoped to the key that created the run, so archive result baselines to disk rather than relying on `flash runs list` to find them later. |
-| `flash env test` passes but the run trains on the wrong data | Local validation is green; the remote run loads a different split | `flash env test` loads `environment.py` with **no** `[environment.params]`, so a params-driven split selection is not exercised. Assert the split inside your own test, or default to the split you actually train on. |
-| Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash runs checkpoint <run-id>`, deploy a specific step with `flash models deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter. |
-| Export fails before upload | CLI says no HuggingFace token | Pass `flash models export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`. |
-| Exported adapter is a silent no-op locally | peft warns about missing adapter keys and local eval matches the bare base model | The adapter's key namespace does not match the loaded model class. `model.layers.*` keys pair with `AutoModelForCausalLM`; `model.language_model.layers.*` keys pair with `Qwen3_5ForConditionalGeneration` / `Qwen3_5MoeForConditionalGeneration` (via `AutoModelForImageTextToText`). See "Loading an exported adapter locally". |
-| SFT loss improves but quality does not | Train loss falls while held-out behavior stalls or degrades | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes. |
-| Cost surprises | A quick experiment uses more GPU time than intended | Start with `--dry-run` and `--cost`, keep `epochs` and `max_examples` small for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time. |
+| Issue                                                        | Symptom                                                                                                                                                                                  | Mitigation                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Environment id is blank or stale                             | A blank id fails config validation. A stale published id can pass `flash train --dry-run` because dry-run does not import or run `environment.py`; the worker then uses old reward/data. | Run `flash env push --project <project-uuid> --name my-env .` after every environment/data edit and paste the returned id into every config you submit.                                                                                                                                                                                                                                                                         |
+| Local-only env path in config                                | Config validation says there is no local path mode                                                                                                                                       | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths.                                                                                                                                                                                                                                                                                                    |
+| Config knobs are in the wrong table                          | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys                                                                                                                          | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`.                                                                                                                                                                                                                                                                                       |
+| GPU selection is not what you expected                       | Leaving `[gpu] type` unset may select a different fitting class as prices or capacity change                                                                                             | Set `[gpu] type` to an active validated class to hard-pin it, or leave it unset for managed cheapest-fit allocation. `train.hf_repo` and `model_policy` remain platform-managed.                                                                                                                                                                                                                                                |
+| Secrets are not available on the worker                      | Reward code works locally but remote logs show missing API keys or auth failures                                                                                                         | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never put secret values in `[worker_env]` or hard-code them in the config.                                                                                                                                                                                                    |
+| Wrong model / thinking setting                               | Config validation fails, or chat behavior does not match the run                                                                                                                         | Config validation is authoritative for model and thinking compatibility. Thinking is a run-level choice, and `flash models chat` does not expose an override flag.                                                                                                                                                                                                                                                              |
+| Thinking reward grades the wrong text                        | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect                                                                                                    | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields.                                                                                                                                                                                                                     |
+| All-zero or flat GRPO reward                                 | `reward` stays near 0 and outputs do not improve                                                                                                                                         | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward.                                                                                                                                                                                                                                                   |
+| Reward rises but behavior is worse                           | Short, templated, malformed, or reward-hacked outputs score well                                                                                                                         | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string.                                                                                                                                                                                                                                                    |
+| OPD makes the student worse, not better                      | The distilled adapter scores _below_ its SFT/base start even though the per-token loss fell                                                                                              | The teacher, not a knob, is the ceiling. Reverse-KL only pulls the student toward the managed GLM-5.2 teacher, so a teacher that is weak or wrong on _your_ task transfers its mistakes. Vet the teacher before you spend — the "On-policy distillation" section gives the two ways to do that with a managed key. If it can't beat your student, use GRPO or SFT instead — OPD cannot exceed a teacher that can't do the task. |
+| Output is truncated                                          | Correct-looking answers cut off mid-response or JSON is incomplete                                                                                                                       | Increase `max_completion_tokens` for GRPO/OPD rollouts or `max_context_tokens` for total prompt+completion context only after seeing truncation. Oversizing them by default just burns memory/cost.                                                                                                                                                                                                                             |
+| Infrastructure, CUDA, OOM, vLLM, or kernel failure           | Run errors before useful metrics, often during setup/model load                                                                                                                          | Treat this as infrastructure pressure, not proof the model is too large. Read `flash runs log <run-id>`, reduce footprint (`max_context_tokens`, `max_completion_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class.                                                                                                                                                                      |
+| Run looks stuck after disconnecting                          | Terminal stopped streaming but the job may still be alive                                                                                                                                | Ctrl-C detaches. Use `flash runs log <run-id> --follow` to reattach, `flash runs log <run-id>` for the console/error output, or `flash runs cancel <run-id>` if you intentionally want to stop it.                                                                                                                                                                                                                              |
+| Two runs training the same thing                             | `flash runs list` shows a live run you thought you had killed, on top of the one you just submitted                                                                                      | Killing the `flash train` client only detaches; it never cancels. Always `flash runs list` and cancel the stale run _before_ re-submitting, and never wrap `flash train` in `timeout`.                                                                                                                                                                                                                                          |
+| Wrong identity spends the money                              | Push/train lands in an org you did not expect, or a run id you know is valid comes back "unknown"                                                                                        | `FREESOLO_API_KEY` in the environment silently overrides `flash login`. Run `flash whoami` first. Run visibility is scoped to the key that created the run, so archive result baselines to disk rather than relying on `flash runs list` to find them later.                                                                                                                                                                    |
+| `flash env test` passes but the run trains on the wrong data | Local validation is green; the remote run loads a different split                                                                                                                        | `flash env test` loads `environment.py` with **no** `[environment.params]`, so a params-driven split selection is not exercised. Assert the split inside your own test, or default to the split you actually train on.                                                                                                                                                                                                          |
+| Final checkpoint regresses                                   | Last step is worse than an earlier checkpoint                                                                                                                                            | Run `flash runs checkpoint <run-id>`, deploy a specific step with `flash models deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter.                                                                                                                                                                                                                                     |
+| Export fails before upload                                   | CLI says no HuggingFace token                                                                                                                                                            | Pass `flash models export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`.                                                                                                                                                                                                                                                                          |
+| Exported adapter is a silent no-op locally                   | peft warns about missing adapter keys and local eval matches the bare base model                                                                                                         | The adapter's key namespace does not match the loaded model class. `model.layers.*` keys pair with `AutoModelForCausalLM`; `model.language_model.layers.*` keys pair with `Qwen3_5ForConditionalGeneration` / `Qwen3_5MoeForConditionalGeneration` (via `AutoModelForImageTextToText`). See "Loading an exported adapter locally".                                                                                              |
+| SFT loss improves but quality does not                       | Train loss falls while held-out behavior stalls or degrades                                                                                                                              | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes.                                                                                                                                                                                                                                                                             |
+| Cost surprises                                               | A quick experiment uses more GPU time than intended                                                                                                                                      | Start with `--dry-run` and `--cost`, keep `epochs` and `max_examples` small for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time.                                                                                                                                                                                     |
 
 ---
 
@@ -464,7 +478,7 @@ spending another GPU run:
 
 - **Decide with the noise band.** When comparing two runs or two checkpoints, record
   the eval-split size `N` and the metric's approximate sampling noise — about
-  `1.96·√(p(1-p)/N)` for a rate metric `p`. Treat a difference *inside* that band as
+  `1.96·√(p(1-p)/N)` for a rate metric `p`. Treat a difference _inside_ that band as
   **no change** — neither improvement nor regression. A within-noise gain is not a win.
 
 ---
@@ -487,17 +501,17 @@ well-formed / parses → schema- & safety-valid → executes / runs → correct 
 ```
 
 Gate only the **top** tiers against gaming; keep the lower tiers dense. GRPO needs
-*within-group variance* to learn — if every rollout in a group scores identically,
+_within-group variance_ to learn — if every rollout in a group scores identically,
 there is nothing to optimize.
 
 ### Separate the shaped reward from a clean success signal
 
 A good GRPO reward is usually **shaped** — partial credit so the model always has a
-gradient to climb. But a shaped score is the wrong thing to judge *final quality* on:
+gradient to climb. But a shaped score is the wrong thing to judge _final quality_ on:
 it can rise from reward-hacking while the outcome you care about stays flat. Report the
 shaped value as `score`, and surface the clean pass/fail as an **explicit
 `RewardMetric`** so it shows up in the run's metric breakdown — a bare `threshold` is
-used for grading but is *not* logged on its own, so it gives you nothing to judge:
+used for grading but is _not_ logged on its own, so it gives you nothing to judge:
 
 ```python
 from freesolo.environments import RewardResult, RewardMetric
@@ -515,7 +529,7 @@ def score_response(self, example, response_text) -> RewardResult:
 GRPO, each `RewardMetric` is averaged across scored completions and logged by name at
 the managed heartbeat cadence, which is not guaranteed to be every optimizer step. That
 is how the clean success rate becomes visible. Multi-turn scoring currently reports only
-the scalar reward. Use the shaped `score` to confirm the model is learning *at all*, and
+the scalar reward. Use the shaped `score` to confirm the model is learning _at all_, and
 judge the run on the explicit `success` metric.
 
 When `thinking = true`, score the final answer unless you intentionally need the
@@ -535,14 +549,14 @@ explicitly inspect the separated completion, reasoning, or original raw model ou
   reward-hack a lenient judge with malformed-but-plausible text.
 - **Judge the realistic outcome, not the raw string.** Give a judge the runtime
   output, tool result, or executed-query records. For database / search / retrieval
-  tasks, grade the *returned records*, not the query text — the query is only
+  tasks, grade the _returned records_, not the query text — the query is only
   secondary validity evidence.
 - **A small format penalty beats a hard zero for shaping.** A useful trick:
   `reward = format_coef * (correct_format - 1) + correct_answer` with `format_coef≈0.1`
   — a tiny penalty for bad formatting, full credit for a correct, well-formatted answer.
 - **Anti-patterns.** Don't reward length or verbosity. Don't ship a reward that is
   always 0 or always 1 (no signal). Simpler rewards usually beat clever ones — a
-  mediocre *stable* reward beats a "perfect" reward you keep tweaking. Changing the
+  mediocre _stable_ reward beats a "perfect" reward you keep tweaking. Changing the
   reward resets progress, so keep the best checkpoint before you do.
 
 ---
@@ -553,7 +567,7 @@ Pick SFT when you already have good answers and want the model to imitate them.
 
 - **Data quality is the ceiling.** SFT can only be as good as the answers you show it.
   A small set of high-quality examples beats a large mediocre one. Keep response format
-  consistent (if you want JSON, *every* example is JSON) and keep the prompt format the
+  consistent (if you want JSON, _every_ example is JSON) and keep the prompt format the
   same as inference time.
 - **Watch the loss fall — and check overfitting yourself.** Flash SFT logs **training
   loss only**; it runs no mid-training held-out eval (evaluation is deferred to the
@@ -613,22 +627,35 @@ run fails if a requested exact save cannot be saved and published.
 
 Pick distillation when a much stronger **teacher** model can grade your student's work
 token-by-token. The student samples on-policy (like GRPO), a managed teacher (GLM 5.2 by default,
-or another via `[train] teacher_model`) scores each of the *student's* completions, and a dense per-token
+or another via `[train] teacher_model`) scores each of the _student's_ completions, and a dense per-token
 loss teaches the student to match the teacher — far more sample-efficient than reward-based RL and
 with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA served exactly like SFT.
 
 - **Vet the teacher on your task before you distil — this is a precondition, not a formality.**
-  Reverse-KL can only pull the student *toward* the selected teacher, so OPD's ceiling is
+  Reverse-KL can only pull the student _toward_ the selected teacher, so OPD's ceiling is
   roughly the teacher's own competence at your task. If the teacher is weak, frequently wrong, or
   solves the task with a strategy your environment can't reward, distillation faithfully transfers
-  those flaws and **drives the student *below* its SFT/base starting point instead of above it** — a
-  low per-token loss just means it matched a bad teacher. So measure the teacher the way you'd score
-  a candidate *before submitting*: roll your chosen teacher through your own environment on a held-out
-  split and read both its score and a sample of its trajectories. Only run OPD when the teacher clearly
-  beats your student (and your target bar) *and* solves the task the way you want the student to. When
+  those flaws and **drives the student _below_ its SFT/base starting point instead of above it** — a
+  low per-token loss just means it matched a bad teacher. Only run OPD when the teacher clearly
+  beats your student (and your target bar) _and_ solves the task the way you want the student to. When
   the teacher is at or below your student on the task, OPD is the wrong tool — reach for GRPO
   (reward-driven, can exceed any single teacher) or SFT on curated data instead. `[train] teacher_model`
   lets you pick the teacher that best fits your task without changing anything else.
+
+  **How to check, given the key is managed.** Flash has no command that generates teacher
+  rollouts — the platform's Fireworks key is used only inside the paid OPD worker, to score the
+  student's own tokens — so there is nothing to run locally with your Flash credentials alone.
+  Two workable routes:
+
+  - _Best, if you can:_ get your own access to the same model (the allow-list is Fireworks-hosted,
+    and these are widely available elsewhere too), point your environment's scorer at it, and grade
+    a held-out split exactly as you would a student. Read the score _and_ a sample of trajectories —
+    a teacher that is right for the wrong reasons transfers the wrong reasons.
+  - _Cheapest, always available:_ run a deliberately short OPD probe (a small `max_steps` on a
+    slice of the data), deploy that adapter, and evaluate it against the same student baseline. If
+    a short run moves the student the wrong way, a long one will move it further the wrong way —
+    stop and change teacher or algorithm rather than buying more steps.
+
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
   the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
   `glm-5.2` (default), `deepseek-v4-pro`, `kimi-k2.6`. Every option is
@@ -638,11 +665,11 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
   at serving time; teacher token cost varies by model and is shown in the pre-flight estimate.
 - **The student (Qwen) and the teacher have different tokenizers.** Flash
-  bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai *spider* / Tinker
+  bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai _spider_ / Tinker
   method): it aligns the two tokenizations by shared decoded-text spans and applies per-span reverse
   KL using only realized-token logprobs — no vocabulary projection, so it covers every token exactly
   and works for any student tokenizer. When the tokenizers happen to agree it reduces to plain
-  per-token reverse KL (Thinking Machines, *On-Policy Distillation*). Nothing to configure.
+  per-token reverse KL (Thinking Machines, _On-Policy Distillation_). Nothing to configure.
 - **Works for multi-turn envs too.** Against an `EnvironmentMultiTurn`, opd rolls out each episode
   (driving `step_episode` / observations just like GRPO) and distils EVERY assistant turn against the
   teacher, each conditioned on the transcript up to that turn — the episode's total reverse-KL over
@@ -676,14 +703,14 @@ the zero-width stop token**. No auxiliary EOS loss is applied. `truncated_rollou
 that reached the length cap without EOS or a configured stop. Warm-starting from an SFT adapter can
 still improve initial termination behavior.
 
-A verbose teacher can also inflate the *content* the student distils toward through long per-turn
+A verbose teacher can also inflate the _content_ the student distils toward through long per-turn
 reasoning and extra multi-turn looping, so episodes still forfeit against the length/turn budget
 regardless of stop-token behavior. Because the teacher scores the
 student's rollouts **conditioned on your environment's own system prompt**, you can shrink its target
 distribution at the source: give the prompt used for OPD rollouts a **hard, specific reasoning
 budget** — e.g. "reason in at most two or three sentences, then act; once you have started, do not
 reconsider" — rather than a vague "be brief." The phrasing matters. A soft brevity request can
-**backfire on a thinking teacher**, trimming the median while *inflating* the long tail (the model
+**backfire on a thinking teacher**, trimming the median while _inflating_ the long tail (the model
 spirals when told to be brief on a problem it finds hard), which is exactly the tail that drives
 runaway. Constrain the content with the prompt and monitor `truncated_rollouts` for length-cap
 failures. This assumes the teacher is still strong at the task (vet it first, above).
@@ -695,21 +722,21 @@ teacher's dominant mode, and it keeps sharpening for as long as you train. This 
 run, at every size** — the whole Flash catalog is small by frontier standards (0.8B-9B dense plus a
 3B-active MoE), so treat over-sharpening as a default risk, not a small-model edge case. The student's
 per-token entropy falls as training proceeds; past the point where it has learned the task, extra
-steps only over-sharpen — *lowering* accuracy. Push it far enough and the distribution peaks so hard
+steps only over-sharpen — _lowering_ accuracy. Push it far enough and the distribution peaks so hard
 that **greedy (temperature=0) decoding falls into a repetition loop** that repeats a phrase to the
 length cap and never emits your answer. The loss looks healthy the whole run (reverse-KL is being
-minimized *by* the collapse), so it is invisible in the loss curve and only surfaces at serving —
+minimized _by_ the collapse), so it is invisible in the loss curve and only surfaces at serving —
 where **temperature=0 is the default**, so it hits real callers, not just a sampled eval.
 
 **Severity scales with size**: on the largest catalog models over-training mostly just leaves
 accuracy on the table (a late checkpoint slightly worse than an earlier one); on the smallest it
 turns into the full-blown greedy loop. But the fix is the same everywhere, and cutting steps helped
-*every* size tested. Four levers, each attacking the same over-sharpening — the first two apply to
+_every_ size tested. Four levers, each attacking the same over-sharpening — the first two apply to
 every run, the last two matter more the smaller the model:
 
 - **Train fewer steps (highest leverage, every size).** The student typically peaks early — often
-  around ~20 optimizer steps — and every step after is pure over-sharpening that *lowers* accuracy
-  while *raising* the loop rate. Cut `max_examples` (or `epochs`) so the run stops before the collapse,
+  around ~20 optimizer steps — and every step after is pure over-sharpening that _lowers_ accuracy
+  while _raising_ the loop rate. Cut `max_examples` (or `epochs`) so the run stops before the collapse,
   and deploy an early **checkpoint** (`flash runs checkpoint <run>`, `flash models deploy <run>/step-N`) rather
   than the final adapter. This helped at every size tested — a 4B went 42% acc / 44% loop at full
   length -> **74% / 0% at step 20**, and even models that never looped came out equal-or-better at the
@@ -720,7 +747,7 @@ every run, the last two matter more the smaller the model:
   often clears the loop outright (a 4B sft->opd went 42%/44% at rank 32 -> 76%/2% at rank 16). Since
   the whole catalog is small, prefer a modest rank (16) as the default for OPD and only raise it with a
   reason.
-- **Match the teacher to the student.** A *stronger* teacher is not universally better — the harder
+- **Match the teacher to the student.** A _stronger_ teacher is not universally better — the harder
   it is for the student to match, the harder the collapse. On a 2B, a closer/weaker teacher can beat a
   frontier one outright; a frontier `teacher_model` only earns its keep once the student is large
   enough to track it (~9B+). Early-stopping also largely neutralizes this gap, since the teacher-driven
@@ -731,19 +758,25 @@ every run, the last two matter more the smaller the model:
 
 ### Distilling from base with no format anchor
 
-`opd` straight from a base model (no SFT warm-start) faithfully distils the teacher's *reasoning* but
+`opd` straight from a base model (no SFT warm-start) faithfully distils the teacher's _reasoning_ but
 the student never learns your **answer format** — it terminates (`finish_reason=stop`) without ever
 emitting the boxed/tagged answer, so completions score unparseable even when the reasoning is fine.
-On-policy distillation reinforces the student's *own* tokens, so if the base never produces the
+On-policy distillation reinforces the student's _own_ tokens, so if the base never produces the
 format there is nothing to reinforce (and a downstream GRPO pass can't rescue it — with no
 correctly-formatted rollout to reward, RL has no signal to climb). Two fixes:
 
 - **Warm-start from an SFT adapter** (`[train] init_from_adapter`) — the SFT installs the output
   format first, then OPD refines the content. This is the reliable default for structured-answer tasks.
-- **Constrain the rollouts with `[train] structured_outputs`** (guided decoding) to a schema whose
-  **answer field comes first** — the model learns to commit a parseable answer *before* any reasoning
-  that might run long, so the answer survives even if the reasoning still loops. This separates the
-  *format* problem (fixed here) from the *loop* problem (fixed by the levers above).
+- **Constrain the rollouts with `[train] structured_outputs`** (guided decoding) so the answer is
+  forced into your schema instead of being left to the base model's habits. This fixes the _format_
+  problem only; the _loop_ problem is fixed by the levers above.
+
+  Field order in that schema is a `thinking = false` lever, not a rescue for runaway reasoning.
+  Under `thinking = true` the grammar is deliberately held until the model emits `</think>`, so it
+  constrains only what comes after the reasoning phase — putting `answer` first cannot make the
+  answer precede the thinking, and if reasoning never terminates the answer is never generated at
+  all. For thinking runs, treat a length cap or a reasoning loop as a budget problem and reach for
+  the SFT warm-start and the prompt/`max_completion_tokens` levers above.
 
 ---
 
@@ -752,32 +785,39 @@ correctly-formatted rollout to reward, RL has no signal to climb). Two fixes:
 Set these in `[train]`. Each is `None` by default — the worker's tuned recipe fills
 in a sensible value, so only override with a reason.
 
-| Knob | Convention |
-| --- | --- |
-| `group_size` | Completions sampled per prompt (default 8). More = more signal and more cost; drop to 4 to trim cost. The group needs *within-group variance* for an advantage to exist. |
-| `max_completion_tokens` | Completion budget per rollout. Size it to the expected output length; too small silently truncates good answers and poisons the reward, while too large just costs more. |
-| `temperature` | Rollout sampling temperature. Keep it near 1.0 for GRPO — too low collapses diversity (and the model can collapse within a few steps); raise it to widen exploration against uniform-reward groups. |
-| `kl_penalty_coef` | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move. |
-| `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy. |
-| `learning_rate` | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it. |
-| `batch_size` | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable. |
-| `structured_outputs` | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then *cannot* emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
+| Knob                           | Convention                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `group_size`                   | Completions sampled per prompt (default 8). More = more signal and more cost; drop to 4 to trim cost. The group needs _within-group variance_ for an advantage to exist.                                                                                                                                                                                                                                          |
+| `max_completion_tokens`        | Completion budget per rollout. Size it to the expected output length; too small silently truncates good answers and poisons the reward, while too large just costs more.                                                                                                                                                                                                                                          |
+| `temperature`                  | Rollout sampling temperature. Keep it near 1.0 for GRPO — too low collapses diversity (and the model can collapse within a few steps); raise it to widen exploration against uniform-reward groups.                                                                                                                                                                                                               |
+| `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
+| `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
+| `learning_rate`                | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it.                                                                                                                                                                                                                                                                                             |
+| `batch_size`                   | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
+| `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
 For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final
 answer or action, so undersizing it can truncate the action and teach the model to stop reasoning;
 watch `truncation_rate`, which counts completions not ending in EOS and is not strictly
 `finish_reason=length` when stop sequences or multi-turn rollouts are involved.
 
-> **On a fixed budget, `batch_size` buys optimizer steps almost for free.** `batch_size`
+> **On a derived horizon, `batch_size` buys optimizer steps cheaply.** `batch_size`
 > overrides the tuned prompts-per-step. Total generated tokens are
-> `steps x prompts_per_step x group_size x max_completion_tokens`, so **lowering
-> `batch_size` raises the step count and leaves the token bill — hence the cost —
-> essentially flat.** The same spend that buys 5 steps at the default batching buys ~80 at
+> `steps x prompts_per_step x group_size x max_completion_tokens`, so when the step count
+> is _derived_ from the data, lowering `batch_size` raises it and leaves the token bill
+> roughly flat — the spend that buys 5 steps at the default batching buys ~80 at
 > `batch_size = 4`. Five GRPO steps cannot plausibly move a model off its starting point, so
-> if your budget only affords single-digit steps at the default, you are not under-funded —
-> you are mis-batched. Smaller batches do mean noisier per-step gradients, so this is a real
-> trade, not free money; but at a fixed budget, 5 steps is not a viable operating point.
-> Verify with `--cost` before and after the change.
+> if your budget only affords single-digit steps at the default, you are probably not
+> under-funded — you are mis-batched.
+>
+> Two things break the flat-cost approximation, so treat it as a hypothesis to check, not a
+> rule. **`[train] max_steps` overrides the derived horizon**: with it set the step count is
+> exactly what you asked for, lowering `batch_size` does not add steps at all, and you
+> simply train on fewer prompts. And per-step cost is not purely token-proportional —
+> GRPO reward waves and OPD teacher calls add latency per step, so multiplying steps can
+> multiply that overhead into a materially larger GPU bill. Smaller batches also mean
+> noisier per-step gradients. Compare concrete `--cost` estimates before and after the
+> change and let those numbers, not the ratio, decide.
 
 For pure multi-turn GRPO, Flash gives each Flash-owned vLLM generation request a managed
 10-to-60-minute absolute deadline and at most two physical attempts. A timed-out request is
@@ -795,7 +835,7 @@ environment calls.
 
 ### `credit_assignment = "per_turn"` is inert unless your environment emits `per_turn_rewards`
 
-Setting `credit_assignment = "per_turn"` is only *half* the request. The trainer reads the
+Setting `credit_assignment = "per_turn"` is only _half_ the request. The trainer reads the
 turn-level signal from `RewardResult.metadata["per_turn_rewards"]`; **when that key is
 missing it silently falls back to episode-level credit.** The config validates, `flash runs
 status` echoes `per_turn` back, and nothing in the CLI, the status output, or the worker log
@@ -838,14 +878,28 @@ like `1 - turns_taken / max_turns` makes perfect play unreachable: an example wh
 solution needs 5 turns caps at `1 - 5/12 = 0.58` even when played perfectly, so "perfect
 across the dataset" is undefined and your gold trajectories never score 1.0. Use
 `minimal_steps / turns_used` instead — a minimal solve scores exactly 1.0 and detours
-degrade smoothly. Assert gold == 1.0 in a local test.
+degrade smoothly.
+
+**Gate that ratio on success and clamp it.** Applied unconditionally it is an active
+hazard, not just imprecise: an episode that gives up after one turn still collects
+`minimal_steps / 1`, so on a five-step example quitting immediately scores **5.0** —
+strictly better than solving it. GRPO optimises exactly that, and you get a run that
+learns to terminate. Score failures at zero, divide only after a solve, and bound the
+result to your reward range:
+
+```python
+reward = min(1.0, minimal_steps / turns_used) if solved else 0.0
+```
+
+Assert both ends in a local test: a gold trajectory scores 1.0, and a one-turn give-up
+scores 0.0.
 
 ---
 
 ## Curriculum — start easy, scale up
 
 Starting too hard produces zero learning signal; the model never succeeds, the reward
-stays at 0, and there is nothing to climb. Start where the base model can *partially*
+stays at 0, and there is nothing to climb. Start where the base model can _partially_
 succeed, then raise difficulty as it improves. The "Goldilocks zone" — where most
 rollouts score somewhere between all-fail and all-pass — is where GRPO has the most
 signal.
@@ -866,17 +920,17 @@ generations** (raw outputs, not just scores), classify the dominant mode, and ap
 targeted fix rather than leaning on the reward gate to slowly select against it. Then
 **re-measure that mode** to confirm it dropped.
 
-| Failure mode | What you see | Targeted fix |
-| --- | --- | --- |
-| Repetition / looping collapse | the same phrase repeats until truncation | repetition or length penalty; lower `temperature` |
-| Overthinking / verbose reasoning | reasoning eats the whole token budget | `thinking_length_penalty_coef`; tighten the prompt with a *hard, specific* budget ("reason in at most N sentences, then act") — a vague "be brief" can backfire on a thinking model and lengthen the tail |
-| Completion truncation | answers cut off mid-thought | raise `max_completion_tokens` / `max_context_tokens` |
-| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | No auxiliary EOS loss is applied. Warm-start from SFT and shrink what has to terminate: constrain the *teacher's* reasoning at the source with a hard, specific budget in the env prompt used for OPD rollouts (the teacher scores the student conditioned on it); a vague "be brief" can backfire on a thinking teacher. First confirm the teacher itself terminates and is strong on the task; a bad teacher is distilled in, not out. |
-| Unparsed / over-escaped output | reward can't read the answer | robust parser; return `0.0` on parse fail; format gate |
-| Wrapper / markdown around structured output | prose around the JSON/answer | a format gate; `stop_sequences` |
-| Uniform-reward groups | every rollout in a group scores the same → no gradient | shape the reward for partial credit; raise `temperature` |
-| Too-hard prompts | the base never succeeds, reward stays at 0 | curriculum / easier prompts; warm-start with SFT |
-| Judge-rewarded degenerate output | short, templated answers a judge still rates well | a minimum-substance zero-gate ahead of the judge |
+| Failure mode                                        | What you see                                                                             | Targeted fix                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Repetition / looping collapse                       | the same phrase repeats until truncation                                                 | repetition or length penalty; lower `temperature`                                                                                                                                                                                                                                                                                                                                                                                        |
+| Overthinking / verbose reasoning                    | reasoning eats the whole token budget                                                    | `thinking_length_penalty_coef`; tighten the prompt with a _hard, specific_ budget ("reason in at most N sentences, then act") — a vague "be brief" can backfire on a thinking model and lengthen the tail                                                                                                                                                                                                                                |
+| Completion truncation                               | answers cut off mid-thought                                                              | raise `max_completion_tokens` / `max_context_tokens`                                                                                                                                                                                                                                                                                                                                                                                     |
+| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | No auxiliary EOS loss is applied. Warm-start from SFT and shrink what has to terminate: constrain the _teacher's_ reasoning at the source with a hard, specific budget in the env prompt used for OPD rollouts (the teacher scores the student conditioned on it); a vague "be brief" can backfire on a thinking teacher. First confirm the teacher itself terminates and is strong on the task; a bad teacher is distilled in, not out. |
+| Unparsed / over-escaped output                      | reward can't read the answer                                                             | robust parser; return `0.0` on parse fail; format gate                                                                                                                                                                                                                                                                                                                                                                                   |
+| Wrapper / markdown around structured output         | prose around the JSON/answer                                                             | a format gate; `stop_sequences`                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Uniform-reward groups                               | every rollout in a group scores the same → no gradient                                   | shape the reward for partial credit; raise `temperature`                                                                                                                                                                                                                                                                                                                                                                                 |
+| Too-hard prompts                                    | the base never succeeds, reward stays at 0                                               | curriculum / easier prompts; warm-start with SFT                                                                                                                                                                                                                                                                                                                                                                                         |
+| Judge-rewarded degenerate output                    | short, templated answers a judge still rates well                                        | a minimum-substance zero-gate ahead of the judge                                                                                                                                                                                                                                                                                                                                                                                         |
 
 ---
 
@@ -890,7 +944,7 @@ A plateau is not automatically a capability ceiling. Before you call it one:
    diversity is **entropy collapse**, not a ceiling — and it's fixable: anchor harder
    with `kl_penalty_coef`, lower the `learning_rate`, or widen exploration. Only if the
    probe shows no headroom is it a genuine ceiling.
-3. **Change a different lever.** If there's real headroom, try a *different* lever from
+3. **Change a different lever.** If there's real headroom, try a _different_ lever from
    the one that just failed — a different knob, reward shape, or data family — one
    controlled change at a time.
 
@@ -915,11 +969,11 @@ on a beyond-noise improvement.
 
 ## Don't let your own harness lie to you
 
-Every item here produced a confident, *wrong* conclusion that survived until someone went
+Every item here produced a confident, _wrong_ conclusion that survived until someone went
 looking. None were Flash defects — they are analysis bugs, and they are the most expensive
 kind because the run itself looks fine.
 
-- **Never join eval results to your dataset by index.** If the harness *samples* rows
+- **Never join eval results to your dataset by index.** If the harness _samples_ rows
   (`random.sample`, a shuffled loader) the output order is neither a prefix nor file order.
   Zipping `results[i]` to `dataset` line `i` mismatched **78 of 150** rows and produced a
   detailed, entirely wrong root-cause analysis of where the model was failing. Carry an
@@ -935,7 +989,7 @@ kind because the run itself looks fine.
   two jobs writing the same output file silently overwrite each other.
 - **Sanity-check a metric against its neighbours.** A metrics dict reading `accuracy: 0.0`
   next to `mean_shaped_score: 0.979` is internally contradictory and is telling you the
-  *reader* is broken, not the model. (`RewardMetric` carries its number in `.score`;
+  _reader_ is broken, not the model. (`RewardMetric` carries its number in `.score`;
   `.value` is a separate optional field and is often `None`.)
 - **Verify the split you evaluate is the split you think.** Confirm gold answers score
   1.0 through your own scorer before trusting any number derived from it, and re-check for
@@ -945,13 +999,13 @@ kind because the run itself looks fine.
   with sampling noise. Archive the pre-fix results rather than overwriting them.
 - **A judge that is itself a reasoning model breaks naive parsing.** Its `<think>` block can
   consume the token budget and truncate the verdict, and it often floats a candidate score
-  mid-reasoning before settling on a different one — so a regex taking the *first* match
+  mid-reasoning before settling on a different one — so a regex taking the _first_ match
   reads a discarded intermediate as the verdict and mis-grades silently. Strip the reasoning
   block, search the post-reasoning answer, take the **last** match, and give the judge
   enough tokens to finish.
 - **State the noise band before you compare.** With a small eval split, differences of a few
   points are not distinguishable from noise; see the noise-band formula above, and treat an
-  in-band difference as *no change* rather than a weak win.
+  in-band difference as _no change_ rather than a weak win.
 
 ---
 
