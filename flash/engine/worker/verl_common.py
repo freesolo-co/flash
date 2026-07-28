@@ -18,9 +18,32 @@ import subprocess
 import time
 from collections.abc import Callable
 
+# verl 0.8.0 exactly, plus the truncation-mask commit. it must stay on the 0.8.0 base: the opd
+# plugin patches 0.8.0 internals and imports verl.trainer.main_ppo_sync, which verl deleted after
+# 0.8.0, and opd's exact-version gate reads the version file this branch pins to the release value.
 VERL_REQUIREMENT = (
-    "verl @ git+https://github.com/freesolo-co/verl@c1962bdee57310aaed7db28992fb16dcb75d3e95"
+    "verl @ git+https://github.com/freesolo-co/verl@0f821c22325a1a51384431d57b899cc5dcf3d837"
 )
+
+
+def verl_supports_rollout_field(python_bin: str, field: str) -> bool:
+    """report whether python_bin's verl declares `field` on RolloutConfig.
+
+    the fork adds rollout fields stock verl does not have. hydra composes an unknown key happily and
+    only fails later in omega_conf_to_dataclass, so callers ask here before emitting a fork-only
+    override rather than letting the run abort at dataclass conversion.
+    """
+    probe = (
+        "from verl.workers.config.rollout import RolloutConfig;"
+        f"print('1' if {field!r} in RolloutConfig.__dataclass_fields__ else '0')"
+    )
+    try:
+        done = subprocess.run(
+            [python_bin, "-c", probe], capture_output=True, text=True, timeout=300
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip().endswith("1")
 
 
 def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
@@ -29,6 +52,10 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     prefers FLASH_VERL_PYTHON (set by the caller when verl is preinstalled, e.g. on a verl image).
     otherwise provisions an isolated venv on the pod so verl's torch/vllm never touch flash's env.
     optionally installs wandb best-effort for callers that enable verl's wandb logger.
+
+    the preset is returned as-is: flash does not own that interpreter and must not mutate it. it can
+    hold a verl without the fork's rollout fields, so callers emitting a fork-only override gate it
+    on verl_supports_rollout_field.
     """
     preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
     if preset:

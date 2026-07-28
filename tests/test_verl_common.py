@@ -59,7 +59,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert calls[0][:2] == ["uv", "venv"]
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@c1962bdee57310aaed7db28992fb16dcb75d3e95"
+        "verl @ git+https://github.com/freesolo-co/verl@0f821c22325a1a51384431d57b899cc5dcf3d837"
     )
     assert vc.VERL_REQUIREMENT in install
     assert "liger-kernel" in install
@@ -70,6 +70,24 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "tqdm" in install
     assert "pyarrow" in install
     assert len(calls) == 2
+
+
+def test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork():
+    # a branch or tag would let the runtime move under a pinned flash release.
+    _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
+    url, _, commit = ref.rpartition("@")
+    assert url == "https://github.com/freesolo-co/verl"
+    assert len(commit) == 40
+    assert all(c in "0123456789abcdef" for c in commit)
+
+
+def test_verl_pin_matches_the_version_opd_requires_exactly():
+    # the pin MUST stay on the verl 0.8.0 base. opd_verl_plugin patches 0.8.0 internals and imports
+    # verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, so a pin built on a newer base
+    # installs a verl that fails opd's exact-version gate and cannot import its own entrypoint.
+    from flash.engine.worker import opd_verl_plugin as plugin
+
+    assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(
@@ -90,6 +108,48 @@ def test_resolve_verl_python_installs_wandb_best_effort_when_requested(
         ["uv", "pip", "install", "--python", str(tmp_path / "verl-venv/bin/python"), "wandb"],
         False,
     )
+
+
+def _probe_interpreter(tmp_path, name, body):
+    """write a stub interpreter that answers the RolloutConfig probe like a real python would."""
+    stub = tmp_path / name
+    stub.write_text("#!/bin/sh\n" + body + "\n")
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def test_verl_supports_rollout_field_true_when_field_declared(tmp_path):
+    fork = _probe_interpreter(tmp_path, "fork-python", "echo 1")
+    assert vc.verl_supports_rollout_field(fork, "mask_truncated_completions") is True
+
+
+def test_verl_supports_rollout_field_false_when_field_absent(tmp_path):
+    # stock verl 0.8.0: RolloutConfig has no such field, so the probe prints 0.
+    stock = _probe_interpreter(tmp_path, "stock-python", "echo 0")
+    assert vc.verl_supports_rollout_field(stock, "mask_truncated_completions") is False
+
+
+def test_verl_supports_rollout_field_false_when_verl_missing(tmp_path):
+    # import error inside the probe: nonzero exit must read as unsupported, not crash the caller.
+    broken = _probe_interpreter(tmp_path, "broken-python", "exit 1")
+    assert vc.verl_supports_rollout_field(broken, "mask_truncated_completions") is False
+
+
+def test_verl_supports_rollout_field_false_when_interpreter_missing(tmp_path):
+    # a bogus FLASH_VERL_PYTHON must not raise OSError out of the capability check.
+    missing = str(tmp_path / "does-not-exist")
+    assert vc.verl_supports_rollout_field(missing, "mask_truncated_completions") is False
+
+
+def test_resolve_verl_python_returns_preset_unmodified(monkeypatch, tmp_path):
+    # flash does not own a preset interpreter and must never mutate it; capability is checked
+    # separately by verl_supports_rollout_field.
+    calls = []
+    monkeypatch.setenv("FLASH_VERL_PYTHON", "/opt/verl/bin/python")
+    monkeypatch.setattr(vc.subprocess, "run", lambda *a, **k: calls.append(a))
+
+    assert vc.resolve_verl_python(str(tmp_path)) == "/opt/verl/bin/python"
+    assert calls == []
 
 
 def test_run_verl_training_streams_steps_and_returns_code():

@@ -106,13 +106,17 @@ def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
     assert not any("drop_last" in override for override in o)
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_build_verl_overrides_sets_truncation_mask(enabled):
-    o = rl_verl.build_verl_overrides(
-        _overrides_cfg(mask_truncated_completions=enabled)
-    )
-    expected = str(enabled).lower()
-    assert f"++actor_rollout_ref.rollout.mask_truncated_completions={expected}" in o
+def test_build_verl_overrides_sets_truncation_mask_when_enabled():
+    o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=True))
+    # `++` (append-or-override), because the key exists in the fork's rollout.yaml but not stock's.
+    assert "++actor_rollout_ref.rollout.mask_truncated_completions=true" in o
+
+
+def test_build_verl_overrides_omits_truncation_mask_when_disabled():
+    # stock verl rejects the unknown key at dataclass conversion, and not masking is already its
+    # behavior, so emitting `=false` would break stock runs while changing nothing.
+    o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=False))
+    assert not any("mask_truncated_completions" in override for override in o)
 
 
 @pytest.mark.parametrize(
