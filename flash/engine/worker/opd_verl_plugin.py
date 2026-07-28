@@ -22,6 +22,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from packaging.version import Version
+
 try:
     from flash_opd_verl_multiturn import build_flash_multi_turn_agent_loop
     from flash_opd_verl_structured import StructuredOutputReplay, canonical_structured_spec
@@ -35,19 +37,25 @@ except ImportError:
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 _FAILURE_FALLBACK_MAX_CHARS = 8192
-_STRUCTURED_RUNTIME_VERSIONS = {
+_STRUCTURED_RUNTIME_EXACT_VERSIONS = {
     "verl": "0.8.0",
-    "vllm": "0.11.0",
     "xgrammar": "0.1.25",
 }
+_STRUCTURED_RUNTIME_MINIMUM_VERSIONS = {"vllm": "0.11.0"}
 
 
 def _require_structured_runtime_versions() -> None:
-    for package, expected in _STRUCTURED_RUNTIME_VERSIONS.items():
+    for package, expected in _STRUCTURED_RUNTIME_EXACT_VERSIONS.items():
         actual = importlib.metadata.version(package)
         if actual != expected:
             raise RuntimeError(
                 f"structured OPD requires {package} {expected} exactly; found {actual}"
+            )
+    for package, minimum in _STRUCTURED_RUNTIME_MINIMUM_VERSIONS.items():
+        actual = importlib.metadata.version(package)
+        if Version(actual) < Version(minimum):
+            raise RuntimeError(
+                f"structured OPD requires {package} {minimum} or newer; found {actual}"
             )
 
 
