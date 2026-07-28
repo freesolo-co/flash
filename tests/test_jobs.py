@@ -8,6 +8,7 @@ import io
 import re
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -209,6 +210,7 @@ def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
         "job_status",
         lambda _endpoint_id, _job_id, **_kwargs: {"status": "COMPLETED", "output": {}},
     )
+
     def read_heartbeat(force=False, **_kwargs):
         forces.append(force)
         return heartbeat
@@ -1794,6 +1796,7 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
                 return None
 
         monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+
         def job_status(*_args, **_kwargs):
             if cancel_during_status:
                 orch._update(spec.run_id, "cancelled")
@@ -4314,7 +4317,7 @@ def test_attach_reconciliation_thread_start_failure_releases_guard(monkeypatch):
         def start(self):
             raise RuntimeError("thread start failed")
 
-    monkeypatch.setattr(deploy_mod.threading, "Thread", RaisingThread)
+    monkeypatch.setattr(deploy_mod, "threading", SimpleNamespace(Thread=RaisingThread))
     with pytest.raises(RuntimeError, match="thread start failed"):
         deploy_mod._schedule_attach_reconciliation(
             run_id,
@@ -4337,7 +4340,7 @@ def test_attach_reconciliation_thread_start_failure_releases_guard(monkeypatch):
         def start(self):
             self.target()
 
-    monkeypatch.setattr(deploy_mod.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(deploy_mod, "threading", SimpleNamespace(Thread=ImmediateThread))
     assert deploy_mod._schedule_attach_reconciliation(
         run_id,
         remote,
@@ -4373,7 +4376,9 @@ def test_attach_reconciliation_cleans_endpoint_after_background_completion(monke
 
         cleaned = []
         monkeypatch.setattr(deploy_mod, "_reconcile_attached_remote", complete_recovery)
-        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda current: cleaned.append(current.run_id))
+        monkeypatch.setattr(
+            orch, "_gc_run_endpoints", lambda current: cleaned.append(current.run_id)
+        )
 
         class ImmediateThread:
             def __init__(self, *, target, daemon):
@@ -4382,7 +4387,7 @@ def test_attach_reconciliation_cleans_endpoint_after_background_completion(monke
             def start(self):
                 self.target()
 
-        monkeypatch.setattr(deploy_mod.threading, "Thread", ImmediateThread)
+        monkeypatch.setattr(deploy_mod, "threading", SimpleNamespace(Thread=ImmediateThread))
 
         assert deploy_mod._schedule_attach_reconciliation(
             run_id,

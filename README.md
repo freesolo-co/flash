@@ -58,11 +58,15 @@ Every run names an environment, which supplies the task data and the reward or S
 Environments are published under a project, which scopes them to an organization:
 
 ```bash
-flash env setup                                       # scaffold environment.py + dataset/train.jsonl
+flash projects create my-project                       # returns a project uuid
+flash projects list                                    # look up existing uuids
+flash env setup                                        # scaffold environment.py + dataset/train.jsonl
 flash env push --project PROJECT_UUID --name my-env .  # returns an environment id
 ```
 
-Project ids come from your Freesolo dashboard. Then describe the run and submit it:
+Project ids also appear in your Freesolo dashboard. Every training TOML carries a required
+top-level `project = "<uuid>"`, which Flash validates against the authenticated
+organization before it allocates a run. Then describe the run and submit it:
 
 ```toml
 project = "your-project-uuid"
@@ -79,14 +83,23 @@ lora_rank = 32
 ```
 
 ```bash
-flash train run.toml               # submit, prints a run id
-flash status RUN_ID                # follow it
-flash deploy RUN_ID                # serve the trained adapter
-flash chat RUN_ID -m "hello"       # talk to it
+flash train run.toml                  # submit, prints a run id
+flash runs status RUN_ID               # follow it
+flash models deploy RUN_ID             # serve the trained adapter
+flash models chat RUN_ID -m "hello"    # talk to it
 ```
 
-`flash models` lists supported base models, `flash gpus` lists GPU classes with estimated
-$/hr, and `flash export` copies a finished adapter to your own HuggingFace repo.
+Run management lives under `flash runs` (`status`, `log`, `cancel`, `checkpoint`) and
+serving under `flash models` (`deploy`, `chat`, `deployments`, `undeploy`, `export`).
+`flash models` on its own lists supported base models and `flash gpus` lists GPU classes
+with estimated $/hr. To copy a finished adapter into your own HuggingFace repo:
+
+```bash
+flash models export --adapter-id RUN_ID --repository your-org/your-repo
+```
+
+Intermediate RL checkpoints are deployable too — list them with
+`flash runs checkpoint RUN_ID`, then pass `RUN_ID/step-N` as the adapter id.
 
 There are no built-in task environments — the environment you push defines the task.
 Single-turn and bounded multi-turn environments are supported.

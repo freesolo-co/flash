@@ -31,6 +31,8 @@ from flash.cli.commands import (  # noqa: F401
     cmd_log,
     cmd_login,
     cmd_models,
+    cmd_projects_create,
+    cmd_projects_list,
     cmd_runs,
     cmd_status,
     cmd_train,
@@ -60,13 +62,15 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("login", "log in with your freesolo API key"),
             ("whoami", "show the identity behind your stored key"),
+            ("projects create", "create a Freesolo project"),
+            ("projects list", "list Freesolo projects and UUIDs"),
             ("version", "print the flash version"),
         ],
     ),
     (
         "catalog",
         [
-            ("models", "list supported base models"),
+            ("models list", "list supported base models"),
             ("gpus", "list managed GPU classes with estimated $/hr"),
         ],
     ),
@@ -86,21 +90,21 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         "training",
         [
             ("train", "submit a managed run from a TOML config"),
-            ("status", "show a run's current status"),
-            ("log", "print or follow a run's logs"),
-            ("runs", "list runs with their state and cost"),
-            ("checkpoints", "list a run's deployable RL checkpoints"),
-            ("cancel", "cancel a running job"),
+            ("runs list", "list runs with their state and cost"),
+            ("runs status", "show a run's current status"),
+            ("runs log", "print or follow a run's logs"),
+            ("runs checkpoint", "list a run's deployable RL checkpoints"),
+            ("runs cancel", "cancel a running job"),
         ],
     ),
     (
         "serving & export",
         [
-            ("deploy", "deploy a run's adapter to an endpoint"),
-            ("chat", "chat with a deployed adapter"),
-            ("deployments", "list active serving deployments"),
-            ("undeploy", "tear down a run's endpoint"),
-            ("export", "export an adapter to your HuggingFace repo"),
+            ("models deploy", "deploy a run's adapter to an endpoint"),
+            ("models chat", "chat with a deployed adapter"),
+            ("models deployments", "list active serving deployments"),
+            ("models undeploy", "tear down a run's endpoint"),
+            ("models export", "export an adapter to your HuggingFace repo"),
         ],
     ),
 ]
@@ -169,7 +173,7 @@ class _FlashParser(_ThemedParser):
         usage = f"{CLI_NAME} [--debug] [-v] <command> [args]"
         footers = [
             f"new here? run `{CLI_NAME} login`, then `{CLI_NAME} env setup`",
-            f"train after publishing: `{CLI_NAME} env push --name my-env .`, "
+            f"train after publishing: `{CLI_NAME} env push --project PROJECT_UUID --name my-env .`, "
             f"then `{CLI_NAME} train configs/sft.toml`",
             f"any command in depth: `{CLI_NAME} <command> --help`",
             "docs: https://docs.freesolo.co",
@@ -200,7 +204,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # `flash <cmd> --help` keeps the standard layout; only the root parser themes its help (see
     # _FlashParser). Nested `env` subcommands inherit _ThemedParser automatically (the env parser
     # is itself a _ThemedParser, so its add_subparsers defaults to the same class).
-    sub = parser.add_subparsers(dest="cmd", required=True, parser_class=_ThemedParser)
+    sub = parser.add_subparsers(
+        dest="cmd", required=True, parser_class=_ThemedParser, metavar="<command>"
+    )
 
     version = sub.add_parser("version", help="print the Flash version")
     version.set_defaults(func=cmd_version)
@@ -227,8 +233,20 @@ def _build_parser() -> argparse.ArgumentParser:
     whoami = sub.add_parser("whoami", help="show the identity behind your stored key")
     whoami.set_defaults(func=cmd_whoami)
 
-    models = sub.add_parser("models", help="list supported base models")
-    models.set_defaults(func=cmd_models)
+    projects = sub.add_parser("projects", help="manage Freesolo projects")
+    projects_sub = projects.add_subparsers(dest="projects_cmd", required=True)
+    projects_create = projects_sub.add_parser("create", help="create a Freesolo project")
+    projects_create.add_argument("name", metavar="NAME")
+    projects_create.add_argument("--description", help="optional project description")
+    projects_create.set_defaults(func=cmd_projects_create)
+    projects_list = projects_sub.add_parser("list", help="list Freesolo projects and UUIDs")
+    projects_list.set_defaults(func=cmd_projects_list)
+
+    models = sub.add_parser("models", help="work with models and deployments")
+    models.set_defaults(func=cmd_models)  # hidden bare `flash models` shim, mirrors `flash runs`
+    models_sub = models.add_subparsers(dest="models_cmd", required=False)
+    models_list = models_sub.add_parser("list", help="list supported base models")
+    models_list.set_defaults(func=cmd_models)
 
     gpus = sub.add_parser("gpus", help="list managed GPU classes with estimated $/hr")
     gpus.set_defaults(func=cmd_gpus)
@@ -267,6 +285,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="scaffold configs without reasoning. This is the default.",
     )
     setup.add_argument(
+        "--project",
+        metavar="PROJECT_UUID",
+        help="Freesolo project UUID for all generated configs and environment publication",
+    )
+    setup.add_argument(
         "-y",
         "--yes",
         dest="yes",
@@ -303,7 +326,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_push.add_argument(
         "--project",
-        help="project id to group the environment under; omit to keep its current project",
+        required=True,
+        metavar="PROJECT_UUID",
+        help="Freesolo project UUID that owns the environment",
     )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
@@ -331,6 +356,12 @@ def _build_parser() -> argparse.ArgumentParser:
     env_delete = env_sub.add_parser("delete", help="delete a published Freesolo environment")
     env_delete.add_argument(
         "env_id", help="the Freesolo environment id to delete, e.g. you/your-env"
+    )
+    env_delete.add_argument(
+        "--project",
+        required=True,
+        metavar="PROJECT_UUID",
+        help="Freesolo project UUID that owns the environment",
     )
     env_delete.add_argument(
         "-y",
@@ -407,43 +438,47 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     train.set_defaults(func=cmd_train)
 
-    status = sub.add_parser("status", help="show a run's current status")
-    status.add_argument("run_id")
-    status.add_argument(
+    runs = sub.add_parser("runs", help="manage training runs")
+    runs.set_defaults(func=cmd_runs)  # hidden bare `flash runs` shim for deployed agents
+    runs_sub = runs.add_subparsers(dest="runs_cmd", required=False)
+
+    runs_list = runs_sub.add_parser("list", help="list runs and their state/cost")
+    runs_list.set_defaults(func=cmd_runs)
+
+    runs_status = runs_sub.add_parser("status", help="show a run's current status")
+    runs_status.add_argument("run_id")
+    runs_status.add_argument(
         "-f",
         "--follow",
         action="store_true",
         help="poll status until the run ends without replaying logs",
     )
-    status.set_defaults(func=cmd_status)
+    runs_status.set_defaults(func=cmd_status)
 
-    log = sub.add_parser(
+    runs_log = runs_sub.add_parser(
         "log",
         help="print a run's full logs, including worker console/error artifacts",
     )
-    log.add_argument("run_id")
-    log.add_argument(
+    runs_log.add_argument("run_id")
+    runs_log.add_argument(
         "-f",
         "--follow",
         action="store_true",
         help="stream logs until the run reaches a terminal state",
     )
-    log.set_defaults(func=cmd_log)
+    runs_log.set_defaults(func=cmd_log)
 
-    runs = sub.add_parser("runs", help="list runs and their state/cost")
-    runs.set_defaults(func=cmd_runs)
+    runs_cancel = runs_sub.add_parser("cancel", help="cancel a run")
+    runs_cancel.add_argument("run_id")
+    runs_cancel.set_defaults(func=cmd_cancel)
 
-    cancel = sub.add_parser("cancel", help="cancel a run")
-    cancel.add_argument("run_id")
-    cancel.set_defaults(func=cmd_cancel)
-
-    checkpoints = sub.add_parser(
-        "checkpoints", help="list a run's deployable per-step RL checkpoints"
+    runs_checkpoint = runs_sub.add_parser(
+        "checkpoint", help="list a run's deployable per-step RL checkpoints"
     )
-    checkpoints.add_argument("run_id")
-    checkpoints.set_defaults(func=cmd_checkpoints)
+    runs_checkpoint.add_argument("run_id")
+    runs_checkpoint.set_defaults(func=cmd_checkpoints)
 
-    deploy = sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
+    deploy = models_sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
     deploy.add_argument(
         "run_id",
         metavar="RUN_ID[/step-N]",
@@ -452,11 +487,13 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy.add_argument("--dry-run", action="store_true")
     deploy.set_defaults(func=cmd_deploy)
 
-    undeploy = sub.add_parser("undeploy", help="tear down a run's serving endpoint")
+    undeploy = models_sub.add_parser("undeploy", help="tear down a run's serving endpoint")
     undeploy.add_argument("run_id")
     undeploy.set_defaults(func=cmd_undeploy)
 
-    export = sub.add_parser("export", help="export a trained adapter to your own HuggingFace repo")
+    export = models_sub.add_parser(
+        "export", help="export a trained adapter to your own HuggingFace repo"
+    )
     export.add_argument(
         "--adapter-id",
         dest="adapter_id",
@@ -481,7 +518,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     export.set_defaults(func=cmd_export)
 
-    deployments = sub.add_parser("deployments", help="list active serving deployments")
+    deployments = models_sub.add_parser("deployments", help="list active serving deployments")
     deployments.add_argument(
         "--json",
         action="store_true",
@@ -489,9 +526,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     deployments.set_defaults(func=cmd_deployments)
 
-    chat = sub.add_parser("chat", help="chat with a deployed adapter")
+    chat = models_sub.add_parser("chat", help="chat with a deployed adapter")
     chat.add_argument(
         "run_id",
+        metavar="TARGET",
         help="a bare RUN_ID (its current deployment), RUN_ID/step-N (a specific deployed "
         "checkpoint), or a full immutable adapter revision",
     )

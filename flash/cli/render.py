@@ -306,6 +306,30 @@ def select(title: str, options: list[tuple[str, str, str]], default: int = 0) ->
     return options[default][0]
 
 
+def select_required(title: str, options: list[tuple[str, str, str]]) -> str:
+    """Themed selector that accepts only an explicit valid numeric choice."""
+    if not options:
+        raise ValueError("selection requires at least one option")
+    prompt_mark = _paint(_glyph("?", "?"), _ACCENT, "1")
+    print(f"{prompt_mark} {_bold(_safe(title))}")
+    for i, (_value, label, hint) in enumerate(options):
+        num = _paint(f"{i + 1})", _ACCENT2)
+        tail = f"  {_dim(_safe(hint))}" if hint else ""
+        print(f"  {num} {_safe(label)}{tail}")
+    pointer = _paint(_glyph("›", ">"), _ACCENT2)  # noqa: RUF001 (the glyph is the point)
+    while True:
+        try:
+            raw = input(f"{pointer} ").strip()
+        except EOFError as exc:
+            print()
+            raise ValueError("an explicit numeric project choice is required") from exc
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx][0]
+        print(note(f"enter a number from 1-{len(options)}; empty input is not accepted"))
+
+
 def money(value: float, decimals: int = 4) -> str:
     return _paint(f"${value:.{decimals}f}", _TEAL)
 
@@ -416,7 +440,7 @@ def version(value: str) -> str:
 def submitted(run_id: str) -> str:
     """The `flash train` hand-off note (printed to stderr before logs start streaming)."""
     head = ok(f"run {_paint(run_id, _ACCENT2)} submitted")
-    hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash log {run_id} --follow`")
+    hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash runs log {run_id} --follow`")
     return _safe(f"{head}\n{hint}")
 
 
@@ -426,6 +450,25 @@ def models_table(rows: list[dict]) -> str:
     ids = "\n".join(f"  {_paint(dot, _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
     foot = arrow("train one with: flash train configs/sft.toml")
     return _safe(f"{header('models', 'supported base models')}\n{ids}\n\n{foot}")
+
+
+def projects_table(rows: list[dict]) -> str:
+    """Freesolo projects with copyable canonical ids."""
+    body = [
+        [
+            (str(row.get("name") or ""), _GRAY),
+            (str(row.get("id") or ""), _ACCENT2),
+        ]
+        for row in rows
+    ]
+    if not body:
+        return _safe(
+            f"{header('projects list', 'Freesolo projects')}\n"
+            f"{_dim('  no projects yet; create one with `flash projects create NAME`')}"
+        )
+    return _safe(
+        f"{header('projects list', 'Freesolo projects')}\n{_table(['NAME', 'PROJECT ID'], body)}"
+    )
 
 
 def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
@@ -515,7 +558,7 @@ def checkpoints_table(run_id: str, rows: list[dict]) -> str:
         for c in sorted(rows, key=lambda c: c.get("step", 0))
     ]
     table = _table(["STEP", "CHECKPOINT"], body, aligns=["r", "l"])
-    foot = arrow(f"deploy one with: flash deploy {run_id}/step-<STEP>")
+    foot = arrow(f"deploy one with: flash models deploy {run_id}/step-<STEP>")
     return _safe(f"{header('checkpoints', f'{len(rows)} deployable')}\n{table}\n\n{foot}")
 
 
@@ -631,14 +674,14 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     if age:
         if running and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
             age += _dim(
-                "  (heartbeat uploads are throttled; quiet is not dead - check flash log -f <run-id>)"
+                "  (heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f)"
             )
         pairs.append(("heartbeat", age))
     return pairs
 
 
 def run_status(obj: dict) -> str:
-    """A curated status panel for `flash status`, with the full JSON below for completeness."""
+    """A curated status panel for `flash runs status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
     where = gpu_label(spec, obj.get("remote") or {}) or None
     pairs = [
@@ -687,7 +730,7 @@ def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
 
 
 def cancelled(payload: dict) -> str:
-    """`flash cancel`: a green confirmation only when the run actually flips to `cancelled`. A
+    """`flash runs cancel`: a green confirmation only when the run actually flips to `cancelled`. A
     no-op cancel of an already-terminal run (done/failed/dry_run) shows a neutral "already ..."
     line instead, so a finished or failed run is never dressed up as a fresh cancellation."""
     state = payload.get("state", "cancelled")
@@ -700,7 +743,7 @@ def cancelled(payload: dict) -> str:
 
 
 def deployed(dep: dict) -> str:
-    """`flash deploy`: the endpoint and serving URL as an aligned card (not a JSON dump)."""
+    """`flash models deploy`: the endpoint and serving URL as an aligned card (not a JSON dump)."""
     endpoint = str(dep.get("endpoint_name") or "")
     url = str(dep.get("openai_base_url") or "")
     pairs = [
@@ -723,7 +766,7 @@ def deployed(dep: dict) -> str:
 
 
 def undeployed(result: dict) -> str:
-    """`flash undeploy`: report the run-scoped aliases and immutable revisions disabled."""
+    """`flash models undeploy`: report the run-scoped aliases and immutable revisions disabled."""
     rid = _paint(result.get("run_id", ""), _ACCENT2)
     aliases = result.get("disabled_aliases") or []
     revisions = result.get("disabled_revisions") or []
@@ -737,7 +780,7 @@ def undeployed(result: dict) -> str:
 
 
 def exported(result: dict) -> str:
-    """`flash export`: where the adapter landed on HuggingFace, as an aligned card."""
+    """`flash models export`: where the adapter landed on HuggingFace, as an aligned card."""
     pairs = [
         ("adapter", _paint(result.get("adapter_id", ""), _ACCENT2)),
         ("repo", _paint(result.get("repository", ""), _ACCENT2)),
@@ -794,7 +837,15 @@ def cost_panel(est) -> str:
     return _safe(out)
 
 
-def env_setup(paths: list[str]) -> str:
+def project_created(project_id: str, name: str) -> str:
+    """Styled project creation confirmation with the copyable id."""
+    return _safe(
+        f"{header('projects create', name)}\n{ok('project created')}\n\n"
+        f"{_dim('project id')}  {_paint(project_id, _ACCENT2, '1')}"
+    )
+
+
+def env_setup(paths: list[str], project_id: str) -> str:
     """Confirmation + file tree for `flash env setup`."""
     labels = {
         "environment.py": "env entrypoint — edit the reward + prompt",
@@ -809,7 +860,7 @@ def env_setup(paths: list[str]) -> str:
         f"  {_paint(p.ljust(keyw), _ACCENT2)}  {_dim(labels.get(p, ''))}" for p in paths
     )
     head = f"{header('env setup', 'starter Freesolo environment')}\n{ok('scaffold ready')}\n"
-    next_step = arrow("publish it: flash env push --name my-env .")
+    next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
     return _safe(f"{head}\n{tree}\n\n{next_step}")
 
 
@@ -818,7 +869,7 @@ def env_list(local: list[str]) -> str:
     if local:
         parts.append(
             _paint("local sources", _GRAY, "1")
-            + _dim("  (publish with flash env push --name <name> <path>)")
+            + _dim("  (publish with flash env push --project <project-uuid> --name <name> <path>)")
         )
         parts.extend(f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(p, _ACCENT2)}" for p in local)
     else:
@@ -832,7 +883,7 @@ def chat_label() -> str:
 
 
 def log_section(name: str) -> str:
-    """A themed divider above a passthrough worker-log section in `flash log` — the same
+    """A themed divider above a passthrough worker-log section in `flash runs log` — the same
     idiom as chat_label sitting above a raw chat reply (the log body stays raw). The machine path
     keeps the plain ``----- name -----`` divider that scripts and tests match on."""
     rule = _paint(_glyph("─", "-") * 3, _FAINT)
