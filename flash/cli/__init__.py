@@ -316,6 +316,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=".",
         help="local environment directory or environment.py path",
     )
+    env_test.add_argument(
+        "--split",
+        default=None,
+        help=(
+            "dataset split to validate, matching [environment.params] split (default: train). "
+            "use the split the run actually trains on, e.g. --split train_sft"
+        ),
+    )
+    env_test.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "extra load_environment() kwarg, as in [environment.params] (repeatable). "
+            'values parse as TOML scalars, so 1/true/"x" keep their types'
+        ),
+    )
     env_test.set_defaults(func=cmd_env_test)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")

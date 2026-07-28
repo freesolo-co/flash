@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sys
+import tomllib
 from pathlib import Path
 
 from . import render
@@ -21,9 +22,7 @@ def _check_messages(messages: object, label: str) -> list[dict]:
         raise ValueError(f"{label} is not well-formed: {label} must be a non-empty list")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
-            raise ValueError(
-                f"{label} is not well-formed: {label} message {index} must be a dict"
-            )
+            raise ValueError(f"{label} is not well-formed: {label} message {index} must be a dict")
         role = message.get("role")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(
@@ -32,8 +31,7 @@ def _check_messages(messages: object, label: str) -> list[dict]:
             )
         if role.strip().lower() not in _ALLOWED_ROLES:
             raise ValueError(
-                f"{label} is not well-formed: {label} message {index} "
-                f"has unsupported role {role!r}"
+                f"{label} is not well-formed: {label} message {index} has unsupported role {role!r}"
             )
         if "content" not in message:
             raise ValueError(
@@ -171,6 +169,31 @@ def _load_failure(reason: str) -> int:
     return _err("overall: FAIL")
 
 
+def _env_params(args) -> dict:
+    """Build the ``load_environment()`` kwargs from ``--split`` / ``--param KEY=VALUE``.
+
+    Mirrors ``[environment.params]`` so the local gate can validate the split a run actually
+    trains on. Without this the gate always loaded ``dataset/train.jsonl`` and could pass while
+    the configured split was never exercised.
+    """
+    params: dict = {}
+    for item in getattr(args, "param", None) or []:
+        key, sep, raw = str(item).partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(f"--param must be KEY=VALUE (got {item!r})")
+        # parse as a toml value so types match [environment.params]; fall back to a bare string
+        # for unquoted text, which is what users type most often.
+        try:
+            params[key] = tomllib.loads(f"v = {raw.strip()}")["v"]
+        except tomllib.TOMLDecodeError:
+            params[key] = raw.strip()
+    split = getattr(args, "split", None)
+    if split and str(split).strip():
+        params["split"] = str(split).strip()
+    return params
+
+
 def cmd_env_test(args) -> int:
     """Load a local environment and drive deterministic offline contract checks.
 
@@ -186,12 +209,17 @@ def cmd_env_test(args) -> int:
         return _load_failure(reason.replace("cannot publish", "cannot test"))
 
     try:
+        params = _env_params(args)
+    except ValueError as exc:
+        return _load_failure(str(exc))
+
+    try:
         from flash.envs.loader import load_freesolo_environment
 
         # resolve to an absolute path so the loader takes its local-file branch; a bare
         # relative dir like `my-env` matches the managed-slug pattern and would otherwise
         # resolve remotely, breaking the offline contract.
-        env = load_freesolo_environment(str(entrypoint.resolve()))
+        env = load_freesolo_environment(str(entrypoint.resolve()), **params)
         dataset = env.dataset()
     except (Exception, SystemExit) as exc:
         reason = str(exc) or exc.__class__.__name__
@@ -231,8 +259,7 @@ def cmd_env_test(args) -> int:
         passed += 1
         if record["policy"] == "replay" and reward is not None and reward <= 0.0:
             message = (
-                f"replay gold answer scored low (reward={reward:.6f}); "
-                "check the reward function"
+                f"replay gold answer scored low (reward={reward:.6f}); check the reward function"
             )
             print(
                 render.warn(message) if render.styled() else f"warning: {message}",
