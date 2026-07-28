@@ -108,8 +108,10 @@ def test_effective_train_tflops_caps_b200_at_h200_class():
     from flash.cost.facts import effective_train_tflops
 
     assert gpu_tflops("B200") == 2250.0  # raw peak unchanged (vram/serving still use gpu_tflops)
-    assert effective_train_tflops("B200") == 990.0
+    # assert the RELATIONSHIP, not a literal: the cap tracks whatever the H200 entry is, and that
+    # entry is anchored to a measured rate that recalibration can move.
     assert effective_train_tflops("B200") == effective_train_tflops("H200")
+    assert effective_train_tflops("B200") < gpu_tflops("B200")
 
 
 def test_effective_train_tflops_is_peak_for_uncapped_classes():
@@ -117,5 +119,5 @@ def test_effective_train_tflops_is_peak_for_uncapped_classes():
 
     for name in ("H100", "H200", "A100 SXM", "RTX 4090", "B200"):
         # only b200 is capped; every other class keeps its peak.
-        expected = 990.0 if name == "B200" else gpu_tflops(name)
+        expected = effective_train_tflops("H200") if name == "B200" else gpu_tflops(name)
         assert effective_train_tflops(name) == expected

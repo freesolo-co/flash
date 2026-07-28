@@ -12,6 +12,7 @@ import math
 from flash.providers.allocator import required_vram_gb, vram_headroom
 
 from .facts import (
+    GPU_COMPUTE_TFLOPS,
     active_params_b,
     download_weight_gb,
     effective_train_tflops,
@@ -147,8 +148,30 @@ def compile_seconds(config: RunConfig, gpu: str) -> float:
     return COMPILE_MOE_SFT_S if config.method == "sft" else COMPILE_MOE_ROLLOUT_S
 
 
-def seconds_per_step(config: RunConfig, gpu: str) -> float:
-    """Steady-state wall time for one optimizer step on ``gpu``."""
+# collective overhead means n cards never deliver n times one card's throughput: fsdp all-gathers
+# parameters and reduce-scatters gradients every layer, and the share of a step spent in collectives
+# grows with the card count. this is the realized fraction of linear scaling per ADDED card, applied
+# geometrically (1 card 1.00x, 2 cards 1.70x, 4 cards 2.46x). deliberately conservative: the
+# allocator must never rank a combination on a speedup the interconnect will not deliver, because
+# every card in it bills whether or not it contributes.
+MULTI_CARD_SCALING = 0.85
+
+
+def multi_card_speedup(gpu_count: int) -> float:
+    """Throughput multiplier for sharding the gpu-bound half of a step over ``gpu_count`` cards."""
+    n = max(1, int(gpu_count))
+    return n * (MULTI_CARD_SCALING ** (n - 1))
+
+
+def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
+    """(gpu-bound, gpu-independent) seconds for one optimizer step on ``gpu``.
+
+    Sharding a step across cards divides the gpu-bound half and leaves the rest untouched: remote
+    teacher scoring and reward grading are waits on services no card count speeds up, and an MoE pays
+    its routing overhead once per step regardless. Ranking hardware needs the halves apart, because a
+    latency-bound job gets no benefit from a faster card while a compute-bound one gets all of it.
+    ``seconds_per_step`` is simply their sum, so this is the single source of the step model.
+    """
     n = config.normalized()
     peak = effective_train_tflops(gpu) * 1e12  # FLOP/s (realized training throughput; see facts)
     # An MoE's per-step wall scales with TOTAL params (routing + all-expert coordination + grouped
@@ -176,11 +199,13 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # latency, NOT the full serial sum (that describes only the CPU-test fallback that can't
         # batch-generate). The teacher endpoint's rate limit is the real ceiling on this fan-out.
         teacher_s = teacher_lat
-        return overhead + gen_s + teacher_s + update_s
+        # the teacher is a remote api: its latency is identical on every card, so it is the part of an
+        # opd step that a faster or more numerous gpu cannot shorten.
+        return gen_s + update_s, overhead + teacher_s
 
     if not n.is_grpo:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
-        return overhead + flops / (peak * sft_mfu)
+        return flops / (peak * sft_mfu), overhead
 
     # GRPO step = rollout (G completions/prompt) + concurrent reward grading + policy/ref update.
     completions = n.batch_size * n.group_size
@@ -191,7 +216,49 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     reward_s = (
         math.ceil(completions / REWARD_CONCURRENCY) * latency
     )  # ceil: a partial wave still costs one latency
-    return overhead + gen_s + reward_s + update_s
+    # reward grading runs off-gpu in concurrent waves, so like the opd teacher it is fixed wall time
+    # no card choice changes. a grpo step dominated by it is latency-bound, not compute-bound.
+    return gen_s + update_s, overhead + reward_s
+
+
+def seconds_per_step(config: RunConfig, gpu: str) -> float:
+    """Steady-state wall time for one optimizer step on ``gpu``."""
+    gpu_bound, fixed = step_seconds_split(config, gpu)
+    return gpu_bound + fixed
+
+
+def step_cost_key(config: RunConfig):
+    """``(gpu, hourly_rate) -> dollars per optimizer step``, or None if ``config`` can't be priced.
+
+    The single ranking basis shared by every GPU-selection path (submit-time allocation, the
+    parse-time provisional shown in the schema, and the cost estimate). Renting the cheapest card
+    is not the same as running the job for the least money: a card bills for the time it takes, so
+    the right basis is rate x duration. An A10 at $0.75/hr is nominally cheaper than an H100 at
+    $3.29 but sustains a fraction of its FLOPs, so the same run costs about three times as much on
+    it. Ranking per STEP prices both halves at once, and since the step count is identical across
+    candidates it orders them exactly as total job cost does -- without needing the run's length.
+
+    Returns None when the model is outside the cost catalog, so callers fall back to $/hr for
+    EVERY candidate rather than ranking a mix of two incomparable bases.
+    """
+    try:
+        step_seconds_split(config, "H100")  # probe: raises for a non-catalog model
+    except Exception:
+        return None
+
+    def cost_key(gpu: str, hourly_usd: float) -> float:
+        if gpu not in GPU_COMPUTE_TFLOPS:
+            # no measured/spec throughput for this class, so its step time would be computed from a
+            # placeholder. ranking on that invents a speed difference the hardware may not have;
+            # return a constant instead, which leaves these classes ordered by the $/hr tie-break.
+            return 0.0
+        try:
+            gpu_bound, fixed = step_seconds_split(config, gpu)
+        except Exception:
+            return 0.0  # unpriceable class falls back to the $/hr tie-break, never fails selection
+        return hourly_usd * (gpu_bound + fixed) / 3600.0
+
+    return cost_key
 
 
 def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> float:
@@ -223,7 +290,13 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
         thinking=config.thinking,
         model_revision=config.model_revision,
     )
-    gpu = pick_gpu(need, provider=config.provider, max_wall_seconds=max_wall_seconds)
+    # rank on job cost, not rental rate, so the quote names the class the allocator will pick.
+    gpu = pick_gpu(
+        need,
+        provider=config.provider,
+        max_wall_seconds=max_wall_seconds,
+        cost_key=step_cost_key(config),
+    )
     return gpu, need
 
 

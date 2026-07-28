@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -325,8 +326,88 @@ def min_cuda_modern(name: str) -> str:
     return get_gpu_info(name).min_cuda_modern or "12.8"
 
 
-def cheapest_gpu(min_vram_gb: int) -> str:
-    """Cheapest validated RunPod GPU class with at least ``min_vram_gb`` VRAM."""
+def run_config_for_ranking(
+    model_id: str,
+    algorithm: str,
+    *,
+    train=None,
+    thinking: bool = False,
+    model_revision: str = "",
+):
+    """Raw train knobs -> a one-step ``RunConfig`` to rank hardware against.
+
+    The single place spec knobs become a priced run, so every selection path (parse-time
+    provisional, submit-time allocator, cost estimate) ranks on identical inputs. ``steps=1``: the
+    ranking key is per-step, so the run's real length never enters it. Imported lazily because the
+    cost model imports this module.
+    """
+    from flash.cost.types import RunConfig
+
+    def knob(key):
+        """A positive whole number from the spec, or None to take the recipe default.
+
+        Bools are rejected before the numeric coercion because ``bool`` is an ``int`` subclass, so
+        a stray ``True`` would otherwise read as the number 1.
+        """
+        if train is None:
+            return None
+        value = train.get(key) if isinstance(train, dict) else getattr(train, key, None)
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or number < 1:
+            return None
+        return int(number)
+
+    return RunConfig(
+        model_id=model_id,
+        method=algorithm,
+        steps=1,
+        seq_len=knob("max_context_tokens"),
+        completion_len=knob("max_completion_tokens"),
+        batch_size=knob("batch_size"),
+        group_size=knob("group_size"),
+        lora_rank=knob("lora_rank"),
+        thinking=thinking,
+        model_revision=model_revision,
+    )
+
+
+def _run_cost_key(
+    model_id: str,
+    algorithm: str,
+    *,
+    train=None,
+    thinking: bool = False,
+    model_revision: str = "",
+):
+    """``(gpu, hourly_rate) -> dollars per step`` for this run, or None if it can't be priced."""
+    try:
+        from flash.cost.analytical import step_cost_key
+
+        return step_cost_key(
+            run_config_for_ranking(
+                model_id,
+                algorithm,
+                train=train,
+                thinking=thinking,
+                model_revision=model_revision,
+            )
+        )
+    except Exception:  # unpriceable run -- rank on $/hr, never fail selection
+        return None
+
+
+def cheapest_gpu(min_vram_gb: int, *, cost_key=None) -> str:
+    """Cheapest validated RunPod GPU class with at least ``min_vram_gb`` VRAM.
+
+    ``cost_key`` is ``(gpu_name, hourly_rate) -> comparable``; when given, classes are ranked by
+    what the JOB costs on each rather than by rental rate, matching the submit-time allocator.
+    Omitted, this ranks on $/hr for callers with no run to price.
+    """
     pool = [
         g for g in GPU_INFO.values() if g.enum_member and g.vram_gb >= min_vram_gb and g.validated
     ]
@@ -336,6 +417,11 @@ def cheapest_gpu(min_vram_gb: int) -> str:
         )
     from flash.providers.runpod.pricing import hourly_rate
 
+    if cost_key is not None:
+        return min(
+            pool,
+            key=lambda g: (cost_key(g.name, hourly_rate(g.name)), hourly_rate(g.name), g.vram_gb),
+        ).name
     return min(pool, key=lambda g: (hourly_rate(g.name), g.vram_gb)).name
 
 
@@ -360,7 +446,14 @@ def provisional_gpu(
         model_revision=model_revision,
     )
     try:
-        return cheapest_gpu(min_vram)
+        # same job-cost basis the submit-time allocator ranks on, so the class previewed here is
+        # the class that actually gets provisioned; falls back to $/hr for an unpriceable run.
+        return cheapest_gpu(
+            min_vram,
+            cost_key=_run_cost_key(
+                model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
+            ),
+        )
     except UnsupportedGpuError as exc:
         if (algorithm or "").lower() == "opd":
             biggest = max(
