@@ -50,7 +50,7 @@ def test_config_to_job_spec():
                 "epochs = 1\n"
                 "max_examples = 10\n"
                 "[gpu]\n"
-                ''
+                ""
             )
         spec = spec_from_file(path, run_id="test-run")
         assert spec.run_id == "test-run"
@@ -92,6 +92,7 @@ def test_cli_train_dry_run(monkeypatch, capsys):
         with open(config, "w") as f:
             f.write(
                 'model = "Qwen/Qwen3.5-4B"\n'
+                'project = "11111111-1111-4111-8111-111111111111"\n'
                 'algorithm = "grpo"\n'
                 "[environment]\n"
                 'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
@@ -99,7 +100,7 @@ def test_cli_train_dry_run(monkeypatch, capsys):
                 "epochs = 1\n"
                 "max_examples = 1\n"
                 "[gpu]\n"
-                ''
+                ""
             )
 
         seen = {}

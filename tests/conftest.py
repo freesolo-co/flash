@@ -16,6 +16,22 @@ import contextlib
 import pytest
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _close_status_reporter_after_suite():
+    yield
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter(close=True)
+
+
+@pytest.fixture(autouse=True)
+def _reset_status_reporter_before_test():
+    import flash.runner as runner
+
+    runner._shutdown_status_reporter(close=True)
+    runner._open_status_reporter()
+
+
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
     # HF param probe -> offline: sizing for an unlisted model falls back to the heuristic

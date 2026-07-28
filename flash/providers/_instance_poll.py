@@ -357,7 +357,7 @@ def poll_instance_job(
         return failure
 
     def _surface_final_heartbeat() -> None:
-        # persist the latest metrics before any terminal give-up so `flash log -f` still shows the final
+        # persist the latest metrics before any terminal give-up so `flash runs log -f` still shows the final
         # per-step metrics for runs that end via deadline / dead-host / poll-outage / stall, not only the
         # per-iteration terminal path below. deadline_at=None reads heartbeats already committed at the
         # boundary even though this runs past the compute deadline; capturing the returned key stops a

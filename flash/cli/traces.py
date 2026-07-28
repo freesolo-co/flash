@@ -59,7 +59,11 @@ def _require_api_key() -> str:
 def project_options(projects: list[dict]) -> list[tuple[str, str, str]]:
     """`render.select` options for a project list: (id, name, id hint)."""
     return [
-        (str(project.get("id")), str(project.get("name") or project.get("id")), "")
+        (
+            str(project.get("id")),
+            str(project.get("name") or "unnamed project"),
+            str(project.get("id")),
+        )
         for project in projects
         if project.get("id")
     ]
@@ -115,12 +119,10 @@ def _resolve_project_id(args, api_key: str) -> str:
             "SDK first, then export them here"
         )
     options = project_options(projects)
-    if len(options) == 1:
-        return options[0][0]
     if not _interactive():
         listing = ", ".join(f"{name} ({value})" for value, name, _hint in options)
         raise ClientError(f"pass --project <id> to choose a project; available: {listing}")
-    return render.select("Which project's traces?", options)
+    return render.select_required("Which project's traces?", options)
 
 
 def _interactive() -> bool:
@@ -216,7 +218,8 @@ def cmd_traces_export(args) -> int:
         if export_format == RECORDS_FORMAT:
             print(
                 render.arrow(
-                    "train on it: flash env push --name my-env . && flash train configs/sft.toml"
+                    "train on it: flash env push --project <project-uuid> --name my-env . "
+                    "&& flash train configs/sft.toml"
                 )
             )
         elif export_format == PROMPTS_FORMAT:
