@@ -274,7 +274,19 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-o
         "datasets>=4.7,<6" \
         "TransferQueue==0.1.7" \
         liger-kernel "bitsandbytes>=0.49" qwen-vl-utils \
-    && rm -f /tmp/verl-overrides.txt
+    && rm -f /tmp/verl-overrides.txt \
+    && uv cache clean
+
+# flash-attn is REQUIRED in here, not best-effort like it is in the main interpreter above. All three
+# backends hard-enable remove-padding (rl_verl.py:138, sft_verl.py:145, opd_verl.py:1458), and verl's
+# CUDA remove-padding path imports flash_attn.bert_padding UNGUARDED
+# (verl/utils/attention_utils.py:30, torch_functional.py:627,657). There is no SDPA fallback on that
+# path: without the module the run dies at the first training batch, which the import-only assert
+# below would not catch. Reuses FLASH_ATTN_SPEC so the venv gets the same wheel as the main
+# interpreter instead of a second source build.
+RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
+    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${FLASH_ATTN_SPEC}" \
+    && uv cache clean
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
@@ -289,6 +301,7 @@ import importlib; \
 [importlib.import_module(m) for m in ('verl.workers.rollout.vllm_rollout.vllm_rollout','verl.workers.rollout.vllm_rollout.vllm_async_server')]; \
 from verl.workers.config.rollout import RolloutConfig; \
 assert 'mask_truncated_completions' in RolloutConfig.__dataclass_fields__, 'verl is not the freesolo fork (no mask_truncated_completions)'; \
+importlib.import_module('flash_attn.bert_padding'); \
 assert M.version('verl') == '0.8.0', 'opd structured gate requires verl exactly 0.8.0, got ' + M.version('verl'); \
 assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
 from vllm import ModelRegistry; \
