@@ -1255,13 +1255,20 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
 
 
 def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatch):
+    import flash.runner as runner_mod
     import flash.server.app as app_mod
 
+    # raise the tagged warm-start error: real adapter-resolution failures are raised inside
+    # prepare_job by _prepare_init_from_adapter, which tags everything it raises, so this is the
+    # error shape the route actually sees. use the reloaded module's class, since the api fixture
+    # reloads flash.runner and a bound import here would be a different object.
     internal_ref = "private-owner/private-repo:sft/source-run/checkpoints/step-20"
     monkeypatch.setattr(
         app_mod,
         "prepare_job",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"failed to read {internal_ref}")),
+        lambda *a, **k: (_ for _ in ()).throw(
+            runner_mod.WarmStartPreparationError(f"failed to read {internal_ref}")
+        ),
     )
     spec = {
         **SPEC,
