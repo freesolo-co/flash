@@ -172,7 +172,8 @@ def create_run(
         )
     runtime_secrets = _runtime_secrets(payload, spec)
     affordability_org_id = str(key.get("org_id") or "").strip()
-    bill_on_completion = not dry_run and key.get("auth_kind") != "internal"
+    billable_key = key.get("auth_kind") != "internal"
+    bill_on_completion = not dry_run and billable_key
     billing_context = None
     if bill_on_completion:
         if not affordability_org_id:
@@ -220,7 +221,10 @@ def create_run(
                 ) from exc
             raise
         run_id = prepared.public_spec.run_id
-        if bill_on_completion:
+        # run the affordability check for dry runs too. it is verify-only (moves no money), so a
+        # `--dry-run` that passes now also proves the org can cover the estimate, instead of the run
+        # being validated here and rejected 402 only on real submission.
+        if bill_on_completion or (dry_run and billable_key and affordability_org_id):
             _precheck_budget_or_block(
                 run_id=run_id,
                 estimate_usd=prepared.estimated_cost_usd,
