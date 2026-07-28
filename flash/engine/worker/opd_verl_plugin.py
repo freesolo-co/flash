@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import types
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -594,15 +595,20 @@ def _wrap_optimizer_with_mutation_notice(optimizer, url: str, token: str):
     original_step = optimizer.step
     mutation_acknowledged = False
 
+    # torch's lr scheduler patches optimizer.step to assert step ordering, and that patch reads
+    # step_fn.__func__ and rebinds it with func.__get__(opt, opt.__class__). both only exist on a
+    # bound method, so assigning a plain function here fails with "'function' object has no
+    # attribute '__func__'" as soon as verl builds its warmup scheduler, before any gpu work
+    # happens. bind the wrapper to the instance so the descriptor protocol keeps working.
     @functools.wraps(original_step)
-    def step_with_notice(*args, **kwargs):
+    def step_with_notice(_optimizer, *args, **kwargs):
         nonlocal mutation_acknowledged
         if not mutation_acknowledged:
             _coordinate_first_mutation_notice(url, token)
             mutation_acknowledged = True
         return original_step(*args, **kwargs)
 
-    optimizer.step = step_with_notice
+    optimizer.step = types.MethodType(step_with_notice, optimizer)
     return optimizer
 
 
@@ -630,7 +636,6 @@ def _install_verl_extensions() -> None:
         DistillationLossSettings,
         register_distillation_loss,
     )
-    from verl.trainer.main_ppo_sync import PPOTrainer
     from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
     from verl.utils.config import omega_conf_to_dataclass
     from verl.utils.metric import AggregationType, Metric, reduce_metrics
@@ -669,6 +674,12 @@ def _install_verl_extensions() -> None:
 
     @dataclass
     class FlashRemoteDistillationConfig(DistillationConfig):
+        # verl's BaseConfig.__setattr__ rejects any assignment to a field that is not listed here
+        # (base_config.py:33-38), so __post_init__ below can only normalize distillation_loss if the
+        # field is declared mutable. verl's own DistillationConfig declares teacher_models for exactly
+        # the same reason; it never reassigns distillation_loss, so it did not need to.
+        _mutable_fields = DistillationConfig._mutable_fields | {"distillation_loss"}
+
         bridge_url: str = ""
         bridge_token: str = ""
         kl_penalty_coef: float = 1.0
@@ -792,7 +803,13 @@ def _install_verl_extensions() -> None:
     AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
     teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
 
-    @register("flash_single_turn")
+    # import main_ppo_sync only after the patch above. applying `@ray.remote` to a class copies the
+    # methods it inherits onto the actor class, so `AgentLoopWorkerTQ(AgentLoopWorker)` freezes
+    # whatever `_compute_teacher_logprobs` resolves to at decoration time. importing this module
+    # earlier snapshots verl's original, which then calls the flash teacher manager with
+    # `sequence_ids=` instead of prompt_ids/response_ids and kills the first rollout.
+    from verl.trainer.main_ppo_sync import PPOTrainer
+
     class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
             params = dict(sampling_params)
@@ -832,8 +849,15 @@ def _install_verl_extensions() -> None:
             output.reward_score = 0.0
             return output
 
+    # verl's `register` freezes `f"{__module__}.{__qualname__}"` into the agent-loop registry at
+    # decoration time, and hydra later resolves that string with a plain dotted-path lookup. this
+    # class is defined inside a function, so its qualname carries `<locals>` and no lookup can
+    # reach it. rewrite both dunders to the importable module-level name first, publish the class
+    # there, and only then register, exactly as the multi-turn loop already does.
     FlashSingleTurnAgentLoop.__module__ = __name__
+    FlashSingleTurnAgentLoop.__qualname__ = "FlashSingleTurnAgentLoop"
     globals()["FlashSingleTurnAgentLoop"] = FlashSingleTurnAgentLoop
+    register("flash_single_turn")(FlashSingleTurnAgentLoop)
 
     FlashMultiTurnAgentLoop = build_flash_multi_turn_agent_loop(
         register=register,

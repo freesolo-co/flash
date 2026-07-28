@@ -67,6 +67,7 @@ from flash.engine.worker.tokenizer_align import (
     groupwise_coverage,
 )
 from flash.engine.worker.verl_common import (
+    agent_loop_workers,
     latest_global_step_dir,
     resolve_verl_python,
     run_verl_training,
@@ -1481,6 +1482,14 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size={_hydra_val(config['ulysses_sequence_parallel_size'])}",
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.mode=async",
+        # safetensors load format is required for lora rollout on vllm, exactly as on the grpo path.
+        # the default is `dummy`, which makes verl set base_sync_done=False and push base weights to
+        # vllm itself. that path routes every name through replace_lora_wrapper, which appends
+        # `.base_layer` to anything matching the all-linear target set, including the vision tower.
+        # plain vllm has no `visual.blocks.N.attn.qkv.base_layer.weight` slot, so the first weight
+        # sync dies with a KeyError before a rollout is ever produced. loading the base from
+        # safetensors keeps vllm authoritative for base weights and transfers only lora deltas.
+        "actor_rollout_ref.rollout.load_format=safetensors",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={_hydra_val(config['n_gpus_per_node'])}",
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
         # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
@@ -1495,6 +1504,20 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={_hydra_val(max_tokens)}",
         "actor_rollout_ref.rollout.agent.default_agent_loop="
         + ("flash_multi_turn" if config.get("multi_turn") else "flash_single_turn"),
+        # opd runs async rollout through verl's AgentLoopManager, which chunks the rollout batch
+        # across agent.num_workers and asserts an exact split. the batch is
+        # train_batch_size * group_size, so verl's default of 8 aborts the run before the first step
+        # whenever that product is not a multiple of 8. size the pool to the batch instead.
+        "actor_rollout_ref.rollout.agent.num_workers="
+        f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}",
+        # verl force-enables TransferQueue on the opd entry point (main_ppo_sync.main sets
+        # transfer_queue.enable = True with no opt-out), and its SimpleStorage default asks for 8
+        # storage units sized for a multi-node cluster. tq.init reserves them through a SPREAD
+        # placement group and blocks in ray.get(pg.ready()) until every 1-cpu bundle is placed,
+        # with no timeout: any ray cluster with fewer free cpus than units hangs the run forever
+        # before a single gpu is touched. one unit is correct for flash's single-node trainer and
+        # keeps the reservation satisfiable regardless of how ray sized the cluster.
+        "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
         "critic.enable=false",
         "reward.reward_model.enable=false",
         "distillation._target_=flash_opd_verl_plugin.FlashRemoteDistillationConfig",

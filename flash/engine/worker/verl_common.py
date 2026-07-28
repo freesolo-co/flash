@@ -27,6 +27,20 @@ VERL_REQUIREMENT = (
 )
 
 
+def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
+    """largest divisor of ``rollout_batch`` that is <= ``cap`` (verl's default worker count).
+
+    verl 0.8.0 hardcodes async rollout (ray_trainer.py:914), so every rollout goes through
+    AgentLoopManager, which splits the batch across agent.num_workers with DataProto.chunk and
+    asserts the split is exact (agent_loop.py:1111 -> protocol.py:874). the worker count must
+    therefore divide the batch. returning a divisor keeps the run alive for any batch size while
+    preserving parallelism whenever the batch permits it.
+    """
+    if rollout_batch <= 0:
+        raise ValueError("rollout_batch must be positive")
+    return next(n for n in range(min(cap, rollout_batch), 0, -1) if rollout_batch % n == 0)
+
+
 def verl_supports_rollout_field(python_bin: str, field: str) -> bool:
     """report whether python_bin's verl declares `field` on RolloutConfig.
 
