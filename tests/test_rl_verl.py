@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from types import SimpleNamespace
@@ -572,3 +573,136 @@ def test_resolve_verl_loggers_falls_back_to_console_when_verl_env_lacks_wandb(mo
     monkeypatch.setenv("WANDB_API_KEY", "k")
     monkeypatch.setattr(rl_verl.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
     assert rl_verl._resolve_verl_loggers("/verl/bin/python") == "console"
+
+
+# ------------------------------- resume (VERL-018) -------------------------------
+def test_build_verl_overrides_enables_resume_mode():
+    # without resume_mode=auto verl ignores a staged checkpoint and silently restarts at step 0.
+    o = rl_verl.build_verl_overrides(_overrides_cfg())
+    assert "trainer.resume_mode=auto" in o
+
+
+def test_restore_verl_resume_is_a_noop_without_a_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(rl_verl._w, "hf_resume_checkpoint", lambda *a, **k: None)
+    assert rl_verl._restore_verl_resume(str(tmp_path)) == 0
+    assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
+
+
+def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(tmp_path, monkeypatch):
+    src = tmp_path / "checkpoint-7"
+    (src / "actor").mkdir(parents=True)
+    (src / "actor" / "model.safetensors").write_text("weights")
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    monkeypatch.setattr(rl_verl._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
+
+    assert rl_verl._restore_verl_resume(str(local_dir)) == 7
+    # verl discovers the checkpoint through this marker plus the global_step_N layout.
+    assert (local_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "7"
+    assert (local_dir / "global_step_7" / "actor" / "model.safetensors").read_text() == "weights"
+
+
+def test_restore_verl_resume_rejects_an_unparseable_checkpoint_path(tmp_path, monkeypatch):
+    bad = tmp_path / "not-a-checkpoint"
+    bad.mkdir()
+    monkeypatch.setattr(rl_verl._w, "hf_resume_checkpoint", lambda *a, **k: str(bad))
+    with pytest.raises(RuntimeError, match="invalid GRPO resume checkpoint path"):
+        rl_verl._restore_verl_resume(str(tmp_path / "ckpt"))
+
+
+def _write_step(local_dir, step):
+    d = local_dir / f"global_step_{step}"
+    (d / "actor").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text(str(step))
+    return d
+
+
+def test_resume_uploader_uploads_each_completed_step(tmp_path):
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    seen = []
+    uploader = rl_verl._VerlResumeUploader(str(local_dir), resume_step=0)
+
+    import flash.engine.worker.rl_verl as mod
+
+    original = mod._w.upload_resume_checkpoint
+    mod._w.upload_resume_checkpoint = lambda step, path, **k: seen.append(int(step))
+    try:
+        _write_step(local_dir, 4)
+        uploader.start()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and 4 not in seen:
+            time.sleep(0.05)
+        _write_step(local_dir, 8)
+        while time.monotonic() < deadline and 8 not in seen:
+            time.sleep(0.05)
+        uploader.stop()
+    finally:
+        mod._w.upload_resume_checkpoint = original
+    assert seen == [4, 8]
+
+
+def test_resume_uploader_skips_the_step_it_resumed_from(tmp_path):
+    # that checkpoint is already durable on hf; re-uploading it wastes the upload slot.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    seen = []
+    import flash.engine.worker.rl_verl as mod
+
+    original = mod._w.upload_resume_checkpoint
+    mod._w.upload_resume_checkpoint = lambda step, path, **k: seen.append(int(step))
+    try:
+        _write_step(local_dir, 5)
+        uploader = rl_verl._VerlResumeUploader(str(local_dir), resume_step=5)
+        uploader.start()
+        time.sleep(0.5)
+        uploader.stop()
+    finally:
+        mod._w.upload_resume_checkpoint = original
+    assert seen == []
+
+
+def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
+    # the policy is still trained and published; a failed resume upload only costs restart distance.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    import flash.engine.worker.rl_verl as mod
+
+    def boom(step, path, **k):
+        raise RuntimeError("hf is down")
+
+    original = mod._w.upload_resume_checkpoint
+    mod._w.upload_resume_checkpoint = boom
+    try:
+        _write_step(local_dir, 2)
+        uploader = rl_verl._VerlResumeUploader(str(local_dir), resume_step=0)
+        uploader.start()
+        time.sleep(0.5)
+        uploader.stop()  # must not raise
+    finally:
+        mod._w.upload_resume_checkpoint = original
+    assert 2 in uploader.processed_steps
+
+
+def test_train_notes_report_whether_the_run_resumed():
+    # without this a resumed run is indistinguishable from a fresh one in train_meta (trl reports it).
+    inp = {
+        "epochs": 2,
+        "group_size": 4,
+        "kl_coef": 0.0,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "ppo_epochs": 1,
+        "verl_total_epochs": 3,
+        "seed": 7,
+    }
+    common = {
+        "steps_run": 3,
+        "retained_prompts": 8,
+        "reward_history": [0.5],
+        "loss_curve": [0.1],
+    }
+    fresh = rl_verl._build_verl_train_notes(inp, **common)
+    assert fresh["resumed"] is False
+    resumed = rl_verl._build_verl_train_notes(inp, **common, resumed=True)
+    assert resumed["resumed"] is True
