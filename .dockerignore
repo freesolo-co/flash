@@ -16,5 +16,9 @@ build/*
 !build/kernel_cache/
 !build/kernel_cache/**
 *.egg-info/
+# the Dockerfile does COPY . ., so an operator's .env.local would otherwise become an
+# image layer even though it was never committed. .env.example carries no values.
 .env
+.env.*
+!.env.example
 .flash/
