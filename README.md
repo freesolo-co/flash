@@ -173,14 +173,25 @@ model — in short, **pull requests go into `dev`**.
 You can run your own control plane, but read this first — it is an operator deployment,
 not a one-command install.
 
-`flash-server` fails fast at startup unless all of the following are present (see
-`flash/providers/preflight.py` and `.env.example`):
+The control plane needs the `server` extra — the base install above is client-only and
+`flash-server` will refuse to start without it:
+
+```bash
+pip install 'freesolo-flash[server]'
+```
+
+`flash-server` then fails fast at startup unless all of the following are present (see
+`flash/providers/preflight.py` and `.env.example`). Note it reads the PROCESS
+environment, so load your `.env` (`set -a && . ./.env && set +a`) rather than relying on
+the file being present:
 
 - `RUNPOD_API_KEY` — **two or more distinct** RunPod account keys, comma-separated. A
   single-account pool cannot reap or fail over across accounts, so the preflight rejects
   it.
 - `LAMBDA_API_KEY` — Lambda Cloud API key.
-- `HF_TOKEN` — write access to each run's artifact repo.
+- `HF_TOKEN` — write access to the dataset repos flash creates for artifacts. The repo is
+  assigned by the control plane and scoped to the environment, so runs sharing an
+  environment share a repo, each under its own prefix.
 - `FREESOLO_INTERNAL_KEY` — control-plane authentication. Requests presenting this key
   authenticate as a single service identity with no network call, which is the path to use
   if you are not integrating with Freesolo identity.

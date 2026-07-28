@@ -31,36 +31,30 @@ def _offline(monkeypatch):
 
     monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [], raising=False)
 
-    # Lambda and Vast are OPT-IN instance-based complements (keyed by LAMBDA_API_KEY / VAST_API_KEY).
-    # On an operator box whose shell sources a .env, those keys are present in the process env — which
-    # would make the provider "available" and pull live capacity/pricing into offline tests (allocation
-    # candidates, registry). Delete them by default so the suite stays hermetic and RunPod-only; a
-    # provider test opts back in with ``monkeypatch.setenv(...)``.
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
-    monkeypatch.delenv("VAST_API_KEY", raising=False)
-
-    # RUNPOD_API_KEY gets deleted rather than merely reset. Importing ``runpod_flash`` runs
-    # ``load_dotenv(find_dotenv(usecwd=True))`` at module scope, which walks UP out of the repo
-    # and loads whatever .env it finds -- so on an operator box a real key appears in os.environ
-    # partway through the suite, as soon as some test imports that package. Tests that seed a key
-    # only when none is set would then run against the operator's live credential.
+    # Credential scrubbing. Importing ``runpod_flash`` runs ``load_dotenv(find_dotenv(usecwd=True))``
+    # at module scope, which walks UP out of the repo and loads whatever .env it finds -- so on an
+    # operator box real keys appear in os.environ partway through the suite, as soon as some test
+    # first imports that package. Deleting a key BEFORE that import is worthless: load_dotenv skips
+    # names already set, so a name we just unset is exactly the one it fills back in.
     #
-    # Deleting it is only sound if that dotenv load has ALREADY happened: a lazy first import
-    # partway through a test would otherwise re-populate everything we just deleted (load_dotenv
-    # does not overwrite what is set, but these names are unset by then, so it fills them in).
-    # Import the package here, before scrubbing, so its module-scope load is a no-op afterwards.
+    # Force the import first, then delete. One ordering, one deletion pass, no name that can be
+    # scrubbed on the wrong side of the import.
     with contextlib.suppress(Exception):  # package absent in a client-only checkout
         import runpod_flash  # noqa: F401
 
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-
     # Secrets flash forwards AUTOMATICALLY (no per-job declaration) are the dangerous ones: a
     # submit-path test asserting on the outgoing payload picks them up from the operator's ambient
-    # env and fails, and a less careful test would ship a real key into a fixture. Derive the list
-    # from the production constant so a key added there is scrubbed here without touching this file.
+    # env and fails, and a less careful test would ship a real key into a fixture. Derived from the
+    # production constant so a key added there is scrubbed here without touching this file.
+    #
+    # Lambda and Vast are OPT-IN instance-based complements: leaving their keys set makes the
+    # provider "available" and pulls live capacity/pricing into offline tests (allocation
+    # candidates, registry). A provider test opts back in with ``monkeypatch.setenv(...)``.
     from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 
-    for _key in DEFAULT_RUNTIME_SECRET_KEYS:
+    for _key in {"RUNPOD_API_KEY", "LAMBDA_API_KEY", "VAST_API_KEY"} | set(
+        DEFAULT_RUNTIME_SECRET_KEYS
+    ):
         monkeypatch.delenv(_key, raising=False)
 
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing

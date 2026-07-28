@@ -67,10 +67,20 @@ LEAKED_EMAIL_RE='internal[.]cloudapp[.]net'
 # Message patterns, shared by the counters and (in spirit) the rewrite callback below.
 # Each is LINE-ANCHORED and trailer-shaped so that counting and removing agree: a commit
 # that merely mentions a trailer in prose is neither rewritten nor counted as a leak.
+#
+# "^" must be followed by what the line actually starts with. Writing '^[[:space:]]*.*X'
+# makes the anchor a NO-OP -- ".*" re-admits any prefix -- so a prose mention counts as a
+# leak, residual never reaches zero, and the gate blocks publication forever. The
+# generated-with footer is usually emoji-prefixed, so allow leading NON-SPACE punctuation
+# explicitly rather than with a blanket ".*".
 CO_AUTHORED_RE='^[[:space:]]*Co-Authored-By:[[:space:]]*Claude'
 SESSION_RE='^[[:space:]]*Claude-Session:'
-GENERATED_RE='^[[:space:]]*.*Generated with .*Claude Code'
-HOSTNAME_RE='internal[.]cloudapp[.]net'
+GENERATED_RE='^[[:space:]]*[^[:alnum:]]*[[:space:]]*Generated with .*Claude Code'
+# The hostname leaks through a Co-authored-by TRAILER, so anchor on the trailer, not on
+# the bare hostname: a commit discussing the hostname in prose is not a trailer leak.
+# (The same hostname in an author/committer FIELD is caught by count_identities, which
+# reads the identity fields directly and is unaffected by this message-level pattern.)
+HOSTNAME_RE='^[[:space:]]*Co-authored-by:.*internal[.]cloudapp[.]net'
 
 CANONICAL_IDENTITY="${FLASH_CANONICAL_IDENTITY:-David Shan <78061174+DavidBShan@users.noreply.github.com>}"
 
@@ -299,11 +309,15 @@ To publish the rewritten history:
      clone time; anything pushed since is NOT in it and the push below would
      delete it. Diff the remote against the snapshot and expect no output:
 
-       git ls-remote $REMOTE 'refs/heads/*' 'refs/tags/*' \\
+       git ls-remote --refs $REMOTE 'refs/heads/*' 'refs/tags/*' \\
          | awk '{print \$1, \$2}' | sort > /tmp/flash-remote-now.txt
        grep -E ' refs/(heads|tags)/' $REFMAP \\
          | sort > /tmp/flash-remote-at-clone.txt
        diff /tmp/flash-remote-at-clone.txt /tmp/flash-remote-now.txt
+
+     --refs matters: without it an ANNOTATED tag also lists its peeled "v1^{}" entry,
+     which the saved map (built with for-each-ref) does not have, so the diff would
+     report a difference on every run and you could never get past this step.
 
      Any difference means someone pushed during the run. STOP: re-run the scrub
      from a fresh clone rather than overwriting their work.
