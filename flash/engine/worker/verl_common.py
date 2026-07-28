@@ -70,13 +70,12 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     if os.path.exists(stamp):
         with open(stamp) as f:
             installed = f.read().strip()
-    if os.path.exists(py) and installed != VERL_REQUIREMENT:
-        # a retry reuses the pod workdir, so this venv can be from an earlier attempt or an earlier
-        # flash release pinning a different verl. it would satisfy the exists check below and train on
-        # the wrong verl, so rebuild it. an install that died partway also lands here: the stamp is
-        # written only after the install succeeds, so a half-populated venv is never reused.
+    if installed != VERL_REQUIREMENT or not os.path.exists(py):
+        # a retry reuses the pod workdir, so this venv can be from an earlier attempt, from an earlier
+        # flash release pinning a different verl, or from an install that died partway. remove it and
+        # start clean: reusing it would train on the wrong verl, and `uv venv` refuses to write into a
+        # directory that already holds a pyvenv.cfg, so a half-built venv wedges every later retry.
         shutil.rmtree(venv, ignore_errors=True)
-    if not os.path.exists(py):
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
         # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
         subprocess.run(["uv", "venv", venv], check=True)

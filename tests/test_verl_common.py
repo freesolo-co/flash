@@ -124,6 +124,23 @@ def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(monkeyp
     assert not (venv / "marker").exists()
 
 
+def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkeypatch, tmp_path):
+    # a pod killed during `uv venv` leaves a pyvenv.cfg but no bin/python. uv then refuses to write
+    # into that directory ("a virtual environment already exists"), so leaving it in place would wedge
+    # every later retry. it must be removed before uv runs.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    venv = tmp_path / "verl-venv"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("half-written")
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    assert not (venv / "pyvenv.cfg").exists()
+    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"]]
+
+
 def test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork():
     # a branch or tag would let the runtime move under a pinned flash release.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
