@@ -11,7 +11,14 @@ updates:
       prefix: ci
 
   # Security-relevant python deps. Grouped so a routine bump is one PR, not ten.
-  - package-ecosystem: pip
+  #
+  # `uv`, not `pip`: the resolved versions CI actually installs live in the committed uv.lock
+  # (ci.yml runs `uv sync`), and the pip ecosystem does not read a lockfile. Most of pyproject
+  # is unconstrained or lower-bound-only, so under pip there is little in the manifest to bump
+  # and the versions that matter would never move. Caveat: with a [dependency-groups] table
+  # present (pyproject.toml), the uv ecosystem updates uv.lock but not pyproject.toml
+  # (dependabot-core#12788), so expect lockfile bumps rather than manifest bumps.
+  - package-ecosystem: uv
     directory: "/"
     schedule:
       interval: weekly
