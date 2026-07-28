@@ -136,6 +136,14 @@ class _FakeClient:
             }
         ]
 
+    def deployment_for(self, run_id: str) -> dict | None:
+        self.calls.append(("deployment_for", run_id))
+        for entry in self.deployments():
+            deployment = entry.get("deployment") or {}
+            if entry.get("run_id") == run_id.split("/", 1)[0]:
+                return {**deployment, "run_id": entry["run_id"]}
+        return None
+
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
         return {"choices": [{"message": {"content": "42"}}]}
@@ -1304,6 +1312,115 @@ def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> 
     err = capsys.readouterr().err
     assert "deployment failed: smoke generation failed" in err
     assert "once it is ready" not in err
+
+
+def _queued_deploy(monkeypatch, fake_client) -> None:
+    """Make POST deploy return what the control plane really returns: a queued record."""
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "queued"},
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+
+
+def test_deploy_without_wait_returns_while_still_queued(fake_client, monkeypatch, capsys) -> None:
+    """No --wait keeps the old behaviour: return immediately, do not poll."""
+    _queued_deploy(monkeypatch, fake_client)
+
+    assert _run(["models", "deploy", "flash-1"]) == 0
+    assert not any(c[0] == "deployment_for" for c in fake_client.calls)
+    assert "deployment state is 'queued'" in capsys.readouterr().err
+
+
+def test_deploy_wait_polls_until_the_revision_is_servable(fake_client, monkeypatch, capsys) -> None:
+    """--wait must not return while the requested revision is still queued.
+
+    deploy returns as soon as the record is persisted, which is normally before the new revision
+    can serve a token, so a caller that starts evaluating on that return hits the old revision or
+    an error. The wait is what makes the printed record mean "ready".
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    states = iter([{"state": "smoke_testing"}, {"state": "reconciling"}, {"state": "ready"}])
+    monkeypatch.setattr(fake_client, "deployment_for", lambda run_id: next(states), raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    out, err = capsys.readouterr()
+    assert "ready" in out
+    assert "queued" not in err
+    assert "ctrl-c stops waiting, not the deployment" in err
+
+
+def test_deploy_wait_stops_on_a_failed_revision(fake_client, monkeypatch, capsys) -> None:
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id: {"state": "failed", "error": "smoke generation failed"},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert "deployment failed: smoke generation failed" in capsys.readouterr().err
+
+
+def test_deploy_wait_gives_up_at_the_timeout_without_claiming_success(
+    fake_client, monkeypatch, capsys
+) -> None:
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id: {"state": "smoke_testing"}, raising=False
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0.01"]) == 0
+    err = capsys.readouterr().err
+    assert "still 'smoke_testing' after 0.01s" in err
+    assert "flash models deployments" in err
+
+
+def test_deploy_wait_ends_when_the_deployment_stops_being_listed(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A run drops out of the listing once its deployment is gone, so that is terminal."""
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(fake_client, "deployment_for", lambda run_id: None, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert "no longer an active deployment" in capsys.readouterr().err
+
+
+def test_deploy_wait_survives_a_transient_control_plane_error(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """One failed poll must not fail a deploy that is progressing fine."""
+    _queued_deploy(monkeypatch, fake_client)
+    results = iter([cli.commands.ClientError("503"), {"state": "ready"}])
+
+    def _next(run_id):
+        value = next(results)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(fake_client, "deployment_for", _next, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert "ready" in capsys.readouterr().out
+
+
+def test_deploy_wait_skips_polling_for_a_dry_run(fake_client, monkeypatch, capsys) -> None:
+    """A dry run creates no deployment, so there is nothing to wait on."""
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "dry_run"},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--dry-run", "--wait"]) == 0
+    assert not any(c[0] == "deployment_for" for c in fake_client.calls)
+    assert "ctrl-c stops waiting" not in capsys.readouterr().err
 
 
 def test_log_follow_progress_includes_heartbeat_age() -> None:

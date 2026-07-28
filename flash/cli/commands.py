@@ -721,6 +721,61 @@ def cmd_checkpoints(args) -> int:
     return 0
 
 
+# the states a deployment sits in before the requested revision is actually servable, mirroring
+# the set the control plane transitions through. anything else ends the wait: ready, failed, or a
+# state this client does not know, which must not spin until the timeout.
+_DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
+_DEPLOY_POLL_SECONDS = 5.0
+
+
+def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> dict:
+    """Poll until the requested revision leaves the busy states, or the timeout expires.
+
+    POST deploy returns as soon as the record is persisted, normally in ``queued`` while the
+    previous revision is still the ready one. A caller that starts evaluating on that return
+    talks to a reconciling endpoint and mostly gets errors. Polling here makes the returned
+    record mean what it appears to mean.
+    """
+    if str(deployment.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
+        return deployment
+    waiting = (
+        f"waiting up to {timeout:g}s for {run_id} to become servable; "
+        "ctrl-c stops waiting, not the deployment"
+    )
+    print(render.note(waiting) if render.styled() else f"note: {waiting}", file=sys.stderr)
+    deadline = time.monotonic() + timeout
+    latest = deployment
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_DEPLOY_POLL_SECONDS, remaining))
+        try:
+            current = client.deployment_for(run_id)
+        except ClientError:
+            # a transient control-plane blip must not fail a deploy that is otherwise progressing;
+            # keep polling to the deadline and report whatever we last saw.
+            continue
+        if current is None:
+            # the listing drops a run once its deployment is gone, so vanishing mid-wait is
+            # terminal, not slow; continuing here would just burn the whole timeout.
+            print(
+                f"warning: {run_id} is no longer an active deployment; "
+                "run `flash models deployments` to check what happened",
+                file=sys.stderr,
+            )
+            return latest
+        latest = current
+        if str(current.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
+            return current
+    print(
+        f"warning: still {str(latest.get('state') or 'unknown')!r} after {timeout:g}s; "
+        f"run `flash models deployments` to keep checking {run_id}",
+        file=sys.stderr,
+    )
+    return latest
+
+
 def cmd_deploy(args) -> int:
     from flash.schema import parse_checkpoint_ref
 
@@ -736,6 +791,10 @@ def cmd_deploy(args) -> int:
     base_run_id, _step = parsed
     client = client_from_config()
     dep = client.deploy(args.run_id, dry_run=args.dry_run)
+    wait_seconds = getattr(args, "wait", None)
+    # a dry run creates no deployment to poll for, so --wait has nothing to observe.
+    if wait_seconds and dep.get("state") != "dry_run":
+        dep = _await_deployment(client, args.run_id, dep, wait_seconds)
     if render.styled():
         print(render.deployed(dep))
     else:

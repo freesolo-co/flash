@@ -613,6 +613,20 @@ class ApiClient:
     def deployments(self) -> list[dict]:
         return self._request("GET", "/v1/deployments")["deployments"]
 
+    def deployment_for(self, run_id: str) -> dict | None:
+        """The current deployment record for one run, or None when it is not listed.
+
+        ``deploy`` returns as soon as the record is persisted, which is normally before the
+        requested revision is servable. This is the read side a caller needs to tell "queued"
+        from "actually ready".
+        """
+        base_run_id, _step = _parse_adapter_target(run_id)
+        for entry in self.deployments():
+            deployment = entry.get("deployment") or {}
+            if deployment.get("run_id") == base_run_id:
+                return deployment
+        return None
+
     def chat(
         self,
         run_id: str,

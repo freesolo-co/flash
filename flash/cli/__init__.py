@@ -523,6 +523,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
     )
     deploy.add_argument("--dry-run", action="store_true")
+    deploy.add_argument(
+        "--wait",
+        nargs="?",
+        type=float,
+        const=1800.0,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "block until the requested revision is ready or failed (default timeout 1800s). "
+            "without it, deploy returns while the revision is still queued"
+        ),
+    )
     deploy.set_defaults(func=cmd_deploy)
 
     undeploy = models_sub.add_parser("undeploy", help="tear down a run's serving endpoint")
