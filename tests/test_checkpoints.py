@@ -657,6 +657,7 @@ def test_register_run_checkpoints_body_shape(monkeypatch):
     assert body["baseModel"] == "Qwen/Qwen3.5-4B"
     assert body["repoId"] == "org/test-runs"
     assert body["repoType"] == "dataset"
+    assert "projectId" not in body
     assert body["checkpoints"] == [
         {"step": 40, "subfolder": "rl/flash-ckpt-1/checkpoints/step-40/adapter"},
         {"step": 80, "subfolder": "rl/flash-ckpt-1/checkpoints/step-80/adapter"},

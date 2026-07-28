@@ -13,6 +13,8 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from flash.spec import require_project_id
+
 from .config import load_credentials_with_source
 
 ProgressCallback = Callable[[int, int], None]
@@ -34,6 +36,7 @@ class ApiError(ClientError):
 
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
+FREESOLO_PROJECTS_PATH = "/api/projects"
 FREESOLO_TRACE_PROJECTS_PATH = "/api/traces/projects"
 FREESOLO_TRACES_EXPORT_PATH = "/api/traces/export"
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
@@ -99,22 +102,28 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
         ) from exc
 
 
-def _freesolo_get(path: str, api_key: str, base_url: str | None = None, timeout: float = 60.0):
-    """GET a freesolo backend endpoint with the user's API key, returning parsed JSON.
-
-    Traces live on the freesolo backend (FREESOLO_BASE_URL), not on the Flash control plane that
-    ApiClient targets, so these reads go direct rather than through ApiClient."""
+def _freesolo_request(
+    method: str,
+    path: str,
+    api_key: str,
+    base_url: str | None = None,
+    *,
+    body: dict[str, Any] | None = None,
+    timeout: float = 60.0,
+):
+    """Call a Freesolo bearer endpoint directly and return parsed JSON."""
     base = freesolo_base_url(base_url)
     req = urllib.request.Request(
         f"{base}{path}",
-        method="GET",
+        method=method,
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
+        if exc.code == 401:
             raise ClientError(
                 "freesolo rejected this API key — run `flash login` with a valid key "
                 "(or set FREESOLO_API_KEY)"
@@ -125,7 +134,72 @@ def _freesolo_get(path: str, api_key: str, base_url: str | None = None, timeout:
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "
             "check your network connection and FREESOLO_BASE_URL"
         ) from exc
-    return json.loads(raw) if raw else {}
+    try:
+        return json.loads(raw) if raw else {}
+    except (TypeError, ValueError) as exc:
+        raise ClientError(f"freesolo returned invalid JSON for {path}") from exc
+
+
+def _freesolo_get(path: str, api_key: str, base_url: str | None = None, timeout: float = 60.0):
+    return _freesolo_request("GET", path, api_key, base_url, timeout=timeout)
+
+
+def list_projects(api_key: str, base_url: str | None = None) -> list[dict[str, Any]]:
+    """List projects in the authenticated caller's Freesolo organization."""
+    payload = _freesolo_get(FREESOLO_PROJECTS_PATH, api_key, base_url)
+    if not isinstance(payload, list) or any(not isinstance(project, dict) for project in payload):
+        raise ClientError("freesolo returned an invalid project list")
+    return payload
+
+
+def get_project(project_id: str, api_key: str, base_url: str | None = None) -> dict[str, Any]:
+    """Fetch one project and require the requested canonical UUID in the response."""
+    try:
+        project_id = require_project_id(project_id)
+    except (TypeError, ValueError) as exc:
+        raise ClientError(str(exc).replace("project", "project id", 1)) from exc
+    quoted = urllib.parse.quote(project_id, safe="")
+    payload = _freesolo_get(f"{FREESOLO_PROJECTS_PATH}/{quoted}", api_key, base_url)
+    project = payload.get("project") if isinstance(payload, dict) else None
+    if not isinstance(project, dict):
+        project = payload if isinstance(payload, dict) else None
+    returned_id = project.get("id") if isinstance(project, dict) else None
+    try:
+        returned_id = require_project_id(returned_id)
+    except (TypeError, ValueError) as exc:
+        raise ClientError(f"freesolo returned no valid project for {project_id}") from exc
+    if returned_id != project_id:
+        raise ClientError(f"freesolo returned a mismatched project id for {project_id}")
+    return {**project, "id": returned_id}
+
+
+def create_project(
+    name: str,
+    description: str | None,
+    api_key: str,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """Create a project in the authenticated caller's organization."""
+    name = str(name or "").strip()
+    if not name:
+        raise ClientError("project name must be nonblank")
+    normalized_description = None
+    if description is not None:
+        normalized_description = str(description).strip() or None
+    payload = _freesolo_request(
+        "POST",
+        FREESOLO_PROJECTS_PATH,
+        api_key,
+        base_url,
+        body={"name": name, "description": normalized_description},
+    )
+    if not isinstance(payload, dict):
+        raise ClientError("freesolo returned an invalid project response")
+    try:
+        project_id = require_project_id(payload.get("id"))
+    except (TypeError, ValueError) as exc:
+        raise ClientError("freesolo returned an invalid project id") from exc
+    return {**payload, "id": project_id}
 
 
 def list_trace_projects(api_key: str, base_url: str | None = None) -> list[dict[str, Any]]:
@@ -301,8 +375,13 @@ class ApiClient:
         body: dict | None = None,
         timeout: float | None = None,
         progress: ProgressCallback | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> Any:
-        headers = {"Content-Type": "application/json", **self._auth_headers()}
+        headers = {
+            "Content-Type": "application/json",
+            **self._auth_headers(),
+            **(extra_headers or {}),
+        }
         if progress is not None:
             payload = json.dumps(body).encode()
             headers["Content-Length"] = str(len(payload))
@@ -364,21 +443,19 @@ class ApiClient:
         *,
         name: str,
         package_b64: str,
-        project_id: str | None = None,
+        project_id: str,
         progress: ProgressCallback | None = None,
     ) -> dict:
-        """Upload a packaged Freesolo environment to the managed Environments Hub.
-
-        ``project_id`` groups the environment under one of the org's projects. Omit it and the
-        env keeps whatever project it is already in, or lands in the org's Default on a first
-        publish — so a republish never has to restate a grouping set from the dashboard."""
-        body = {"name": name, "package_b64": package_b64}
-        if project_id:
-            body["project_id"] = project_id
+        """Upload a packaged environment under one explicit Freesolo project."""
+        try:
+            project_id = require_project_id(project_id)
+        except (TypeError, ValueError) as exc:
+            raise ClientError(str(exc).replace("project", "project id", 1)) from exc
+        body = {"name": name, "package_b64": package_b64, "project_id": project_id}
         return self._request("POST", "/v1/envs", body=body, timeout=1800.0, progress=progress)
 
-    def delete_env(self, env_id: str) -> dict:
-        """Delete a published Freesolo environment by its ``namespace/name`` id.
+    def delete_env(self, env_id: str, *, project_id: str) -> dict:
+        """Delete a published Freesolo environment from one explicit project.
 
         The id carries a slash, which the server route matches with a ``:path`` converter, so the
         path segments go straight into the URL — but percent-encode everything except ``/`` first so
@@ -391,8 +468,17 @@ class ApiClient:
         multiple times, and each attempt includes several git commands with a 180s per-command
         timeout (clone/pull/push can dominate). Keep the client timeout at least as large as the
         server's so the CLI doesn't time out while a destructive delete is still in progress."""
+        try:
+            project_id = require_project_id(project_id)
+        except (TypeError, ValueError) as exc:
+            raise ClientError(str(exc).replace("project", "project id", 1)) from exc
         quoted = urllib.parse.quote(env_id, safe="/")
-        return self._request("DELETE", f"/v1/envs/{quoted}", timeout=1800.0)
+        return self._request(
+            "DELETE",
+            f"/v1/envs/{quoted}",
+            timeout=1800.0,
+            extra_headers={"X-Freesolo-Project-Id": project_id},
+        )
 
     def download_env_package(self, env_id: str) -> bytes:
         """Download a managed environment package through the Flash control plane."""
@@ -413,7 +499,13 @@ class ApiClient:
         dry_run: bool = False,
         client_train_schema: dict | None = None,
     ) -> dict:
-        body: dict = {"spec": spec}
+        if not isinstance(spec, dict):
+            raise ClientError("spec must be an object")
+        try:
+            project_id = require_project_id(spec.get("project"))
+        except (TypeError, ValueError) as exc:
+            raise ClientError(str(exc)) from exc
+        body: dict = {"spec": {**spec, "project": project_id}}
         if runtime_secrets:
             body["runtime_secrets"] = runtime_secrets
         if dry_run:
@@ -476,12 +568,12 @@ class ApiClient:
             if time.monotonic() >= deadline:
                 raise ClientError(
                     f"cancel request timed out before confirmation; latest state={last_state!r}. "
-                    f"Run `flash status {run_id}` to check the authoritative state before retrying."
+                    f"Run `flash runs status {run_id}` to check the authoritative state before retrying."
                 ) from cause
             time.sleep(2.0)
 
     def checkpoints(self, run_id: str) -> list[dict]:
-        """Deployable per-step RL checkpoints for a run (serve one with `flash deploy RUN/step-N`)."""
+        """Deployable per-step RL checkpoints for a run (serve one with `flash models deploy RUN/step-N`)."""
         return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
 
     def deploy(

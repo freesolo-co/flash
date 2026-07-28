@@ -1453,7 +1453,10 @@ def mark_undeployed(run_id: str) -> RunStatus:
 
         def _commit() -> None:
             if status.deployment:
-                status.deployment = {**status.deployment, "state": "undeployed"}
+                deployment = dict(status.deployment)
+                for field in ("error", "retryable", "updated_at"):
+                    deployment.pop(field, None)
+                status.deployment = {**deployment, "state": "undeployed"}
             if status.state == "deployed":
                 status.state = "done"
             status.updated_at = time.time()

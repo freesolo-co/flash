@@ -140,6 +140,13 @@ def cmd_env_pull(args) -> int:
 
 def cmd_env_delete(args) -> int:
     from flash.client import ClientError, client_from_config
+    from flash.spec import require_project_id
+
+    try:
+        project_id = require_project_id(getattr(args, "project", None))
+    except (TypeError, ValueError) as exc:
+        detail = str(exc).replace("project", "project id", 1)
+        return _err(f"{detail}: pass `--project <project-uuid>`")
 
     # Delete only targets MANAGED hub ids ("namespace/name") — not github: refs or local paths, which
     # don't live on the hub. And enforce the hub's canonical form (lowercase, no surrounding
@@ -165,7 +172,7 @@ def cmd_env_delete(args) -> int:
             print("aborted; environment not deleted", file=sys.stderr)
             return 1
     try:
-        result = client_from_config().delete_env(env_id)
+        result = client_from_config().delete_env(env_id, project_id=project_id)
     except ClientError as exc:
         return _err(str(exc))
     deleted = bool(result["deleted"])
@@ -274,11 +281,7 @@ def _with_syspath_bootstrap(env_source: str) -> str:
         insert_after = body[i].end_lineno or insert_after
         i += 1
     lines = env_source.splitlines(keepends=True)
-    return (
-        "".join(lines[:insert_after])
-        + _ENV_SYSPATH_BOOTSTRAP
-        + "".join(lines[insert_after:])
-    )
+    return "".join(lines[:insert_after]) + _ENV_SYSPATH_BOOTSTRAP + "".join(lines[insert_after:])
 
 
 def _raise_walk_error(error: OSError) -> None:
@@ -314,9 +317,7 @@ def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bo
         return True
     if path.is_dir() and (path / "pyvenv.cfg").is_file():
         return True
-    if path == entrypoint or (
-        path.parent == env_root and lowered_name == _ENV_ENTRYPOINT.lower()
-    ):
+    if path == entrypoint or (path.parent == env_root and lowered_name == _ENV_ENTRYPOINT.lower()):
         return True
     if lowered_name.startswith(".") or lowered_name in _ENV_PUSH_IGNORED_NAMES:
         return True
@@ -469,7 +470,7 @@ class _UploadProgress(TtyStatusLine):
 
 
 def _upload_and_report(
-    name: str, *, package_b64: str, bar: _UploadProgress, project_id: str | None = None
+    name: str, *, package_b64: str, bar: _UploadProgress, project_id: str
 ) -> int:
     """Upload a packaged env to the managed control plane and print the returned id."""
     from flash.client import ClientError, client_from_config
@@ -541,10 +542,13 @@ def cmd_env_push(args) -> int:
     if not env_name:
         return _err("env name required: pass `--name <name>`")
 
-    # unlike `flash traces export`, an omitted --project is not a prompt: env push is
-    # non-interactive and grouping is optional, so no project means "leave the grouping
-    # where it is" (or the org's Default on a first publish).
-    project_id = str(getattr(args, "project", "") or "").strip() or None
+    from flash.spec import require_project_id
+
+    try:
+        project_id = require_project_id(getattr(args, "project", None))
+    except (TypeError, ValueError) as exc:
+        detail = str(exc).replace("project", "project id", 1)
+        return _err(f"{detail}: pass `--project <project-uuid>`")
 
     try:
         src, env_root, entrypoint, include_full_tree = _resolve_local_env_entrypoint(args.path)

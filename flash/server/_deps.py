@@ -44,6 +44,17 @@ def owned_run(run_id: str, key: dict):
     return _load_status(run_id)
 
 
+def _internal_org_run(run_id: str, key: dict, org_id: str | None = None):
+    org = (org_id or "").strip()
+    if key.get("auth_kind") == "internal" and org:
+        from flash.runner import _status_org_id
+
+        status = _load_status(run_id)
+        if _status_org_id(status) == org:
+            return status
+    raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
+
+
 def readable_run(run_id: str, key: dict, org_id: str | None = None):
     """Load a run's status for READ-only endpoints (`/logs`, `/worker`) via one of two paths.
 
@@ -60,14 +71,29 @@ def readable_run(run_id: str, key: dict, org_id: str | None = None):
     """
     if db.run_owner(run_id) == key["id"]:
         return _load_status(run_id)
-    org = (org_id or "").strip()
-    if key.get("auth_kind") == "internal" and org:
-        from flash.runner import _status_org_id
+    return _internal_org_run(run_id, key, org_id)
 
-        status = _load_status(run_id)
-        if _status_org_id(status) == org:
+
+def manageable_run(
+    run_id: str,
+    key: dict,
+    org_id: str | None = None,
+    project_id: str | None = None,
+):
+    """Load a run for deployment management by its exact owner or matching internal scope."""
+    if key.get("auth_kind") == "internal":
+        status = _internal_org_run(run_id, key, org_id)
+        project = (project_id or "").strip()
+        persisted_project = status.spec.get("project") if isinstance(status.spec, dict) else None
+        if (
+            project
+            and isinstance(persisted_project, str)
+            and persisted_project.strip()
+            and persisted_project == project
+        ):
             return status
-    raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
+        raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
+    return owned_run(run_id, key)
 
 
 def _require_bool(payload: dict, field: str, default: bool) -> bool:
@@ -89,18 +115,17 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
     if env_raw is None:
         env_raw = {}
     if not isinstance(env_raw, dict):
-        raise HTTPException(
-            status_code=400, detail="spec.environment must be a JSON object"
-        )
+        raise HTTPException(status_code=400, detail="spec.environment must be a JSON object")
     if env_raw.get("path"):
         raise HTTPException(
             status_code=400,
             detail="local environment paths are not supported on the managed service; "
-            "publish the environment with `flash env push --name <name>`, then reference it "
+            "publish the environment with `flash env push --project <project-uuid> --name <name>`, "
+            "then reference it "
             "by the returned environment id",
         )
     try:
-        return spec_from_dict(spec_raw, run_id=run_id)
+        return spec_from_dict(spec_raw, run_id=run_id, project_required=True)
     except (ConfigError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

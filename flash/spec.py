@@ -6,6 +6,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
+from uuid import UUID
 
 from .catalog import DEFAULT_MODEL, normalize_algorithm
 from .opd_retry_contract import OPD_RESUME_REVISION_ENV
@@ -65,6 +66,21 @@ def _coerce_str_map(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     return {str(k): str(v) for k, v in value.items()}
+
+
+def require_project_id(value: Any) -> str:
+    """Return one explicit canonical Freesolo project UUID or reject it."""
+    if value is None:
+        raise ValueError("project is required and must be nonblank")
+    if not isinstance(value, str):
+        raise TypeError("project must be a string")
+    project_id = value.strip()
+    if not project_id:
+        raise ValueError("project is required and must be nonblank")
+    try:
+        return str(UUID(project_id))
+    except ValueError as exc:
+        raise ValueError("project must be a valid UUID") from exc
 
 
 def _coerce_wandb(value: Any) -> WandbSpec:
@@ -259,7 +275,7 @@ class TrainSpec:
     # lora_rank and to_dict() omits it. The internal from_dict still round-trips the stored value so
     # a warm-start's inherited parent alpha survives control-plane -> worker serialization.
     lora_alpha: int = 64
-    # Artifact-store adapter ref output by `flash status`:
+    # artifact-store adapter ref output by `flash runs status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = field(default="", metadata={"introduced_in": "0.2.0"})
     # internal: immutable source dataset commit used for a prepared warm-start. parsed only from
@@ -362,9 +378,8 @@ class JobSpec:
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_revision: str = ""
-    # optional flash project id (the org-scoped grouping shown in the dashboard);
-    # empty means the run is ungrouped. the control plane forwards it to the
-    # platform, which writes it to flash_training_runs.project_id.
+    # canonical freesolo project uuid. every config, control-plane record, and worker round trip
+    # carries the same explicit identity; there is no name/default/sole-project resolution.
     project: str = ""
 
     def __post_init__(self) -> None:
@@ -443,9 +458,7 @@ class JobSpec:
         if not isinstance(gpu_type_raw, str):
             raise TypeError("gpu.type must be a string")
         gpu_type = (
-            _validated_gpu_type(gpu_type_raw, field_name="gpu.type")
-            if gpu_type_raw.strip()
-            else ""
+            _validated_gpu_type(gpu_type_raw, field_name="gpu.type") if gpu_type_raw.strip() else ""
         )
         provider = gpu.get("provider", "")
         if not isinstance(provider, str):
@@ -461,6 +474,10 @@ class JobSpec:
                 raise ValueError(
                     f"gpu.provider {provider!r} cannot provision gpu.type {gpu_type!r}"
                 )
+        project_raw = data.get("project", "")
+        if not isinstance(project_raw, str):
+            raise TypeError("project must be a string")
+        project = require_project_id(project_raw) if project_raw.strip() else ""
         return cls(
             model=data.get("model", cls.model),
             model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
@@ -523,7 +540,7 @@ class JobSpec:
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
-            project=str(data.get("project") or ""),
+            project=project,
         )
 
     @classmethod
