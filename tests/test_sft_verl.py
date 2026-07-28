@@ -285,6 +285,44 @@ def test_explicit_schema_and_custom_dataset_read_text_image_orders(
     assert image_item["multi_modal_inputs"]["image_grid_thw"].tolist() == [[1, 2, 3]]
 
 
+@pytest.mark.parametrize("shape", ["listconfig", "list", "str"])
+def test_custom_dataset_accepts_every_parquet_files_shape(tmp_path, shape):
+    """verl passes data.train_files through from hydra, so the dataset sees a ListConfig."""
+    module = _load_custom_dataset_module(tmp_path)
+    parquet = tmp_path / "rows.parquet"
+    rows = [{"input_ids": [1, 2], "loss_mask": [0, 1], "images": [], "multimodal_inputs": b""}]
+    _write_sft_parquet(rows, str(parquet))
+
+    if shape == "listconfig":
+        # omegaconf is not a flash dependency (it lives in the verl venv), so stand in for
+        # ListConfig with the property that actually broke: a sequence that is not a list/tuple.
+        class _ListConfig:
+            def __init__(self, items):
+                self._items = list(items)
+
+            def __iter__(self):
+                return iter(self._items)
+
+            def __len__(self):
+                return len(self._items)
+
+        assert not isinstance(_ListConfig([]), (list, tuple))
+        parquet_files = _ListConfig([str(parquet)])
+    elif shape == "list":
+        parquet_files = [str(parquet)]
+    else:
+        parquet_files = str(parquet)
+
+    dataset = module.FlashTokenizedSFTDataset(
+        parquet_files=parquet_files,
+        tokenizer=SimpleNamespace(),
+        config={"max_length": 8, "truncation": "right", "ignore_input_ids_mismatch": False},
+    )
+    # constructing is the assertion: the ListConfig shape used to die here reading the parquet.
+    assert len(dataset) == 1
+    assert list(dataset.dataframe["input_ids"].iloc[0]) == [1, 2]
+
+
 def test_custom_dataset_rejects_suppressed_input_id_checks(tmp_path):
     module = _load_custom_dataset_module(tmp_path)
     parquet = tmp_path / "one.parquet"
