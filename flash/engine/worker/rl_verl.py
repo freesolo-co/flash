@@ -39,6 +39,7 @@ from flash.engine.worker.verl_common import (
     resolve_verl_python,
     verl_supports_rollout_field,
 )
+from flash.spec import gpu_count_of
 
 DATA_SOURCE = "flash_env"
 
@@ -154,6 +155,15 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # ppo_epochs multiplies verl's update loop, so its default of 1 preserves the requested update
         # count and on-policy baseline. unlike trl reuse, verl samples a fresh rollout for every update.
         f"actor_rollout_ref.actor.ppo_epochs={cfg['ppo_epochs']}",
+        # multi-gpu shape: shard every card along the sequence (ulysses) rather than the batch, and
+        # give vllm the same width for tensor parallelism. verl builds mesh_shape=(dp, sp) from this,
+        # so sp == n_gpus keeps dp == 1: the optimizer still sees ONE global batch of exactly
+        # prompts_per_step * group_size, identical to the single-gpu recipe. splitting the batch
+        # instead would silently change the gradient (dp shards ppo_mini_batch_size). sequence
+        # sharding is also what makes long contexts fit, since activations divide by n_gpus.
+        # ref (when kl is on) inherits this through dp_ref.yaml's oc.select on the actor key.
+        # requires use_remove_padding, which this recipe already sets above.
+        f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={cfg['n_gpus']}",
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
         # verl 0.8.0 hardcodes async rollout (ray_trainer.py:914), and AgentLoopManager splits the
@@ -180,7 +190,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
         f"actor_rollout_ref.rollout.gpu_memory_utilization={cfg['gpu_mem_util']}",
-        f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg['tp_size']}",
+        f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg['n_gpus']}",
         f"actor_rollout_ref.rollout.temperature={cfg['temperature']}",
         f"actor_rollout_ref.rollout.top_p={cfg['top_p']}",
         # verl recomputes rollout log-probs for the importance ratio regardless of the kl term.
@@ -191,7 +201,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # is migrated in the main process but not visible to the RewardLoopWorker actor); emit both.
         f"reward.custom_reward_function.path={cfg['reward_path']}",
         f"reward.custom_reward_function.name={cfg['reward_name']}",
-        "trainer.n_gpus_per_node=1",
+        f"trainer.n_gpus_per_node={cfg['n_gpus']}",
         "trainer.nnodes=1",
         f"trainer.total_epochs={cfg['total_epochs']}",
         # honor [train].max_steps: total_training_steps caps the optimizer-update horizon.
@@ -239,6 +249,7 @@ def _build_verl_training_cfg(
     fp8_kv: bool,
     reward_path: str,
     local_dir: str,
+    n_gpus: int = 1,
 ) -> dict:
     return {
         "train_files": train_files,
@@ -264,7 +275,7 @@ def _build_verl_training_cfg(
         "steps": int(inp["steps"]),
         "warmstart_adapter": inp["warmstart_adapter"],
         "gpu_mem_util": 0.5,
-        "tp_size": 1,
+        "n_gpus": n_gpus,
         "loggers": loggers,
         "fp8_kv": fp8_kv,
         "reward_path": reward_path,
@@ -959,6 +970,7 @@ def run_rl_verl():
             fp8_kv=fp8_kv,
             reward_path=reward_py,
             local_dir=local_dir,
+            n_gpus=gpu_count_of(_w.JOB_SPEC),
         )
         overrides = build_verl_overrides(cfg)
 
