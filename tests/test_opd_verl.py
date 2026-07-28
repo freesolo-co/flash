@@ -3791,6 +3791,43 @@ def test_optimizer_rank_posts_marker_once_across_multiple_steps(monkeypatch):
     assert updates == [True, True]
 
 
+def test_wrapped_optimizer_step_survives_the_lr_scheduler_rebind(monkeypatch):
+    # verl builds a warmup lr scheduler immediately after the optimizer, and torch's
+    # LRScheduler.__init__ patches optimizer.step through step_fn.__func__ followed by
+    # func.__get__(opt, opt.__class__). both only exist on a bound method, so wrapping step with a
+    # plain function crashed every opd run at engine construction, before any gpu work, with
+    # "'function' object has no attribute '__func__'". this replays that exact sequence rather
+    # than importing torch so it gates on machines without the training extras installed.
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    coordination = []
+    updates = []
+
+    class Optimizer:
+        def step(self, scale=1):
+            updates.append(scale)
+            return len(updates)
+
+    monkeypatch.setattr(
+        plugin,
+        "_coordinate_first_mutation_notice",
+        lambda url, token: coordination.append((url, token)),
+        raising=False,
+    )
+    optimizer = plugin._wrap_optimizer_with_mutation_notice(
+        Optimizer(),
+        "http://bridge",
+        "token",
+    )
+
+    function = optimizer.step.__func__
+    optimizer.step = function.__get__(optimizer, type(optimizer))
+
+    assert optimizer.step(scale=2) == 1
+    assert updates == [2]
+    assert coordination == [("http://bridge", "token")]
+
+
 def test_each_optimizer_rank_acknowledges_marker_while_parent_publishes_once(
     monkeypatch,
 ):

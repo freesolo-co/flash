@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import types
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -594,15 +595,20 @@ def _wrap_optimizer_with_mutation_notice(optimizer, url: str, token: str):
     original_step = optimizer.step
     mutation_acknowledged = False
 
+    # torch's lr scheduler patches optimizer.step to assert step ordering, and that patch reads
+    # step_fn.__func__ and rebinds it with func.__get__(opt, opt.__class__). both only exist on a
+    # bound method, so assigning a plain function here fails with "'function' object has no
+    # attribute '__func__'" as soon as verl builds its warmup scheduler, before any gpu work
+    # happens. bind the wrapper to the instance so the descriptor protocol keeps working.
     @functools.wraps(original_step)
-    def step_with_notice(*args, **kwargs):
+    def step_with_notice(_optimizer, *args, **kwargs):
         nonlocal mutation_acknowledged
         if not mutation_acknowledged:
             _coordinate_first_mutation_notice(url, token)
             mutation_acknowledged = True
         return original_step(*args, **kwargs)
 
-    optimizer.step = step_with_notice
+    optimizer.step = types.MethodType(step_with_notice, optimizer)
     return optimizer
 
 
