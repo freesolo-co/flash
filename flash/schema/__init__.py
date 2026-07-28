@@ -636,6 +636,19 @@ def _validate_opsd(spec: JobSpec) -> None:
         raise ConfigError(
             "opsd uses the local frozen base teacher; train.teacher_model is not supported"
         )
+    # the opsd worker writes one adapter after the loop and never reads either knob, so accepting
+    # them means a run that validates, round-trips the setting in its spec, and then silently has
+    # no mid-run checkpoint to recover from. reject at submit instead of at the end of a paid run.
+    if spec.train.save_every is not None:
+        raise ConfigError(
+            "opsd writes a single adapter when the run finishes; train.save_every is not "
+            "supported. Remove it, or use an algorithm with periodic checkpoints."
+        )
+    if spec.train.save_at_steps:
+        raise ConfigError(
+            "opsd writes a single adapter when the run finishes; train.save_at_steps is not "
+            "supported. Remove it, or use an algorithm with periodic checkpoints."
+        )
     _validate_on_policy_prompt_budget(spec, "opsd")
 
 

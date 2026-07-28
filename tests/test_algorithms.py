@@ -52,6 +52,30 @@ def test_opsd_algorithm_accepted_and_normalized():
     assert spec.phase == "opsd"
 
 
+@pytest.mark.parametrize(
+    ("knob", "value"),
+    [("save_every", 10), ("save_at_steps", [5])],
+)
+def test_opsd_rejects_checkpoint_knobs_its_worker_never_reads(knob, value):
+    """OPSD writes one adapter at the end, so accepting these makes recovery look configured.
+
+    The knobs validated and round-tripped in the run spec while the worker never read them, so a
+    run that degraded mid-way had no mid-run checkpoint to fall back to, and nothing said so until
+    the paid run was over.
+    """
+    with pytest.raises(ConfigError, match="single adapter when the run finishes"):
+        spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opsd",
+                "thinking": True,
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "train": {"epochs": 1, "max_examples": 10, "max_steps": 20, knob: value},
+            },
+            run_id="x",
+        )
+
+
 def test_opsd_registration_boundaries_are_on_policy_local_teacher_and_text_only():
     from flash.catalog import samples_on_policy, validate_model_for_algorithm
     from flash.cost.spec import runconfig_from_spec, spec_steps
