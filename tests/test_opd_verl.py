@@ -4431,6 +4431,7 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["++actor_rollout_ref.rollout.limit_images"] == "8"
     assert overrides["++actor_rollout_ref.rollout.engine_kwargs.vllm.seed"] == "42"
     assert "actor_rollout_ref.rollout.seed" not in overrides
+    assert overrides["actor_rollout_ref.rollout.load_format"] == "safetensors"
     assert "actor.engine.ulysses_sequence_parallel_size" not in overrides
     assert "ref_log_prob" not in " ".join(overrides)
     assert not any("structured_outputs_config" in key for key in overrides)
