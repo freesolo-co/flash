@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pytest
+
 import flash.cli as cli
 from flash.cli.env_test import cmd_env_test
 
@@ -494,6 +496,34 @@ def test_env_test_param_flag_parses_toml_scalars(monkeypatch, tmp_path):
 
     assert args.func(args) == 0
     assert seen["kwargs"] == {"max_rows": 5, "strict": True, "name": "hard"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["filters=[1,2", 'name="unterminated', "opts={a=1", "tags=['x'"],
+)
+def test_env_test_malformed_structured_param_fails_instead_of_becoming_a_string(
+    monkeypatch, tmp_path, capsys, value
+):
+    # a value that opens a quote, array, or inline table is structured but malformed. keeping it
+    # as a literal string would validate the environment against parameters the equivalent
+    # [environment.params] entry could never load, so the offline check would pass on inputs
+    # training rejects.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    assert "is not a valid TOML value" in capsys.readouterr().err
+
+
+def test_env_test_bare_unquoted_param_still_falls_back_to_a_string(monkeypatch, tmp_path):
+    # the common case stays convenient: unquoted text is not valid TOML but is what users type.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=["name=hard mode"])) == 0
+    assert seen["kwargs"] == {"name": "hard mode"}
 
 
 def test_env_test_split_flag_overrides_param_split(monkeypatch, tmp_path):
