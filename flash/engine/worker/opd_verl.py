@@ -71,6 +71,7 @@ from flash.engine.worker.verl_common import (
     clamp_engine_len,
     latest_global_step_dir,
     model_max_position_embeddings,
+    parse_verl_metric,
     parse_wandb_link,
     render_wandb_link_shim,
     resolve_verl_python,
@@ -79,7 +80,6 @@ from flash.engine.worker.verl_common import (
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resume_state_metadata
 
 _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
-_VERL_METRIC_RE = re.compile(r"(?:^| - )(?P<name>[^:]+):(?P<value>[^ ]+)")
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 _TEXT_TEACHER_BATCH_SIZE = 8
@@ -1721,17 +1721,6 @@ def _write_opd_parquet(rows: list[dict], path: str) -> None:
     Dataset.from_list(rows, features=features).to_parquet(path)
 
 
-def _metric_value(line: str, name: str) -> float | None:
-    for match in _VERL_METRIC_RE.finditer(line):
-        if match.group("name").strip() != name:
-            continue
-        try:
-            return float(match.group("value"))
-        except ValueError:
-            return None
-    return None
-
-
 # the verl bridge stores the empty-alignment skip under its own internal key,
 # which the resume state also reads. trl publishes the same condition as
 # alignment_empty, so translate it at the metadata boundary only.
@@ -2464,9 +2453,15 @@ def run_opd_verl(spec=None) -> None:
             step_match = _VERL_STEP_RE.search(line)
             if step_match is None:
                 return
-            loss = _metric_value(line, "actor/distillation/loss")
+            # parse_verl_metric, not a local float(): verl aggregates this metric with
+            # Metric(SUM) -> np.sum (verl/utils/metric/utils.py), and LocalLogger renders it
+            # through pprint, so under the image's numpy 2.2.6 it prints as
+            # "np.float64(0.64)". a bare float() raises on that spelling, dropping every step
+            # and leaving loss_curve empty -- which the publish guard below turns into a hard
+            # failure on a run that actually trained.
+            loss = parse_verl_metric(line, "actor/distillation/loss")
             if loss is None:
-                loss = _metric_value(line, "distillation/loss")
+                loss = parse_verl_metric(line, "distillation/loss")
             if loss is None:
                 # verl emits step-tagged lines that are not metric summaries (timers, val lines);
                 # skip those rather than killing the run. the end-of-run guard still fails loud

@@ -752,3 +752,47 @@ def test_overrides_enable_fused_linear_ce_for_long_context():
     assert "model.use_fused_kernels=true" in o
     assert "model.fused_kernel_options.impl_backend=torch" in o
     assert "data.max_length=32768" in o
+
+
+def test_sft_line_handler_reads_metrics_through_the_shared_parser():
+    """sft shares OPD's numpy-2-aware parser instead of keeping its own float() copy.
+
+    sft's three metrics reach the logger as plain python floats today (engine_workers.py
+    returns loss/grad_norm via .item() and lr via get_last_lr()), so unlike OPD's
+    Metric(SUM) they do not currently print in numpy's np.float64(...) spelling. the
+    duplicate parser was still removed: one upstream metric-type change would have
+    reintroduced the same silent drop, and the shared helper additionally rejects nan/inf,
+    which would otherwise serialize into the heartbeat as bare NaN.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import flash.engine.worker.sft_verl as sv
+
+    source = textwrap.dedent(inspect.getsource(sv.run_sft_verl))
+    handler = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "on_line"
+    )
+    calls = [
+        node.func.id
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert calls.count("parse_verl_metric") == 3
+    assert "_metric_value" not in calls
+    # the duplicated helper and its regex are gone, not merely unused.
+    assert not hasattr(sv, "_metric_value")
+    assert not hasattr(sv, "_VERL_METRIC_RE")
+
+
+def test_sft_drops_a_non_finite_loss_instead_of_poisoning_the_heartbeat():
+    """a nan loss serializes as bare NaN, which strict json consumers reject."""
+    import flash.engine.worker.sft_verl as sv
+
+    assert sv.parse_verl_metric("step:2 - train/loss:nan - train/lr:1e-05", "train/loss") is None
+    assert sv.parse_verl_metric("step:2 - train/loss:inf", "train/loss") is None
+    # a finite value on the same line is unaffected.
+    assert sv.parse_verl_metric("step:2 - train/loss:nan - train/lr:1e-05", "train/lr") == 1e-05
