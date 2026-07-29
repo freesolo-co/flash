@@ -167,6 +167,65 @@ def test_cmd_env_pull_positional_dir_names_the_destination_form(monkeypatch, tmp
     assert "david-freesolo-co/stuff" in err
 
 
+def test_cmd_env_pull_explicit_output_dir_keeps_the_single_file_diagnostic(
+    monkeypatch, tmp_path, capsys
+):
+    """An explicit `-o dir` named the in-env path on purpose, so do not tell the user to drop it.
+
+    `flash env pull ns/env config.json -o existing-dir` is a single-file pull whose destination is
+    wrong. Following the mistaken-positional hint here would abandon config.json and turn the
+    command into a whole-environment download instead of fixing the destination.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "existing-dir").mkdir()
+
+    rc = cmd_env_pull(_margs(path="config.json", output="existing-dir", force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "needs -o to be a FILE path" in err
+    assert "drop the second positional" not in err
+
+
+def test_cmd_env_pull_positional_dir_hint_is_shell_quoted(monkeypatch, tmp_path, capsys):
+    """The suggested command must survive a copy-paste out of a directory name with spaces.
+
+    Unquoted, `-o into here` splits into two shell arguments and argparse rejects the very command
+    offered as the remedy.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into here").mkdir()
+
+    rc = cmd_env_pull(_margs(path="into here", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "-o 'into here'" in err
+
+
+def test_cmd_env_pull_positional_nonempty_dir_hint_says_how_to_replace_it(
+    monkeypatch, tmp_path, capsys
+):
+    """A nonempty destination needs --force, so the bare command would just fail again.
+
+    The whole-environment path runs ensure_environment_pull_destination_available(overwrite=False),
+    which rejects every nonempty directory -- offering it as the remedy trades one error for the next.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into-here").mkdir()
+    (tmp_path / "into-here" / "existing.txt").write_text("keep me")
+
+    rc = cmd_env_pull(_margs(path="into-here", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "not empty" in err
+    assert "--force" in err
+
+
 def test_cmd_env_pull_whole_env(monkeypatch, tmp_path):
     _patch_client(
         monkeypatch,
