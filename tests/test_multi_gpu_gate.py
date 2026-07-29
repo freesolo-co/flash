@@ -66,11 +66,11 @@ def test_gate_rejects_multi_gpu_on_providers_that_ignore_count():
 
 
 def test_effective_backend_reads_the_phase_env_key():
-    from flash import runner
+    from flash.spec import effective_backend
 
     # grpo's worker env key is FLASH_RL_BACKEND (spec.phase maps grpo -> rl), not FLASH_GRPO_BACKEND.
-    assert runner._effective_backend(_spec(1, "grpo", backend="verl")) == "verl"
-    assert runner._effective_backend(_spec(1, "sft")) == "trl"
+    assert effective_backend(_spec(1, "grpo", backend="verl")) == "verl"
+    assert effective_backend(_spec(1, "sft")) == "trl"
 
 
 def test_submit_job_rejects_multi_gpu_at_boundary(monkeypatch):
