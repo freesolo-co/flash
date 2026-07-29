@@ -1228,11 +1228,85 @@ def test_run_rl_verl_wires_the_gradient_check_into_the_publish_path():
     # a helper nothing calls is not a guard. assert the training path actually invokes it, and that
     # it does so before the adapter export rather than after a publish has already happened.
     source = inspect.getsource(rl_verl.run_rl_verl)
-    assert "_check_grpo_had_a_gradient(reward_history, adv_spread_history)" in source
+    assert (
+        "_check_grpo_had_a_gradient(reward_history, adv_spread_history, resumed=bool(resume_step))"
+        in source
+    )
     assert source.index("_check_grpo_had_a_gradient") < source.index("_export_peft_adapter")
     # and that the spread series it passes is actually collected from the child's output.
     assert 'parse_verl_metric(line, "critic/advantages/max")' in source
     assert 'parse_verl_metric(line, "critic/advantages/min")' in source
+
+
+def test_grpo_gradient_check_abstains_for_a_resumed_run():
+    # a run resuming at step 9 of 10 observes ONE step; if that group ties, the spread history is
+    # all-zero even though the restored weights carry nine steps of real updates. rejecting it would
+    # throw away a correctly trained policy, so the resumed case abstains from the spread verdict.
+    rl_verl._check_grpo_had_a_gradient([1.0], [0.0], resumed=True)
+    # abstaining is scoped to the spread verdict only: the parse/wiring checks still apply, because
+    # a missing metric stream is a regression no matter where training started.
+    with pytest.raises(RuntimeError, match="no advantage metrics"):
+        rl_verl._check_grpo_had_a_gradient([1.0], [], resumed=True)
+    with pytest.raises(RuntimeError, match="never consulted"):
+        rl_verl._check_grpo_had_a_gradient([], [], resumed=True)
+    # and a FRESH run with the same all-zero history is still rejected -- the abstention must be
+    # about the resume boundary, not a weakening of the guard.
+    with pytest.raises(RuntimeError, match="zero advantage spread"):
+        rl_verl._check_grpo_had_a_gradient([1.0], [0.0], resumed=False)
+
+
+def test_resume_uploader_withholds_deployables_until_spread_appears():
+    # the uploader publishes servable adapters WHILE training runs, so a degenerate-reward run would
+    # make untrained adapters durable minutes before the end-of-run guard fails the run.
+    spread: list[float] = []
+    uploader = rl_verl._VerlResumeUploader(
+        "/nonexistent",
+        resume_step=0,
+        required_steps=(1,),
+        had_gradient=lambda: any(s > 0.0 for s in spread),
+    )
+    assert uploader._deployable_allowed() is False
+    spread.append(0.0)  # a step ran, but its group tied: still no gradient evidence
+    assert uploader._deployable_allowed() is False
+    spread.append(1.25)
+    assert uploader._deployable_allowed() is True
+
+
+def test_resume_uploader_treats_an_unreadable_gradient_signal_as_closed():
+    # this gate decides whether an artifact becomes durable and servable, so a callback that raises
+    # must not be read as permission to publish.
+    def boom() -> bool:
+        raise RuntimeError("signal unavailable")
+
+    uploader = rl_verl._VerlResumeUploader("/nonexistent", resume_step=0, had_gradient=boom)
+    assert uploader._deployable_allowed() is False
+    # and no callback at all means no gate, which is the resume-only configuration.
+    assert rl_verl._VerlResumeUploader("/nonexistent", resume_step=0)._deployable_allowed() is True
+
+
+def test_run_rl_verl_gates_midtraining_deployables_and_exempts_resumes():
+    source = inspect.getsource(rl_verl.run_rl_verl)
+    # the gate must be wired into the uploader, not merely available on it.
+    assert "had_gradient=(" in source
+    # a resumed run publishes as before: its restored weights already carry earlier updates that
+    # this worker's spread history cannot speak for.
+    assert "if resume_step" in source.split("had_gradient=(")[1].split(")")[0] + ")"
+    # the spread series must be declared before the uploader closes over it, or the closure raises
+    # NameError the first time the drain thread consults it.
+    assert source.index("adv_spread_history: list[float] = []") < source.index("_VerlResumeUploader(")
+
+
+def test_resume_uploader_withheld_required_step_is_not_marked_processed():
+    # withholding must leave the step PENDING so it republishes once spread appears, and so
+    # raise_if_incomplete() still reports it missing if it never does. marking it processed would
+    # convert "not yet allowed" into "silently dropped".
+    source = inspect.getsource(rl_verl._VerlResumeUploader._run)
+    gate = source.split("if not deployable_ok:")[1]
+    body = gate.split("self._publish_deployable")[0]
+    assert "continue" in body
+    assert "processed_steps.add" not in body
+    # and stop() must not wait forever on a step the gate will never release.
+    assert "stalled" in source
 
 
 def test_train_notes_report_whether_the_run_resumed():

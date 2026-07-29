@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from functools import reduce
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import gcd
@@ -944,6 +945,7 @@ class _VerlResumeUploader:
         model_id: str = "",
         model_revision: str = "",
         tokenizer=None,
+        had_gradient: Callable[[], bool] | None = None,
     ) -> None:
         self.local_dir = local_dir
         # whatever this run resumed from is already durable; re-uploading it would waste the
@@ -955,6 +957,13 @@ class _VerlResumeUploader:
         self.model_id = model_id
         self.model_revision = model_revision
         self.tokenizer = tokenizer
+        # gates DEPLOYABLE publication (not resume upload) on the run having produced a real
+        # gradient. these publishes land while training is still running, so without the gate a
+        # degenerate-reward run makes untrained adapters durable and servable minutes before
+        # _check_grpo_had_a_gradient fails the run -- the guard would reject the final adapter while
+        # the per-step ones stayed published. resume state is deliberately still uploaded: it is
+        # internal retry scaffolding, not something a customer can serve.
+        self.had_gradient = had_gradient
         # populated by credit_durable_required_steps() before start(): crediting a required step
         # needs an hf lookup, which does not belong in a constructor.
         self.published_steps: set[int] = set()
@@ -997,6 +1006,20 @@ class _VerlResumeUploader:
         missing = sorted(self.required_steps - self.published_steps)
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
+
+    def _deployable_allowed(self) -> bool:
+        """whether gradient evidence has appeared yet, so a deployable may be published.
+
+        no callback means no gate (the resume-only configuration and the tests that predate it).
+        a raising callback is treated as CLOSED: this decides whether an artifact becomes durable
+        and servable, so an unreadable signal must not be read as permission.
+        """
+        if self.had_gradient is None:
+            return True
+        try:
+            return bool(self.had_gradient())
+        except Exception:
+            return False
 
     def _completed_step(self) -> int:
         tracker = os.path.join(self.local_dir, "latest_checkpointed_iteration.txt")
@@ -1046,15 +1069,25 @@ class _VerlResumeUploader:
         # it propagates and raise_if_incomplete() turns it into a run failure.
         try:
             while True:
+                deployable_ok = self._deployable_allowed()
                 for step, path in self._pending(self._completed_step()):
                     if step in self.required_steps and step not in self.published_steps:
+                        if not deployable_ok:
+                            # hold this step back rather than publish an untrained adapter, and do
+                            # NOT mark it processed: the next sweep retries it once spread appears,
+                            # and if it never does, raise_if_incomplete still reports it missing.
+                            continue
                         self._publish_deployable(step, path)
                     try:
                         _w.upload_resume_checkpoint(step, path)
                     except Exception as error:
                         print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
                     self.processed_steps.add(step)
-                if self._stop.is_set() and not self._pending(self._completed_step()):
+                # a withheld step stays pending by design, so "stopped and drained" can no longer be
+                # the only exit: with the gate shut those steps never clear, and waiting for them
+                # would hang stop(). raise_if_incomplete() reports them as the run failure instead.
+                stalled = not deployable_ok and bool(self.required_steps)
+                if self._stop.is_set() and (stalled or not self._pending(self._completed_step())):
                     return
                 time.sleep(0.5)
         except BaseException as error:
@@ -1083,7 +1116,12 @@ def _restore_verl_resume(local_dir: str) -> int:
     return step
 
 
-def _check_grpo_had_a_gradient(reward_history: list[float], adv_spread_history: list[float]) -> None:
+def _check_grpo_had_a_gradient(
+    reward_history: list[float],
+    adv_spread_history: list[float],
+    *,
+    resumed: bool = False,
+) -> None:
     """raise unless the run's rewards actually produced a nonzero policy gradient.
 
     every other completion check a grpo run passes -- terminal state, a written checkpoint, an
@@ -1094,6 +1132,14 @@ def _check_grpo_had_a_gradient(reward_history: list[float], adv_spread_history: 
     advantages is the only one of these series that can tell the two apart: the reward mean cannot
     (a constant reward has a perfectly healthy mean) and neither can pg_loss, which is near zero at
     step 1 for a genuinely training run too, because the importance ratio is still exactly 1.
+
+    ``resumed`` disables the spread verdict, because these series only cover the steps THIS worker
+    observed. a run resuming at step 9 of 10 sees one step, and if that step's group happens to tie
+    the history is all-zero even though the restored weights already carry nine steps of productive
+    updates -- rejecting it would discard a correctly trained policy. the evidence needed to judge a
+    resumed run lives in the steps a previous worker ran, which is not recoverable from this
+    worker's stdout, so the honest move is to abstain rather than guess. the degenerate-environment
+    case this guard exists for is unaffected: such a run fails on its first, unresumed attempt.
     """
     if not reward_history:
         raise RuntimeError(
@@ -1111,6 +1157,11 @@ def _check_grpo_had_a_gradient(reward_history: list[float], adv_spread_history: 
             "critic/advantages/max and /min could not be parsed (metric-format regression); "
             "refusing to publish because the zero-gradient check cannot run"
         )
+    if resumed:
+        # see the docstring: this worker's history is a suffix of the run's training, so an all-zero
+        # suffix is not evidence the run never had a gradient. the parse checks above still apply --
+        # they catch a wiring/format regression regardless of where training started.
+        return
     # deliberately "no step ever had spread" rather than "some step had none": a run that genuinely
     # converges, or that draws one unlucky all-equal group, legitimately reports zero spread on
     # individual steps, and rejecting those would fail correct runs.
@@ -1588,6 +1639,13 @@ def run_rl_verl():
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
         _w.heartbeat("rl_step", step=0, initial=True)
         t_train = time.time()
+        # grpo's advantage is within-group and mean-centred (A_i = r_i - mean(r_group)), so a group
+        # whose rewards are all equal yields advantage exactly 0 for every sample, hence a zero
+        # gradient. the spread of the advantages is what says whether the optimizer got a signal;
+        # neither the reward mean nor pg_loss can, so collect max/min per step and check below.
+        # declared here, ahead of the uploader, because the uploader's publication gate closes over
+        # it -- the metric loop that fills it starts further down.
+        adv_spread_history: list[float] = []
         resume_uploader = _VerlResumeUploader(
             local_dir,
             resume_step=resume_step,
@@ -1597,6 +1655,14 @@ def run_rl_verl():
             model_id=inp["model_id"],
             model_revision=inp["model_revision"],
             tokenizer=tok,
+            # a resumed run's restored weights already carry the earlier steps' updates, so this
+            # worker's own spread history cannot speak for them; let it publish as before and leave
+            # the verdict to the same abstention _check_grpo_had_a_gradient makes.
+            had_gradient=(
+                None
+                if resume_step
+                else lambda: any(spread > 0.0 for spread in adv_spread_history)
+            ),
         )
         resume_uploader.credit_durable_required_steps(resume_step)
         resume_uploader.start()
@@ -1622,11 +1688,6 @@ def run_rl_verl():
         reward_history: list[float] = []
         resp_len_history: list[float] = []
         loss_curve: list[float] = []
-        # grpo's advantage is within-group and mean-centred (A_i = r_i - mean(r_group)), so a group
-        # whose rewards are all equal yields advantage exactly 0 for every sample, hence a zero
-        # gradient. the spread of the advantages is what says whether the optimizer got a signal;
-        # neither the reward mean nor pg_loss can, so collect max/min per step and check below.
-        adv_spread_history: list[float] = []
         last_dump_step = [-1]
         # per-step backlog for `flash runs log -f`, rebuilt from verl's own step lines because its
         # trainer runs out of process and cannot host trl's callback. read by the liveness thread
@@ -1742,7 +1803,7 @@ def run_rl_verl():
     shutil.rmtree(adapter_dir, ignore_errors=True)
     os.makedirs(adapter_dir, exist_ok=True)
     train_wall = time.time() - t_train
-    _check_grpo_had_a_gradient(reward_history, adv_spread_history)
+    _check_grpo_had_a_gradient(reward_history, adv_spread_history, resumed=bool(resume_step))
     actor_dir, steps_run = _latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
         raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")
