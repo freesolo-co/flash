@@ -245,6 +245,10 @@ def _negative_control_rewards(env, example: dict, reference: str) -> list[float]
 
     Returns None when no control can be shown to be wrong for this example, so the caller can
     exclude the episode instead of drawing a conclusion the evidence does not support.
+
+    Raises ValueError when the grader returns a non-finite score, which is the same contract
+    violation the gold answer is already failed for: the policy reaches this scorer with
+    completions no more expected than these, and NaN or infinity there yields unusable samples.
     """
     if env.multi_turn:
         return None
@@ -258,8 +262,9 @@ def _negative_control_rewards(env, example: dict, reference: str) -> list[float]
             # the grader may reject an off-distribution string outright. that is its prerogative
             # and says nothing about the gold answer, so decline to judge rather than fail.
             return None
-        if math.isfinite(score):
-            scores.append(score)
+        if not math.isfinite(score):
+            raise ValueError(f"reward is not finite for a non-reference completion: {score}")
+        scores.append(score)
     return scores or None
 
 
@@ -341,6 +346,7 @@ def cmd_env_test(args) -> int:
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
         failure: str | None = None
+        controls: list[float] | None = None
         try:
             if env.multi_turn:
                 _drive_multi_turn(env, example, record)
@@ -349,6 +355,14 @@ def cmd_env_test(args) -> int:
             reward = record["reward"]
             if reward is None or not math.isfinite(reward):
                 raise ValueError(f"reward is not finite: {reward}")
+            if record["policy"] == "replay" and not record["partial_replay"]:
+                # the absolute value of a gold reward proves nothing: the contract accepts any
+                # finite scalar, so an env may legitimately score its reference 0.0 with worse
+                # completions below it. what makes a grader unusable for RL is that it cannot
+                # SEPARATE a good completion from a bad one, so score wrong answers and compare.
+                # scored inside this guard because a non-finite control breaks the same reward
+                # contract as a non-finite gold score and must fail the episode the same way.
+                controls = _negative_control_rewards(env, example, record["responses"][0])
         except (Exception, SystemExit) as exc:
             failure = str(exc) or exc.__class__.__name__
 
@@ -365,18 +379,11 @@ def cmd_env_test(args) -> int:
             continue
 
         passed += 1
-        if record["policy"] == "replay" and reward is not None and not record["partial_replay"]:
-            # the absolute value of a gold reward proves nothing: the contract accepts any finite
-            # scalar, so an env may legitimately score its reference 0.0 with worse completions
-            # below it. what makes a grader unusable for RL is that it cannot SEPARATE a good
-            # completion from a bad one, so score deliberately wrong answers and compare.
-            controls = _negative_control_rewards(env, example, record["responses"][0])
-            if controls is None:
-                # no wrong answer could be shown to be wrong for this example (multi-turn, no
-                # control disjoint from the gold text, or the grader rejected them outright), so
-                # this episode carries no evidence either way. counting it as controlled would let
-                # the gate below speak for episodes it never tested.
-                continue
+        # controls is None when no wrong answer could be shown to be wrong for this example
+        # (multi-turn, no control disjoint from the gold text, or the grader rejected them
+        # outright), so the episode carries no evidence either way. counting it as controlled
+        # would let the gate below speak for episodes it never tested.
+        if controls is not None and reward is not None:
             controlled += 1
             if all(control == reward for control in controls):
                 scored_flat += 1

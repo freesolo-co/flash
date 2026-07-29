@@ -499,6 +499,29 @@ def test_env_test_substring_grader_gold_inside_a_control_still_passes(
                 assert gold not in control, (gold, control)
 
 
+def test_env_test_non_finite_control_reward_fails_the_episode(monkeypatch, tmp_path, capsys):
+    # a scorer that returns NaN for an unexpected completion breaks the same reward contract the
+    # gold answer is already failed for: the policy reaches this scorer with completions no more
+    # expected than the controls, and non-finite rewards there yield unusable samples. excluding
+    # the episode as merely inconclusive would let `overall: PASS` hide that.
+    env_dir = _environment_dir(tmp_path)
+
+    class _NanControlEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            if completion != example.get("output", ""):
+                return float("nan")
+            return 1.0
+
+    _patch_loader(monkeypatch, _NanControlEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "0/1 episodes passed contract checks" in captured.out
+    assert "reward is not finite for a non-reference completion" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_test_permissive_grader_is_not_reported_as_unrankable(monkeypatch, tmp_path, capsys):
     # an open-ended task ("respond with a sentence") can legitimately accept a wrong english
     # sentence while still ranking other completions below it. scoring several controls rather
