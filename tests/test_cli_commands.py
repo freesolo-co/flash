@@ -192,6 +192,14 @@ def project_api(monkeypatch):
 def fake_client(monkeypatch) -> _FakeClient:
     client = _FakeClient()
     monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: client)
+    # whoami builds its client directly from one credential snapshot rather than going through
+    # client_from_config, so patch that construction too or it would reach the real control plane.
+    monkeypatch.setattr(cli.commands, "ApiClient", lambda *a, **k: client)
+    monkeypatch.setattr(
+        cli.commands,
+        "credential_snapshot",
+        lambda: ("https://flash.test", "fslo-test", "FREESOLO_API_KEY", "FLASH_API_URL"),
+    )
     return client
 
 
