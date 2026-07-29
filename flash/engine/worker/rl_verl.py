@@ -1490,7 +1490,8 @@ def run_rl_verl():
             raise RuntimeError(
                 f"grpo requested mask_truncated_completions but the verl at {python_bin} does not "
                 "support it. that verl predates the freesolo fork; point FLASH_VERL_PYTHON at an "
-                f"interpreter with '{VERL_REQUIREMENT}' installed, or unset it to provision one."
+                f"interpreter with '{VERL_REQUIREMENT}' installed, or set it EMPTY "
+                '([worker_env] FLASH_VERL_PYTHON = "") to provision one.'
             )
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).

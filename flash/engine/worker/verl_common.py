@@ -115,7 +115,12 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     on verl_supports_rollout_field.
 
     a self-provisioned venv is flash's own, and is rebuilt whenever it does not record the current
-    VERL_REQUIREMENT, so unsetting FLASH_VERL_PYTHON always yields the pinned verl.
+    VERL_REQUIREMENT, so an empty/absent FLASH_VERL_PYTHON always yields the pinned verl.
+
+    an EMPTY value is deliberately equivalent to absent, and it is the only route a run has: worker
+    images can export FLASH_VERL_PYTHON themselves, and [worker_env] can set a key but never delete
+    one, so omitting it from the spec leaves the image's value in place. `""` is what lets a spec
+    say "ignore the image's interpreter and provision the pinned one".
     """
     preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
     if preset:

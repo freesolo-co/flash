@@ -70,6 +70,22 @@ def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):
     assert vc.resolve_verl_python(str(tmp_path)) == "/opt/verl/bin/python"
 
 
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_path, blank):
+    # a worker IMAGE can export FLASH_VERL_PYTHON itself, and [worker_env] can only SET a key, never
+    # delete one -- so omitting it from a spec leaves the image's interpreter in place. an empty
+    # value is the only way a run can say "ignore the image's verl and provision the pinned fork",
+    # and the error at rl_verl.py's mask_truncated_completions gate names exactly this remedy.
+    calls = []
+    monkeypatch.setenv("FLASH_VERL_PYTHON", blank)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    python_bin = vc.resolve_verl_python(str(tmp_path))
+
+    assert python_bin.endswith("/verl-venv/bin/python")
+    assert vc.VERL_REQUIREMENT in calls[1]
+
+
 def _fake_verl_venv(tmp_path, *, stamp: str | None):
     """materialize a verl-venv as an earlier attempt would have left it on the pod."""
     venv = tmp_path / "verl-venv"
