@@ -1573,6 +1573,7 @@ def run_rl_verl():
         # trainer runs out of process and cannot host trl's callback. read by the liveness thread
         # below, so mutate it in place (append_step_metrics) rather than rebinding.
         metrics_last: list[dict] = []
+        sent_first_metrics = False
         with liveness_heartbeat(
             "rl_step",
             progress=_progress,
@@ -1615,6 +1616,20 @@ def run_rl_verl():
                         # the worker's error path reads this global, so a run that dies mid-training
                         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
                         LATEST_GRPO_METRICS_LAST[:] = metrics_last
+                        # the rl_train_start ping arms the 900s rl_step throttle, and the liveness
+                        # daemon never forces, so the first backlog would stay invisible for 15
+                        # minutes. force it through the way trl does (heartbeat.py
+                        # force_first_samples), and keep retrying until one commits: the daemon may
+                        # claim this step first, which is fine because its payload carries the same
+                        # backlog. only the FIRST is forced, so the hf commit cap stays protected.
+                        if not sent_first_metrics:
+                            sent_first_metrics = _w.heartbeat(
+                                "rl_step",
+                                force=True,
+                                step=step_metrics["step"],
+                                metrics_last=list(metrics_last),
+                                gpu=gpu_diagnostics(include_torch=False),
+                            )
                         # per-step series for train_meta observability parity. these live on the same
                         # line as everything else: verl's only console metric sink is LocalLogger,
                         # which always prints "step:N - ..." (verl/utils/logger/aggregate_logger.py),

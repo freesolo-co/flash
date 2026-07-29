@@ -238,6 +238,36 @@ def test_train_meta_series_are_collected_only_from_step_lines():
         assert verl_key in collected, f"{verl_key} must be collected inside the step branch"
 
 
+def test_first_backlog_is_forced_past_the_rl_step_throttle():
+    # rl_train_start arms the 900s rl_step throttle and the liveness daemon never passes force=True,
+    # so without an explicit forced ping the first metrics row stays invisible for 15 minutes -- the
+    # exact window trl covers with force_first_samples (heartbeat.py). the retry-until-committed
+    # shape matters too: the daemon can claim the step first, and a bare `sent = True` would then
+    # mark a heartbeat that never committed as sent.
+    tree = _verl_rl_tree()
+
+    forced = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "rl_step"
+        and any(kw.arg == "force" for kw in node.keywords)
+    ]
+    assert len(forced) == 1, "verl must force exactly one first rl_step metrics heartbeat"
+    keywords = {kw.arg for kw in forced[0].keywords}
+    assert "metrics_last" in keywords, "the forced ping must carry the backlog it exists to surface"
+
+    guard = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If) and "sent_first_metrics" in ast.unparse(node.test)
+    )
+    assert isinstance(guard.body[0], ast.Assign), "retry until a forced ping actually commits"
+    assert "heartbeat" in ast.unparse(guard.body[0].value)
+
+
 def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
     # the payload schema belongs to the cli, not verl: a key the renderer does not know is dead
     # weight, so keep the mapping's flash-side names inside the rendered set.
