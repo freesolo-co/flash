@@ -536,10 +536,11 @@ def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
         ),
         _smoke_spec(algorithm="grpo", thinking=False, max_completion_tokens=8192),
         _smoke_spec(algorithm="opd", thinking=False, max_completion_tokens=8192),
-        _smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192),
     ],
 )
-def test_run_deployment_smoke_keeps_non_target_paths_at_256(monkeypatch, spec):
+def test_run_deployment_smoke_keeps_non_thinking_paths_at_256(monkeypatch, spec):
+    """A non-thinking adapter emits its answer immediately, so 256 tokens is enough for every
+    algorithm. Only the thinking path needs the run's real budget."""
     calls = []
 
     def fake_serve_chat(**kwargs):
@@ -550,6 +551,54 @@ def test_run_deployment_smoke_keeps_non_target_paths_at_256(monkeypatch, spec):
     _run_smoke(spec)
 
     assert calls[0]["max_tokens"] == 256
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        # opd with an explicit budget, no grammar: previously fell to 256 and could not deploy.
+        (_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192), 8192),
+        # grpo thinking with no grammar and no explicit budget -> the thinking recipe default.
+        (_smoke_spec(algorithm="grpo", thinking=True), 1536),
+    ],
+)
+def test_run_deployment_smoke_budgets_thinking_without_structured_outputs(
+    monkeypatch, spec, expected
+):
+    """A thinking adapter spends its budget reasoning BEFORE emitting content, so 256 tokens buys a
+    truncated <think> block and no answer -- the smoke then fails "returned no content
+    (finish_reason='length')" and the deployment is rejected. That is a property of thinking, not of
+    structured_outputs, so a run using stop_sequences instead of a grammar was undeployable: every
+    checkpoint failed the same gate. The larger budget must follow spec.thinking alone."""
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("<think>2+2 is 4</think>The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    out = _run_smoke(spec)
+
+    assert calls[0]["max_tokens"] == expected
+    # the whole balanced string is the sample on the non-structured path (no </think> split).
+    assert out["verify_sample"] == "<think>2+2 is 4</think>The answer is 4"
+    assert out["thinking_tag"] is True
+
+
+def test_run_deployment_smoke_rejects_truncated_thinking_without_a_grammar(monkeypatch):
+    """Widening the budget must not turn a hard failure into a silent pass. Serving hands the
+    reasoning back in reasoning_content and flash folds it into a balanced block, so a run cut off
+    mid-thought arrives with non-empty content and clears the empty-content check -- the smoke would
+    certify a truncated non-answer as a working deployment. finish_reason='length' on a thinking run
+    is a failure whether or not a grammar is configured."""
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>2 plus 2 is</think>", "length"),
+    )
+
+    with pytest.raises(ServingError, match="smoke generation was truncated at the maximum token"):
+        _run_smoke(_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192))
 
 
 def test_zero_completion_budget_resolves_to_thinking_recipe_default():
@@ -948,7 +997,7 @@ def test_structured_json_rejects_nonfinite_constants(monkeypatch, constant, cons
             {"choice": ["4"]},
             "<think>x</think>4",
             "length",
-            "truncated at the maximum token length",
+            "smoke generation was truncated at the maximum token length",
         ),
     ],
 )

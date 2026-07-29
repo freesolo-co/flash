@@ -574,7 +574,13 @@ def _run_deployment_smoke(
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
     max_tokens = 256
-    if constraint is not None and spec.thinking:
+    # a thinking adapter spends tokens reasoning BEFORE it emits any content, so 256 buys it a
+    # truncated <think> block and no answer -- the smoke then fails with "returned no content
+    # (finish_reason='length')" and the deployment is rejected. that cost does not depend on
+    # whether a grammar is configured, and resolve_effective_completion_tokens reads the run's own
+    # budget rather than the constraint, so gating the larger budget on structured_outputs left
+    # every thinking run that uses stop_sequences instead undeployable.
+    if spec.thinking:
         max_tokens = max(256, resolve_effective_completion_tokens(spec))
         serving_capacity = serving_completion_token_capacity(
             spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
@@ -612,8 +618,11 @@ def _run_deployment_smoke(
             continue
         break
     content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
-    if constraint and spec.thinking and finish == "length":
-        raise ServingError("structured smoke generation was truncated at the maximum token length")
+    # truncation is a thinking-budget failure whether or not a grammar is configured: serving
+    # returns the reasoning in reasoning_content, so a run cut off mid-thought still arrives with a
+    # balanced <think>...</think> and passes the empty-content check carrying a non-answer.
+    if spec.thinking and finish == "length":
+        raise ServingError("smoke generation was truncated at the maximum token length")
     answer = (
         _thinking_structured_answer(content) if constraint and spec.thinking else content.strip()
     )
