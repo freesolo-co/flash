@@ -618,13 +618,17 @@ def test_route_does_not_blame_the_adapter_for_unrelated_failures(api, monkeypatc
     # the regression this guards: gpu sizing, budget, and environment resolution also run inside
     # prepare_job, for every submit. those failures must reach the user as themselves instead of
     # sending them to re-check an adapter that is fine.
+    #
+    # the spec MUST set train.init_from_adapter: the old bug only rewrote failures when that field
+    # was populated, so a submit without it cannot distinguish the fix from the bug.
     import flash.server.app as app_mod
 
     def _prepare(*args, **kwargs):
         raise ValueError("no gpu class satisfies the requested memory")
 
     monkeypatch.setattr(app_mod, "prepare_job", _prepare)
-    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
+    warm_start_spec = {**SPEC, "train": {**SPEC["train"], "init_from_adapter": "source-run"}}
+    res = api.post("/v1/runs", json={"spec": warm_start_spec}, headers=_bearer("fslo-user-1"))
 
     assert "no gpu class satisfies" in res.text
     assert "init_from_adapter" not in res.text
