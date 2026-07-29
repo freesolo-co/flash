@@ -65,6 +65,17 @@ def test_org_mutating_command_warns(monkeypatch, capsys):
     assert "shadowed!" in capsys.readouterr().err
 
 
+def test_train_cost_stays_quiet(monkeypatch, capsys):
+    # `train --cost` is catalog-only and never contacts an org, so warning that it runs against the
+    # environment key's organization would describe a request the command does not make.
+    monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
+    args = argparse.Namespace(func=cmd_train, cost=True)
+
+    cli._warn_if_login_shadowed(args)
+
+    assert capsys.readouterr().err == ""
+
+
 def test_read_only_command_stays_quiet(monkeypatch, capsys):
     # `flash whoami` names the key source in its own output, so a second warning is noise.
     monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
@@ -91,18 +102,27 @@ def test_every_org_mutating_command_is_registered():
     }
 
 
-def test_whoami_reports_the_key_source(monkeypatch, capsys):
-    monkeypatch.setattr(
-        cli.commands,
-        "load_credentials_with_source",
-        lambda: ("https://flash.freesolo.co", "fslo-key", "FREESOLO_API_KEY"),
-    )
+def _patch_whoami_client(monkeypatch, captured: dict | None = None):
+    """Stand in for ApiClient so whoami runs offline, recording the url it was built with."""
 
     class _FakeClient:
+        def __init__(self, api_url, api_key, key_source=None, **kw):
+            if captured is not None:
+                captured["api_url"] = api_url
+
         def me(self):
             return {"kind": "freesolo_api_key", "key_prefix": "fslo-ke", "email": "me@x.co"}
 
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda: _FakeClient())
+    monkeypatch.setattr(cli.commands, "ApiClient", _FakeClient)
+
+
+def test_whoami_reports_the_key_source(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli.commands,
+        "credential_snapshot",
+        lambda: ("https://flash.freesolo.co", "fslo-key", "FREESOLO_API_KEY", "FLASH_API_URL"),
+    )
+    _patch_whoami_client(monkeypatch)
 
     assert cmd_whoami(argparse.Namespace()) == 0
     out = capsys.readouterr().out
@@ -144,18 +164,45 @@ def test_whoami_names_the_control_plane_it_resolved(monkeypatch, capsys):
     """
     monkeypatch.setattr(
         cli.commands,
-        "load_credentials_with_source",
-        lambda: ("https://flash.freesolo.co", "fslo-key", "FREESOLO_API_KEY"),
+        "credential_snapshot",
+        lambda: (
+            "https://flash.freesolo.co",
+            "fslo-key",
+            "FREESOLO_API_KEY",
+            "default for the release channel",
+        ),
     )
-    monkeypatch.setattr(cli.commands, "api_url_source", lambda: "default for the release channel")
-
-    class _FakeClient:
-        def me(self):
-            return {"kind": "freesolo_api_key", "key_prefix": "fslo-ke", "email": "me@x.co"}
-
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda: _FakeClient())
+    _patch_whoami_client(monkeypatch)
 
     assert cmd_whoami(argparse.Namespace()) == 0
     out = capsys.readouterr().out
     assert "https://flash.freesolo.co" in out
     assert "default for the release channel" in out
+
+
+def test_whoami_queries_the_plane_it_names(monkeypatch, capsys):
+    """The identity must come from the same plane the output reports.
+
+    Resolving the url, the key, and the url's source in three separate config reads let a
+    concurrent `flash login` land in between, so whoami could ask plane A and print plane B -- the
+    diagnostic asserting the opposite of what happened. One snapshot closes the window.
+    """
+    reads = iter(
+        [
+            {"api_key": "fslo-first", "api_url": "https://first.example"},
+            # a concurrent `flash login` rewrote the config between reads
+            {"api_key": "fslo-second", "api_url": "https://second.example"},
+            {"api_key": "fslo-second", "api_url": "https://second.example"},
+        ]
+    )
+    monkeypatch.delenv("FLASH_API_URL", raising=False)
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+    monkeypatch.setattr(client_config, "_read_config", lambda: next(reads))
+    captured: dict = {}
+    _patch_whoami_client(monkeypatch, captured)
+
+    assert cmd_whoami(argparse.Namespace()) == 0
+    out = capsys.readouterr().out
+    assert captured["api_url"] == "https://first.example"
+    assert "https://first.example" in out
+    assert "https://second.example" not in out

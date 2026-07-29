@@ -5,17 +5,23 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pytest
+
 import flash.cli as cli
-from flash.cli.env_test import cmd_env_test
+from flash.cli.env_test import _CONTROL_CANDIDATES, cmd_env_test
 
 
 class _SingleTurnEnv:
     multi_turn = False
     max_turns = 8
 
-    def __init__(self, *, rows=None, reward=1.0):
+    def __init__(self, *, rows=None, reward=1.0, wrong_reward=None):
         self.rows = [{"input": "what is 2 + 2?", "output": "4"}] if rows is None else rows
         self.reward_value = reward
+        # a working grader separates a correct completion from a wrong one. default one full
+        # point below the gold score so the flat-reward gate sees real ranking; pass
+        # wrong_reward=reward to model a grader that cannot tell them apart.
+        self.wrong_reward = reward - 1.0 if wrong_reward is None else wrong_reward
         self.completions: list[str] = []
 
     def dataset(self):
@@ -29,7 +35,15 @@ class _SingleTurnEnv:
 
     def reward(self, completion, example, state=None):
         self.completions.append(completion)
+        gold = example.get("output", "")
+        if gold and completion != gold:
+            return self.wrong_reward
         return self.reward_value
+
+    @property
+    def replayed(self) -> list[str]:
+        """Completions the driver actually replayed, without the gate's negative controls."""
+        return [c for c in self.completions if c not in _CONTROL_CANDIDATES]
 
 
 class _MultiTurnEnv:
@@ -221,7 +235,7 @@ def test_env_test_single_turn_replays_reference_and_passes(monkeypatch, tmp_path
     assert args.func is cmd_env_test
     assert args.func(args) == 0
     assert seen["reference"] == str((env_dir / "environment.py").resolve())
-    assert env.completions == ["4"]
+    assert env.replayed == ["4"]
     out = capsys.readouterr().out
     assert "episode 1: policy=replay turns=1 reward=1.000000" in out
     assert "1/1 episodes passed contract checks" in out
@@ -261,7 +275,7 @@ def test_env_test_text_block_sft_completion_replays(monkeypatch, tmp_path, capsy
     _patch_loader(monkeypatch, env)
 
     assert cmd_env_test(_args(env_dir)) == 0
-    assert env.completions == ["4"]
+    assert env.replayed == ["4"]
     out = capsys.readouterr().out
     assert "episode 1: policy=replay turns=1 reward=1.000000" in out
     assert "overall: PASS" in out
@@ -355,7 +369,7 @@ def test_env_test_drives_three_episodes_by_default(monkeypatch, tmp_path, capsys
     _patch_loader(monkeypatch, env)
 
     assert cmd_env_test(_args(env_dir)) == 0
-    assert len(env.completions) == 3
+    assert len(env.replayed) == 3
     out = capsys.readouterr().out
     assert "3/3 episodes passed contract checks" in out
     assert "overall: PASS" in out
@@ -437,32 +451,128 @@ def test_env_test_multi_turn_stops_on_empty_env_reply(monkeypatch, tmp_path, cap
     assert "overall: PASS" in out
 
 
-def test_env_test_all_replays_scoring_zero_fails(monkeypatch, tmp_path, capsys):
-    # a grader that cannot score its own gold answers is broken (or its runtime deps are
-    # missing). the contract checks still pass, so this must fail on the reward signal itself,
-    # otherwise a flat-zero reward reaches a gpu and the run can never learn.
+def test_env_test_grader_that_cannot_rank_completions_fails(monkeypatch, tmp_path, capsys):
+    # a grader that hands a deliberately wrong answer the same score as its own gold answer
+    # cannot rank completions at all. the contract checks still pass, so this must fail on the
+    # reward signal itself, otherwise identically-zero advantages reach a gpu and the run can
+    # never learn.
     env_dir = _environment_dir(tmp_path)
-    _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0))
+    _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0, wrong_reward=0.0))
 
     assert cmd_env_test(_args(env_dir)) == 1
     captured = capsys.readouterr()
     assert "episode 1: policy=replay turns=1 reward=0.000000" in captured.out
     assert "1/1 episodes passed contract checks" in captured.out
     assert "overall: PASS" not in captured.out
-    assert "all 1 replayed gold answer(s) scored 0.0" in captured.err
+    assert "all 1 replayed episode(s) scored every deliberately wrong answer" in captured.err
     assert "overall: FAIL" in captured.err
 
 
-def test_env_test_partial_replay_zeros_warn_but_pass(monkeypatch, tmp_path, capsys):
-    # only some gold answers scoring zero is a hard dataset, not a broken grader: warn, but
-    # keep passing so a strict reward function is not blocked from training.
+def test_env_test_substring_grader_gold_inside_a_control_still_passes(
+    monkeypatch, tmp_path, capsys
+):
+    # the graders this repo ships by default accept a completion when the gold text occurs
+    # anywhere inside it (BaseEnvironment.grade, and the exact_match_reward written by
+    # `flash env setup`). a gold answer that is a word of a control string would then score that
+    # control CORRECT, and reading the equal scores as "cannot rank" would fail a working
+    # environment. only controls disjoint from the gold text may be scored.
+    env_dir = _environment_dir(tmp_path)
+
+    class _SubstringEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            gold = str(example.get("output") or "").strip()
+            return 1.0 if gold and gold in completion else 0.0
+
+    # each of these is a word of the English control candidate
+    for gold in ("test", "answer", "wrong"):
+        env = _SubstringEnv(rows=[{"input": "say the word", "output": gold}])
+        _patch_loader(monkeypatch, env)
+
+        assert cmd_env_test(_args(env_dir)) == 0, gold
+        captured = capsys.readouterr()
+        assert "overall: PASS" in captured.out, gold
+        assert "overall: FAIL" not in captured.err, gold
+        # whatever controls were scored, none may contain the gold answer
+        for control in env.completions:
+            if control != gold:
+                assert gold not in control, (gold, control)
+
+
+def test_env_test_non_finite_control_reward_fails_the_episode(monkeypatch, tmp_path, capsys):
+    # a scorer that returns NaN for an unexpected completion breaks the same reward contract the
+    # gold answer is already failed for: the policy reaches this scorer with completions no more
+    # expected than the controls, and non-finite rewards there yield unusable samples. excluding
+    # the episode as merely inconclusive would let `overall: PASS` hide that.
+    env_dir = _environment_dir(tmp_path)
+
+    class _NanControlEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            if completion != example.get("output", ""):
+                return float("nan")
+            return 1.0
+
+    _patch_loader(monkeypatch, _NanControlEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "0/1 episodes passed contract checks" in captured.out
+    assert "reward is not finite for a non-reference completion" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_permissive_grader_is_not_reported_as_unrankable(monkeypatch, tmp_path, capsys):
+    # an open-ended task ("respond with a sentence") can legitimately accept a wrong english
+    # sentence while still ranking other completions below it. scoring several controls rather
+    # than one keeps such a grader passing, because the degenerate fillers still fail it.
+    env_dir = _environment_dir(tmp_path)
+
+    class _AnyProseEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            return 1.0 if " " in completion.strip() else 0.0
+
+    # this gold shares no word with the english control, so that control really is scored here
+    env = _AnyProseEnv(rows=[{"input": "say something", "output": "quick brown fox jumps"}])
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" not in captured.err
+    # the permissive english control scored as high as the gold answer; only the degenerate
+    # fillers separate, so the gate must have scored more than the first usable control.
+    assert len(env.completions) > 2
+
+
+@pytest.mark.parametrize("gold", [0.0, -0.1, 5.0])
+def test_env_test_gold_reward_value_alone_never_fails_the_gate(monkeypatch, tmp_path, capsys, gold):
+    # the reward contract accepts any finite scalar, so an env may legitimately score its gold
+    # answer 0.0 or -0.1 with worse completions below it. only the gold-vs-wrong comparison may
+    # fail the gate; the absolute value carries no information about the grader.
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv(reward=gold))
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert f"episode 1: policy=replay turns=1 reward={gold:.6f}" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "check the reward function" not in captured.err
+
+
+def test_env_test_partial_flat_rewards_warn_but_pass(monkeypatch, tmp_path, capsys):
+    # one row the grader cannot separate is a hard row, not a broken grader: warn, but keep
+    # passing so a strict reward function is not blocked from training.
     env_dir = _environment_dir(tmp_path)
     rows = [{"input": "q1", "output": "4"}, {"input": "q2", "output": "8"}]
 
     class _FirstRowOnlyEnv(_SingleTurnEnv):
         def reward(self, completion, example, state=None):
             self.completions.append(completion)
-            return 1.0 if example["output"] == "4" else 0.0
+            if example["output"] != "4":
+                return 0.0
+            return 1.0 if completion == "4" else 0.0
 
     _patch_loader(monkeypatch, _FirstRowOnlyEnv(rows=rows))
 
@@ -471,7 +581,137 @@ def test_env_test_partial_replay_zeros_warn_but_pass(monkeypatch, tmp_path, caps
     assert "2/2 episodes passed contract checks" in captured.out
     assert "overall: PASS" in captured.out
     assert "check the reward function" in captured.err
-    assert "all 2 replayed gold answer(s) scored 0.0" not in captured.err
+    assert "all 2 replayed episode(s)" not in captured.err
+
+
+def test_env_test_unrepresentable_gold_turn_is_excluded_from_the_gate(monkeypatch, tmp_path, capsys):
+    # a native tool-call turn (content=None + tool_calls) cannot be replayed as text: the driver
+    # sends an empty turn stripped of the call. a grader that correctly rejects that mutilated
+    # transcript scores zero, which says nothing about the reward function, so it must not trip
+    # the all-zero gate.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ToolCallGoldEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f"}}],
+                },
+                {"role": "assistant", "content": example.get("output", "")},
+            ]
+
+    _patch_loader(monkeypatch, _ToolCallGoldEnv(reward=0.0, wrong_reward=0.0))
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "all 1 replayed episode(s)" not in captured.err
+
+
+def test_env_test_null_content_turn_without_tool_calls_still_feeds_the_gate(
+    monkeypatch, tmp_path, capsys
+):
+    # a bare content=None turn with no tool_calls carries no payload, so replaying it as the
+    # empty string loses nothing. marking it partial would excuse the episode from the gate and
+    # let a grader that cannot rank completions pass.
+    env_dir = _environment_dir(tmp_path)
+
+    class _NullTurnGoldEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [
+                {"role": "assistant", "content": None},
+                {"role": "assistant", "content": example.get("output", "")},
+            ]
+
+    _patch_loader(monkeypatch, _NullTurnGoldEnv(reward=0.0, wrong_reward=0.0))
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "all 1 replayed episode(s) scored every deliberately wrong answer" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_multi_message_single_turn_gold_is_excluded_from_the_gate(
+    monkeypatch, tmp_path, capsys
+):
+    # the real single-turn scorer grades only the LAST assistant message
+    # (flash.multimodal.assistant_completion_text), but the driver joins every assistant turn.
+    # a grader that correctly accepts only the final answer therefore scores the joined text
+    # like any wrong answer, which says nothing about the reward function.
+    env_dir = _environment_dir(tmp_path)
+
+    class _TrajectoryGoldEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [
+                {"role": "assistant", "content": "let me compute that"},
+                {"role": "assistant", "content": example.get("output", "")},
+            ]
+
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            # only the exact final answer scores; the joined trajectory does not
+            return 1.0 if completion == example.get("output", "") else 0.0
+
+    _patch_loader(monkeypatch, _TrajectoryGoldEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "all 1 replayed episode(s)" not in captured.err
+
+
+def test_env_test_multi_turn_episodes_never_reach_the_reward_gate(monkeypatch, tmp_path, capsys):
+    # a multi-turn reward reads the accumulated rollout state, so swapping in one wrong
+    # completion string cannot produce a comparable wrong episode and there is no control to
+    # compare against. such episodes carry no evidence either way and must not fail the gate,
+    # including when the env drives more turns than the gold transcript provides and the driver
+    # pads the tail with echo filler.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ShortGoldMultiTurnEnv(_MultiTurnEnv):
+        def sft_completion(self, example):
+            # one gold turn, but env_reply keeps the rollout going for two
+            return [{"role": "assistant", "content": "first"}]
+
+        def reward(self, completion, example, state=None):
+            self.scored_state = state
+            return 0.0
+
+    _patch_loader(monkeypatch, _ShortGoldMultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "check the reward function" not in captured.err
+
+
+def test_env_test_sft_only_environment_is_not_failed_by_the_reward_gate(
+    monkeypatch, tmp_path, capsys
+):
+    # `env test` takes no algorithm argument and the environment declares none, so it cannot
+    # know a placeholder scorer will ever reach GRPO. the SFT worker trains on
+    # prompt_messages/sft_completion and never calls env.reward (flash/engine/worker/sft.py),
+    # so a grader that rejects the off-distribution control must not block an SFT push.
+    env_dir = _environment_dir(tmp_path)
+
+    class _SftOnlyEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            if completion in _CONTROL_CANDIDATES:
+                raise NotImplementedError("this environment has no reward function")
+            return 0.0
+
+    _patch_loader(monkeypatch, _SftOnlyEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" not in captured.err
 
 
 def test_env_test_echo_policy_zero_reward_still_passes(monkeypatch, tmp_path, capsys):
@@ -532,6 +772,34 @@ def test_env_test_param_flag_parses_toml_scalars(monkeypatch, tmp_path):
 
     assert args.func(args) == 0
     assert seen["kwargs"] == {"max_rows": 5, "strict": True, "name": "hard"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["filters=[1,2", 'name="unterminated', "opts={a=1", "tags=['x'"],
+)
+def test_env_test_malformed_structured_param_fails_instead_of_becoming_a_string(
+    monkeypatch, tmp_path, capsys, value
+):
+    # a value that opens a quote, array, or inline table is structured but malformed. keeping it
+    # as a literal string would validate the environment against parameters the equivalent
+    # [environment.params] entry could never load, so the offline check would pass on inputs
+    # training rejects.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    assert "is not a valid TOML value" in capsys.readouterr().err
+
+
+def test_env_test_bare_unquoted_param_still_falls_back_to_a_string(monkeypatch, tmp_path):
+    # the common case stays convenient: unquoted text is not valid TOML but is what users type.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=["name=hard mode"])) == 0
+    assert seen["kwargs"] == {"name": "hard mode"}
 
 
 def test_env_test_split_flag_overrides_param_split(monkeypatch, tmp_path):
