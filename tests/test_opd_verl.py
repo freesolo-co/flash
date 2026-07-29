@@ -64,6 +64,7 @@ from flash.engine.worker.opd_verl_structured import (
     canonical_structured_spec,
 )
 from flash.engine.worker.tokenizer_align import TeacherToken
+from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION
 from flash.opd_verl_validation import validate_opd_verl_structured_outputs
 
 
@@ -719,7 +720,7 @@ class _BridgeTokenizer:
 
 def _resume_accounting(step=2):
     return {
-        "contract_version": 2,
+        "contract_version": OPD_RESUME_STATE_VERSION,
         "seed": 42,
         "opt_steps": step,
         "step": step,
@@ -5020,6 +5021,26 @@ def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
     assert '"opt_steps": len(final_accounting["loss_curve"]),' in notes
 
 
+def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
+    import inspect
+
+    from flash.engine.worker.opd_verl import run_opd_verl
+
+    source = inspect.getsource(run_opd_verl)
+    # record_step only checks that each metric line FOLLOWS the previous one, so it cannot notice a
+    # MISSING TRAILING metric: on_line silently skips any step-tagged line whose loss it cannot
+    # parse, and no later step ever arrives to trip the sequence check. that leaves a curve of
+    # length N-1 for a run verl actually checkpointed at step N, and opt_steps is published straight
+    # from that curve. the guard must compare against final_step, not merely require non-emptiness.
+    assert 'if len(final_accounting["loss_curve"]) != final_step:' in source
+    guard = source[source.index('if len(final_accounting["loss_curve"]) != final_step:') :]
+    assert "raise RuntimeError(" in guard[:600]
+    # and it must sit BEFORE the publish, not after it.
+    assert source.index('if len(final_accounting["loss_curve"]) != final_step:') < source.index(
+        "_w.write_train_meta("
+    )
+
+
 def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     import inspect
 
@@ -5030,9 +5051,14 @@ def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     # only the single-turn text path runs through the batcher, and it holds one serial scoring
     # thread. multimodal scores one item per call and multi-turn batches an episode, both on the
     # bridge's own request threads -- neither has a constant to report.
+    # the reported cap is bounded by the samples one step can actually produce, matching trl's
+    # _opd_teacher_batch_size: a 1-rollout step can never fill a batch of 8, so publishing the
+    # global cap there would describe a shape the run is structurally unable to reach.
     assert (
         '"opd_teacher_batch_size": (\n'
-        "                    _TEXT_TEACHER_BATCH_SIZE if not multimodal and not multi_turn else None\n"
+        "                    min(_TEXT_TEACHER_BATCH_SIZE, max(1, prompts_per_step * knobs.group_size))\n"
+        "                    if not multimodal and not multi_turn\n"
+        "                    else None\n"
         "                ),"
     ) in notes
     assert (

@@ -17,7 +17,12 @@ OPD_OPTIMIZER_START_PHASE = "opd"
 OPD_RETRY_ARTIFACT_PREFIX = "_opd_retry"
 OPD_OPTIMIZER_START_FILENAME = "optimizer-start.v1.json"
 OPD_RESUME_REVISION_ENV = "FLASH_OPD_RESUME_REVISION"
-OPD_RESUME_STATE_VERSION = 2
+# bumped to 3 when the verl worker began accumulating align_group_sum/align_group_n. a version-2
+# state carries neither, so resuming one would restart the accumulator at zero and publish a
+# post-resume-only mean_align_granularity as though it described the whole run. the version check
+# below already rejects mismatches fail-closed, so the bump refuses those states outright instead of
+# threading a completeness flag through the accounting.
+OPD_RESUME_STATE_VERSION = 3
 MAX_BOUNDED_NONNEGATIVE_INTEGER = (1 << 63) - 1
 
 # a full-state opd resume checkpoint (the custom loop's counterpart to the hf trainer's checkpoint-n)
@@ -54,6 +59,13 @@ _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "skip_counts": "dict",
     "opd_phase_seconds": "dict",
     "opd_phase_counts": "dict",
+}
+# alignment granularity, accumulated only by the verl worker. the trl worker's granularity lives in
+# the granularity_* slots above; in verl those same slots hold COVERAGE, so verl carries its own pair
+# and both must be validated when present rather than coerced past the fail-closed contract.
+_OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA = {
+    "align_group_sum": "nonneg_number",
+    "align_group_n": "nonneg_int",
 }
 
 
@@ -135,6 +147,14 @@ def validate_opd_resume_state_metadata(
             raise ValueError(f"opd resume state {field} must be a list")
         elif field_type == "dict" and not isinstance(value, dict):
             raise ValueError(f"opd resume state {field} must be an object")
+
+    for field, field_type in _OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA.items():
+        if field not in state:
+            continue
+        if field_type == "nonneg_int":
+            _nonnegative_integer(state[field], field=field)
+        else:
+            _finite_number(state[field], field=field, nonnegative=True)
 
     for field in ("loss_curve", "coverage_curve"):
         curve = state[field]

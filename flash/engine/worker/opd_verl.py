@@ -2543,6 +2543,17 @@ def run_opd_verl(spec=None) -> None:
                 "verl OPD produced no distillation-loss metrics for the whole run — the "
                 "distillation path never engaged; refusing to publish"
             )
+        if len(final_accounting["loss_curve"]) != final_step:
+            # record_step only checks that each metric line FOLLOWS the last one, so a missing
+            # trailing metric (on_line skips any step-tagged line whose loss it cannot parse) leaves
+            # a curve shorter than the checkpoint verl actually wrote, and nothing later arrives to
+            # catch it. opt_steps is published from this curve, so a short curve would understate the
+            # updates applied. fail loud instead of reporting a number the curve cannot support.
+            raise RuntimeError(
+                f"verl OPD recorded {len(final_accounting['loss_curve'])} distillation-loss metrics "
+                f"for {final_step} optimizer updates; refusing to publish an accounting that does "
+                "not cover every update"
+            )
         if int(final_accounting.get("aligned_sequences", 0) or 0) <= 0:
             # zeroed-mask pass-through batches still emit a (zero) loss metric, so the loss-curve
             # check alone cannot distinguish real distillation from a run where the teacher never
@@ -2582,7 +2593,8 @@ def run_opd_verl(spec=None) -> None:
             notes={
                 "steps": update_horizon,
                 # optimizer updates that actually produced a distillation loss. record_step enforces
-                # loss_curve length == the metric step, so this is measured, not assumed.
+                # loss_curve length == the metric step, and the guard above rejects a curve shorter
+                # than final_step, so this is measured, not assumed.
                 "opt_steps": len(final_accounting["loss_curve"]),
                 "epochs": knobs.epochs,
                 "retained_prompts": len(prompts),
@@ -2639,8 +2651,13 @@ def run_opd_verl(spec=None) -> None:
                 # item per call and the multi-turn path batches a whole episode, and both run on the
                 # bridge's own request threads -- neither has a constant, so None records "not
                 # batched by flash" instead of asserting a number nothing enforces.
+                # the cap is bounded by the samples one step can actually produce (trl does the same
+                # in _opd_teacher_batch_size): a step of 1 rollout can never fill a batch of 8, and
+                # reporting the global cap there would describe a shape the run cannot reach.
                 "opd_teacher_batch_size": (
-                    _TEXT_TEACHER_BATCH_SIZE if not multimodal and not multi_turn else None
+                    min(_TEXT_TEACHER_BATCH_SIZE, max(1, prompts_per_step * knobs.group_size))
+                    if not multimodal and not multi_turn
+                    else None
                 ),
                 "opd_teacher_workers": 1 if not multimodal and not multi_turn else None,
                 "rollout_backend": "verl_vllm",
