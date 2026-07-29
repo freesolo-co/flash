@@ -5186,3 +5186,46 @@ def test_worker_fails_closed_on_tool_env(monkeypatch):
     monkeypatch.setattr(ov._w, "require_active_env", lambda: FakeEnv())
     with pytest.raises(RuntimeError, match="native tool-calling OPD environments are not supported"):
         ov.run_opd_verl(spec=object())
+
+
+def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints():
+    """the distillation loss must survive numpy 2's np.float64(...) repr.
+
+    verl aggregates actor/distillation/loss with Metric(SUM) -> np.sum
+    (verl/utils/metric/utils.py), and LocalLogger renders it through pprint. verl pins
+    numpy<2, but Dockerfile.worker installs numpy 2.2.6 into the /opt/verl-venv interpreter
+    flash actually launches, where that scalar prints as "np.float64(0.64)". a bare float()
+    raises on that spelling, so every step is skipped, loss_curve ends empty, and the publish
+    guard rejects a run that trained correctly.
+    """
+    import flash.engine.worker.opd_verl as ov
+
+    ray_prefixed = "(TaskRunner pid=3125) step:4 - actor/distillation/loss:np.float64(0.6421)"
+    assert ov.parse_verl_metric(ray_prefixed, "actor/distillation/loss") == 0.6421
+    # the unprefixed numpy-1 spelling verl's own pin produces still parses.
+    assert ov.parse_verl_metric("step:4 - actor/distillation/loss:0.6421", "actor/distillation/loss") == 0.6421
+    # the un-namespaced fallback key the handler tries second.
+    assert ov.parse_verl_metric("step:4 - distillation/loss:np.float32(0.25)", "distillation/loss") == 0.25
+
+
+def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
+    """pin the call site, not just the helper: a local float() here would reintroduce the drop."""
+    import ast
+    import inspect
+    import textwrap
+
+    import flash.engine.worker.opd_verl as ov
+
+    source = textwrap.dedent(inspect.getsource(ov.run_opd_verl))
+    handler = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "on_line"
+    )
+    calls = [
+        node.func.id
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert "parse_verl_metric" in calls
+    assert "_metric_value" not in calls
