@@ -35,6 +35,11 @@ from flash.engine.steps import (
     resolve_update_horizon,
     validate_save_steps,
 )
+from flash.engine.structured_outputs import (
+    describe_structured_outputs,
+    parse_structured_outputs,
+    reasoning_parser_for,
+)
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.hf import _deployable_adapter_on_hf
@@ -268,6 +273,19 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
         # engine_kwargs.vllm struct (it is not a default field).
         o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
+    _reasoning_parser = reasoning_parser_for(
+        thinking=bool(cfg.get("thinking", False)),
+        structured_outputs=cfg.get("structured_outputs"),
+    )
+    if _reasoning_parser:
+        # the engine half of structured outputs: hold the guided grammar until </think> closes, so a
+        # thinking model reasons freely and only its answer is constrained. on the trl path this is
+        # injected into the colocate llm kwargs; verl spreads engine_kwargs.vllm straight into
+        # AsyncEngineArgs, where reasoning_parser is a real field, so a plain override suffices.
+        # '+' appends under the existing engine_kwargs.vllm struct, as kv_cache_dtype does above.
+        o.append(
+            f"+actor_rollout_ref.rollout.engine_kwargs.vllm.reasoning_parser={_reasoning_parser}"
+        )
     return o
 
 
@@ -310,6 +328,7 @@ def _build_verl_training_cfg(
         "kl_coef": inp["kl_coef"],
         "entropy_quantile": inp["entropy_quantile"],
         "stop_sequences": inp["stop_sequences"],
+        "structured_outputs": inp["structured_outputs"],
         "thinking": thinking,
         "loss_agg_mode": "seq-mean-token-sum-norm",
         "seed": inp["seed"],
@@ -353,6 +372,7 @@ def _build_verl_train_notes(
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],
             "stop_sequences": list(inp["stop_sequences"]),
+            "structured_outputs": inp["structured_outputs"],
             "temperature": inp["temperature"],
             "top_p": inp["top_p"],
             "ppo_epochs": inp["ppo_epochs"],
@@ -366,6 +386,63 @@ def _build_verl_train_notes(
 
 _ENTROPY_QUANTILE_MARKER = "[flash-verl] top-entropy token masking active"
 _STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
+_STRUCTURED_OUTPUTS_MARKER = "[flash-verl] rollout structured outputs active"
+
+
+def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
+    """return the sitecustomize source that constrains verl's rollout to a guided grammar.
+
+    the sampling half of ``train.structured_outputs``. it rides the same per-sample dict as the stop
+    strings, so the mechanism is identical to render_stop_sequences_shim; only the value differs.
+    the engine half (``reasoning_parser``, applied when thinking is also on) is a plain hydra
+    override and needs no shim -- see _build_verl_overrides.
+
+    the value MUST be wrapped in ``StructuredOutputsParams``. vllm accepts a raw dict here, passes
+    ``_verify_args()``, and then stores a plain dict with no ``.json`` attribute -- constraining
+    nothing, with no error and no log line. trl avoids this by wrapping in its colocate path
+    (generation/vllm_generation.py), which is exactly why flash's trl path passes the spec as a
+    plain dict; on verl nothing wraps it, so the shim must.
+
+    the object survives the worker -> server hop: that hop is ``server.generate.remote(...)``, a ray
+    actor rpc (cloudpickle), not http/json, so it arrives as the same dataclass it left as.
+    """
+    if not structured_outputs:
+        return ""
+    return f'''
+from verl.experimental.agent_loop import agent_loop as _flash_so_agent_loop
+from vllm.sampling_params import StructuredOutputsParams as _FlashStructuredOutputsParams
+
+_flash_structured_outputs = {structured_outputs!r}
+
+
+def _flash_patch_structured_outputs():
+    """add ``structured_outputs`` to the per-sample sampling params on their way into the loop.
+
+    patched on ``_run_agent_loop`` for the same reason as the stop strings: it receives the
+    per-sample dict after verl's validate/greedy overrides, so the constraint also applies to
+    validation rollouts -- matching trl, where it lives in generation_kwargs and is not swapped out
+    for eval.
+    """
+    original = _flash_so_agent_loop.AgentLoopWorker._run_agent_loop
+
+    async def _run_agent_loop(self, sampling_params, *args, **kwargs):
+        params = dict(sampling_params)
+        # build a fresh params object per request: vllm mutates sampling params in place (it
+        # resolves the structured-outputs backend on first use and caches it on the instance), so a
+        # shared one would leak that resolution across requests.
+        params["structured_outputs"] = _FlashStructuredOutputsParams(**_flash_structured_outputs)
+        return await original(self, params, *args, **kwargs)
+
+    _flash_so_agent_loop.AgentLoopWorker._run_agent_loop = _run_agent_loop
+
+
+if not getattr(
+    _flash_so_agent_loop.AgentLoopWorker._run_agent_loop, "_flash_so_patched", False
+):
+    _flash_patch_structured_outputs()
+    _flash_so_agent_loop.AgentLoopWorker._run_agent_loop._flash_so_patched = True
+    print({_STRUCTURED_OUTPUTS_MARKER!r} + " " + repr(_flash_structured_outputs), flush=True)
+'''
 
 
 def render_stop_sequences_shim(stop_sequences: tuple[str, ...]) -> str:
@@ -938,10 +1015,17 @@ def _resolve_single_turn_inputs():
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
     # fail loud on grpo features the verl backend does not yet honor, so a migration never silently
     # trains without a requested behavior.
-    if _t and getattr(_t, "structured_outputs", ""):
-        raise RuntimeError(
-            "train.structured_outputs is not yet supported on the verl backend; use the trl backend "
-            "(unset FLASH_RL_BACKEND) until guided-decoding parity lands."
+    # structured_outputs: two halves, mirroring the trl path. the constraint itself rides the
+    # per-sample sampling params via a shim (render_structured_outputs_shim); the reasoning_parser
+    # that defers the grammar past </think> is an engine arg, applied as a plain hydra override in
+    # _build_verl_overrides. parse raises on a corrupt payload rather than training unconstrained.
+    structured_outputs = (
+        parse_structured_outputs(getattr(_t, "structured_outputs", "") if _t else "") or None
+    )
+    if structured_outputs:
+        print(
+            f"[rl-verl] structured outputs: every rollout constrained to "
+            f"{describe_structured_outputs(structured_outputs)}"
         )
     # stop_sequences: on the trl backend these ride generation_kwargs["stop"] into vllm's
     # SamplingParams. verl builds its sampling params without a stop field, so a sitecustomize shim
@@ -1115,6 +1199,7 @@ def _resolve_single_turn_inputs():
         "kl_coef": kl_coef,
         "entropy_quantile": entropy_quantile,
         "stop_sequences": stop_sequences,
+        "structured_outputs": structured_outputs,
         "max_completion": max_completion,
         "max_prompt_len": prompt_budget,
         # the engine's full sequence length (prompt + completion), already clamped to the model's
@@ -1223,6 +1308,7 @@ def run_rl_verl():
         for part in (
             render_entropy_quantile_shim(inp["entropy_quantile"]),
             render_stop_sequences_shim(inp["stop_sequences"]),
+            render_structured_outputs_shim(inp["structured_outputs"]),
         )
         if part
     )
