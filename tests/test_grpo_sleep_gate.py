@@ -317,3 +317,40 @@ def test_worker_sleep_upgrade_leaves_the_verl_conf_alone(monkeypatch):
     monkeypatch.delenv("FLASH_RL_BACKEND")
     gpu_setup.finalize_alloc_conf_for_sleep()
     assert os.environ["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
+
+
+@pytest.mark.parametrize(
+    ("first_key", "first_value", "second_key", "second_value"),
+    [
+        ("flash_opd_backend", "trl", "FLASH_OPD_BACKEND", "verl"),
+        ("FLASH_OPD_BACKEND", "verl", "flash_opd_backend", "trl"),
+        ("flash_opd_backend", "verl", "FLASH_OPD_BACKEND", "trl"),
+    ],
+)
+def test_backend_resolution_matches_the_key_the_worker_reads(
+    first_key, first_value, second_key, second_value
+):
+    """[worker_env] is exported verbatim and the worker reads ONLY the uppercase name, so the
+    resolver must key on the exact same name. a case-folded lookup returns whichever duplicate came
+    first, which disagrees with the worker in both directions: fold->trl / worker->verl hands verl
+    the expandable conf that crashes its CuMemAllocator, and fold->verl / worker->trl silently runs
+    a different trainer than the launcher recorded (codex[bot])."""
+    from flash.providers._worker import build_worker_env
+    from flash.spec import JobSpec, effective_backend
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "m",
+            "seed": 0,
+            "algorithm": "opd",
+            "worker_env": {first_key: first_value, second_key: second_value},
+        }
+    )
+    env = build_worker_env(spec, 0)
+    # the worker's own resolution, reproduced exactly: os.environ.get(KEY, "trl")
+    worker_reads = env.get("FLASH_OPD_BACKEND", "trl").strip().lower()
+
+    assert effective_backend(spec) == worker_reads
+    if worker_reads == "verl":
+        assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
+        assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]

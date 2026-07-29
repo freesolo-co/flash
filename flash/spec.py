@@ -231,13 +231,18 @@ def effective_backend(spec: JobSpec) -> str:
     env is the spec's own [worker_env] table -- build_worker_env starts from an empty dict and
     forwards a fixed credential allowlist, never the ambient control-plane env. so the backend is a
     property of the SPEC and a launcher can read it here rather than guessing.
+
+    the lookup is EXACT-CASE on purpose. build_worker_env exports every [worker_env] entry under its
+    verbatim key, and the worker reads only the uppercase name, so a case-insensitive match here can
+    disagree with the process that actually runs: given both `flash_opd_backend` and
+    `FLASH_OPD_BACKEND`, folding returns whichever came first while the worker always reads the
+    uppercase one. That divergence is not cosmetic -- it picks the allocator conf, and handing verl
+    expandable_segments crashes its vLLM rollout outright (cumem.py CuMemAllocator assert). Matching
+    the exact key the worker consumes keeps the two definitionally in agreement.
     """
-    key = backend_env_key(spec)
     worker_env = getattr(spec, "worker_env", None) or {}
-    for name, value in worker_env.items():
-        if str(name).upper() == key:
-            return str(value).strip().lower()
-    return "trl"
+    value = worker_env.get(backend_env_key(spec))
+    return str(value).strip().lower() if value is not None else "trl"
 
 
 def require_matching_seed(spec: JobSpec, seed: Any) -> int:
