@@ -131,3 +131,41 @@ def test_gate_message_names_the_key_that_enables_sharding(algorithm, key):
     assert key in message
     assert "verl" in message
     assert "worker_env" in message
+
+
+def _submittable(algorithm: str, backend: str = ""):
+    """a spec that survives a full submit, unlike _spec (which only needs to reach the gate).
+
+    the gate raises before model/train validation, so the gate helper can use a fake model id and no
+    train table. recording the backend happens at the END of submit, so this one must be real.
+    """
+    from flash.spec import JobSpec
+
+    train: dict = {"max_examples": 4}
+    if algorithm == "opd":
+        train["teacher_model"] = "kimi-k2.6"
+    body: dict = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": algorithm,
+        "gpu": {"type": "H200", "count": 1, "provider": "runpod"},
+        "train": train,
+    }
+    if backend:
+        body["worker_env"] = {_BACKEND_ENV[algorithm]: backend}
+    return JobSpec.from_dict(body)
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "backend", "expected"),
+    [("grpo", "verl", "verl"), ("grpo", "", "trl"), ("sft", "verl", "verl"), ("opd", "", "trl")],
+)
+def test_submit_records_the_resolved_backend(monkeypatch, algorithm, backend, expected):
+    from flash import runner
+
+    # the backend is resolved ONLY from the spec's [worker_env] and defaults to trl SILENTLY, so a
+    # spec that forgot the key runs a different trainer than intended with no error. record the
+    # resolution on the run so which trainer actually ran is auditable from the run itself.
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        status = runner.submit_job(_submittable(algorithm, backend), dry_run=True)
+        assert (status.effective_preparation or {}).get("backend") == expected
