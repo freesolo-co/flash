@@ -17,6 +17,7 @@ from flash.providers.base import get_gpu_info
 from flash.spec import (
     RESERVED_WORKER_ENV_KEYS,
     JobSpec,
+    effective_backend,
     require_matching_seed,
     validate_worker_env_reserved,
 )
@@ -228,11 +229,22 @@ def build_worker_env(
     validate_worker_env_reserved(spec.worker_env)
     # grpo uses a non-expandable alloc conf: expandable_segments crashes the vllm sleep-mode engine.
     # The worker upgrades RL to expandable when it resolves sleep=OFF (finalize_alloc_conf_for_sleep).
-    # SFT and OPD have NO vLLM sleep engine and allocate large HF generate/logit tensors, so both take
-    # the anti-fragmentation expandable allocator up front: OPD was previously lumped in with RL here
-    # (`not in ("sft",)`) and ran non-expandable despite having no sleep engine, so a long-completion /
-    # large-vocab OPD job fragmented and OOM'd on a GPU the VRAM estimate said would fit (codex[bot]).
-    _needs_nonexpandable = str(getattr(spec, "algorithm", "")).lower() not in ("sft", "opd")
+    # SFT and OPD on the TRL backend have NO vLLM sleep engine and allocate large HF generate/logit
+    # tensors, so both take the anti-fragmentation expandable allocator up front: OPD was previously
+    # lumped in with RL here (`not in ("sft",)`) and ran non-expandable despite having no sleep engine,
+    # so a long-completion / large-vocab OPD job fragmented and OOM'd on a GPU the VRAM estimate said
+    # would fit (codex[bot]).
+    #
+    # verl is the exception, by BACKEND rather than by algorithm: its GRPO and OPD trainers both run a
+    # vLLM rollout (`actor_rollout_ref.rollout.name=vllm`) and verl leaves rollout.enable_sleep_mode
+    # defaulted True, so the engine always builds a CuMemAllocator -- which asserts outright on
+    # "expandable_segments:True" (vllm/device_allocator/cumem.py:132, pytorch#147851). Selecting on the
+    # algorithm alone sent verl OPD an allocator conf that crashes it before the first step.
+    _verl = effective_backend(spec) == "verl"
+    _needs_nonexpandable = _verl or str(getattr(spec, "algorithm", "")).lower() not in (
+        "sft",
+        "opd",
+    )
     _alloc_conf = (
         "garbage_collection_threshold:0.8,max_split_size_mb:256"
         if _needs_nonexpandable

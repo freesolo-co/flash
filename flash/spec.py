@@ -215,6 +215,31 @@ def validate_worker_env_reserved(worker_env: Any) -> None:
         )
 
 
+def backend_env_key(spec: JobSpec) -> str:
+    """the [worker_env] key that selects this spec's training backend.
+
+    one definition so a caller's remedy cannot name a different key than the worker reads: the phase
+    mapping is not derivable from the algorithm (grpo -> FLASH_RL_BACKEND).
+    """
+    return f"FLASH_{spec.phase.upper()}_BACKEND"
+
+
+def effective_backend(spec: JobSpec) -> str:
+    """the training backend this spec will actually run, as the worker resolves it.
+
+    the worker reads FLASH_{SFT,RL,OPD}_BACKEND (default "trl"), and the only route into the worker
+    env is the spec's own [worker_env] table -- build_worker_env starts from an empty dict and
+    forwards a fixed credential allowlist, never the ambient control-plane env. so the backend is a
+    property of the SPEC and a launcher can read it here rather than guessing.
+    """
+    key = backend_env_key(spec)
+    worker_env = getattr(spec, "worker_env", None) or {}
+    for name, value in worker_env.items():
+        if str(name).upper() == key:
+            return str(value).strip().lower()
+    return "trl"
+
+
 def require_matching_seed(spec: JobSpec, seed: Any) -> int:
     """Require the retained provider seed argument to match the authoritative JobSpec seed."""
     provided = parse_seed(seed)

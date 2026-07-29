@@ -9,6 +9,10 @@ wiring itself is exercised by the live smokes).
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from flash.engine.vram import estimate_vram_gb, grpo_fits_resident, grpo_rollout_seq_len
 
 
@@ -245,3 +249,71 @@ def test_boot_alloc_conf_and_run_rl_share_sleep_resolver():
     assert "fp8_kv" in resolver_kws, "shared GRPO sleep resolver must pass fp8_kv"
     assert _call_keywords(w.run_rl, "resolve_grpo_sleep_mode") is not None
     assert _call_keywords(gpu_setup.finalize_alloc_conf_for_sleep, "resolve_grpo_sleep_mode") is not None
+# ---------------------------------------------------------------------------
+# expandable_segments vs verl's rollout allocator.
+#
+# verl's GRPO and OPD trainers both run a vLLM rollout and leave rollout.enable_sleep_mode defaulted
+# True, so the engine ALWAYS builds a CuMemAllocator -- and CuMemAllocator asserts outright on
+# "expandable_segments:True" (vllm/device_allocator/cumem.py:132, pytorch#147851). Two independent
+# routes could hand verl that conf: the launcher's per-algorithm choice, and the worker's sleep-mode
+# upgrade. Both must be backend-aware.
+# ---------------------------------------------------------------------------
+def _worker_env_for(algorithm: str, phase: str, backend: str | None) -> dict:
+    from flash.providers._worker import build_worker_env
+    from flash.spec import JobSpec
+
+    payload = {"model": "m", "seed": 0, "algorithm": algorithm}
+    if backend is not None:
+        payload["worker_env"] = {f"FLASH_{phase.upper()}_BACKEND": backend}
+    spec = JobSpec.from_dict(payload)
+    assert spec.phase == phase, "phase is derived from algorithm; the mapping moved"
+    return build_worker_env(spec, 0)
+
+
+@pytest.mark.parametrize(("algorithm", "phase"), [("grpo", "rl"), ("opd", "opd"), ("sft", "sft")])
+def test_verl_backend_never_gets_expandable_segments(algorithm, phase):
+    env = _worker_env_for(algorithm, phase, "verl")
+    for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        assert "expandable_segments" not in env[key], (
+            f"verl {algorithm} would build a CuMemAllocator against {env[key]}"
+        )
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "phase", "expect_expandable"),
+    [("opd", "opd", True), ("sft", "sft", True), ("grpo", "rl", False)],
+)
+def test_trl_backend_keeps_its_per_algorithm_alloc_conf(algorithm, phase, expect_expandable):
+    """the verl carve-out must not change the TRL path: OPD/SFT keep the anti-fragmentation
+    expandable allocator they were given for large HF generate/logit tensors, and GRPO keeps the
+    non-expandable conf its colocate sleep engine needs."""
+    for backend in (None, "trl"):  # omitted key resolves to trl
+        env = _worker_env_for(algorithm, phase, backend)
+        assert ("expandable_segments" in env["PYTORCH_ALLOC_CONF"]) is expect_expandable
+
+
+def test_worker_sleep_upgrade_leaves_the_verl_conf_alone(monkeypatch):
+    """finalize_alloc_conf_for_sleep runs before handler() for BOTH backends, so a verl run whose
+    sleep gate resolves OFF would otherwise have expandable_segments written over the launcher's
+    correct conf, in-process, right before verl builds its rollout."""
+    import flash.engine.worker as w
+    from flash.engine.worker import gpu_setup
+
+    launcher_conf = "garbage_collection_threshold:0.8,max_split_size_mb:256"
+    monkeypatch.setattr(w, "PHASE", "rl")
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", launcher_conf)
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", launcher_conf)
+    # sleep OFF is exactly the branch that upgrades to expandable_segments on the TRL path
+    monkeypatch.setattr(
+        "flash.engine.worker.grpo.resolve_grpo_sleep_mode", lambda: (False, 2048, 80.0, False)
+    )
+
+    monkeypatch.setenv("FLASH_RL_BACKEND", "verl")
+    gpu_setup.finalize_alloc_conf_for_sleep()
+    assert os.environ["PYTORCH_ALLOC_CONF"] == launcher_conf
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == launcher_conf
+
+    # same inputs on the TRL path still upgrade -- this test pins the carve-out, not the feature
+    monkeypatch.delenv("FLASH_RL_BACKEND")
+    gpu_setup.finalize_alloc_conf_for_sleep()
+    assert os.environ["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
