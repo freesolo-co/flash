@@ -167,6 +167,35 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     return py
 
 
+def resolve_checkpoint_actor_dir(step_dir: str) -> str:
+    """return the directory inside ``global_step_N`` that holds the saved model + ``huggingface/``.
+
+    verl's two trainers do not agree on this layout, and the difference is not configurable:
+
+    - RL nests per-role, ``global_step_N/actor/`` (``trainer/ppo/ray_trainer.py`` builds
+      ``os.path.join(local_global_step_folder, "actor")``).
+    - SFT writes the shards straight into ``global_step_N/`` (``utils/checkpoint/
+      checkpoint_handler.py`` passes ``local_path=local_global_step_folder`` unmodified).
+
+    So detect the layout from what verl actually wrote rather than hardcoding either convention.
+    ``huggingface/`` is the right marker because it is the subfolder ``verl.model_merger`` resolves
+    ``hf_model_config_path`` against, which is precisely what a wrong answer here breaks.
+
+    Getting this wrong does not surface as a missing path: ``AutoConfig.from_pretrained`` treats a
+    nonexistent local directory as a *hub repo id*, so the failure arrives as
+    ``HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name'`` and reads
+    like a credentials or network problem instead of a path bug.
+    """
+    nested = os.path.join(step_dir, "actor")
+    if os.path.isdir(os.path.join(nested, "huggingface")):
+        return nested
+    if os.path.isdir(os.path.join(step_dir, "huggingface")):
+        return step_dir
+    # neither marker is present (an interrupted save, or a layout this code has not seen). prefer the
+    # nested dir when it exists at all so the error names the RL path the caller most likely wanted.
+    return nested if os.path.isdir(nested) else step_dir
+
+
 def latest_global_step_dir(local_dir: str) -> tuple[str, int]:
     """return (actor_dir, step) for the highest global_step_N checkpoint verl wrote."""
     best_step, best = -1, ""
@@ -175,7 +204,7 @@ def latest_global_step_dir(local_dir: str) -> tuple[str, int]:
             m = re.fullmatch(r"global_step_(\d+)", name)
             if m and int(m.group(1)) > best_step:
                 best_step = int(m.group(1))
-                best = os.path.join(local_dir, name, "actor")
+                best = resolve_checkpoint_actor_dir(os.path.join(local_dir, name))
     if best_step < 0:
         raise RuntimeError(f"no global_step_N checkpoint found under {local_dir}")
     return best, best_step
@@ -190,11 +219,13 @@ def export_peft_adapter(
 ) -> None:
     """turn verl's saved lora checkpoint into a flash-servable peft adapter dir.
 
-    verl saves fsdp-sharded checkpoints under ``<local_dir>/global_step_N/actor`` (model/optim
-    shards + a ``huggingface/`` config+tokenizer subfolder). ``verl.model_merger merge`` writes a
-    standard peft adapter (adapter_config.json + adapter_model.safetensors) to a ``lora_adapter/``
-    subfolder of its target; we copy just that adapter into flash's adapter dir (the co-produced
-    merged full model is discarded -- flash serves the lora on the immutable base).
+    verl saves fsdp-sharded checkpoints (model/optim shards + a ``huggingface/`` config+tokenizer
+    subfolder) under ``<local_dir>/global_step_N/actor`` for RL and ``<local_dir>/global_step_N``
+    for SFT -- pass the dir that ``resolve_checkpoint_actor_dir`` picked, not a hardcoded one.
+    ``verl.model_merger merge`` writes a standard peft adapter (adapter_config.json +
+    adapter_model.safetensors) to a ``lora_adapter/`` subfolder of its target; we copy just that
+    adapter into flash's adapter dir (the co-produced merged full model is discarded -- flash
+    serves the lora on the immutable base).
 
     verified against verl 0.8 on an h100: merger emits ``<target>/lora_adapter/{adapter_config
     .json,adapter_model.safetensors}`` with ``base_model_name_or_path: null``.

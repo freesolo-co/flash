@@ -35,12 +35,39 @@ def test_agent_loop_workers_rejects_a_nonpositive_batch():
 
 def test_latest_global_step_dir_picks_highest(tmp_path):
     for step in (1, 5, 20, 3):
-        os.makedirs(tmp_path / f"global_step_{step}" / "actor", exist_ok=True)
+        os.makedirs(tmp_path / f"global_step_{step}" / "actor" / "huggingface", exist_ok=True)
     # a non-checkpoint dir must be ignored, not crash the scan.
     os.makedirs(tmp_path / "not_a_step", exist_ok=True)
     actor, step = vc.latest_global_step_dir(str(tmp_path))
     assert step == 20
     assert actor == os.path.join(str(tmp_path), "global_step_20", "actor")
+
+
+def test_latest_global_step_dir_resolves_the_sft_layout(tmp_path):
+    # verl's sft trainer saves straight into global_step_N with no actor/ level. hardcoding the rl
+    # convention here pointed the model merger at a path that does not exist, and AutoConfig
+    # reinterpreted it as a hub repo id -- so the run died on a bogus HFValidationError.
+    for step in (1, 2):
+        os.makedirs(tmp_path / f"global_step_{step}" / "huggingface", exist_ok=True)
+    actor, step = vc.latest_global_step_dir(str(tmp_path))
+    assert step == 2
+    assert actor == os.path.join(str(tmp_path), "global_step_2")
+
+
+def test_resolve_checkpoint_actor_dir_prefers_the_nested_rl_layout(tmp_path):
+    # rl checkpoints carry huggingface/ at both levels (the merger wants the actor one).
+    os.makedirs(tmp_path / "actor" / "huggingface")
+    os.makedirs(tmp_path / "huggingface")
+    assert vc.resolve_checkpoint_actor_dir(str(tmp_path)) == os.path.join(str(tmp_path), "actor")
+
+
+def test_resolve_checkpoint_actor_dir_falls_back_when_no_marker_exists(tmp_path):
+    # an interrupted save has no huggingface/ anywhere; name the rl path the caller likely wanted.
+    os.makedirs(tmp_path / "actor")
+    assert vc.resolve_checkpoint_actor_dir(str(tmp_path)) == os.path.join(str(tmp_path), "actor")
+    empty = tmp_path / "empty"
+    os.makedirs(empty)
+    assert vc.resolve_checkpoint_actor_dir(str(empty)) == str(empty)
 
 
 def test_latest_global_step_dir_raises_when_empty(tmp_path):
