@@ -12,10 +12,16 @@ from .envpush import _err, _resolve_local_env_entrypoint
 
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ECHO_RESPONSE = "test"
-# a completion no reasonable grader accepts, used as the negative control for the flat-reward
-# check below. deliberately not _ECHO_RESPONSE: that string already stands for "there is no gold
-# answer to replay", and reusing it would conflate the two.
-_NEGATIVE_CONTROL = "flash env test negative control: this answer is deliberately wrong."
+# wrong completions offered to the flat-reward check below as negative controls. deliberately not
+# _ECHO_RESPONSE: that string already stands for "there is no gold answer to replay", and reusing
+# it would conflate the two. the two single-character fillers are what make the set usable against
+# the substring graders this repo ships by default (see _control_is_disjoint): they draw on
+# disjoint alphabets, so no single gold answer can occur inside both.
+_CONTROL_CANDIDATES = (
+    "flash env test negative control: this answer is deliberately wrong.",
+    "z" * 64,
+    "0" * 64,
+)
 _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
 
@@ -206,23 +212,55 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     record["reward"] = float(env.reward("", example, state))
 
 
-def _negative_control_reward(env, example: dict) -> float | None:
-    """Score a deliberately wrong single-turn answer, or None when that is not meaningful.
+def _control_is_disjoint(control: str, reference: str) -> bool:
+    """Report whether `control` is a usable wrong answer for a gold `reference`.
+
+    The default graders in this repo accept a completion when the gold text occurs anywhere inside
+    it (`BaseEnvironment.grade`, and the `exact_match_reward` written by `flash env setup`). A
+    control that happens to contain the gold answer is therefore *correct* under those graders, and
+    reading equal scores as "this grader cannot rank" would fail a working environment. Require the
+    control to contain neither the gold text nor any of its words, in either direction.
+    """
+    gold = reference.strip().casefold()
+    if not gold:
+        return False
+    lowered = control.casefold()
+    if gold in lowered or lowered in gold:
+        return False
+    return not any(word in lowered for word in gold.split())
+
+
+def _negative_control_rewards(env, example: dict, reference: str) -> list[float] | None:
+    """Score deliberately wrong single-turn answers, or None when that is not meaningful.
 
     This is the comparison that makes the flat-reward gate scale-independent: a grader is unusable
     for RL when a wrong answer scores the same as the gold one, whatever that number is. Only the
     single-turn path is controlled -- a multi-turn reward reads the accumulated rollout state, and
     swapping one completion string cannot produce a comparable wrong episode.
+
+    Every usable control is scored rather than just the first, so an episode counts as separated
+    when *any* of them ranks below the gold answer. That keeps a permissive but working grader --
+    one that accepts a wrong English sentence for an open-ended task, say -- from being reported as
+    unable to rank, since the degenerate controls still fail it.
+
+    Returns None when no control can be shown to be wrong for this example, so the caller can
+    exclude the episode instead of drawing a conclusion the evidence does not support.
     """
     if env.multi_turn:
         return None
-    try:
-        control = float(env.reward(_NEGATIVE_CONTROL, example))
-    except (Exception, SystemExit):
-        # the grader may reject an off-distribution string outright. that is its prerogative and
-        # says nothing about the gold answer, so decline to judge rather than fail the episode.
-        return None
-    return control if math.isfinite(control) else None
+    scores = []
+    for control in _CONTROL_CANDIDATES:
+        if not _control_is_disjoint(control, reference):
+            continue
+        try:
+            score = float(env.reward(control, example))
+        except (Exception, SystemExit):
+            # the grader may reject an off-distribution string outright. that is its prerogative
+            # and says nothing about the gold answer, so decline to judge rather than fail.
+            return None
+        if math.isfinite(score):
+            scores.append(score)
+    return scores or None
 
 
 def _load_failure(reason: str) -> int:
@@ -325,19 +363,20 @@ def cmd_env_test(args) -> int:
             # the absolute value of a gold reward proves nothing: the contract accepts any finite
             # scalar, so an env may legitimately score its reference 0.0 with worse completions
             # below it. what makes a grader unusable for RL is that it cannot SEPARATE a good
-            # completion from a bad one, so score a deliberately wrong answer and compare.
-            control = _negative_control_reward(env, example)
-            if control is None:
-                # no comparable wrong answer to score (multi-turn, or the grader rejected the
-                # control outright), so this episode carries no evidence either way. counting it
-                # as controlled would let the gate below speak for episodes it never tested.
+            # completion from a bad one, so score deliberately wrong answers and compare.
+            controls = _negative_control_rewards(env, example, record["responses"][0])
+            if controls is None:
+                # no wrong answer could be shown to be wrong for this example (multi-turn, no
+                # control disjoint from the gold text, or the grader rejected them outright), so
+                # this episode carries no evidence either way. counting it as controlled would let
+                # the gate below speak for episodes it never tested.
                 continue
             controlled += 1
-            if control == reward:
+            if all(control == reward for control in controls):
                 scored_flat += 1
                 message = (
-                    f"replay gold answer and a deliberately wrong answer both scored "
-                    f"{reward:.6f}; check the reward function"
+                    f"replay gold answer and {len(controls)} deliberately wrong answer(s) all "
+                    f"scored {reward:.6f}; check the reward function"
                 )
                 print(
                     render.warn(message) if render.styled() else f"warning: {message}",
@@ -347,17 +386,17 @@ def cmd_env_test(args) -> int:
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
         return _err("overall: FAIL")
-    # a grader that hands a deliberately wrong answer the same score as its own gold answer on
+    # a grader that hands every deliberately wrong answer the same score as its own gold answer on
     # every sampled episode cannot rank completions at all: a broken reward function or a missing
     # runtime dependency, not a hard dataset. that must fail the gate, since passing here sends a
     # run to a gpu whose advantages are identically zero. episodes whose transcript the driver
-    # could not reproduce verbatim, and those whose control could not be scored, are excluded
-    # above. this samples the first few rows, so it is deliberately a claim about the sample:
-    # separation anywhere in it is enough to pass.
+    # could not reproduce verbatim, and those with no control provably wrong for their gold answer,
+    # are excluded above. this samples the first few rows, so it is deliberately a claim about the
+    # sample: separation anywhere in it is enough to pass.
     if controlled and scored_flat == controlled:
         _err(
-            f"all {controlled} replayed episode(s) scored a deliberately wrong answer exactly as "
-            "high as the gold answer; the reward function cannot rank completions. check the "
+            f"all {controlled} replayed episode(s) scored every deliberately wrong answer exactly "
+            "as high as the gold answer; the reward function cannot rank completions. check the "
             "grader and that its runtime dependencies are installed in this environment."
         )
         return _err("overall: FAIL")
