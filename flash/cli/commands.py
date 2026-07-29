@@ -338,7 +338,9 @@ def _print_train_schema_compatibility(result: object) -> None:
     print(render.note(text) if render.styled() else text, file=sys.stderr)
 
 
-def _warn_if_wandb_requested_without_key(spec, runtime_secrets: dict | None) -> None:
+def _warn_if_wandb_requested_without_key(
+    spec, runtime_secrets: dict | None, *, dry_run: bool
+) -> None:
     """Warn when a config asks for W&B but no ``WANDB_API_KEY`` was found locally.
 
     ``WANDB_API_KEY`` is an optional runtime secret, and discovery only looks at the process env and
@@ -348,12 +350,22 @@ def _warn_if_wandb_requested_without_key(spec, runtime_secrets: dict | None) -> 
     """
     if not (spec.wandb.project or spec.wandb.run_name):
         return
-    if (runtime_secrets or {}).get("WANDB_API_KEY"):
+    # strip before deciding: the server's _runtime_secrets() strips and drops the value, so a
+    # whitespace-only key reaches the worker as no key at all -- the exact silent-no-logging
+    # failure this warning exists to prevent, but with the warning suppressed.
+    if str((runtime_secrets or {}).get("WANDB_API_KEY") or "").strip():
         return
+    # a dry-run allocates no gpu and trains nothing, so "this run will train" would contradict the
+    # dry-run notice printed moments later and can read as though a paid run started.
+    outcome = (
+        "a run submitted with this config will train with W&B logging DISABLED"
+        if dry_run
+        else "this run will train with W&B logging DISABLED"
+    )
     message = (
         "[wandb] is configured but no WANDB_API_KEY was found in the environment, "
-        "./.env(.local), or the .env(.local) beside the config; this run will train with W&B "
-        "logging DISABLED. Export WANDB_API_KEY or put it in a .env next to the config."
+        f"./.env(.local), or the .env(.local) beside the config; {outcome}. "
+        "Export WANDB_API_KEY or put it in a .env next to the config."
     )
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
@@ -378,7 +390,7 @@ def cmd_train(args) -> int:
     runtime_secrets = (
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
-    _warn_if_wandb_requested_without_key(spec, runtime_secrets)
+    _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
     if args.dry_run:
         # dry-run runs submit-time server preflights without importing user code, allocating a gpu,
         # or charging anything. a rejection surfaces as the server's error with exit status 1.
@@ -771,7 +783,17 @@ def cmd_checkpoints(args) -> int:
 # the set the control plane transitions through. anything else ends the wait: ready, failed, or a
 # state this client does not know, which must not spin until the timeout.
 _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
+# the only states in which the control plane will actually serve the revision, mirroring
+# flash/server/routes/serving.py. leaving the busy set is NOT the same as arriving here:
+# `revocation_failed` (a concurrent undeploy whose backend cleanup failed) and any state a newer
+# plane introduces are both non-busy and non-servable, so `--wait` must fail closed on them
+# rather than let `deploy --wait && evaluate` proceed against nothing.
+_DEPLOYMENT_READY_STATES = frozenset({"ready", "deployed"})
 _DEPLOY_POLL_SECONDS = 5.0
+# `--wait 0` still owes the caller its one read, and a read needs a positive timeout. this bounds
+# that single request without falling back to the client's 60s default, which is the overshoot the
+# per-poll bound exists to prevent.
+_DEPLOY_ZERO_WAIT_READ_SECONDS = 10.0
 # an auth or authorization rejection answers the same way every time; polling through it just
 # spends the whole timeout to arrive at the identical error.
 _PERMANENT_POLL_STATUSES = frozenset({401, 403})
@@ -794,15 +816,29 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
     print(render.note(waiting) if render.styled() else f"note: {waiting}", file=sys.stderr)
     deadline = time.monotonic() + timeout
     latest = deployment
+    first = True
     while True:
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if remaining <= 0 and not first:
             break
-        time.sleep(min(_DEPLOY_POLL_SECONDS, remaining))
+        if not first:
+            time.sleep(min(_DEPLOY_POLL_SECONDS, remaining))
+            remaining = deadline - time.monotonic()
+            # the sleep can consume the whole budget. issuing the read anyway, with the 1s floor
+            # below, is how `--wait 0.1` came to block for over a second: check again after waking.
+            if remaining <= 0:
+                break
+        # `--wait 0` is documented as "check once, do not block", so the first read happens before
+        # the deadline applies. without it zero never calls deployment_for at all and the command
+        # judges readiness from the POST body, which is queued on every normal async deploy.
+        first = False
         try:
             # bound the read by what is left of the wait. the client's default timeout is 60s, so
-            # an unbounded poll inside `--wait 5` blocks far past the deadline the user set.
-            current = client.deployment_for(run_id, timeout=max(deadline - time.monotonic(), 1.0))
+            # an unbounded poll inside `--wait 5` blocks far past the deadline the user set. a
+            # blanket 1s floor would do the same to shorter waits, so only the zero-budget one-shot
+            # gets a fixed bound; every other read honours the remainder exactly.
+            budget = remaining if remaining > 0 else _DEPLOY_ZERO_WAIT_READ_SECONDS
+            current = client.deployment_for(run_id, timeout=budget)
         except ApiError as exc:
             if exc.status in _PERMANENT_POLL_STATUSES:
                 # retrying will not fix a rejected key or a run this key cannot see. without this
@@ -820,7 +856,7 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             # terminal, not slow; continuing here would just burn the whole timeout.
             print(
                 f"warning: {run_id} is no longer an active deployment; "
-                "run `flash models deployments` to check what happened",
+                f"run `{CLI_NAME} models deployments` to check what happened",
                 file=sys.stderr,
             )
             return latest
@@ -829,7 +865,7 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             return current
     print(
         f"warning: still {str(latest.get('state') or 'unknown')!r} after {timeout:g}s; "
-        f"run `flash models deployments` to keep checking {run_id}",
+        f"run `{CLI_NAME} models deployments` to keep checking {run_id}",
         file=sys.stderr,
     )
     return latest
@@ -846,14 +882,16 @@ def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
     """
     if str(final.get("state") or "") == "failed":
         return True
-    if not final.get("last_deploy_error"):
-        return False
     asked = requested.get("requested_at")
     got = final.get("requested_at")
-    # no attempt stamp on either side: a recorded error is the only signal available.
-    if asked is None or got is None:
-        return True
-    return asked != got
+    # a differing stamp means the record on the plane belongs to some other deploy request. that
+    # happens without any error at all: a concurrent `deploy` for the same run supersedes this one
+    # and reaches ready on ITS checkpoint, and reading only last_deploy_error would call that this
+    # command's success. compare the stamps whenever both sides carry one.
+    if asked is not None and got is not None:
+        return asked != got
+    # no attempt stamp to compare: a recorded error is the only signal left.
+    return bool(final.get("last_deploy_error"))
 
 
 def cmd_deploy(args) -> int:
@@ -878,12 +916,13 @@ def cmd_deploy(args) -> int:
     if wait_seconds is not None and dep.get("state") != "dry_run":
         requested = dep
         dep = _await_deployment(client, args.run_id, dep, wait_seconds)
-        # --wait promises the revision is servable on return. a record still in a busy state means
-        # the wait ended without that promise (timeout, vanished listing, or an unpollable plane),
-        # and a restored previous revision means the requested one never made it. exiting 0 in
-        # either case lets `deploy --wait && evaluate` run against the wrong adapter.
-        still_busy = str(dep.get("state") or "") in _DEPLOYMENT_BUSY_STATES
-        waited_but_unservable = still_busy or _deployment_attempt_failed(requested, dep)
+        # --wait promises the revision is servable on return, so require the plane to SAY it is
+        # servable. "not busy" is a weaker claim that also covers a timeout, a vanished listing, an
+        # unpollable plane, `revocation_failed`, and any state a newer plane adds; a restored
+        # previous revision means the requested one never made it. exiting 0 on any of those lets
+        # `deploy --wait && evaluate` run against the wrong adapter, or against none.
+        not_ready = str(dep.get("state") or "") not in _DEPLOYMENT_READY_STATES
+        waited_but_unservable = not_ready or _deployment_attempt_failed(requested, dep)
     if render.styled():
         print(render.deployed(dep))
     else:
@@ -892,7 +931,7 @@ def cmd_deploy(args) -> int:
     if dep.get("state") != "dry_run":
         openai_base = str(dep.get("openai_base_url") or "")
         note = (
-            f"serving is billed per token only; use `flash models undeploy {base_run_id}` "
+            f"serving is billed per token only; use `{CLI_NAME} models undeploy {base_run_id}` "
             "to deregister the adapter."
         )
         print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
@@ -908,8 +947,8 @@ def cmd_deploy(args) -> int:
         if state == "failed":
             detail = str(dep.get("error") or dep.get("detail") or "unknown error")
             status_note = (
-                f"deployment failed: {detail}; run `flash models deployments` for details and "
-                f"retry `flash models deploy {args.run_id}` after fixing the error."
+                f"deployment failed: {detail}; run `{CLI_NAME} models deployments` for details "
+                f"and retry `{CLI_NAME} models deploy {args.run_id}` after fixing the error."
             )
         elif waited_but_unservable and dep.get("last_deploy_error"):
             # state reads `ready`, but it is the PREVIOUS revision: say so, or the reader trusts
@@ -917,13 +956,21 @@ def cmd_deploy(args) -> int:
             detail = str(dep.get("last_deploy_error"))
             status_note = (
                 f"the requested revision did not become servable ({detail}); the previously "
-                f"deployed revision is still serving. retry `flash models deploy {args.run_id}` "
-                "after fixing the error."
+                f"deployed revision is still serving. retry "
+                f"`{CLI_NAME} models deploy {args.run_id}` after fixing the error."
+            )
+        elif waited_but_unservable:
+            # the wait ended without the plane calling this revision servable, and there is no
+            # recorded error to explain it: a timeout, or a terminal state that is not ready. the
+            # generic "use chat once it is ready" below would read as success next to the exit 1.
+            status_note = (
+                f"deployment state is {state!r} after waiting; the requested revision is not "
+                f"servable yet. run `{CLI_NAME} models deployments` to keep checking it."
             )
         else:
             status_note = (
-                f"deployment state is {state!r}; run `flash models deployments` to check progress "
-                "and use `flash models chat` once it is ready."
+                f"deployment state is {state!r}; run `{CLI_NAME} models deployments` to check "
+                f"progress and use `{CLI_NAME} models chat` once it is ready."
             )
         print(
             render.arrow(status_note) if render.styled() else f"note: {status_note}",
