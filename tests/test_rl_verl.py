@@ -62,6 +62,7 @@ def _overrides_cfg(**over):
         "prompts_per_step": 16, "max_prompt_len": 2048,
         "max_model_len": 2368, "max_token_len_per_gpu": 2368,
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
+        "entropy_quantile": None,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
         "steps": 60, "gpu_mem_util": 0.5, "n_gpus": 1, "loggers": "console", "fp8_kv": False,
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
@@ -235,7 +236,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
         "prompts_per_step": 16, "mask_truncated_completions": True,
         "max_prompt_len": 3072, "max_completion": 1024, "engine_len": 4096,
-        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "seed": 42,
+        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "entropy_quantile": None, "seed": 42,
         "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
         "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
     }
@@ -874,31 +875,56 @@ def test_reward_server_scorer_can_capture_samples():
         server.shutdown()
 
 
-def test_resolve_single_turn_inputs_guards_entropy_quantile(monkeypatch):
-    # entropy_quantile<1.0 has no verl equivalent (trl top-entropy masking); the single-turn resolver
-    # must fail loud rather than silently train without the requested masking.
-    import pytest
+def test_entropy_quantile_shim_is_emitted_only_when_masking_is_requested():
+    # 1.0 (and unset) means "keep every token", which is verl's own behavior -- emitting a shim then
+    # would patch the loss to do nothing. only a real quantile may put a patch on the import path.
+    assert rl_verl.render_entropy_quantile_shim(None) == ""
+    assert rl_verl.render_entropy_quantile_shim(1.0) == ""
+    source = rl_verl.render_entropy_quantile_shim(0.2)
+    assert source
+    # trl thresholds at 1 - top_entropy_quantile: keeping the top 20% means cutting at the 0.8
+    # quantile. carrying the flash value through unconverted would keep the BOTTOM 20% instead.
+    assert "_flash_entropy_threshold_q = 0.8" in source
+    assert rl_verl._ENTROPY_QUANTILE_MARKER in source
 
-    import flash.engine.worker.rl_verl as rlv
-    from flash.engine.worker._pkg import W
-    from flash.spec import JobSpec
 
-    spec = JobSpec.from_dict(
-        {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo", "train": {"entropy_quantile": 0.2}}
+def test_entropy_quantile_shim_refuses_to_wrap_itself_twice():
+    # double-wrapping would take the top quantile OF the top quantile: with 0.2 that trains on ~4%
+    # of tokens instead of 20%, and nothing in the logs would show it. verified numerically against
+    # verl's real ppo_loss -- without this guard the loss drifted from -0.0428 to -0.0251.
+    source = rl_verl.render_entropy_quantile_shim(0.2)
+    assert '_flash_entropy_masked", False)' in source
+    assert "_flash_entropy_masked_ppo_loss._flash_entropy_masked = True" in source
+
+
+def test_entropy_quantile_shim_masks_only_the_policy_gradient_term():
+    # trl multiplies per_token_loss by the entropy mask and THEN adds the kl term, so kl and the
+    # entropy bonus stay on the full response mask. masking inside ppo_loss itself would shrink all
+    # three. the shim therefore wraps get_policy_loss_fn, not the aggregation.
+    source = rl_verl.render_entropy_quantile_shim(0.2)
+    assert "_flash_losses.get_policy_loss_fn = _flash_masked_policy_loss_fn" in source
+    assert 'kwargs["response_mask"] = _flash_high_entropy_mask' in source
+    # equivalence also needs a mask-independent denominator, which is why flash pins this mode.
+    assert _overrides_cfg()["loss_agg_mode"] == "seq-mean-token-sum-norm"
+
+
+def test_entropy_quantile_overrides_enable_verl_entropy_and_stay_off_by_default():
+    # the shim reads model_output["entropy"], which verl only populates when calculate_entropy is
+    # set. flash's recipe has entropy_coeff 0, so nothing else would turn it on.
+    assert "actor_rollout_ref.actor.calculate_entropy=True" in rl_verl.build_verl_overrides(
+        _overrides_cfg(entropy_quantile=0.2)
+    )
+    assert "actor_rollout_ref.actor.calculate_entropy=True" not in rl_verl.build_verl_overrides(
+        _overrides_cfg()
     )
 
-    class _Env:
-        is_tool_env = False
-        multi_turn = False
 
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "SEED", 42, raising=False)
-    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    # the resolver seeds rngs (torch) before validating; stub it so this stays cpu/offline-runnable.
-    monkeypatch.setattr(rlv, "seed_training_rngs", lambda seed: None)
-
-    with pytest.raises(RuntimeError, match="entropy_quantile"):
-        rlv._resolve_single_turn_inputs()
+def test_resolve_single_turn_inputs_no_longer_rejects_entropy_quantile():
+    # the guard this replaces raised on any entropy_quantile < 1.0. the shim implements the masking,
+    # so the resolver must pass the value through instead of failing the run.
+    source = inspect.getsource(rl_verl._resolve_single_turn_inputs)
+    assert "is not yet supported" not in source.split("entropy_quantile")[1].split("\n\n")[0]
+    assert '"entropy_quantile": entropy_quantile' in source
 
 
 def test_build_verl_overrides_enable_fused_linear_ce():
@@ -1060,6 +1086,7 @@ def test_train_notes_report_whether_the_run_resumed():
         "epochs": 2,
         "group_size": 4,
         "kl_coef": 0.0,
+        "entropy_quantile": None,
         "temperature": 1.0,
         "top_p": 1.0,
         "ppo_epochs": 1,
