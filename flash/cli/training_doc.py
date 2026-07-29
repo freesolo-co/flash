@@ -730,12 +730,22 @@ reference with adapters disabled, so the reference would be the bare base model 
 SFT adapter, pulling the policy back toward base. Every one of these raises at startup rather
 than quietly training on a different contract.
 
-The verl OPD backend has one gap of its own: a multi-turn env combined with `[train]
-structured_outputs` stays on `trl`. Multi-turn OPD alone is fine on verl, and structured outputs
-alone are fine on verl; only the combination raises, because applying one schema uniformly to
-every assistant turn is the wrong contract when intermediate turns and the final answer have
-different shapes. Like the GRPO gaps, it raises at startup rather than training on a contract you
-did not ask for.
+The verl OPD backend has gaps of its own. A multi-turn env combined with `[train]
+structured_outputs` stays on `trl`: multi-turn OPD alone runs on verl, and structured outputs
+alone run on verl, but the combination raises.
+
+Structured-output OPD on verl additionally requires the constraint to be exactly replayable on
+CPU, which pins it to xgrammar. These raise at startup even on a single-turn env: a
+`whitespace_pattern`, `disable_additional_properties` (guidance-backend only), a JSON schema using
+features that need vLLM's guidance fallback, or a model carrying a vLLM Mistral tokenizer.
+
+On either backend, note what a multi-turn structured-output run actually does: one schema is
+applied to EVERY assistant turn, mid-rollout turns included, because the env contract has no
+per-turn schema channel. If your intermediate turns and your final answer have different shapes,
+`trl` will constrain the intermediate ones to the final-answer schema rather than reject the run.
+That is the contract verl declines to guess at, and it is why the fix is a per-turn constraint
+channel rather than simply lifting the verl check. Like the GRPO gaps, verl raises at startup
+rather than training on a contract you did not ask for.
 
 ---
 
