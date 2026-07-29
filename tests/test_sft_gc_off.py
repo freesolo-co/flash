@@ -184,6 +184,27 @@ def test_grpo_use_reentrant_true_for_gdn_hybrid():
         assert grpo_use_reentrant(gdn_id) is True, gdn_id
 
 
+def test_grpo_use_reentrant_true_for_gemma3():
+    # gemma3 upcasts inside the checkpointed region (normalizer / attention soft-cap run in fp32),
+    # so the recompute disagrees on BOTH dtype and rank -- saved [494, 2560] bfloat16 vs recomputed
+    # [1, 494, 2560] float32 -- and non-reentrant checkpointing raises CheckpointError on the FIRST
+    # backward, before any optimizer step. live-confirmed on google/gemma-3-4b-pt and -4b-it, H100
+    # sm90: without this, gemma3 sft/grpo cannot start at all.
+    from flash.engine.worker.perf.memory import grpo_use_reentrant
+
+    for gemma_id in (
+        "google/gemma-3-4b-pt",
+        "google/gemma-3-4b-it",
+        "google/gemma-3-27b-it",
+    ):
+        assert grpo_use_reentrant(gemma_id) is True, gemma_id
+    # the family check is spelling-tolerant: a hub id may separate the version with . or _.
+    assert grpo_use_reentrant("some-org/gemma3-custom") is True
+    assert grpo_use_reentrant("some-org/gemma_3-custom") is True
+    # gemma2 and earlier do not upcast inside the checkpoint and keep the non-reentrant path.
+    assert grpo_use_reentrant("google/gemma-2-9b-it") is False
+
+
 def test_grpo_use_reentrant_false_for_non_gdn_dense():
     # uncataloged non-gdn dense models keep the faster non-reentrant path because standard
     # transformer layers recompute deterministically without metadata divergence.

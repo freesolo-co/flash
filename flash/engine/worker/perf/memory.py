@@ -84,6 +84,18 @@ def _is_gdn_hybrid_family(model_id: str) -> bool:
     return any(token in mid for token in ("qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6"))
 
 
+def _is_upcasting_checkpoint_family(model_id: str) -> bool:
+    """Offline family check for an arch that changes activation dtype/rank inside the checkpoint.
+
+    Gemma3 upcasts inside the checkpointed region (its normalizer and attention soft-cap run in
+    fp32), so the recompute hands back a tensor whose dtype AND rank both differ from what the
+    forward saved. Same hermetic string form as ``_is_gdn_hybrid_family``: no config probe, so
+    ``grpo_use_reentrant`` stays callable at config-build time without HF access.
+    """
+    mid = (model_id or "").lower()
+    return any(token in mid for token in ("gemma-3", "gemma3", "gemma_3"))
+
+
 def grpo_use_reentrant(model_id: str) -> bool:
     """Whether GRPO gradient checkpointing must use REENTRANT recompute for this model.
 
@@ -102,18 +114,23 @@ def grpo_use_reentrant(model_id: str) -> bool:
       kernels each save shape-/data-dependent tensors that the non-reentrant metadata-equality check
       can't positionally reconcile (live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090: forward packed
       varlen ``[1636, ...]`` vs recompute padded ``[1024, ...]``). Same failure mode as MoE.
+    - Gemma3: the normalizer/soft-cap upcast inside the checkpointed region makes the recompute
+      disagree on BOTH dtype and rank (saved ``[494, 2560] bfloat16`` vs recomputed
+      ``[1, 494, 2560] float32``). Live-confirmed on ``google/gemma-3-4b-pt`` and
+      ``google/gemma-3-4b-it``, H100 sm90, raising on the first backward.
 
     Reentrant checkpointing re-runs the forward inside the same autograd context over the same
     closed-over inputs (mask/position_ids threaded via the ``partial``; ``use_cache=False``) and does
     NOT assert metadata equality, so it tolerates these recomputes and produces correct gradients.
-    Uncataloged non-GDN dense open models keep the faster, lower-overhead non-reentrant path.
+    Uncataloged dense open models with none of these traits keep the faster, lower-overhead
+    non-reentrant path.
     """
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)
     if info is not None and info.is_moe:
         return True
-    return _is_gdn_hybrid_family(model_id)
+    return _is_gdn_hybrid_family(model_id) or _is_upcasting_checkpoint_family(model_id)
 
 
 def enable_multimodal_input_require_grads(model) -> object | None:
