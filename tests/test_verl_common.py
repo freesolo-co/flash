@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import time
@@ -68,6 +69,46 @@ def test_stamp_adapter_dir_provenance_rejects_base_mismatch(tmp_path):
 def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):
     monkeypatch.setenv("FLASH_VERL_PYTHON", "/opt/verl/bin/python")
     assert vc.resolve_verl_python(str(tmp_path)) == "/opt/verl/bin/python"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_path, blank):
+    # a worker IMAGE can export FLASH_VERL_PYTHON itself, and [worker_env] can only SET a key, never
+    # delete one -- so omitting it from a spec leaves the image's interpreter in place. an empty
+    # value is the only way a run can say "ignore the image's verl and provision the pinned fork",
+    # and the error at rl_verl.py's mask_truncated_completions gate names exactly this remedy.
+    calls = []
+    monkeypatch.setenv("FLASH_VERL_PYTHON", blank)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    python_bin = vc.resolve_verl_python(str(tmp_path))
+
+    assert python_bin.endswith("/verl-venv/bin/python")
+    assert vc.VERL_REQUIREMENT in calls[1]
+
+
+def test_worker_env_remedies_are_copy_pasteable_toml():
+    # a [worker_env] snippet in an error gets pasted into a config verbatim, so it has to survive the
+    # real parser: '[worker_env] KEY = "..."' reads fine in prose but is invalid TOML, because a
+    # table header must end its line. a blocked run would just hit a second, more confusing error.
+    import re
+    import tomllib
+
+    from flash.engine.worker import rl_verl
+
+    # only assignment forms -- '[worker_env] can set a key but never delete one' is prose, not a
+    # snippet, and carries no '=' to paste.
+    pattern = re.compile(r"\[worker_env\][^\n]*?[A-Z_]+\s*=\s*(\"[^\"]*\"|'[^']*')")
+    snippets = [m.group(0) for m in pattern.finditer(inspect.getsource(rl_verl))]
+    assert snippets, "expected rl_verl to advertise at least one [worker_env] remedy"
+
+    for snippet in snippets:
+        # a valid snippet is the header, a newline, then the assignment -- exactly what we tell users.
+        header, _, assignment = snippet.partition("]")
+        parsed = tomllib.loads(f"{header}]\n{assignment.split('as ')[-1].strip()}")
+        assert parsed == {"worker_env": {"FLASH_VERL_PYTHON": ""}}
+        # and the prose must not run the header into the assignment on one line.
+        assert not re.match(r"\[worker_env\]\s+[A-Z_]+\s*=", snippet), snippet
 
 
 def _fake_verl_venv(tmp_path, *, stamp: str | None):
