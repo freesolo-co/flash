@@ -41,7 +41,7 @@ from flash.engine.structured_outputs import (
     reasoning_parser_for,
 )
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.heartbeat import _GRPO_METRIC_HISTORY_LIMIT, liveness_heartbeat
 from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
@@ -357,6 +357,48 @@ def _build_verl_training_cfg(
         "project_name": project_name,
         "experiment_name": experiment_name,
     }
+
+
+# verl prints every per-step metric on one stdout line, under its own names. map them onto the
+# payload keys the cli step table already renders (_FOLLOW_METRIC_FIELDS in cli/commands.py) so a
+# verl run shows the same history a trl run does.
+_VERL_STEP_METRIC_KEYS = (
+    ("reward", r"critic/rewards/mean:([-\d.eE+]+)"),
+    ("reward_std", r"critic/rewards/std:([-\d.eE+]+)"),
+    ("grad_norm", r"actor/grad_norm:([-\d.eE+]+)"),
+    ("kl", r"actor/kl_loss:([-\d.eE+]+)"),
+    ("entropy", r"actor/entropy(?:_loss)?:([-\d.eE+]+)"),
+    ("mean_completion_tokens", r"response_length/mean:([-\d.eE+]+)"),
+    ("truncation_rate", r"response_length/clip_ratio:([-\d.eE+]+)"),
+)
+_VERL_STEP_METRIC_RES = tuple((key, re.compile(pat)) for key, pat in _VERL_STEP_METRIC_KEYS)
+
+
+def _verl_step_metrics(line: str, *, max_completion_tokens: int | None = None) -> dict | None:
+    """Parse one verl stdout line into a ``metrics_last`` row, or None if it is not a step line.
+
+    The trl backend builds these rows in its trainer callback (``heartbeat.py``), which verl never
+    instantiates because it trains out of process -- so without this the cli's per-step metrics table
+    is empty for every verl run. Only the step number is required; each metric is independent, so a
+    verl version that omits one still yields a row carrying the rest.
+    """
+    step_hit = re.search(r"step:\s*(\d+)", line)
+    if not step_hit:
+        return None
+    metrics: dict = {"step": int(step_hit.group(1))}
+    for key, pattern in _VERL_STEP_METRIC_RES:
+        hit = pattern.search(line)
+        if not hit:
+            continue
+        try:
+            value = float(hit.group(1))
+        except ValueError:
+            continue
+        if math.isfinite(value):
+            metrics[key] = value
+    if max_completion_tokens is not None:
+        metrics["max_completion_tokens"] = int(max_completion_tokens)
+    return metrics
 
 
 def _build_verl_train_notes(
@@ -1565,7 +1607,14 @@ def run_rl_verl():
         resp_len_history: list[float] = []
         loss_curve: list[float] = []
         last_dump_step = [-1]
-        with liveness_heartbeat("rl_step", progress=_progress, progress_step=True):
+        # per-step rows for the cli's step table; the trl backend fills this from its trainer
+        # callback, which verl has no counterpart for (it trains out of process).
+        metrics_last: list[dict] = []
+        def _hb_metrics_fields():
+            return {"metrics_last": list(metrics_last)}
+
+        with liveness_heartbeat("rl_step", progress=_progress, progress_step=True,
+                                fields=_hb_metrics_fields):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env_for_verl,
@@ -1577,6 +1626,16 @@ def run_rl_verl():
                     link = parse_wandb_link(line)
                     if link is not None:
                         wandb_link.update(link)
+                    row = _verl_step_metrics(
+                        line, max_completion_tokens=inp.get("max_completion")
+                    )
+                    if row is not None:
+                        metrics_last[:] = [
+                            *[item for item in metrics_last if item["step"] != row["step"]][
+                                -(_GRPO_METRIC_HISTORY_LIMIT - 1) :
+                            ],
+                            row,
+                        ]
                     m = step_re.search(line)
                     if m:
                         step_box[0] = int(m.group(1))
@@ -1661,7 +1720,13 @@ def run_rl_verl():
         if final_save_due(steps_run, inp["save_at_steps"]):
             _w.publish_deployable_checkpoint(adapter_dir, steps_run)
 
-    _w.heartbeat("rl_trained", train_wall=train_wall, step=steps_run, gpu=gpu_diagnostics())
+    _w.heartbeat(
+        "rl_trained",
+        train_wall=train_wall,
+        step=steps_run,
+        gpu=gpu_diagnostics(),
+        metrics_last=list(metrics_last),
+    )
     _w.write_train_meta(
         phase="rl",
         adapter_dir=adapter_dir,
@@ -1669,6 +1734,7 @@ def run_rl_verl():
         train_wall=train_wall,
         setup_seconds=setup_seconds,
         train_tokens=0,
+        heartbeat_fields={"metrics_last": list(metrics_last)},
         generated_tokens=int(
             sum(resp_len_history) / max(1, len(resp_len_history))
             * steps_run * inp["prompts_per_step"] * inp["group_size"]

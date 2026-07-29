@@ -1384,3 +1384,65 @@ def test_capability_guards_admit_the_supported_single_turn_text_env(monkeypatch)
     # guard that fires on every env would fail here instead of passing the four tests above.
     inp = _capability_resolve(monkeypatch, _capability_env())
     assert inp["max_prompt_len"] > 0
+
+
+def test_verl_step_metrics_parses_the_cli_step_table_fields():
+    # the cli renders one row per metrics_last entry (cli/commands.py:_FOLLOW_METRIC_FIELDS), and
+    # the trl backend fills that list from its trainer callback. verl trains OUT OF PROCESS, so no
+    # callback ever runs and the table is empty for every verl run unless the stdout line is parsed.
+    line = (
+        "step:7 - critic/rewards/mean:0.4213 - critic/rewards/std:0.1102 - "
+        "actor/pg_loss:-0.0031 - actor/grad_norm:1.75 - actor/kl_loss:0.0042 - "
+        "actor/entropy:0.913 - response_length/mean:311.5 - response_length/clip_ratio:0.125"
+    )
+    row = rl_verl._verl_step_metrics(line, max_completion_tokens=512)
+    assert row == {
+        "step": 7,
+        "reward": pytest.approx(0.4213),
+        "reward_std": pytest.approx(0.1102),
+        "grad_norm": pytest.approx(1.75),
+        "kl": pytest.approx(0.0042),
+        "entropy": pytest.approx(0.913),
+        "mean_completion_tokens": pytest.approx(311.5),
+        "truncation_rate": pytest.approx(0.125),
+        "max_completion_tokens": 512,
+    }
+    # every field parsed here is one the cli step table actually renders, so nothing is collected
+    # that the consumer would drop on the floor.
+    from flash.cli.commands import _FOLLOW_METRIC_FIELDS
+
+    rendered = {key for key, _ in _FOLLOW_METRIC_FIELDS}
+    assert set(row) - {"step"} <= rendered
+    # verl prints no counterpart for trl's frac_reward_zero_std (it is computed inside the trl
+    # trainer, not logged by verl), so that one column stays blank on a verl run. every other
+    # column the table renders is filled.
+    assert rendered - set(row) == {"frac_reward_zero_std"}
+
+
+def test_verl_step_metrics_skips_non_step_lines_and_tolerates_missing_metrics():
+    # a line with no step number is not a metrics row at all.
+    assert rl_verl._verl_step_metrics("[verl] loading checkpoint ...") is None
+    # each metric is independent: a verl build that omits some still yields a row with the rest,
+    # rather than dropping the step from the table entirely.
+    row = rl_verl._verl_step_metrics("step:3 - critic/rewards/mean:0.9")
+    assert row == {"step": 3, "reward": 0.9}
+    # a non-finite or unparsable value is skipped, not written as nan into the rendered table.
+    row = rl_verl._verl_step_metrics("step:4 - critic/rewards/mean:nan - actor/grad_norm:2.0")
+    assert row == {"step": 4, "grad_norm": 2.0}
+    # entropy is reported as actor/entropy on some verl versions and actor/entropy_loss on others.
+    assert rl_verl._verl_step_metrics("step:5 - actor/entropy_loss:0.5")["entropy"] == 0.5
+
+
+def test_verl_grpo_emits_metrics_last_on_heartbeats_and_train_meta():
+    # producer pin. VERL-037: rl_verl.py had ZERO references to metrics_last, so a verl run showed
+    # an empty per-step table where an otherwise-identical trl run showed history. assert against
+    # the SOURCE of the verl entrypoint, the way the trl contract is pinned in
+    # test_worker_init_heartbeat.py -- the verl backend cannot silently drop the field again.
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    # carried on the per-step liveness heartbeat, so the table fills DURING the run...
+    assert 'return {"metrics_last": list(metrics_last)}' in src
+    assert "fields=_hb_metrics_fields" in src
+    # ...on the terminal heartbeat...
+    assert "metrics_last=list(metrics_last)" in src
+    # ...and into train_meta, so it survives after the run ends.
+    assert 'heartbeat_fields={"metrics_last": list(metrics_last)}' in src
