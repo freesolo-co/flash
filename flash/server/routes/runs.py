@@ -9,6 +9,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
+import flash.runner as _runner
+from flash.multimodal import preflight_validate_image_opd
 from flash.runner import (
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
@@ -175,12 +177,15 @@ def create_run(
     billable_key = key.get("auth_kind") != "internal"
     bill_on_completion = not dry_run and billable_key
     billing_context = None
+    # the org requirement is a property of the KEY, not of the mode: a dry run whose org cannot be
+    # resolved would otherwise skip the affordability check and answer 200, while submitting the very
+    # same spec for real is rejected 400 here -- the preview contradicting the launch it previews.
+    if billable_key and not affordability_org_id:
+        raise HTTPException(
+            status_code=400,
+            detail="org id is required to bill a completed training run",
+        )
     if bill_on_completion:
-        if not affordability_org_id:
-            raise HTTPException(
-                status_code=400,
-                detail="org id is required to bill a completed training run",
-            )
         billing_context = {"org_id": affordability_org_id}
     platform_context = {
         field: value
@@ -221,10 +226,18 @@ def create_run(
                 ) from exc
             raise
         run_id = prepared.public_spec.run_id
+        # validate the spec BEFORE charging affordability against it. submit_job runs these same
+        # read-only gates, but it runs them after this point, so an unsupported spec would be told
+        # "insufficient balance" (402) for a run it can never launch at any balance -- sending the
+        # user to top up instead of to the real defect. both are pure and raise ValueError, which the
+        # handler below turns into the 400 submit_job would have produced.
+        _runner._require_supported_gpu_count(prepared.public_spec)
+        _runner._require_supported_gpu_count(prepared.worker_spec)
+        preflight_validate_image_opd(prepared.worker_spec)
         # run the affordability check for dry runs too. it is verify-only (moves no money), so a
         # `--dry-run` that passes now also proves the org can cover the estimate, instead of the run
         # being validated here and rejected 402 only on real submission.
-        if bill_on_completion or (dry_run and billable_key and affordability_org_id):
+        if bill_on_completion or (dry_run and billable_key):
             _precheck_budget_or_block(
                 run_id=run_id,
                 estimate_usd=prepared.estimated_cost_usd,
