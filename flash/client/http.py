@@ -624,14 +624,24 @@ class ApiClient:
         that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
         overshoot the bound the user asked for by an order of magnitude.
         """
-        base_run_id, _step = _parse_adapter_target(run_id)
+        base_run_id, step = _parse_adapter_target(run_id)
         for entry in self.deployments(timeout=timeout):
             deployment = entry.get("deployment") or {}
             # the id lives on the nested record or on the listing row depending on the endpoint;
             # the render and list paths already read both. matching only the nested one makes a
             # live deployment look absent, which --wait would report as "vanished".
-            if base_run_id in (deployment.get("run_id"), entry.get("run_id")):
-                return deployment
+            if base_run_id not in (deployment.get("run_id"), entry.get("run_id")):
+                continue
+            # the requested step is part of the identity, not decoration. matching on the run id
+            # alone lets `deploy RUN/step-40 --wait` settle on whichever revision happens to be
+            # listed -- an older one still marked ready, or a replacement another shell deployed
+            # mid-wait -- and report that as this caller's own revision.
+            if "checkpoint_step" in deployment:
+                listed = deployment.get("checkpoint_step")
+                # None is the final adapter, an int is RUN/step-N (see the deployments renderer).
+                if (listed if listed is None else int(listed)) != step:
+                    continue
+            return deployment
         return None
 
     def chat(
