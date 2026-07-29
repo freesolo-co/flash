@@ -1168,7 +1168,7 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *args, **kwargs: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda: None)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda: {})
-    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda: None)
+    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(
         transformers.AutoProcessor,
         "from_pretrained",

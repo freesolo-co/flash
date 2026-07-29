@@ -664,6 +664,80 @@ def test_attn_impl_for_capability_per_arch(monkeypatch):
     assert f(10, 0, fa2_available=False) == "sdpa"
 
 
+def test_optimal_attn_impl_skips_a_backend_the_arch_disclaims(monkeypatch):
+    """The capability map is model-blind, so on Blackwell it forces attn_implementation="sdpa" for
+    every arch. GptOssForCausalLM sets _supports_sdpa = False (it ships flash and flex only), so the
+    forced override is REJECTED at from_pretrained -- "does not support an attention implementation
+    through torch.nn.functional.scaled_dot_product_attention yet" -- and gpt-oss cannot train on
+    B200 at all. Selecting a backend must therefore consult the architecture's own support flags."""
+    w = _import_worker(monkeypatch)
+    attn = sys.modules["flash.engine.worker.perf.attn"]
+
+    monkeypatch.setattr(attn, "_flash_attn_available", lambda: False)
+    monkeypatch.setattr(attn, "_flash_attn_3_available", lambda: False)
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda _i: (10, 0),  # datacenter Blackwell -> "sdpa"
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    supported = {"org/supports-sdpa": True, "openai/gpt-oss-20b": False}
+    monkeypatch.setattr(
+        attn, "_arch_supports_attn_impl", lambda model_id, impl, revision="": supported[model_id]
+    )
+
+    # an arch that ships an sdpa kernel keeps the Blackwell override.
+    assert w.optimal_attn_impl("org/supports-sdpa") == "sdpa"
+    # one that disclaims it falls back to transformers' own default rather than crashing at load.
+    assert w.optimal_attn_impl("openai/gpt-oss-20b") is None
+    # with no model id there is nothing to check, so the capability verdict stands unchanged.
+    assert w.optimal_attn_impl() == "sdpa"
+
+
+def test_arch_supports_attn_impl_reads_the_transformers_flag(monkeypatch):
+    """The support probe reads the architecture class's own _supports_* flag, and treats anything it
+    cannot resolve as supported so an unknown arch keeps the existing capability behaviour."""
+    w = _import_worker(monkeypatch)
+    f = w._arch_supports_attn_impl
+
+    class _Cfg:
+        pass
+
+    class _NoSdpa:
+        _supports_sdpa = False
+        _supports_flash_attn = True
+
+    fake_modeling_auto = types.ModuleType("transformers.models.auto.modeling_auto")
+    fake_modeling_auto.MODEL_FOR_CAUSAL_LM_MAPPING = {_Cfg: _NoSdpa}
+    monkeypatch.setitem(sys.modules, "transformers.models.auto.modeling_auto", fake_modeling_auto)
+    monkeypatch.setattr(
+        "transformers.AutoConfig", types.SimpleNamespace(from_pretrained=lambda *a, **k: _Cfg())
+    )
+
+    assert f("org/model", "sdpa") is False  # declared unsupported -> veto
+    assert f("org/model", "flash_attention_2") is True  # declared supported -> allowed
+    assert f("org/model", "flash_attention_3") is True  # shares the flash_attn flag
+    assert f("org/model", "eager") is True  # no flag maps to eager -> never vetoed
+
+    # an arch the mapping does not know is not vetoed either (KeyError -> fail open).
+    class _Other:
+        pass
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig", types.SimpleNamespace(from_pretrained=lambda *a, **k: _Other())
+    )
+    assert f("org/unmapped", "sdpa") is True
+
+    # an unresolvable config must NOT be vetoed: the probe fails open so behaviour is unchanged.
+    def _boom(*a, **k):
+        raise OSError("no config")
+
+    monkeypatch.setattr("transformers.AutoConfig", types.SimpleNamespace(from_pretrained=_boom))
+    assert f("org/unknown", "sdpa") is True
+
+
 def test_flash_attn_probes_false_in_ci(monkeypatch):
     """The FA2/FA3 probes report False in offline CI (neither transformers/flash_attn nor the FA3
     ``flash_attn_interface`` is present). FA is used whenever importable — there is no disable
@@ -886,7 +960,7 @@ def test_warmstart_base_loader_forwards_model_revision(monkeypatch):
     )
     monkeypatch.setattr(adapter_mod, "_download_adapter", lambda prefix: "/tmp/adapter")
     monkeypatch.setattr(adapter_mod, "adapter_is_vl_warmstart", lambda *args, **kwargs: False)
-    monkeypatch.setattr(adapter_mod, "optimal_attn_impl", lambda: None)
+    monkeypatch.setattr(adapter_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(adapter_mod, "_assert_warmstart_adapter_applied", lambda *args: None)
 
     model, peft_config = adapter_mod._init_adapter_model("org/model")

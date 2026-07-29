@@ -646,7 +646,7 @@ def run_opd():
     thinking_prefill = _thinking_prefill_text(tok)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    _attn = optimal_attn_impl()
+    _attn = optimal_attn_impl(model_id, model_revision)
     model_init_kwargs = {
         "dtype": torch.bfloat16,
         **model_revision_kwargs(model_revision),

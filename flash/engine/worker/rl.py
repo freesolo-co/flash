@@ -731,7 +731,7 @@ def run_rl():
     # chalk kernels are applied below against trainer.model (the authoritative target); TRL may
     # rebuild/wrap the PeftModel, and the fresh-LoRA path only passes the model-id string here.
     if init_peft is not None:
-        _attn = optimal_attn_impl()
+        _attn = optimal_attn_impl(model_id, model_revision)
         # Force bf16 (TRL string-loading can fall back to fp32 and double VRAM).
         grpo_kwargs["model_init_kwargs"] = {
             "dtype": "bfloat16",
@@ -740,7 +740,7 @@ def run_rl():
         if _attn:
             grpo_kwargs["model_init_kwargs"]["attn_implementation"] = _attn
     else:
-        _attn = optimal_attn_impl()
+        _attn = optimal_attn_impl(model_id, model_revision)
     # vLLM sampler stop: truncate each rollout at the delimiter so the reward sees the same text.
     _gen_kwargs: dict = {}
     if multimodal and not is_multi_turn:

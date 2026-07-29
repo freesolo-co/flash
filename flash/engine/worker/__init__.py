@@ -100,6 +100,7 @@ from flash.engine.worker.lora import (
 from flash.engine.worker.opd import run_opd
 from flash.engine.worker.perf import (
     RetriableInfraError,
+    _arch_supports_attn_impl,
     _attn_impl_for_capability,
     _ensure_fla_fastpath_on_hopper,
     _estimate_params,
@@ -472,6 +473,7 @@ __all__ = [
     "_WANDB_FINISH_WAIT_S",
     "RetriableInfraError",
     "_GpuPeakSampler",
+    "_arch_supports_attn_impl",
     "_attn_impl_for_capability",
     "_current_cuda_sm",
     "_download_adapter",

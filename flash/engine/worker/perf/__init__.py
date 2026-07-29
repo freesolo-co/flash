@@ -15,6 +15,7 @@ import os
 import sys
 
 from flash.engine.worker.perf.attn import (
+    _arch_supports_attn_impl,
     _attn_impl_for_capability,
     _flash_attn_3_available,
     _flash_attn_available,
@@ -460,6 +461,7 @@ __all__ = [
     "_LONG_CONTEXT_TOKENS",
     "RetriableInfraError",
     "_GpuPeakSampler",
+    "_arch_supports_attn_impl",
     "_attn_impl_for_capability",
     "_clean_diag",
     "_ensure_fla_fastpath_on_hopper",

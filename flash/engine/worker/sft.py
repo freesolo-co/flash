@@ -877,7 +877,7 @@ def run_sft():
             )
         if _memory_mode(model_id, sft_max_len, revision=model_revision):
             print("[sft] chalk standalone fused kernels scheduled after trainer build")
-        _attn = optimal_attn_impl()
+        _attn = optimal_attn_impl(model_id, model_revision)
         # When bfd packing is on, ensure a varlen-capable flash impl; sdpa cross-contaminates packed examples.
         # _attn=="sdpa" (Blackwell): disable bfd — don't force FA2 (unverified SASS). SDPA-mask path below still packs.
         # _attn is None (Hopper without FA3): force FA2 if available, else drop packing.

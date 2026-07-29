@@ -161,7 +161,7 @@ def _init_adapter_model(model_id: str):
             "or omit init_from_adapter to train a fresh LoRA."
         )
     print("[init-adapter] continuing the prepared source LoRA")
-    _attn = optimal_attn_impl()
+    _attn = optimal_attn_impl(model_id, model_revision)
     attn_kw = {"attn_implementation": _attn} if _attn else {}
 
     from peft import PeftModel

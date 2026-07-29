@@ -19,6 +19,42 @@ def _attn_impl_for_capability(
     return None
 
 
+def _arch_supports_attn_impl(model_id: str, impl: str, revision: str = "") -> bool:
+    """Whether this architecture declares support for ``impl``, per its own transformers flags.
+
+    An architecture may ship without a kernel for a backend the capability map would otherwise pick:
+    ``GptOssForCausalLM`` sets ``_supports_sdpa = False`` (it has flash and flex only), so forcing
+    the Blackwell ``sdpa`` override makes ``from_pretrained`` raise ``does not support an attention
+    implementation through torch.nn.functional.scaled_dot_product_attention yet`` and the run dies at
+    model load. Unknown arch, unreadable config, or an unset flag all read as SUPPORTED so the
+    capability map keeps its existing behaviour -- this only vetoes a backend an arch explicitly
+    disclaims.
+    """
+    flag = {
+        "sdpa": "_supports_sdpa",
+        "flash_attention_2": "_supports_flash_attn",
+        "flash_attention_3": "_supports_flash_attn",
+    }.get(impl)
+    if not flag:
+        return True
+    try:
+        from transformers import AutoConfig
+        from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
+
+        from flash.engine.worker.hf import model_revision_kwargs
+
+        cfg = AutoConfig.from_pretrained(
+            model_id, trust_remote_code=True, **model_revision_kwargs(revision)
+        )
+        # multimodal checkpoints nest the decoder config; the causal-LM mapping is keyed on it.
+        cfg = getattr(cfg, "text_config", None) or cfg
+        cls = MODEL_FOR_CAUSAL_LM_MAPPING[type(cfg)]
+    except Exception as e:
+        print(f"[attn] arch-support probe failed for {model_id!r} (assuming {impl} supported): {e}")
+        return True
+    return getattr(cls, flag, True) is not False
+
+
 def _flash_attn_3_available() -> bool:
     """True when flash_attn_interface is importable (FA3 usable by transformers).
 
@@ -53,8 +89,12 @@ def _flash_attn_available() -> bool:
             return False
 
 
-def optimal_attn_impl() -> str | None:
-    """Best ``attn_implementation`` for the live GPU (None = leave transformers' default)."""
+def optimal_attn_impl(model_id: str = "", revision: str = "") -> str | None:
+    """Best ``attn_implementation`` for the live GPU (None = leave transformers' default).
+
+    Pass ``model_id`` so an architecture that disclaims the chosen backend keeps transformers'
+    own default instead of being forced onto a kernel it does not ship.
+    """
     try:
         import torch
 
@@ -67,6 +107,14 @@ def optimal_attn_impl() -> str | None:
     fa2 = _flash_attn_available()
     fa3 = _flash_attn_3_available() if major == 9 else False
     impl = _attn_impl_for_capability(major, minor, fa3_available=fa3, fa2_available=fa2)
+    if impl and model_id and not _arch_supports_attn_impl(model_id, impl, revision):
+        # forcing it would raise at from_pretrained, so leave transformers to pick a backend the
+        # arch actually ships (gpt-oss on Blackwell: no sdpa kernel -> flash/flex).
+        print(
+            f"[attn] sm{major}{minor} would select attn_implementation={impl}, but {model_id} "
+            "declares no support for it -> leaving the transformers default"
+        )
+        return None
     if impl in ("flash_attention_2", "flash_attention_3"):
         ver = "FlashAttention-3" if impl == "flash_attention_3" else "FlashAttention-2"
         print(
