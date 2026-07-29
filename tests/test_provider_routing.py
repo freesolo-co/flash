@@ -1179,5 +1179,51 @@ def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monk
 
     assert gpus == ["H200", "H200"]  # nowhere to walk: the same class is genuinely reused
     text = log.getvalue()
+    assert "retrying on H200 @ runpod again" in text, text
     assert "no untried GPU class fits this run" in text, text
     assert "next-best" not in text, "claimed an escalation that the picker cannot perform"
+
+
+def test_last_gpu_retry_message_names_the_clamped_back_class_not_the_current_one(orch, monkeypatch):
+    """on_last_gpu means no UNTRIED class is left -- NOT that the current class is reused. With two
+    fitting classes the walk is PCIe, SXM, then back to the cheaper PCIe, so the message printed on
+    the SXM failure must name the PCIe the picker actually selects, not the SXM it is leaving."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.0, 80),
+        Candidate("runpod", "A100 SXM", 2.0, 80),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    gpus = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle("ep1", "j1", attempt))
+        if attempt < 2:
+            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=2)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    # the clamp-back the message has to describe: cheapest, then the untried SXM, then back.
+    assert gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
+    text = log.getvalue()
+    assert "retrying on A100 PCIe @ runpod, no untried GPU class fits this run" in text, text
+    # the failing attempt was the SXM; promising it back would name hardware the picker skipped.
+    assert "retrying on A100 SXM" not in text, text
+    assert "A100 SXM @ runpod again" not in text, text

@@ -125,6 +125,10 @@ class GRPOPerTurnTrainer(GRPOTrainer):
             [item.get("turn_rewards") for item in inputs],
         )
         if not any(rewards is not None for rewards in turn_rewards):
+            # the whole-batch miss is the common case: the environment never emits per_turn_rewards
+            # at all. it returns before build_per_turn_advantages(), so warn here too or the very
+            # configuration this warning exists for is the one that stays silent.
+            _warn_episode_fallback()
             return output
         if self.accelerator.num_processes > 1:
             raise NotImplementedError(

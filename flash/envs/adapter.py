@@ -100,6 +100,13 @@ class FreesoloEnvironment(BaseEnvironment):
         # env is loaded; off by default so a CLI-side load (flash env test) grades raw text, which
         # is what an echo/replay harness feeds it.
         self.thinking = False
+        # whether the chat template pre-opens an unclosed <think> in every assistant generation
+        # prompt (Qwen with enable_thinking does). the worker derives this from a REAL rendered
+        # prompt, never from the thinking flag, and sets it alongside .thinking -- a template that
+        # ignores enable_thinking must not have its tagless answers read as unterminated reasoning.
+        # both parsers need it or a turn truncated before </think> grades as the whole ramble here
+        # while the single-turn path correctly grades it empty.
+        self.prompt_opens_thinking = False
 
     @property
     def max_turns(self) -> int:
@@ -401,6 +408,7 @@ class FreesoloEnvironment(BaseEnvironment):
             "turns": [],
             "done": False,
             "response_text": "",
+            "raw_response_text": "",
             "turn": 0,
             "max_episode_turns": episode_turns,
         }
@@ -417,19 +425,30 @@ class FreesoloEnvironment(BaseEnvironment):
             self._EnvironmentTurn(role="assistant", content=content)
         )
         state["response_text"] = self._scored_turn_text(content)
+        # step_episode drives the episode, it does not grade it: it parses the action, and often
+        # requires assistant_response to equal messages[-1]["content"]. that message is raw, so
+        # handing it the stripped text would step the env on something the model never emitted.
+        state["raw_response_text"] = content
         return msg
 
     def _scored_turn_text(self, content: str):
-        """The assistant turn as the scorer should see it: answer-only, reasoning available."""
+        """The assistant turn as the scorer should see it: answer-only, reasoning available.
+
+        Both parsers get ``prompt_opens_thinking``, exactly as the single-turn path forwards its
+        own ``_prompt_opens_thinking`` (flash/engine/worker/rl.py). Without it a turn truncated
+        before ``</think>`` is tagless reasoning that ``strip_think`` returns whole as the answer,
+        so the rollout can be rewarded for unfinished thinking that single-turn grading scores 0.
+        """
         if not self.thinking:
             return content
         from flash.thinking import strip_think, thinking_text
 
-        answer = strip_think(content)
+        opened = self.prompt_opens_thinking
+        answer = strip_think(content, prompt_opened_thinking=opened)
         return _ScoredResponseText(
             answer if isinstance(answer, str) else content,
             raw=content,
-            thinking=thinking_text(content),
+            thinking=thinking_text(content, prompt_opened_thinking=opened),
         )
 
     def env_reply(self, messages: list[dict], state: dict) -> list[dict]:
@@ -438,11 +457,18 @@ class FreesoloEnvironment(BaseEnvironment):
         task = state.get("task")
         if task is None:
             raise RuntimeError("missing Freesolo rollout task state")
-        assistant_response = str(state.get("response_text") or "")
-        step = self._env.step_episode(task, list(messages), assistant_response)
+        # the raw turn, not the scored one: see record_model_turn. falls back to response_text for a
+        # state built by something other than record_model_turn (where the two are the same text).
+        raw = state.get("raw_response_text")
+        if not isinstance(raw, str):
+            raw = str(state.get("response_text") or "")
+        step = self._env.step_episode(task, list(messages), raw)
         state["done"] = bool(step.done)
         if step.final_response_text is not None:
+            # the env overrode the episode's answer, so it is already the text to grade -- do not
+            # strip it. keep the raw view in step with it for any later turn.
             state["response_text"] = step.final_response_text
+            state["raw_response_text"] = str(step.final_response_text)
         state["turn"] = int(state.get("turn", 0)) + 1
         if step.metadata:
             state.setdefault("step_metadata", []).append(step.metadata)

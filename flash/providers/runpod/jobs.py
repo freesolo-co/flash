@@ -828,10 +828,12 @@ def poll_job(
         raise ValueError("endpoint-only RunPod handles cannot be polled")
 
     say = make_say(log)
-    # the picker only ever holds classes that FIT the model, so on the last one there is nowhere to
-    # walk and the retry re-picks this same class. saying "next-best GPU" there is a false promise.
+    # on_last_gpu says no UNTRIED class is left to walk to, so "next-best GPU" is a false promise.
+    # it does NOT say which class the retry reuses -- the picker can clamp back to a cheaper
+    # already-tried one, and only the supervisor holds the candidate list needed to know. so state
+    # the exhaustion the provider can actually see; lifecycle names the projected class.
     next_gpu_note = (
-        "retrying on the same class (no other GPU class fits this run)"
+        "retrying with no untried GPU class left to walk to"
         if on_last_gpu
         else "retrying on the next-best GPU"
     )

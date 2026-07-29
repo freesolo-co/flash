@@ -73,7 +73,7 @@ def test_pin_keeps_an_existing_pin_without_re_resolving(monkeypatch) -> None:
 
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", _boom)
     spec = _env_spec(_SHA)
-    assert _pin_environment_for_run(spec, io.StringIO()) is spec
+    assert _pin_environment_for_run(spec, io.StringIO(), attempt_started=False) is spec
 
 
 def test_pin_resolves_and_reports_when_submit_left_it_unpinned(monkeypatch) -> None:
@@ -82,7 +82,7 @@ def test_pin_resolves_and_reports_when_submit_left_it_unpinned(monkeypatch) -> N
 
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: _with_sha(spec, _SHA))
     log = io.StringIO()
-    out = _pin_environment_for_run(_env_spec(), log)
+    out = _pin_environment_for_run(_env_spec(), log, attempt_started=False)
     assert out.environment.resolved_sha == _SHA
     assert _SHA in log.getvalue()  # the pin is visible in the run log the user reads
 
@@ -94,10 +94,56 @@ def test_pin_warns_in_the_run_log_when_it_cannot_resolve(monkeypatch) -> None:
 
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: spec)
     log = io.StringIO()
-    out = _pin_environment_for_run(_env_spec(), log)
+    out = _pin_environment_for_run(_env_spec(), log, attempt_started=False)
     assert out.environment.resolved_sha == ""
     assert "could not pin" in log.getvalue()
     assert "retry" in log.getvalue()
+
+
+def test_pin_fails_closed_once_an_attempt_has_already_run_unpinned(monkeypatch) -> None:
+    """Resolving after an unpinned attempt would pin a commit that attempt may not have used.
+
+    An attempt that ran unpinned resolved the symbolic ref on its own worker, and that commit is not
+    knowable here. Pinning now can only guess -- and since a retry resumes from the unpinned attempt's
+    checkpoint, guessing wrong splits one run across two commits. Staying symbolic is the consistent
+    answer.
+    """
+    import flash.runner as runner
+    from flash.runner.lifecycle import _pin_environment_for_run
+
+    def _boom(_spec):
+        raise AssertionError("must not resolve the ref after an attempt has already run unpinned")
+
+    monkeypatch.setattr(runner, "_assign_resolved_env_sha", _boom)
+    log = io.StringIO()
+
+    out = _pin_environment_for_run(_env_spec(), log, attempt_started=True)
+
+    assert out.environment.resolved_sha == ""
+    assert "ran unpinned on an earlier attempt" in log.getvalue()
+
+
+def test_pin_still_applies_a_submit_time_pin_after_an_attempt_has_run(monkeypatch) -> None:
+    """Failing closed must not discard a pin that already exists.
+
+    Post-restart recovery reloads a spec that submit DID pin. That pin is the run's one commit and
+    every later attempt must keep using it; the fail-closed branch is only about refusing to resolve
+    a ref that is still symbolic.
+    """
+    import flash.runner as runner
+    from flash.runner.lifecycle import _pin_environment_for_run
+
+    monkeypatch.setattr(
+        runner,
+        "_assign_resolved_env_sha",
+        lambda _spec: pytest.fail("must not re-resolve an already-pinned spec"),
+    )
+    log = io.StringIO()
+
+    out = _pin_environment_for_run(_env_spec(_SHA), log, attempt_started=True)
+
+    assert out.environment.resolved_sha == _SHA
+    assert log.getvalue() == ""
 
 
 # ============================================================================================
@@ -193,3 +239,59 @@ def test_retry_trains_on_the_same_environment_commit_as_the_first_attempt(
     assert seen_shas == [_SHA, _SHA], (
         f"retry trained on a different environment commit: {seen_shas}"
     )
+    assert resolved == [_SHA], f"the ref must be resolved once per run, not per attempt: {resolved}"
+
+
+def test_a_recovered_resolve_cannot_pin_a_newer_commit_mid_run(orch, monkeypatch) -> None:
+    """The pin must not start working halfway through a run.
+
+    Both submit and the run-start resolve fail transiently, so attempt 1 runs unpinned and resolves
+    environment-hub@main on its own worker. If GitHub then recovers, resolving before attempt 2 pins
+    whatever main points at NOW -- and a push in between means the retry, which resumes from attempt
+    1's checkpoint, trains on different environment code. Exactly the corruption the pin exists to
+    prevent, just moved one attempt later.
+    """
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    calls: list[str] = []
+
+    def _outage_then_recovery(spec):
+        # attempt 1 gets nothing; by attempt 2 github is back and main has advanced.
+        calls.append("resolve")
+        return spec if len(calls) == 1 else _with_sha(spec, _NEWER_SHA)
+
+    monkeypatch.setattr(orch, "_assign_resolved_env_sha", _outage_then_recovery)
+
+    seen_shas: list[str] = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        seen_shas.append(run_spec.environment.resolved_sha)
+        on_handle(
+            {
+                "provider": "runpod",
+                "endpoint_id": f"ep{attempt}",
+                "endpoint_name": f"ep{attempt}-name",
+                "key_fingerprint": "rpk-0123456789ab",
+                "job_id": f"j{attempt}",
+                "attempt": attempt,
+                "started_ts": float(attempt + 1),
+            }
+        )
+        if attempt == 0:
+            return PollResult(False, failure="stalled", detail="infra")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+
+    spec = _retry_spec()
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()))
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, 0, log)
+
+    assert len(seen_shas) == 2, "the infra failure should have produced a second attempt"
+    assert seen_shas == ["", ""], (
+        f"the retry pinned a commit the first attempt never used: {seen_shas}"
+    )
+    assert calls == ["resolve"], f"the ref must not be re-resolved per attempt: {calls}"
+    assert "could not pin" in log.getvalue()
