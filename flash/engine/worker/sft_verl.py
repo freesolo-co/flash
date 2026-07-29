@@ -42,6 +42,7 @@ from flash.engine.worker.sft import (
 from flash.engine.worker.verl_common import (
     export_peft_adapter,
     latest_global_step_dir,
+    parse_verl_metric,
     parse_wandb_link,
     render_wandb_link_shim,
     resolve_verl_python,
@@ -53,7 +54,6 @@ from flash.engine.worker.verl_common import (
 _SFT_LORAPLUS_RATIO = 16.0
 _LORAPLUS_READY_MARKER = "FLASH_LORAPLUS_READY"
 _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
-_VERL_METRIC_RE = re.compile(r"(?:^| - )(?P<name>[^:]+):(?P<value>[^ ]+)")
 
 _REQUIRED_OVERRIDE_KEYS = (
     "train_files",
@@ -525,17 +525,6 @@ _FlashFSDPEngine._build_module = _flash_build_reentrant_module
 '''
     source += render_loraplus_shim(loraplus_ratio)
     return source
-
-
-def _metric_value(line: str, name: str) -> float | None:
-    for match in _VERL_METRIC_RE.finditer(line):
-        if match.group("name") != name:
-            continue
-        try:
-            return float(match.group("value"))
-        except ValueError:
-            return None
-    return None
 
 
 def _copy_processing_sidecars(actor_dir: str, adapter_dir: str) -> None:
@@ -1346,9 +1335,15 @@ def run_sft_verl(spec=None) -> None:
             return
         if _SFT_LORAPLUS_RATIO > 1 and not loraplus_applied:
             raise RuntimeError("verl reached an optimizer step before the required lora+ shim succeeded")
-        loss = _metric_value(line, "train/loss")
-        grad_norm = _metric_value(line, "train/grad_norm")
-        learning_rate_value = _metric_value(line, "train/lr")
+        # these three reach the logger as plain python floats (engine_workers.py returns
+        # loss/grad_norm through .item() and lr through get_last_lr()), so unlike OPD's
+        # Metric(SUM) they do not print in numpy's np.float64(...) spelling today. they share
+        # the parser anyway: one upstream metric-type change would otherwise reintroduce the
+        # same silent drop here, and the shared helper also rejects nan/inf, which would
+        # serialize into the heartbeat as bare NaN and break strict json consumers.
+        loss = parse_verl_metric(line, "train/loss")
+        grad_norm = parse_verl_metric(line, "train/grad_norm")
+        learning_rate_value = parse_verl_metric(line, "train/lr")
         if loss is not None:
             loss_curve.append(round(loss, 4))
             progress["loss"] = loss
