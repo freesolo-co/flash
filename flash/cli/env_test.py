@@ -16,26 +16,6 @@ _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
 
 
-def _report_algorithm_shape(env) -> None:
-    """Say up front which algorithms this environment's shape rules out.
-
-    opsd phase 1 refuses multi-turn and tool environments, but that guard lives at worker boot:
-    past admission, past gpu allocation, past billing. a multi-turn env therefore pays for a gpu
-    to learn something knowable offline, since `multi_turn` is derived from the sdk base class at
-    load time and is already settled here. report it rather than let the gpu do it.
-    """
-    multi_turn = bool(getattr(env, "multi_turn", False))
-    tool_env = bool(getattr(env, "is_tool_env", False))
-    if not (multi_turn or tool_env):
-        return
-    shape = "tool-using" if tool_env else "multi-turn"
-    message = (
-        f'this environment is {shape}; algorithm = "opsd" will be rejected at worker '
-        "startup (after the gpu is allocated and billed). sft, grpo and opd support this shape."
-    )
-    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
-
-
 def _check_messages(messages: object, label: str) -> list[dict]:
     """Validate that `messages` is a well-formed chat message list and return it."""
     if not isinstance(messages, list) or not messages:
@@ -247,8 +227,6 @@ def cmd_env_test(args) -> int:
 
     if not dataset:
         return _load_failure("dataset is empty")
-
-    _report_algorithm_shape(env)
 
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0

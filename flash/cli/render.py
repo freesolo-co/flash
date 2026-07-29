@@ -718,7 +718,7 @@ _QUIET_HEARTBEAT_HINT = (
 # carries is stale reporting, not a stalled trainer -- the distinction that decides whether someone
 # cancels a healthy paid run.
 _STALE_STEP_AFTER_S = 900.0
-_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step", "opd_step", "opsd_step"})
+_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
 
 
 def _stale_step_hint(
