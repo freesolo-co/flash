@@ -52,6 +52,8 @@ from flash.engine.worker.verl_common import (
     agent_loop_workers,
     clamp_engine_len,
     model_max_position_embeddings,
+    parse_wandb_link,
+    render_wandb_link_shim,
     resolve_verl_python,
     verl_supports_rollout_field,
 )
@@ -370,6 +372,8 @@ def _build_verl_train_notes(
     fp8_kv: bool = False,
     wandb_project: str | None = None,
     wandb_run_name: str | None = None,
+    wandb_url: str | None = None,
+    wandb_id: str | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -419,6 +423,10 @@ def _build_verl_train_notes(
         "ppo_max_token_len_per_gpu": inp["engine_len"],
         "wandb_project": wandb_project,
         "wandb_run_name": wandb_run_name,
+        # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
+        # wandb.run, verl from the child marker (see verl_common.render_wandb_link_shim).
+        "wandb_url": wandb_url,
+        "wandb_id": wandb_id,
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],
@@ -1420,6 +1428,10 @@ def run_rl_verl():
             render_stop_sequences_shim(inp["stop_sequences"]),
             render_structured_outputs_shim(inp["structured_outputs"]),
             render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"]),
+            # gated on the key rather than the resolved logger list: that list needs python_bin,
+            # which is resolved after this file is written. the shim is inert either way -- it only
+            # fires when verl actually calls wandb.init, which requires wandb in the logger list.
+            render_wandb_link_shim() if os.environ.get("WANDB_API_KEY") else "",
         )
         if part
     )
@@ -1433,6 +1445,8 @@ def run_rl_verl():
     # rolling buffer of recent (completion, score) so the training loop can dump one sample per step
     # to the flash log, matching the trl path's #607 per-step completion dump.
     recent_samples: list[tuple[str, float]] = []
+    # filled from the child's marker line; stays empty when wandb is off (see render_wandb_link_shim).
+    wandb_link: dict[str, str | None] = {}
     _samples_lock = threading.Lock()
 
     def _score(index: int, solution_str: str) -> float:
@@ -1560,6 +1574,9 @@ def run_rl_verl():
             try:
                 for line in proc.stdout:
                     print(f"[verl] {line}", end="", flush=True)
+                    link = parse_wandb_link(line)
+                    if link is not None:
+                        wandb_link.update(link)
                     m = step_re.search(line)
                     if m:
                         step_box[0] = int(m.group(1))
@@ -1670,5 +1687,7 @@ def run_rl_verl():
             fp8_kv=fp8_kv,
             wandb_project=project_name if "wandb" in loggers else None,
             wandb_run_name=experiment_name if "wandb" in loggers else None,
+            wandb_url=wandb_link.get("wandb_url"),
+            wandb_id=wandb_link.get("wandb_id"),
         ),
     )

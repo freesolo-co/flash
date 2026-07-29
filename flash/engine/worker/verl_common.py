@@ -317,3 +317,77 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=10)
+
+
+# --------------------------- w&b run link (all three verl backends) ---------------------------
+# trl spreads wandb_run_info() into its notes, giving the sdk's link_wandb a clickable
+# notes["wandb_url"]. verl calls wandb.init INSIDE the training subprocess, so the flash parent's
+# wandb.run is None and that spread would be a silent no-op. the url is not derivable up here
+# either: it needs entity/project/runs/<wandb-generated-id>, and flash only knows the project and
+# its own run NAME. so the child reports it back over the marker channel the parent already scans.
+FLASH_WANDB_LINK_MARKER = "FLASH_WANDB_LINK"
+
+_WANDB_LINK_RE = re.compile(rf"{FLASH_WANDB_LINK_MARKER}\s+(\{{.*\}})\s*$")
+
+
+def render_wandb_link_shim() -> str:
+    """child-side sitecustomize fragment that reports the live w&b run's url and id.
+
+    wraps wandb.init rather than reading wandb.run at import time: sitecustomize runs long before
+    verl's tracking module initializes the run, so anything read here would always be None.
+
+    never raises. wandb is optional and a logging link must not be able to abort paid training, so
+    every failure path leaves the run unlinked instead of dead.
+    """
+    return f'''
+# --- flash: report the w&b run link to the parent (see verl_common.render_wandb_link_shim) ---
+try:
+    import json as _flash_wandb_json
+
+    import wandb as _flash_wandb
+
+    _flash_wandb_init = _flash_wandb.init
+
+    def _flash_wandb_init_reporting(*args, **kwargs):
+        _run = _flash_wandb_init(*args, **kwargs)
+        try:
+            _url = getattr(_run, "url", None)
+            _id = getattr(_run, "id", None)
+            if _url:
+                print(
+                    "{FLASH_WANDB_LINK_MARKER} "
+                    + _flash_wandb_json.dumps({{"wandb_url": _url, "wandb_id": _id}}),
+                    flush=True,
+                )
+        except Exception:
+            pass
+        return _run
+
+    _flash_wandb.init = _flash_wandb_init_reporting
+except Exception:
+    pass
+'''
+
+
+def parse_wandb_link(line: str) -> dict | None:
+    """the {{wandb_url, wandb_id}} a marker line carries, or None for every other line.
+
+    returns None rather than raising on a malformed payload: this parses child stdout, and a
+    truncated or interleaved line under multi-rank logging must not take down the run.
+    """
+    match = _WANDB_LINK_RE.search(line)
+    if match is None:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    url = payload.get("wandb_url")
+    # https only: the sdk renders this as a clickable dashboard link, and child stdout also carries
+    # rollout text, so the field must not be able to become an arbitrary scheme.
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return None
+    wandb_id = payload.get("wandb_id")
+    return {"wandb_url": url, "wandb_id": wandb_id if isinstance(wandb_id, str) else None}
