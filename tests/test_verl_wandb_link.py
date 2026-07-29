@@ -151,27 +151,50 @@ def test_parser_tolerates_a_missing_id():
     }
 
 
+def _dict_literal_keys(node: ast.Dict) -> set[str]:
+    """top-level string keys of a dict literal; nested dicts (grpo_recipe) are not notes keys."""
+    return {k.value for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+
+
 def _emitted_notes_keys(module: str) -> set[str]:
-    """every key literal passed as write_train_meta(notes={...}) in one worker module.
+    """the notes keys write_train_meta actually receives in one worker module.
 
     read from real source rather than a mirror: a mirror can only fail when someone edits the
     mirror, which is exactly how this gap survived.
+
+    grpo passes notes=_build_verl_train_notes(...), so the keys live in that function's RETURNED
+    dict, not in the call kwargs. counting kwarg names instead would leave the probe vacuous --
+    dropping "wandb_url" from the returned dict would keep the suite green while link_wandb got
+    nothing, which is the exact defect this module exists to catch.
     """
     tree = ast.parse((_WORKER / module).read_text())
+    builders = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+
     keys: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-        if name not in {"write_train_meta", "_build_verl_train_notes"}:
+        name = (
+            node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        )
+        if name != "write_train_meta":
             continue
         for kw in node.keywords:
-            if kw.arg == "notes" and isinstance(kw.value, ast.Dict):
-                keys.update(
-                    k.value for k in kw.value.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)
-                )
-            elif name == "_build_verl_train_notes" and kw.arg:
-                keys.add(kw.arg)
+            if kw.arg != "notes":
+                continue
+            if isinstance(kw.value, ast.Dict):
+                keys.update(_dict_literal_keys(kw.value))
+            elif isinstance(kw.value, ast.Call):
+                fn = getattr(kw.value.func, "id", None) or getattr(kw.value.func, "attr", "")
+                # an unresolvable builder means the probe cannot see the real keys. surface that as a
+                # sentinel so the assert fails loudly instead of silently checking nothing.
+                target = builders.get(fn)
+                if target is None:
+                    keys.add(f"<unresolved builder {fn}>")
+                    continue
+                for ret in ast.walk(target):
+                    if isinstance(ret, ast.Return) and isinstance(ret.value, ast.Dict):
+                        keys.update(_dict_literal_keys(ret.value))
     return keys
 
 
