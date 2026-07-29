@@ -89,10 +89,19 @@ def force_vit_sdpa_on_blackwell() -> bool:
 
 
 def finalize_alloc_conf_for_sleep() -> None:
-    """Sync PYTORCH_ALLOC_CONF with the resolved GRPO sleep mode (RL only).
+    """Sync PYTORCH_ALLOC_CONF with the resolved GRPO sleep mode (TRL RL only).
 
     PYTORCH_ALLOC_CONF is read at first CUDA allocation — must run before any allocation."""
     if _w.PHASE != "rl":
+        return
+    # verl owns its own rollout engine and always builds a CuMemAllocator (it leaves
+    # rollout.enable_sleep_mode defaulted True), which asserts on "expandable_segments:True"
+    # (vllm/device_allocator/cumem.py:132, pytorch#147851). flash's sleep resolution describes the TRL
+    # colocate engine and does not apply, so never let it upgrade the conf out from under verl.
+    if os.environ.get("FLASH_RL_BACKEND", "trl").strip().lower() == "verl":
+        print(
+            "[alloc] verl backend -> keeping launcher's non-expandable conf (vllm CuMemAllocator)"
+        )
         return
     try:
         from flash.engine.worker.grpo import resolve_grpo_sleep_mode

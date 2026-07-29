@@ -29,7 +29,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import MANAGED_GPU_KEYS, JobSpec
+from flash.spec import MANAGED_GPU_KEYS, JobSpec, backend_env_key, effective_backend
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -1168,7 +1168,7 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
         "worker_spec": worker_spec.to_internal_dict(),
         "adapter_identity": adapter_identity,
         "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
-        "backend": _effective_backend(public_spec),
+        "backend": effective_backend(public_spec),
     }
     return _update(
         worker_spec.run_id,
@@ -1188,35 +1188,11 @@ _MULTI_GPU_BACKENDS: frozenset[str] = frozenset({"verl"})
 _MULTI_GPU_PROVIDERS: frozenset[str] = frozenset({"runpod"})
 
 
-def _backend_env_key(spec: JobSpec) -> str:
-    """the [worker_env] key that selects this spec's training backend.
-
-    one definition so the gate's remedy cannot name a different key than the resolver reads: the
-    phase mapping is not derivable from the algorithm (grpo -> FLASH_RL_BACKEND).
-    """
-    return f"FLASH_{spec.phase.upper()}_BACKEND"
-
-
-def _effective_backend(spec: JobSpec) -> str:
-    """the training backend this spec will actually run, as the worker resolves it.
-
-    the worker reads FLASH_{SFT,RL,OPD}_BACKEND (default "trl"), and on the runpod path the only
-    route into the worker env is the spec's own [worker_env] table -- build_worker_env starts from an
-    empty dict and forwards a fixed credential allowlist, never the ambient control-plane env. so the
-    backend is a property of the SPEC and the gate can read it here rather than guessing.
-
-    that spec-scoped resolution is deliberate (a run's trainer must be reproducible from the spec,
-    not from wherever the control plane happened to be booted), but it defaults SILENTLY: an omitted
-    key selects "trl" without any error, and exporting the variable next to the control plane has no
-    effect on submitted runs. recording the result in effective_preparation makes the choice
-    auditable after the fact instead of only inferable from the [worker_env] table.
-    """
-    key = _backend_env_key(spec)
-    worker_env = getattr(spec, "worker_env", None) or {}
-    for name, value in worker_env.items():
-        if str(name).upper() == key:
-            return str(value).strip().lower()
-    return "trl"
+# backend_env_key/effective_backend live in flash.spec so the launcher's alloc-conf choice and this
+# gate cannot disagree about which trainer a spec runs. the resolution defaults SILENTLY: an omitted
+# key selects "trl" without any error, and exporting the variable next to the control plane has no
+# effect on submitted runs. recording the result in effective_preparation makes the choice auditable
+# after the fact instead of only inferable from the [worker_env] table.
 
 
 def _require_supported_gpu_count(spec: JobSpec) -> None:
@@ -1229,12 +1205,12 @@ def _require_supported_gpu_count(spec: JobSpec) -> None:
     count = getattr(spec.gpu, "count", 1)
     if count <= 1:
         return
-    backend = _effective_backend(spec)
+    backend = effective_backend(spec)
     if backend not in _MULTI_GPU_BACKENDS:
         # name the key that actually enables sharding. the backend is selected only through
         # [worker_env], which no other error or doc mentions, so a message that offers just
         # "set gpu.count to 1" leaves multi-gpu undiscoverable.
-        key = _backend_env_key(spec)
+        key = backend_env_key(spec)
         sharding = ", ".join(sorted(_MULTI_GPU_BACKENDS))
         raise ValueError(
             f"multi-gpu training (gpu.count={count}) is not supported by the {backend!r} backend "
@@ -1306,7 +1282,7 @@ def submit_job(
             "preparation_digest": _preparation_digest(
                 public_spec, worker_spec, prepared.adapter_identity
             ),
-            "backend": _effective_backend(public_spec),
+            "backend": effective_backend(public_spec),
         },
         # Snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
