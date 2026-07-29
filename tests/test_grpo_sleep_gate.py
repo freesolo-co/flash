@@ -270,8 +270,11 @@ def _worker_env_for(algorithm: str, phase: str, backend: str | None) -> dict:
     return build_worker_env(spec, 0)
 
 
-@pytest.mark.parametrize(("algorithm", "phase"), [("grpo", "rl"), ("opd", "opd"), ("sft", "sft")])
-def test_verl_backend_never_gets_expandable_segments(algorithm, phase):
+@pytest.mark.parametrize(("algorithm", "phase"), [("grpo", "rl"), ("opd", "opd")])
+def test_verl_rollout_never_gets_expandable_segments(algorithm, phase):
+    """GRPO and OPD are the verl algorithms that build a vLLM rollout, so they are the ones whose
+    CuMemAllocator asserts on expandable_segments. SFT is covered separately: it has no rollout and
+    must KEEP the expandable conf."""
     env = _worker_env_for(algorithm, phase, "verl")
     for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
         assert "expandable_segments" not in env[key], (
@@ -354,3 +357,40 @@ def test_backend_resolution_matches_the_key_the_worker_reads(
     if worker_reads == "verl":
         assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
         assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
+
+
+def test_verl_sft_keeps_the_expandable_allocator():
+    """verl.trainer.sft_trainer is a pure FSDP trainer: no rollout, no vLLM engine, no CuMemAllocator.
+    so the verl carve-out must not reach it -- switching verl SFT to the non-expandable conf would
+    regress the large-tensor SFT path onto a fragmentation-prone allocator and OOM jobs that fit
+    today. the predicate is "generates through verl", not "runs on verl" (codex[bot])."""
+    sft_conf = _worker_env_for("sft", "sft", "verl")["PYTORCH_CUDA_ALLOC_CONF"]
+    assert sft_conf == "expandable_segments:True"
+    # the algorithms that DO build a verl rollout still get the non-expandable conf
+    for algorithm, phase in (("grpo", "rl"), ("opd", "opd")):
+        conf = _worker_env_for(algorithm, phase, "verl")["PYTORCH_CUDA_ALLOC_CONF"]
+        assert "expandable_segments" not in conf
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_allocator_conf_follows_a_backend_delivered_as_a_runtime_secret(declared):
+    """a spec may DECLARE its phase backend key in [environment].secrets and receive the value at
+    launch. build_worker_env exports that secret over the spec value, so the allocator choice has to
+    resolve with the same precedence -- reading the spec alone picks an allocator for a backend that
+    is not the one about to run, and a secret-supplied verl would crash on the CuMemAllocator assert.
+
+    the undeclared case is the control: an undeclared key is not exported, so the worker reads trl and
+    the expandable conf is correct. the invariant under test is agreement, not a fixed conf."""
+    from flash.providers._worker import build_worker_env
+    from flash.spec import JobSpec
+
+    body: dict = {"model": "m", "seed": 0, "algorithm": "opd"}
+    if declared:
+        body["environment"] = {"secrets": ["FLASH_OPD_BACKEND"]}
+    spec = JobSpec.from_dict(body)
+    env = build_worker_env(spec, 0, runtime_secrets={"FLASH_OPD_BACKEND": "verl"})
+
+    worker_reads = env.get("FLASH_OPD_BACKEND", "trl").strip().lower()
+    assert worker_reads == ("verl" if declared else "trl")
+    # a verl OPD rollout must never see expandable_segments; a trl one must keep it
+    assert ("expandable_segments" in env["PYTORCH_CUDA_ALLOC_CONF"]) is (worker_reads == "trl")
