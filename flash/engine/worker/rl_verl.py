@@ -258,6 +258,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     else:
         # flash default: dr-grpo with no kl term, so no reference policy.
         o.append("actor_rollout_ref.actor.use_kl_loss=False")
+    if cfg.get("entropy_quantile") is not None:
+        # the top-entropy shim thresholds on per-token entropy, which verl computes only when asked:
+        # calculate_entropy defaults to false and entropy_coeff is 0 on the flash recipe, so without
+        # this the shim would receive no entropy and raise rather than silently skip the masking.
+        o.append("actor_rollout_ref.actor.calculate_entropy=True")
     if cfg.get("fp8_kv"):
         # fp8 kv cache on ada/hopper+ (cc>=8.9), matching the trl colocate path; tis (above) covers
         # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
@@ -303,6 +308,7 @@ def _build_verl_training_cfg(
         "temperature": inp["temperature"],
         "top_p": inp["top_p"],
         "kl_coef": inp["kl_coef"],
+        "entropy_quantile": inp["entropy_quantile"],
         "thinking": thinking,
         "loss_agg_mode": "seq-mean-token-sum-norm",
         "seed": inp["seed"],
@@ -344,6 +350,7 @@ def _build_verl_train_notes(
         "loss_curve": loss_curve,
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
+            "entropy_quantile": inp["entropy_quantile"],
             "temperature": inp["temperature"],
             "top_p": inp["top_p"],
             "ppo_epochs": inp["ppo_epochs"],
@@ -353,6 +360,119 @@ def _build_verl_train_notes(
             "norm_adv_by_std_in_grpo": False,
         },
     }
+
+
+_ENTROPY_QUANTILE_MARKER = "[flash-verl] top-entropy token masking active"
+
+
+def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
+    """return the sitecustomize source that adds trl's top-entropy token masking to verl.
+
+    trl's GRPOTrainer keeps only the top ``entropy_quantile`` fraction of response tokens in the
+    policy-gradient term (``get_high_entropy_mask``); verl has no such knob. the mask is expressible
+    as an extra factor on ``response_mask``, so this patches ``ppo_loss`` rather than registering a
+    custom policy loss: ``ppo_loss`` computes per-token entropy but never forwards it to
+    ``policy_loss_fn``, so a registered loss could not see the entropy it needs to threshold on.
+
+    the mask applies to the policy-gradient term ONLY, which is what trl does -- it multiplies
+    ``per_token_loss`` by the mask and then adds the kl term, so kl and the entropy bonus stay on the
+    full response mask. equivalence also needs a mask-independent denominator: flash pins
+    ``seq-mean-token-sum-norm``, which divides by ``global_batch_size * loss_scale_factor``, so
+    dropping tokens from the numerator does not rescale the remaining ones (the same property that
+    makes trl's dr_grpo normalizer ``per_token_loss.size(0) * max_completion_length``).
+    """
+    if entropy_quantile is None or float(entropy_quantile) >= 1.0:
+        return ""
+    threshold = 1.0 - float(entropy_quantile)
+    return f'''
+import threading as _flash_threading
+
+import torch as _flash_torch
+import torch.distributed as _flash_dist
+from verl.workers.utils import losses as _flash_losses
+from verl.workers.utils.padding import no_padding_2_padding as _flash_no_padding_2_padding
+
+_flash_entropy_threshold_q = {threshold!r}
+_flash_original_ppo_loss = _flash_losses.ppo_loss
+_flash_original_get_policy_loss_fn = _flash_losses.get_policy_loss_fn
+# carries this micro-batch's padded entropy from ppo_loss down to the policy loss, which verl
+# never passes it. thread-local rather than a module global so the handoff cannot leak across
+# concurrent loss calls, and always cleared in a finally.
+_flash_entropy_state = _flash_threading.local()
+
+
+def _flash_high_entropy_mask(entropy, response_mask):
+    """trl get_high_entropy_mask: keep tokens at or above the global entropy quantile."""
+    local = entropy[response_mask.bool()].float().reshape(-1)
+    # the quantile is over the whole global batch, not the local shard, so every rank thresholds
+    # identically. trl gathers via accelerate; verl's actor shards over the default process group.
+    if _flash_dist.is_available() and _flash_dist.is_initialized() and _flash_dist.get_world_size() > 1:
+        sizes = [_flash_torch.zeros(1, dtype=_flash_torch.long, device=local.device)
+                 for _ in range(_flash_dist.get_world_size())]
+        _flash_dist.all_gather(sizes, _flash_torch.tensor([local.numel()], dtype=_flash_torch.long, device=local.device))
+        largest = int(max(int(s.item()) for s in sizes))
+        if largest == 0:
+            return _flash_torch.zeros_like(entropy, dtype=_flash_torch.bool)
+        # pad with a negative sentinel: entropy is non-negative, so it can never collide with a
+        # real value and is dropped after the gather (trl uses the same -1e9 trick).
+        padded = _flash_torch.full((largest,), -1e9, dtype=_flash_torch.float32, device=local.device)
+        padded[: local.numel()] = local
+        buckets = [_flash_torch.empty_like(padded) for _ in range(_flash_dist.get_world_size())]
+        _flash_dist.all_gather(buckets, padded)
+        gathered = _flash_torch.cat(buckets)
+        gathered = gathered[gathered != -1e9]
+    else:
+        gathered = local
+    if gathered.numel() == 0:
+        return _flash_torch.zeros_like(entropy, dtype=_flash_torch.bool)
+    cutoff = _flash_torch.quantile(gathered, _flash_entropy_threshold_q)
+    return ((entropy * response_mask.float()) >= cutoff) & response_mask.bool()
+
+
+def _flash_masked_policy_loss_fn(loss_mode):
+    """wrap the resolved policy loss so it sees the entropy-masked response mask.
+
+    masking here rather than in ppo_loss keeps the mask on the policy-gradient term only: ppo_loss
+    aggregates the kl and entropy-bonus terms against its own unmasked response_mask, exactly as
+    trl adds its kl term after multiplying per_token_loss by the entropy mask.
+    """
+    inner = _flash_original_get_policy_loss_fn(loss_mode)
+
+    def _masked(*args, **kwargs):
+        entropy = getattr(_flash_entropy_state, "entropy", None)
+        response_mask = kwargs.get("response_mask", None)
+        if entropy is not None and response_mask is not None:
+            kwargs["response_mask"] = _flash_high_entropy_mask(entropy, response_mask)
+        return inner(*args, **kwargs)
+
+    return _masked
+
+
+def _flash_entropy_masked_ppo_loss(config, model_output, data, dp_group=None):
+    entropy = model_output.get("entropy", None)
+    if entropy is None:
+        raise RuntimeError(
+            "train.entropy_quantile needs per-token entropy, but verl produced none; "
+            "actor.calculate_entropy must be true."
+        )
+    # ppo_loss re-derives this internally; convert here too so the mask is padded to the same
+    # (bsz, response_len) shape the policy loss receives its response_mask in.
+    _flash_entropy_state.entropy = _flash_no_padding_2_padding(entropy, data)
+    try:
+        return _flash_original_ppo_loss(config, model_output, data, dp_group)
+    finally:
+        _flash_entropy_state.entropy = None
+
+
+# patch once. python imports sitecustomize a single time per interpreter, so this should not come
+# up -- but wrapping an already-wrapped loss would mask the top quantile OF the top quantile and
+# train on a fraction of the requested tokens, with nothing in the logs to show for it.
+if not getattr(_flash_original_ppo_loss, "_flash_entropy_masked", False):
+    _flash_entropy_masked_ppo_loss._flash_entropy_masked = True
+    _flash_losses.get_policy_loss_fn = _flash_masked_policy_loss_fn
+    _flash_losses.ppo_loss = _flash_entropy_masked_ppo_loss
+    print({_ENTROPY_QUANTILE_MARKER!r} + " quantile={entropy_quantile:g}", flush=True)
+'''
 
 
 def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
@@ -773,15 +893,11 @@ def _resolve_single_turn_inputs():
             "train.stop_sequences is not yet supported on the verl backend (verl's vllm rollout has "
             "no stop-string field here); use the trl backend (unset FLASH_RL_BACKEND) for it."
         )
-    # entropy_quantile drives trl GRPOTrainer's internal top-entropy token masking (top_entropy_quantile);
-    # verl has no equivalent, so honoring the flash default (1.0 = no masking) is fine but any customer
-    # value < 1.0 must fail loud rather than train without the requested masking (silent drift).
+    # entropy_quantile drives trl GRPOTrainer's internal top-entropy token masking
+    # (top_entropy_quantile). verl has no such knob, so a sitecustomize shim adds it; see
+    # render_entropy_quantile_shim. a value >= 1.0 (or unset) masks nothing and needs no shim.
     _eq = getattr(_t, "entropy_quantile", None) if _t else None
-    if _eq is not None and float(_eq) < 1.0:
-        raise RuntimeError(
-            f"train.entropy_quantile={_eq} is not yet supported on the verl backend (trl's top-entropy "
-            "token masking has no verl equivalent); use the trl backend (unset FLASH_RL_BACKEND) for it."
-        )
+    entropy_quantile = float(_eq) if _eq is not None and float(_eq) < 1.0 else None
     # flash's lora dropout is fixed at 0.0; verl matches (peft default). guard defensively so a future
     # non-zero recipe value can never be silently ignored.
     if float(RECIPE.lora.dropout) != 0.0:
@@ -942,6 +1058,7 @@ def _resolve_single_turn_inputs():
         "top_p": float(rl.sampling_top_p),
         "think_penalty": think_penalty,
         "kl_coef": kl_coef,
+        "entropy_quantile": entropy_quantile,
         "max_completion": max_completion,
         "max_prompt_len": prompt_budget,
         # the engine's full sequence length (prompt + completion), already clamped to the model's
@@ -1036,6 +1153,19 @@ def run_rl_verl():
     pd.DataFrame(rows[: max(1, min(4, len(rows)))]).to_parquet(val_pq)
     with open(reward_py, "w") as f:
         f.write(render_reward_module())
+
+    # runtime patches for the verl interpreter. only written when something needs patching, so the
+    # default path puts nothing on the child's import path. a stale shim from a prior attempt would
+    # otherwise keep patching this one, so the file is removed when no patch is wanted.
+    shim_dir = os.path.join(workdir, "shim")
+    os.makedirs(shim_dir, exist_ok=True)
+    shim_py = os.path.join(shim_dir, "sitecustomize.py")
+    shim_source = render_entropy_quantile_shim(inp["entropy_quantile"])
+    if shim_source:
+        with open(shim_py, "w") as f:
+            f.write(shim_source)
+    elif os.path.exists(shim_py):
+        os.remove(shim_py)
 
     # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. also keep a
     # rolling buffer of recent (completion, score) so the training loop can dump one sample per step
@@ -1134,6 +1264,13 @@ def run_rl_verl():
         env_for_verl["HF_HUB_OFFLINE"] = "1"
         env_for_verl["TRANSFORMERS_OFFLINE"] = "1"
         env_for_verl["HF_HUB_DISABLE_XET"] = "1"
+        if shim_source:
+            # python imports sitecustomize automatically at startup, so the shim patches verl before
+            # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
+            # install itself, and ray workers inherit this env so every actor gets the same patch.
+            env_for_verl["PYTHONPATH"] = os.pathsep.join(
+                item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
+            )
         step_re = re.compile(r"step:\s*(\d+)")
         reward_re = re.compile(r"critic/rewards/mean:([-\d.eE+]+)")
         loss_re = re.compile(r"actor/pg_loss:([-\d.eE+]+)")
