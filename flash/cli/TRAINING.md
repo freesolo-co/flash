@@ -808,7 +808,10 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
     save_at_steps = [4, 8, 12]   # exact steps; overrides the periodic save_every entirely
     ```
 
-    Every entry must land within `max_steps` — a step you never reach is simply never saved.
+    Every entry must land within `max_steps`, and an out-of-range one is **rejected, not skipped**:
+    config validation fails the submit outright, and the worker re-checks it again before training
+    starts. So a stale entry left over from a longer run does not quietly cost you one checkpoint —
+    it stops the run from starting.
 
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
   the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
