@@ -1403,6 +1403,115 @@ def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_ti
     uploader.raise_if_incomplete()
 
 
+def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_path, monkeypatch):
+    # a previous worker resume-uploads a required checkpoint while withholding its adapter behind the
+    # gradient gate, so the step is durable as resume state but NOT published. seeding processed_steps
+    # with resume_step would hide it from _pending forever, and completeness would then fail a run on
+    # the one step this worker is both able and allowed to publish.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    published: list[int] = []
+    monkeypatch.setattr(
+        rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader,
+        "_publish_deployable",
+        lambda self, step, path: (published.append(int(step)), self.published_steps.add(step))[0],
+    )
+    _write_step(local_dir, 4)
+    # resumed at exactly the required step, and no adapter on hf for it, so it stays uncredited.
+    monkeypatch.setattr(rl_verl, "_deployable_adapter_on_hf", lambda step: False)
+    uploader = rl_verl._VerlResumeUploader(str(local_dir), resume_step=4, required_steps=(4,))
+    uploader.credit_durable_required_steps(4)
+    uploader.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not published:
+        time.sleep(0.01)
+    uploader.stop()
+    assert published == [4]
+    uploader.raise_if_incomplete()
+
+
+def test_checkpoint_appearing_at_stop_is_uploaded_before_the_stalled_exit(tmp_path, monkeypatch):
+    # verl advances latest_checkpointed_iteration.txt right up to the moment the child exits, so the
+    # newest resume checkpoint can appear after the drain's last scan but before stop(). with the
+    # gradient gate shut the `stalled` exit fires, and bailing out without sweeping that checkpoint
+    # would drop durable work a preemption then has to redo. resume upload is not gated.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    uploaded: list[int] = []
+    monkeypatch.setattr(
+        rl_verl._w,
+        "upload_resume_checkpoint",
+        lambda step, path, **k: uploaded.append(int(step)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader,
+        "_publish_deployable",
+        lambda self, step, path: (_ for _ in ()).throw(AssertionError("gate is shut")),
+    )
+    # the checkpoint must become visible AFTER a sweep has already decided what to scan, with stop
+    # already set -- writing it between sweeps does not discriminate, because the next top-of-loop
+    # scan picks it up either way. the tracker read is that boundary: _pending only accepts steps at
+    # or below the value it returns, so a step written right after that read is invisible to the
+    # sweep holding it and visible to the next one.
+    real_completed = rl_verl._VerlResumeUploader._completed_step
+    raced = [False]
+
+    def _completed_then_race(self):
+        value = real_completed(self)
+        if not raced[0]:
+            raced[0] = True
+            # verl finishes step 5 and advances its tracker here, then the child exits and the main
+            # thread calls stop() -- all after this sweep already read the pre-step-5 tracker.
+            _write_step(local_dir, 5)
+            self._stop.set()
+        return value
+
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader, "_completed_step", _completed_then_race, raising=True
+    )
+    uploader = rl_verl._VerlResumeUploader(
+        str(local_dir), resume_step=0, required_steps=(5,), had_gradient=lambda: False
+    )
+    uploader.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and uploader._thread.is_alive():
+        time.sleep(0.01)
+    uploader.stop()
+    assert uploaded == [5]
+
+
+def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, monkeypatch):
+    # a zero-spread run withholds every required deployable by design. checking completeness first
+    # would raise on artifacts the gate is deliberately holding, reporting a checkpoint-publication
+    # failure -- the symptom -- instead of the constant reward signal that caused it.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    _write_step(local_dir, 6)
+    monkeypatch.setattr(
+        rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+    uploader = rl_verl._VerlResumeUploader(
+        str(local_dir), resume_step=0, required_steps=(6,), had_gradient=lambda: False
+    )
+    uploader.start()
+    uploader.stop()
+    # both failures are live: the deployable was withheld, and the run produced no spread. the
+    # gradient verdict must be the one that speaks.
+    with pytest.raises(RuntimeError, match="zero advantage spread on all"):
+        rl_verl._check_grpo_had_a_gradient([0.5, 0.5], [0.0, 0.0], resumed=False)
+    with pytest.raises(RuntimeError, match="required saves were not durably published"):
+        uploader.raise_if_incomplete()
+    # ordering is asserted at the call site: the verdict precedes stop()/raise_if_incomplete().
+    source = inspect.getsource(rl_verl.run_rl_verl)
+    verdict = source.index("_check_grpo_had_a_gradient(reward_history")
+    completeness = source.index("resume_uploader.raise_if_incomplete()")
+    assert verdict < completeness
+
+
 def test_train_notes_report_whether_the_run_resumed():
     # without this a resumed run is indistinguishable from a fresh one in train_meta (trl reports it).
     inp = _notes_inp()

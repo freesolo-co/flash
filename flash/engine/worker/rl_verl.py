@@ -948,14 +948,20 @@ class _VerlResumeUploader:
         had_gradient: Callable[[], bool] | None = None,
     ) -> None:
         self.local_dir = local_dir
-        # whatever this run resumed from is already durable; re-uploading it would waste the
-        # upload slot on state hf already holds.
-        self.processed_steps: set[int] = {resume_step} if resume_step else set()
+        self.required_steps = frozenset(required_steps)
+        # whatever this run resumed from is already durable as RESUME state, so re-uploading it
+        # would waste the upload slot on state hf already holds. that is tracked in uploaded_steps
+        # below; processed_steps is deliberately NOT seeded for a required resume step, because its
+        # DEPLOYABLE can still be missing -- a previous worker resume-uploads a checkpoint while
+        # withholding its adapter behind the gradient gate, and hiding that step from _pending would
+        # fail completeness on the one step this worker is both able and allowed to publish.
+        self.processed_steps: set[int] = (
+            {resume_step} if resume_step and resume_step not in self.required_steps else set()
+        )
         # resume upload is tracked separately from processed_steps because a withheld required step
         # stays deliberately unprocessed so a later sweep can still publish it. sharing one set would
         # either re-upload that checkpoint on every 0.5s sweep or lose the retry.
         self.uploaded_steps: set[int] = {resume_step} if resume_step else set()
-        self.required_steps = frozenset(required_steps)
         self.export_root = export_root
         self.python_bin = python_bin
         self.model_id = model_id
@@ -1073,6 +1079,12 @@ class _VerlResumeUploader:
         # it propagates and raise_if_incomplete() turns it into a run failure.
         try:
             while True:
+                # sampled before the sweep so a stop() arriving mid-sweep still gets one full pass
+                # over the checkpoints it made visible. verl advances
+                # latest_checkpointed_iteration.txt right up to the moment the child exits, so the
+                # newest resume checkpoint routinely appears in that window; exiting without
+                # sweeping it would drop durable work a preemption then has to redo.
+                stopping = self._stop.is_set()
                 deployable_ok = self._deployable_allowed()
                 for step, path in self._pending(self._completed_step()):
                     # hold a required step's DEPLOYABLE back rather than publish an untrained
@@ -1110,9 +1122,12 @@ class _VerlResumeUploader:
                 # sweep: the main thread can record the run's first positive spread and call stop()
                 # in between, and exiting on the stale "shut" reading would fail a genuinely trained
                 # run on nothing but thread timing.
-                stalled = bool(self.required_steps) and not self._deployable_allowed()
-                if self._stop.is_set() and (stalled or not self._pending(self._completed_step())):
-                    return
+                # `stopping`, not a fresh read: the sweep above is the full pass over everything
+                # stop() had made visible, and only after running it may the loop exit.
+                if stopping:
+                    stalled = bool(self.required_steps) and not self._deployable_allowed()
+                    if stalled or not self._pending(self._completed_step()):
+                        return
                 time.sleep(0.5)
         except BaseException as error:
             self._error = error
@@ -1804,6 +1819,12 @@ def run_rl_verl():
                 raise
         if rc != 0:
             raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
+        # the gradient verdict runs here, ahead of required-save completeness, because a zero-spread
+        # run withholds every required deployable BY DESIGN: checking completeness first would raise
+        # on artifacts the gate is deliberately holding and report a checkpoint-publication failure
+        # -- the symptom -- instead of the constant reward signal that caused it. raising inside the
+        # try still runs the finally below, so the reward server and gpu sampler shut down either way.
+        _check_grpo_had_a_gradient(reward_history, adv_spread_history, resumed=bool(resume_step))
         # training finished cleanly, so a missing required save is a real defect rather than a
         # side effect of a crash. stop here (not in finally, which suppresses) to surface it.
         # only when exact saves were requested: without them the drain stays best-effort, and
@@ -1827,7 +1848,9 @@ def run_rl_verl():
     shutil.rmtree(adapter_dir, ignore_errors=True)
     os.makedirs(adapter_dir, exist_ok=True)
     train_wall = time.time() - t_train
-    _check_grpo_had_a_gradient(reward_history, adv_spread_history, resumed=bool(resume_step))
+    # the zero-gradient verdict already ran inside the try above, ahead of required-save
+    # completeness, so that a withheld deployable reports the reward cause rather than the
+    # publication symptom.
     actor_dir, steps_run = _latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
         raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")
