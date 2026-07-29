@@ -485,6 +485,8 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   the student's generated tokens is the sum of its per-turn reverse-KLs. Env/observation tokens are
   never distilled (they're context, not the student's output). Set `[train] max_context_tokens` to bound the
   transcript; the teacher must cover it (the allow-listed teachers' contexts far exceed the default budget).
+  On the verl backend this holds for everything except multi-turn combined with `structured_outputs`,
+  which stays on `trl` (see the backend section below).
 - **Judge it like SFT.** Distillation logs a falling per-token loss; a low loss alone is not proof.
   Keep a held-out split, `flash models deploy` the adapter, and score it — confirm the student actually
   moved toward the teacher's behavior, not just its surface tokens.
@@ -727,6 +729,23 @@ image-prompt environments stay on `trl` (which is single-GPU). Warm-starting wit
 reference with adapters disabled, so the reference would be the bare base model instead of your
 SFT adapter, pulling the policy back toward base. Every one of these raises at startup rather
 than quietly training on a different contract.
+
+The verl OPD backend has gaps of its own. A multi-turn env combined with `[train]
+structured_outputs` stays on `trl`: multi-turn OPD alone runs on verl, and structured outputs
+alone run on verl, but the combination raises.
+
+Structured-output OPD on verl additionally requires the constraint to be exactly replayable on
+CPU, which pins it to xgrammar. These raise at startup even on a single-turn env: a
+`whitespace_pattern`, `disable_additional_properties` (guidance-backend only), a JSON schema using
+features that need vLLM's guidance fallback, or a model carrying a vLLM Mistral tokenizer.
+
+On either backend, note what a multi-turn structured-output run actually does: one schema is
+applied to EVERY assistant turn, mid-rollout turns included, because the env contract has no
+per-turn schema channel. If your intermediate turns and your final answer have different shapes,
+`trl` will constrain the intermediate ones to the final-answer schema rather than reject the run.
+That is the contract verl declines to guess at, and it is why the fix is a per-turn constraint
+channel rather than simply lifting the verl check. Like the GRPO gaps, verl raises at startup
+rather than training on a contract you did not ask for.
 
 ---
 
