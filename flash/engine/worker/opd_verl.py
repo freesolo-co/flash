@@ -86,6 +86,20 @@ _TEXT_TEACHER_SHUTDOWN_WAIT_S = 5.0
 _TEXT_TEACHER_REQUEST_BACKLOG = 64
 
 
+def _align_granularity(groups, student_tokens) -> float:
+    """mean student-tokens-per-group: the alignment-health signal coverage cannot provide.
+
+    a degenerate alignment that collapses every student token onto a single group still scores
+    coverage ~1.0, so coverage alone never flags it. this is the trl opd formula verbatim
+    (``opd.py``): non-empty student spans over surviving groups, counted after fully-forced groups
+    are dropped so the ratio describes the signal that actually reaches the loss.
+    """
+    if not groups:
+        return 0.0
+    n_align = sum(1 for st in student_tokens if st.end > st.start)
+    return n_align / len(groups)
+
+
 class _TeacherBridgeHTTPServer(ThreadingHTTPServer):
     request_queue_size = _TEXT_TEACHER_REQUEST_BACKLOG
 
@@ -518,6 +532,12 @@ class _TeacherAlignmentBridge:
         self.forced_tokens = int(state.get("forced_tokens", 0))
         self.dropped_forced_groups = int(state.get("dropped_forced_groups", 0))
         self.coverage_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        # alignment GRANULARITY (mean aligned-groups-per-sequence), distinct from coverage: a
+        # collapsed alignment that maps every student token onto one group still scores coverage
+        # ~1.0, so coverage alone cannot flag that failure mode. no legacy alias here -- the old
+        # granularity_* state keys held coverage, so reading them would restore the wrong quantity.
+        self.align_group_sum = float(state.get("align_group_sum", 0.0))
+        self.align_group_n = int(state.get("align_group_n", 0))
         # resume: baseline the per-step delta counters at the restored cumulative mass, so the
         # first resumed step reports its own coverage instead of the whole prior run's.
         self._prev_aligned = self.aligned_sequences
@@ -648,6 +668,8 @@ class _TeacherAlignmentBridge:
                 "aligned_sequences": self.aligned_sequences,
                 "empty_alignments": self.empty_alignments,
                 "coverage_sum": self.coverage_sum,
+                "align_group_sum": self.align_group_sum,
+                "align_group_n": self.align_group_n,
             }
 
     def _empty(self, prompt_length: int, response_length: int) -> dict:
@@ -756,12 +778,15 @@ class _TeacherAlignmentBridge:
         aligned_group_count = len(groups)
         groups = _drop_fully_forced_groups(groups, kept_forced)
         coverage = groupwise_coverage(groups, student_tokens)
+        granularity = _align_granularity(groups, student_tokens)
         with self._stats_lock:
             self.teacher_input_tokens += teacher_input_tokens
             self.dropped_forced_groups += aligned_group_count - len(groups)
             self.coverage_sum += coverage
             if groups:
                 self.aligned_sequences += 1
+                self.align_group_sum += granularity
+                self.align_group_n += 1
             else:
                 self.empty_alignments += 1
         teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
@@ -1084,11 +1109,14 @@ class _TeacherAlignmentBridge:
                     groups = groupwise_alignment(student_tokens, teacher_tokens)
                     groups = [(indices, logsum) for indices, logsum in groups if indices]
                     coverage = groupwise_coverage(groups, student_tokens)
+                    granularity = _align_granularity(groups, student_tokens)
                     with self._stats_lock:
                         self.teacher_input_tokens += len(turn["prompt_ids"]) + len(student_ids)
                         self.coverage_sum += coverage
                         if groups:
                             self.aligned_sequences += 1
+                            self.align_group_sum += granularity
+                            self.align_group_n += 1
                         else:
                             self.empty_alignments += 1
                     teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
@@ -2515,6 +2543,17 @@ def run_opd_verl(spec=None) -> None:
                 "verl OPD produced no distillation-loss metrics for the whole run — the "
                 "distillation path never engaged; refusing to publish"
             )
+        if len(final_accounting["loss_curve"]) != final_step:
+            # record_step only checks that each metric line FOLLOWS the last one, so a missing
+            # trailing metric (on_line skips any step-tagged line whose loss it cannot parse) leaves
+            # a curve shorter than the checkpoint verl actually wrote, and nothing later arrives to
+            # catch it. opt_steps is published from this curve, so a short curve would understate the
+            # updates applied. fail loud instead of reporting a number the curve cannot support.
+            raise RuntimeError(
+                f"verl OPD recorded {len(final_accounting['loss_curve'])} distillation-loss metrics "
+                f"for {final_step} optimizer updates; refusing to publish an accounting that does "
+                "not cover every update"
+            )
         if int(final_accounting.get("aligned_sequences", 0) or 0) <= 0:
             # zeroed-mask pass-through batches still emit a (zero) loss metric, so the loss-curve
             # check alone cannot distinguish real distillation from a run where the teacher never
@@ -2553,6 +2592,10 @@ def run_opd_verl(spec=None) -> None:
             generated_tokens=int(final_accounting["generated_tokens"]),
             notes={
                 "steps": update_horizon,
+                # optimizer updates that actually produced a distillation loss. record_step enforces
+                # loss_curve length == the metric step, and the guard above rejects a curve shorter
+                # than final_step, so this is measured, not assumed.
+                "opt_steps": len(final_accounting["loss_curve"]),
                 "epochs": knobs.epochs,
                 "retained_prompts": len(prompts),
                 "dropped_long_prompts": dropped_long,
@@ -2566,6 +2609,15 @@ def run_opd_verl(spec=None) -> None:
                     float(final_accounting["coverage_sum"])
                     / int(final_accounting["aligned_sequences"])
                     if final_accounting["aligned_sequences"]
+                    else 0.0
+                ),
+                # the real alignment-health signal. mean_coverage reads ~1.0 even when the alignment
+                # has collapsed every student token onto one group, so it cannot flag that failure
+                # mode on its own; this ratio can.
+                "mean_align_granularity": (
+                    float(final_accounting["align_group_sum"])
+                    / int(final_accounting["align_group_n"])
+                    if final_accounting["align_group_n"]
                     else 0.0
                 ),
                 "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
@@ -2591,6 +2643,23 @@ def run_opd_verl(spec=None) -> None:
                     if multi_turn and final_accounting["episodes_seen"]
                     else None
                 ),
+                # the engine length actually handed to vllm (prompt + completion), already clamped to
+                # the model's own limit. the prompt filter is carved out of this same number.
+                "vllm_max_model_len": max_model_len,
+                # teacher call shape. only the single-turn TEXT path goes through the batcher, which
+                # holds a fixed cap and one serial scoring thread. the multimodal path scores one
+                # item per call and the multi-turn path batches a whole episode, and both run on the
+                # bridge's own request threads -- neither has a constant, so None records "not
+                # batched by flash" instead of asserting a number nothing enforces.
+                # the cap is bounded by the samples one step can actually produce (trl does the same
+                # in _opd_teacher_batch_size): a step of 1 rollout can never fill a batch of 8, and
+                # reporting the global cap there would describe a shape the run cannot reach.
+                "opd_teacher_batch_size": (
+                    min(_TEXT_TEACHER_BATCH_SIZE, max(1, prompts_per_step * knobs.group_size))
+                    if not multimodal and not multi_turn
+                    else None
+                ),
+                "opd_teacher_workers": 1 if not multimodal and not multi_turn else None,
                 "rollout_backend": "verl_vllm",
                 "verl_version": "0.8.0",
                 "verl_backend": "fsdp",
