@@ -64,6 +64,7 @@ def _overrides_cfg(**over):
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
         "entropy_quantile": None,
         "stop_sequences": (),
+        "structured_outputs": None, "thinking": False,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
         "steps": 60, "gpu_mem_util": 0.5, "n_gpus": 1, "loggers": "console", "fp8_kv": False,
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
@@ -237,7 +238,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
         "prompts_per_step": 16, "mask_truncated_completions": True,
         "max_prompt_len": 3072, "max_completion": 1024, "engine_len": 4096,
-        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (), "seed": 42,
+        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (), "structured_outputs": None, "seed": 42,
         "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
         "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
     }
@@ -966,16 +967,69 @@ def test_stop_sequences_gate_off_truncated_completion_masking():
     assert W.grpo_mask_truncated_completions(SimpleNamespace(stop_sequences=()))
 
 
-def test_both_shims_compose_into_one_sitecustomize():
+def test_all_shims_compose_into_one_sitecustomize():
     # python imports sitecustomize once, so a second file would never load. the renderers must
     # concatenate into a single source rather than each owning a file.
     source = inspect.getsource(rl_verl.run_rl_verl)
     assert 'render_entropy_quantile_shim(inp["entropy_quantile"])' in source
     assert 'render_stop_sequences_shim(inp["stop_sequences"])' in source
-    combined = rl_verl.render_entropy_quantile_shim(0.2) + rl_verl.render_stop_sequences_shim(
-        ("</answer>",)
+    assert 'render_structured_outputs_shim(inp["structured_outputs"])' in source
+    combined = (
+        rl_verl.render_entropy_quantile_shim(0.2)
+        + rl_verl.render_stop_sequences_shim(("</answer>",))
+        + rl_verl.render_structured_outputs_shim({"json": {"type": "object"}})
     )
     compile(combined, "sitecustomize.py", "exec")
+
+
+def test_structured_outputs_shim_is_emitted_only_when_a_constraint_is_requested():
+    assert rl_verl.render_structured_outputs_shim(None) == ""
+    assert rl_verl.render_structured_outputs_shim({}) == ""
+    spec = {"json": {"type": "object", "properties": {"a": {"type": "string"}}}}
+    source = rl_verl.render_structured_outputs_shim(spec)
+    assert source
+    assert repr(spec) in source
+    assert rl_verl._STRUCTURED_OUTPUTS_MARKER in source
+
+
+def test_structured_outputs_shim_wraps_the_spec_rather_than_passing_a_raw_dict():
+    # the whole point: vllm ACCEPTS a raw dict, passes _verify_args, and then stores a plain dict
+    # with no .json attribute -- constraining nothing, silently. trl wraps it in its colocate path,
+    # which is why flash's trl path hands over a plain dict; on verl nothing wraps it, so the shim
+    # must, or the run trains unconstrained and looks completely normal.
+    source = rl_verl.render_structured_outputs_shim({"json": {"type": "object"}})
+    assert "StructuredOutputsParams as _FlashStructuredOutputsParams" in source
+    assert (
+        'params["structured_outputs"] = _FlashStructuredOutputsParams(**_flash_structured_outputs)'
+        in source
+    )
+    # built per request, not once: vllm resolves the backend on first use and caches it on the
+    # instance, so a shared object would leak that resolution across requests.
+    assert "params = dict(sampling_params)" in source
+
+
+def test_structured_outputs_shim_refuses_to_wrap_itself_twice():
+    source = rl_verl.render_structured_outputs_shim({"json": {"type": "object"}})
+    assert '"_flash_so_patched", False' in source
+    assert "_flash_so_patched = True" in source
+
+
+def test_reasoning_parser_override_needs_both_thinking_and_a_constraint():
+    # engine half. verl spreads engine_kwargs.vllm straight into AsyncEngineArgs, where
+    # reasoning_parser is a real field, so this needs a plain hydra override and no shim.
+    spec = {"json": {"type": "object"}}
+    key = "+actor_rollout_ref.rollout.engine_kwargs.vllm.reasoning_parser=deepseek_r1"
+    assert key in rl_verl.build_verl_overrides(
+        _overrides_cfg(thinking=True, structured_outputs=spec)
+    )
+    # thinking off -> no reasoning phase to protect; no constraint -> the grammar gate never runs.
+    for off in (
+        {"thinking": False, "structured_outputs": spec},
+        {"thinking": True, "structured_outputs": None},
+    ):
+        assert not [
+            o for o in rl_verl.build_verl_overrides(_overrides_cfg(**off)) if "reasoning_parser" in o
+        ]
 
 
 def test_build_verl_overrides_enable_fused_linear_ce():
@@ -1139,6 +1193,7 @@ def test_train_notes_report_whether_the_run_resumed():
         "kl_coef": 0.0,
         "entropy_quantile": None,
         "stop_sequences": (),
+        "structured_outputs": None,
         "temperature": 1.0,
         "top_p": 1.0,
         "ppo_epochs": 1,
