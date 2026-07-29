@@ -108,6 +108,20 @@ def _hydra_val(value) -> str:
     return text
 
 
+# the optimizer verl builds for SFT, named rather than imported: verl resolves it on the worker
+# with importlib(optim.optimizer_impl) + getattr(optim.optimizer), so the control path never needs
+# the class object -- and the control path has no torch.
+#
+# fp32 AdamW, NOT the TRL path's 8-bit paged optimizer. verl shards with FSDP2, whose parameters
+# are DTensor; bitsandbytes' optimizer_update_8bit_blockwise is a plain CUDA kernel, not a
+# distributed operator, so it raises "got mixed torch.Tensor and DTensor" on the first step.
+# fsdp1 would sidestep DTensor but flattens parameter names, and PEFT's LoRA+ builder groups by
+# name ("lora_B" in name or param.ndim == 1) -- under a flat_param every parameter is 1-D and
+# would land in the 16x group, corrupting training silently instead of crashing.
+_VERL_OPTIMIZER_IMPL = "torch.optim"
+_VERL_OPTIMIZER_NAME = "AdamW"
+
+
 def _optimizer_override_config(cfg: dict) -> dict:
     override = dict(cfg.get("optimizer_kwargs") or {})
     override.setdefault("eps", cfg.get("eps", 1e-8))
@@ -1218,7 +1232,6 @@ def run_sft_verl(spec=None) -> None:
         gradient_checkpointing and _w.grpo_use_reentrant(model_id)
     )
 
-    optimizer_cls, optimizer_kwargs = _w.loraplus_optimizer_cls(_w.fused_optim_name())
     python_bin = resolve_verl_python(workdir)
     model_path = _cached_model_path(model_id, model_revision)
     loggers = ["console"]
@@ -1248,9 +1261,9 @@ def run_sft_verl(spec=None) -> None:
         "ulysses_sp_size": gpu_count,
         "lr": learning_rate,
         "warmup_ratio": RECIPE.sft.warmup_frac,
-        "optimizer_impl": optimizer_cls.__module__,
-        "optimizer_name": optimizer_cls.__name__,
-        "optimizer_kwargs": optimizer_kwargs or None,
+        "optimizer_impl": _VERL_OPTIMIZER_IMPL,
+        "optimizer_name": _VERL_OPTIMIZER_NAME,
+        "optimizer_kwargs": None,
         "local_dir": local_dir,
         "save_freq": save_freq,
         "n_gpus_per_node": gpu_count,
@@ -1454,7 +1467,7 @@ def run_sft_verl(spec=None) -> None:
             "loss_curve": loss_curve[:400],
             "peak_gpu_gb": device_peak_gpu_gb,
             "device_peak_gpu_gb": device_peak_gpu_gb,
-            "loraplus_optim": optimizer_cls.__name__,
+            "loraplus_optim": _VERL_OPTIMIZER_NAME,
             "loraplus_applied": loraplus_applied,
             "chalk_kernels": None,
             "verl_backend": "fsdp2",
