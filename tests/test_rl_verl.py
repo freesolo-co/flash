@@ -1390,8 +1390,10 @@ def test_verl_step_metrics_parses_the_cli_step_table_fields():
     # the cli renders one row per metrics_last entry (cli/commands.py:_FOLLOW_METRIC_FIELDS), and
     # the trl backend fills that list from its trainer callback. verl trains OUT OF PROCESS, so no
     # callback ever runs and the table is empty for every verl run unless the stdout line is parsed.
+    # the metric names here are the ones the PINNED verl reporter actually prints; see
+    # test_verl_step_metrics_parses_only_keys_the_pinned_verl_emits for why that matters.
     line = (
-        "step:7 - critic/rewards/mean:0.4213 - critic/rewards/std:0.1102 - "
+        "step:7 - critic/rewards/mean:0.4213 - critic/rewards/max:0.9 - "
         "actor/pg_loss:-0.0031 - actor/grad_norm:1.75 - actor/kl_loss:0.0042 - "
         "actor/entropy:0.913 - response_length/mean:311.5 - response_length/clip_ratio:0.125"
     )
@@ -1399,7 +1401,6 @@ def test_verl_step_metrics_parses_the_cli_step_table_fields():
     assert row == {
         "step": 7,
         "reward": pytest.approx(0.4213),
-        "reward_std": pytest.approx(0.1102),
         "grad_norm": pytest.approx(1.75),
         "kl": pytest.approx(0.0042),
         "entropy": pytest.approx(0.913),
@@ -1413,10 +1414,28 @@ def test_verl_step_metrics_parses_the_cli_step_table_fields():
 
     rendered = {key for key, _ in _FOLLOW_METRIC_FIELDS}
     assert set(row) - {"step"} <= rendered
-    # verl prints no counterpart for trl's frac_reward_zero_std (it is computed inside the trl
-    # trainer, not logged by verl), so that one column stays blank on a verl run. every other
-    # column the table renders is filled.
-    assert rendered - set(row) == {"frac_reward_zero_std"}
+    # reward_std and frac_reward_zero_std are both computed inside the trl trainer and never logged
+    # by verl, so those two columns stay blank on a verl run. every other column is filled.
+    assert rendered - set(row) == {"reward_std", "frac_reward_zero_std"}
+
+
+def test_verl_step_metrics_parses_only_keys_the_pinned_verl_emits():
+    """The pattern table may only name metrics the pinned verl actually prints.
+
+    `critic/rewards/std` is NOT one of them: the pinned reporter emits `critic/rewards/mean`, `/max`
+    and `/min` only (verl/trainer/ppo/metric_utils.py:220-222). A pattern for a key verl never logs
+    cannot fail loudly -- it just never matches, so every production row silently lacks the column
+    while the parser looks complete and the synthetic test line makes it look covered. Assert against
+    the emitted key set instead of a hand-written line.
+    """
+    emitted = {key for _, pat in rl_verl._VERL_STEP_METRIC_KEYS for key in [pat]}
+    assert not any("rewards/std" in pat for pat in emitted)
+    # a line carrying the pinned reporter's real reward keys yields no reward_std column.
+    row = rl_verl._verl_step_metrics(
+        "step:3 - critic/rewards/mean:0.5 - critic/rewards/max:0.9 - critic/rewards/min:0.1"
+    )
+    assert row == {"step": 3, "reward": pytest.approx(0.5)}
+    assert "reward_std" not in row
 
 
 def test_verl_step_metrics_skips_non_step_lines_and_tolerates_missing_metrics():
@@ -1446,3 +1465,36 @@ def test_verl_grpo_emits_metrics_last_on_heartbeats_and_train_meta():
     assert "metrics_last=list(metrics_last)" in src
     # ...and into train_meta, so it survives after the run ends.
     assert 'heartbeat_fields={"metrics_last": list(metrics_last)}' in src
+
+
+def test_verl_grpo_syncs_the_shared_backlog_for_the_error_path():
+    """A short verl run that parses steps and then RAISES must still surface its step table.
+
+    The top-level handler in worker/__init__.py builds its error heartbeat from
+    `heartbeat.LATEST_GRPO_METRICS_LAST` and nothing else, so a backlog kept only in the local list
+    is invisible exactly when it matters most -- a run that died early is the one whose last few
+    steps a user needs. The trl callback syncs that module list on every logged step
+    (heartbeat.py:429); the verl parser has to do the same.
+    """
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    assert "LATEST_GRPO_METRICS_LAST[:] = metrics_last" in src
+    # the consumer really does read only the module global, so the sync is load-bearing.
+    consumer = inspect.getsource(W)
+    assert '{"metrics_last": list(LATEST_GRPO_METRICS_LAST)} if LATEST_GRPO_METRICS_LAST else {}' in consumer
+
+
+def test_verl_grpo_forces_the_first_parsed_metrics_row_past_the_throttle():
+    """`rl_step` is throttled on _HB_MIN_INTERVAL_S (900s) and the `initial=True` ping immediately
+    before the loop has just taken the upload slot. Relying on the liveness daemon alone therefore
+    keeps every parsed row LOCAL for any run that finishes inside 15 minutes -- the step table would
+    appear only on the terminal heartbeat, i.e. after the run is already over. The trl callback
+    forces its first sample-bearing payload through for the same reason; force the first parsed row.
+    """
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    assert 'if not sent_first_metrics_heartbeat[0] and _w.heartbeat(' in src
+    assert '"rl_step", force=True, step=row["step"], metrics_last=list(metrics_last)' in src
+    # latched on the COMMIT result, not on the attempt: a forced heartbeat that loses the upload
+    # slot must be retried on the next parsed row rather than silently marked as delivered.
+    assert "sent_first_metrics_heartbeat[0] = True" in src
+    # the latch above is only correct because heartbeat() reports whether the payload COMMITTED.
+    assert "return payload_committed" in inspect.getsource(W.heartbeat)

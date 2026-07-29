@@ -41,7 +41,11 @@ from flash.engine.structured_outputs import (
     reasoning_parser_for,
 )
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import _GRPO_METRIC_HISTORY_LIMIT, liveness_heartbeat
+from flash.engine.worker.heartbeat import (
+    _GRPO_METRIC_HISTORY_LIMIT,
+    LATEST_GRPO_METRICS_LAST,
+    liveness_heartbeat,
+)
 from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
@@ -362,9 +366,14 @@ def _build_verl_training_cfg(
 # verl prints every per-step metric on one stdout line, under its own names. map them onto the
 # payload keys the cli step table already renders (_FOLLOW_METRIC_FIELDS in cli/commands.py) so a
 # verl run shows the same history a trl run does.
+#
+# only keys the PINNED verl actually prints belong here. its reporter emits critic/rewards/mean,
+# /max and /min but no /std (verl/trainer/ppo/metric_utils.py:220-222 at the pinned commit), so a
+# reward_std pattern would never match real output -- it would only make the parser look complete
+# while every production row silently lacked the column. reward_std and frac_reward_zero_std are
+# both computed inside the trl trainer, so both stay blank on a verl run.
 _VERL_STEP_METRIC_KEYS = (
     ("reward", r"critic/rewards/mean:([-\d.eE+]+)"),
-    ("reward_std", r"critic/rewards/std:([-\d.eE+]+)"),
     ("grad_norm", r"actor/grad_norm:([-\d.eE+]+)"),
     ("kl", r"actor/kl_loss:([-\d.eE+]+)"),
     ("entropy", r"actor/entropy(?:_loss)?:([-\d.eE+]+)"),
@@ -1610,6 +1619,9 @@ def run_rl_verl():
         # per-step rows for the cli's step table; the trl backend fills this from its trainer
         # callback, which verl has no counterpart for (it trains out of process).
         metrics_last: list[dict] = []
+        # one-shot latch for the forced first-row snapshot below (boxed: the reader is a closure).
+        sent_first_metrics_heartbeat = [False]
+
         def _hb_metrics_fields():
             return {"metrics_last": list(metrics_last)}
 
@@ -1636,6 +1648,19 @@ def run_rl_verl():
                             ],
                             row,
                         ]
+                        # mirror the trl callback (heartbeat.py): the top-level error handler in
+                        # worker/__init__.py reads ONLY this module list, so without the sync a verl
+                        # run that parses steps and then raises sends its error heartbeat with an
+                        # empty backlog -- exactly the table this parser exists to restore.
+                        LATEST_GRPO_METRICS_LAST[:] = metrics_last
+                        # and force the FIRST parsed row past the throttle. rl_step is throttled on
+                        # _HB_MIN_INTERVAL_S (900s) and the initial=True ping just took the upload
+                        # slot, so a run finishing inside 15 minutes would otherwise keep every row
+                        # local until the terminal heartbeat and show no step table while training.
+                        if not sent_first_metrics_heartbeat[0] and _w.heartbeat(
+                            "rl_step", force=True, step=row["step"], metrics_last=list(metrics_last)
+                        ):
+                            sent_first_metrics_heartbeat[0] = True
                     m = step_re.search(line)
                     if m:
                         step_box[0] = int(m.group(1))
