@@ -10,6 +10,7 @@ on top.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
 import math
@@ -281,6 +282,65 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
         json.dump(cfg, f, indent=2)
 
 
+# how many of the child's most recent output lines to retain for stall reporting. the child's last
+# words before it wedges are the whole diagnostic, and a stall is usually preceded by a short burst
+# (a ray warning, a placement-group notice, a partial traceback), so a small window suffices.
+CHILD_TAIL_LINES = 60
+# per-line cap when rendering the retained tail. verl prints resolved-config blocks thousands of
+# characters wide; an unbounded tail would blow the heartbeat payload it has to travel inside.
+_CHILD_TAIL_LINE_CHARS = 300
+# how many retained lines ride along on a pre-first-step heartbeat. narrower than what is retained:
+# this payload is uploaded every tick, so it stays small enough not to bloat the snapshot.
+STALL_TAIL_LINES = 15
+
+
+class ChildOutputTail:
+    """bounded ring buffer of a subprocess's most recent output lines.
+
+    exists because the verl child's stdout reaches **no collected log stream**. ``run_verl_training``
+    re-prints every child line to the parent worker's stdout, and the parent's stdout is not on the
+    path the plane scrapes -- only the ``HEARTBEAT <json>`` marker line is (``heartbeat.py``). so a
+    child that wedges produces zero retrievable bytes: an OPD arm stalled 3/3 attempts on 3 separate
+    endpoints and every attempt cost ~50 minutes of paid H100 time to learn nothing (ISSUES VERL-061).
+
+    retaining the tail in memory lets a stall report the child's own last words through the marker
+    channel that provably survives, instead of inferring the cause from the outside.
+    """
+
+    def __init__(self, limit: int = CHILD_TAIL_LINES) -> None:
+        self._lines: collections.deque[str] = collections.deque(maxlen=limit)
+
+    def record(self, line: str) -> None:
+        text = line.rstrip("\n")
+        if text:
+            self._lines.append(text[:_CHILD_TAIL_LINE_CHARS])
+
+    def tail(self, limit: int | None = None) -> list[str]:
+        """the retained lines, oldest first, optionally narrowed to the most recent ``limit``."""
+        lines = list(self._lines)
+        if limit is not None and limit >= 0:
+            lines = lines[len(lines) - limit :] if limit < len(lines) else lines
+        return lines
+
+
+def stall_tail_fields(
+    step: int, tail: ChildOutputTail, limit: int = STALL_TAIL_LINES
+) -> dict[str, object]:
+    """heartbeat fields carrying the child's last words, but only while it has made no progress.
+
+    a run that is training is diagnosable from its step/loss stream, so attaching the tail then would
+    add an uploaded payload every tick for no information. before the first step there is no such
+    stream, and that is exactly the window a setup stall lands in -- the child prints its complaint,
+    nobody collects the parent's stdout, and the run dies to a watchdog with zero evidence.
+
+    returns an empty dict once ``step`` advances, or when the child has said nothing yet.
+    """
+    if step > 0:
+        return {}
+    recent = tail.tail(limit=limit)
+    return {"child_tail": recent} if recent else {}
+
+
 def run_verl_training(
     cmd: list[str],
     *,
@@ -290,6 +350,7 @@ def run_verl_training(
     heartbeat: Callable[[], None] | None = None,
     step_pattern: str = r"step:\s*(\d+)",
     heartbeat_interval_s: float = 20.0,
+    tail: ChildOutputTail | None = None,
 ) -> int:
     """run a verl trainer subprocess, streaming stdout and surfacing step progress.
 
@@ -297,6 +358,10 @@ def run_verl_training(
     receives every line, ``on_step`` receives each parsed training step, and ``heartbeat`` is called
     at most once per ``heartbeat_interval_s``. callback failures terminate the child before they are
     re-raised so a failed required checkpoint upload cannot leave paid training running unattended.
+
+    ``tail``, when supplied, retains the child's most recent lines so a caller that observes a stall
+    can report what the child last said. the parent's own stdout reaches no collected stream, so this
+    buffer is the only way the child's words escape the container (see ``ChildOutputTail``).
 
     the child gets its own session so teardown can signal the whole process group. verl spawns vllm's
     EngineCore as a grandchild, and terminating only the direct child reparents that grandchild to
@@ -318,6 +383,8 @@ def run_verl_training(
         assert proc.stdout is not None
         for line in proc.stdout:
             print(line, end="", flush=True)
+            if tail is not None:
+                tail.record(line)
             if on_line is not None:
                 on_line(line)
             m = step_re.search(line)
