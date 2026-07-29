@@ -14,6 +14,8 @@ import pytest
 from flash.engine.worker.sft import _pretokenize_completion_only
 from flash.engine.worker.sft_verl import (
     _LORAPLUS_READY_MARKER,
+    _VERL_OPTIMIZER_IMPL,
+    _VERL_OPTIMIZER_NAME,
     _build_verl_child_env,
     _render_sft_dataset_module,
     _render_sft_sitecustomize,
@@ -114,6 +116,28 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
     assert "optim.eps" not in overrides
     assert "optim.lr_scheduler_type" not in overrides
     assert "data.messages_key" not in overrides
+
+
+def test_verl_sft_optimizer_is_dtensor_safe():
+    """the fsdp2 engine hands DTensor params to the optimizer.
+
+    bitsandbytes' 8-bit blockwise kernel is not a distributed operator and raises
+    "got mixed torch.Tensor and DTensor" on the first step, so the verl SFT path must
+    never select an 8-bit optimizer regardless of what the TRL memory profile prefers.
+    """
+    assert (_VERL_OPTIMIZER_IMPL, _VERL_OPTIMIZER_NAME) == ("torch.optim", "AdamW")
+    assert "8bit" not in _VERL_OPTIMIZER_NAME.lower()
+    assert "bitsandbytes" not in _VERL_OPTIMIZER_IMPL
+
+
+def test_sft_engine_strategy_stays_fsdp2():
+    """LoRA+ groups parameters by name ("lora_B" in name).
+
+    fsdp1 flattens parameters into a 1-D flat_param, which would route every parameter
+    into the 16x group B and silently corrupt the learning rates, so the DTensor problem
+    above must not be "fixed" by downgrading the strategy.
+    """
+    assert _as_map(build_sft_verl_overrides(_cfg()))["engine.strategy"] == "fsdp2"
 
 
 def test_optimizer_eps_merges_into_override_config():
@@ -620,12 +644,6 @@ def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypat
         lora_alpha = 32
         target_modules = "all-linear"
 
-    class Optimizer:
-        pass
-
-    Optimizer.__module__ = "torch.optim"
-    Optimizer.__name__ = "AdamW"
-
     class PeakSampler:
         def start(self):
             return self
@@ -664,8 +682,6 @@ def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypat
     monkeypatch.setattr(worker, "make_lora", lambda model_id: LoraConfig())
     monkeypatch.setattr(worker, "grad_checkpointing_on", lambda *args, **kwargs: True)
     monkeypatch.setattr(worker, "grpo_use_reentrant", lambda model_id: False)
-    monkeypatch.setattr(worker, "loraplus_optimizer_cls", lambda name: (Optimizer, {}))
-    monkeypatch.setattr(worker, "fused_optim_name", lambda: "paged_adamw_8bit")
     monkeypatch.setattr(worker, "backend_seed", lambda seed: seed)
     monkeypatch.setattr(worker, "wandb_run_name", lambda: "flash-sft-test")
     monkeypatch.setattr(

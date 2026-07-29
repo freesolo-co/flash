@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from flash.catalog import MODELS
+from flash.catalog import MODELS, serving_lora_rank_cap
 from flash.engine.vram import (
     _KV_BLOCK_TOKENS,
     _LORA_ADAMW_BYTES_PER_PARAM,
@@ -59,6 +59,40 @@ def test_shape_sizing_keeps_the_measured_lora_floor(model_id: str):
 
     assert sized_gb >= exact_opd_gb
     assert sized_gb >= _legacy_lora_floor_gb(rank, effective_params_b)
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "opd"])
+@pytest.mark.parametrize("model_id", tuple(MODELS))
+def test_sizing_covers_fp32_adamw_for_sft_and_opd(model_id: str, algorithm: str):
+    """SFT and OPD size on fp32 AdamW. verl builds torch.optim.AdamW for both -- OPD inherits verl's
+    own default and SFT names it explicitly for FSDP2/DTensor safety -- and the backend lives in the
+    spec's [worker_env], which never reaches this sizing path. so the estimate must cover the AdamW
+    footprint unconditionally; sizing on the 8-bit paged optimizer under-reserves a verl run and
+    places it on a card that cannot hold its optimizer state.
+
+    GRPO is excluded on purpose: verl GRPO runs AdamW too, but its estimate is already at the B200
+    ceiling (the 35B MoE at 4096 ctx sizes to 180 GB exactly), so widening it rejects a configuration
+    that runs today. that gap is tracked separately and needs the resident-peak model retuned."""
+    info = MODELS[model_id]
+    rank = serving_lora_rank_cap(model_id) or 64
+    target_dims = sum(
+        (in_features + out_features) * count
+        for in_features, out_features, count in info.lora_target_shapes
+    )
+    adamw_gb = rank * target_dims * _LORA_ADAMW_BYTES_PER_PARAM / 1e9
+    effective_params_b = info.active_params_b or info.params_b
+
+    assert _lora_memory_gb(rank, effective_params_b, algorithm, info) >= adamw_gb
+    # and the whole-run estimate the allocator ranks on must carry it too
+    assert model_required_vram_gb(model_id, algorithm, train={"lora_rank": rank}) >= adamw_gb
+
+
+def test_9b_rank64_sft_is_sized_off_the_rtx_5090():
+    """the exact configuration the paged-optimizer estimate mis-sized: 9B SFT at rank 64 (its catalog
+    cap) fits a 32 GB RTX 5090 only when the adapter is sized on the 8-bit paged optimizer. under
+    verl's AdamW it needs 33 GB, so a paged-based estimate would place a run on a card 1 GB short."""
+    need = model_required_vram_gb("Qwen/Qwen3.5-9B", "sft", train={"lora_rank": 64})
+    assert need > 32, f"9B rank-64 SFT sized at {need} GB would still be placed on a 32 GB RTX 5090"
 
 
 def test_gdn_state_page_and_attention_kv_use_real_geometry():
