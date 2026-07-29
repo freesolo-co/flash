@@ -201,8 +201,24 @@ def test_grpo_use_reentrant_true_for_gemma3():
     # the family check is spelling-tolerant: a hub id may separate the version with . or _.
     assert grpo_use_reentrant("some-org/gemma3-custom") is True
     assert grpo_use_reentrant("some-org/gemma_3-custom") is True
+    # gemma-3n keeps matching: the right side of the version stays open.
+    assert grpo_use_reentrant("google/gemma-3n-E4B-it") is True
     # gemma2 and earlier do not upcast inside the checkpoint and keep the non-reentrant path.
     assert grpo_use_reentrant("google/gemma-2-9b-it") is False
+
+
+def test_grpo_use_reentrant_does_not_match_paligemma():
+    """paligemma CONTAINS "gemma-3" as a substring but is a different arch that does not upcast
+    inside the checkpointed region. A bare substring test drags it onto the slower reentrant path
+    for no reason, so "gemma" has to start the model-name segment."""
+    from flash.engine.worker.perf.memory import grpo_use_reentrant
+
+    for other_id in (
+        "google/paligemma-3b-pt-224",
+        "google/paligemma-3b-mix-448",
+        "google/paligemma2-3b-pt-224",
+    ):
+        assert grpo_use_reentrant(other_id) is False, other_id
 
 
 def test_grpo_use_reentrant_false_for_non_gdn_dense():
