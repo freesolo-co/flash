@@ -908,6 +908,37 @@ def _retryable_smoke_unavailable(
     return RetryableServingUnavailable(str(code), retry_after_seconds)
 
 
+def _balanced_thinking_content(message: dict) -> str:
+    """Fold a split-out ``reasoning_content`` back into a balanced ``<think>...</think>`` block.
+
+    A thinking chat template renders the OPENING ``<think>`` into the *prompt*, so the model only
+    ever samples the closing tag; serving's OpenAI surface then hands the reasoning back in
+    ``reasoning_content`` with just the answer in ``content``. A caller reading ``content`` alone
+    watches the reasoning vanish, and one reading the raw text sees a stray ``</think>`` with no
+    opener. Re-open the block so every flash-side consumer -- the deployment smoke's content and
+    truncation checks, the thinking-tag telemetry, the answer split -- reads one structurally
+    balanced string. ``reasoning_content`` is left in place for callers that want the split.
+    """
+    content = str(message.get("content") or "")
+    reasoning = message.get("reasoning_content")
+    if not isinstance(reasoning, str) or not reasoning:
+        return content
+    if "</think>" in content:
+        # already balanced, or serving never split the tags out: don't nest a second block.
+        return content
+    return f"<think>{reasoning}</think>{content}"
+
+
+def _balance_thinking_payload(payload: object) -> None:
+    """Rewrite each choice's ``content`` in place so the returned payload is balanced."""
+    if not isinstance(payload, dict):
+        return
+    for choice in payload.get("choices") or []:
+        message = choice.get("message") if isinstance(choice, dict) else None
+        if isinstance(message, dict):
+            message["content"] = _balanced_thinking_content(message)
+
+
 def chat(
     run_id: str,
     messages: list[dict],
@@ -950,6 +981,7 @@ def chat(
                 raise retryable_error
         resp.raise_for_status()
         payload = resp.json()
+        _balance_thinking_payload(payload)
         if expected_checkpoint and isinstance(payload, dict):
             payload["_freesolo_headers"] = {
                 "adapter_revision": resp.headers.get("X-Freesolo-Adapter-Revision"),
@@ -960,6 +992,11 @@ def chat(
 
 
 def _openai_stream_content(lines: Iterator[str]) -> Iterator[str]:
+    # reasoning arrives on its own delta field (see _balanced_thinking_content). re-open the block
+    # around it and close it at the answer boundary, so the streamed text a caller prints is the
+    # same balanced string the non-streaming path returns instead of silently dropping the
+    # reasoning phase and then emitting a bare closing tag.
+    reasoning_open = False
     for line in lines:
         line = line.strip()
         if not line.startswith("data:"):
@@ -971,9 +1008,23 @@ def _openai_stream_content(lines: Iterator[str]) -> Iterator[str]:
             continue
         chunk = json.loads(data)
         for choice in chunk.get("choices") or []:
-            content = ((choice.get("delta") or {}).get("content")) or ""
+            delta = (choice.get("delta") or {}) if isinstance(choice, dict) else {}
+            reasoning = delta.get("reasoning_content") or ""
+            if reasoning:
+                if not reasoning_open:
+                    reasoning_open = True
+                    yield "<think>"
+                yield str(reasoning)
+            content = delta.get("content") or ""
             if content:
+                if reasoning_open:
+                    reasoning_open = False
+                    yield "</think>"
                 yield str(content)
+    if reasoning_open:
+        # generation stopped inside the reasoning block (a length cap, usually). still close it:
+        # an unbalanced opener is the same defect as the unbalanced closer, mirrored.
+        yield "</think>"
 
 
 def chat_stream(
@@ -1005,7 +1056,9 @@ def chat_stream(
             # client.stream() leaves body unread; must call resp.read() before .json().
             resp.read()
             payload = resp.json()
-            content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
+            content = _balanced_thinking_content(
+                (payload.get("choices") or [{}])[0].get("message") or {}
+            )
             if content:
                 yield str(content)
             return
