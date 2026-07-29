@@ -1296,17 +1296,70 @@ def test_run_rl_verl_gates_midtraining_deployables_and_exempts_resumes():
     assert source.index("adv_spread_history: list[float] = []") < source.index("_VerlResumeUploader(")
 
 
-def test_resume_uploader_withheld_required_step_is_not_marked_processed():
-    # withholding must leave the step PENDING so it republishes once spread appears, and so
-    # raise_if_incomplete() still reports it missing if it never does. marking it processed would
-    # convert "not yet allowed" into "silently dropped".
-    source = inspect.getsource(rl_verl._VerlResumeUploader._run)
-    gate = source.split("if not deployable_ok:")[1]
-    body = gate.split("self._publish_deployable")[0]
-    assert "continue" in body
-    assert "processed_steps.add" not in body
-    # and stop() must not wait forever on a step the gate will never release.
-    assert "stalled" in source
+def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path, monkeypatch):
+    # withholding gates the DEPLOYABLE only. the resume upload is internal retry scaffolding, and with
+    # exact save_at_steps these are often the only on-disk checkpoints -- skipping it would leave a run
+    # preempted before the first nonzero spread with nothing to resume from. and because a withheld
+    # step deliberately stays pending, the upload must be keyed on its own bookkeeping or the drain
+    # loop re-uploads the same checkpoint every 0.5s sweep.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    uploaded: list[int] = []
+    published: list[int] = []
+    spread: list[float] = []
+    monkeypatch.setattr(
+        rl_verl._w, "upload_resume_checkpoint",
+        lambda step, path, **k: uploaded.append(int(step)), raising=False,
+    )
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader, "_publish_deployable",
+        lambda self, step, path: (published.append(int(step)), self.published_steps.add(step))[0],
+    )
+    _write_step(local_dir, 3)
+    uploader = rl_verl._VerlResumeUploader(
+        str(local_dir), resume_step=0, required_steps=(3,),
+        had_gradient=lambda: any(s > 0.0 for s in spread),
+    )
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and 3 not in uploaded:
+            time.sleep(0.05)
+        # the gate is shut, so the deployable is withheld -- but resume state IS durable.
+        assert uploaded == [3]
+        assert published == []
+        # and it stays pending, so raise_if_incomplete() can still report it.
+        assert 3 not in uploader.processed_steps
+        time.sleep(1.5)  # several sweeps: the upload must not repeat
+        assert uploaded == [3]
+        spread.append(2.0)  # gradient evidence appears; the held-back deployable is released
+        while time.monotonic() < deadline and not published:
+            time.sleep(0.05)
+        assert published == [3]
+        assert uploaded == [3]
+        assert 3 in uploader.processed_steps
+    finally:
+        uploader.stop()
+    uploader.raise_if_incomplete()
+
+
+def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_path, monkeypatch):
+    # the gate never opening must not wedge stop() waiting for a step it will never release, and the
+    # run must still fail rather than silently ship without the customer's requested deployable.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    monkeypatch.setattr(
+        rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+    _write_step(local_dir, 3)
+    uploader = rl_verl._VerlResumeUploader(
+        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=lambda: False
+    )
+    uploader.start()
+    time.sleep(0.5)
+    uploader.stop()  # must return, not hang
+    with pytest.raises(RuntimeError, match="required saves were not durably published"):
+        uploader.raise_if_incomplete()
 
 
 def test_train_notes_report_whether_the_run_resumed():

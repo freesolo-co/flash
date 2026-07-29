@@ -951,6 +951,10 @@ class _VerlResumeUploader:
         # whatever this run resumed from is already durable; re-uploading it would waste the
         # upload slot on state hf already holds.
         self.processed_steps: set[int] = {resume_step} if resume_step else set()
+        # resume upload is tracked separately from processed_steps because a withheld required step
+        # stays deliberately unprocessed so a later sweep can still publish it. sharing one set would
+        # either re-upload that checkpoint on every 0.5s sweep or lose the retry.
+        self.uploaded_steps: set[int] = {resume_step} if resume_step else set()
         self.required_steps = frozenset(required_steps)
         self.export_root = export_root
         self.python_bin = python_bin
@@ -1071,18 +1075,34 @@ class _VerlResumeUploader:
             while True:
                 deployable_ok = self._deployable_allowed()
                 for step, path in self._pending(self._completed_step()):
-                    if step in self.required_steps and step not in self.published_steps:
-                        if not deployable_ok:
-                            # hold this step back rather than publish an untrained adapter, and do
-                            # NOT mark it processed: the next sweep retries it once spread appears,
-                            # and if it never does, raise_if_incomplete still reports it missing.
-                            continue
+                    # hold a required step's DEPLOYABLE back rather than publish an untrained
+                    # adapter. the step stays out of processed_steps so the next sweep retries it
+                    # once spread appears, and if it never does, raise_if_incomplete reports it.
+                    withheld = (
+                        step in self.required_steps
+                        and step not in self.published_steps
+                        and not deployable_ok
+                    )
+                    if (
+                        step in self.required_steps
+                        and step not in self.published_steps
+                        and not withheld
+                    ):
                         self._publish_deployable(step, path)
-                    try:
-                        _w.upload_resume_checkpoint(step, path)
-                    except Exception as error:
-                        print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
-                    self.processed_steps.add(step)
+                    # the resume upload is NOT gated on gradient evidence: it is internal retry
+                    # scaffolding rather than a servable artifact, and with exact save_at_steps these
+                    # are often the only on-disk checkpoints, so skipping it would leave a run
+                    # preempted before the first nonzero spread nothing to resume from. marked before
+                    # the attempt, so one permanently failing upload cannot spin every 0.5s -- which
+                    # is also the pre-existing non-fatal semantics for this upload.
+                    if step not in self.uploaded_steps:
+                        self.uploaded_steps.add(step)
+                        try:
+                            _w.upload_resume_checkpoint(step, path)
+                        except Exception as error:
+                            print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
+                    if not withheld:
+                        self.processed_steps.add(step)
                 # a withheld step stays pending by design, so "stopped and drained" can no longer be
                 # the only exit: with the gate shut those steps never clear, and waiting for them
                 # would hang stop(). raise_if_incomplete() reports them as the run failure instead.
