@@ -835,7 +835,9 @@ def run_sft():
             # saved tensors differently on recompute, so non-reentrant checkpointing's metadata-equality
             # assert fires on the FIRST backward (Qwen3.6-35B-A3B). Mirror the GRPO path (rl.py, #429/#432)
             # and pick REENTRANT recompute for those; dense models keep the faster non-reentrant path.
-            "gradient_checkpointing_kwargs": {"use_reentrant": grpo_use_reentrant(model_id)},
+            "gradient_checkpointing_kwargs": {
+                "use_reentrant": grpo_use_reentrant(model_id, model_revision)
+            },
             "completion_only_loss": True,
             "loss_type": "chunked_nll" if _sft_fused else "nll",
             # remove_unused_columns=False: HF Trainer would otherwise drop completion_mask before

@@ -9,9 +9,10 @@ from flash.engine.worker.perf.liger import _liger_default_for_model
 
 _LONG_CONTEXT_TOKENS = _LIGER_LONG_CTX_TOKENS
 
-# "gemma" must start the model name segment: a bare substring test also matches paligemma-3b, a
-# different arch that does not upcast. the right side stays open so gemma-3n and gemma-3-4b both
-# match, and the separator is optional so gemma3 / gemma_3 spellings do too.
+# name-based fallback, used ONLY when the model's config cannot be read (see
+# _is_upcasting_checkpoint_family). "gemma" must start the model name segment: a bare substring test
+# also matches paligemma-3b, a different arch that does not upcast. the right side stays open so
+# gemma-3n and gemma-3-4b both match, and the separator is optional so gemma3 / gemma_3 do too.
 _GEMMA3_RE = re.compile(r"(?:^|[^a-z0-9])gemma[-_]?3")
 
 
@@ -91,18 +92,58 @@ def _is_gdn_hybrid_family(model_id: str) -> bool:
     return any(token in mid for token in ("qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6"))
 
 
-def _is_upcasting_checkpoint_family(model_id: str) -> bool:
-    """Offline family check for an arch that changes activation dtype/rank inside the checkpoint.
+def _is_upcasting_checkpoint_family(model_id: str, revision: str = "") -> bool:
+    """Whether this arch changes activation dtype/rank inside the checkpointed region.
 
-    Gemma3 upcasts inside the checkpointed region (its normalizer and attention soft-cap run in
-    fp32), so the recompute hands back a tensor whose dtype AND rank both differ from what the
-    forward saved. Same hermetic form as ``_is_gdn_hybrid_family``: no config probe, so
-    ``grpo_use_reentrant`` stays callable at config-build time without HF access.
+    Gemma3 upcasts there (its normalizer and attention soft-cap run in fp32), so the recompute hands
+    back a tensor whose dtype AND rank both differ from what the forward saved.
+
+    Decided from the model's OWN ``model_type``, not its repository name. A name test is wrong in
+    both directions: ``paligemma-3b`` contains the literal segment but is a different arch that does
+    not upcast, while ``google/medgemma-4b-it`` (``model_type: gemma3``) and
+    ``google/medgemma-27b-text-it`` (``gemma3_text``) are real Gemma3 derivatives that omit it --
+    live-probed on the hub. A false negative is the costly direction: it puts a genuine Gemma3 back
+    on non-reentrant checkpointing, where it dies on the first backward. Every caller runs after
+    ``prefetch_model``, so the config is already on local disk and this costs no network.
+
+    The name check remains only as the fallback for a config that cannot be read at all (offline,
+    gated repo, malformed). An unreadable config must not fail the run, so a probe failure degrades
+    to the previous behaviour rather than raising.
     """
-    return _GEMMA3_RE.search((model_id or "").lower()) is not None
+    mid = (model_id or "").lower()
+    model_type = _model_type(model_id, revision)
+    if model_type is None:
+        return _GEMMA3_RE.search(mid) is not None
+    # gemma3 / gemma3_text (text-only derivatives) / gemma3n all upcast; gemma2, gemma, paligemma
+    # and shieldgemma2 do not.
+    return model_type.startswith("gemma3")
 
 
-def grpo_use_reentrant(model_id: str) -> bool:
+def _model_type(model_id: str, revision: str = "") -> str | None:
+    """The model's ``model_type``, or None when the config cannot be read.
+
+    Reads the nested ``text_config`` only as a fallback, the way multimodal architectures nest it
+    (mirrors ``model_max_position_embeddings`` in ``verl_common``).
+    """
+    try:
+        from transformers import AutoConfig
+
+        from flash.engine.worker.hf import model_revision_kwargs
+
+        cfg = AutoConfig.from_pretrained(
+            model_id, trust_remote_code=True, **model_revision_kwargs(revision)
+        )
+        found = getattr(cfg, "model_type", None)
+        if not found:
+            text_cfg = getattr(cfg, "text_config", None)
+            found = getattr(text_cfg, "model_type", None) if text_cfg else None
+        return str(found).lower() if found else None
+    except Exception as e:  # an unreadable config must not fail the run
+        print(f"[perf] model_type probe failed for {model_id!r} (using name fallback): {e}")
+        return None
+
+
+def grpo_use_reentrant(model_id: str, revision: str = "") -> bool:
     """Whether GRPO gradient checkpointing must use REENTRANT recompute for this model.
 
     MoE models AND GatedDeltaNet (GDN) hybrids need it. Non-reentrant checkpointing
@@ -123,7 +164,9 @@ def grpo_use_reentrant(model_id: str) -> bool:
     - Gemma3: the normalizer/soft-cap upcast inside the checkpointed region makes the recompute
       disagree on BOTH dtype and rank (saved ``[494, 2560] bfloat16`` vs recomputed
       ``[1, 494, 2560] float32``). Live-confirmed on ``google/gemma-3-4b-pt`` and
-      ``google/gemma-3-4b-it``, H100 sm90, raising on the first backward.
+      ``google/gemma-3-4b-it``, H100 sm90, raising on the first backward. Detected from the
+      checkpoint's ``model_type``, so renamed derivatives like ``google/medgemma-4b-it`` are caught
+      too (see ``_is_upcasting_checkpoint_family``).
 
     Reentrant checkpointing re-runs the forward inside the same autograd context over the same
     closed-over inputs (mask/position_ids threaded via the ``partial``; ``use_cache=False``) and does
@@ -136,7 +179,7 @@ def grpo_use_reentrant(model_id: str) -> bool:
     info = MODELS.get(model_id)
     if info is not None and info.is_moe:
         return True
-    return _is_gdn_hybrid_family(model_id) or _is_upcasting_checkpoint_family(model_id)
+    return _is_gdn_hybrid_family(model_id) or _is_upcasting_checkpoint_family(model_id, revision)
 
 
 def enable_multimodal_input_require_grads(model) -> object | None:

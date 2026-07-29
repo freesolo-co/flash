@@ -801,7 +801,7 @@ def run_opd():
             # dependent tensors laid out differently on recompute) -> torch.utils.checkpoint
             # CheckpointError; its fragmenting alloc pattern also OOMs under non-expandable segments.
             # See grpo_use_reentrant (#429/#432 fixed this for GRPO; OPD's custom loop never got it).
-            _reentrant = grpo_use_reentrant(model_id)
+            _reentrant = grpo_use_reentrant(model_id, model_revision)
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": _reentrant}
             )

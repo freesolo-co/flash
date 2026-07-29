@@ -593,7 +593,9 @@ def run_rl():
         # MoE needs REENTRANT recompute: its router re-dispatches tokens on the backward recompute,
         # so non-reentrant's metadata-equality assert fires on the first backward and kills the run
         # (Qwen3.6-35B-A3B). Dense models keep the faster non-reentrant path. See grpo_use_reentrant.
-        "gradient_checkpointing_kwargs": {"use_reentrant": grpo_use_reentrant(model_id)},
+        "gradient_checkpointing_kwargs": {
+            "use_reentrant": grpo_use_reentrant(model_id, model_revision)
+        },
         # Pin a stable GRPO recipe instead of TRL's defaults (which suppress the lift on short runs):
         # constant LR, group-mean-centered advantages (no std scaling), no length-norm; beta = KL coef.
         "lr_scheduler_type": "constant",
