@@ -322,48 +322,8 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
     # UNCLAMPED context. those prompts plus the completion allowance overflow the engine vllm was
     # actually given, so they die at rollout instead of training on the shorter context. every
     # length must descend from one clamped value.
-    from flash.engine.worker._pkg import W
-    from flash.spec import JobSpec
-
-    class _Env:
-        multi_turn = False
-        is_tool_env = False
-
-        def dataset(self):
-            return [{"index": i} for i in range(8)]
-
-        def prompt_messages(self, ex):
-            return [{"role": "user", "content": f"question {ex['index']}"}]
-
-    class _Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
-
-        def apply_chat_template(self, messages, **kwargs):
-            return messages[0]["content"]
-
-        def __call__(self, text, **kwargs):
-            return SimpleNamespace(input_ids=[1])
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "grpo",
-            # asks for twice the architecture's context.
-            "train": {"batch_size": 4, "epochs": 1, "max_context_tokens": 65536},
-        }
-    )
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "SEED", 42, raising=False)
-    monkeypatch.setattr(W, "THINKING", False, raising=False)
-    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
-    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
-    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
-    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
-    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 32768)
-
-    inp = rl_verl._resolve_single_turn_inputs()
+    # asks for twice the architecture's context (model_max_position_embeddings is pinned to 32768).
+    inp = _capability_resolve(monkeypatch, _capability_env(), train={"max_context_tokens": 65536})
     assert inp["engine_len"] == 32768
     # the prompt filter's budget is carved out of the clamped engine, not the requested 65536.
     assert inp["max_prompt_len"] + inp["max_completion"] == 32768
@@ -388,47 +348,12 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
 
 def _save_steps_inputs(monkeypatch, *, save_at_steps=None, save_every=None, max_steps=100):
     """resolve grpo verl inputs for a job with (or without) exact save steps."""
-    from flash.engine.worker._pkg import W
-    from flash.spec import JobSpec
-
-    class _Env:
-        multi_turn = False
-        is_tool_env = False
-
-        def dataset(self):
-            return [{"index": i} for i in range(8)]
-
-        def prompt_messages(self, ex):
-            return [{"role": "user", "content": f"question {ex['index']}"}]
-
-    class _Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
-
-        def apply_chat_template(self, messages, **kwargs):
-            return messages[0]["content"]
-
-        def __call__(self, text, **kwargs):
-            return SimpleNamespace(input_ids=[1])
-
-    train: dict = {"batch_size": 4, "epochs": 1, "max_steps": max_steps}
+    train: dict = {"max_steps": max_steps}
     if save_at_steps is not None:
         train["save_at_steps"] = list(save_at_steps)
     if save_every is not None:
         train["save_every"] = save_every
-    spec = JobSpec.from_dict(
-        {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo", "train": train}
-    )
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "SEED", 42, raising=False)
-    monkeypatch.setattr(W, "THINKING", False, raising=False)
-    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
-    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
-    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
-    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
-    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 32768)
-    return rl_verl._resolve_single_turn_inputs()
+    return _capability_resolve(monkeypatch, _capability_env(), train=train)
 
 
 def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
