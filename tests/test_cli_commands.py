@@ -1821,6 +1821,41 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
     assert "hb=" not in progress  # non-numeric ts -> no fabricated age
 
 
+def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
+    """A preemption relaunch rewinds the step counter while the state stays "running", so the
+    follow line must name the attempt or the rewind reads as lost progress with no cause."""
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    # attempts are 0-based, so a first attempt must stay unannotated.
+    first = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
+    }
+    _, progress = _log_follow_progress(first, "unknown")
+    assert "step=455" in progress
+    assert "attempt=" not in progress
+
+    # relaunched on fresh hardware: same state, step back to 0, attempt incremented.
+    relaunched = {
+        "state": "running",
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": "boot", "step": 0, "ts": _time.time(), "attempt": 1},
+    }
+    state, progress = _log_follow_progress(relaunched, "unknown")
+    assert state == "running"
+    assert "step=0" in progress
+    assert "attempt=1" in progress
+
+    malformed = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_step", "ts": _time.time(), "attempt": "two"},
+    }
+    _, progress = _log_follow_progress(malformed, "unknown")
+    assert "attempt=" not in progress  # non-integer attempt -> no fabricated identity
+
+
 @pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
 def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
     import time as _time
