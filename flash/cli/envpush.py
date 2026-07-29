@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shlex
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -102,11 +103,31 @@ def cmd_env_pull(args) -> int:
                 # basename became the output, which happens to be that same directory. saying
                 # only "refusing to overwrite" leaves the user to guess that; name the
                 # destination form instead.
-                hint = (
-                    f"\nhint: to download the whole environment into {out}{os.sep}, "
-                    f"drop the second positional and pass it as the destination: "
-                    f"flash env pull {env_id} -o {out}"
-                )
+                #
+                # only when -o is ABSENT, though. with an explicit `-o somedir` the user named the
+                # in-env path deliberately, so telling them to drop it would abandon the file they
+                # asked for and silently turn this into a whole-environment download.
+                hint = ""
+                if not args.output:
+                    # shell-quote: the directory that triggered this can contain spaces or
+                    # metacharacters, and an unquoted `-o into here` splits into two arguments.
+                    quoted = shlex.quote(str(out))
+                    # the whole-environment path refuses any nonempty destination, so recommending
+                    # it verbatim into a populated directory just trades this error for the next.
+                    if any(out.iterdir()):
+                        hint = (
+                            f"\nhint: {out}{os.sep} is a directory, and the second positional is a "
+                            f"path INSIDE the environment, not a destination. to download the whole "
+                            f"environment, pass a destination with -o; {out}{os.sep} is not empty, so "
+                            f"choose a new path or replace its contents: "
+                            f"flash env pull {env_id} -o {quoted} --force"
+                        )
+                    else:
+                        hint = (
+                            f"\nhint: to download the whole environment into {out}{os.sep}, "
+                            f"drop the second positional and pass it as the destination: "
+                            f"flash env pull {env_id} -o {quoted}"
+                        )
                 print(
                     f"refusing to overwrite directory {out} with a file "
                     "(a single-file pull needs -o to be a FILE path, not a directory)" + hint,
