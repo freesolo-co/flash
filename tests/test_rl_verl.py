@@ -1343,3 +1343,119 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
     assert notes["ppo_max_token_len_per_gpu"] == 4096
     # trl pins vllm's prefill batch because it hardcodes 4096; this path sets no such override.
     assert notes["vllm_max_num_batched_tokens"] is None
+
+
+# ------------------- capability guards: the four specs verl grpo refuses -------------------
+# these four raises are the ONLY thing standing between a trl-supported job and a verl run that
+# trains on a different contract. they had no regression coverage: every resolver test above drives
+# the happy path, so deleting any guard left the suite green. each test below asserts one rejection
+# by its own message, because a bare pytest.raises(RuntimeError) passes on any of the ~20 other
+# raises in this resolver.
+
+
+def _capability_env(*, multi_turn=False, is_tool_env=False, images=False):
+    """a minimal single-turn text env, optionally flipped to a shape verl grpo rejects."""
+
+    class _Env:
+        def __init__(self):
+            self.multi_turn = multi_turn
+            self.is_tool_env = is_tool_env
+
+        def dataset(self):
+            return [{"index": i} for i in range(8)]
+
+        def prompt_messages(self, ex):
+            if images:
+                # record_has_images matches an image content BLOCK, so build the real shape rather
+                # than a sentinel key the guard would not see.
+                return [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"question {ex['index']}"},
+                            {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+                        ],
+                    }
+                ]
+            return [{"role": "user", "content": f"question {ex['index']}"}]
+
+    return _Env()
+
+
+def _capability_resolve(monkeypatch, env, train=None, overrides=None):
+    """run the resolver against one env, with everything else on the supported path."""
+    from flash.engine.worker._pkg import W as _PkgW
+    from flash.spec import JobSpec
+
+    class _Tokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "prompt"
+
+        def __call__(self, text, **kwargs):
+            return SimpleNamespace(input_ids=[1])
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "train": {"batch_size": 4, "epochs": 1, **(train or {})},
+        }
+    )
+    monkeypatch.setattr(_PkgW, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(_PkgW, "SEED", 42, raising=False)
+    monkeypatch.setattr(_PkgW, "THINKING", False, raising=False)
+    monkeypatch.setattr(_PkgW, "require_active_env", lambda: env, raising=False)
+    monkeypatch.setattr(_PkgW, "grpo_overrides", lambda: dict(overrides or {}), raising=False)
+    monkeypatch.setattr(_PkgW, "grpo_mask_truncated_completions", lambda t: False, raising=False)
+    monkeypatch.setattr(_PkgW, "load_tokenizer", lambda *a, **k: _Tokenizer(), raising=False)
+    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 32768)
+    return rl_verl._resolve_single_turn_inputs()
+
+
+def test_capability_guard_rejects_multi_turn_env(monkeypatch):
+    # trl grpo drives multi-turn through a rollout func (rl.py select_grpo_trainer); the verl path
+    # has no equivalent, so it must refuse rather than train only the first turn.
+    with pytest.raises(RuntimeError, match="single-turn, non-tool"):
+        _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+
+
+def test_capability_guard_rejects_tool_env(monkeypatch):
+    # trl grpo hands tool schemas AND callables to the trainer; verl gets neither, so a tool env
+    # would train against completions that never call a tool.
+    with pytest.raises(RuntimeError, match="single-turn, non-tool"):
+        _capability_resolve(monkeypatch, _capability_env(is_tool_env=True))
+
+
+def test_capability_guard_rejects_image_prompts(monkeypatch):
+    # this guard runs AFTER prompt_messages is built, so it needs a real image content block, not a
+    # flag. trl selects a multimodal trainer here; verl grpo is text-only and would silently drop
+    # the image, training the model on the caption alone.
+    with pytest.raises(RuntimeError, match="non-multimodal grpo only"):
+        _capability_resolve(monkeypatch, _capability_env(images=True))
+
+
+def test_capability_guard_rejects_kl_anchored_warm_start(monkeypatch):
+    # verl computes its kl reference with adapters DISABLED, so under init_from_adapter the
+    # reference is the bare base model and the penalty drags the policy away from the sft start -
+    # the opposite of what the knob asks for. must raise until verl can hold a reference adapter.
+    # the kl coefficient arrives through grpo_overrides, so it must go through the helper: patching
+    # it separately gets clobbered by the helper's own patch and the test then fails on the adapter
+    # download instead, passing a bare raises() while proving nothing about this guard.
+    with pytest.raises(RuntimeError, match="kl_penalty_coef"):
+        _capability_resolve(
+            monkeypatch,
+            _capability_env(),
+            train={"init_from_adapter": "org/some-sft-adapter"},
+            overrides={"kl_penalty_coef": 0.1},
+        )
+
+
+def test_capability_guards_admit_the_supported_single_turn_text_env(monkeypatch):
+    # the control: with none of the four shapes present the resolver must run to completion, so a
+    # guard that fires on every env would fail here instead of passing the four tests above.
+    inp = _capability_resolve(monkeypatch, _capability_env())
+    assert inp["max_prompt_len"] > 0
