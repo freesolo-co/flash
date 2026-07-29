@@ -338,7 +338,9 @@ def _print_train_schema_compatibility(result: object) -> None:
     print(render.note(text) if render.styled() else text, file=sys.stderr)
 
 
-def _warn_if_wandb_requested_without_key(spec, runtime_secrets: dict | None) -> None:
+def _warn_if_wandb_requested_without_key(
+    spec, runtime_secrets: dict | None, *, dry_run: bool
+) -> None:
     """Warn when a config asks for W&B but no ``WANDB_API_KEY`` was found locally.
 
     ``WANDB_API_KEY`` is an optional runtime secret, and discovery only looks at the process env and
@@ -348,12 +350,22 @@ def _warn_if_wandb_requested_without_key(spec, runtime_secrets: dict | None) -> 
     """
     if not (spec.wandb.project or spec.wandb.run_name):
         return
-    if (runtime_secrets or {}).get("WANDB_API_KEY"):
+    # strip before deciding: the server's _runtime_secrets() strips and drops the value, so a
+    # whitespace-only key reaches the worker as no key at all -- the exact silent-no-logging
+    # failure this warning exists to prevent, but with the warning suppressed.
+    if str((runtime_secrets or {}).get("WANDB_API_KEY") or "").strip():
         return
+    # a dry-run allocates no gpu and trains nothing, so "this run will train" would contradict the
+    # dry-run notice printed moments later and can read as though a paid run started.
+    outcome = (
+        "a run submitted with this config will train with W&B logging DISABLED"
+        if dry_run
+        else "this run will train with W&B logging DISABLED"
+    )
     message = (
         "[wandb] is configured but no WANDB_API_KEY was found in the environment, "
-        "./.env(.local), or the .env(.local) beside the config; this run will train with W&B "
-        "logging DISABLED. Export WANDB_API_KEY or put it in a .env next to the config."
+        f"./.env(.local), or the .env(.local) beside the config; {outcome}. "
+        "Export WANDB_API_KEY or put it in a .env next to the config."
     )
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
@@ -378,7 +390,7 @@ def cmd_train(args) -> int:
     runtime_secrets = (
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
-    _warn_if_wandb_requested_without_key(spec, runtime_secrets)
+    _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
     if args.dry_run:
         # dry-run runs submit-time server preflights without importing user code, allocating a gpu,
         # or charging anything. a rejection surfaces as the server's error with exit status 1.
