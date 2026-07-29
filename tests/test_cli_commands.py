@@ -1538,6 +1538,123 @@ def test_deploy_wait_bounds_each_poll_by_the_remaining_time(
     assert seen == [pytest.approx(5.0, abs=0.5)]
 
 
+def test_deploy_wait_zero_actually_reads_the_current_state(fake_client, monkeypatch) -> None:
+    """`--wait 0` means "check once, do not block" -- it must issue that one read.
+
+    The deadline was evaluated before the first poll, so a zero budget was already expired on entry
+    and deployment_for never ran. Readiness was then judged from the POST body, which is `queued` on
+    every normal async deploy, so `--wait 0` could not succeed even against a ready revision.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    polls: list[str] = []
+
+    def _poll(run_id, timeout=None):
+        polls.append(run_id)
+        return {"state": "ready"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 0
+    assert polls == ["flash-1"], polls
+
+
+def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
+    fake_client, monkeypatch
+) -> None:
+    """A sleep that consumes the whole budget must end the wait, not fund one more read.
+
+    The remaining time was computed once before sleeping, so the post-sleep request still went out
+    with the 1.0s floor: `--wait 0.1` against a stalled plane blocked for over a second past the
+    bound it advertised.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    # the sleep is what burns the budget, exactly as a real one would.
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    seen: list[float | None] = []
+
+    def _poll(run_id, timeout=None):
+        seen.append(timeout)
+        return {"state": "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0.1"]) == 1
+    # exactly one read: the up-front one-shot. the post-sleep read is past the deadline.
+    assert seen == [pytest.approx(0.1, abs=0.001)], seen
+
+
+@pytest.mark.parametrize("state", ["revocation_failed", "some_state_a_newer_plane_added"])
+def test_deploy_wait_fails_closed_on_a_terminal_state_that_is_not_ready(
+    fake_client, monkeypatch, capsys, state
+) -> None:
+    """Leaving the busy set is not the same as being servable.
+
+    `revocation_failed` is a real persisted state (a concurrent undeploy whose backend cleanup
+    failed), and an unknown state arrives on any client/server skew. Both are non-busy, so gating
+    success on "not busy" exited 0 with nothing actually serving.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {"state": state},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    err = capsys.readouterr().err
+    assert "not\nservable" in err or "not servable" in err, err
+    assert "once it is ready" not in err, err
+
+
+def test_deploy_wait_rejects_a_superseding_deploy_that_carries_no_error(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A concurrent deploy for the same run reaches ready on ITS checkpoint, with no error at all.
+
+    Returning early whenever last_deploy_error was absent meant the stamps were never compared on
+    exactly the case that needs them, so `deploy --wait && evaluate` reported success and then
+    evaluated the other shell's revision.
+    """
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {
+            "run_id": run_id,
+            "state": "queued",
+            "requested_at": "2026-07-29T02:00:00Z",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        # ready, no error, different attempt: someone else's deploy.
+        lambda run_id, timeout=None: {
+            "state": "ready",
+            "requested_at": "2026-07-29T03:00:00Z",
+        },
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert "once it is ready" not in capsys.readouterr().err
+
+
+def test_deploy_notes_name_this_channels_executable(fake_client, monkeypatch, capsys) -> None:
+    """The dev channel installs `flash-dev`; a hardcoded `flash ...` hint is not runnable there."""
+    monkeypatch.setattr(cli.commands, "CLI_NAME", "flash-dev")
+    _queued_deploy(monkeypatch, fake_client)
+
+    assert _run(["models", "deploy", "flash-1"]) == 0
+    err = capsys.readouterr().err
+    assert "flash-dev models deployments" in err, err
+    assert "`flash models" not in err, err
+
+
 def test_deploy_wait_stops_retrying_a_rejected_key(fake_client, monkeypatch, capsys) -> None:
     """401/403 answers the same way every time, so polling through it just burns the timeout.
 
