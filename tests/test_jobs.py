@@ -511,7 +511,44 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     # Never scheduled (no capacity) is reported distinctly from a scheduled-then-stalled worker.
     assert res.failure == "no_capacity"
     assert "IN_QUEUE" in res.detail
+    # polled with the 900s LAST-gpu grace above, so there is nowhere left to walk: the detail must
+    # not promise a next-best class it cannot reach.
+    assert "next-best GPU" not in res.detail
+    assert "same class" in res.detail
+
+
+def test_no_capacity_detail_promises_a_walk_only_when_one_exists(monkeypatch):
+    # Same never-scheduled stall as above, but polled with the NON-last grace: a next-best class
+    # does exist here, so the detail should say so. Pairing the two directions is the point --
+    # _select_candidate ranks tried classes down but never FILTERS them, so on a one-entry
+    # candidate list (any spec that pins gpu.type) the retry re-picks the same class. A detail
+    # that always promised "next-best GPU" read as a walk that never happened.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: (_ for _ in ()).throw(RuntimeError("no workers yet")),
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    h = _runpod_handle(jobs)
+    res = jobs.poll_job(
+        h,
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=5000.0,
+        queue_grace_s=300.0,  # not the last GPU: the walk has somewhere to go
+    )
+    assert not res.ok
+    assert res.failure == "no_capacity"
     assert "next-best GPU" in res.detail
+    assert "same class" not in res.detail
 
 
 def test_capacity_grace_scales_with_gpu_walk_position():
