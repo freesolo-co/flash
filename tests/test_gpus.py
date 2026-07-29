@@ -189,6 +189,32 @@ def test_flash_gpu_enum_members():
     assert flash_gpu("B200").name == "NVIDIA_B200"
 
 
+def test_explicit_gpu_pin_cannot_widen_to_its_whole_pool():
+    """An explicit class pin must serialize to that card, never to "any card in its pool".
+
+    The SDK's POOLS_TO_TYPES lists 1 of ADA_80_PRO's 3 real members, and to_gpu_ids_str derives
+    negations from that table, so an unpatched H100 pin sends a bare 'ADA_80_PRO' -- RunPod may
+    then assign an H100 NVL, which verify_gpu rejects as an exact-class mismatch.
+    """
+    pytest.importorskip("runpod_flash")
+
+    from runpod_flash.core.resources.gpu import GpuGroup
+
+    from flash.providers.runpod.gpus import flash_gpu
+
+    ids = GpuGroup.to_gpu_ids_str([flash_gpu("H100")])
+    assert "-NVIDIA H100 NVL" in ids
+    assert "-NVIDIA H100 PCIe" in ids
+
+    # repeated resolution must not accumulate duplicate negations
+    for _ in range(3):
+        flash_gpu("H100")
+    assert GpuGroup.to_gpu_ids_str([flash_gpu("H100")]) == ids
+
+    # classes whose SDK pool table is already complete stay exactly as they were
+    assert GpuGroup.to_gpu_ids_str([flash_gpu("A100 SXM")]) == "AMPERE_80,-NVIDIA A100 80GB PCIe"
+
+
 def test_gpu_short():
     from flash.providers.base import gpu_short
 
