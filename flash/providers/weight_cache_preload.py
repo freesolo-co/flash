@@ -130,9 +130,9 @@ def _has_worker(workers: dict | None) -> bool | None:
       ``_only_unhealthy_workers`` is what separates that case out on its own timer.
 
     ``throttled`` is deliberately NOT counted. ``jobs.py`` classifies a sustained throttled worker as
-    ``no_capacity`` ("retrying on the next-best GPU"), which is exactly the condition this poller
-    exists to catch: RunPod is not scheduling the pinned class here. Treating it as capacity would
-    make a preload sit the full timeout on a datacenter that will never run it.
+    ``no_capacity``, which is exactly the condition this poller exists to catch: RunPod is not
+    scheduling the pinned class here. Treating it as capacity would make a preload sit the full
+    timeout on a datacenter that will never run it.
 
     Returns None when health could not be read. That is deliberately NOT False: the caller escalates
     a sustained False into NoCapacityError and tears the endpoint down, so a health endpoint that is

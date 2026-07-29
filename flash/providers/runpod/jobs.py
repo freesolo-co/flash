@@ -101,6 +101,12 @@ def weight_cache_grow_headroom_s() -> float:
 
     return WEIGHT_CACHE_GROW_BUDGET_S * max(1, rp_keys.key_count())
 
+
+# capacity grace on the LAST candidate class: there is nowhere left to walk, so wait longer before
+# giving up. purely a timing knob -- it says nothing about whether a retry follows, because
+# on_last_gpu (runner/lifecycle.py) is also true when the infra retry budget is exhausted.
+LAST_GPU_CAPACITY_GRACE_S = 900.0
+
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
@@ -109,7 +115,7 @@ TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:
     """poll_job stall-window kwargs. queue/throttled grace is ~5 min normally, ~15 min on last GPU (nowhere left to walk)."""
-    grace = 900.0 if on_last_gpu else 300.0
+    grace = LAST_GPU_CAPACITY_GRACE_S if on_last_gpu else 300.0
     return {
         "stall_after_s": 1500.0,
         "setup_grace_s": 3000.0,
@@ -958,7 +964,7 @@ def poll_job(
                 False,
                 failure="no_capacity",
                 detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
-                "(no RunPod capacity for the pinned GPU class); retrying on the next-best GPU",
+                "(no RunPod capacity for the pinned GPU class)",
             )
         if status != "IN_QUEUE":
             # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
@@ -1005,8 +1011,8 @@ def poll_job(
                         False,
                         failure="no_capacity",
                         detail=f"never scheduled: worker stuck THROTTLED for "
-                        f"{int(now - throttled_timer.since)}s while IN_QUEUE (no RunPod "
-                        f"capacity for the pinned GPU class); retrying on the next-best GPU",
+                        f"{int(now - throttled_timer.since)}s while IN_QUEUE "
+                        f"(no RunPod capacity for the pinned GPU class)",
                     )
             except Exception:
                 pass

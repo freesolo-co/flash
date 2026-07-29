@@ -511,7 +511,51 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     # Never scheduled (no capacity) is reported distinctly from a scheduled-then-stalled worker.
     assert res.failure == "no_capacity"
     assert "IN_QUEUE" in res.detail
-    assert "next-best GPU" in res.detail
+    # the detail states the OBSERVED condition and stops there. poll_job cannot know what happens
+    # next: the retry disposition lives in _run_training, which owns the candidate list and the
+    # retry budget and already prints "retrying ..." / "not retrying" alongside this detail.
+    # a provider-side guess contradicts that line whenever the budget is exhausted.
+    assert "no RunPod capacity" in res.detail
+    assert "retrying" not in res.detail
+
+
+def test_no_capacity_detail_never_predicts_the_retry_disposition(monkeypatch):
+    # Same never-scheduled stall, polled with the NON-last grace. The detail must be IDENTICAL in
+    # wording regardless of grace: the grace does not determine what happens next.
+    #
+    # on_last_gpu (lifecycle.py:781) is an OR of two unrelated conditions -- "last untried class"
+    # and "infra retry budget exhausted" -- so a 900s grace can mean the walk wraps back to an
+    # already-tried class, OR that can_retry() returns false and the run TERMINATES. Any wording
+    # derived from the grace alone is wrong in at least one of those paths, and "retrying on the
+    # same class" on a max_retries=0 run directly contradicts lifecycle's own "not retrying".
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: (_ for _ in ()).throw(RuntimeError("no workers yet")),
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    h = _runpod_handle(jobs)
+    res = jobs.poll_job(
+        h,
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=5000.0,
+        queue_grace_s=300.0,  # not the last GPU
+    )
+    assert not res.ok
+    assert res.failure == "no_capacity"
+    assert "no RunPod capacity" in res.detail
+    # no next-step claim in EITHER direction -- that is _run_training's line to print.
+    assert "retrying" not in res.detail
+    assert "next-best" not in res.detail
 
 
 def test_capacity_grace_scales_with_gpu_walk_position():
