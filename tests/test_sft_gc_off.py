@@ -184,7 +184,14 @@ def test_grpo_use_reentrant_true_for_gdn_hybrid():
         assert grpo_use_reentrant(gdn_id) is True, gdn_id
 
 
-def test_grpo_use_reentrant_true_for_gemma3():
+def _pin_model_type(monkeypatch, mapping):
+    """Pin the arch probe to real hub model_type values so the test needs no network."""
+    from flash.engine.worker.perf import memory
+
+    monkeypatch.setattr(memory, "_model_type", lambda model_id, revision="": mapping[model_id])
+
+
+def test_grpo_use_reentrant_true_for_gemma3(monkeypatch):
     # gemma3 upcasts inside the checkpointed region (normalizer / attention soft-cap run in fp32),
     # so the recompute disagrees on BOTH dtype and rank -- saved [494, 2560] bfloat16 vs recomputed
     # [1, 494, 2560] float32 -- and non-reentrant checkpointing raises CheckpointError on the FIRST
@@ -192,43 +199,139 @@ def test_grpo_use_reentrant_true_for_gemma3():
     # sm90: without this, gemma3 sft/grpo cannot start at all.
     from flash.engine.worker.perf.memory import grpo_use_reentrant
 
+    # model_type values below are the real ones served by the hub api for each id.
+    _pin_model_type(
+        monkeypatch,
+        {
+            "google/gemma-3-4b-pt": "gemma3",
+            "google/gemma-3-4b-it": "gemma3",
+            "google/gemma-3-27b-it": "gemma3",
+            "google/gemma-3-270m": "gemma3_text",
+            "google/gemma-3n-E4B-it": "gemma3n",
+            "google/gemma-2-9b-it": "gemma2",
+        },
+    )
     for gemma_id in (
         "google/gemma-3-4b-pt",
         "google/gemma-3-4b-it",
         "google/gemma-3-27b-it",
     ):
         assert grpo_use_reentrant(gemma_id) is True, gemma_id
-    # the family check is spelling-tolerant: a hub id may separate the version with . or _.
-    assert grpo_use_reentrant("some-org/gemma3-custom") is True
-    assert grpo_use_reentrant("some-org/gemma_3-custom") is True
-    # gemma-3n keeps matching: the right side of the version stays open.
+    # text-only (gemma3_text) and gemma-3n variants upcast the same way and must match too.
+    assert grpo_use_reentrant("google/gemma-3-270m") is True
     assert grpo_use_reentrant("google/gemma-3n-E4B-it") is True
     # gemma2 and earlier do not upcast inside the checkpoint and keep the non-reentrant path.
     assert grpo_use_reentrant("google/gemma-2-9b-it") is False
 
 
-def test_grpo_use_reentrant_does_not_match_paligemma():
-    """paligemma CONTAINS "gemma-3" as a substring but is a different arch that does not upcast
-    inside the checkpointed region. A bare substring test drags it onto the slower reentrant path
-    for no reason, so "gemma" has to start the model-name segment."""
+def test_grpo_use_reentrant_true_for_renamed_gemma3_derivative(monkeypatch):
+    """A derivative whose repo name omits "gemma-3" is still gemma3 and still crashes without this.
+
+    medgemma is gemma3 by model_type (medgemma-4b-it -> gemma3, medgemma-27b-text-it ->
+    gemma3_text, both live-probed). A name-only check misses them and puts a real gemma3 back on
+    non-reentrant checkpointing, where it dies on the first backward -- the exact failure this
+    module exists to prevent. The false negative is the costly direction, so detection reads the
+    checkpoint's own model_type.
+    """
     from flash.engine.worker.perf.memory import grpo_use_reentrant
 
-    for other_id in (
-        "google/paligemma-3b-pt-224",
-        "google/paligemma-3b-mix-448",
-        "google/paligemma2-3b-pt-224",
+    _pin_model_type(
+        monkeypatch,
+        {
+            "google/medgemma-4b-it": "gemma3",
+            "google/medgemma-27b-text-it": "gemma3_text",
+            "some-org/renamed-finetune": "gemma3",
+        },
+    )
+    for derived_id in (
+        "google/medgemma-4b-it",
+        "google/medgemma-27b-text-it",
+        "some-org/renamed-finetune",
     ):
+        assert grpo_use_reentrant(derived_id) is True, derived_id
+
+
+def test_grpo_use_reentrant_excludes_other_gemma_architectures(monkeypatch):
+    """Sibling "gemma" arches do not upcast inside the checkpointed region and must stay
+    non-reentrant. paligemma even CONTAINS "gemma-3" as a substring, so a name test drags it onto
+    the slower path for no reason; its model_type (paligemma) says plainly that it is not gemma3."""
+    from flash.engine.worker.perf.memory import grpo_use_reentrant
+
+    # every model_type below is the real value the hub api returns for that id.
+    others = {
+        "google/paligemma-3b-pt-224": "paligemma",
+        "google/paligemma-3b-mix-448": "paligemma",
+        "google/paligemma2-3b-pt-224": "paligemma",
+        "google/shieldgemma-2-4b-it": "shieldgemma2",
+        "google/txgemma-9b-chat": "gemma2",
+        "google/codegemma-7b": "gemma",
+    }
+    _pin_model_type(monkeypatch, others)
+    for other_id in others:
         assert grpo_use_reentrant(other_id) is False, other_id
 
 
-def test_grpo_use_reentrant_false_for_non_gdn_dense():
+def test_grpo_use_reentrant_falls_back_to_the_name_when_the_config_is_unreadable(monkeypatch):
+    """An unreadable config (offline, gated, malformed) must not fail the run: the probe returns
+    None and detection degrades to the name check rather than raising."""
+    from flash.engine.worker.perf import memory
+    from flash.engine.worker.perf.memory import grpo_use_reentrant
+
+    monkeypatch.setattr(memory, "_model_type", lambda model_id, revision="": None)
+
+    assert grpo_use_reentrant("google/gemma-3-4b-it") is True
+    # the fallback stays spelling-tolerant: a hub id may separate the version with . or _.
+    assert grpo_use_reentrant("some-org/gemma3-custom") is True
+    assert grpo_use_reentrant("some-org/gemma_3-custom") is True
+    assert grpo_use_reentrant("google/gemma-3n-E4B-it") is True
+    # and still does not drag paligemma onto the reentrant path.
+    assert grpo_use_reentrant("google/paligemma-3b-pt-224") is False
+    assert grpo_use_reentrant("google/gemma-2-9b-it") is False
+
+
+def test_model_type_probe_swallows_a_failed_config_read(monkeypatch):
+    """The probe itself must convert any config-read failure into None, not propagate it."""
+    import sys
+    import types
+
+    from flash.engine.worker.perf.memory import _model_type
+
+    def _boom(*args, **kwargs):
+        raise OSError("gated repo")
+
+    stub = types.ModuleType("transformers")
+    stub.AutoConfig = types.SimpleNamespace(from_pretrained=_boom)
+    monkeypatch.setitem(sys.modules, "transformers", stub)
+
+    assert _model_type("google/gemma-3-4b-it") is None
+
+
+def test_grpo_use_reentrant_false_for_non_gdn_dense(monkeypatch):
     # uncataloged non-gdn dense models keep the faster non-reentrant path because standard
     # transformer layers recompute deterministically without metadata divergence.
     from flash.engine.worker.perf.memory import grpo_use_reentrant
 
+    _pin_model_type(
+        monkeypatch,
+        {"meta-llama/Llama-3.2-1B": "llama", "some/uncataloged-open-model": None},
+    )
     assert grpo_use_reentrant("meta-llama/Llama-3.2-1B") is False
     # an uncataloged open non-qwen model is treated as non-gdn dense (null-safe, no crash).
     assert grpo_use_reentrant("some/uncataloged-open-model") is False
+
+
+def test_every_caller_passes_the_pinned_revision():
+    """The arch probe resolves a repo at a revision, so a run pinned to an older commit has to read
+    THAT commit's config. Dropping the argument silently reads main instead, which for a pin that
+    predates a config change is a different architecture than the one being trained."""
+    import inspect
+
+    from flash.engine.worker import opd, rl, sft
+
+    for module in (sft, rl, opd):
+        src = inspect.getsource(module)
+        assert "grpo_use_reentrant(model_id, model_revision)" in src, module.__name__
+        assert "grpo_use_reentrant(model_id)" not in src, module.__name__
 
 
 def test_is_moe_property():

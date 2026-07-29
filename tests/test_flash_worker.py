@@ -606,10 +606,11 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     # not that the call sits at any particular nesting depth.
     assert re.search(r"grad_checkpointing_on\(\s*model_id,\s*_runtime_max_len,", src)
     assert '"gradient_checkpointing": _grad_ckpt' in src
-    # Reentrant recompute for MoE / GatedDeltaNet (same rule as GRPO's rl.py, #429/#432): those
-    # architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
+    # Reentrant recompute for MoE / GatedDeltaNet / gemma3 (same rule as GRPO's rl.py, #429/#432):
+    # those architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
     # non-reentrant's metadata-equality assert kills the first backward. Dense stays non-reentrant.
-    assert '"use_reentrant": grpo_use_reentrant(model_id)' in src
+    # the revision is threaded through so the arch probe reads the pinned commit's config.
+    assert '"use_reentrant": grpo_use_reentrant(model_id, model_revision)' in src
     assert '"optim": fused_optim_name()' in src
 
 
