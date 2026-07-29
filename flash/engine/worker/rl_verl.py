@@ -24,12 +24,20 @@ import shutil
 import subprocess
 import threading
 import time
+from functools import reduce
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from math import gcd
 
 from flash.engine.recipe import RECIPE
-from flash.engine.steps import on_policy_steps, resolve_update_horizon
+from flash.engine.steps import (
+    final_save_due,
+    on_policy_steps,
+    resolve_update_horizon,
+    validate_save_steps,
+)
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import sanitize_rollout_text
@@ -226,7 +234,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # honor [train].max_steps: total_training_steps caps the optimizer-update horizon.
         f"trainer.total_training_steps={cfg['steps']}",
         f"trainer.save_freq={cfg['save_freq']}",
-        "trainer.max_actor_ckpt_to_keep=1",
+        f"trainer.max_actor_ckpt_to_keep={cfg['ckpt_to_keep']}",
         # resume from whatever _restore_verl_resume staged into default_local_dir. auto is a no-op
         # when nothing was staged, so a fresh run is unaffected; without it a preempted run silently
         # restarts at step 0 and re-bills the whole budget.
@@ -308,7 +316,9 @@ def _build_verl_training_cfg(
         "reward_path": reward_path,
         "reward_name": "compute_score",
         "total_epochs": inp["verl_total_epochs"],
-        "save_freq": inp["save_every"],
+        # already the gcd of any exact save steps, so verl's modulo save lands on every one of them.
+        "save_freq": inp["save_freq"],
+        "ckpt_to_keep": inp["ckpt_to_keep"],
         "local_dir": local_dir,
     }
 
@@ -540,28 +550,77 @@ def _export_peft_adapter(
 class _VerlResumeUploader:
     """stream each completed verl checkpoint to hf so a preempted grpo run can resume from it.
 
-    grpo publishes only a final deployable adapter (both backends), so unlike sft this uploads the
-    resume state alone. verl writes global_step_N under default_local_dir and only then advances
+    without exact save steps grpo publishes only a final deployable adapter (both backends), so this
+    uploads the resume state alone. with save_at_steps set it also exports and publishes a servable
+    adapter at each required step, which is what makes those steps deployable rather than merely
+    resumable. verl writes global_step_N under default_local_dir and only then advances
     latest_checkpointed_iteration.txt, so gating on that marker never uploads a half-written dir.
     """
 
-    def __init__(self, local_dir: str, *, resume_step: int) -> None:
+    def __init__(
+        self,
+        local_dir: str,
+        *,
+        resume_step: int,
+        required_steps: tuple[int, ...] = (),
+        export_root: str = "",
+        python_bin: str = "",
+        model_id: str = "",
+        model_revision: str = "",
+        tokenizer=None,
+    ) -> None:
         self.local_dir = local_dir
         # whatever this run resumed from is already durable; re-uploading it would waste the
         # upload slot on state hf already holds.
         self.processed_steps: set[int] = {resume_step} if resume_step else set()
+        self.required_steps = frozenset(required_steps)
+        self.export_root = export_root
+        self.python_bin = python_bin
+        self.model_id = model_id
+        self.model_revision = model_revision
+        self.tokenizer = tokenizer
+        # populated by credit_durable_required_steps() before start(): crediting a required step
+        # needs an hf lookup, which does not belong in a constructor.
+        self.published_steps: set[int] = set()
         self._error: BaseException | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def credit_durable_required_steps(self, resume_step: int) -> None:
+        """Credit required saves a pre-resume worker already published.
+
+        A resumed run never re-saves a step it trained past, so without this every required step
+        below the resume point would be reported missing and fail an otherwise-successful retry.
+        Crediting is gated on the adapter being verified on hf rather than inferred from the step
+        counter: a preempted worker can advance past a required step without its deployable ever
+        landing, and that step must stay uncredited so completeness still catches it.
+        """
+        for step in sorted(self.required_steps):
+            if step <= int(resume_step) and _deployable_adapter_on_hf(step):
+                self.published_steps.add(step)
 
     def start(self) -> None:
         self._thread.start()
 
     def stop(self) -> None:
+        # idempotent: the clean path stops the drain early to surface a missing required save, and
+        # the finally block stops it again on every path.
         self._stop.set()
         self._thread.join(timeout=600)
         if self._thread.is_alive():
             raise RuntimeError("verl resume uploader did not stop")
+
+    def raise_if_incomplete(self) -> None:
+        """fail the run when a required save never became durable.
+
+        called only after training finished cleanly: on a crash or cancel the missing steps are a
+        symptom of the real failure, and raising here would mask it.
+        """
+        if self._error is not None:
+            raise RuntimeError("verl resume uploader failed") from self._error
+        missing = sorted(self.required_steps - self.published_steps)
+        if missing:
+            raise RuntimeError(f"required saves were not durably published: {missing}")
 
     def _completed_step(self) -> int:
         tracker = os.path.join(self.local_dir, "latest_checkpointed_iteration.txt")
@@ -587,19 +646,43 @@ class _VerlResumeUploader:
                 found.append((step, path))
         return sorted(found)
 
+    def _publish_deployable(self, step: int, checkpoint_dir: str) -> None:
+        """export a required step's checkpoint into a servable adapter and publish it."""
+        actor_dir = os.path.join(checkpoint_dir, "actor")
+        adapter_dir = os.path.join(self.export_root, f"step-{step}")
+        shutil.rmtree(adapter_dir, ignore_errors=True)
+        os.makedirs(adapter_dir, exist_ok=True)
+        _export_peft_adapter(
+            actor_dir, adapter_dir, base_model_id=self.model_id, python_bin=self.python_bin
+        )
+        # the served adapter needs its tokenizer alongside it, exactly as the final publish does.
+        # grpo verl rejects multimodal upstream, so a tokenizer (not a processor) is the whole set.
+        self.tokenizer.save_pretrained(adapter_dir)
+        _stamp_adapter_dir_provenance(adapter_dir, self.model_id, self.model_revision)
+        _w.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
+        _w.publish_deployable_checkpoint(adapter_dir, step, required=True, _provenance_ready=True)
+        self.published_steps.add(step)
+
     def _run(self) -> None:
         # a failed resume upload must not fail the run: the policy is still trained and published at
         # the end, and the only loss is having to restart from an earlier step after a preemption.
-        while True:
-            for step, path in self._pending(self._completed_step()):
-                try:
-                    _w.upload_resume_checkpoint(step, path)
-                except Exception as error:
-                    print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
-                self.processed_steps.add(step)
-            if self._stop.is_set() and not self._pending(self._completed_step()):
-                return
-            time.sleep(0.5)
+        # a failed REQUIRED save is different -- the customer asked for a deployable at that step, so
+        # it propagates and raise_if_incomplete() turns it into a run failure.
+        try:
+            while True:
+                for step, path in self._pending(self._completed_step()):
+                    if step in self.required_steps and step not in self.published_steps:
+                        self._publish_deployable(step, path)
+                    try:
+                        _w.upload_resume_checkpoint(step, path)
+                    except Exception as error:
+                        print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
+                    self.processed_steps.add(step)
+                if self._stop.is_set() and not self._pending(self._completed_step()):
+                    return
+                time.sleep(0.5)
+        except BaseException as error:
+            self._error = error
 
 
 def _restore_verl_resume(local_dir: str) -> int:
@@ -690,12 +773,6 @@ def _resolve_single_turn_inputs():
             "train.stop_sequences is not yet supported on the verl backend (verl's vllm rollout has "
             "no stop-string field here); use the trl backend (unset FLASH_RL_BACKEND) for it."
         )
-    if _t and getattr(_t, "save_at_steps", ()):
-        raise RuntimeError(
-            "train.save_at_steps is not yet supported on the verl backend (verl saves on a fixed "
-            "save_freq interval, not arbitrary steps); use the trl backend for it."
-        )
-
     # entropy_quantile drives trl GRPOTrainer's internal top-entropy token masking (top_entropy_quantile);
     # verl has no equivalent, so honoring the flash default (1.0 = no masking) is fine but any customer
     # value < 1.0 must fail loud rather than train without the requested masking (silent drift).
@@ -838,6 +915,19 @@ def _resolve_single_turn_inputs():
         steps=int(steps),
     )
     save_every = int(_t.save_every) if (_t and _t.save_every) else 20
+    # exact save steps: verl only saves when global_step % save_freq == 0, so it cannot hit an
+    # arbitrary set directly. the gcd is the largest interval every required step is a multiple of,
+    # so verl saves a superset and the uploader publishes the deployables at exactly the required
+    # ones. same derivation the sft verl backend already uses.
+    save_at_steps = tuple(int(step) for step in (getattr(_t, "save_at_steps", ()) or ()))
+    validate_save_steps(save_at_steps, int(steps))
+    save_freq = reduce(gcd, save_at_steps) if save_at_steps else save_every
+    # retention has to outlive the export. verl prunes a checkpoint only once the NEXT one finishes
+    # writing, so keeping 1 leaves the uploader a single save interval to run model_merger before
+    # its source directory is deleted -- and a gcd of 1 makes that interval a single update. keep a
+    # small history while exact saves are pending so a slow export cannot lose a required step.
+    # without exact saves nothing is exported mid-run, so 1 stays correct and cheapest on disk.
+    ckpt_to_keep = 3 if save_at_steps else 1
 
     return {
         "env": env,
@@ -866,7 +956,9 @@ def _resolve_single_turn_inputs():
         "epochs": epochs,
         "verl_total_epochs": verl_total_epochs,
         "steps": int(steps),
-        "save_every": save_every,
+        "save_freq": save_freq,
+        "save_at_steps": save_at_steps,
+        "ckpt_to_keep": ckpt_to_keep,
         # verl's default preserves the update horizon and on-policy baseline; unlike trl reuse, each
         # update gets a fresh rollout batch.
         "ppo_epochs": 1,
@@ -1019,7 +1111,17 @@ def run_rl_verl():
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
         _w.heartbeat("rl_step", step=0, initial=True)
         t_train = time.time()
-        resume_uploader = _VerlResumeUploader(local_dir, resume_step=resume_step)
+        resume_uploader = _VerlResumeUploader(
+            local_dir,
+            resume_step=resume_step,
+            required_steps=inp["save_at_steps"],
+            export_root=os.path.join(workdir, "exports"),
+            python_bin=python_bin,
+            model_id=inp["model_id"],
+            model_revision=inp["model_revision"],
+            tokenizer=tok,
+        )
+        resume_uploader.credit_durable_required_steps(resume_step)
         resume_uploader.start()
         step_box = [0]
 
@@ -1084,6 +1186,13 @@ def run_rl_verl():
                 raise
         if rc != 0:
             raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
+        # training finished cleanly, so a missing required save is a real defect rather than a
+        # side effect of a crash. stop here (not in finally, which suppresses) to surface it.
+        # only when exact saves were requested: without them the drain stays best-effort, and
+        # letting a slow resume upload raise here would fail an otherwise-successful run.
+        if resume_uploader is not None and resume_uploader.required_steps:
+            resume_uploader.stop()
+            resume_uploader.raise_if_incomplete()
     finally:
         # drain before the reward server goes down: on a cancel or crash the last completed
         # checkpoint is exactly the one a retry needs, so it is worth uploading on the way out.
@@ -1119,7 +1228,10 @@ def run_rl_verl():
         _stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        _w.publish_deployable_checkpoint(adapter_dir, steps_run)
+        # preserve the final checkpoint only when exact save steps are not configured, matching the
+        # trl path: with save_at_steps set the customer asked for those steps and nothing else.
+        if final_save_due(steps_run, inp["save_at_steps"]):
+            _w.publish_deployable_checkpoint(adapter_dir, steps_run)
 
     _w.heartbeat("rl_trained", train_wall=train_wall, step=steps_run, gpu=gpu_diagnostics())
     _w.write_train_meta(
