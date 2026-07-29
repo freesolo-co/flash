@@ -1106,7 +1106,11 @@ class _VerlResumeUploader:
                 # a withheld step stays pending by design, so "stopped and drained" can no longer be
                 # the only exit: with the gate shut those steps never clear, and waiting for them
                 # would hang stop(). raise_if_incomplete() reports them as the run failure instead.
-                stalled = not deployable_ok and bool(self.required_steps)
+                # the gate is re-read here rather than reusing the sample taken at the top of the
+                # sweep: the main thread can record the run's first positive spread and call stop()
+                # in between, and exiting on the stale "shut" reading would fail a genuinely trained
+                # run on nothing but thread timing.
+                stalled = bool(self.required_steps) and not self._deployable_allowed()
                 if self._stop.is_set() and (stalled or not self._pending(self._completed_step())):
                     return
                 time.sleep(0.5)

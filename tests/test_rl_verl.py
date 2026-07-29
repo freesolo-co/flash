@@ -1362,6 +1362,47 @@ def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_pa
         uploader.raise_if_incomplete()
 
 
+def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_timing(
+    tmp_path, monkeypatch
+):
+    # the drain loop samples the gate at the top of a sweep. if the main thread records the run's
+    # first positive spread and calls stop() after that sample, exiting on the stale "shut" reading
+    # would fail a genuinely trained run for no reason but thread scheduling. the stall verdict must
+    # therefore re-read the gate, not reuse the sample.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    published: list[int] = []
+    monkeypatch.setattr(
+        rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader,
+        "_publish_deployable",
+        lambda self, step, path: (published.append(int(step)), self.published_steps.add(step))[0],
+    )
+    _write_step(local_dir, 3)
+    gate = [False]
+    # flips the gate open on the sweep *after* the first sample, mimicking the main thread recording
+    # spread while the drain loop is already past its own read.
+    reads = [0]
+
+    def _had_gradient():
+        reads[0] += 1
+        return gate[0]
+
+    uploader = rl_verl._VerlResumeUploader(
+        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=_had_gradient
+    )
+    uploader.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and reads[0] < 1:
+        time.sleep(0.01)
+    gate[0] = True  # spread appears, then the run ends immediately
+    uploader.stop()
+    assert published == [3]
+    uploader.raise_if_incomplete()
+
+
 def test_train_notes_report_whether_the_run_resumed():
     # without this a resumed run is indistinguishable from a fresh one in train_meta (trl reports it).
     inp = _notes_inp()
