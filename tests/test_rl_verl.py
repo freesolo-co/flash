@@ -234,8 +234,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
     inp = {
         "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
         "prompts_per_step": 16, "mask_truncated_completions": True,
-        "max_prompt_len": 3072, "max_completion": 1024,
-        "engine_len": 4096, "max_position_embeddings": 40960,
+        "max_prompt_len": 3072, "max_completion": 1024, "engine_len": 4096,
         "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "seed": 42,
         "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
         "verl_total_epochs": 2, "save_every": 20,
@@ -246,14 +245,10 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "reward_path": "/w/r.py", "local_dir": "/w/ckpt",
     }
     cfg = rl_verl._build_verl_training_cfg(inp, **common)
-    # the engine gets the full prompt+completion length, not the prompt budget alone.
+    # the engine gets the full prompt+completion length, not the prompt budget alone, and the token
+    # budget matches it. the resolver clamps engine_len, so the builder passes it through unchanged.
     assert cfg["max_model_len"] == 4096
     assert cfg["max_token_len_per_gpu"] == 4096
-    # and a job that overshoots the architecture is clamped rather than rejected by verl.
-    clamped = rl_verl._build_verl_training_cfg(
-        {**inp, "engine_len": 65536, "max_position_embeddings": 32768}, **common
-    )
-    assert clamped["max_model_len"] == 32768
 
 
 @pytest.mark.parametrize(
@@ -315,6 +310,73 @@ def test_verl_epoch_capacity_invariant_across_valid_inputs():
                         steps=steps,
                     )
                     assert (prompt_count // prompts_per_step) * resolved_epochs >= steps
+
+
+def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
+    # regression: clamping only the engine let the prompt filter admit prompts sized against the
+    # UNCLAMPED context. those prompts plus the completion allowance overflow the engine vllm was
+    # actually given, so they die at rollout instead of training on the shorter context. every
+    # length must descend from one clamped value.
+    from flash.engine.worker._pkg import W
+    from flash.spec import JobSpec
+
+    class _Env:
+        multi_turn = False
+        is_tool_env = False
+
+        def dataset(self):
+            return [{"index": i} for i in range(8)]
+
+        def prompt_messages(self, ex):
+            return [{"role": "user", "content": f"question {ex['index']}"}]
+
+    class _Tokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return messages[0]["content"]
+
+        def __call__(self, text, **kwargs):
+            return SimpleNamespace(input_ids=[1])
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            # asks for twice the architecture's context.
+            "train": {"batch_size": 4, "epochs": 1, "max_context_tokens": 65536},
+        }
+    )
+    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(W, "SEED", 42, raising=False)
+    monkeypatch.setattr(W, "THINKING", False, raising=False)
+    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
+    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
+    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
+    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
+    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 32768)
+
+    inp = rl_verl._resolve_single_turn_inputs()
+    assert inp["engine_len"] == 32768
+    # the prompt filter's budget is carved out of the clamped engine, not the requested 65536.
+    assert inp["max_prompt_len"] + inp["max_completion"] == 32768
+    # and every length the overrides emit agrees with it.
+    cfg = rl_verl._build_verl_training_cfg(
+        inp,
+        train_files="/w/train.parquet",
+        val_files="/w/val.parquet",
+        model_id=inp["model_id"],
+        thinking=False,
+        loggers="console",
+        fp8_kv=False,
+        reward_path="/w/reward.py",
+        local_dir="/w/ckpt",
+    )
+    assert cfg["max_model_len"] == 32768
+    assert cfg["max_token_len_per_gpu"] == 32768
+    assert cfg["max_prompt_len"] + cfg["max_completion"] == cfg["max_model_len"]
 
 
 def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeypatch):

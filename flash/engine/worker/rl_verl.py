@@ -319,7 +319,9 @@ def _build_verl_training_cfg(
         "group_size": inp["group_size"],
         "prompts_per_step": inp["prompts_per_step"],
         "mask_truncated_completions": inp["mask_truncated_completions"],
-        "max_model_len": clamp_engine_len(engine_len, inp.get("max_position_embeddings")),
+        # already clamped to the model's limit by the resolver, which derives max_prompt_len from
+        # the same value -- so the engine, the prompt filter, and the token budget cannot disagree.
+        "max_model_len": engine_len,
         # one full-length sequence is the floor: a budget below engine_len cannot schedule the
         # longest sequence the engine will ever produce, and verl would fail to place it in any
         # micro-batch. this is the same sequence_length-derived budget sft and opd use.
@@ -826,7 +828,19 @@ def _resolve_single_turn_inputs():
         or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
     )
     train_ctx = _t.max_context_tokens if (_t and _t.max_context_tokens) else 0
-    vllm_max_len = int(train_ctx or max(1024, rl.max_prompt_len + max_completion))
+    requested_len = int(train_ctx or max(1024, rl.max_prompt_len + max_completion))
+    # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
+    # clamping only the engine would admit prompts up to the unclamped budget and then fail them at
+    # rollout, and would let the token budget pack more than the one-sequence memory floor intends.
+    vllm_max_len = clamp_engine_len(
+        requested_len, model_max_position_embeddings(model_id, model_revision)
+    )
+    if vllm_max_len < requested_len:
+        print(
+            f"[rl-verl] max_context_tokens {requested_len} exceeds the {model_id} context limit; "
+            f"training at {vllm_max_len}",
+            flush=True,
+        )
     prompt_budget = vllm_max_len - max_completion
     if prompt_budget <= 0:
         raise ValueError("engine length leaves no room for the completion; raise max_context_tokens")
@@ -876,10 +890,10 @@ def _resolve_single_turn_inputs():
         "kl_coef": kl_coef,
         "max_completion": max_completion,
         "max_prompt_len": prompt_budget,
-        # the engine's full sequence length (prompt + completion), which sizes both vllm's kv cache
-        # and the training token budget. prompt_budget alone would under-size both.
+        # the engine's full sequence length (prompt + completion), already clamped to the model's
+        # own limit. sizes vllm's kv cache and the training token budget, and prompt_budget above is
+        # derived from this same value so all three lengths agree.
         "engine_len": vllm_max_len,
-        "max_position_embeddings": model_max_position_embeddings(model_id, model_revision),
         "prompt_opened_thinking": prompt_opened_thinking,
         "lr": learning_rate,
         "lora_rank": lora_rank,
