@@ -36,6 +36,8 @@ from flash.engine.worker.rollout_samples import sanitize_rollout_text
 from flash.engine.worker.verl_common import (
     VERL_REQUIREMENT,
     agent_loop_workers,
+    clamp_engine_len,
+    model_max_position_embeddings,
     resolve_verl_python,
     verl_supports_rollout_field,
 )
@@ -60,44 +62,6 @@ def _verl_epochs_for_horizon(
     # the flag cannot be configured off, and ceil here would still under-serve the requested horizon.
     steps_per_epoch = prompt_count // prompts_per_step
     return max(epochs, math.ceil(steps / steps_per_epoch))
-
-
-def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
-    """the engine length verl will accept: the job's context, capped at the model's own limit.
-
-    verl raises ValueError when rollout.max_model_len exceeds the model's max_position_embeddings,
-    so a job whose max_context_tokens overshoots the architecture would die at rollout startup
-    rather than train on a shorter context. clamp instead. an unknown limit (probe failed) passes
-    through untouched, leaving verl's own resolution in charge.
-    """
-    if max_position_embeddings is None or max_position_embeddings <= 0:
-        return int(engine_len)
-    return min(int(engine_len), int(max_position_embeddings))
-
-
-def model_max_position_embeddings(model_id: str, revision: str = "") -> int | None:
-    """the model's architectural context limit, or None when it cannot be determined.
-
-    mirrors verl's own lookup: the top-level attribute, falling back to the nested text_config that
-    multimodal architectures use. None on any probe failure, so a config that cannot be read never
-    blocks a run that works today.
-    """
-    try:
-        from transformers import AutoConfig
-
-        from flash.engine.worker.hf import model_revision_kwargs
-
-        cfg = AutoConfig.from_pretrained(
-            model_id, trust_remote_code=True, **model_revision_kwargs(revision)
-        )
-        limit = getattr(cfg, "max_position_embeddings", None)
-        if limit is None:
-            text_cfg = getattr(cfg, "text_config", None)
-            limit = getattr(text_cfg, "max_position_embeddings", None) if text_cfg else None
-        return int(limit) if limit else None
-    except Exception as e:  # an unreadable config must not fail the run
-        print(f"[rl-verl] max_position_embeddings probe failed for {model_id!r}: {e}", flush=True)
-        return None
 
 
 def build_verl_dataset_rows(
