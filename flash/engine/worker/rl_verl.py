@@ -64,7 +64,7 @@ from flash.engine.worker.verl_common import (
     resolve_verl_python,
     verl_supports_rollout_field,
 )
-from flash.spec import gpu_count_of
+from flash.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 
 DATA_SOURCE = "flash_env"
 
@@ -1161,6 +1161,16 @@ def _resolve_single_turn_inputs():
     # render_entropy_quantile_shim. a value >= 1.0 (or unset) masks nothing and needs no shim.
     _eq = getattr(_t, "entropy_quantile", None) if _t else None
     entropy_quantile = float(_eq) if _eq is not None and float(_eq) < 1.0 else None
+    # credit_assignment: the trl path swaps in GRPOPerTurnTrainer for per_turn (see
+    # rl.py select_grpo_trainer). verl has no equivalent, so accepting the key here would train with
+    # per-episode credit while the run reports success -- a silently different objective.
+    credit_assignment = getattr(_t, "credit_assignment", DEFAULT_CREDIT_ASSIGNMENT) if _t else None
+    if credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
+        raise RuntimeError(
+            f"credit_assignment={credit_assignment!r} is not supported on the verl grpo backend "
+            f"(it would silently train with {DEFAULT_CREDIT_ASSIGNMENT!r} credit); use the trl "
+            "backend (unset FLASH_RL_BACKEND) for it."
+        )
     # flash's lora dropout is fixed at 0.0; verl matches (peft default). guard defensively so a future
     # non-zero recipe value can never be silently ignored.
     if float(RECIPE.lora.dropout) != 0.0:

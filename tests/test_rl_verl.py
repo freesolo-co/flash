@@ -1402,6 +1402,29 @@ def test_capability_guard_rejects_kl_anchored_warm_start(monkeypatch):
         )
 
 
+def test_capability_guard_rejects_per_turn_credit_assignment(monkeypatch):
+    # trl swaps in GRPOPerTurnTrainer for per_turn (rl.py select_grpo_trainer); verl has no
+    # equivalent. accepting the key would train per-episode while reporting success, so the run
+    # would silently optimize a different objective than the one configured.
+    with pytest.raises(RuntimeError, match="credit_assignment"):
+        _capability_resolve(
+            monkeypatch,
+            _capability_env(),
+            train={"credit_assignment": "per_turn"},
+        )
+
+
+def test_capability_guard_admits_the_default_credit_assignment(monkeypatch):
+    # the control for the guard above: per_episode is what verl actually implements, so stating it
+    # explicitly must not raise. without this, a guard that rejected every value would still pass.
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(),
+        train={"credit_assignment": "per_episode"},
+    )
+    assert inp["max_prompt_len"] > 0
+
+
 def test_capability_guards_admit_the_supported_single_turn_text_env(monkeypatch):
     # the control: with none of the four shapes present the resolver must run to completion, so a
     # guard that fires on every env would fail here instead of passing the four tests above.
