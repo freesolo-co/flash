@@ -709,6 +709,43 @@ def warmup_message(
     )
 
 
+# the throttle hint points at `runs log`, which reads the SAME uploaded heartbeats -- so when the
+# step counter itself is what has gone stale, that advice sends you to an equally frozen surface.
+_QUIET_HEARTBEAT_HINT = (
+    "heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f"
+)
+# a training heartbeat this old is past every upload interval (900s mid-training), so the step it
+# carries is stale reporting, not a stalled trainer -- the distinction that decides whether someone
+# cancels a healthy paid run.
+_STALE_STEP_AFTER_S = 900.0
+_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step", "opd_step", "opsd_step"})
+
+
+def _stale_step_hint(
+    heartbeat: dict, heartbeat_age_seconds: float | None, *, running: bool
+) -> str | None:
+    """Say a frozen training step is stale reporting, not a stalled trainer.
+
+    A throttled worker can leave ``step`` pinned at its first training heartbeat for many minutes
+    while the trainer is genuinely progressing. Through the CLI alone that is indistinguishable from
+    a hung run, and the obvious reaction -- cancel and relaunch -- throws away a healthy paid GPU.
+    Only fires for a *training* stage carrying a step, since a setup stage has no step to be stale.
+    """
+    if not running or heartbeat_age_seconds is None:
+        return None
+    if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
+        return None
+    if str(heartbeat.get("stage") or "") not in _TRAINING_STEP_STAGES:
+        return None
+    if heartbeat.get("step") is None:
+        return None
+    return (
+        "the step above is the last one UPLOADED, not necessarily the one training is on; "
+        "a throttled worker can hold it for many minutes while the trainer advances normally. "
+        "confirm against your [wandb] run before treating this as a stall"
+    )
+
+
 def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
     hb = obj.get("last_heartbeat")
@@ -734,10 +771,11 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     age = _humanize_age_seconds(heartbeat_age_seconds)
     if age:
         if running and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
-            age += _dim(
-                "  (heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f)"
-            )
+            age += _dim(f"  ({_QUIET_HEARTBEAT_HINT})")
         pairs.append(("heartbeat", age))
+        stale_step = _stale_step_hint(hb, heartbeat_age_seconds, running=running)
+        if stale_step:
+            pairs.append(("progress", stale_step))
     return pairs
 
 
