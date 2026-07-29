@@ -1083,6 +1083,46 @@ def _restore_verl_resume(local_dir: str) -> int:
     return step
 
 
+def _check_grpo_had_a_gradient(reward_history: list[float], adv_spread_history: list[float]) -> None:
+    """raise unless the run's rewards actually produced a nonzero policy gradient.
+
+    every other completion check a grpo run passes -- terminal state, a written checkpoint, an
+    exported adapter, a populated reward history -- is also passed by a run that trained on nothing.
+    grpo mean-centres its advantage within each group (A_i = r_i - mean(r_group)), so an environment
+    whose reward does not discriminate between completions gives every sample advantage exactly 0,
+    hence pg_loss exactly 0 and an adapter identical to its initialization. the spread of the
+    advantages is the only one of these series that can tell the two apart: the reward mean cannot
+    (a constant reward has a perfectly healthy mean) and neither can pg_loss, which is near zero at
+    step 1 for a genuinely training run too, because the importance ratio is still exactly 1.
+    """
+    if not reward_history:
+        raise RuntimeError(
+            "verl reported no reward metrics for the whole run — the flash reward bridge was "
+            "never consulted (wiring regression); refusing to publish a policy trained on "
+            "default rewards"
+        )
+    if not adv_spread_history:
+        # advantages ride the same log line as critic/rewards/mean (both come from one
+        # compute_data_metrics dict), so reward metrics without advantage metrics means the parse
+        # broke, not that verl chose not to report. treat that as a regression rather than let the
+        # spread check below degrade into a guard that cannot fire.
+        raise RuntimeError(
+            "verl reported reward metrics but no advantage metrics for any step — "
+            "critic/advantages/max and /min could not be parsed (metric-format regression); "
+            "refusing to publish because the zero-gradient check cannot run"
+        )
+    # deliberately "no step ever had spread" rather than "some step had none": a run that genuinely
+    # converges, or that draws one unlucky all-equal group, legitimately reports zero spread on
+    # individual steps, and rejecting those would fail correct runs.
+    if not any(spread > 0.0 for spread in adv_spread_history):
+        raise RuntimeError(
+            f"grpo saw zero advantage spread on all {len(adv_spread_history)} steps — every group's "
+            "rewards were identical, so every advantage was 0 and the gradient was exactly 0; the "
+            "environment's reward does not discriminate between completions. refusing to publish an "
+            "adapter identical to its initialization"
+        )
+
+
 def _latest_global_step_dir(local_dir: str) -> tuple[str, int]:
     """return (actor_dir, step) for the highest global_step_N checkpoint verl wrote."""
     best_step, best = -1, ""
@@ -1582,6 +1622,11 @@ def run_rl_verl():
         reward_history: list[float] = []
         resp_len_history: list[float] = []
         loss_curve: list[float] = []
+        # grpo's advantage is within-group and mean-centred (A_i = r_i - mean(r_group)), so a group
+        # whose rewards are all equal yields advantage exactly 0 for every sample, hence a zero
+        # gradient. the spread of the advantages is what says whether the optimizer got a signal;
+        # neither the reward mean nor pg_loss can, so collect max/min per step and check below.
+        adv_spread_history: list[float] = []
         last_dump_step = [-1]
         # per-step backlog for `flash runs log -f`, rebuilt from verl's own step lines because its
         # trainer runs out of process and cannot host trl's callback. read by the liveness thread
@@ -1656,6 +1701,13 @@ def run_rl_verl():
                             value = parse_verl_metric(line, verl_key)
                             if value is not None:
                                 sink.append(value)
+                        # advantages/max and /min are emitted for every step outside verl's
+                        # use_critic branch (trainer/ppo/metric_utils.py), so they are present under
+                        # grpo even though the key is namespaced critic/.
+                        adv_max = parse_verl_metric(line, "critic/advantages/max")
+                        adv_min = parse_verl_metric(line, "critic/advantages/min")
+                        if adv_max is not None and adv_min is not None:
+                            adv_spread_history.append(adv_max - adv_min)
                 rc = proc.wait()
             except BaseException:
                 # the stream loop died (upload error, cancel, oom in the parent): a still-running
@@ -1690,12 +1742,7 @@ def run_rl_verl():
     shutil.rmtree(adapter_dir, ignore_errors=True)
     os.makedirs(adapter_dir, exist_ok=True)
     train_wall = time.time() - t_train
-    if not reward_history:
-        raise RuntimeError(
-            "verl reported no reward metrics for the whole run — the flash reward bridge was "
-            "never consulted (wiring regression); refusing to publish a policy trained on "
-            "default rewards"
-        )
+    _check_grpo_had_a_gradient(reward_history, adv_spread_history)
     actor_dir, steps_run = _latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
         raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")

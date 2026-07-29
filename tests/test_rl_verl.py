@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 import flash.engine.worker as W
-from flash.engine.worker import rl, rl_verl
+from flash.engine.worker import rl, rl_verl, verl_common
 
 
 # ------------------------------- dispatch -------------------------------
@@ -1168,6 +1168,70 @@ def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
     finally:
         mod._w.upload_resume_checkpoint = original
     assert 2 in uploader.processed_steps
+
+
+def test_grpo_gradient_check_rejects_a_run_whose_rewards_never_varied():
+    # the defect this guards: a run on a constant-reward environment reaches state=done with a
+    # written checkpoint and an exported adapter, and its reward history looks perfectly healthy,
+    # but every advantage was 0 so the published adapter equals its initialization.
+    with pytest.raises(RuntimeError, match="zero advantage spread"):
+        rl_verl._check_grpo_had_a_gradient([1.0, 1.0, 1.0], [0.0, 0.0, 0.0])
+
+
+def test_grpo_gradient_check_admits_a_run_with_spread_on_any_step():
+    # zero spread on some steps is legitimate (a converged run, or one unlucky all-equal group), so
+    # the guard must key on "no step ever had spread" rather than "some step had none".
+    rl_verl._check_grpo_had_a_gradient([0.4, 0.6], [0.0, 1.5])
+    rl_verl._check_grpo_had_a_gradient([0.4], [2.0])
+
+
+def test_grpo_gradient_check_rejects_reward_metrics_without_advantage_metrics():
+    # both series are parsed off the same verl log line, so advantages missing while rewards are
+    # present means the parse regressed. without this the spread check silently cannot fire.
+    with pytest.raises(RuntimeError, match="no advantage metrics"):
+        rl_verl._check_grpo_had_a_gradient([1.0], [])
+
+
+def test_grpo_gradient_check_still_rejects_an_unconsulted_reward_bridge():
+    with pytest.raises(RuntimeError, match="never consulted"):
+        rl_verl._check_grpo_had_a_gradient([], [])
+
+
+def test_advantage_spread_is_parsed_from_a_real_verl_step_line():
+    # the guard is only as good as this parse: verl namespaces both keys under critic/ even though
+    # grpo runs without a critic, and emits them outside its use_critic branch
+    # (verl/trainer/ppo/metric_utils.py), so they are present for every grpo step.
+    line = (
+        "step:1 - critic/rewards/mean:1.0 - critic/rewards/max:1.0 - critic/rewards/min:1.0 - "
+        "critic/advantages/mean:0.0 - critic/advantages/max:0.0 - critic/advantages/min:0.0 - "
+        "actor/pg_loss:0.0"
+    )
+    adv_max = verl_common.parse_verl_metric(line, "critic/advantages/max")
+    adv_min = verl_common.parse_verl_metric(line, "critic/advantages/min")
+    assert adv_max == 0.0 and adv_min == 0.0
+    # this is the exact shape of the run in ISSUES VERL-064: healthy reward, zero spread.
+    with pytest.raises(RuntimeError, match="zero advantage spread"):
+        rl_verl._check_grpo_had_a_gradient([1.0], [adv_max - adv_min])
+
+    varied = line.replace("critic/advantages/max:0.0", "critic/advantages/max:0.67").replace(
+        "critic/advantages/min:0.0", "critic/advantages/min:-0.33"
+    )
+    spread = verl_common.parse_verl_metric(varied, "critic/advantages/max") - verl_common.parse_verl_metric(
+        varied, "critic/advantages/min"
+    )
+    assert spread > 0.0
+    rl_verl._check_grpo_had_a_gradient([0.5], [spread])
+
+
+def test_run_rl_verl_wires_the_gradient_check_into_the_publish_path():
+    # a helper nothing calls is not a guard. assert the training path actually invokes it, and that
+    # it does so before the adapter export rather than after a publish has already happened.
+    source = inspect.getsource(rl_verl.run_rl_verl)
+    assert "_check_grpo_had_a_gradient(reward_history, adv_spread_history)" in source
+    assert source.index("_check_grpo_had_a_gradient") < source.index("_export_peft_adapter")
+    # and that the spread series it passes is actually collected from the child's output.
+    assert 'parse_verl_metric(line, "critic/advantages/max")' in source
+    assert 'parse_verl_metric(line, "critic/advantages/min")' in source
 
 
 def test_train_notes_report_whether_the_run_resumed():
