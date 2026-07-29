@@ -84,7 +84,7 @@ _HB_CLAIM_SEQ = 0
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
 # retain at least one metric row per second across the 900s training heartbeat throttle window.
-_GRPO_METRIC_HISTORY_LIMIT = 1024
+GRPO_METRIC_HISTORY_LIMIT = 1024
 
 
 def _dump_thread_stacks(reason: str) -> None:
@@ -425,7 +425,7 @@ def make_reward_heartbeat_callback(reward_metrics=None, samples=None):
                     metrics["max_completion_tokens"] = int(max_completion_tokens)
             self.metrics_last = [item for item in self.metrics_last if item["step"] != step]
             self.metrics_last.append(metrics)
-            self.metrics_last = self.metrics_last[-_GRPO_METRIC_HISTORY_LIMIT:]
+            self.metrics_last = self.metrics_last[-GRPO_METRIC_HISTORY_LIMIT:]
             LATEST_GRPO_METRICS_LAST[:] = self.metrics_last
             payload = {
                 **metrics,
