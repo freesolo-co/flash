@@ -284,10 +284,16 @@ def _env_params(args) -> dict:
             raise ValueError(f"--param must be KEY=VALUE (got {item!r})")
         # parse as a toml value so types match [environment.params]; fall back to a bare string
         # for unquoted text, which is what users type most often.
+        value = raw.strip()
         try:
-            params[key] = tomllib.loads(f"v = {raw.strip()}")["v"]
-        except tomllib.TOMLDecodeError:
-            params[key] = raw.strip()
+            params[key] = tomllib.loads(f"v = {value}")["v"]
+        except tomllib.TOMLDecodeError as exc:
+            # only bare unquoted text may fall back. a value that opens a quote, array, or inline
+            # table is structured but malformed, and silently keeping it as a literal string would
+            # validate parameters the equivalent [environment.params] entry could never load.
+            if value[:1] in {'"', "'", "[", "{"}:
+                raise ValueError(f"--param {key} is not a valid TOML value: {exc}") from exc
+            params[key] = value
     split = getattr(args, "split", None)
     if split and str(split).strip():
         params["split"] = str(split).strip()
