@@ -596,6 +596,10 @@ def _warn_if_login_shadowed(args) -> None:
     """Surface an ambient FREESOLO_API_KEY that redirects a mutating command to another org."""
     if getattr(args, "func", None) not in _ORG_MUTATING_COMMANDS:
         return
+    # `train --cost` is catalog-only: it never loads credentials or reaches an organization, so a
+    # warning that names the environment key's org would describe a request this command never makes.
+    if getattr(args, "cost", False):
+        return
     message = shadowed_login_warning()
     if not message:
         return
