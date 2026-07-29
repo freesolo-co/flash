@@ -68,6 +68,7 @@ from flash.engine.worker.tokenizer_align import (
 )
 from flash.engine.worker.verl_common import (
     ChildOutputTail,
+    ChildTailStaleness,
     agent_loop_workers,
     clamp_engine_len,
     latest_global_step_dir,
@@ -2484,9 +2485,14 @@ def run_opd_verl(spec=None) -> None:
             _w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
 
         child_tail = ChildOutputTail()
+        # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside
+        # the per-tick callback.
+        tail_staleness = ChildTailStaleness()
 
         def liveness_fields() -> dict[str, object]:
-            return stall_tail_fields(int(progress["step"] or 0), child_tail)
+            return stall_tail_fields(
+                int(progress["step"] or 0), child_tail, staleness=tail_staleness
+            )
 
         gpu_sampler = _NvidiaSmiPeakSampler().start()
         train_started_at = time.time()
