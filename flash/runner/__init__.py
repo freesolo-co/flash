@@ -1187,6 +1187,15 @@ _MULTI_GPU_BACKENDS: frozenset[str] = frozenset({"verl"})
 _MULTI_GPU_PROVIDERS: frozenset[str] = frozenset({"runpod"})
 
 
+def _backend_env_key(spec: JobSpec) -> str:
+    """the [worker_env] key that selects this spec's training backend.
+
+    one definition so the gate's remedy cannot name a different key than the resolver reads: the
+    phase mapping is not derivable from the algorithm (grpo -> FLASH_RL_BACKEND).
+    """
+    return f"FLASH_{spec.phase.upper()}_BACKEND"
+
+
 def _effective_backend(spec: JobSpec) -> str:
     """the training backend this spec will actually run, as the worker resolves it.
 
@@ -1195,7 +1204,7 @@ def _effective_backend(spec: JobSpec) -> str:
     empty dict and forwards a fixed credential allowlist, never the ambient control-plane env. so the
     backend is a property of the SPEC and the gate can read it here rather than guessing.
     """
-    key = f"FLASH_{spec.phase.upper()}_BACKEND"
+    key = _backend_env_key(spec)
     worker_env = getattr(spec, "worker_env", None) or {}
     for name, value in worker_env.items():
         if str(name).upper() == key:
@@ -1218,7 +1227,7 @@ def _require_supported_gpu_count(spec: JobSpec) -> None:
         # name the key that actually enables sharding. the backend is selected only through
         # [worker_env], which no other error or doc mentions, so a message that offers just
         # "set gpu.count to 1" leaves multi-gpu undiscoverable.
-        key = f"FLASH_{spec.phase.upper()}_BACKEND"
+        key = _backend_env_key(spec)
         sharding = ", ".join(sorted(_MULTI_GPU_BACKENDS))
         raise ValueError(
             f"multi-gpu training (gpu.count={count}) is not supported by the {backend!r} backend "
