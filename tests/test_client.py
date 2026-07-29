@@ -754,3 +754,76 @@ def test_export_rejects_malformed_checkpoint_ref():
     for bad in ("r1/step-", "r1/checkpoints/step-4", "r1/step-4/adapter"):
         with pytest.raises(ClientError, match="invalid adapter id"):
             client.export(bad, repository="me/a", hf_token="hf")
+
+
+def test_deployment_for_matches_a_run_id_on_the_listing_row(monkeypatch):
+    """The run id lives on the nested record or on the listing row depending on the endpoint.
+
+    Matching only the nested one makes a live deployment look absent, and `deploy --wait` reports
+    that as "no longer an active deployment" and stops waiting on a run that is still coming up.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    monkeypatch.setattr(
+        client,
+        "deployments",
+        lambda timeout=None: [{"run_id": "flash-1", "deployment": {"state": "queued"}}],
+    )
+
+    assert client.deployment_for("flash-1") == {"state": "queued"}
+
+
+def test_deployment_for_requires_the_requested_checkpoint_step(monkeypatch):
+    """The requested step is part of the identity, not decoration.
+
+    Matching on the run id alone let `deploy RUN/step-40 --wait` settle on whichever revision was
+    listed -- an older one still marked ready, or a replacement another shell deployed mid-wait --
+    and report it as the caller's own.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    monkeypatch.setattr(
+        client,
+        "deployments",
+        lambda timeout=None: [
+            {"run_id": "flash-1", "deployment": {"state": "ready", "checkpoint_step": 20}}
+        ],
+    )
+
+    assert client.deployment_for("flash-1/step-40") is None
+    assert client.deployment_for("flash-1/step-20") == {"state": "ready", "checkpoint_step": 20}
+    # the bare run id is the FINAL adapter, which the plane lists as a null step -- a checkpoint
+    # revision must not answer for it either.
+    assert client.deployment_for("flash-1") is None
+
+
+def test_deployment_for_matches_the_final_adapters_null_step(monkeypatch):
+    """`checkpoint_step` is None for the final adapter; the bare run id must still match it."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    monkeypatch.setattr(
+        client,
+        "deployments",
+        lambda timeout=None: [
+            {"run_id": "flash-1", "deployment": {"state": "ready", "checkpoint_step": None}}
+        ],
+    )
+
+    assert client.deployment_for("flash-1") == {"state": "ready", "checkpoint_step": None}
+    assert client.deployment_for("flash-1/step-40") is None
+
+
+def test_deployment_for_bounds_the_listing_request(monkeypatch):
+    """A caller polling against its own deadline has to be able to bound the read.
+
+    The client default is 60s, so an unbounded listing inside a short --wait overshoots the
+    timeout the user asked for.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    seen: dict = {}
+
+    def _listing(timeout=None):
+        seen["timeout"] = timeout
+        return []
+
+    monkeypatch.setattr(client, "deployments", _listing)
+
+    assert client.deployment_for("flash-1", timeout=3.0) is None
+    assert seen["timeout"] == 3.0
