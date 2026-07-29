@@ -135,6 +135,11 @@ class RunpodProvider:
             failure_detail_reader=failure_reader,
             current_attempt=rh.attempt,
             **deadline_kwargs(poll_job, _deadline_at),
+            # the recovery path must word its capacity failures exactly as the direct submit does:
+            # the flag was persisted onto the handle for precisely this, and feeding it only to
+            # stall_kwargs left poll_job at its False default -- so a reattached last-GPU job still
+            # promised "the next-best GPU" that the picker has nowhere to walk to.
+            on_last_gpu=on_last_gpu,
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 

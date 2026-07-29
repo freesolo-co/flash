@@ -5566,12 +5566,57 @@ def _poll_in_queue_forever(monkeypatch, **poll_kwargs):
 
 def test_capacity_detail_does_not_promise_a_next_best_gpu_on_the_last_class(monkeypatch):
     """LS-008/AT-013: the capacity failure detail claimed 'retrying on the next-best GPU' even when
-    the picker had no untried fitting class left and would re-select the same one. On the last GPU it
-    must describe the reuse instead."""
+    the picker had no untried fitting class left. On the last GPU it must report the exhaustion.
+
+    It must NOT name a class: on_last_gpu says nothing about WHICH class the retry reuses (the picker
+    can clamp back to a cheaper already-tried one), and only the supervisor holds the candidate list
+    needed to know -- so a "same class" promise here would be the same false claim in new words."""
     res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
     assert res.failure == "no_capacity"
     assert "next-best" not in res.detail, res.detail
-    assert "retrying on the same class" in res.detail, res.detail
+    assert "no untried GPU class left to walk to" in res.detail, res.detail
+    assert "same class" not in res.detail, res.detail
+
+
+def test_reattached_last_gpu_job_words_capacity_like_the_direct_submit(monkeypatch):
+    """The flag is persisted onto the handle for recovery, but poll() fed it only to stall_kwargs, so
+    poll_job stayed at its False default and a reattached last-GPU job still promised the next-best
+    GPU. Recovery must word capacity failures exactly as the submit path does."""
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import PROVIDER
+    from flash.providers.runpod import jobs as jobs
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    captured: dict = {}
+
+    def fake_poll_job(handle, **kw):
+        captured.update(kw)
+        return jobs.PollResult(True, metrics={})
+
+    monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
+    spec = JobSpec(
+        run_id="reattach-lastgpu",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="grpo",
+        train=TrainSpec(epochs=1, max_examples=1, hf_repo=""),
+        gpu=GpuSpec(type="A100 PCIe"),
+    )
+    base = {
+        "provider": "runpod",
+        "endpoint_id": "ep",
+        "endpoint_name": "n",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
+        "job_id": "j",
+        "started_ts": 1.0,
+        "attempt": 2,
+    }
+
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True}), spec, spec.seed)
+    assert captured["on_last_gpu"] is True
+
+    captured.clear()
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False}), spec, spec.seed)
+    assert captured["on_last_gpu"] is False
 
 
 def test_capacity_detail_still_promises_next_best_when_one_exists(monkeypatch):

@@ -475,6 +475,24 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
     )
 
 
+def _projected_retry_class(candidates, failed_providers, tried_classes, chosen, *, cache_drop: bool):
+    """The class the NEXT attempt actually selects, given the failure this one is about to record.
+
+    Mirrors the bookkeeping at the bottom of the retry loop: a cache-drop retry leaves both sets
+    untouched (same class, cold), any other retry marks this class tried and its provider failed.
+    Only valid off the OOM path, where the escalation floor rewrites the candidate list first.
+    """
+    if not candidates:
+        return None
+    if cache_drop:
+        return _select_candidate(candidates, failed_providers, tried_classes)
+    return _select_candidate(
+        candidates,
+        failed_providers | {chosen.provider},
+        tried_classes | {(chosen.provider, chosen.gpu)},
+    )
+
+
 def _oom_escalated(candidates, oom_vram_floor: int):
     """Candidates strictly LARGER than the VRAM that just OOM'd. ``oom_vram_floor == 0`` (no prior OOM)
     leaves the list unchanged; otherwise an 80GB OOM leaves only the >80GB classes (a same-size retry
@@ -948,13 +966,21 @@ def _submit_seed_supervised(
             res.failure,
             cache_drop=first_cache_drop,
         )
-        # name the class the retry will ACTUALLY land on. the picker walks only classes that fit the
-        # model, so when this was the last untried one the retry re-picks it -- and a log line that
-        # implied a move to different hardware would misread as an escalation that never happened.
+        # name the class the retry will ACTUALLY land on. on_last_gpu only says no UNTRIED class
+        # remains -- it does NOT mean this class is reused: with several fitting classes the picker
+        # clamps back to the cheapest already-tried one (A100 PCIe, A100 SXM, then A100 PCIe again).
+        # so re-run the picker against the sets this failure is about to update instead of assuming.
+        projected = None
         if will_retry and not oom_mode and chosen is not None and current_on_last_gpu["value"]:
+            projected = _projected_retry_class(
+                cands, failed_providers, tried_classes, chosen, cache_drop=first_cache_drop
+            )
+        if projected is not None:
+            same = (projected.provider, projected.gpu) == (chosen.provider, chosen.gpu)
             retry_target = (
-                f"retrying on {chosen.gpu} @ {chosen.provider} again, no untried GPU class fits "
-                "this run (resume from last checkpoint)"
+                f"retrying on {projected.gpu} @ {projected.provider}"
+                f"{' again' if same else ''}, no untried GPU class fits this run "
+                "(resume from last checkpoint)"
             )
         else:
             retry_target = "retrying (resume from last checkpoint)"
