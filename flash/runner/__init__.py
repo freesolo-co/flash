@@ -1168,6 +1168,7 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
         "worker_spec": worker_spec.to_internal_dict(),
         "adapter_identity": adapter_identity,
         "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
+        "backend": _effective_backend(public_spec),
     }
     return _update(
         worker_spec.run_id,
@@ -1203,6 +1204,12 @@ def _effective_backend(spec: JobSpec) -> str:
     route into the worker env is the spec's own [worker_env] table -- build_worker_env starts from an
     empty dict and forwards a fixed credential allowlist, never the ambient control-plane env. so the
     backend is a property of the SPEC and the gate can read it here rather than guessing.
+
+    that spec-scoped resolution is deliberate (a run's trainer must be reproducible from the spec,
+    not from wherever the control plane happened to be booted), but it defaults SILENTLY: an omitted
+    key selects "trl" without any error, and exporting the variable next to the control plane has no
+    effect on submitted runs. recording the result in effective_preparation makes the choice
+    auditable after the fact instead of only inferable from the [worker_env] table.
     """
     key = _backend_env_key(spec)
     worker_env = getattr(spec, "worker_env", None) or {}
@@ -1299,6 +1306,7 @@ def submit_job(
             "preparation_digest": _preparation_digest(
                 public_spec, worker_spec, prepared.adapter_identity
             ),
+            "backend": _effective_backend(public_spec),
         },
         # Snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
