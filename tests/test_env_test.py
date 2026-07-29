@@ -220,7 +220,7 @@ def _patch_loader(monkeypatch, env, seen=None):
 
 
 def _args(path, **overrides):
-    namespace = argparse.Namespace(path=str(path), split=None, param=[])
+    namespace = argparse.Namespace(path=str(path), split=None, param=[], algorithm=None)
     for key, value in overrides.items():
         setattr(namespace, key, value)
     return namespace
@@ -459,7 +459,7 @@ def test_env_test_grader_that_cannot_rank_completions_fails(monkeypatch, tmp_pat
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0, wrong_reward=0.0))
 
-    assert cmd_env_test(_args(env_dir)) == 1
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
     captured = capsys.readouterr()
     assert "episode 1: policy=replay turns=1 reward=0.000000" in captured.out
     assert "1/1 episodes passed contract checks" in captured.out
@@ -520,6 +520,105 @@ def test_env_test_non_finite_control_reward_fails_the_episode(monkeypatch, tmp_p
     assert "0/1 episodes passed contract checks" in captured.out
     assert "reward is not finite for a non-reference completion" in captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_env_test_sft_placeholder_reward_warns_instead_of_failing(monkeypatch, tmp_path, capsys):
+    # the sft worker builds rows from dataset()/prompt_messages()/sft_completion() and never calls
+    # reward() (flash/engine/worker/sft.py), so an sft-only environment may ship a placeholder
+    # scorer returning one constant. failing that would reject a working environment.
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0, wrong_reward=0.0))
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" not in captured.err
+    assert "cannot rank completions" in captured.err
+
+
+def test_env_test_unknown_algorithm_warns_instead_of_failing(monkeypatch, tmp_path, capsys):
+    # without --algorithm the command cannot know whether reward() will ever be consumed, so the
+    # finding is reported without failing rather than blocking a possibly-sft environment.
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0, wrong_reward=0.0))
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" not in captured.err
+    assert "pass --algorithm to fail on this instead of warning" in captured.err
+
+
+def test_env_test_inverted_reward_direction_fails(monkeypatch, tmp_path, capsys):
+    # a grader whose sign is inverted scores wrong answers ABOVE gold. grpo maximizes the reward,
+    # so the run would train directly away from the references. differing scores are not enough:
+    # the gold answer must not rank below a deliberately wrong one.
+    env_dir = _environment_dir(tmp_path)
+
+    class _InvertedEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            return 0.0 if completion == example.get("output", "") else 1.0
+
+    _patch_loader(monkeypatch, _InvertedEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "the reward direction is inverted" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_control_rejected_on_one_row_still_counts_as_separation(
+    monkeypatch, tmp_path, capsys
+):
+    # grpo's reward_fn catches a raising env scorer and scores that completion 0.0
+    # (flash/engine/worker/rl.py), so a rejected control is real evidence of gold-vs-wrong
+    # separation, not an inconclusive result. dropping the row would leave a later tied row to
+    # fail the whole sample alone.
+    env_dir = _environment_dir(tmp_path)
+    rows = [{"input": "q1", "output": "4"}, {"input": "q2", "output": "8"}]
+
+    class _RejectsControlEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            if example["output"] == "4":
+                if completion != "4":
+                    raise ValueError("cannot parse this completion")
+                return 1.0
+            return 0.0
+
+    _patch_loader(monkeypatch, _RejectsControlEnv(rows=rows))
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "2/2 episodes passed contract checks" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" not in captured.err
+
+
+def test_env_test_gold_ending_in_an_empty_turn_is_excluded_from_the_gate(
+    monkeypatch, tmp_path, capsys
+):
+    # assistant_completion_text returns a trailing empty content verbatim, so training would grade
+    # "" here while the driver joins the earlier text. that mismatch means the reward below is not
+    # the reward the run would compute, so the episode must not feed the flat-reward gate.
+    env_dir = _environment_dir(tmp_path)
+
+    class _EmptyLastTurnEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [
+                {"role": "assistant", "content": example.get("output", "")},
+                {"role": "assistant", "content": ""},
+            ]
+
+    _patch_loader(monkeypatch, _EmptyLastTurnEnv(reward=0.0, wrong_reward=0.0))
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" not in captured.err
 
 
 def test_env_test_permissive_grader_is_not_reported_as_unrankable(monkeypatch, tmp_path, capsys):
@@ -628,7 +727,7 @@ def test_env_test_null_content_turn_without_tool_calls_still_feeds_the_gate(
 
     _patch_loader(monkeypatch, _NullTurnGoldEnv(reward=0.0, wrong_reward=0.0))
 
-    assert cmd_env_test(_args(env_dir)) == 1
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
     captured = capsys.readouterr()
     assert "all 1 replayed episode(s) scored every deliberately wrong answer" in captured.err
     assert "overall: FAIL" in captured.err
