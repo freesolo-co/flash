@@ -4349,6 +4349,7 @@ def _config(**overrides):
         "train_batch_size": 8,
         "max_prompt_length": 1024,
         "max_response_length": 512,
+        "max_sequence_length": 1536,
         "model_path": "/models/student",
         "lora_rank": 32,
         "lora_alpha": 64,
@@ -4419,7 +4420,8 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["actor_rollout_ref.model.fused_kernel_options.impl_backend"] == "torch"
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == "4"
     assert overrides["actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size"] == "4"
-    assert overrides["actor_rollout_ref.rollout.max_model_len"] == "32768"
+    # the engine is sized to the job's own sequence length, never a hardcoded context.
+    assert overrides["actor_rollout_ref.rollout.max_model_len"] == "1536"
     assert overrides["distillation.n_gpus_per_node"] == "0"
     assert overrides["distillation.nnodes"] == "0"
     assert overrides["distillation.teacher_key"] == "index"
@@ -4439,7 +4441,7 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     multi_turn_overrides = dict(
         value.split("=", 1)
         for value in build_opd_verl_overrides(
-            _config(multi_turn=True, max_sequence_length=1536, max_model_len=1536)
+            _config(multi_turn=True, max_sequence_length=1536)
         )
     )
     assert (
@@ -4465,6 +4467,39 @@ def test_overrides_size_agent_loop_workers_to_the_opd_rollout_batch():
         for value in build_opd_verl_overrides(_config(train_batch_size=64, group_size=8))
     )
     assert big["actor_rollout_ref.rollout.agent.num_workers"] == "8"
+
+
+def test_overrides_size_the_engine_to_the_job_not_a_hardcoded_context():
+    # regression: single-turn opd hardcoded rollout.max_model_len=32768 while the prompt budget was
+    # carved out of the job's own max_context_tokens. above 32768 the prompt filter admitted prompts
+    # the engine could not hold, so they died at rollout instead of training on a shorter context;
+    # below it, vllm reserved kv cache for a context the job never uses. every length must descend
+    # from one value.
+    overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_verl_overrides(
+            _config(max_prompt_length=65024, max_response_length=512, max_sequence_length=65536)
+        )
+    )
+    assert overrides["actor_rollout_ref.rollout.max_model_len"] == "65536"
+    # the token budgets track the same value, so a full-length sequence always fits a micro-batch.
+    assert overrides["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"] == "65536"
+    assert overrides["actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu"] == "65536"
+    # and the prompt filter's budget is carved out of the engine, never larger than it.
+    assert (
+        int(overrides["data.max_prompt_length"]) + int(overrides["data.max_response_length"])
+        == int(overrides["actor_rollout_ref.rollout.max_model_len"])
+    )
+
+
+def test_overrides_require_an_explicit_sequence_length():
+    # the engine length is load-bearing for the kv cache, the prompt filter, and the token budget.
+    # a defaulted one would silently size the run for a context the caller never asked for, which is
+    # exactly the bug above. missing means fail loudly, before any gpu is paid for.
+    config = _config()
+    del config["max_sequence_length"]
+    with pytest.raises(KeyError, match="max_sequence_length"):
+        build_opd_verl_overrides(config)
 
 
 def test_overrides_bound_transfer_queue_storage_to_one_unit():
