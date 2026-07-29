@@ -511,18 +511,23 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     # Never scheduled (no capacity) is reported distinctly from a scheduled-then-stalled worker.
     assert res.failure == "no_capacity"
     assert "IN_QUEUE" in res.detail
-    # polled with the 900s LAST-gpu grace above, so there is nowhere left to walk: the detail must
-    # not promise a next-best class it cannot reach.
-    assert "next-best GPU" not in res.detail
-    assert "same class" in res.detail
+    # the detail states the OBSERVED condition and stops there. poll_job cannot know what happens
+    # next: the retry disposition lives in _run_training, which owns the candidate list and the
+    # retry budget and already prints "retrying ..." / "not retrying" alongside this detail.
+    # a provider-side guess contradicts that line whenever the budget is exhausted.
+    assert "no RunPod capacity" in res.detail
+    assert "retrying" not in res.detail
 
 
-def test_no_capacity_detail_promises_a_walk_only_when_one_exists(monkeypatch):
-    # Same never-scheduled stall as above, but polled with the NON-last grace: a next-best class
-    # does exist here, so the detail should say so. Pairing the two directions is the point --
-    # _select_candidate ranks tried classes down but never FILTERS them, so on a one-entry
-    # candidate list (any spec that pins gpu.type) the retry re-picks the same class. A detail
-    # that always promised "next-best GPU" read as a walk that never happened.
+def test_no_capacity_detail_never_predicts_the_retry_disposition(monkeypatch):
+    # Same never-scheduled stall, polled with the NON-last grace. The detail must be IDENTICAL in
+    # wording regardless of grace: the grace does not determine what happens next.
+    #
+    # on_last_gpu (lifecycle.py:781) is an OR of two unrelated conditions -- "last untried class"
+    # and "infra retry budget exhausted" -- so a 900s grace can mean the walk wraps back to an
+    # already-tried class, OR that can_retry() returns false and the run TERMINATES. Any wording
+    # derived from the grace alone is wrong in at least one of those paths, and "retrying on the
+    # same class" on a max_retries=0 run directly contradicts lifecycle's own "not retrying".
     import itertools
 
     from flash.providers.runpod import api as runpod_api
@@ -543,12 +548,14 @@ def test_no_capacity_detail_promises_a_walk_only_when_one_exists(monkeypatch):
         interval_s=0,
         heartbeat_reader=lambda: None,
         setup_grace_s=5000.0,
-        queue_grace_s=300.0,  # not the last GPU: the walk has somewhere to go
+        queue_grace_s=300.0,  # not the last GPU
     )
     assert not res.ok
     assert res.failure == "no_capacity"
-    assert "next-best GPU" in res.detail
-    assert "same class" not in res.detail
+    assert "no RunPod capacity" in res.detail
+    # no next-step claim in EITHER direction -- that is _run_training's line to print.
+    assert "retrying" not in res.detail
+    assert "next-best" not in res.detail
 
 
 def test_capacity_grace_scales_with_gpu_walk_position():

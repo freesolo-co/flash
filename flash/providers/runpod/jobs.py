@@ -101,28 +101,16 @@ def weight_cache_grow_headroom_s() -> float:
 
     return WEIGHT_CACHE_GROW_BUDGET_S * max(1, rp_keys.key_count())
 
-# capacity grace on the LAST candidate class: there is nowhere to walk, so wait longer before
-# giving up. also the signal _capacity_next_step reads to tell "walk on" from "retry in place".
+
+# capacity grace on the LAST candidate class: there is nowhere left to walk, so wait longer before
+# giving up. purely a timing knob -- it says nothing about whether a retry follows, because
+# on_last_gpu (runner/lifecycle.py) is also true when the infra retry budget is exhausted.
 LAST_GPU_CAPACITY_GRACE_S = 900.0
 
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
 TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
-
-
-def _capacity_next_step(grace_s: float) -> str:
-    """what a no-capacity failure actually does next, given the grace it was polled with.
-
-    stall_kwargs raises the capacity grace to LAST_GPU_CAPACITY_GRACE_S exactly when the walk has
-    nowhere left to go, so the grace doubles as that flag without threading it through poll_job.
-    a spec that pins gpu.type is always on the last (only) candidate, so promising a "next-best GPU"
-    there is wrong: _select_candidate ranks tried classes down but never filters them out, and a
-    one-entry list re-picks the same class.
-    """
-    if grace_s >= LAST_GPU_CAPACITY_GRACE_S:
-        return "no cheaper-or-equal GPU class is left to walk to; retrying on the same class"
-    return "retrying on the next-best GPU"
 
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:
@@ -976,7 +964,7 @@ def poll_job(
                 False,
                 failure="no_capacity",
                 detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
-                f"(no RunPod capacity for the pinned GPU class); {_capacity_next_step(queue_grace_s)}",
+                "(no RunPod capacity for the pinned GPU class)",
             )
         if status != "IN_QUEUE":
             # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
@@ -1023,9 +1011,8 @@ def poll_job(
                         False,
                         failure="no_capacity",
                         detail=f"never scheduled: worker stuck THROTTLED for "
-                        f"{int(now - throttled_timer.since)}s while IN_QUEUE (no RunPod "
-                        f"capacity for the pinned GPU class); "
-                        f"{_capacity_next_step(throttled_grace_s)}",
+                        f"{int(now - throttled_timer.since)}s while IN_QUEUE "
+                        f"(no RunPod capacity for the pinned GPU class)",
                     )
             except Exception:
                 pass
