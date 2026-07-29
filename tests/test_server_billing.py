@@ -475,6 +475,48 @@ def test_dry_run_fails_open_when_billing_backend_is_unreachable(api, monkeypatch
     assert res.json()["state"] == "dry_run"
 
 
+def test_billable_dry_run_without_an_org_is_rejected_like_a_real_submit(api, monkeypatch):
+    # the org requirement belongs to the key, not the mode. when it was checked only for real
+    # submits, an org-less billable key skipped the affordability conjunct and got 200 from
+    # --dry-run, then 400 for the identical spec on submit: the preview contradicting the launch.
+    import flash.server.billing as billing_mod
+
+    def _unexpected(**kwargs):
+        raise AssertionError("affordability cannot be checked without an org")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _unexpected)
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-noorg"),
+    )
+
+    assert res.status_code == 400, res.text
+    assert "org id" in res.text
+
+
+def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, monkeypatch):
+    # gpu.count > 1 is unsupported at ANY balance, so 402 would send the user to top up over a spec
+    # that can never launch. submit_job rejects it too, but only after this point -- so with the
+    # precheck ahead of the gate, the payment error won the race and hid the real cause.
+    import flash.server.billing as billing_mod
+
+    def _block(**k):
+        raise billing_mod.BillingError(402, "insufficient balance")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
+    multi_gpu_spec = {**SPEC, "gpu": {**SPEC["gpu"], "count": 2}}
+    res = api.post(
+        "/v1/runs",
+        json={"spec": multi_gpu_spec, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 400, res.text
+    assert "multi-gpu" in res.text
+    assert "insufficient" not in res.text
+
+
 def test_internal_submit_skips_affordability_precheck_before_persistence(api, monkeypatch):
     import flash.server.billing as billing_mod
     import flash.server.db as db_mod
