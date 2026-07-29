@@ -207,6 +207,43 @@ def test_trainer_noops_when_all_turn_rewards_are_none(monkeypatch):
     assert output["advantages"].shape == (2,)
 
 
+def test_trainer_warns_when_no_row_carries_per_turn_rewards(
+    monkeypatch, reset_fallback_warning, capsys
+):
+    """The whole-batch miss must warn too, not just the per-group one.
+
+    This is the common AS-028 shape: the environment emits no per_turn_rewards at all. The trainer
+    returns at the all-None check before build_per_turn_advantages() is ever called, so a warning
+    that lives only in that helper stays silent for exactly the configuration it exists to report.
+    """
+    from trl import GRPOTrainer
+
+    inputs = [
+        {"turn_spans": [(0, 1)], "turn_rewards": None},
+        {"turn_spans": [(0, 1)], "turn_rewards": None},
+    ]
+    monkeypatch.setattr(
+        GRPOTrainer,
+        "_generate_and_score_completions",
+        lambda self, rows: {
+            "completion_ids": torch.zeros((2, 1), dtype=torch.long),
+            "advantages": torch.zeros(2),
+        },
+    )
+    trainer = object.__new__(GRPOPerTurnTrainer)
+
+    trainer._generate_and_score_completions(inputs)
+    # a second batch keeps hitting the same environment, so the latch must hold across calls or the
+    # log fills with one copy per step.
+    trainer._generate_and_score_completions(inputs)
+
+    out = capsys.readouterr().out
+    assert out.count("[grpo][warn]") == 1
+    assert "per_turn" in out
+    assert "episode credit" in out
+    assert "per_turn_rewards" in out
+
+
 def test_trainer_replaces_scalar_advantages_in_output_row_order(monkeypatch):
     from trl import GRPOTrainer
 
