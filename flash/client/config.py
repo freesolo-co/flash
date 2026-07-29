@@ -48,6 +48,14 @@ def load_credentials() -> tuple[str, str | None]:
     return api_url, api_key
 
 
+def _api_url_source_from(cfg: dict) -> str:
+    if os.environ.get("FLASH_API_URL"):
+        return "FLASH_API_URL"
+    if cfg.get("api_url"):
+        return str(CONFIG_PATH)
+    return f"default for the {CHANNEL} channel"
+
+
 def api_url_source() -> str:
     """Name where the control-plane URL came from, for display alongside the key source.
 
@@ -55,11 +63,26 @@ def api_url_source() -> str:
     channel is production. Nothing in the output says so, so a user who believes they are
     pointed somewhere else gets no signal until a run has already been created there.
     """
-    if os.environ.get("FLASH_API_URL"):
-        return "FLASH_API_URL"
-    if _read_config().get("api_url"):
-        return str(CONFIG_PATH)
-    return f"default for the {CHANNEL} channel"
+    return _api_url_source_from(_read_config())
+
+
+def credential_snapshot() -> tuple[str, str | None, str | None, str]:
+    """Resolve (api_url, api_key, key_source, api_url_source) from ONE read of the config.
+
+    ``~/.flash/config.json`` is shared mutable state: a concurrent ``flash login`` can land between
+    two reads. A caller that resolves the URL, the key, and the URL's origin separately can then
+    query one control plane while reporting another, which is exactly the confusion the diagnostic
+    output exists to remove. Reading once makes the reported plane the plane that was used.
+    """
+    cfg = _read_config()
+    api_url = (os.environ.get("FLASH_API_URL") or cfg.get("api_url") or DEFAULT_API_URL).rstrip("/")
+    env_key = os.environ.get("FREESOLO_API_KEY")
+    url_source = _api_url_source_from(cfg)
+    if env_key:
+        return api_url, env_key, "FREESOLO_API_KEY", url_source
+    if cfg.get("api_key"):
+        return api_url, cfg["api_key"], str(CONFIG_PATH), url_source
+    return api_url, None, None, url_source
 
 
 def shadowed_login_warning() -> str | None:

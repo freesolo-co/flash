@@ -610,20 +610,27 @@ class ApiClient:
     def undeploy(self, run_id: str) -> dict:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
 
-    def deployments(self) -> list[dict]:
-        return self._request("GET", "/v1/deployments")["deployments"]
+    def deployments(self, timeout: float | None = None) -> list[dict]:
+        return self._request("GET", "/v1/deployments", timeout=timeout)["deployments"]
 
-    def deployment_for(self, run_id: str) -> dict | None:
+    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
         """The current deployment record for one run, or None when it is not listed.
 
         ``deploy`` returns as soon as the record is persisted, which is normally before the
         requested revision is servable. This is the read side a caller needs to tell "queued"
         from "actually ready".
+
+        ``timeout`` bounds the single request. A caller polling against its own deadline needs
+        that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
+        overshoot the bound the user asked for by an order of magnitude.
         """
         base_run_id, _step = _parse_adapter_target(run_id)
-        for entry in self.deployments():
+        for entry in self.deployments(timeout=timeout):
             deployment = entry.get("deployment") or {}
-            if deployment.get("run_id") == base_run_id:
+            # the id lives on the nested record or on the listing row depending on the endpoint;
+            # the render and list paths already read both. matching only the nested one makes a
+            # live deployment look absent, which --wait would report as "vanished".
+            if base_run_id in (deployment.get("run_id"), entry.get("run_id")):
                 return deployment
         return None
 

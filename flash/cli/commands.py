@@ -21,7 +21,7 @@ from flash.client import (
     save_credentials,
     verify_freesolo_key,
 )
-from flash.client.config import api_url_source, load_credentials, load_credentials_with_source
+from flash.client.config import credential_snapshot, load_credentials
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
@@ -136,9 +136,15 @@ def _identity_or_none(api_key: str, api_url: str) -> dict | None:
 
 
 def cmd_whoami(args) -> int:
-    api_url, _, key_source = load_credentials_with_source()
-    me = client_from_config().me()
-    print(render.whoami(me, key_source, api_url, api_url_source()))
+    # one snapshot for all four values: a concurrent `flash login` between reads would otherwise let
+    # whoami fetch the identity from one control plane and print another one's url and source.
+    api_url, api_key, key_source, url_source = credential_snapshot()
+    if not api_key:
+        raise ClientError(
+            "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
+        )
+    me = ApiClient(api_url, api_key, key_source=key_source).me()
+    print(render.whoami(me, key_source, api_url, url_source))
     return 0
 
 
@@ -766,6 +772,9 @@ def cmd_checkpoints(args) -> int:
 # state this client does not know, which must not spin until the timeout.
 _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 _DEPLOY_POLL_SECONDS = 5.0
+# an auth or authorization rejection answers the same way every time; polling through it just
+# spends the whole timeout to arrive at the identical error.
+_PERMANENT_POLL_STATUSES = frozenset({401, 403})
 
 
 def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> dict:
@@ -791,7 +800,17 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             break
         time.sleep(min(_DEPLOY_POLL_SECONDS, remaining))
         try:
-            current = client.deployment_for(run_id)
+            # bound the read by what is left of the wait. the client's default timeout is 60s, so
+            # an unbounded poll inside `--wait 5` blocks far past the deadline the user set.
+            current = client.deployment_for(run_id, timeout=max(deadline - time.monotonic(), 1.0))
+        except ApiError as exc:
+            if exc.status in _PERMANENT_POLL_STATUSES:
+                # retrying will not fix a rejected key or a run this key cannot see. without this
+                # the loop burns the full timeout (30 minutes by default) on a request that
+                # answers identically every time, and then reports it as "still queued".
+                print(f"warning: cannot check {run_id}: {exc}", file=sys.stderr)
+                return latest
+            continue
         except ClientError:
             # a transient control-plane blip must not fail a deploy that is otherwise progressing;
             # keep polling to the deadline and report whatever we last saw.
@@ -816,6 +835,27 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
     return latest
 
 
+def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
+    """True when the revision we asked for is not the one now being served.
+
+    A failed redeploy does not leave a `failed` record. `mark_deployment_failed` restores the
+    previous deployment verbatim and records the failure only in `last_deploy_error`, so the run
+    ends up `ready` on the OLD adapter. Treating that as success is how
+    `deploy --wait && evaluate` silently evaluates the previous checkpoint. Compare the attempt
+    identity instead of trusting the state word.
+    """
+    if str(final.get("state") or "") == "failed":
+        return True
+    if not final.get("last_deploy_error"):
+        return False
+    asked = requested.get("requested_at")
+    got = final.get("requested_at")
+    # no attempt stamp on either side: a recorded error is the only signal available.
+    if asked is None or got is None:
+        return True
+    return asked != got
+
+
 def cmd_deploy(args) -> int:
     from flash.schema import parse_checkpoint_ref
 
@@ -832,9 +872,18 @@ def cmd_deploy(args) -> int:
     client = client_from_config()
     dep = client.deploy(args.run_id, dry_run=args.dry_run)
     wait_seconds = getattr(args, "wait", None)
-    # a dry run creates no deployment to poll for, so --wait has nothing to observe.
-    if wait_seconds and dep.get("state") != "dry_run":
+    # a dry run creates no deployment to poll for, so --wait has nothing to observe. test against
+    # None, not truthiness: `--wait 0` is an explicit "poll once, do not block" and 0.0 is falsy.
+    waited_but_unservable = False
+    if wait_seconds is not None and dep.get("state") != "dry_run":
+        requested = dep
         dep = _await_deployment(client, args.run_id, dep, wait_seconds)
+        # --wait promises the revision is servable on return. a record still in a busy state means
+        # the wait ended without that promise (timeout, vanished listing, or an unpollable plane),
+        # and a restored previous revision means the requested one never made it. exiting 0 in
+        # either case lets `deploy --wait && evaluate` run against the wrong adapter.
+        still_busy = str(dep.get("state") or "") in _DEPLOYMENT_BUSY_STATES
+        waited_but_unservable = still_busy or _deployment_attempt_failed(requested, dep)
     if render.styled():
         print(render.deployed(dep))
     else:
@@ -862,6 +911,15 @@ def cmd_deploy(args) -> int:
                 f"deployment failed: {detail}; run `flash models deployments` for details and "
                 f"retry `flash models deploy {args.run_id}` after fixing the error."
             )
+        elif waited_but_unservable and dep.get("last_deploy_error"):
+            # state reads `ready`, but it is the PREVIOUS revision: say so, or the reader trusts
+            # the word and never learns the requested checkpoint is not the one being served.
+            detail = str(dep.get("last_deploy_error"))
+            status_note = (
+                f"the requested revision did not become servable ({detail}); the previously "
+                f"deployed revision is still serving. retry `flash models deploy {args.run_id}` "
+                "after fixing the error."
+            )
         else:
             status_note = (
                 f"deployment state is {state!r}; run `flash models deployments` to check progress "
@@ -871,7 +929,7 @@ def cmd_deploy(args) -> int:
             render.arrow(status_note) if render.styled() else f"note: {status_note}",
             file=sys.stderr,
         )
-    return 1 if dep.get("state") == "failed" else 0
+    return 1 if dep.get("state") == "failed" or waited_but_unservable else 0
 
 
 def cmd_export(args) -> int:
