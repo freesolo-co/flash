@@ -42,6 +42,8 @@ from flash.engine.worker.sft import (
 from flash.engine.worker.verl_common import (
     export_peft_adapter,
     latest_global_step_dir,
+    parse_wandb_link,
+    render_wandb_link_shim,
     resolve_verl_python,
     run_verl_training,
     stamp_adapter_dir_provenance,
@@ -1282,6 +1284,8 @@ def run_sft_verl(spec=None) -> None:
         total_steps=update_horizon,
         reentrant_gradient_checkpointing=reentrant_gradient_checkpointing,
     )
+    if "wandb" in loggers:
+        shim_source += render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
         file.write(shim_source)
     with open(custom_dataset_path, "w", encoding="utf-8") as file:
@@ -1327,12 +1331,16 @@ def run_sft_verl(spec=None) -> None:
         resume_step,
     )
     loraplus_applied = resume_step >= update_horizon
+    wandb_link: dict[str, str | None] = {}
 
     def on_line(line: str) -> None:
         nonlocal loraplus_applied
         watcher.raise_if_failed()
         if _LORAPLUS_READY_MARKER in line:
             loraplus_applied = True
+        link = parse_wandb_link(line)
+        if link is not None:
+            wandb_link.update(link)
         step_match = _VERL_STEP_RE.search(line)
         if step_match is None:
             return
@@ -1458,5 +1466,9 @@ def run_sft_verl(spec=None) -> None:
             "ulysses_sequence_parallel_size": gpu_count,
             "wandb_project": project_name if "wandb" in loggers else None,
             "wandb_run_name": experiment_name if "wandb" in loggers else None,
+            # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
+            # wandb.run, verl from the child marker (see verl_common.render_wandb_link_shim).
+            "wandb_url": wandb_link.get("wandb_url"),
+            "wandb_id": wandb_link.get("wandb_id"),
         },
     )

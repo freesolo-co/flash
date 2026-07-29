@@ -71,6 +71,8 @@ from flash.engine.worker.verl_common import (
     clamp_engine_len,
     latest_global_step_dir,
     model_max_position_embeddings,
+    parse_wandb_link,
+    render_wandb_link_shim,
     resolve_verl_python,
     run_verl_training,
 )
@@ -2344,13 +2346,14 @@ def run_opd_verl(spec=None) -> None:
     entry_path = os.path.join(shim_dir, "flash_opd_verl_entry.py")
     with open(entry_path, "w", encoding="utf-8") as file:
         file.write("import verl\nfrom flash_opd_verl_plugin import main\nmain()\n")
+    opd_shim_source = _render_opd_sitecustomize(
+        save_at_steps=knobs.save_at_steps,
+        total_steps=update_horizon,
+    )
+    if "wandb" in loggers:
+        opd_shim_source += render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(
-            _render_opd_sitecustomize(
-                save_at_steps=knobs.save_at_steps,
-                total_steps=update_horizon,
-            )
-        )
+        file.write(opd_shim_source)
 
     resume_step, resume_state = _restore_verl_resume(
         local_dir,
@@ -2451,9 +2454,13 @@ def run_opd_verl(spec=None) -> None:
         )
         command = [python_bin, entry_path, *overrides]
         progress = {"step": resume_step, "loss": None}
+        wandb_link: dict[str, str | None] = {}
 
         def on_line(line: str) -> None:
             watcher.raise_if_failed()
+            link = parse_wandb_link(line)
+            if link is not None:
+                wandb_link.update(link)
             step_match = _VERL_STEP_RE.search(line)
             if step_match is None:
                 return
@@ -2669,6 +2676,10 @@ def run_opd_verl(spec=None) -> None:
                 "resumed": bool(resume_step),
                 "wandb_project": project_name if "wandb" in loggers else None,
                 "wandb_run_name": experiment_name if "wandb" in loggers else None,
+                # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
+                # wandb.run, verl from the child marker (see verl_common.render_wandb_link_shim).
+                "wandb_url": wandb_link.get("wandb_url"),
+                "wandb_id": wandb_link.get("wandb_id"),
             },
         )
     finally:
