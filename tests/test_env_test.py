@@ -763,12 +763,13 @@ def test_env_test_multi_message_single_turn_gold_is_excluded_from_the_gate(
     assert "all 1 replayed episode(s)" not in captured.err
 
 
-def test_env_test_multi_turn_episodes_never_reach_the_reward_gate(monkeypatch, tmp_path, capsys):
-    # a multi-turn reward reads the accumulated rollout state, so swapping in one wrong
-    # completion string cannot produce a comparable wrong episode and there is no control to
-    # compare against. such episodes carry no evidence either way and must not fail the gate,
-    # including when the env drives more turns than the gold transcript provides and the driver
-    # pads the tail with echo filler.
+def test_env_test_echo_padded_multi_turn_episode_is_excluded_from_the_gate(
+    monkeypatch, tmp_path, capsys
+):
+    # the env drives more turns than the gold transcript provides, so the driver pads the tail
+    # with echo filler and the reward grades a transcript no correct policy would produce. that
+    # is not the gold reward, so the episode carries no evidence either way and must not fail
+    # the gate even though the grader here is genuinely flat.
     env_dir = _environment_dir(tmp_path)
 
     class _ShortGoldMultiTurnEnv(_MultiTurnEnv):
@@ -782,10 +783,75 @@ def test_env_test_multi_turn_episodes_never_reach_the_reward_gate(monkeypatch, t
 
     _patch_loader(monkeypatch, _ShortGoldMultiTurnEnv())
 
-    assert cmd_env_test(_args(env_dir)) == 0
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     captured = capsys.readouterr()
     assert "overall: PASS" in captured.out
     assert "check the reward function" not in captured.err
+
+
+def test_env_test_multi_turn_grader_that_cannot_rank_completions_fails(
+    monkeypatch, tmp_path, capsys
+):
+    # a multi-turn reward reads the accumulated rollout state, so the control is driven through
+    # the same rollout loop answering the wrong text at every turn rather than assembled. a
+    # grader that scores that wrong episode exactly as high as the replayed gold one cannot rank
+    # completions and would reach a paid run with no learning signal.
+    env_dir = _environment_dir(tmp_path)
+
+    class _FlatMultiTurnEnv(_MultiTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.scored_state = state
+            return 0.0
+
+    _patch_loader(monkeypatch, _FlatMultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "check the reward function" in captured.err
+    assert "cannot rank completions" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_multi_turn_control_is_a_driven_rollout(monkeypatch, tmp_path, capsys):
+    # a multi-turn reward reads the accumulated rollout state, so the control has to be driven
+    # through the same loop rather than assembled from one wrong string. assert that directly on
+    # what the grader was handed: every scored control transcript must be a full rollout, the
+    # same length as the gold one and wrong at every turn. an assembled control would score a
+    # single-turn state the real trainer never produces, and its reward would not be comparable
+    # to the gold reward the gate ranks it against.
+    env_dir = _environment_dir(tmp_path)
+
+    class _TranscriptScoringEnv(_MultiTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.scored_transcripts = []
+
+        def reward(self, completion, example, state=None):
+            self.scored_state = state
+            said = [
+                message["content"]
+                for message in state["messages"]
+                if message.get("role") == "assistant"
+            ]
+            self.scored_transcripts.append(said)
+            gold = [turn["content"] for turn in example["output"]]
+            return float(sum(1 for text in said if text in gold))
+
+    env = _TranscriptScoringEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "check the reward function" not in captured.err
+    assert "reward direction" not in captured.err
+
+    gold_transcript, *control_transcripts = env.scored_transcripts
+    assert gold_transcript == ["first", "second"]
+    assert control_transcripts, "no negative control was scored"
+    for transcript in control_transcripts:
+        assert len(transcript) == len(gold_transcript)
+        assert set(transcript).isdisjoint(gold_transcript)
 
 
 def test_env_test_sft_only_environment_is_not_failed_by_the_reward_gate(
