@@ -41,7 +41,11 @@ from flash.engine.structured_outputs import (
     reasoning_parser_for,
 )
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.heartbeat import (
+    GRPO_METRIC_HISTORY_LIMIT,
+    LATEST_GRPO_METRICS_LAST,
+    liveness_heartbeat,
+)
 from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
@@ -50,8 +54,11 @@ from flash.engine.worker.sft_verl import _hydra_val, _NvidiaSmiPeakSampler
 from flash.engine.worker.verl_common import (
     VERL_REQUIREMENT,
     agent_loop_workers,
+    append_step_metrics,
     clamp_engine_len,
     model_max_position_embeddings,
+    parse_verl_metric,
+    parse_verl_step_metrics,
     parse_wandb_link,
     render_wandb_link_shim,
     resolve_verl_python,
@@ -1558,14 +1565,20 @@ def run_rl_verl():
                 item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
             )
         step_re = re.compile(r"step:\s*(\d+)")
-        reward_re = re.compile(r"critic/rewards/mean:([-\d.eE+]+)")
-        loss_re = re.compile(r"actor/pg_loss:([-\d.eE+]+)")
         reward_history: list[float] = []
-        resp_len_re = re.compile(r"response_length/mean:([\d.eE+-]+)")
         resp_len_history: list[float] = []
         loss_curve: list[float] = []
         last_dump_step = [-1]
-        with liveness_heartbeat("rl_step", progress=_progress, progress_step=True):
+        # per-step backlog for `flash runs log -f`, rebuilt from verl's own step lines because its
+        # trainer runs out of process and cannot host trl's callback. read by the liveness thread
+        # below, so mutate it in place (append_step_metrics) rather than rebinding.
+        metrics_last: list[dict] = []
+        with liveness_heartbeat(
+            "rl_step",
+            progress=_progress,
+            fields=lambda: {"metrics_last": list(metrics_last)},
+            progress_step=True,
+        ):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env_for_verl,
@@ -1591,16 +1604,26 @@ def run_rl_verl():
                                     f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
                                     flush=True,
                                 )
+                    step_metrics = parse_verl_step_metrics(line)
+                    if step_metrics is not None:
+                        # a run constant rather than a verl metric, so it is stamped here the way
+                        # trl's callback reads it off args.max_completion_length.
+                        step_metrics["max_completion_tokens"] = inp["max_completion"]
+                        append_step_metrics(
+                            metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT
+                        )
+                        # the worker's error path reads this global, so a run that dies mid-training
+                        # still reports the steps it did complete (worker/__init__.py:_err_metrics).
+                        LATEST_GRPO_METRICS_LAST[:] = metrics_last
                     # capture verl's per-step reward + policy loss for train_meta observability parity.
-                    for pat, sink in (
-                        (reward_re, reward_history),
-                        (loss_re, loss_curve),
-                        (resp_len_re, resp_len_history),
+                    for verl_key, sink in (
+                        ("critic/rewards/mean", reward_history),
+                        ("actor/pg_loss", loss_curve),
+                        ("response_length/mean", resp_len_history),
                     ):
-                        hit = pat.search(line)
-                        if hit:
-                            with contextlib.suppress(ValueError):
-                                sink.append(float(hit.group(1)))
+                        value = parse_verl_metric(line, verl_key)
+                        if value is not None:
+                            sink.append(value)
                 rc = proc.wait()
             except BaseException:
                 # the stream loop died (upload error, cancel, oom in the parent): a still-running
@@ -1648,6 +1671,7 @@ def run_rl_verl():
     with liveness_heartbeat(
         "rl_finalizing",
         progress=lambda: steps_run,
+        fields=lambda: {"metrics_last": list(metrics_last)},
         progress_step=True,
         keepalive=True,
     ):
@@ -1661,7 +1685,13 @@ def run_rl_verl():
         if final_save_due(steps_run, inp["save_at_steps"]):
             _w.publish_deployable_checkpoint(adapter_dir, steps_run)
 
-    _w.heartbeat("rl_trained", train_wall=train_wall, step=steps_run, gpu=gpu_diagnostics())
+    _w.heartbeat(
+        "rl_trained",
+        train_wall=train_wall,
+        step=steps_run,
+        gpu=gpu_diagnostics(),
+        metrics_last=list(metrics_last),
+    )
     _w.write_train_meta(
         phase="rl",
         adapter_dir=adapter_dir,
@@ -1669,6 +1699,7 @@ def run_rl_verl():
         train_wall=train_wall,
         setup_seconds=setup_seconds,
         train_tokens=0,
+        heartbeat_fields={"metrics_last": list(metrics_last)},
         generated_tokens=int(
             sum(resp_len_history) / max(1, len(resp_len_history))
             * steps_run * inp["prompts_per_step"] * inp["group_size"]

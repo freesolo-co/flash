@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -391,3 +392,92 @@ def parse_wandb_link(line: str) -> dict | None:
         return None
     wandb_id = payload.get("wandb_id")
     return {"wandb_url": url, "wandb_id": wandb_id if isinstance(wandb_id, str) else None}
+
+
+# --------------------------- per-step grpo metrics (verl -> `flash runs log -f`) ---------------------------
+# trl feeds `metrics_last` from a TrainerCallback (heartbeat.make_reward_heartbeat_callback), which
+# verl cannot use: its trainer runs out of process. verl's LocalLogger prints exactly one line per
+# optimizer update -- "step:N - key:value - key:value" over every scalar metric -- so the parent
+# reconstructs the same backlog from that line. the payload schema is the CLI's, not verl's: keys
+# below are what flash/cli/commands.py:_FOLLOW_METRIC_FIELDS renders.
+#
+# not anchored at line start: ray tags worker stdout with a "(TaskRunner pid=123) " prefix, so an
+# anchored match would parse nothing at all in production. the existing progress regex in rl_verl
+# is unanchored for the same reason.
+_VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+) - ")
+
+# verl metric key -> flash `metrics_last` field. verl has no counterpart for trl's
+# frac_reward_zero_std (an advantage-collapse fraction trl computes per group), so that column is
+# simply absent for verl runs rather than faked; the renderer skips fields it does not find.
+_VERL_METRIC_FIELDS = (
+    ("critic/rewards/mean", "reward"),
+    ("actor/grad_norm", "grad_norm"),
+    ("actor/kl_loss", "kl"),
+    ("actor/entropy", "entropy"),
+    ("response_length/mean", "mean_completion_tokens"),
+    ("response_length/clip_ratio", "truncation_rate"),
+)
+
+# verl reduces most metrics with np.mean and formats them through pprint, so under numpy>=2 a value
+# prints as "np.float32(1.25)" rather than "1.25". verl's own requirements pin numpy<2, but the
+# production interpreter comes from FLASH_VERL_PYTHON (a prebuilt image flash does not own), so
+# accept both spellings -- the numpy-2 form would otherwise drop these columns silently.
+_NUMPY_SCALAR_RE = re.compile(r"^np\.\w+\((.*)\)$")
+
+
+def _metric_value(raw: str) -> float | None:
+    """one verl-printed scalar as a finite float, or None when it is not usable."""
+    wrapper = _NUMPY_SCALAR_RE.match(raw)
+    if wrapper is not None:
+        raw = wrapper.group(1)
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    # nan/inf survive float() ("nan", "inf") but would render as a meaningless column and can poison
+    # a json payload downstream, so drop them the way the trl callback does.
+    return value if math.isfinite(value) else None
+
+
+def parse_verl_metric(line: str, verl_key: str) -> float | None:
+    """one verl metric's finite float value from a step line, or None when absent.
+
+    anchors the key on a separator so a metric whose name merely ends with another's
+    (response_length_non_aborted/mean vs response_length/mean) cannot cross-match, and accepts the
+    numpy>=2 ``np.float64(...)`` spelling (see _NUMPY_SCALAR_RE).
+    """
+    hit = re.search(rf"(?:^|[\s-]){re.escape(verl_key)}:(\S+)", line)
+    return None if hit is None else _metric_value(hit.group(1))
+
+
+def parse_verl_step_metrics(line: str) -> dict | None:
+    """the flash `metrics_last` entry a verl step line carries, or None for every other line.
+
+    returns None rather than raising: this parses child stdout under multi-rank logging, where a
+    truncated or interleaved line must not take down a paid run.
+    """
+    match = _VERL_STEP_RE.search(line)
+    if match is None:
+        return None
+    metrics: dict[str, float | int] = {"step": int(match.group(1))}
+    for verl_key, flash_key in _VERL_METRIC_FIELDS:
+        value = parse_verl_metric(line, verl_key)
+        if value is not None:
+            metrics[flash_key] = value
+    return metrics
+
+
+def append_step_metrics(backlog: list[dict], metrics: dict, *, limit: int) -> None:
+    """record one step in a bounded, de-duplicated backlog, mirroring the trl callback.
+
+    verl reprints a step on a validation pass, and a resumed run replays its resume step, so a
+    repeat must replace rather than append -- otherwise the CLI renders the same step twice.
+
+    the heartbeat thread reads ``backlog`` while the stdout loop writes it, so the new contents are
+    published in ONE slice assignment: a filter/append/truncate sequence would let that reader
+    observe a torn intermediate state with the step momentarily missing.
+    """
+    step = metrics.get("step")
+    kept = [item for item in backlog if item.get("step") != step]
+    kept.append(metrics)
+    backlog[:] = kept[-limit:]
