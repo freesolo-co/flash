@@ -36,6 +36,7 @@ from flash.engine.worker.packing import (
     tokenize_for_packing,
 )
 from flash.engine.worker.perf import (
+    _arch_supports_attn_impl,
     _flash_attn_available,
     _GpuPeakSampler,
     _memory_mode,
@@ -889,7 +890,7 @@ def run_sft():
                 print(
                     "[sft] packing disabled: selected attn_implementation=sdpa (no varlen flash backend)"
                 )
-            elif _fa_ok:
+            elif _fa_ok and _arch_supports_attn_impl(model_id, "flash_attention_2", model_revision):
                 _attn = "flash_attention_2"
                 print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
             else:
@@ -928,7 +929,13 @@ def run_sft():
         # Cap at 16384: dense [B,1,T,T] mask is O(T^2) memory; above this packing gains little anyway.
         _PACK_MASK_MAX_LEN = 16384
         _mask_pack_ok = sft_max_len <= _PACK_MASK_MAX_LEN
-        _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok)
+        # both mask-packing paths below REQUIRE sdpa (a flash kernel ignores the 4D mask), so an arch
+        # that ships no sdpa kernel cannot take them at all -- forcing it would only move the failure
+        # to from_pretrained. skip the packing instead and train unpacked on the arch's own backend.
+        _sdpa_ok = _arch_supports_attn_impl(model_id, "sdpa", model_revision)
+        _sdpa_pack = bool(
+            not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok and _sdpa_ok
+        )
         if _sdpa_pack:
             if _attn in ("flash_attention_2", "flash_attention_3"):
                 print(
@@ -951,6 +958,7 @@ def run_sft():
             and _gdn
             and gdn_packing_available(model_id, revision=model_revision)
             and _mask_pack_ok
+            and _sdpa_ok
         ):
             # GDN hybrid: 4D mask for full-attn layers + cu_seqlens/seq_idx to reset DeltaNet recurrence.
             # Flash varlen would ignore the 4D mask — downgrade to sdpa for the full-attn layers.
@@ -977,6 +985,11 @@ def run_sft():
                 f"[sft] packing stays OFF: max_length {sft_max_len} > {_PACK_MASK_MAX_LEN} — the dense "
                 "O(T^2) block-diagonal mask gets too large at long context (unpacked is more memory-"
                 "efficient there, and long rows already fill a block)."
+            )
+        elif not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _sdpa_ok:
+            print(
+                f"[sft] packing stays OFF: {model_id} declares no sdpa kernel, and the block-diagonal "
+                "mask paths need one (a flash kernel ignores the 4D mask)."
             )
         elif not multimodal and not cfg_kwargs.get("packing") and not _pure_attn:
             _why = (

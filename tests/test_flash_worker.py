@@ -632,6 +632,31 @@ def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
     assert 'cfg_kwargs["gradient_accumulation_steps"] = grad_accum' in src
 
 
+def test_sft_packing_never_reselects_a_backend_the_arch_disclaims():
+    """optimal_attn_impl returns None when the architecture disclaims the selected backend, but
+    run_sft then picks a backend AGAIN for packing: it restores flash_attention_2 for the bfd path,
+    and both mask-packing paths set sdpa unconditionally. That re-selection lands in
+    model_init_kwargs["attn_implementation"] and fails at from_pretrained exactly as the veto was
+    meant to prevent (gpt-oss on Blackwell with flash_attn absent takes the pure-attention SDPA
+    path). Every packing-side selection must consult the same support probe.
+
+    The mask paths REQUIRE sdpa -- a flash kernel silently ignores the 4D block-diagonal mask -- so
+    a vetoed arch has to skip packing rather than be forced onto a kernel it does not ship."""
+    import inspect
+
+    from flash.engine.worker import sft
+
+    src = inspect.getsource(sft.run_sft)
+    # the bfd path may only restore FA2 when the arch actually declares it.
+    assert '_fa_ok and _arch_supports_attn_impl(model_id, "flash_attention_2", model_revision)' in src
+    # both mask-packing paths are gated on one probe result: the pure-attention path via _sdpa_pack,
+    # the GDN hybrid via its own elif chain.
+    assert '_sdpa_ok = _arch_supports_attn_impl(model_id, "sdpa", model_revision)' in src
+    assert src.count("_sdpa_ok") == 4  # the assignment, both packing gates, and the skip notice
+    # the skip is announced rather than silently degrading to unpacked training.
+    assert "declares no sdpa kernel" in src
+
+
 def test_trl_collator_masks_prompt_from_pretokenized_rows():
     """The UNPACKED / TRL-bfd path (not covered by BlockDiagonalCollator tests): feed TRL's real
     DataCollatorForLanguageModeling pre-tokenized {input_ids, completion_mask} rows with
