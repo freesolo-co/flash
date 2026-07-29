@@ -474,6 +474,48 @@ def test_env_test_partial_replay_zeros_warn_but_pass(monkeypatch, tmp_path, caps
     assert "all 2 replayed gold answer(s) scored 0.0" not in captured.err
 
 
+def test_env_test_negative_reward_scale_is_not_a_zero(monkeypatch, tmp_path, capsys):
+    # an env may put its gold answer at a negative reward with worse completions lower still. the
+    # gate must compare against exactly 0.0, or every replay on such a scale counts as a zero and a
+    # working grader is rejected -- while the warning misreports -0.100000 as "scored 0.0".
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv(reward=-0.1))
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=1 reward=-0.100000" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "scored zero" not in captured.err
+    assert "replayed gold answer(s) scored 0.0" not in captured.err
+
+
+def test_env_test_unrepresentable_gold_turn_is_excluded_from_the_gate(monkeypatch, tmp_path, capsys):
+    # a native tool-call turn (content=None + tool_calls) cannot be replayed as text: the driver
+    # sends an empty turn stripped of the call. a grader that correctly rejects that mutilated
+    # transcript scores zero, which says nothing about the reward function, so it must not trip
+    # the all-zero gate.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ToolCallGoldEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f"}}],
+                },
+                {"role": "assistant", "content": example.get("output", "")},
+            ]
+
+    _patch_loader(monkeypatch, _ToolCallGoldEnv(reward=0.0))
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "replayed gold answer(s) scored 0.0" not in captured.err
+
+
 def test_env_test_echo_policy_zero_reward_still_passes(monkeypatch, tmp_path, capsys):
     # an echo episode has no gold answer to score, so a zero reward says nothing about the
     # grader. the zero-reward gate must only judge replayed gold answers.

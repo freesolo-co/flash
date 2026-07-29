@@ -65,6 +65,17 @@ def test_org_mutating_command_warns(monkeypatch, capsys):
     assert "shadowed!" in capsys.readouterr().err
 
 
+def test_train_cost_stays_quiet(monkeypatch, capsys):
+    # `train --cost` is catalog-only and never contacts an org, so warning that it runs against the
+    # environment key's organization would describe a request the command does not make.
+    monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
+    args = argparse.Namespace(func=cmd_train, cost=True)
+
+    cli._warn_if_login_shadowed(args)
+
+    assert capsys.readouterr().err == ""
+
+
 def test_read_only_command_stays_quiet(monkeypatch, capsys):
     # `flash whoami` names the key source in its own output, so a second warning is noise.
     monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
