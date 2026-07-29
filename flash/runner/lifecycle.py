@@ -931,10 +931,20 @@ def _submit_seed_supervised(
             res.failure,
             cache_drop=first_cache_drop,
         )
+        # name the class the retry will ACTUALLY land on. the picker walks only classes that fit the
+        # model, so when this was the last untried one the retry re-picks it -- and a log line that
+        # implied a move to different hardware would misread as an escalation that never happened.
+        if will_retry and not oom_mode and chosen is not None and current_on_last_gpu["value"]:
+            retry_target = (
+                f"retrying on {chosen.gpu} @ {chosen.provider} again, no untried GPU class fits "
+                "this run (resume from last checkpoint)"
+            )
+        else:
+            retry_target = "retrying (resume from last checkpoint)"
         action = (
             f"retrying on a larger GPU (> {oom_vram_floor} GB)"
             if (will_retry and oom_mode)
-            else "retrying (resume from last checkpoint)"
+            else retry_target
             if will_retry
             else "not retrying"
         )
