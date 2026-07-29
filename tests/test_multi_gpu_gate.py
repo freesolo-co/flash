@@ -110,3 +110,24 @@ def test_run_training_gates_effective_spec_on_recovery():
     # before any provisioning (the gate precedes the first get_status/allocation touch).
     with pytest.raises(ValueError, match="multi-gpu training"):
         _run_training(_spec(2), io.StringIO(), prior_cost=0.0)
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "key"),
+    [("sft", "FLASH_SFT_BACKEND"), ("grpo", "FLASH_RL_BACKEND"), ("opd", "FLASH_OPD_BACKEND")],
+)
+def test_gate_message_names_the_key_that_enables_sharding(algorithm, key):
+    from flash import runner
+
+    # [worker_env] is the ONLY route to a sharding backend, and the phase key is not guessable from
+    # the algorithm (grpo -> FLASH_RL_BACKEND). a message offering only "set gpu.count to 1" leaves
+    # multi-gpu undiscoverable, so assert the remedy travels with the rejection.
+    # match the backend rejection specifically: the gate also raises for gpu.provider, and that
+    # path carries no backend key, so a bare raises() would pass while checking nothing.
+    with pytest.raises(ValueError, match="multi-gpu training") as excinfo:
+        runner._require_supported_gpu_count(_spec(4, algorithm))
+
+    message = str(excinfo.value)
+    assert key in message
+    assert "verl" in message
+    assert "worker_env" in message
