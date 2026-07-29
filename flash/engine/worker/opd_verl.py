@@ -68,7 +68,9 @@ from flash.engine.worker.tokenizer_align import (
 )
 from flash.engine.worker.verl_common import (
     agent_loop_workers,
+    clamp_engine_len,
     latest_global_step_dir,
+    model_max_position_embeddings,
     resolve_verl_python,
     run_verl_training,
 )
@@ -1394,6 +1396,7 @@ _REQUIRED_OVERRIDE_KEYS = (
     "train_batch_size",
     "max_prompt_length",
     "max_response_length",
+    "max_sequence_length",
     "model_path",
     "lora_rank",
     "lora_alpha",
@@ -1419,12 +1422,10 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in config]
     if missing:
         raise KeyError(f"build_opd_verl_overrides missing required config keys: {missing}")
-    sequence_length = config.get("max_sequence_length")
-    max_tokens = int(
-        sequence_length
-        if sequence_length is not None
-        else int(config["max_prompt_length"]) + int(config["max_response_length"])
-    )
+    # the full sequence length the engine is sized for. the caller derives max_prompt_length by
+    # carving max_response_length out of this same value, so the token budget, the prompt filter,
+    # and the engine always agree.
+    max_tokens = int(config["max_sequence_length"])
     overrides = [
         "algorithm.adv_estimator=grpo",
         "algorithm.use_kl_in_reward=false",
@@ -1495,7 +1496,7 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
         # composed rollout node, so hydra rejects a bare assignment.
         "++actor_rollout_ref.rollout.limit_images=8",
-        f"actor_rollout_ref.rollout.max_model_len={_hydra_val(config.get('max_model_len', 32768))}",
+        f"actor_rollout_ref.rollout.max_model_len={_hydra_val(max_tokens)}",
         f"actor_rollout_ref.rollout.temperature={_hydra_val(config.get('temperature', 1.0))}",
         f"actor_rollout_ref.rollout.top_p={_hydra_val(config.get('top_p', 1.0))}",
         "actor_rollout_ref.rollout.top_k=-1",
@@ -2135,7 +2136,19 @@ def run_opd_verl(spec=None) -> None:
         tokenizer.pad_token = tokenizer.eos_token
     thinking_prefill = _thinking_prefill_text(tokenizer)
     eos_token_ids = _generation_eos_from_cached_config(model_id, model_revision, tokenizer)
-    max_model_len = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
+    requested_len = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
+    # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
+    # clamping only the engine would admit prompts sized against the unclamped budget and then fail
+    # them at rollout instead of training on the shorter context.
+    max_model_len = clamp_engine_len(
+        requested_len, model_max_position_embeddings(model_id, model_revision)
+    )
+    if max_model_len < requested_len:
+        print(
+            f"[opd-verl] max_context_tokens {requested_len} exceeds the {model_id} context limit; "
+            f"training at {max_model_len}",
+            flush=True,
+        )
     prompt_budget = max_model_len - knobs.max_completion
     if prompt_budget < 1:
         raise RuntimeError("opd max_context_tokens leaves no room for a prompt")
@@ -2359,8 +2372,12 @@ def run_opd_verl(spec=None) -> None:
             "kl_penalty_coef": knobs.kl_coef,
             "temperature": knobs.temperature,
             "top_p": knobs.top_p,
-            "max_model_len": max_model_len if multi_turn else 32768,
-            "max_sequence_length": max_model_len if multi_turn else None,
+            # the job's own engine length (prompt + completion), already clamped to the model's
+            # limit. prompt_budget above is carved out of this same value, so the engine, the prompt
+            # filter, and the token budget cannot disagree. a hardcoded engine would size vllm's kv
+            # cache for a context the job never uses, and -- above it -- admit prompts the engine
+            # cannot hold.
+            "max_sequence_length": max_model_len,
             "multi_turn": multi_turn,
             "thinking": bool(_w.THINKING),
             "structured_outputs": structured_outputs,
