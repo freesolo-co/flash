@@ -551,3 +551,42 @@ def test_env_test_malformed_param_fails_before_loading(monkeypatch, tmp_path, ca
     captured = capsys.readouterr()
     assert "--param must be KEY=VALUE" in captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_multi_turn_env_warns_that_opsd_will_be_rejected(monkeypatch, tmp_path, capsys):
+    # the worker-side opsd guard fires after admission and gpu allocation, so a multi-turn env
+    # only learns it is unsupported once it has been billed for the gpu. multi_turn is settled at
+    # load time, so `env test` can say it for free.
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _MultiTurnEnv())
+    args = cli._build_parser().parse_args(["env", "test", str(env_dir)])
+
+    assert args.func(args) == 0
+    captured = capsys.readouterr()
+    assert "multi-turn" in captured.err
+    assert 'algorithm = "opsd"' in captured.err
+    assert "after the gpu is allocated and billed" in captured.err
+    # the shape is a warning about one algorithm, never a failure of the contract gate itself.
+    assert "overall: PASS" in captured.out
+
+
+def test_tool_env_names_its_own_shape(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv()
+    env.is_tool_env = True
+    _patch_loader(monkeypatch, env)
+    args = cli._build_parser().parse_args(["env", "test", str(env_dir)])
+
+    assert args.func(args) == 0
+    assert "tool-using" in capsys.readouterr().err
+
+
+def test_single_turn_env_says_nothing_about_algorithm_shape(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+    args = cli._build_parser().parse_args(["env", "test", str(env_dir)])
+
+    assert args.func(args) == 0
+    err = capsys.readouterr().err
+    assert "opsd" not in err
+    assert "multi-turn" not in err
