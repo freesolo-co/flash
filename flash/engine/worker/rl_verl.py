@@ -387,6 +387,7 @@ def _build_verl_train_notes(
 _ENTROPY_QUANTILE_MARKER = "[flash-verl] top-entropy token masking active"
 _STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
 _STRUCTURED_OUTPUTS_MARKER = "[flash-verl] rollout structured outputs active"
+_EXACT_SAVE_STEPS_MARKER = "[flash-verl] exact save steps active"
 
 
 def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
@@ -442,6 +443,63 @@ if not getattr(
     _flash_patch_structured_outputs()
     _flash_so_agent_loop.AgentLoopWorker._run_agent_loop._flash_so_patched = True
     print({_STRUCTURED_OUTPUTS_MARKER!r} + " " + repr(_flash_structured_outputs), flush=True)
+'''
+
+
+def render_exact_save_steps_shim(save_at_steps: tuple[int, ...], total_steps: int) -> str:
+    """return the sitecustomize source that suppresses verl's superset checkpoint writes.
+
+    verl only saves when ``global_steps % save_freq == 0``, so it cannot hit an arbitrary set of
+    steps. the resolver picks the gcd of the required steps, which makes verl save a SUPERSET and
+    the uploader publish deployables at exactly the required ones. correct, but the gcd can be
+    tiny -- save_at_steps=(7, 13) gives gcd 1, a full checkpoint written every single step -- and
+    each write is a full-state dump of a multi-billion-parameter policy.
+
+    this drops the writes flash never asked for, so only the required steps (and the last step,
+    which the run's final publish needs) reach disk. the sft verl backend already does exactly this
+    (sft_verl.py); this is the same suppression on the ppo driver.
+
+    ``RayPPOTrainer._save_checkpoint`` takes no step argument -- it reads ``self.global_steps`` --
+    so the filter reads it off the instance rather than a parameter. returning early is safe
+    because the method's only other effect is advancing latest_checkpointed_iteration.txt, and a
+    step with no checkpoint on disk must not be advertised as resumable: the uploader gates on that
+    marker precisely so it never uploads a half-written or absent directory.
+    """
+    if not save_at_steps:
+        return ""
+    return f'''
+from verl.trainer.ppo import ray_trainer as _flash_save_ray_trainer
+
+_flash_required_save_steps = frozenset({tuple(sorted(save_at_steps))!r})
+_flash_total_steps = {int(total_steps)}
+
+def _flash_patch_exact_save_steps():
+    """save only the steps flash asked for, plus the final step.
+
+    the gcd interval makes verl save a superset; every extra write is a full-state dump that is
+    never published and is pruned again a few steps later. the last step stays because the run's
+    final publish reads the checkpoint verl writes there.
+    """
+    original = _flash_save_ray_trainer.RayPPOTrainer._save_checkpoint
+
+    def _save_checkpoint(self):
+        step = int(self.global_steps)
+        if step not in _flash_required_save_steps and step != _flash_total_steps:
+            return None
+        return original(self)
+
+    _flash_save_ray_trainer.RayPPOTrainer._save_checkpoint = _save_checkpoint
+
+if not getattr(
+    _flash_save_ray_trainer.RayPPOTrainer._save_checkpoint, "_flash_save_patched", False
+):
+    _flash_patch_exact_save_steps()
+    _flash_save_ray_trainer.RayPPOTrainer._save_checkpoint._flash_save_patched = True
+    print(
+        {_EXACT_SAVE_STEPS_MARKER!r} + " " + repr(sorted(_flash_required_save_steps))
+        + " final=" + repr(_flash_total_steps),
+        flush=True,
+    )
 '''
 
 
@@ -1178,10 +1236,11 @@ def _resolve_single_turn_inputs():
     validate_save_steps(save_at_steps, int(steps))
     save_freq = reduce(gcd, save_at_steps) if save_at_steps else save_every
     # retention has to outlive the export. verl prunes a checkpoint only once the NEXT one finishes
-    # writing, so keeping 1 leaves the uploader a single save interval to run model_merger before
-    # its source directory is deleted -- and a gcd of 1 makes that interval a single update. keep a
-    # small history while exact saves are pending so a slow export cannot lose a required step.
-    # without exact saves nothing is exported mid-run, so 1 stays correct and cheapest on disk.
+    # writing, so keeping 1 leaves the uploader one save interval to run model_merger before its
+    # source directory is deleted. with exact saves the suppression shim drops every write that is
+    # not required, so that interval is the gap between two REQUIRED steps rather than the gcd -- but
+    # keep a small history anyway: consecutive required steps (e.g. 7 and 8) still leave a short
+    # window, and a slow export must not lose a step the customer asked for.
     ckpt_to_keep = 3 if save_at_steps else 1
 
     return {
@@ -1309,6 +1368,7 @@ def run_rl_verl():
             render_entropy_quantile_shim(inp["entropy_quantile"]),
             render_stop_sequences_shim(inp["stop_sequences"]),
             render_structured_outputs_shim(inp["structured_outputs"]),
+            render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"]),
         )
         if part
     )
