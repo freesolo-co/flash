@@ -1215,10 +1215,16 @@ def _require_supported_gpu_count(spec: JobSpec) -> None:
         return
     backend = _effective_backend(spec)
     if backend not in _MULTI_GPU_BACKENDS:
+        # name the key that actually enables sharding. the backend is selected only through
+        # [worker_env], which no other error or doc mentions, so a message that offers just
+        # "set gpu.count to 1" leaves multi-gpu undiscoverable.
+        key = f"FLASH_{spec.phase.upper()}_BACKEND"
+        sharding = ", ".join(sorted(_MULTI_GPU_BACKENDS))
         raise ValueError(
             f"multi-gpu training (gpu.count={count}) is not supported by the {backend!r} backend "
             f"for algorithm {spec.algorithm!r}; it trains in a single process and would leave "
-            f"{count - 1} rented card(s) idle. set gpu.count to 1"
+            f"{count - 1} rented card(s) idle. set gpu.count to 1, or select a sharding backend "
+            f'with [worker_env] {key} = "{sharding}"'
         )
     provider = (getattr(spec.gpu, "provider", "") or "").strip().lower()
     if provider not in _MULTI_GPU_PROVIDERS:
