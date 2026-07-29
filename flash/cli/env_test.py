@@ -64,7 +64,27 @@ def _message_text(content: object) -> str:
     return ""
 
 
-def _reference_turns(env, example: dict) -> list[str]:
+def _turn_is_representable(message: dict) -> bool:
+    """Whether replaying this assistant turn as plain text reproduces the reference faithfully.
+
+    The driver replays each assistant turn as a text-only message. A native tool call
+    (``content=None`` plus ``tool_calls``) or an image-only turn therefore reaches the grader as an
+    empty turn stripped of the payload the reference actually carried. A grader that correctly
+    rejects that mutilated transcript scores zero, which is a property of the replay, not of the
+    reward function -- so such episodes must not feed the all-zero grader gate.
+    """
+    if message.get("tool_calls"):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        # text blocks survive extraction verbatim; anything else (an image block) is dropped.
+        return all(isinstance(block, dict) and block.get("type") == "text" for block in content)
+    return False
+
+
+def _reference_turns(env, example: dict) -> tuple[list[str], bool]:
     # the sft_completion gold answer stands in for the missing policy model. validate its
     # envelope like the prompt so a malformed completion (scalar content, missing role)
     # fails the episode instead of silently falling back to echo. text is extracted the
@@ -77,8 +97,10 @@ def _reference_turns(env, example: dict) -> list[str]:
     # _resolve_policy falls back to echo.
     assistant = [m for m in messages if m["role"].strip().lower() == "assistant"]
     # assistant turns only (a gold with no assistant message must echo, not replay user/system);
-    # keep text-free turns positionally (empty string) so multi-turn replay stays aligned.
-    return [_message_text(m["content"]) for m in assistant]
+    # keep text-free turns positionally (empty string) so multi-turn replay stays aligned. the second
+    # element reports whether any turn lost content in that flattening; see _turn_is_representable.
+    partial = any(not _turn_is_representable(m) for m in assistant)
+    return [_message_text(m["content"]) for m in assistant], partial
 
 
 def _resolve_policy(reference_turns: list[str]) -> str:
@@ -106,13 +128,21 @@ def _preview(value: object) -> str:
 
 def _new_record() -> dict:
     """Mutable per-episode record so a failing episode still reports real progress."""
-    return {"policy": "n/a", "turns": 0, "reward": None, "prompt": [], "responses": []}
+    return {
+        "policy": "n/a",
+        "turns": 0,
+        "reward": None,
+        "prompt": [],
+        "responses": [],
+        # True when the gold transcript could not be replayed verbatim (see _turn_is_representable).
+        "partial_replay": False,
+    }
 
 
 def _drive_single_turn(env, example: dict, record: dict) -> None:
     prompt = _check_messages(env.prompt_messages(example), "prompt")
     record["prompt"] = prompt
-    reference_turns = _reference_turns(env, example)
+    reference_turns, record["partial_replay"] = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
     response = (
@@ -128,7 +158,7 @@ def _drive_single_turn(env, example: dict, record: dict) -> None:
 def _drive_multi_turn(env, example: dict, record: dict) -> None:
     state = env.new_rollout_state(example)
     record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
-    reference_turns = _reference_turns(env, example)
+    reference_turns, record["partial_replay"] = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
     # mirror the worker turn loop (flash/engine/multiturn_rollout.py): drive one model
@@ -259,12 +289,15 @@ def cmd_env_test(args) -> int:
             continue
 
         passed += 1
-        if record["policy"] == "replay" and reward is not None:
+        if record["policy"] == "replay" and reward is not None and not record["partial_replay"]:
             replayed += 1
-            if reward <= 0.0:
+            # exactly 0.0, not <= 0.0: the reward contract accepts any finite scalar, and an env may
+            # legitimately put its gold answer at 0 or -0.1 with worse completions below it. counting
+            # those as zeros would fail the gate on a working grader and print a negative as "0.0".
+            if reward == 0.0:
                 scored_zero += 1
                 message = (
-                    f"replay gold answer scored low (reward={reward:.6f}); "
+                    f"replay gold answer scored zero (reward={reward:.6f}); "
                     "check the reward function"
                 )
                 print(
@@ -275,9 +308,10 @@ def cmd_env_test(args) -> int:
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
         return _err("overall: FAIL")
-    # every replayed gold answer scoring 0 means the grader cannot recognize its own reference
-    # answers: a broken reward function or a missing runtime dependency, not a hard dataset. that
-    # must fail the gate, since passing here sends a run to a gpu that can only see flat-zero reward.
+    # every faithfully replayed gold answer scoring 0 means the grader cannot recognize its own
+    # reference answers: a broken reward function or a missing runtime dependency, not a hard dataset.
+    # that must fail the gate, since passing here sends a run to a gpu that can only see flat-zero
+    # reward. episodes whose transcript the driver could not reproduce verbatim are excluded above.
     if replayed and scored_zero == replayed:
         _err(
             f"all {replayed} replayed gold answer(s) scored 0.0; the reward function cannot score "
