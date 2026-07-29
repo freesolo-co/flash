@@ -214,3 +214,34 @@ def test_chat_prints_styled_label_before_streaming(monkeypatch, capsys) -> None:
 
     assert result == 0
     assert capsys.readouterr().out.startswith("assistant-label\nhi")
+
+
+def test_chat_fails_when_the_stream_carries_no_text(monkeypatch, capsys) -> None:
+    """An empty but successful chat stream must fail loudly instead of exiting 0 with no output.
+
+    A serving path that stopped applying the run's chat template returns a well-formed response
+    carrying no assistant text. Exiting 0 there makes that indistinguishable from a model that
+    answered nothing, so the surface cannot be trusted as a health check.
+    """
+
+    class EmptyChatClient:
+        def chat_stream(self, run_id, messages, **kwargs):
+            return iter(())
+
+    monkeypatch.setattr(commands, "client_from_config", EmptyChatClient)
+    monkeypatch.setattr(commands.render, "styled", lambda: False)
+
+    result = commands.cmd_chat(
+        SimpleNamespace(
+            run_id="flash-1",
+            message="hello",
+            system=None,
+            temperature=0.0,
+            max_tokens=32,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert "no response text from flash-1" in captured.err

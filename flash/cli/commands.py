@@ -1090,6 +1090,17 @@ def cmd_chat(args) -> int:
     ):
         print(chunk, end="", flush=True)
         wrote = True
-    if wrote:
-        print()
+    if not wrote:
+        # the request succeeded at the transport level but carried no assistant text, which is what
+        # a serving path that stopped applying the run's chat template looks like from here. exiting
+        # 0 with an empty stdout makes that indistinguishable from a model that answered nothing, so
+        # this surface cannot be used as a health check -- say what happened and fail.
+        print(
+            f"no response text from {chat_target}: the request succeeded but the model returned "
+            "nothing. the deployment may be unhealthy or still starting; check "
+            f"`{CLI_NAME} models list` and retry.",
+            file=sys.stderr,
+        )
+        return 1
+    print()
     return 0
