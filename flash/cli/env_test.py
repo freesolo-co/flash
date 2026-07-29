@@ -7,6 +7,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+from flash.catalog import normalize_algorithm, samples_on_policy
+
 from . import render
 from .envpush import _err, _resolve_local_env_entrypoint
 
@@ -165,9 +167,12 @@ def _drive_single_turn(env, example: dict, record: dict) -> None:
     # a single-turn gold that spans several assistant messages (a tool-call trajectory, say) is
     # joined above so the preview shows the whole reference, but the real single-turn scorer sees
     # only the last assistant message (flash/multimodal.py assistant_completion_text, called from
-    # flash/engine/worker/rl.py). the joined text is therefore not what training would grade, so a
-    # grader that correctly accepts only the final answer must not feed the flat-reward gate.
-    if policy == "replay" and len([turn for turn in reference_turns if turn]) > 1:
+    # flash/engine/worker/rl.py). compare against exactly that: whenever the joined text differs
+    # from what training would grade, the reward below is not the reward the run would compute, so
+    # the episode must not feed the flat-reward gate. an equality test rather than a count of
+    # non-empty turns, because assistant_completion_text returns a trailing empty content verbatim
+    # -- a gold ending in "" would otherwise be graded here as its earlier text and look faithful.
+    if policy == "replay" and response != reference_turns[-1]:
         record["partial_replay"] = True
     record["responses"] = [response]
     record["turns"] = 1
@@ -243,8 +248,13 @@ def _negative_control_rewards(env, example: dict, reference: str) -> list[float]
     one that accepts a wrong English sentence for an open-ended task, say -- from being reported as
     unable to rank, since the degenerate controls still fail it.
 
-    Returns None when no control can be shown to be wrong for this example, so the caller can
-    exclude the episode instead of drawing a conclusion the evidence does not support.
+    Returns None when no control is provably wrong for this example, so the caller can exclude the
+    episode instead of drawing a conclusion the evidence does not support.
+
+    A grader that raises on a control is not inconclusive: GRPO's reward_fn catches exactly that
+    and scores the completion 0.0 (flash/engine/worker/rl.py), so training would see a real number
+    there. Record that same 0.0 rather than discarding the episode, otherwise a row that genuinely
+    separates gold from wrong is dropped and a later tied row can fail the whole sample alone.
 
     Raises ValueError when the grader returns a non-finite score, which is the same contract
     violation the gold answer is already failed for: the policy reaches this scorer with
@@ -259,9 +269,8 @@ def _negative_control_rewards(env, example: dict, reference: str) -> list[float]
         try:
             score = float(env.reward(control, example))
         except (Exception, SystemExit):
-            # the grader may reject an off-distribution string outright. that is its prerogative
-            # and says nothing about the gold answer, so decline to judge rather than fail.
-            return None
+            # mirrors reward_fn's own except branch: the run would score this 0.0 and carry on.
+            score = 0.0
         if not math.isfinite(score):
             raise ValueError(f"reward is not finite for a non-reference completion: {score}")
         scores.append(score)
@@ -305,6 +314,22 @@ def _env_params(args) -> dict:
     return params
 
 
+def _grades_completions(args) -> bool:
+    """Whether the run this environment is for will actually call ``env.reward()``.
+
+    The SFT worker builds rows from ``dataset()``, ``prompt_messages()`` and ``sft_completion()``
+    and never scores anything (``flash/engine/worker/sft.py``), so an SFT-only environment may
+    legitimately ship a placeholder scorer that returns one constant. Failing that on reward
+    quality would reject a working environment, and this command has no config to infer intent
+    from -- hence the explicit flag. Unset means "unknown", which is not grounds to fail; the
+    ranking check still reports its finding as a warning.
+    """
+    algorithm = getattr(args, "algorithm", None)
+    if not algorithm or not str(algorithm).strip():
+        return False
+    return samples_on_policy(normalize_algorithm(str(algorithm).strip()))
+
+
 def cmd_env_test(args) -> int:
     """Load a local environment and drive deterministic offline contract checks.
 
@@ -321,6 +346,7 @@ def cmd_env_test(args) -> int:
 
     try:
         params = _env_params(args)
+        grades = _grades_completions(args)
     except ValueError as exc:
         return _load_failure(str(exc))
 
@@ -343,6 +369,7 @@ def cmd_env_test(args) -> int:
     passed = 0
     controlled = 0
     scored_flat = 0
+    inverted = 0
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
         failure: str | None = None
@@ -380,12 +407,25 @@ def cmd_env_test(args) -> int:
 
         passed += 1
         # controls is None when no wrong answer could be shown to be wrong for this example
-        # (multi-turn, no control disjoint from the gold text, or the grader rejected them
-        # outright), so the episode carries no evidence either way. counting it as controlled
-        # would let the gate below speak for episodes it never tested.
+        # (multi-turn, or no control disjoint from the gold text), so the episode carries no
+        # evidence either way. counting it as controlled would let the gate below speak for
+        # episodes it never tested.
         if controls is not None and reward is not None:
             controlled += 1
-            if all(control == reward for control in controls):
+            if any(control > reward for control in controls):
+                # strictly worse than a deliberately wrong answer. GRPO maximizes this number, so
+                # the run would train away from the gold answers -- a broken reward direction is
+                # worse than a flat one, and no amount of separation elsewhere redeems it.
+                inverted += 1
+                message = (
+                    f"a deliberately wrong answer scored higher ({max(controls):.6f}) than the "
+                    f"replayed gold answer ({reward:.6f}); the reward direction looks inverted"
+                )
+                print(
+                    render.warn(message) if render.styled() else f"warning: {message}",
+                    file=sys.stderr,
+                )
+            elif all(control == reward for control in controls):
                 scored_flat += 1
                 message = (
                     f"replay gold answer and {len(controls)} deliberately wrong answer(s) all "
@@ -401,17 +441,37 @@ def cmd_env_test(args) -> int:
         return _err("overall: FAIL")
     # a grader that hands every deliberately wrong answer the same score as its own gold answer on
     # every sampled episode cannot rank completions at all: a broken reward function or a missing
-    # runtime dependency, not a hard dataset. that must fail the gate, since passing here sends a
-    # run to a gpu whose advantages are identically zero. episodes whose transcript the driver
-    # could not reproduce verbatim, and those with no control provably wrong for their gold answer,
-    # are excluded above. this samples the first few rows, so it is deliberately a claim about the
-    # sample: separation anywhere in it is enough to pass.
-    if controlled and scored_flat == controlled:
-        _err(
+    # runtime dependency, not a hard dataset. one that ranks them ABOVE gold is worse still, since
+    # GRPO would maximize its way off the references. both send a run to a gpu that cannot learn
+    # what the dataset teaches. episodes whose transcript the driver could not reproduce verbatim,
+    # and those with no control provably wrong for their gold answer, are excluded above. this
+    # samples the first few rows, so the flat finding is deliberately a claim about the sample:
+    # separation anywhere in it is enough to pass.
+    #
+    # only failed for an algorithm that actually consumes reward(). SFT never calls it, so a
+    # placeholder scorer there is not a defect, and without --algorithm the intent is unknown --
+    # report the finding without failing rather than block a working environment.
+    finding = ""
+    if inverted:
+        finding = (
+            f"{inverted} replayed episode(s) scored a deliberately wrong answer higher than the "
+            "gold answer; the reward direction is inverted and training would move away from the "
+            "references. check the grader's sign."
+        )
+    elif controlled and scored_flat == controlled:
+        finding = (
             f"all {controlled} replayed episode(s) scored every deliberately wrong answer exactly "
             "as high as the gold answer; the reward function cannot rank completions. check the "
             "grader and that its runtime dependencies are installed in this environment."
         )
+    if finding and grades:
+        _err(finding)
         return _err("overall: FAIL")
+    if finding:
+        message = f"{finding} pass --algorithm to fail on this instead of warning."
+        print(
+            render.warn(message) if render.styled() else f"warning: {message}",
+            file=sys.stderr,
+        )
     print(render.ok("overall: PASS") if render.styled() else "overall: PASS")
     return 0
