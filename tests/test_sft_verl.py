@@ -528,7 +528,7 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
 
     checkpoint_dir = tmp_path / "checkpoints" / "global_step_5"
     actor_dir = checkpoint_dir / "actor"
-    actor_dir.mkdir(parents=True)
+    (actor_dir / "huggingface").mkdir(parents=True)
     exported = []
     published = []
     uploaded = []
@@ -566,6 +566,45 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
     assert published[0][2]["required"] is True
     assert uploaded == [(5, str(checkpoint_dir))]
     assert watcher.processed_steps == {5}
+
+
+def test_checkpoint_watcher_exports_the_sft_layout(monkeypatch, tmp_path):
+    # this is the layout verl's sft trainer actually writes: shards + huggingface/ directly under
+    # global_step_N. exporting <dir>/actor here hands the merger a path that does not exist.
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_verl
+
+    checkpoint_dir = tmp_path / "checkpoints" / "global_step_5"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+    exported = []
+
+    def fake_export(actor, adapter, **kwargs):
+        if not os.path.isdir(actor):
+            raise AssertionError(f"exported a checkpoint dir that does not exist: {actor}")
+        exported.append(actor)
+        os.makedirs(adapter, exist_ok=True)
+
+    monkeypatch.setattr(sft_verl, "_export_checkpoint_adapter", fake_export)
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, checkpoint, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+    watcher = sft_verl._VerlCheckpointWatcher(
+        local_dir=str(tmp_path / "checkpoints"),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(5,),
+    )
+
+    watcher._publish(5, str(checkpoint_dir))
+
+    assert exported == [str(checkpoint_dir)]
 
 
 def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
@@ -716,7 +755,7 @@ def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypat
     monkeypatch.setattr(
         sft_verl,
         "latest_global_step_dir",
-        lambda local_dir: (os.path.join(local_dir, "global_step_2", "actor"), 2),
+        lambda local_dir: (os.path.join(local_dir, "global_step_2"), 2),
     )
 
     def fake_export(actor_dir, adapter_dir, **kwargs):
