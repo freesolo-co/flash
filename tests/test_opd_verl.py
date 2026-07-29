@@ -64,6 +64,7 @@ from flash.engine.worker.opd_verl_structured import (
     canonical_structured_spec,
 )
 from flash.engine.worker.tokenizer_align import TeacherToken
+from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION
 from flash.opd_verl_validation import validate_opd_verl_structured_outputs
 
 
@@ -719,7 +720,7 @@ class _BridgeTokenizer:
 
 def _resume_accounting(step=2):
     return {
-        "contract_version": 2,
+        "contract_version": OPD_RESUME_STATE_VERSION,
         "seed": 42,
         "opt_steps": step,
         "step": step,
@@ -841,7 +842,14 @@ def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
     assert '"teacher_transient":' not in write_train_meta_source
     assert '"teacher_error":' not in write_train_meta_source
-    assert '"mean_align_granularity":' not in write_train_meta_source
+    # granularity IS reported, but only from its own accumulator. the snapshot's granularity_sum /
+    # granularity_n are legacy aliases holding COVERAGE, so deriving the ratio from them would
+    # publish coverage a second time under the name of the one signal coverage cannot provide.
+    assert '"mean_align_granularity":' in write_train_meta_source
+    assert 'final_accounting["align_group_sum"]' in write_train_meta_source
+    assert 'final_accounting["align_group_n"]' in write_train_meta_source
+    assert "granularity_sum" not in write_train_meta_source
+    assert "granularity_n" not in write_train_meta_source
 
 
 class _BridgeTeacher:
@@ -1049,6 +1057,87 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     assert bridge.generated_tokens == 3
     with pytest.raises(ValueError, match="prompt ids"):
         bridge.score(0, 2, [10, 12, 65, 99])
+
+
+def test_bridge_granularity_separates_a_collapsed_alignment_from_a_healthy_one():
+    # both teachers cover every student token, so coverage is 1.0 for BOTH and cannot tell them
+    # apart. the merged teacher returns one span where the healthy one returns two, which is the
+    # degenerate collapse mean_coverage is blind to -- granularity is the signal that sees it.
+    healthy = _text_bridge(_BridgeTeacher())
+    healthy.score(0, 2, [10, 11, 65, 66, 99])
+    collapsed = _text_bridge(_MergedBridgeTeacher())
+    collapsed.score(0, 2, [10, 11, 65, 66, 99])
+
+    assert healthy.coverage_sum == collapsed.coverage_sum == 1.0
+    assert healthy.aligned_sequences == collapsed.aligned_sequences == 1
+    # two student tokens over two groups vs two student tokens over one merged group.
+    assert healthy.align_group_sum == 1.0
+    assert collapsed.align_group_sum == 2.0
+    assert healthy.align_group_n == collapsed.align_group_n == 1
+
+
+def test_bridge_granularity_counts_only_sequences_that_reached_the_loss():
+    # a teacher that returns no tokens still reaches the accounting, but its sequence carries no
+    # groups and contributes nothing to the loss. folding its 0.0 into the mean would report a
+    # collapse that never happened -- it belongs in empty_alignments only.
+    class _EmptyAlignmentTeacher:
+        def score(self, _prompt_text, _completion_text):
+            return []
+
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge.score(0, 2, [10, 11, 65, 66, 99])
+    assert bridge.align_group_n == 1
+    assert bridge.align_group_sum == 1.0
+
+    bridge.teacher = _ScoreManyTeacherAdapter(_EmptyAlignmentTeacher())
+    bridge._text_teacher_batcher = None
+    bridge.score(0, 2, [10, 11, 65, 66, 99])
+
+    assert bridge.empty_alignments == 1
+    # the empty sequence moved empty_alignments, and left the granularity mean untouched.
+    assert bridge.align_group_n == 1
+    assert bridge.align_group_sum == 1.0
+
+
+def test_bridge_granularity_survives_resume_without_reading_the_coverage_aliases():
+    # granularity_sum / granularity_n are LEGACY ALIASES for coverage. resuming granularity from
+    # them would silently restore coverage under the granularity name, so an old-format state must
+    # restart the accumulator at zero rather than inherit the wrong quantity.
+    resumed = _text_bridge(_BridgeTeacher())
+    state = dict(_resume_accounting())
+    state.update({"align_group_sum": 6.0, "align_group_n": 3})
+    carried = _TeacherAlignmentBridge(
+        prompts=list(resumed.prompts),
+        tokenizer=_BridgeTokenizer(),
+        teacher=_ScoreManyTeacherAdapter(_BridgeTeacher()),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+        initial_state=state,
+    )
+    assert carried.align_group_sum == 6.0
+    assert carried.align_group_n == 3
+    snapshot = carried.accounting_snapshot()
+    assert snapshot["align_group_sum"] == 6.0
+    assert snapshot["align_group_n"] == 3
+
+    legacy_only = _TeacherAlignmentBridge(
+        prompts=list(resumed.prompts),
+        tokenizer=_BridgeTokenizer(),
+        teacher=_ScoreManyTeacherAdapter(_BridgeTeacher()),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+        initial_state=_resume_accounting(),
+    )
+    # granularity_sum is 3.5 and granularity_n is 5 in that state; both must be ignored here.
+    assert legacy_only.align_group_sum == 0.0
+    assert legacy_only.align_group_n == 0
+    # the coverage accumulators, whose aliases those really are, DO still resume from them.
+    assert legacy_only.coverage_sum == 3.5
+    assert legacy_only.aligned_sequences == 5
 
 
 def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests():
@@ -4917,6 +5006,109 @@ def test_deterministic_seed_uses_every_rollout_identity_component():
     assert 0 <= baseline < 2**63
 
 
+
+
+def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
+    import inspect
+
+    from flash.engine.worker.opd_verl import run_opd_verl
+
+    notes = inspect.getsource(run_opd_verl)
+    notes = notes[notes.index("_w.write_train_meta(") :]
+    # `steps` is the REQUESTED horizon. a step whose batch carried no teacher signal never applies
+    # an update, so reporting the horizon as the work done would overstate a partly-starved run.
+    assert '"steps": update_horizon,' in notes
+    assert '"opt_steps": len(final_accounting["loss_curve"]),' in notes
+
+
+def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
+    import inspect
+
+    from flash.engine.worker.opd_verl import run_opd_verl
+
+    source = inspect.getsource(run_opd_verl)
+    # record_step only checks that each metric line FOLLOWS the previous one, so it cannot notice a
+    # MISSING TRAILING metric: on_line silently skips any step-tagged line whose loss it cannot
+    # parse, and no later step ever arrives to trip the sequence check. that leaves a curve of
+    # length N-1 for a run verl actually checkpointed at step N, and opt_steps is published straight
+    # from that curve. the guard must compare against final_step, not merely require non-emptiness.
+    assert 'if len(final_accounting["loss_curve"]) != final_step:' in source
+    guard = source[source.index('if len(final_accounting["loss_curve"]) != final_step:') :]
+    assert "raise RuntimeError(" in guard[:600]
+    # and it must sit BEFORE the publish, not after it.
+    assert source.index('if len(final_accounting["loss_curve"]) != final_step:') < source.index(
+        "_w.write_train_meta("
+    )
+
+
+def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
+    import inspect
+
+    from flash.engine.worker.opd_verl import run_opd_verl
+
+    notes = inspect.getsource(run_opd_verl)
+    notes = notes[notes.index("_w.write_train_meta(") :]
+    # only the single-turn text path runs through the batcher, and it holds one serial scoring
+    # thread. multimodal scores one item per call and multi-turn batches an episode, both on the
+    # bridge's own request threads -- neither has a constant to report.
+    # the reported cap is bounded by the samples one step can actually produce, matching trl's
+    # _opd_teacher_batch_size: a 1-rollout step can never fill a batch of 8, so publishing the
+    # global cap there would describe a shape the run is structurally unable to reach.
+    assert (
+        '"opd_teacher_batch_size": (\n'
+        "                    min(_TEXT_TEACHER_BATCH_SIZE, max(1, prompts_per_step * knobs.group_size))\n"
+        "                    if not multimodal and not multi_turn\n"
+        "                    else None\n"
+        "                ),"
+    ) in notes
+    assert (
+        '"opd_teacher_workers": 1 if not multimodal and not multi_turn else None,'
+    ) in notes
+    # the engine length handed to vllm, not a hardcoded default: prompt filtering is carved out of
+    # this same number, so a fabricated one would disagree with the budget the run actually used.
+    assert '"vllm_max_model_len": max_model_len,' in notes
+
+
+def test_text_teacher_batcher_scores_one_batch_at_a_time():
+    # opd_teacher_workers reports 1 for the text path. that is only honest while the batcher scores
+    # serially, so assert the observable property rather than the thread count: no two score_many
+    # calls may ever overlap, however the batcher is wired internally.
+    from flash.engine.worker.opd_verl import _TextTeacherBatcher
+
+    class _OverlapDetectingTeacher:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.in_flight = 0
+            self.max_in_flight = 0
+
+        def score_many(self, items):
+            with self.lock:
+                self.in_flight += 1
+                self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            # hold the call open long enough that a second scoring thread would land inside it.
+            time.sleep(0.05)
+            with self.lock:
+                self.in_flight -= 1
+            return [
+                [TeacherToken(text=completion, logprob=-1.0, start=0, end=len(completion))]
+                for _prompt, completion in items
+            ]
+
+    teacher = _OverlapDetectingTeacher()
+    batcher = _TextTeacherBatcher(teacher, max_batch_size=1, flush_wait_s=0.01)
+    batcher.start()
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [
+                executor.submit(batcher.score, f"prompt-{index}", f"completion-{index}")
+                for index in range(8)
+            ]
+            for future in futures:
+                future.result(timeout=10.0)
+    finally:
+        batcher.close()
+
+    assert teacher.max_in_flight == 1
 
 
 def test_worker_structured_validator_runs_before_model_download():

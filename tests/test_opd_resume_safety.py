@@ -1123,6 +1123,62 @@ def test_gate_blocks_pinned_checkpoint_metadata_download_failure(monkeypatch, tm
         _run_gate()
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"align_group_sum": float("nan")},
+        {"align_group_sum": float("inf")},
+        {"align_group_sum": -1.0},
+        {"align_group_n": -1},
+        {"align_group_n": 1.5},
+        {"align_group_n": True},
+    ],
+)
+def test_resume_validator_rejects_corrupt_alignment_granularity(overrides):
+    # the verl worker resumes its granularity accumulators from these fields and publishes their
+    # ratio into train_meta. a tampered or corrupt checkpoint must fail the fail-closed contract
+    # here, not coerce past it and propagate a non-finite or negative mean into every later
+    # checkpoint and the run's reported alignment health.
+    state = _valid_resume_state(2, **overrides)
+    # match on the corrupt field itself: a validator that rejected for some unrelated reason would
+    # pass a bare raises() while leaving this pair entirely unchecked.
+    (field,) = overrides
+
+    with pytest.raises(ValueError, match=field):
+        validate_opd_resume_state_metadata(state, expected_seed=42, checkpoint_step=2)
+
+
+def test_resume_state_version_rejects_states_predating_alignment_granularity():
+    # the verl worker resumes align_group_sum/align_group_n and publishes their ratio as
+    # mean_align_granularity. a state written before those accumulators existed carries neither, so
+    # resuming one restarts the accumulator at zero and the ratio would describe only the
+    # post-resume samples while being reported as the whole run's alignment health. the contract
+    # version is the enforcement point: it must have moved past 2 so the existing fail-closed check
+    # refuses those states outright.
+    assert OPD_RESUME_STATE_VERSION > 2
+
+    stale = _valid_resume_state(2)
+    stale["contract_version"] = 2
+
+    with pytest.raises(ValueError, match="contract_version"):
+        validate_opd_resume_state_metadata(stale, expected_seed=42, checkpoint_step=2)
+
+
+def test_resume_validator_accepts_alignment_granularity_and_states_without_it():
+    # verl writes the pair; trl does not. both must validate, so the fields are checked when present
+    # rather than required -- otherwise adding them would reject every trl checkpoint.
+    with_granularity = _valid_resume_state(2, align_group_sum=3.0, align_group_n=2)
+    validated = validate_opd_resume_state_metadata(
+        with_granularity, expected_seed=42, checkpoint_step=2
+    )
+    assert validated["align_group_sum"] == 3.0
+    assert validated["align_group_n"] == 2
+
+    without = _valid_resume_state(2)
+    assert "align_group_sum" not in without
+    validate_opd_resume_state_metadata(without, expected_seed=42, checkpoint_step=2)
+
+
 def test_shared_resume_metadata_validator_returns_a_copy():
     state = _valid_resume_state(3)
 
