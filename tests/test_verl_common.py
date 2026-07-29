@@ -389,3 +389,86 @@ def test_run_verl_training_kills_the_grandchild_not_just_the_direct_child(tmp_pa
             return
         time.sleep(0.05)
     pytest.fail(f"grandchild {grandchild} survived teardown and is still holding the gpu")
+
+
+def test_child_output_tail_retains_bounded_recent_lines():
+    tail = vc.ChildOutputTail(limit=3)
+    for i in range(6):
+        tail.record(f"line{i}\n")
+    # bounded: the oldest are evicted, the most recent survive in order.
+    assert tail.tail() == ["line3", "line4", "line5"]
+    assert tail.tail(limit=2) == ["line4", "line5"]
+    # a limit wider than the buffer is not an error and does not pad.
+    assert tail.tail(limit=99) == ["line3", "line4", "line5"]
+
+
+def test_child_output_tail_drops_blank_lines_and_caps_line_width():
+    tail = vc.ChildOutputTail()
+    tail.record("\n")
+    tail.record("   \n")  # whitespace-only survives rstrip("\n") and is intentionally kept
+    tail.record("x" * 5000 + "\n")
+    kept = tail.tail()
+    assert "" not in kept, "a bare newline must not occupy a slot in the window"
+    widest = max(len(line) for line in kept)
+    assert widest <= vc._CHILD_TAIL_LINE_CHARS, (
+        f"retained a {widest}-char line; verl prints multi-KB config blocks and the tail "
+        "has to ride inside an uploaded heartbeat payload"
+    )
+
+
+def test_run_verl_training_records_child_output_into_the_tail():
+    """the child's words must reach the tail, because the parent's stdout reaches no log stream."""
+    tail = vc.ChildOutputTail()
+    code = vc.run_verl_training(
+        ["bash", "-c", "echo 'ray placement group pending'; echo 'step: 1'; echo 'wedged here'"],
+        env=dict(os.environ),
+        tail=tail,
+    )
+    assert code == 0
+    captured = tail.tail()
+    # this is the diagnostic that was unretrievable in production: the child's last line before it
+    # stopped producing output (ISSUES VERL-061).
+    assert captured[-1] == "wedged here"
+    assert "ray placement group pending" in captured
+
+
+def test_run_verl_training_without_a_tail_is_unchanged():
+    """tail is opt-in; omitting it must not alter streaming or the exit code."""
+    lines: list[str] = []
+    code = vc.run_verl_training(
+        ["bash", "-c", "echo 'step: 4'; exit 3"],
+        env=dict(os.environ),
+        on_line=lines.append,
+    )
+    assert code == 3
+    assert lines == ["step: 4\n"]
+
+
+def test_stall_tail_fields_reports_only_before_the_first_step():
+    tail = vc.ChildOutputTail()
+    tail.record("ray: placement group pending\n")
+
+    # pre-first-step: this is the blind window, so the child's words must be carried out.
+    fields = vc.stall_tail_fields(0, tail)
+    assert fields == {"child_tail": ["ray: placement group pending"]}
+
+    # once training progresses the step/loss stream is the diagnostic; the tail would be pure
+    # payload bloat on every tick.
+    assert vc.stall_tail_fields(1, tail) == {}
+    assert vc.stall_tail_fields(500, tail) == {}
+
+
+def test_stall_tail_fields_is_empty_when_the_child_has_said_nothing():
+    # an empty key would claim the child spoke and said nothing, which is a different fact from
+    # "the child has produced no output at all".
+    assert vc.stall_tail_fields(0, vc.ChildOutputTail()) == {}
+
+
+def test_stall_tail_fields_narrows_to_the_most_recent_lines():
+    tail = vc.ChildOutputTail()
+    for i in range(vc.STALL_TAIL_LINES + 25):
+        tail.record(f"line{i}\n")
+    carried = vc.stall_tail_fields(0, tail)["child_tail"]
+    assert len(carried) == vc.STALL_TAIL_LINES
+    # the most recent lines are the ones that matter: they are what the child said last.
+    assert carried[-1] == f"line{vc.STALL_TAIL_LINES + 24}"

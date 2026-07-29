@@ -67,6 +67,7 @@ from flash.engine.worker.tokenizer_align import (
     groupwise_coverage,
 )
 from flash.engine.worker.verl_common import (
+    ChildOutputTail,
     agent_loop_workers,
     clamp_engine_len,
     latest_global_step_dir,
@@ -76,6 +77,7 @@ from flash.engine.worker.verl_common import (
     render_wandb_link_shim,
     resolve_verl_python,
     run_verl_training,
+    stall_tail_fields,
 )
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resume_state_metadata
 
@@ -2481,6 +2483,11 @@ def run_opd_verl(spec=None) -> None:
         def child_heartbeat() -> None:
             _w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
 
+        child_tail = ChildOutputTail()
+
+        def liveness_fields() -> dict[str, object]:
+            return stall_tail_fields(int(progress["step"] or 0), child_tail)
+
         gpu_sampler = _NvidiaSmiPeakSampler().start()
         train_started_at = time.time()
         return_code = 0
@@ -2493,6 +2500,7 @@ def run_opd_verl(spec=None) -> None:
                     "opd_step",
                     progress=lambda: int(progress["step"] or 0),
                     progress_step=True,
+                    fields=liveness_fields,
                 ):
                     return_code = run_verl_training(
                         command,
@@ -2500,6 +2508,7 @@ def run_opd_verl(spec=None) -> None:
                         on_step=on_step,
                         on_line=on_line,
                         heartbeat=child_heartbeat,
+                        tail=child_tail,
                     )
                     training_completed = return_code == 0
         finally:
