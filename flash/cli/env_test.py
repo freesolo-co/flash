@@ -148,6 +148,8 @@ def _new_record() -> dict:
         "reward": None,
         "prompt": [],
         "responses": [],
+        # the gold text of each replayed turn, which a negative control has to be wrong against.
+        "reference_turns": [],
         # True when the gold transcript could not be replayed verbatim (see _turn_is_representable).
         "partial_replay": False,
     }
@@ -175,16 +177,20 @@ def _drive_single_turn(env, example: dict, record: dict) -> None:
     if policy == "replay" and response != reference_turns[-1]:
         record["partial_replay"] = True
     record["responses"] = [response]
+    # what the single-turn scorer actually grades, which is the one text a control must be wrong
+    # against. the earlier assistant turns are already excluded from the gate via partial_replay.
+    record["reference_turns"] = [response] if policy == "replay" else []
     record["turns"] = 1
     record["reward"] = float(env.reward(response, example))
 
 
-def _drive_multi_turn(env, example: dict, record: dict) -> None:
+def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str]]:
+    """Drive one offline multi-turn rollout, returning the final state and the turns taken.
+
+    `turn_content(index)` supplies the model's text for each turn, so the same loop can replay a
+    gold transcript or a deliberately wrong one.
+    """
     state = env.new_rollout_state(example)
-    record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
-    reference_turns, record["partial_replay"] = _reference_turns(env, example)
-    policy = _resolve_policy(reference_turns)
-    record["policy"] = policy
     # mirror the worker turn loop (flash/engine/multiturn_rollout.py): drive one model
     # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
     # env yields no reply. the hard cap is fixed at what the trainer passes (env.max_turns)
@@ -192,17 +198,12 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     # stepping env terminates here exactly as it would in training; no separate
     # non-termination guard is needed.
     hard_cap = int(env.max_turns)
-    turns = 0
+    responses: list[str] = []
     while True:
-        if policy == "replay" and turns < len(reference_turns):
-            content = reference_turns[turns]
-        else:
-            content = _ECHO_RESPONSE
-        record["responses"].append(content)
+        content = turn_content(len(responses))
+        responses.append(content)
         env.record_model_turn(state, content)
-        turns += 1
-        record["turns"] = turns
-        if turns >= hard_cap or env.rollout_done(state, max_turns=hard_cap):
+        if len(responses) >= hard_cap or env.rollout_done(state, max_turns=hard_cap):
             break
         env_msgs = env.env_reply(state["messages"], state)
         if not env_msgs:
@@ -213,6 +214,30 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
         _check_messages(env_msgs, "env_reply")
         if env.rollout_done(state, max_turns=hard_cap):
             break
+    return state, responses
+
+
+def _drive_multi_turn(env, example: dict, record: dict) -> None:
+    reference_turns, record["partial_replay"] = _reference_turns(env, example)
+    policy = _resolve_policy(reference_turns)
+    record["policy"] = policy
+
+    def content(index: int) -> str:
+        if policy == "replay" and index < len(reference_turns):
+            return reference_turns[index]
+        return _ECHO_RESPONSE
+
+    state, responses = _run_rollout(env, example, content)
+    record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
+    record["responses"].extend(responses)
+    record["turns"] = len(responses)
+    record["reference_turns"] = reference_turns
+    # the env kept the rollout going past the gold transcript, so the tail of `responses` is echo
+    # filler rather than the reference. the reward below then grades a transcript no correct policy
+    # would produce, which is not the gold reward and must not feed the flat-reward gate -- the same
+    # reason a partially representable transcript is excluded.
+    if policy == "replay" and len(responses) != len(reference_turns):
+        record["partial_replay"] = True
 
     record["reward"] = float(env.reward("", example, state))
 
@@ -235,13 +260,40 @@ def _control_is_disjoint(control: str, reference: str) -> bool:
     return not any(word in lowered for word in gold.split())
 
 
-def _negative_control_rewards(env, example: dict, reference: str) -> list[float] | None:
-    """Score deliberately wrong single-turn answers, or None when that is not meaningful.
+def _score_control(env, example: dict, control: str, multi_turn: bool) -> float:
+    """Score one deliberately wrong answer the way training would score it.
+
+    A grader that raises here is not inconclusive: GRPO's reward_fn catches exactly that and scores
+    the completion 0.0 (flash/engine/worker/rl.py), so training would see a real number. Record that
+    same 0.0, otherwise a row that genuinely separates gold from wrong is dropped and a later tied
+    row can fail the whole sample alone.
+
+    Raises ValueError when the grader returns a non-finite score, which is the same contract
+    violation the gold answer is already failed for: the policy reaches this scorer with completions
+    no more expected than these, and NaN or infinity there yields unusable samples.
+    """
+    try:
+        if multi_turn:
+            # a multi-turn reward reads the accumulated rollout state, so a comparable wrong
+            # episode has to be driven, not assembled -- replay the same loop answering `control`
+            # at every turn.
+            state, _ = _run_rollout(env, example, lambda _index: control)
+            score = float(env.reward("", example, state))
+        else:
+            score = float(env.reward(control, example))
+    except (Exception, SystemExit):
+        # mirrors reward_fn's own except branch: the run would score this 0.0 and carry on.
+        score = 0.0
+    if not math.isfinite(score):
+        raise ValueError(f"reward is not finite for a non-reference completion: {score}")
+    return score
+
+
+def _negative_control_rewards(env, example: dict, references: list[str]) -> list[float] | None:
+    """Score deliberately wrong answers, or None when that is not meaningful.
 
     This is the comparison that makes the flat-reward gate scale-independent: a grader is unusable
-    for RL when a wrong answer scores the same as the gold one, whatever that number is. Only the
-    single-turn path is controlled -- a multi-turn reward reads the accumulated rollout state, and
-    swapping one completion string cannot produce a comparable wrong episode.
+    for RL when a wrong answer scores the same as the gold one, whatever that number is.
 
     Every usable control is scored rather than just the first, so an episode counts as separated
     when *any* of them ranks below the gold answer. That keeps a permissive but working grader --
@@ -250,30 +302,15 @@ def _negative_control_rewards(env, example: dict, reference: str) -> list[float]
 
     Returns None when no control is provably wrong for this example, so the caller can exclude the
     episode instead of drawing a conclusion the evidence does not support.
-
-    A grader that raises on a control is not inconclusive: GRPO's reward_fn catches exactly that
-    and scores the completion 0.0 (flash/engine/worker/rl.py), so training would see a real number
-    there. Record that same 0.0 rather than discarding the episode, otherwise a row that genuinely
-    separates gold from wrong is dropped and a later tied row can fail the whole sample alone.
-
-    Raises ValueError when the grader returns a non-finite score, which is the same contract
-    violation the gold answer is already failed for: the policy reaches this scorer with
-    completions no more expected than these, and NaN or infinity there yields unusable samples.
     """
-    if env.multi_turn:
-        return None
-    scores = []
-    for control in _CONTROL_CANDIDATES:
-        if not _control_is_disjoint(control, reference):
-            continue
-        try:
-            score = float(env.reward(control, example))
-        except (Exception, SystemExit):
-            # mirrors reward_fn's own except branch: the run would score this 0.0 and carry on.
-            score = 0.0
-        if not math.isfinite(score):
-            raise ValueError(f"reward is not finite for a non-reference completion: {score}")
-        scores.append(score)
+    usable = [
+        control
+        for control in _CONTROL_CANDIDATES
+        # every gold turn has to be wrong under the control, since a multi-turn reward reads the
+        # whole transcript: a control matching any single turn is not a wrong episode.
+        if all(_control_is_disjoint(control, reference) for reference in references)
+    ]
+    scores = [_score_control(env, example, control, env.multi_turn) for control in usable]
     return scores or None
 
 
@@ -389,7 +426,9 @@ def cmd_env_test(args) -> int:
                 # SEPARATE a good completion from a bad one, so score wrong answers and compare.
                 # scored inside this guard because a non-finite control breaks the same reward
                 # contract as a non-finite gold score and must fail the episode the same way.
-                controls = _negative_control_rewards(env, example, record["responses"][0])
+                controls = _negative_control_rewards(
+                    env, example, record["reference_turns"] or record["responses"][:1]
+                )
         except (Exception, SystemExit) as exc:
             failure = str(exc) or exc.__class__.__name__
 
