@@ -309,6 +309,7 @@ def _build_verl_training_cfg(
         "top_p": inp["top_p"],
         "kl_coef": inp["kl_coef"],
         "entropy_quantile": inp["entropy_quantile"],
+        "stop_sequences": inp["stop_sequences"],
         "thinking": thinking,
         "loss_agg_mode": "seq-mean-token-sum-norm",
         "seed": inp["seed"],
@@ -351,6 +352,7 @@ def _build_verl_train_notes(
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],
+            "stop_sequences": list(inp["stop_sequences"]),
             "temperature": inp["temperature"],
             "top_p": inp["top_p"],
             "ppo_epochs": inp["ppo_epochs"],
@@ -363,6 +365,59 @@ def _build_verl_train_notes(
 
 
 _ENTROPY_QUANTILE_MARKER = "[flash-verl] top-entropy token masking active"
+_STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
+
+
+def render_stop_sequences_shim(stop_sequences: tuple[str, ...]) -> str:
+    """return the sitecustomize source that gives verl's rollout trl's stop-string behavior.
+
+    on the trl backend flash puts ``stop`` into ``generation_kwargs``, which reaches vllm's
+    ``SamplingParams`` unchanged. verl builds its sampling params as a literal dict in
+    ``AgentLoopWorker.generate_sequences`` (agent_loop.py) with no stop field and no passthrough, so
+    the key has to be inserted there. the value then rides the existing dict all the way into
+    ``SamplingParams(max_tokens=..., **sampling_params)`` in the vllm server, which accepts it.
+
+    the patch lands on ``_run_agent_loop`` rather than the vllm server because the worker owns the
+    dict: patching further down would have to reconstruct which request the params belong to, and
+    the tool/multi-turn loops pass the same dict through untouched.
+
+    token-level semantics match trl exactly. vllm truncates ``output_text`` at a stop-string match
+    but leaves ``token_ids`` intact, and both backends read ``output.token_ids`` -- so the trained
+    tokens are the same on either backend, including the trailing delimiter tokens.
+    """
+    if not stop_sequences:
+        return ""
+    return f'''
+from verl.experimental.agent_loop import agent_loop as _flash_agent_loop
+
+_flash_stop_sequences = {list(stop_sequences)!r}
+
+
+def _flash_patch_run_agent_loop():
+    """add ``stop`` to the per-sample sampling params on their way into the agent loop.
+
+    ``_run_agent_loop`` receives the fully-built dict for one sample, after verl has applied its
+    validation/greedy overrides. patching here rather than at dict construction means the stop
+    strings survive those overrides and apply to validation rollouts too, matching trl, where the
+    stop list lives in generation_kwargs and is not swapped out for eval.
+    """
+    original = _flash_agent_loop.AgentLoopWorker._run_agent_loop
+
+    async def _run_agent_loop(self, sampling_params, *args, **kwargs):
+        params = dict(sampling_params)
+        params["stop"] = list(_flash_stop_sequences)
+        return await original(self, params, *args, **kwargs)
+
+    _flash_agent_loop.AgentLoopWorker._run_agent_loop = _run_agent_loop
+
+
+# patch once. wrapping twice would be harmless here (the key is overwritten, not appended) but the
+# guard keeps the behavior obvious and matches the entropy shim.
+if not getattr(_flash_agent_loop.AgentLoopWorker._run_agent_loop, "_flash_stop_patched", False):
+    _flash_patch_run_agent_loop()
+    _flash_agent_loop.AgentLoopWorker._run_agent_loop._flash_stop_patched = True
+    print({_STOP_SEQUENCES_MARKER!r} + " " + repr(_flash_stop_sequences), flush=True)
+'''
 
 
 def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
@@ -888,11 +943,11 @@ def _resolve_single_turn_inputs():
             "train.structured_outputs is not yet supported on the verl backend; use the trl backend "
             "(unset FLASH_RL_BACKEND) until guided-decoding parity lands."
         )
-    if _t and getattr(_t, "stop_sequences", ()):
-        raise RuntimeError(
-            "train.stop_sequences is not yet supported on the verl backend (verl's vllm rollout has "
-            "no stop-string field here); use the trl backend (unset FLASH_RL_BACKEND) for it."
-        )
+    # stop_sequences: on the trl backend these ride generation_kwargs["stop"] into vllm's
+    # SamplingParams. verl builds its sampling params without a stop field, so a sitecustomize shim
+    # inserts the key; see render_stop_sequences_shim. note grpo_mask_truncated_completions below
+    # gates itself OFF when stop_sequences is set, on either backend.
+    stop_sequences = tuple(str(s) for s in (getattr(_t, "stop_sequences", ()) or ())) if _t else ()
     # entropy_quantile drives trl GRPOTrainer's internal top-entropy token masking
     # (top_entropy_quantile). verl has no such knob, so a sitecustomize shim adds it; see
     # render_entropy_quantile_shim. a value >= 1.0 (or unset) masks nothing and needs no shim.
@@ -1059,6 +1114,7 @@ def _resolve_single_turn_inputs():
         "think_penalty": think_penalty,
         "kl_coef": kl_coef,
         "entropy_quantile": entropy_quantile,
+        "stop_sequences": stop_sequences,
         "max_completion": max_completion,
         "max_prompt_len": prompt_budget,
         # the engine's full sequence length (prompt + completion), already clamped to the model's
@@ -1160,7 +1216,16 @@ def run_rl_verl():
     shim_dir = os.path.join(workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
     shim_py = os.path.join(shim_dir, "sitecustomize.py")
-    shim_source = render_entropy_quantile_shim(inp["entropy_quantile"])
+    # one sitecustomize holds every patch: python imports it once, so a second file would never be
+    # loaded. each renderer returns "" when its feature is off, so the default path writes nothing.
+    shim_source = "".join(
+        part
+        for part in (
+            render_entropy_quantile_shim(inp["entropy_quantile"]),
+            render_stop_sequences_shim(inp["stop_sequences"]),
+        )
+        if part
+    )
     if shim_source:
         with open(shim_py, "w") as f:
             f.write(shim_source)

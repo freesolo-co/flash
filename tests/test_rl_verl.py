@@ -63,6 +63,7 @@ def _overrides_cfg(**over):
         "max_model_len": 2368, "max_token_len_per_gpu": 2368,
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
         "entropy_quantile": None,
+        "stop_sequences": (),
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
         "steps": 60, "gpu_mem_util": 0.5, "n_gpus": 1, "loggers": "console", "fp8_kv": False,
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
@@ -236,7 +237,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
         "prompts_per_step": 16, "mask_truncated_completions": True,
         "max_prompt_len": 3072, "max_completion": 1024, "engine_len": 4096,
-        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "entropy_quantile": None, "seed": 42,
+        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (), "seed": 42,
         "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
         "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
     }
@@ -927,6 +928,56 @@ def test_resolve_single_turn_inputs_no_longer_rejects_entropy_quantile():
     assert '"entropy_quantile": entropy_quantile' in source
 
 
+def test_stop_sequences_shim_is_emitted_only_when_stop_strings_are_requested():
+    assert rl_verl.render_stop_sequences_shim(()) == ""
+    source = rl_verl.render_stop_sequences_shim(("</answer>", "\n\nQ:"))
+    assert source
+    # the exact list must survive into the child verbatim, escaping included -- a mangled delimiter
+    # would silently never fire and the run would look normal.
+    assert "_flash_stop_sequences = ['</answer>', '\\n\\nQ:']" in source
+    assert rl_verl._STOP_SEQUENCES_MARKER in source
+
+
+def test_stop_sequences_shim_patches_the_per_sample_params_not_the_config():
+    # _run_agent_loop receives the per-sample dict AFTER verl applies its validate/greedy overrides,
+    # so patching there keeps stop strings on eval rollouts too -- matching trl, where the stop list
+    # lives in generation_kwargs and is not swapped out for validation.
+    source = rl_verl.render_stop_sequences_shim(("</answer>",))
+    assert "AgentLoopWorker._run_agent_loop" in source
+    assert 'params["stop"] = list(_flash_stop_sequences)' in source
+    # the dict is copied before mutation: verl reuses sample_sampling_params across the batch.
+    assert "params = dict(sampling_params)" in source
+
+
+def test_stop_sequences_shim_refuses_to_wrap_itself_twice():
+    source = rl_verl.render_stop_sequences_shim(("</answer>",))
+    assert '_flash_stop_patched", False)' in source
+
+
+def test_stop_sequences_gate_off_truncated_completion_masking():
+    # main couples these: stop-string rollouts do not end on EOS, so masking truncated completions
+    # would wrongly drop every one of them. the verl resolver must inherit that coupling, not
+    # re-derive it.
+    source = inspect.getsource(rl_verl._resolve_single_turn_inputs)
+    assert "_w.grpo_mask_truncated_completions(_t)" in source
+    assert not W.grpo_mask_truncated_completions(
+        SimpleNamespace(stop_sequences=("</answer>",))
+    )
+    assert W.grpo_mask_truncated_completions(SimpleNamespace(stop_sequences=()))
+
+
+def test_both_shims_compose_into_one_sitecustomize():
+    # python imports sitecustomize once, so a second file would never load. the renderers must
+    # concatenate into a single source rather than each owning a file.
+    source = inspect.getsource(rl_verl.run_rl_verl)
+    assert 'render_entropy_quantile_shim(inp["entropy_quantile"])' in source
+    assert 'render_stop_sequences_shim(inp["stop_sequences"])' in source
+    combined = rl_verl.render_entropy_quantile_shim(0.2) + rl_verl.render_stop_sequences_shim(
+        ("</answer>",)
+    )
+    compile(combined, "sitecustomize.py", "exec")
+
+
 def test_build_verl_overrides_enable_fused_linear_ce():
     # 32k GRPO must not materialize [tokens, vocab] logits; fused torch-backend linear-CE
     # computes logprobs from hidden states in chunks (numerically exact).
@@ -1087,6 +1138,7 @@ def test_train_notes_report_whether_the_run_resumed():
         "group_size": 4,
         "kl_coef": 0.0,
         "entropy_quantile": None,
+        "stop_sequences": (),
         "temperature": 1.0,
         "top_p": 1.0,
         "ppo_epochs": 1,
