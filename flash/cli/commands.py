@@ -21,7 +21,7 @@ from flash.client import (
     save_credentials,
     verify_freesolo_key,
 )
-from flash.client.config import api_url_source, load_credentials, load_credentials_with_source
+from flash.client.config import credential_snapshot, load_credentials
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
@@ -136,9 +136,15 @@ def _identity_or_none(api_key: str, api_url: str) -> dict | None:
 
 
 def cmd_whoami(args) -> int:
-    api_url, _, key_source = load_credentials_with_source()
-    me = client_from_config().me()
-    print(render.whoami(me, key_source, api_url, api_url_source()))
+    # one snapshot for all four values: a concurrent `flash login` between reads would otherwise let
+    # whoami fetch the identity from one control plane and print another one's url and source.
+    api_url, api_key, key_source, url_source = credential_snapshot()
+    if not api_key:
+        raise ClientError(
+            "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
+        )
+    me = ApiClient(api_url, api_key, key_source=key_source).me()
+    print(render.whoami(me, key_source, api_url, url_source))
     return 0
 
 
