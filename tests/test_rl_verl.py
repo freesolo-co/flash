@@ -322,48 +322,8 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
     # UNCLAMPED context. those prompts plus the completion allowance overflow the engine vllm was
     # actually given, so they die at rollout instead of training on the shorter context. every
     # length must descend from one clamped value.
-    from flash.engine.worker._pkg import W
-    from flash.spec import JobSpec
-
-    class _Env:
-        multi_turn = False
-        is_tool_env = False
-
-        def dataset(self):
-            return [{"index": i} for i in range(8)]
-
-        def prompt_messages(self, ex):
-            return [{"role": "user", "content": f"question {ex['index']}"}]
-
-    class _Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
-
-        def apply_chat_template(self, messages, **kwargs):
-            return messages[0]["content"]
-
-        def __call__(self, text, **kwargs):
-            return SimpleNamespace(input_ids=[1])
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "grpo",
-            # asks for twice the architecture's context.
-            "train": {"batch_size": 4, "epochs": 1, "max_context_tokens": 65536},
-        }
-    )
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "SEED", 42, raising=False)
-    monkeypatch.setattr(W, "THINKING", False, raising=False)
-    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
-    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
-    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
-    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
-    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 32768)
-
-    inp = rl_verl._resolve_single_turn_inputs()
+    # asks for twice the architecture's context (model_max_position_embeddings is pinned to 32768).
+    inp = _capability_resolve(monkeypatch, _capability_env(), train={"max_context_tokens": 65536})
     assert inp["engine_len"] == 32768
     # the prompt filter's budget is carved out of the clamped engine, not the requested 65536.
     assert inp["max_prompt_len"] + inp["max_completion"] == 32768
@@ -388,47 +348,12 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
 
 def _save_steps_inputs(monkeypatch, *, save_at_steps=None, save_every=None, max_steps=100):
     """resolve grpo verl inputs for a job with (or without) exact save steps."""
-    from flash.engine.worker._pkg import W
-    from flash.spec import JobSpec
-
-    class _Env:
-        multi_turn = False
-        is_tool_env = False
-
-        def dataset(self):
-            return [{"index": i} for i in range(8)]
-
-        def prompt_messages(self, ex):
-            return [{"role": "user", "content": f"question {ex['index']}"}]
-
-    class _Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
-
-        def apply_chat_template(self, messages, **kwargs):
-            return messages[0]["content"]
-
-        def __call__(self, text, **kwargs):
-            return SimpleNamespace(input_ids=[1])
-
-    train: dict = {"batch_size": 4, "epochs": 1, "max_steps": max_steps}
+    train: dict = {"max_steps": max_steps}
     if save_at_steps is not None:
         train["save_at_steps"] = list(save_at_steps)
     if save_every is not None:
         train["save_every"] = save_every
-    spec = JobSpec.from_dict(
-        {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo", "train": train}
-    )
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "SEED", 42, raising=False)
-    monkeypatch.setattr(W, "THINKING", False, raising=False)
-    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
-    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
-    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
-    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
-    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 32768)
-    return rl_verl._resolve_single_turn_inputs()
+    return _capability_resolve(monkeypatch, _capability_env(), train=train)
 
 
 def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
@@ -1343,3 +1268,119 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
     assert notes["ppo_max_token_len_per_gpu"] == 4096
     # trl pins vllm's prefill batch because it hardcodes 4096; this path sets no such override.
     assert notes["vllm_max_num_batched_tokens"] is None
+
+
+# ------------------- capability guards: the four specs verl grpo refuses -------------------
+# these four raises are the ONLY thing standing between a trl-supported job and a verl run that
+# trains on a different contract. they had no regression coverage: every resolver test above drives
+# the happy path, so deleting any guard left the suite green. each test below asserts one rejection
+# by its own message, because a bare pytest.raises(RuntimeError) passes on any of the ~20 other
+# raises in this resolver.
+
+
+def _capability_env(*, multi_turn=False, is_tool_env=False, images=False):
+    """a minimal single-turn text env, optionally flipped to a shape verl grpo rejects."""
+
+    class _Env:
+        def __init__(self):
+            self.multi_turn = multi_turn
+            self.is_tool_env = is_tool_env
+
+        def dataset(self):
+            return [{"index": i} for i in range(8)]
+
+        def prompt_messages(self, ex):
+            if images:
+                # record_has_images matches an image content BLOCK, so build the real shape rather
+                # than a sentinel key the guard would not see.
+                return [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"question {ex['index']}"},
+                            {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+                        ],
+                    }
+                ]
+            return [{"role": "user", "content": f"question {ex['index']}"}]
+
+    return _Env()
+
+
+def _capability_resolve(monkeypatch, env, train=None, overrides=None):
+    """run the resolver against one env, with everything else on the supported path."""
+    from flash.engine.worker._pkg import W as _PkgW
+    from flash.spec import JobSpec
+
+    class _Tokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "prompt"
+
+        def __call__(self, text, **kwargs):
+            return SimpleNamespace(input_ids=[1])
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "train": {"batch_size": 4, "epochs": 1, **(train or {})},
+        }
+    )
+    monkeypatch.setattr(_PkgW, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(_PkgW, "SEED", 42, raising=False)
+    monkeypatch.setattr(_PkgW, "THINKING", False, raising=False)
+    monkeypatch.setattr(_PkgW, "require_active_env", lambda: env, raising=False)
+    monkeypatch.setattr(_PkgW, "grpo_overrides", lambda: dict(overrides or {}), raising=False)
+    monkeypatch.setattr(_PkgW, "grpo_mask_truncated_completions", lambda t: False, raising=False)
+    monkeypatch.setattr(_PkgW, "load_tokenizer", lambda *a, **k: _Tokenizer(), raising=False)
+    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 32768)
+    return rl_verl._resolve_single_turn_inputs()
+
+
+def test_capability_guard_rejects_multi_turn_env(monkeypatch):
+    # trl grpo drives multi-turn through a rollout func (rl.py select_grpo_trainer); the verl path
+    # has no equivalent, so it must refuse rather than train only the first turn.
+    with pytest.raises(RuntimeError, match="single-turn, non-tool"):
+        _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+
+
+def test_capability_guard_rejects_tool_env(monkeypatch):
+    # trl grpo hands tool schemas AND callables to the trainer; verl gets neither, so a tool env
+    # would train against completions that never call a tool.
+    with pytest.raises(RuntimeError, match="single-turn, non-tool"):
+        _capability_resolve(monkeypatch, _capability_env(is_tool_env=True))
+
+
+def test_capability_guard_rejects_image_prompts(monkeypatch):
+    # this guard runs AFTER prompt_messages is built, so it needs a real image content block, not a
+    # flag. trl selects a multimodal trainer here; verl grpo is text-only and would silently drop
+    # the image, training the model on the caption alone.
+    with pytest.raises(RuntimeError, match="non-multimodal grpo only"):
+        _capability_resolve(monkeypatch, _capability_env(images=True))
+
+
+def test_capability_guard_rejects_kl_anchored_warm_start(monkeypatch):
+    # verl computes its kl reference with adapters DISABLED, so under init_from_adapter the
+    # reference is the bare base model and the penalty drags the policy away from the sft start -
+    # the opposite of what the knob asks for. must raise until verl can hold a reference adapter.
+    # the kl coefficient arrives through grpo_overrides, so it must go through the helper: patching
+    # it separately gets clobbered by the helper's own patch and the test then fails on the adapter
+    # download instead, passing a bare raises() while proving nothing about this guard.
+    with pytest.raises(RuntimeError, match="kl_penalty_coef"):
+        _capability_resolve(
+            monkeypatch,
+            _capability_env(),
+            train={"init_from_adapter": "org/some-sft-adapter"},
+            overrides={"kl_penalty_coef": 0.1},
+        )
+
+
+def test_capability_guards_admit_the_supported_single_turn_text_env(monkeypatch):
+    # the control: with none of the four shapes present the resolver must run to completion, so a
+    # guard that fires on every env would fail here instead of passing the four tests above.
+    inp = _capability_resolve(monkeypatch, _capability_env())
+    assert inp["max_prompt_len"] > 0
