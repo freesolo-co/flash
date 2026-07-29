@@ -33,6 +33,7 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
         "rl_data_loading",
         "rl_adapter_loading",
         "sft_pretokenizing",
+        "sft_configuring",
         "opd_filtering_prompts",
         "sft_initializing",
         "rl_initializing",
