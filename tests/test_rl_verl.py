@@ -1402,27 +1402,30 @@ def test_capability_guard_rejects_kl_anchored_warm_start(monkeypatch):
         )
 
 
-def test_capability_guard_rejects_per_turn_credit_assignment(monkeypatch):
-    # trl swaps in GRPOPerTurnTrainer for per_turn (rl.py select_grpo_trainer); verl has no
-    # equivalent. accepting the key would train per-episode while reporting success, so the run
-    # would silently optimize a different objective than the one configured.
-    with pytest.raises(RuntimeError, match="credit_assignment"):
-        _capability_resolve(
-            monkeypatch,
-            _capability_env(),
-            train={"credit_assignment": "per_turn"},
-        )
-
-
-def test_capability_guard_admits_the_default_credit_assignment(monkeypatch):
-    # the control for the guard above: per_episode is what verl actually implements, so stating it
-    # explicitly must not raise. without this, a guard that rejected every value would still pass.
+def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch, capsys):
+    # per_turn only diverges from per_episode when there is more than one assistant turn to credit:
+    # trl reaches GRPOPerTurnTrainer solely through use_rollout_func, which requires is_multi_turn.
+    # the multi-turn/tool guard above already rejects every env that could get there, so anything
+    # reaching here is single-turn and the two modes are the same objective -- trl accepts the key on
+    # exactly these envs. rejecting it would break configs that run correctly on the trl backend.
     inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(),
+        train={"credit_assignment": "per_turn"},
+    )
+    assert inp["max_prompt_len"] > 0
+    assert "equivalent to per_episode" in capsys.readouterr().out
+
+
+def test_default_credit_assignment_does_not_log_an_equivalence_note(monkeypatch, capsys):
+    # the control: the note above must be tied to an explicitly non-default value, not printed on
+    # every run. without this a hardcoded print would still satisfy the test above.
+    _capability_resolve(
         monkeypatch,
         _capability_env(),
         train={"credit_assignment": "per_episode"},
     )
-    assert inp["max_prompt_len"] > 0
+    assert "equivalent to per_episode" not in capsys.readouterr().out
 
 
 def test_capability_guards_admit_the_supported_single_turn_text_env(monkeypatch):

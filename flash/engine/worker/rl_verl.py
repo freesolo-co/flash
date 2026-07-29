@@ -1161,15 +1161,18 @@ def _resolve_single_turn_inputs():
     # render_entropy_quantile_shim. a value >= 1.0 (or unset) masks nothing and needs no shim.
     _eq = getattr(_t, "entropy_quantile", None) if _t else None
     entropy_quantile = float(_eq) if _eq is not None and float(_eq) < 1.0 else None
-    # credit_assignment: the trl path swaps in GRPOPerTurnTrainer for per_turn (see
-    # rl.py select_grpo_trainer). verl has no equivalent, so accepting the key here would train with
-    # per-episode credit while the run reports success -- a silently different objective.
+    # credit_assignment: per_turn only changes the objective when there is more than one assistant
+    # turn to credit -- trl reaches GRPOPerTurnTrainer solely via use_rollout_func, which requires
+    # is_multi_turn (rl.py select_grpo_trainer). the multi-turn/tool guard above already rejects every
+    # env that could get there, so anything still running here is single-turn, where the two modes are
+    # the same objective. trl says so itself and accepts the key ("per-turn is equivalent to
+    # per-episode for single-turn environments", rl.py). match that: log it, do not reject.
     credit_assignment = getattr(_t, "credit_assignment", DEFAULT_CREDIT_ASSIGNMENT) if _t else None
     if credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
-        raise RuntimeError(
-            f"credit_assignment={credit_assignment!r} is not supported on the verl grpo backend "
-            f"(it would silently train with {DEFAULT_CREDIT_ASSIGNMENT!r} credit); use the trl "
-            "backend (unset FLASH_RL_BACKEND) for it."
+        print(
+            f"[rl-verl] credit assignment: {credit_assignment} is equivalent to "
+            f"{DEFAULT_CREDIT_ASSIGNMENT} for single-turn environments",
+            flush=True,
         )
     # flash's lora dropout is fixed at 0.0; verl matches (peft default). guard defensively so a future
     # non-zero recipe value can never be silently ignored.
