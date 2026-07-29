@@ -66,7 +66,7 @@ def _overrides_cfg(**over):
         "steps": 60, "gpu_mem_util": 0.5, "n_gpus": 1, "loggers": "console", "fp8_kv": False,
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
         "mask_truncated_completions": True,
-        "total_epochs": 1, "save_freq": 20, "local_dir": "/w/ckpt",
+        "total_epochs": 1, "save_freq": 20, "ckpt_to_keep": 1, "local_dir": "/w/ckpt",
     }
     cfg.update(over)
     return cfg
@@ -237,7 +237,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "max_prompt_len": 3072, "max_completion": 1024, "engine_len": 4096,
         "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "seed": 42,
         "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
-        "verl_total_epochs": 2, "save_freq": 20,
+        "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
     }
     common = {
         "train_files": "/w/t.parquet", "val_files": "/w/v.parquet", "model_id": "Qwen/Qwen3-4B",
@@ -503,6 +503,55 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
     # step 20 never completed, so the run must fail rather than silently ship an incomplete set.
     with pytest.raises(RuntimeError, match="required saves were not durably published: \\[20\\]"):
         uploader.raise_if_incomplete()
+
+
+def test_resume_credits_required_steps_already_durable_on_hf(tmp_path, monkeypatch):
+    # a resumed run never re-saves a step it trained past. without crediting the earlier required
+    # steps a retry that resumes at 20 would report step 10 missing and fail a successful run.
+    monkeypatch.setattr(rl_verl, "_deployable_adapter_on_hf", lambda step: step == 10)
+
+    class _Tok:
+        def save_pretrained(self, path):
+            pass
+
+    uploader = rl_verl._VerlResumeUploader(
+        str(tmp_path),
+        resume_step=20,
+        required_steps=(10, 15, 25),
+        tokenizer=_Tok(),
+    )
+    uploader.credit_durable_required_steps(20)
+
+    # step 10 is verified on hf, so it is credited. step 15 is below the resume point but its
+    # adapter never landed, so it stays uncredited and completeness still catches it. step 25 is
+    # ahead of the resume point and is this run's job to publish.
+    assert uploader.published_steps == {10}
+    with pytest.raises(RuntimeError, match=r"not durably published: \[15, 25\]"):
+        uploader.raise_if_incomplete()
+
+
+def test_resume_step_is_not_credited_without_a_durable_adapter(tmp_path, monkeypatch):
+    # a preempted worker can advance past a required step without its deployable ever reaching hf,
+    # so the restored step counter alone must never credit a required save.
+    monkeypatch.setattr(rl_verl, "_deployable_adapter_on_hf", lambda step: False)
+
+    uploader = rl_verl._VerlResumeUploader(str(tmp_path), resume_step=10, required_steps=(10,))
+    uploader.credit_durable_required_steps(10)
+
+    assert uploader.published_steps == set()
+
+
+def test_checkpoint_retention_outlives_the_export_when_exact_saves_are_set(monkeypatch):
+    # verl prunes a checkpoint once the NEXT save completes, so keeping 1 gives the uploader a
+    # single save interval to export before its source is deleted. with a gcd of 1 that interval is
+    # one update, which races the export and can lose a required deployable.
+    exact = _save_steps_inputs(monkeypatch, save_at_steps=(10, 11))
+    assert exact["save_freq"] == 1
+    assert exact["ckpt_to_keep"] > 1
+
+    # nothing is exported mid-run without exact saves, so retention stays at its cheapest.
+    periodic = _save_steps_inputs(monkeypatch, save_every=15)
+    assert periodic["ckpt_to_keep"] == 1
 
 
 def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeypatch):

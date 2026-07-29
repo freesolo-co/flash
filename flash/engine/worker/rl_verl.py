@@ -37,6 +37,7 @@ from flash.engine.steps import (
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import sanitize_rollout_text
@@ -233,7 +234,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # honor [train].max_steps: total_training_steps caps the optimizer-update horizon.
         f"trainer.total_training_steps={cfg['steps']}",
         f"trainer.save_freq={cfg['save_freq']}",
-        "trainer.max_actor_ckpt_to_keep=1",
+        f"trainer.max_actor_ckpt_to_keep={cfg['ckpt_to_keep']}",
         # resume from whatever _restore_verl_resume staged into default_local_dir. auto is a no-op
         # when nothing was staged, so a fresh run is unaffected; without it a preempted run silently
         # restarts at step 0 and re-bills the whole budget.
@@ -317,6 +318,7 @@ def _build_verl_training_cfg(
         "total_epochs": inp["verl_total_epochs"],
         # already the gcd of any exact save steps, so verl's modulo save lands on every one of them.
         "save_freq": inp["save_freq"],
+        "ckpt_to_keep": inp["ckpt_to_keep"],
         "local_dir": local_dir,
     }
 
@@ -577,12 +579,25 @@ class _VerlResumeUploader:
         self.model_id = model_id
         self.model_revision = model_revision
         self.tokenizer = tokenizer
-        # a step already published before a preemption is durable; republishing it would redo the
-        # export for state hf already holds.
-        self.published_steps: set[int] = set(self.processed_steps & self.required_steps)
+        # populated by credit_durable_required_steps() before start(): crediting a required step
+        # needs an hf lookup, which does not belong in a constructor.
+        self.published_steps: set[int] = set()
         self._error: BaseException | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def credit_durable_required_steps(self, resume_step: int) -> None:
+        """Credit required saves a pre-resume worker already published.
+
+        A resumed run never re-saves a step it trained past, so without this every required step
+        below the resume point would be reported missing and fail an otherwise-successful retry.
+        Crediting is gated on the adapter being verified on hf rather than inferred from the step
+        counter: a preempted worker can advance past a required step without its deployable ever
+        landing, and that step must stay uncredited so completeness still catches it.
+        """
+        for step in sorted(self.required_steps):
+            if step <= int(resume_step) and _deployable_adapter_on_hf(step):
+                self.published_steps.add(step)
 
     def start(self) -> None:
         self._thread.start()
@@ -652,7 +667,7 @@ class _VerlResumeUploader:
         # a failed resume upload must not fail the run: the policy is still trained and published at
         # the end, and the only loss is having to restart from an earlier step after a preemption.
         # a failed REQUIRED save is different -- the customer asked for a deployable at that step, so
-        # it propagates and stop(require_complete=True) turns it into a run failure.
+        # it propagates and raise_if_incomplete() turns it into a run failure.
         try:
             while True:
                 for step, path in self._pending(self._completed_step()):
@@ -907,6 +922,12 @@ def _resolve_single_turn_inputs():
     save_at_steps = tuple(int(step) for step in (getattr(_t, "save_at_steps", ()) or ()))
     validate_save_steps(save_at_steps, int(steps))
     save_freq = reduce(gcd, save_at_steps) if save_at_steps else save_every
+    # retention has to outlive the export. verl prunes a checkpoint only once the NEXT one finishes
+    # writing, so keeping 1 leaves the uploader a single save interval to run model_merger before
+    # its source directory is deleted -- and a gcd of 1 makes that interval a single update. keep a
+    # small history while exact saves are pending so a slow export cannot lose a required step.
+    # without exact saves nothing is exported mid-run, so 1 stays correct and cheapest on disk.
+    ckpt_to_keep = 3 if save_at_steps else 1
 
     return {
         "env": env,
@@ -937,6 +958,7 @@ def _resolve_single_turn_inputs():
         "steps": int(steps),
         "save_freq": save_freq,
         "save_at_steps": save_at_steps,
+        "ckpt_to_keep": ckpt_to_keep,
         # verl's default preserves the update horizon and on-policy baseline; unlike trl reuse, each
         # update gets a fresh rollout batch.
         "ppo_epochs": 1,
@@ -1099,6 +1121,7 @@ def run_rl_verl():
             model_revision=inp["model_revision"],
             tokenizer=tok,
         )
+        resume_uploader.credit_durable_required_steps(resume_step)
         resume_uploader.start()
         step_box = [0]
 
@@ -1165,7 +1188,9 @@ def run_rl_verl():
             raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
         # training finished cleanly, so a missing required save is a real defect rather than a
         # side effect of a crash. stop here (not in finally, which suppresses) to surface it.
-        if resume_uploader is not None:
+        # only when exact saves were requested: without them the drain stays best-effort, and
+        # letting a slow resume upload raise here would fail an otherwise-successful run.
+        if resume_uploader is not None and resume_uploader.required_steps:
             resume_uploader.stop()
             resume_uploader.raise_if_incomplete()
     finally:
