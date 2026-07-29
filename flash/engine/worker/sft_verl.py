@@ -45,6 +45,7 @@ from flash.engine.worker.verl_common import (
     parse_verl_metric,
     parse_wandb_link,
     render_wandb_link_shim,
+    resolve_checkpoint_actor_dir,
     resolve_verl_python,
     run_verl_training,
     stamp_adapter_dir_provenance,
@@ -659,7 +660,7 @@ class _VerlCheckpointWatcher:
         if not self._should_publish(step):
             self.processed_steps.add(step)
             return
-        actor_dir = os.path.join(checkpoint_dir, "actor")
+        actor_dir = resolve_checkpoint_actor_dir(checkpoint_dir)
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         _export_checkpoint_adapter(
             actor_dir,
