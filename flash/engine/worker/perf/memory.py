@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import re
+
 from flash.engine.vram import _LIGER_LONG_CTX_TOKENS
 from flash.engine.worker.perf.liger import _liger_default_for_model
 
 _LONG_CONTEXT_TOKENS = _LIGER_LONG_CTX_TOKENS
+
+# "gemma" must start the model name segment: a bare substring test also matches paligemma-3b, a
+# different arch that does not upcast. the right side stays open so gemma-3n and gemma-3-4b both
+# match, and the separator is optional so gemma3 / gemma_3 spellings do too.
+_GEMMA3_RE = re.compile(r"(?:^|[^a-z0-9])gemma[-_]?3")
 
 
 def _memory_mode(model_id: str, max_length: int = 0, *, revision: str = "") -> bool:
@@ -89,11 +96,10 @@ def _is_upcasting_checkpoint_family(model_id: str) -> bool:
 
     Gemma3 upcasts inside the checkpointed region (its normalizer and attention soft-cap run in
     fp32), so the recompute hands back a tensor whose dtype AND rank both differ from what the
-    forward saved. Same hermetic string form as ``_is_gdn_hybrid_family``: no config probe, so
+    forward saved. Same hermetic form as ``_is_gdn_hybrid_family``: no config probe, so
     ``grpo_use_reentrant`` stays callable at config-build time without HF access.
     """
-    mid = (model_id or "").lower()
-    return any(token in mid for token in ("gemma-3", "gemma3", "gemma_3"))
+    return _GEMMA3_RE.search((model_id or "").lower()) is not None
 
 
 def grpo_use_reentrant(model_id: str) -> bool:
