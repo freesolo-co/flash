@@ -1208,7 +1208,8 @@ def test_advantage_spread_is_parsed_from_a_real_verl_step_line():
     )
     adv_max = verl_common.parse_verl_metric(line, "critic/advantages/max")
     adv_min = verl_common.parse_verl_metric(line, "critic/advantages/min")
-    assert adv_max == 0.0 and adv_min == 0.0
+    assert adv_max == 0.0
+    assert adv_min == 0.0
     # this is the exact shape of the run in ISSUES VERL-064: healthy reward, zero spread.
     with pytest.raises(RuntimeError, match="zero advantage spread"):
         rl_verl._check_grpo_had_a_gradient([1.0], [adv_max - adv_min])
