@@ -46,6 +46,7 @@ from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import sanitize_rollout_text
+from flash.engine.worker.sft_verl import _hydra_val, _NvidiaSmiPeakSampler
 from flash.engine.worker.verl_common import (
     VERL_REQUIREMENT,
     agent_loop_workers,
@@ -247,8 +248,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         "trainer.test_freq=-1",
         "trainer.val_before_train=False",
         f"trainer.logger=[{cfg['loggers']}]",
-        "trainer.project_name=flash_verl",
-        "trainer.experiment_name=grpo",
+        # the run's own wandb project/name, exactly as the sft and opd verl backends resolve them. a
+        # hardcoded pair would land every grpo run in one wandb project under one experiment name, so
+        # concurrent runs overwrite each other's curves and an explicit [wandb] config is ignored.
+        f"trainer.project_name={_hydra_val(cfg['project_name'])}",
+        f"trainer.experiment_name={_hydra_val(cfg['experiment_name'])}",
         f"trainer.default_local_dir={cfg['local_dir']}",
     ]
     if kl_on:
@@ -300,6 +304,8 @@ def _build_verl_training_cfg(
     fp8_kv: bool,
     reward_path: str,
     local_dir: str,
+    project_name: str,
+    experiment_name: str,
     n_gpus: int = 1,
 ) -> dict:
     engine_len = int(inp["engine_len"])
@@ -346,6 +352,8 @@ def _build_verl_training_cfg(
         "save_freq": inp["save_freq"],
         "ckpt_to_keep": inp["ckpt_to_keep"],
         "local_dir": local_dir,
+        "project_name": project_name,
+        "experiment_name": experiment_name,
     }
 
 
@@ -357,6 +365,11 @@ def _build_verl_train_notes(
     reward_history: list[float],
     loss_curve: list[float],
     resumed: bool = False,
+    download_seconds: float = 0.0,
+    device_peak_gpu_gb: float | None = None,
+    fp8_kv: bool = False,
+    wandb_project: str | None = None,
+    wandb_run_name: str | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -368,6 +381,44 @@ def _build_verl_train_notes(
         "group_size": inp["group_size"],
         "reward_history": reward_history,
         "loss_curve": loss_curve,
+        "download_seconds": download_seconds,
+        "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
+        # verl trains out-of-process, so torch's in-process allocator counter would read ~0 here and
+        # miss the trainer entirely. nvidia-smi is the only reading that sees the child, so both keys
+        # carry the same device-level figure -- unlike the trl path, where peak_gpu_gb is the
+        # torch-allocated subset of device_peak_gpu_gb.
+        "peak_gpu_gb": device_peak_gpu_gb,
+        "device_peak_gpu_gb": device_peak_gpu_gb,
+        # chalk installs against an in-process trainer.model; verl's model lives in the subprocess, so
+        # no kernel can engage on this path. None (not an empty list) matches the sft verl backend.
+        "chalk_kernels": None,
+        # trl counts generated tokens from a padded upper bound; verl derives them from the response
+        # lengths it actually observed. without this flag the two backends' token counts read as
+        # comparable when they are not.
+        "gen_tokens_is_upper_bound": False,
+        "thinking": _w.THINKING,
+        # the console is uploaded only on failure, so a SUCCESSFUL run has no other record that fp8 kv
+        # engaged. this is resolved per-card (cc>=8.9, and never for gdn hybrids), so it is a property
+        # of the run rather than of the config.
+        "vllm_kv_cache_dtype": "fp8" if fp8_kv else None,
+        # trl pins vllm's prefill batch explicitly because it hardcodes 4096; the verl path sets no
+        # such override, so the engine keeps its own default. None records "not pinned by flash"
+        # rather than asserting a number flash never chose.
+        "vllm_max_num_batched_tokens": None,
+        "max_completion_len": inp["max_completion"],
+        "prompts_per_step": inp["prompts_per_step"],
+        # one optimizer step consumes exactly this many completions: ulysses shards along the
+        # sequence, so dp stays 1 and the global batch is not split across cards.
+        "generations_per_step": inp["prompts_per_step"] * inp["group_size"],
+        # trl fixes a per-device SEQUENCE count and carries the rest in grad accumulation. verl
+        # bounds the backward pass by TOKENS instead (use_dynamic_bsz + ppo_max_token_len_per_gpu),
+        # so a micro-batch holds however many sequences fit the budget and varies step to step.
+        # there is no constant to report, and reporting a fabricated one would read as comparable.
+        "per_device_train_batch_size": None,
+        "gradient_accumulation_steps": None,
+        "ppo_max_token_len_per_gpu": inp["engine_len"],
+        "wandb_project": wandb_project,
+        "wandb_run_name": wandb_run_name,
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],
@@ -1304,7 +1355,7 @@ def run_rl_verl():
     # subprocess simply reuses that cache.
     model_path_for_verl = inp["model_id"]
     if inp["model_revision"]:
-        _w.prefetch_model(inp["model_id"], revision=inp["model_revision"])
+        download_seconds = _w.prefetch_model(inp["model_id"], revision=inp["model_revision"])
         # verl resolves model.path offline against the HF cache; a bare repo id would pick the
         # cached "main" ref, not the pin. hand verl the pinned revision's snapshot dir instead.
         from huggingface_hub import snapshot_download as _snap
@@ -1324,7 +1375,7 @@ def run_rl_verl():
                 inp["model_id"], revision=inp["model_revision"], local_files_only=True
             )
     else:
-        _w.prefetch_model(inp["model_id"])
+        download_seconds = _w.prefetch_model(inp["model_id"])
 
     # stable int index -> rollout example, exactly as the trl path (reward maps back via this).
     ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
@@ -1400,6 +1451,11 @@ def run_rl_verl():
     server, reward_url = start_reward_server(_score, example_count=len(rollout_examples))
     # bound before the try so the finally can always ask whether it was started.
     resume_uploader: _VerlResumeUploader | None = None
+    # verl trains out-of-process, so torch's in-process allocator counter never sees the trainer.
+    # nvidia-smi is the only reading that covers the child, and it must be sampled while the child
+    # runs; stopping it in the finally keeps the reading even when the run crashes or is cancelled.
+    gpu_sampler = _NvidiaSmiPeakSampler().start()
+    device_peak_gpu_gb: float | None = None
     try:
         python_bin = resolve_verl_python(
             workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
@@ -1418,6 +1474,9 @@ def run_rl_verl():
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).
         loggers = _resolve_verl_loggers(python_bin)
+        _spec = _w.JOB_SPEC
+        project_name = (_spec.wandb.project if _spec and _spec.wandb else None) or "flash"
+        experiment_name = _w.wandb_run_name()
         # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path — but NOT for
         # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
         # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
@@ -1444,6 +1503,8 @@ def run_rl_verl():
             fp8_kv=fp8_kv,
             reward_path=reward_py,
             local_dir=local_dir,
+            project_name=project_name,
+            experiment_name=experiment_name,
             n_gpus=gpu_count_of(_w.JOB_SPEC),
         )
         overrides = build_verl_overrides(cfg)
@@ -1547,6 +1608,8 @@ def run_rl_verl():
         if resume_uploader is not None:
             with contextlib.suppress(Exception):
                 resume_uploader.stop()
+        with contextlib.suppress(Exception):
+            device_peak_gpu_gb = gpu_sampler.stop_gb()
         server.shutdown()
 
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
@@ -1602,5 +1665,10 @@ def run_rl_verl():
             reward_history=reward_history,
             loss_curve=loss_curve,
             resumed=bool(resume_step),
+            download_seconds=download_seconds,
+            device_peak_gpu_gb=device_peak_gpu_gb,
+            fp8_kv=fp8_kv,
+            wandb_project=project_name if "wandb" in loggers else None,
+            wandb_run_name=experiment_name if "wandb" in loggers else None,
         ),
     )

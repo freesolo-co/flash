@@ -70,6 +70,7 @@ def _overrides_cfg(**over):
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
         "mask_truncated_completions": True,
         "total_epochs": 1, "save_freq": 20, "ckpt_to_keep": 1, "local_dir": "/w/ckpt",
+        "project_name": "flash", "experiment_name": "flash-rl-run123",
     }
     cfg.update(over)
     return cfg
@@ -246,6 +247,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "train_files": "/w/t.parquet", "val_files": "/w/v.parquet", "model_id": "Qwen/Qwen3-4B",
         "thinking": False, "loggers": "console", "fp8_kv": False,
         "reward_path": "/w/r.py", "local_dir": "/w/ckpt",
+        "project_name": "flash", "experiment_name": "flash-rl-run123",
     }
     cfg = rl_verl._build_verl_training_cfg(inp, **common)
     # the engine gets the full prompt+completion length, not the prompt budget alone, and the token
@@ -376,6 +378,8 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
         fp8_kv=False,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
+        project_name="flash",
+        experiment_name="flash-rl-run123",
     )
     assert cfg["max_model_len"] == 32768
     assert cfg["max_token_len_per_gpu"] == 32768
@@ -610,6 +614,8 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         fp8_kv=False,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
+        project_name="flash",
+        experiment_name="flash-rl-run123",
     )
     overrides = rl_verl.build_verl_overrides(cfg)
     notes = rl_verl._build_verl_train_notes(
@@ -1218,7 +1224,16 @@ def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
 
 def test_train_notes_report_whether_the_run_resumed():
     # without this a resumed run is indistinguishable from a fresh one in train_meta (trl reports it).
-    inp = {
+    inp = _notes_inp()
+    common = _notes_common()
+    fresh = rl_verl._build_verl_train_notes(inp, **common)
+    assert fresh["resumed"] is False
+    resumed = rl_verl._build_verl_train_notes(inp, **common, resumed=True)
+    assert resumed["resumed"] is True
+
+
+def _notes_inp():
+    return {
         "epochs": 2,
         "group_size": 4,
         "kl_coef": 0.0,
@@ -1230,14 +1245,101 @@ def test_train_notes_report_whether_the_run_resumed():
         "ppo_epochs": 1,
         "verl_total_epochs": 3,
         "seed": 7,
+        "max_completion": 512,
+        "prompts_per_step": 8,
+        "engine_len": 4096,
     }
-    common = {
-        "steps_run": 3,
-        "retained_prompts": 8,
-        "reward_history": [0.5],
-        "loss_curve": [0.1],
-    }
-    fresh = rl_verl._build_verl_train_notes(inp, **common)
-    assert fresh["resumed"] is False
-    resumed = rl_verl._build_verl_train_notes(inp, **common, resumed=True)
-    assert resumed["resumed"] is True
+
+
+def _notes_common():
+    return {"steps_run": 3, "retained_prompts": 8, "reward_history": [0.5], "loss_curve": [0.1]}
+
+
+def test_train_notes_carry_the_trl_observability_fields():
+    # the console is uploaded only on FAILURE, so a successful run's train_meta is the sole record
+    # of how it ran. the trl path reports these; without them a verl run cannot be compared to a
+    # trl one, and the fp8-kv decision (resolved per-card at runtime) leaves no trace at all.
+    notes = rl_verl._build_verl_train_notes(
+        _notes_inp(),
+        **_notes_common(),
+        download_seconds=12.5,
+        device_peak_gpu_gb=71.25,
+        fp8_kv=True,
+        wandb_project="acme",
+        wandb_run_name="flash-rl-run123",
+    )
+    assert notes["download_seconds"] == 12.5
+    assert notes["vllm_kv_cache_dtype"] == "fp8"
+    assert notes["wandb_project"] == "acme"
+    assert notes["wandb_run_name"] == "flash-rl-run123"
+    # verl trains out-of-process, so nvidia-smi is the only reading that sees the trainer: both keys
+    # carry the same device figure rather than a torch-allocated subset that would read ~0 here.
+    assert notes["peak_gpu_gb"] == 71.25
+    assert notes["device_peak_gpu_gb"] == 71.25
+    # chalk installs against an in-process trainer.model, which verl does not have.
+    assert notes["chalk_kernels"] is None
+    # trl counts generated tokens from a padded upper bound; verl uses observed response lengths.
+    # without the flag the two backends' token counts read as comparable when they are not.
+    assert notes["gen_tokens_is_upper_bound"] is False
+
+
+def test_train_notes_report_bf16_kv_when_fp8_did_not_engage():
+    # fp8 is gated on cc>=8.9 AND a non-gdn model, so "requested" and "engaged" are not the same
+    # thing. reporting fp8 unconditionally would claim a memory saving the run never got.
+    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common(), fp8_kv=False)
+    assert notes["vllm_kv_cache_dtype"] is None
+
+
+def test_train_notes_omit_wandb_identity_when_wandb_is_off():
+    # verl logs from its own interpreter, so flash's in-process wandb.run is empty on this path and
+    # the names come from the config. recording them when the logger is off would point a reader at
+    # a dashboard run that was never created.
+    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common())
+    assert notes["wandb_project"] is None
+    assert notes["wandb_run_name"] is None
+    # a sampler that never saw a card must not report a fabricated zero-gb peak.
+    assert notes["peak_gpu_gb"] is None
+    assert notes["device_peak_gpu_gb"] is None
+
+
+def test_verl_grpo_logs_to_the_runs_own_wandb_project_and_name():
+    # a hardcoded project/experiment pair lands every grpo run in one wandb experiment, so
+    # concurrent runs overwrite each other's curves and an explicit [wandb] project is ignored. the
+    # sft and opd verl backends already resolve both from the spec.
+    o = rl_verl.build_verl_overrides(
+        _overrides_cfg(project_name="acme", experiment_name="flash-rl-run123")
+    )
+    assert "trainer.project_name=acme" in o
+    assert "trainer.experiment_name=flash-rl-run123" in o
+    assert "trainer.project_name=flash_verl" not in o
+    assert "trainer.experiment_name=grpo" not in o
+
+
+def test_verl_grpo_wandb_names_survive_hydra_special_characters():
+    # a run name is user-settable via [wandb] run_name; an unquoted '=' or ',' would split the
+    # override and hydra would compose a different key entirely.
+    o = rl_verl.build_verl_overrides(_overrides_cfg(experiment_name="run=a,b"))
+    assert 'trainer.experiment_name="run=a,b"' in o
+
+
+def test_train_notes_record_the_batch_shape_one_step_consumed():
+    # the trl path reports the batch shape, so without it a verl run's reward curve cannot be read
+    # against a trl one: the same step count at a different batch size is a different experiment.
+    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common())
+    assert notes["max_completion_len"] == 512
+    assert notes["prompts_per_step"] == 8
+    # ulysses shards along the sequence, so dp stays 1 and one optimizer step sees the whole batch.
+    assert notes["generations_per_step"] == 8 * 4
+
+
+def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
+    # trl fixes a per-device SEQUENCE count; verl bounds the backward pass by tokens, so a
+    # micro-batch holds however many sequences fit and varies step to step. reporting a number here
+    # would read as directly comparable to trl's when nothing enforces it.
+    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common())
+    assert notes["per_device_train_batch_size"] is None
+    assert notes["gradient_accumulation_steps"] is None
+    # the bound that IS enforced gets recorded in their place.
+    assert notes["ppo_max_token_len_per_gpu"] == 4096
+    # trl pins vllm's prefill batch because it hardcodes 4096; this path sets no such override.
+    assert notes["vllm_max_num_batched_tokens"] is None
