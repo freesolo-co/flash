@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
+import textwrap
 import threading
 import time
 import urllib.error
@@ -609,7 +611,28 @@ def test_verl_uses_canonical_heartbeat_stage_contracts():
     assert "rl_verl_finalizing" not in src
     initial_heartbeat = '_w.heartbeat("rl_step", step=0, initial=True)'
     assert initial_heartbeat in src
-    assert src.index(initial_heartbeat) < src.index('liveness_heartbeat("rl_step"')
+    # ordering is read off the ast, not off substring offsets: the liveness call spans several lines
+    # once it carries keywords, and a text search for the one-line spelling would report "missing"
+    # for a call that is present and correctly placed.
+    tree = ast.parse(textwrap.dedent(src))
+    stage_linenos = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        first = node.args[0]
+        if not (isinstance(first, ast.Constant) and first.value == "rl_step"):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == "liveness_heartbeat":
+            stage_linenos["liveness"] = node.lineno
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "heartbeat"
+            and any(kw.arg == "initial" for kw in node.keywords)
+        ):
+            stage_linenos["initial"] = node.lineno
+    assert "initial" in stage_linenos
+    assert "liveness" in stage_linenos
+    assert stage_linenos["initial"] < stage_linenos["liveness"]
     assert '"rl_finalizing"' in src
     assert "rl_step" in _HB_THROTTLED_STAGES
     assert "rl_step" in STEP_GATED_STAGES
