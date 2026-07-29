@@ -624,10 +624,14 @@ def test_verl_uses_canonical_heartbeat_stage_contracts():
             continue
         if isinstance(node.func, ast.Name) and node.func.id == "liveness_heartbeat":
             stage_linenos["liveness"] = node.lineno
-        elif isinstance(node.func, ast.Attribute) and node.func.attr == "heartbeat":
-            if any(kw.arg == "initial" for kw in node.keywords):
-                stage_linenos["initial"] = node.lineno
-    assert "initial" in stage_linenos and "liveness" in stage_linenos
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "heartbeat"
+            and any(kw.arg == "initial" for kw in node.keywords)
+        ):
+            stage_linenos["initial"] = node.lineno
+    assert "initial" in stage_linenos
+    assert "liveness" in stage_linenos
     assert stage_linenos["initial"] < stage_linenos["liveness"]
     assert '"rl_finalizing"' in src
     assert "rl_step" in _HB_THROTTLED_STAGES

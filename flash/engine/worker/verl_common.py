@@ -451,20 +451,29 @@ def parse_verl_metric(line: str, verl_key: str) -> float | None:
 
 
 def parse_verl_step_metrics(line: str) -> dict | None:
-    """the flash `metrics_last` entry a verl step line carries, or None for every other line.
+    """the flash `metrics_last` entry a verl step line carries, or None when it carries none.
 
     returns None rather than raising: this parses child stdout under multi-rank logging, where a
     truncated or interleaved line must not take down a paid run.
+
+    a step line with no renderable metric yields None rather than a bare ``{"step": n}``: verl logs
+    its pre-training validation pass as its own record at the *current* step counter
+    (ray_trainer.py `logger.log(data=val_metrics, step=self.global_steps)`), and every key on that
+    line is namespaced val-core/ or val-aux/. keeping it would render a row with a step number and
+    no metrics, and -- because the backlog is deduplicated by step -- a resumed run's validation
+    pass would land on the resume step and displace a real training row.
     """
     match = _VERL_STEP_RE.search(line)
     if match is None:
         return None
-    metrics: dict[str, float | int] = {"step": int(match.group(1))}
+    metrics: dict[str, float | int] = {}
     for verl_key, flash_key in _VERL_METRIC_FIELDS:
         value = parse_verl_metric(line, verl_key)
         if value is not None:
             metrics[flash_key] = value
-    return metrics
+    if not metrics:
+        return None
+    return {"step": int(match.group(1)), **metrics}
 
 
 def append_step_metrics(backlog: list[dict], metrics: dict, *, limit: int) -> None:

@@ -1615,15 +1615,18 @@ def run_rl_verl():
                         # the worker's error path reads this global, so a run that dies mid-training
                         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
                         LATEST_GRPO_METRICS_LAST[:] = metrics_last
-                    # capture verl's per-step reward + policy loss for train_meta observability parity.
-                    for verl_key, sink in (
-                        ("critic/rewards/mean", reward_history),
-                        ("actor/pg_loss", loss_curve),
-                        ("response_length/mean", resp_len_history),
-                    ):
-                        value = parse_verl_metric(line, verl_key)
-                        if value is not None:
-                            sink.append(value)
+                        # per-step series for train_meta observability parity. these live on the same
+                        # line as everything else: verl's only console metric sink is LocalLogger,
+                        # which always prints "step:N - ..." (verl/utils/logger/aggregate_logger.py),
+                        # so a line without a step carries no metric to collect.
+                        for verl_key, sink in (
+                            ("critic/rewards/mean", reward_history),
+                            ("actor/pg_loss", loss_curve),
+                            ("response_length/mean", resp_len_history),
+                        ):
+                            value = parse_verl_metric(line, verl_key)
+                            if value is not None:
+                                sink.append(value)
                 rc = proc.wait()
             except BaseException:
                 # the stream loop died (upload error, cancel, oom in the parent): a still-running

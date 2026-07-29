@@ -89,6 +89,20 @@ def test_non_step_lines_are_ignored():
         assert parse_verl_step_metrics(line) is None
 
 
+def test_validation_only_record_yields_no_row():
+    # verl logs its pre-training validation pass as its own record at the current step counter
+    # (ray_trainer.py `logger.log(data=val_metrics, step=self.global_steps)`), and every key on it
+    # is namespaced val-core/ or val-aux/. emitting {"step": n} for it would render a row carrying a
+    # step number and nothing else, and on a resumed run it would displace a real training row
+    # because the backlog deduplicates by step.
+    line = (
+        "(TaskRunner pid=3125) step:0 - val-core/openai/gsm8k/reward/mean@1:0.31"
+        " - val-aux/num_turns/mean:1.0"
+    )
+
+    assert parse_verl_step_metrics(line) is None
+
+
 def test_metric_key_does_not_cross_match_a_longer_sibling():
     # response_length_non_aborted/mean ENDS WITH response_length/mean, so an unanchored substring
     # search would report the non-aborted value under the wrong column.
@@ -201,6 +215,27 @@ def test_verl_rl_publishes_backlog_to_the_error_path_global():
         )
     ]
     assert assigns, "verl rl must publish its backlog to LATEST_GRPO_METRICS_LAST"
+
+
+def test_train_meta_series_are_collected_only_from_step_lines():
+    # verl's sole console metric sink is LocalLogger, which always prints "step:N - ...", so a line
+    # without a step carries no metric. collecting the train_meta series outside the step branch
+    # would re-scan every rollout/log line for keys that cannot be there.
+    tree = _verl_rl_tree()
+
+    guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Name)
+        and node.test.left.id == "step_metrics"
+    ]
+    assert len(guards) == 1, "expected exactly one step_metrics guard"
+    collected = ast.unparse(guards[0])
+
+    for verl_key in ("critic/rewards/mean", "actor/pg_loss", "response_length/mean"):
+        assert verl_key in collected, f"{verl_key} must be collected inside the step branch"
 
 
 def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
