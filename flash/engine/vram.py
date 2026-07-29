@@ -64,6 +64,17 @@ _KV_BLOCK_TOKENS = 16
 # floor remains authoritative at short context; longer contexts retain 1.5 gb plus 25% fragmentation.
 _KV_PROFILE_OVERHEAD_GB = 1.5
 _KV_FRAGMENTATION_MARGIN = 1.25
+# adapter bytes per trainable parameter. the 8-bit paged optimizer needs ~10; fp32 AdamW needs 16
+# (4 param + 2 gradient + 8 moments + 2 bf16 shadow). SFT and OPD size on AdamW because verl builds
+# torch.optim.AdamW for both -- OPD inherits verl's own default, and SFT names it explicitly since
+# bitsandbytes' 8-bit blockwise update is not a distributed operator and dies on FSDP2's DTensor
+# parameters. the backend is a [worker_env] property that never reaches this sizing path, so the
+# heavier optimizer is the only safe basis: under-reserving OOMs a paid run.
+#
+# GRPO stays on the paged constant. verl GRPO also runs AdamW, so it is under-sized by the same
+# 6 bytes/param -- but GRPO's estimate is already at the B200 ceiling (the 35B MoE at 4096 ctx sizes
+# to 180 GB exactly), and widening it there REJECTS a configuration that runs today. that gap is real
+# and tracked separately; correcting it needs the resident-peak model retuned, not a constant swap.
 _LORA_PAGED_BYTES_PER_PARAM = 10.0
 _LORA_ADAMW_BYTES_PER_PARAM = 16.0
 
@@ -231,9 +242,9 @@ def _lora_memory_gb(
     )
     trainable_params = max(1, int(lora_rank)) * target_dims
     bytes_per_param = (
-        _LORA_ADAMW_BYTES_PER_PARAM
-        if (algorithm or "").lower() == "opd"
-        else _LORA_PAGED_BYTES_PER_PARAM
+        _LORA_PAGED_BYTES_PER_PARAM
+        if (algorithm or "").lower() in ("grpo", "rl")
+        else _LORA_ADAMW_BYTES_PER_PARAM
     )
     exact = trainable_params * bytes_per_param / 1e9
     return max(floor, exact)
