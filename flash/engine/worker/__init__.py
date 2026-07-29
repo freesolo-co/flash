@@ -98,7 +98,6 @@ from flash.engine.worker.lora import (
     patch_grpo_mask_aware_lm_head,
 )
 from flash.engine.worker.opd import run_opd
-from flash.engine.worker.opsd import run_opsd
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,
@@ -174,7 +173,7 @@ PHASE = os.environ.get(
     "PHASE",
     JOB_SPEC.phase
     if JOB_SPEC
-    else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd", "opsd") else "sft"),
+    else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
 )
 OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
 
@@ -308,7 +307,6 @@ def main():
             "sft": run_sft,
             "rl": run_rl,
             "opd": run_opd,
-            "opsd": run_opsd,
         }
         handler = modes.get(RUN_MODE)
         if handler is None:
@@ -552,7 +550,6 @@ __all__ = [
     "resolve_grpo_prompts_per_step",
     "rl_per_device_comps",
     "run_opd",
-    "run_opsd",
     "run_rl",
     "run_sft",
     "seed_training_rngs",
