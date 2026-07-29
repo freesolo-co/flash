@@ -237,7 +237,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "max_prompt_len": 3072, "max_completion": 1024, "engine_len": 4096,
         "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "seed": 42,
         "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
-        "verl_total_epochs": 2, "save_every": 20,
+        "verl_total_epochs": 2, "save_freq": 20,
     }
     common = {
         "train_files": "/w/t.parquet", "val_files": "/w/v.parquet", "model_id": "Qwen/Qwen3-4B",
@@ -377,6 +377,132 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
     assert cfg["max_model_len"] == 32768
     assert cfg["max_token_len_per_gpu"] == 32768
     assert cfg["max_prompt_len"] + cfg["max_completion"] == cfg["max_model_len"]
+
+
+def _save_steps_inputs(monkeypatch, *, save_at_steps=None, save_every=None, max_steps=100):
+    """resolve grpo verl inputs for a job with (or without) exact save steps."""
+    from flash.engine.worker._pkg import W
+    from flash.spec import JobSpec
+
+    class _Env:
+        multi_turn = False
+        is_tool_env = False
+
+        def dataset(self):
+            return [{"index": i} for i in range(8)]
+
+        def prompt_messages(self, ex):
+            return [{"role": "user", "content": f"question {ex['index']}"}]
+
+    class _Tokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return messages[0]["content"]
+
+        def __call__(self, text, **kwargs):
+            return SimpleNamespace(input_ids=[1])
+
+    train: dict = {"batch_size": 4, "epochs": 1, "max_steps": max_steps}
+    if save_at_steps is not None:
+        train["save_at_steps"] = list(save_at_steps)
+    if save_every is not None:
+        train["save_every"] = save_every
+    spec = JobSpec.from_dict(
+        {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo", "train": train}
+    )
+    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(W, "SEED", 42, raising=False)
+    monkeypatch.setattr(W, "THINKING", False, raising=False)
+    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
+    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
+    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
+    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
+    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 32768)
+    return rl_verl._resolve_single_turn_inputs()
+
+
+def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
+    # verl only saves when global_step % save_freq == 0, so it cannot hit an arbitrary set directly.
+    # the gcd is the largest interval every required step divides, so verl writes a superset of the
+    # checkpoints and the uploader publishes deployables at exactly the requested ones.
+    inp = _save_steps_inputs(monkeypatch, save_at_steps=(10, 25, 100))
+    assert inp["save_freq"] == 5
+    assert inp["save_at_steps"] == (10, 25, 100)
+    for step in inp["save_at_steps"]:
+        assert step % inp["save_freq"] == 0
+
+
+def test_save_freq_falls_back_to_save_every_without_exact_steps(monkeypatch):
+    # no exact steps: periodic saves are preserved on the customer's own interval.
+    inp = _save_steps_inputs(monkeypatch, save_every=15)
+    assert inp["save_freq"] == 15
+    assert inp["save_at_steps"] == ()
+
+
+def test_save_steps_reach_the_horizon_they_were_validated_against(monkeypatch):
+    # save_at_steps requires max_steps, and the horizon resolves to exactly that, so every required
+    # step is reachable by the run. this is the invariant the uploader's completeness check assumes.
+    inp = _save_steps_inputs(monkeypatch, save_at_steps=(10, 25, 100), max_steps=100)
+    assert inp["steps"] == 100
+    assert inp["save_at_steps"][-1] <= inp["steps"]
+
+
+def test_final_publish_is_suppressed_when_exact_save_steps_are_set():
+    # parity with the trl path (rl.py: `if final_save_due(...)`): with save_at_steps set the customer
+    # asked for those steps and nothing else, so the final step must not add an unrequested
+    # deployable. without them the final checkpoint is still preserved.
+    from flash.engine.steps import final_save_due
+
+    assert not final_save_due(100, (10, 25))
+    assert final_save_due(100, ())
+
+
+def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, monkeypatch):
+    # the deployable at a required step is the whole point of save_at_steps. a resume-state upload
+    # alone leaves the step resumable but not servable, which is the gap this closes.
+    published: list[tuple[str, int, bool]] = []
+    monkeypatch.setattr(
+        rl_verl._w,
+        "publish_deployable_checkpoint",
+        lambda d, s, **kw: published.append((d, s, kw.get("required", False))),
+        raising=False,
+    )
+    monkeypatch.setattr(rl_verl._w, "upload_resume_checkpoint", lambda *a, **kw: True, raising=False)
+    monkeypatch.setattr(rl_verl._w, "write_base_model_provenance", lambda *a, **kw: None, raising=False)
+    monkeypatch.setattr(rl_verl, "_export_peft_adapter", lambda *a, **kw: None)
+    monkeypatch.setattr(rl_verl, "_stamp_adapter_dir_provenance", lambda *a, **kw: None)
+
+    local_dir = tmp_path / "ckpt"
+    (local_dir / "global_step_10" / "actor").mkdir(parents=True)
+    (local_dir / "global_step_5" / "actor").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("10")
+
+    class _Tok:
+        def save_pretrained(self, path):
+            pass
+
+    uploader = rl_verl._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(10, 20),
+        export_root=str(tmp_path / "exports"),
+        python_bin="python",
+        model_id="Qwen/Qwen3.5-0.8B",
+        model_revision="rev",
+        tokenizer=_Tok(),
+    )
+    uploader.start()
+    uploader.stop()
+
+    # step 10 was required and completed, so it published as a REQUIRED deployable. step 5 is a gcd
+    # by-product verl wrote on the way there; it is resume state only and must not be published.
+    assert [(step, required) for _, step, required in published] == [(10, True)]
+    # step 20 never completed, so the run must fail rather than silently ship an incomplete set.
+    with pytest.raises(RuntimeError, match="required saves were not durably published: \\[20\\]"):
+        uploader.raise_if_incomplete()
 
 
 def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeypatch):
