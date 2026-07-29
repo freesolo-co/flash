@@ -974,12 +974,43 @@ def test_all_shims_compose_into_one_sitecustomize():
     assert 'render_entropy_quantile_shim(inp["entropy_quantile"])' in source
     assert 'render_stop_sequences_shim(inp["stop_sequences"])' in source
     assert 'render_structured_outputs_shim(inp["structured_outputs"])' in source
+    assert 'render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"])' in source
     combined = (
         rl_verl.render_entropy_quantile_shim(0.2)
         + rl_verl.render_stop_sequences_shim(("</answer>",))
         + rl_verl.render_structured_outputs_shim({"json": {"type": "object"}})
+        + rl_verl.render_exact_save_steps_shim((7, 13), 20)
     )
     compile(combined, "sitecustomize.py", "exec")
+
+
+def test_exact_save_steps_shim_is_emitted_only_when_exact_saves_are_requested():
+    # without exact saves verl's own save_every cadence is already what flash wants, so there is
+    # nothing to suppress and the shim must stay out of the child's import path.
+    assert rl_verl.render_exact_save_steps_shim((), 20) == ""
+    source = rl_verl.render_exact_save_steps_shim((7, 13), 20)
+    assert source
+    assert rl_verl._EXACT_SAVE_STEPS_MARKER in source
+
+
+def test_exact_save_steps_shim_keeps_required_steps_and_the_final_step():
+    # the gcd of the required steps makes verl save a SUPERSET (gcd(7,13) == 1 is a full-state dump
+    # every step). the shim drops the writes flash never asked for -- but losing a required step
+    # fails the run, and losing the final step leaves the final publish with no source checkpoint.
+    source = rl_verl.render_exact_save_steps_shim((7, 13), 20)
+    assert "_flash_required_save_steps = frozenset((7, 13))" in source
+    assert "_flash_total_steps = 20" in source
+    assert (
+        "if step not in _flash_required_save_steps and step != _flash_total_steps:" in source
+    )
+    # it reads the step off the instance: verl's _save_checkpoint takes no step argument.
+    assert "step = int(self.global_steps)" in source
+
+
+def test_exact_save_steps_shim_refuses_to_wrap_itself_twice():
+    source = rl_verl.render_exact_save_steps_shim((7,), 20)
+    assert '"_flash_save_patched", False' in source
+    assert "_flash_save_patched = True" in source
 
 
 def test_structured_outputs_shim_is_emitted_only_when_a_constraint_is_requested():
