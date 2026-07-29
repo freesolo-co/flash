@@ -1402,6 +1402,32 @@ def test_capability_guard_rejects_kl_anchored_warm_start(monkeypatch):
         )
 
 
+def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch, capsys):
+    # per_turn only diverges from per_episode when there is more than one assistant turn to credit:
+    # trl reaches GRPOPerTurnTrainer solely through use_rollout_func, which requires is_multi_turn.
+    # the multi-turn/tool guard above already rejects every env that could get there, so anything
+    # reaching here is single-turn and the two modes are the same objective -- trl accepts the key on
+    # exactly these envs. rejecting it would break configs that run correctly on the trl backend.
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(),
+        train={"credit_assignment": "per_turn"},
+    )
+    assert inp["max_prompt_len"] > 0
+    assert "equivalent to per_episode" in capsys.readouterr().out
+
+
+def test_default_credit_assignment_does_not_log_an_equivalence_note(monkeypatch, capsys):
+    # the control: the note above must be tied to an explicitly non-default value, not printed on
+    # every run. without this a hardcoded print would still satisfy the test above.
+    _capability_resolve(
+        monkeypatch,
+        _capability_env(),
+        train={"credit_assignment": "per_episode"},
+    )
+    assert "equivalent to per_episode" not in capsys.readouterr().out
+
+
 def test_capability_guards_admit_the_supported_single_turn_text_env(monkeypatch):
     # the control: with none of the four shapes present the resolver must run to completion, so a
     # guard that fires on every env would fail here instead of passing the four tests above.
