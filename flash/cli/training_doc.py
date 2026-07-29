@@ -697,6 +697,39 @@ on a beyond-noise improvement.
 
 ---
 
+## Multi-GPU training (`gpu.count > 1`)
+
+Flash trains on one card by default. The default `trl` backend is single-process and never
+reads `gpu.count`, so raising the count alone would rent n cards and train on one — submit
+rejects that rather than billing for idle hardware.
+
+To shard one job across several cards, select the `verl` backend for the phase you are running:
+
+```toml
+[gpu]
+type = "B200"
+count = 4
+# provider must also be pinned: not every provider puts all n cards on ONE machine, and
+# submit names the ones that qualify when it rejects an unpinned multi-gpu spec.
+
+[worker_env]
+FLASH_SFT_BACKEND = "verl"   # SFT
+# FLASH_RL_BACKEND  = "verl"   # GRPO  (the key is RL, not GRPO)
+# FLASH_OPD_BACKEND = "verl"   # OPD
+```
+
+One key per phase, and GRPO's is `FLASH_RL_BACKEND`. The verl worker launches one rank per
+card with Ulysses sequence parallelism.
+
+The verl GRPO backend covers single-turn, non-tool, non-multimodal runs; multi-turn, tool, and
+image-prompt environments stay on `trl` (which is single-GPU). Warm-starting with
+`init_from_adapter` while `kl_penalty_coef > 0` is also `trl`-only: verl computes its KL
+reference with adapters disabled, so the reference would be the bare base model instead of your
+SFT adapter, pulling the policy back toward base. Every one of these raises at startup rather
+than quietly training on a different contract.
+
+---
+
 ## Command reference
 
 ```bash
