@@ -1141,3 +1141,43 @@ def test_config_gpu_fields(monkeypatch):
     assert again.gpu.type == ""
     spec = spec_from_dict({**base, "gpu": {"type": "A100 SXM"}}, run_id="x")
     assert spec.gpu.type == "A100 SXM"
+
+
+def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monkeypatch):
+    """LS-008/AT-013: a capacity failure on the LAST fitting class used to say the run was 'retrying
+    on the next-best GPU' while the picker had nowhere to walk and re-selected that same class. The
+    log must describe the retry that actually happens."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    # exactly one fitting class: the picker can only ever re-pick it.
+    candidates = (Candidate("runpod", "H200", 4.0, 141),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    gpus = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle("ep1", "j1", attempt))
+        if attempt == 0:
+            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert gpus == ["H200", "H200"]  # nowhere to walk: the same class is genuinely reused
+    text = log.getvalue()
+    assert "no untried GPU class fits this run" in text, text
+    assert "next-best" not in text, "claimed an escalation that the picker cannot perform"

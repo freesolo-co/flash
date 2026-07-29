@@ -5536,3 +5536,48 @@ def test_deploy_train_endpoint_gpu_count_defaults_to_one(monkeypatch):
 
     jobs.deploy_train_endpoint("A100", name_suffix="testrun", endpoint_kwargs={})
     assert captured["gpu_count"] == 1
+
+
+def _poll_in_queue_forever(monkeypatch, **poll_kwargs):
+    """Drive poll_job against a job that never leaves IN_QUEUE (no capacity for the pinned class)."""
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: (_ for _ in ()).throw(RuntimeError("no workers yet")),
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    return jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=5000.0,
+        queue_grace_s=900.0,
+        **poll_kwargs,
+    )
+
+
+def test_capacity_detail_does_not_promise_a_next_best_gpu_on_the_last_class(monkeypatch):
+    """LS-008/AT-013: the capacity failure detail claimed 'retrying on the next-best GPU' even when
+    the picker had no untried fitting class left and would re-select the same one. On the last GPU it
+    must describe the reuse instead."""
+    res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
+    assert res.failure == "no_capacity"
+    assert "next-best" not in res.detail, res.detail
+    assert "retrying on the same class" in res.detail, res.detail
+
+
+def test_capacity_detail_still_promises_next_best_when_one_exists(monkeypatch):
+    """With classes left to walk the original escalation message is correct, so it must survive the
+    fix. Deliberately relies on the default rather than passing on_last_gpu, to guard the normal path
+    both before and after the change."""
+    res = _poll_in_queue_forever(monkeypatch)
+    assert res.failure == "no_capacity"
+    assert "retrying on the next-best GPU" in res.detail, res.detail

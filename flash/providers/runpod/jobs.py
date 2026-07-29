@@ -100,6 +100,7 @@ def weight_cache_grow_headroom_s() -> float:
 
     return WEIGHT_CACHE_GROW_BUDGET_S * max(1, rp_keys.key_count())
 
+
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
@@ -690,7 +691,9 @@ def deploy_train_endpoint(
                 rp_keys.key_count(),
             )
             continue
-        raise deploy_failover_exc or RuntimeError("deploy_train_endpoint: deploy failover exhausted")
+        raise deploy_failover_exc or RuntimeError(
+            "deploy_train_endpoint: deploy failover exhausted"
+        )
 
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
@@ -810,17 +813,28 @@ def poll_job(
     queue_grace_s: float = 300.0,
     deadline_at: float | None = None,
     current_attempt: int | None = None,
+    on_last_gpu: bool = False,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
 
     Uses setup_grace_s (large) until first training heartbeat, then stall_after_s (tight).
     Fails fast on THROTTLED/UNHEALTHY workers and jobs stuck IN_QUEUE past queue_grace_s.
+
+    ``on_last_gpu`` says there is no untried class left to walk to, so a capacity failure reports the
+    retry it will actually get (same class again) instead of promising a next-best GPU.
     """
 
     if not handle.job_id:
         raise ValueError("endpoint-only RunPod handles cannot be polled")
 
     say = make_say(log)
+    # the picker only ever holds classes that FIT the model, so on the last one there is nowhere to
+    # walk and the retry re-picks this same class. saying "next-best GPU" there is a false promise.
+    next_gpu_note = (
+        "retrying on the same class (no other GPU class fits this run)"
+        if on_last_gpu
+        else "retrying on the next-best GPU"
+    )
     poll_errors = PollErrorTracker(say, interval_s)
 
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
@@ -910,7 +924,7 @@ def poll_job(
                 False,
                 failure="no_capacity",
                 detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
-                "(no RunPod capacity for the pinned GPU class); retrying on the next-best GPU",
+                f"(no RunPod capacity for the pinned GPU class); {next_gpu_note}",
             )
         if status != "IN_QUEUE":
             # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
@@ -958,7 +972,7 @@ def poll_job(
                         failure="no_capacity",
                         detail=f"never scheduled: worker stuck THROTTLED for "
                         f"{int(now - throttled_timer.since)}s while IN_QUEUE (no RunPod "
-                        f"capacity for the pinned GPU class); retrying on the next-best GPU",
+                        f"capacity for the pinned GPU class); {next_gpu_note}",
                     )
             except Exception:
                 pass
@@ -1137,6 +1151,7 @@ def submit_run(
         failure_detail_reader=failure_reader,
         current_attempt=attempt_id,
         **deadline_kwargs(poll_job, deadline_at),
+        on_last_gpu=on_last_gpu,
         **stall_kwargs(on_last_gpu=on_last_gpu),
     )
 
