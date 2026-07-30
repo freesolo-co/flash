@@ -27,20 +27,54 @@ def test_split_reasoning_is_folded_back_into_a_balanced_block():
 
 
 def test_content_without_reasoning_is_returned_verbatim():
+    # absent and null both mean serving never split the tags out: nothing to fold back in.
     assert deploy._balanced_thinking_content({"content": "plain answer"}) == "plain answer"
-    assert deploy._balanced_thinking_content({"content": "plain", "reasoning_content": ""}) == (
-        "plain"
-    )
     assert deploy._balanced_thinking_content({"content": "plain", "reasoning_content": None}) == (
         "plain"
     )
     assert deploy._balanced_thinking_content({}) == ""
 
 
+def test_an_explicitly_empty_reasoning_string_still_gets_a_balanced_pair():
+    """`""` is not the same as absent: it means the model closed its block before answering.
+
+    Collapsing the two loses a real distinction. A thinking consumer splits the answer on
+    `</think>`, so returning the bare answer here makes a valid completion look like it has no
+    answer at all -- a thinking structured-output deployment then fails its smoke test despite
+    the model having answered correctly.
+    """
+    assert deploy._balanced_thinking_content(
+        {"content": "plain", "reasoning_content": ""}
+    ) == "<think></think>plain"
+
+
 def test_content_that_already_closes_a_block_is_not_nested_again():
-    # a serving build that leaves the tags inline must not gain a second, outer block.
+    # a serving build that leaves the tags inline must not gain a second, outer block -- but it
+    # must still gain the OPENER, which the prompt swallowed. the old expectation returned this
+    # string verbatim, which left `reasoned</think>answer`: a close with nothing opening it, i.e.
+    # exactly the malformed completion this helper exists to repair.
     message = {"content": "reasoned</think>answer", "reasoning_content": "reasoned"}
-    assert deploy._balanced_thinking_content(message) == "reasoned</think>answer"
+    assert deploy._balanced_thinking_content(message) == "<think>reasoned</think>answer"
+
+
+def test_a_bare_inline_close_is_reopened_rather_than_treated_as_balanced():
+    """`</think>answer` has a closer and no opener, so `"</think>" in content` is not "balanced".
+
+    The opening tag came from the prompt, so a serving build that also leaves the sampled close in
+    `content` produces this shape. Treating the stray closer as proof of a balanced block hands
+    CLI and API consumers the very completion this helper repairs.
+    """
+    message = {"content": "</think>answer", "reasoning_content": "reasoned"}
+    out = deploy._balanced_thinking_content(message)
+    assert out == "<think>reasoned</think>answer"
+    assert out.count("<think>") == 1
+    assert out.count("</think>") == 1
+
+
+def test_a_real_opener_is_left_alone():
+    # a genuinely balanced block must pass through untouched, with no second pair.
+    message = {"content": "<think>r</think>answer", "reasoning_content": "r"}
+    assert deploy._balanced_thinking_content(message) == "<think>r</think>answer"
 
 
 def test_payload_balancing_rewrites_every_choice_in_place():
@@ -77,6 +111,29 @@ def test_streamed_reasoning_opens_and_closes_around_the_answer():
 def test_streamed_answer_without_reasoning_is_untouched():
     lines = _sse({"content": "just "}, {"content": "text"})
     assert "".join(deploy._openai_stream_content(iter(lines))) == "just text"
+
+
+def test_streamed_inline_close_is_not_duplicated_by_the_synthetic_one():
+    """The streaming twin of `test_content_that_already_closes_a_block_is_not_nested_again`.
+
+    A compatibility build can emit reasoning on its own delta field AND retain the sampled close
+    at the head of the first content delta. Synthesising a second one produced
+    `<think>reasoned</think></think>answer`, which leaves `flash models chat` output and any
+    downstream parser malformed.
+    """
+    lines = _sse({"reasoning_content": "reasoned"}, {"content": "</think>answer"})
+    out = "".join(deploy._openai_stream_content(iter(lines)))
+    assert out == "<think>reasoned</think>answer"
+    assert out.count("</think>") == 1
+
+
+def test_streamed_content_keeps_a_close_tag_that_is_not_the_block_delimiter():
+    # only a close at the HEAD of the first content delta is the sampled delimiter. one appearing
+    # later is answer text, and stripping it would corrupt the answer.
+    lines = _sse({"reasoning_content": "r"}, {"content": "answer about </think> tags"})
+    assert "".join(deploy._openai_stream_content(iter(lines))) == (
+        "<think>r</think>answer about </think> tags"
+    )
 
 
 def test_streamed_reasoning_cut_off_mid_block_is_still_closed():
