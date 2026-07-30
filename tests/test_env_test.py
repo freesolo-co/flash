@@ -1038,3 +1038,32 @@ def test_env_test_per_turn_credit_separates_a_flat_episode_score(monkeypatch, tm
     assert "episode 1: policy=replay turns=2 reward=0.500000" in captured.out
     assert "overall: PASS" in captured.out
     assert "cannot rank completions" not in captured.err
+
+
+def test_env_test_thinking_reference_is_excluded_from_the_reward_gate(
+    monkeypatch, tmp_path, capsys
+):
+    # a gold answer carrying reasoning markup is graded by the run as graded_text leaves it, which
+    # strips the <think> span under a thinking config (flash/engine/worker/rl.py). this command has
+    # no run config to know whether thinking is on, so it cannot reproduce that text: an exact-answer
+    # grader scores the raw reference and every control zero, and treating that as conclusive would
+    # fail a working environment. the episode carries no evidence and must be excluded.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ThinkingGoldEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [{"role": "assistant", "content": "<think>work</think>4"}]
+
+        def reward(self, completion, example, state=None):
+            # an exact-answer grader: the raw reference still carries the reasoning span, so it
+            # scores zero exactly as every deliberately wrong control does.
+            self.completions.append(completion)
+            return 1.0 if completion == example.get("output", "") else 0.0
+
+    _patch_loader(monkeypatch, _ThinkingGoldEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "cannot rank completions" not in captured.err
