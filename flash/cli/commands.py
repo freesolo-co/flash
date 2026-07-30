@@ -422,6 +422,14 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
     if isinstance(heartbeat, dict):
         heartbeat_age_seconds = render._heartbeat_age_seconds(heartbeat.get("ts"))
+        # stage and step come from the heartbeat, attempt from `remote` below. during the relaunch
+        # window those are two different attempts, so printing them side by side reads as progress
+        # the replacement worker has not made: `stage=sft_step step=455 attempt=1` attributes the
+        # superseded worker's 455 steps to an attempt that just started from zero -- the exact
+        # rewind the attempt counter was added to explain. mark the heartbeat-sourced fields as
+        # the previous attempt's instead of dropping them: the run really did reach that step, and
+        # suppressing it entirely would read as no progress at all (codex[bot]).
+        stale_heartbeat = not render.heartbeat_is_current_attempt(status, heartbeat)
         stage = heartbeat.get("stage")
         if stage:
             parts.append(f"stage={stage}")
@@ -429,13 +437,17 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
                 warmup = render.warmup_message(
                     stage,
                     heartbeat_age_seconds,
-                    render.heartbeat_is_current_attempt(status, heartbeat),
+                    not stale_heartbeat,
                 )
                 if warmup:
                     parts.append(warmup)
         step = heartbeat.get("step")
         if step is not None:
             parts.append(f"step={step}")
+        if stale_heartbeat and (stage or step is not None):
+            # one marker for the whole heartbeat-sourced group rather than a suffix on each field:
+            # the staleness is a property of the ping, not of any one value it carried.
+            parts.append("(prev attempt)")
         # a preemption relaunches the run on fresh hardware from step 0 while `state` stays
         # "running", so the step counter silently rewinds and the earlier progress is gone. the
         # attempt counter is the one field that distinguishes that from normal progress, so show it

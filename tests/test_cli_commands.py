@@ -1380,6 +1380,9 @@ def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
     }
     _, progress = _log_follow_progress(mid_relaunch, "unknown")
     assert "attempt=1" in progress
+    # ...and the step it is printed next to belongs to attempt 0, so it must not read as attempt
+    # 1's progress. see test_log_follow_progress_marks_a_stale_heartbeats_fields.
+    assert "(prev attempt)" in progress
 
     # `remote` is absent on planes that do not surface it, so the heartbeat still has to answer.
     no_remote = {
@@ -1388,6 +1391,57 @@ def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
     }
     _, progress = _log_follow_progress(no_remote, "unknown")
     assert "attempt=2" in progress
+
+
+def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
+    """stage/step come from the heartbeat, attempt from `remote` -- during a relaunch those differ.
+
+    Printed unqualified, `stage=sft_step step=455 attempt=1` says the replacement worker has run
+    455 steps. It has not: it restarted from zero, and 455 is the superseded worker's last ping.
+    That is the exact rewind the attempt counter was added to explain, reported as if it never
+    happened.
+
+    Marked rather than suppressed: the run did reach step 455, and dropping the fields entirely
+    would read as a worker that has produced nothing.
+    """
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    _, progress = _log_follow_progress(
+        {
+            "state": "running",
+            "remote": {"attempt": 1},
+            "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
+        },
+        "unknown",
+    )
+    assert "step=455" in progress
+    assert "attempt=1" in progress
+    assert "(prev attempt)" in progress, progress
+
+    # a heartbeat from the live attempt is not stale, so nothing is marked.
+    _, current = _log_follow_progress(
+        {
+            "state": "running",
+            "remote": {"attempt": 1},
+            "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 1},
+        },
+        "unknown",
+    )
+    assert "step=455" in current
+    assert "(prev attempt)" not in current, current
+
+    # no `remote` means the live attempt is unknown, so staleness is unprovable -- marking there
+    # would label every ordinary heartbeat on a plane that does not surface `remote`.
+    _, no_remote = _log_follow_progress(
+        {
+            "state": "running",
+            "last_heartbeat": {"stage": "sft_step", "step": 12, "ts": _time.time(), "attempt": 2},
+        },
+        "unknown",
+    )
+    assert "(prev attempt)" not in no_remote, no_remote
 
 
 @pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
