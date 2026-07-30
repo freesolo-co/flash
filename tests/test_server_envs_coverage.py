@@ -17,6 +17,7 @@ import subprocess
 import tarfile
 import time
 import types
+from typing import ClassVar
 
 import pytest
 
@@ -652,7 +653,7 @@ def test_chat_body_carries_stop_sequences(monkeypatch):
 
     class _Resp:
         status_code = 200
-        headers: dict[str, str] = {}
+        headers: ClassVar[dict[str, str]] = {}
 
         def raise_for_status(self):
             return None
