@@ -330,6 +330,12 @@ def _print_train_schema_compatibility(result: object) -> None:
     print(render.note(text) if render.styled() else text, file=sys.stderr)
 
 
+# algorithms whose worker never creates a W&B run, so a key changes nothing for them. the other
+# three reach it through their trainer: opd calls wandb_report_to() directly, and grpo (the rl
+# worker) and sft pass it as report_to.
+_ALGORITHMS_WITHOUT_WANDB = frozenset({"opsd"})
+
+
 def _warn_if_wandb_requested_without_key(
     spec, runtime_secrets: dict | None, *, dry_run: bool
 ) -> None:
@@ -342,22 +348,28 @@ def _warn_if_wandb_requested_without_key(
     """
     if not (spec.wandb.project or spec.wandb.run_name):
         return
+    # a dry-run allocates no gpu and trains nothing, so "this run will train" would contradict the
+    # dry-run notice printed moments later and can read as though a paid run started.
+    subject = "a run submitted with this config will train" if dry_run else "this run will train"
+    # opsd never initializes a W&B run: unlike opd/rl/sft it makes no wandb_report_to() call and
+    # contributes no wandb_run_info() to its metadata. so a key would not help, and telling the
+    # user to export one would clear the warning while the paid run still logs nowhere.
+    if spec.algorithm in _ALGORITHMS_WITHOUT_WANDB:
+        message = (
+            f"[wandb] is configured but W&B logging is not supported for {spec.algorithm}; "
+            f"{subject} with W&B logging DISABLED regardless of WANDB_API_KEY."
+        )
+        print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+        return
     # strip before deciding: the server's _runtime_secrets() strips and drops the value, so a
     # whitespace-only key reaches the worker as no key at all -- the exact silent-no-logging
     # failure this warning exists to prevent, but with the warning suppressed.
     if str((runtime_secrets or {}).get("WANDB_API_KEY") or "").strip():
         return
-    # a dry-run allocates no gpu and trains nothing, so "this run will train" would contradict the
-    # dry-run notice printed moments later and can read as though a paid run started.
-    outcome = (
-        "a run submitted with this config will train with W&B logging DISABLED"
-        if dry_run
-        else "this run will train with W&B logging DISABLED"
-    )
     message = (
         "[wandb] is configured but no WANDB_API_KEY was found in the environment, "
-        f"./.env(.local), or the .env(.local) beside the config; {outcome}. "
-        "Export WANDB_API_KEY or put it in a .env next to the config."
+        f"./.env(.local), or the .env(.local) beside the config; {subject} with W&B logging "
+        "DISABLED. Export WANDB_API_KEY or put it in a .env next to the config."
     )
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 

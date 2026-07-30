@@ -8,7 +8,7 @@ logging off, which is only discoverable after the GPU spend, when the curve is g
 
 from __future__ import annotations
 
-from flash.cli.commands import _warn_if_wandb_requested_without_key
+from flash.cli.commands import _ALGORITHMS_WITHOUT_WANDB, _warn_if_wandb_requested_without_key
 from flash.spec import JobSpec, WandbSpec
 
 
@@ -65,3 +65,65 @@ def test_dry_run_does_not_claim_the_run_will_train(capsys):
     assert "DISABLED" in err
     assert "this run will train" not in err
     assert "a run submitted with this config will train" in err
+
+
+def test_opsd_is_told_wandb_is_unsupported_rather_than_to_export_a_key(capsys):
+    """opsd never creates a W&B run, so exporting a key would silence the warning and change nothing.
+
+    The remedy has to be truthful: following "export WANDB_API_KEY" here clears the warning while
+    the paid run still produces no dashboard, which is worse than the warning it replaced.
+    """
+    spec = JobSpec(algorithm="opsd", wandb=WandbSpec(project="my-project"))
+
+    _warn_if_wandb_requested_without_key(spec, None, dry_run=False)
+
+    err = capsys.readouterr().err
+    assert "not supported for opsd" in err
+    assert "DISABLED" in err
+    assert "Export WANDB_API_KEY" not in err
+
+
+def test_opsd_warns_even_when_a_key_is_present(capsys):
+    """The key is irrelevant for opsd, so a user who has one must still learn logging is off."""
+    spec = JobSpec(algorithm="opsd", wandb=WandbSpec(project="my-project"))
+
+    _warn_if_wandb_requested_without_key(spec, {"WANDB_API_KEY": "wandb-key"}, dry_run=False)
+
+    assert "not supported for opsd" in capsys.readouterr().err
+
+
+def test_supported_algorithms_still_get_the_export_remedy(capsys):
+    """grpo/opd/sft reach W&B through their trainers, so a key genuinely fixes their case."""
+    for algorithm in ("sft", "grpo", "opd"):
+        spec = JobSpec(algorithm=algorithm, wandb=WandbSpec(project="my-project"))
+
+        _warn_if_wandb_requested_without_key(spec, None, dry_run=False)
+
+        err = capsys.readouterr().err
+        assert "Export WANDB_API_KEY" in err, algorithm
+        assert "not supported" not in err, algorithm
+
+
+def test_unsupported_set_matches_the_workers_that_never_call_wandb():
+    """Pin the constant to the source of truth, so adding W&B to opsd cannot leave a stale warning.
+
+    The warning claims a worker never creates a W&B run. That claim is only true while the worker
+    makes no wandb_report_to()/wandb_run_info() call, so assert it against the modules themselves
+    rather than trusting the hand-maintained set.
+    """
+    import inspect
+    from pathlib import Path
+
+    from flash.catalog import ALGORITHMS
+    from flash.engine import worker as worker_pkg
+
+    worker_dir = Path(inspect.getfile(worker_pkg)).parent
+    without_wandb = set()
+    for algorithm in ALGORITHMS:
+        # JobSpec.phase is the algorithm -> worker-module mapping (grpo runs the rl worker)
+        module = worker_dir / f"{JobSpec(algorithm=algorithm).phase}.py"
+        source = module.read_text()
+        if "wandb_report_to" not in source and "wandb_run_info" not in source:
+            without_wandb.add(algorithm)
+
+    assert without_wandb == set(_ALGORITHMS_WITHOUT_WANDB)
