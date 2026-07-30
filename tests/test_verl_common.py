@@ -464,6 +464,59 @@ def test_stall_tail_fields_is_empty_when_the_child_has_said_nothing():
     assert vc.stall_tail_fields(0, vc.ChildOutputTail()) == {}
 
 
+def test_stall_tail_fields_reports_how_long_the_child_has_been_silent():
+    # the whole point: a child still loading shards and a child wedged forever both present a fully
+    # populated tail whose newest line looks plausible. only whether the tail CHANGED separates them,
+    # and without this the comparison has to be reconstructed by hand from consecutive heartbeats.
+    tail = vc.ChildOutputTail()
+    staleness = vc.ChildTailStaleness()
+    tail.record("Started a local Ray instance\n")
+
+    first = vc.stall_tail_fields(0, tail, staleness=staleness)
+    assert first["child_tail_silent_ticks"] == 0
+
+    # two more ticks with the child saying nothing new: same tail, rising silence.
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 1
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 2
+
+    # the child speaks again, so it is slow rather than stuck and the counter resets.
+    tail.record("loading checkpoint shards 1/4\n")
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+
+
+def test_child_tail_silence_survives_the_retention_limit():
+    # staleness is counted from lines WRITTEN, not from the retained window: once the ring buffer is
+    # full its contents can keep changing while its length does not, and a length-based comparison
+    # would then report a talking child as silent.
+    tail = vc.ChildOutputTail(limit=3)
+    staleness = vc.ChildTailStaleness()
+    for i in range(3):
+        tail.record(f"line{i}\n")
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    tail.record("line3\n")  # evicts line0; the deque stays length 3
+    assert len(tail.tail()) == 3
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+
+
+def test_child_tail_silence_is_measured_from_the_childs_first_line():
+    # a child silent for the first ticks then talking must not be credited with the silence that
+    # preceded its first line -- otherwise a slow starter reports as long-wedged the moment it speaks.
+    tail = vc.ChildOutputTail()
+    staleness = vc.ChildTailStaleness()
+    for _ in range(4):
+        assert vc.stall_tail_fields(0, tail, staleness=staleness) == {}
+    tail.record("first words\n")
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+
+
+def test_stall_tail_fields_omits_silence_when_no_tracker_is_supplied():
+    # the field must not appear as a fabricated 0 for callers that do not track staleness: absent and
+    # "zero ticks silent" are different claims.
+    tail = vc.ChildOutputTail()
+    tail.record("only line\n")
+    assert vc.stall_tail_fields(0, tail) == {"child_tail": ["only line"]}
+
+
 def test_stall_tail_fields_narrows_to_the_most_recent_lines():
     tail = vc.ChildOutputTail()
     for i in range(vc.STALL_TAIL_LINES + 25):
