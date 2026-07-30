@@ -89,7 +89,8 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
             # agree exactly whenever one card is enough.
             return cost_key(candidate.gpu, candidate.hourly_usd)
         gpu_bound, fixed = step_seconds_split(config, candidate.gpu)
-        seconds = gpu_bound / multi_card_speedup(candidate.gpu_count) + fixed
+        # scaling is per-class: an nvlink pair keeps ~0.88 of linear per card, a pcie pair ~0.71.
+        seconds = gpu_bound / multi_card_speedup(candidate.gpu_count, candidate.gpu) + fixed
         return candidate.total_hourly_usd * seconds / 3600.0
 
     return cost_per_step

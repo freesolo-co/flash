@@ -42,10 +42,39 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
 }
 _DEFAULT_TFLOPS = 100.0
 
+# classes whose cards talk to each other over nvlink rather than the pcie root complex. this is the
+# single largest input to multi-card scaling: the same 2-card benchmark measured 1.7675x on an
+# nvlink pair and 1.4212x on a pcie pair, so one global scaling constant cannot describe both.
+# membership is by form factor -- sxm datacenter parts carry nvlink, pcie boards and every geforce
+# part do not (the 4090 dropped nvlink entirely). anything absent is treated as pcie, which is the
+# conservative side: it under-credits a combination rather than ranking it on bandwidth it lacks.
+# note the "H100" entry above is the pcie board runpod provisions, so it is deliberately not here.
+_NVLINK_CLASSES: frozenset[str] = frozenset(
+    {
+        # MEASURED: 2x A100-SXM4-80GB on RunPod reached 1.7675x (see MULTI_CARD_SCALING_NVLINK).
+        "A100 SXM",
+        # same sxm4 board and nvlink fabric as the 80gb part, less hbm only.
+        "A100 SXM 40GB",
+        # sxm parts with nvlink/nvswitch by form factor. INFERRED, not measured -- no multi-card
+        # benchmark has been run on either class.
+        "H200",
+        "B200",
+    }
+)
+
 
 def gpu_tflops(name: str) -> float:
     """Peak bf16 tensor TFLOPS for a managed GPU class."""
     return GPU_COMPUTE_TFLOPS.get(name, _DEFAULT_TFLOPS)
+
+
+def has_nvlink(name: str) -> bool:
+    """Whether cards of class ``name`` are interconnected by nvlink rather than pcie.
+
+    Unknown classes report False: a class nobody has classified is far more likely to be a pcie
+    board than an sxm one, and guessing wrong in that direction only under-credits scaling.
+    """
+    return name in _NVLINK_CLASSES
 
 
 # realized TRAINING throughput sits well below peak when a class's training kernels don't reach it.
