@@ -473,6 +473,39 @@ def test_dry_run_fails_open_when_billing_backend_is_unreachable(api, monkeypatch
 
     assert res.status_code == 200, res.text
     assert res.json()["state"] == "dry_run"
+    # failing open is intentional, but the response must not imply cost was validated: the same
+    # spec can still be rejected 402 once the backend recovers.
+    assert res.json()["affordability_verified"] is False
+
+
+def test_dry_run_reports_affordability_verified_when_the_check_ran(api, monkeypatch):
+    """A real pass and a failed-open skip must be distinguishable, since both answer 200."""
+    import flash.server.billing as billing_mod
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["affordability_verified"] is True
+
+
+def test_dry_run_reports_unverified_when_internal_reporting_is_off(api, monkeypatch):
+    """The other fail-open path: no internal key, so the precheck returns before calling billing."""
+    import flash.server._internal_client as internal_mod
+
+    monkeypatch.setattr(internal_mod, "internal_key", lambda: None)
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["affordability_verified"] is False
 
 
 def test_billable_dry_run_without_an_org_is_rejected_like_a_real_submit(api, monkeypatch):

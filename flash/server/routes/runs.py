@@ -87,14 +87,19 @@ def _client_train_schema(payload: dict) -> dict | None:
     }
 
 
-def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> None:
-    """Reject an unaffordable prepared run before recording or allocating it."""
+def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> bool:
+    """Reject an unaffordable prepared run before recording or allocating it.
+
+    Returns whether affordability was actually VERIFIED. The two fail-open paths below deliberately
+    let the run through on a billing-infra problem, but a caller that reports the outcome must be
+    able to tell that apart from a real pass: an unverified run can still be rejected 402 later.
+    """
     from flash.server._internal_client import internal_key as _internal_key
 
     key = _internal_key()
     if not key:
         # internal reporting is off -> no completion billing either, so there is nothing to gate.
-        return
+        return False
     try:
         from flash.server.billing import precheck_training_run
 
@@ -105,6 +110,8 @@ def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) 
         if isinstance(exc, BillingError) and exc.status_code == 402:
             raise HTTPException(status_code=402, detail=exc.detail) from exc
         _LOG.warning("budget precheck skipped for %s (billing service error): %s", run_id, exc)
+        return False
+    return True
 
 
 @router.post("/v1/runs")
@@ -198,6 +205,7 @@ def create_run(
         if value
     }
     run_id = spec.run_id
+    affordability_verified = False
     try:
         try:
             prepared = _app.prepare_job(
@@ -238,7 +246,7 @@ def create_run(
         # `--dry-run` that passes now also proves the org can cover the estimate, instead of the run
         # being validated here and rejected 402 only on real submission.
         if bill_on_completion or (dry_run and billable_key):
-            _precheck_budget_or_block(
+            affordability_verified = _precheck_budget_or_block(
                 run_id=run_id,
                 estimate_usd=prepared.estimated_cost_usd,
                 org_id=affordability_org_id,
@@ -279,6 +287,11 @@ def create_run(
     response = status.to_dict()
     if dry_run and schema is not None:
         response["train_schema_compatibility"] = schema["compatibility"]
+    if dry_run:
+        # say whether the affordability check actually RAN. it fails open on a billing-infra
+        # problem, so a silent 200 would claim the dry run validated cost when it did not -- and
+        # the identical spec can still be rejected 402 once the backend recovers.
+        response["affordability_verified"] = affordability_verified
     return response
 
 
