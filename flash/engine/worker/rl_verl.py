@@ -953,15 +953,18 @@ class _VerlResumeUploader:
         # would waste the upload slot on state hf already holds. that is tracked in uploaded_steps
         # below; processed_steps is deliberately NOT seeded for a required resume step, because its
         # DEPLOYABLE can still be missing -- a previous worker resume-uploads a checkpoint while
-        # withholding its adapter behind the gradient gate, and hiding that step from _pending would
-        # fail completeness on the one step this worker is both able and allowed to publish.
+        # withholding its adapter behind the gradient gate -- and _pending must yield that step once
+        # so its adapter gets staged from the checkpoint this run restored.
         self.processed_steps: set[int] = (
             {resume_step} if resume_step and resume_step not in self.required_steps else set()
         )
-        # resume upload is tracked separately from processed_steps because a withheld required step
-        # stays deliberately unprocessed so a later sweep can still publish it. sharing one set would
-        # either re-upload that checkpoint on every 0.5s sweep or lose the retry.
+        # tracked separately from processed_steps: a required resume step is left unprocessed so it
+        # can be staged, but its resume state is already on hf and must not be re-uploaded.
         self.uploaded_steps: set[int] = {resume_step} if resume_step else set()
+        # required step -> staged adapter directory, populated the sweep a checkpoint appears and
+        # drained by publication once the gradient gate opens. this is what decouples publication
+        # from verl's checkpoint retention.
+        self.staged_steps: dict[int, str] = {}
         self.export_root = export_root
         self.python_bin = python_bin
         self.model_id = model_id
@@ -1055,8 +1058,17 @@ class _VerlResumeUploader:
                 found.append((step, path))
         return sorted(found)
 
-    def _publish_deployable(self, step: int, checkpoint_dir: str) -> None:
-        """export a required step's checkpoint into a servable adapter and publish it."""
+    def _stage_deployable(self, step: int, checkpoint_dir: str) -> str:
+        """export a required step's checkpoint into a servable adapter under export_root.
+
+        staging is deliberately NOT gated on gradient evidence, while publication is. verl owns
+        ``checkpoint_dir`` and prunes it once max_actor_ckpt_to_keep newer saves exist, so an export
+        deferred until the gate opens can find its source already deleted -- with four or more
+        required steps ahead of the first varying-reward group, the earliest ones would then be
+        unpublishable and fail an otherwise valid run. export_root is flash's own workdir, so the
+        staged adapter outlives verl's retention. it is not servable until _publish_staged uploads
+        it, which is what keeps the gate's guarantee intact.
+        """
         actor_dir = os.path.join(checkpoint_dir, "actor")
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         shutil.rmtree(adapter_dir, ignore_errors=True)
@@ -1069,6 +1081,10 @@ class _VerlResumeUploader:
         self.tokenizer.save_pretrained(adapter_dir)
         _stamp_adapter_dir_provenance(adapter_dir, self.model_id, self.model_revision)
         _w.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
+        return adapter_dir
+
+    def _publish_staged(self, step: int, adapter_dir: str) -> None:
+        """make an already-staged adapter durable and servable."""
         _w.publish_deployable_checkpoint(adapter_dir, step, required=True, _provenance_ready=True)
         self.published_steps.add(step)
 
@@ -1085,22 +1101,17 @@ class _VerlResumeUploader:
                 # newest resume checkpoint routinely appears in that window; exiting without
                 # sweeping it would drop durable work a preemption then has to redo.
                 stopping = self._stop.is_set()
-                deployable_ok = self._deployable_allowed()
                 for step, path in self._pending(self._completed_step()):
-                    # hold a required step's DEPLOYABLE back rather than publish an untrained
-                    # adapter. the step stays out of processed_steps so the next sweep retries it
-                    # once spread appears, and if it never does, raise_if_incomplete reports it.
-                    withheld = (
-                        step in self.required_steps
-                        and step not in self.published_steps
-                        and not deployable_ok
-                    )
+                    # stage while verl's checkpoint still exists; publication happens below, once
+                    # the gate opens. the two have different deadlines -- the source expires with
+                    # verl's retention, the permission arrives with the first varying-reward group --
+                    # so a step is staged on the sweep that finds it and published whenever it may be.
                     if (
                         step in self.required_steps
                         and step not in self.published_steps
-                        and not withheld
+                        and step not in self.staged_steps
                     ):
-                        self._publish_deployable(step, path)
+                        self.staged_steps[step] = self._stage_deployable(step, path)
                     # the resume upload is NOT gated on gradient evidence: it is internal retry
                     # scaffolding rather than a servable artifact, and with exact save_at_steps these
                     # are often the only on-disk checkpoints, so skipping it would leave a run
@@ -1113,21 +1124,21 @@ class _VerlResumeUploader:
                             _w.upload_resume_checkpoint(step, path)
                         except Exception as error:
                             print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
-                    if not withheld:
-                        self.processed_steps.add(step)
-                # a withheld step stays pending by design, so "stopped and drained" can no longer be
-                # the only exit: with the gate shut those steps never clear, and waiting for them
-                # would hang stop(). raise_if_incomplete() reports them as the run failure instead.
-                # the gate is re-read here rather than reusing the sample taken at the top of the
-                # sweep: the main thread can record the run's first positive spread and call stop()
-                # in between, and exiting on the stale "shut" reading would fail a genuinely trained
-                # run on nothing but thread timing.
+                    self.processed_steps.add(step)
+                # publication is driven off staged_steps rather than _pending, so a step whose verl
+                # checkpoint has since been pruned is still publishable: everything the upload needs
+                # already lives under export_root. read the gate once per sweep, after staging, so a
+                # spread recorded during a slow export is honoured on this pass.
+                if self._deployable_allowed():
+                    for step in sorted(self.staged_steps):
+                        if step not in self.published_steps:
+                            self._publish_staged(step, self.staged_steps[step])
                 # `stopping`, not a fresh read: the sweep above is the full pass over everything
-                # stop() had made visible, and only after running it may the loop exit.
-                if stopping:
-                    stalled = bool(self.required_steps) and not self._deployable_allowed()
-                    if stalled or not self._pending(self._completed_step()):
-                        return
+                # stop() had made visible, and only after running it may the loop exit. staged
+                # steps still awaiting the gate cannot hold the loop open -- with the gate shut they
+                # never clear, and waiting would hang stop(); raise_if_incomplete() reports them.
+                if stopping and not self._pending(self._completed_step()):
+                    return
                 time.sleep(0.5)
         except BaseException as error:
             self._error = error

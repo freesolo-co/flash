@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import os
+import shutil
 import textwrap
 import threading
 import time
@@ -1296,25 +1298,43 @@ def test_run_rl_verl_gates_midtraining_deployables_and_exempts_resumes():
     assert source.index("adv_spread_history: list[float] = []") < source.index("_VerlResumeUploader(")
 
 
+def _patch_stage_and_publish(monkeypatch, staged: list[int], published: list[int]) -> None:
+    """record staging and publication separately, without running model_merger or touching hf.
+
+    they are patched as two seams because the production code separates them: staging is bounded by
+    verl's checkpoint retention, publication by the gradient gate.
+    """
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader,
+        "_stage_deployable",
+        lambda self, step, path: (staged.append(int(step)), f"{path}-adapter")[1],
+    )
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader,
+        "_publish_staged",
+        lambda self, step, adapter_dir: (
+            published.append(int(step)),
+            self.published_steps.add(step),
+        )[0],
+    )
+
+
 def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path, monkeypatch):
-    # withholding gates the DEPLOYABLE only. the resume upload is internal retry scaffolding, and with
+    # withholding gates PUBLICATION only. the resume upload is internal retry scaffolding, and with
     # exact save_at_steps these are often the only on-disk checkpoints -- skipping it would leave a run
-    # preempted before the first nonzero spread with nothing to resume from. and because a withheld
-    # step deliberately stays pending, the upload must be keyed on its own bookkeeping or the drain
-    # loop re-uploads the same checkpoint every 0.5s sweep.
+    # preempted before the first nonzero spread with nothing to resume from. neither the upload nor the
+    # staging may repeat on every 0.5s sweep while the step waits for the gate.
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     uploaded: list[int] = []
+    staged: list[int] = []
     published: list[int] = []
     spread: list[float] = []
     monkeypatch.setattr(
         rl_verl._w, "upload_resume_checkpoint",
         lambda step, path, **k: uploaded.append(int(step)), raising=False,
     )
-    monkeypatch.setattr(
-        rl_verl._VerlResumeUploader, "_publish_deployable",
-        lambda self, step, path: (published.append(int(step)), self.published_steps.add(step))[0],
-    )
+    _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 3)
     uploader = rl_verl._VerlResumeUploader(
         str(local_dir), resume_step=0, required_steps=(3,),
@@ -1325,19 +1345,20 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and 3 not in uploaded:
             time.sleep(0.05)
-        # the gate is shut, so the deployable is withheld -- but resume state IS durable.
+        # the gate is shut, so publication is withheld -- but resume state IS durable, and the
+        # adapter is already staged out of verl's reach.
         assert uploaded == [3]
+        assert staged == [3]
         assert published == []
-        # and it stays pending, so raise_if_incomplete() can still report it.
-        assert 3 not in uploader.processed_steps
-        time.sleep(1.5)  # several sweeps: the upload must not repeat
+        time.sleep(1.5)  # several sweeps: neither the upload nor the export may repeat
         assert uploaded == [3]
+        assert staged == [3]
         spread.append(2.0)  # gradient evidence appears; the held-back deployable is released
         while time.monotonic() < deadline and not published:
             time.sleep(0.05)
         assert published == [3]
         assert uploaded == [3]
-        assert 3 in uploader.processed_steps
+        assert staged == [3]
     finally:
         uploader.stop()
     uploader.raise_if_incomplete()
@@ -1351,6 +1372,7 @@ def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_pa
     monkeypatch.setattr(
         rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
+    _patch_stage_and_publish(monkeypatch, [], [])
     _write_step(local_dir, 3)
     uploader = rl_verl._VerlResumeUploader(
         str(local_dir), resume_step=0, required_steps=(3,), had_gradient=lambda: False
@@ -1365,21 +1387,17 @@ def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_pa
 def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_timing(
     tmp_path, monkeypatch
 ):
-    # the drain loop samples the gate at the top of a sweep. if the main thread records the run's
-    # first positive spread and calls stop() after that sample, exiting on the stale "shut" reading
-    # would fail a genuinely trained run for no reason but thread scheduling. the stall verdict must
-    # therefore re-read the gate, not reuse the sample.
+    # the drain loop samples the gate once per sweep. if the main thread records the run's first
+    # positive spread and calls stop() after that sample, publishing nothing would fail a genuinely
+    # trained run for no reason but thread scheduling. the sweep that observes stop() must therefore
+    # still act on the gate as it stands then.
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     published: list[int] = []
     monkeypatch.setattr(
         rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
-    monkeypatch.setattr(
-        rl_verl._VerlResumeUploader,
-        "_publish_deployable",
-        lambda self, step, path: (published.append(int(step)), self.published_steps.add(step))[0],
-    )
+    _patch_stage_and_publish(monkeypatch, [], published)
     _write_step(local_dir, 3)
     gate = [False]
     # flips the gate open on the sweep *after* the first sample, mimicking the main thread recording
@@ -1414,11 +1432,7 @@ def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_pat
     monkeypatch.setattr(
         rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
-    monkeypatch.setattr(
-        rl_verl._VerlResumeUploader,
-        "_publish_deployable",
-        lambda self, step, path: (published.append(int(step)), self.published_steps.add(step))[0],
-    )
+    _patch_stage_and_publish(monkeypatch, [], published)
     _write_step(local_dir, 4)
     # resumed at exactly the required step, and no adapter on hf for it, so it stays uncredited.
     monkeypatch.setattr(rl_verl, "_deployable_adapter_on_hf", lambda step: False)
@@ -1433,14 +1447,15 @@ def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_pat
     uploader.raise_if_incomplete()
 
 
-def test_checkpoint_appearing_at_stop_is_uploaded_before_the_stalled_exit(tmp_path, monkeypatch):
+def test_checkpoint_appearing_at_stop_is_uploaded_before_the_exit(tmp_path, monkeypatch):
     # verl advances latest_checkpointed_iteration.txt right up to the moment the child exits, so the
-    # newest resume checkpoint can appear after the drain's last scan but before stop(). with the
-    # gradient gate shut the `stalled` exit fires, and bailing out without sweeping that checkpoint
-    # would drop durable work a preemption then has to redo. resume upload is not gated.
+    # newest resume checkpoint can appear after the drain's last scan but before stop(). exiting
+    # without sweeping that checkpoint would drop durable work a preemption then has to redo. resume
+    # upload is not gated, and with the gradient gate shut nothing may be PUBLISHED.
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     uploaded: list[int] = []
+    staged: list[int] = []
     monkeypatch.setattr(
         rl_verl._w,
         "upload_resume_checkpoint",
@@ -1449,8 +1464,13 @@ def test_checkpoint_appearing_at_stop_is_uploaded_before_the_stalled_exit(tmp_pa
     )
     monkeypatch.setattr(
         rl_verl._VerlResumeUploader,
-        "_publish_deployable",
-        lambda self, step, path: (_ for _ in ()).throw(AssertionError("gate is shut")),
+        "_stage_deployable",
+        lambda self, step, path: (staged.append(int(step)), f"{path}-adapter")[1],
+    )
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader,
+        "_publish_staged",
+        lambda self, step, adapter_dir: (_ for _ in ()).throw(AssertionError("gate is shut")),
     )
     # the checkpoint must become visible AFTER a sweep has already decided what to scan, with stop
     # already set -- writing it between sweeps does not discriminate, because the next top-of-loop
@@ -1482,6 +1502,72 @@ def test_checkpoint_appearing_at_stop_is_uploaded_before_the_stalled_exit(tmp_pa
         time.sleep(0.01)
     uploader.stop()
     assert uploaded == [5]
+    # staged out of verl's reach on the same sweep, so the gate opening later can still publish it.
+    assert staged == [5]
+
+
+def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monkeypatch):
+    # verl keeps only max_actor_ckpt_to_keep=3 actor checkpoints, so with four or more required steps
+    # written before the first varying-reward group it deletes the earliest source while its
+    # deployable is still withheld. deferring the EXPORT until the gate opens would then leave that
+    # step unpublishable and fail an otherwise valid run, so the export is staged under export_root
+    # (flash's own workdir, outside verl's retention) and only the upload waits for the gate.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    staged: list[int] = []
+    published: list[int] = []
+    gate = [False]
+    monkeypatch.setattr(
+        rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+    def _stage_requiring_its_source(self, step, path):
+        # the real _stage_deployable runs model_merger over <path>/actor, so it cannot succeed once
+        # verl has pruned that directory. asserting it here is what makes this test fail on the
+        # actual defect -- an unpublishable required step -- rather than on bookkeeping.
+        if not os.path.isdir(path):
+            raise AssertionError(f"staged step {step} after verl pruned {path}")
+        staged.append(int(step))
+        return f"{path}-adapter"
+
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader, "_stage_deployable", _stage_requiring_its_source
+    )
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader,
+        "_publish_staged",
+        lambda self, step, adapter_dir: (
+            published.append(int(step)),
+            self.published_steps.add(step),
+        )[0],
+    )
+    for step in (1, 2, 3, 4):
+        (local_dir / f"global_step_{step}").mkdir()
+    _write_step(local_dir, 4)
+    uploader = rl_verl._VerlResumeUploader(
+        str(local_dir), resume_step=0, required_steps=(1, 2, 3, 4), had_gradient=lambda: gate[0]
+    )
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(staged) < 4:
+            time.sleep(0.01)
+        # nothing may be servable yet: the gate is still shut.
+        assert published == []
+        # verl prunes the oldest checkpoints now that step 4 has landed -- exactly what strands a
+        # step whose export was deferred until the gate opened.
+        for step in (1, 2):
+            shutil.rmtree(local_dir / f"global_step_{step}")
+        gate[0] = True  # the first varying-reward group finally arrives
+        while time.monotonic() < deadline and len(published) < 4:
+            time.sleep(0.01)
+    finally:
+        uploader.stop()
+    # every required step publishes, including the two whose verl checkpoints no longer exist. this
+    # is asserted before `staged` so a deferred export fails here, on the unpublishable step, rather
+    # than on the bookkeeping that led to it.
+    assert published == [1, 2, 3, 4]
+    uploader.raise_if_incomplete()
+    assert staged == [1, 2, 3, 4]
 
 
 def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, monkeypatch):
@@ -1494,6 +1580,7 @@ def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, mon
     monkeypatch.setattr(
         rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
+    _patch_stage_and_publish(monkeypatch, [], [])
     uploader = rl_verl._VerlResumeUploader(
         str(local_dir), resume_step=0, required_steps=(6,), had_gradient=lambda: False
     )
