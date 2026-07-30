@@ -444,7 +444,15 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         # nonzero value is already a relaunch.
         from flash.providers._poll import _attempt_int
 
-        attempt = _attempt_int(heartbeat.get("attempt"))
+        # prefer the live attempt from `remote` over the heartbeat's. during the relaunch window
+        # this line exists to explain, `remote.attempt` has already advanced while `last_heartbeat`
+        # is still the superseded worker's ping, so reading the heartbeat leaves the first
+        # preemption unlabelled (stale attempt 0) and names the *previous* attempt on later ones.
+        # `remote` is absent on planes that do not surface it, hence the heartbeat fallback.
+        remote = status.get("remote")
+        attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
+        if attempt is None:
+            attempt = _attempt_int(heartbeat.get("attempt"))
         if attempt:
             parts.append(f"attempt={attempt}")
         # live heartbeat age so a long quiet phase reads as "alive, throttled" not "frozen".

@@ -1369,6 +1369,26 @@ def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
     _, progress = _log_follow_progress(malformed, "unknown")
     assert "attempt=" not in progress  # non-integer attempt -> no fabricated identity
 
+    # the relaunch window this line exists to explain: `remote.attempt` has advanced but the
+    # replacement worker has not published a heartbeat yet, so `last_heartbeat` is still the
+    # superseded attempt's ping. reading the heartbeat here leaves the first preemption entirely
+    # unlabelled (its stale attempt is 0) and names the previous attempt on every later one.
+    mid_relaunch = {
+        "state": "running",
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
+    }
+    _, progress = _log_follow_progress(mid_relaunch, "unknown")
+    assert "attempt=1" in progress
+
+    # `remote` is absent on planes that do not surface it, so the heartbeat still has to answer.
+    no_remote = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_step", "step": 12, "ts": _time.time(), "attempt": 2},
+    }
+    _, progress = _log_follow_progress(no_remote, "unknown")
+    assert "attempt=2" in progress
+
 
 @pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
 def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
