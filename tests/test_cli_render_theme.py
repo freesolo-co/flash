@@ -668,9 +668,22 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     assert "last one UPLOADED" in out
     assert "before treating this as a stall" in out
 
-    # a step that is merely throttled-quiet, not stale, must stay silent.
-    fresh = dict(base, last_heartbeat={"stage": "rl_step", "step": 73, "ts": _time.time() - 400})
+    # the reported incident ages sit inside the 900s throttle window; a gate at 900s would stay
+    # silent on exactly the runs that prompted the fix.
+    for incident_age in (559, 687):
+        seen = dict(
+            base,
+            last_heartbeat={"stage": "rl_step", "step": 1, "ts": _time.time() - incident_age},
+        )
+        assert "last one UPLOADED" in render.run_status(seen), incident_age
+
+    # a recently uploaded step is live enough to trust as-is.
+    fresh = dict(base, last_heartbeat={"stage": "rl_step", "step": 73, "ts": _time.time() - 100})
     assert "last one UPLOADED" not in render.run_status(fresh)
+
+    # one explanation for one silence: the quiet hint points at `runs log`, which reads the same
+    # frozen heartbeats, so it must not ride along with the progress row.
+    assert render._QUIET_HEARTBEAT_HINT not in out
 
     # a SETUP stage has no step to be stale about -- it gets the warmup/quiet hints instead.
     setup = dict(

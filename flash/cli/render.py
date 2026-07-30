@@ -653,10 +653,12 @@ def warmup_message(
 _QUIET_HEARTBEAT_HINT = (
     "heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f"
 )
-# a training heartbeat this old is past every upload interval (900s mid-training), so the step it
-# carries is stale reporting, not a stalled trainer -- the distinction that decides whether someone
-# cancels a healthy paid run.
-_STALE_STEP_AFTER_S = 900.0
+# a throttled training step is never guaranteed current: the worker holds mid-training commits for
+# up to _HB_MIN_INTERVAL_S (900s), so from upload until the next commit the displayed step lags by an
+# unknown amount. gate on the same age at which the panel already flags the quiet (300s) rather than
+# on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that window,
+# where a 900s gate would stay silent and leave only the dead-end quiet hint (codex[bot]).
+_STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
 # only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
 # post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older than
 # 900s means a long step, failed uploads, or a real stall -- not reporting lag (codex[bot]).
@@ -676,6 +678,9 @@ def _stale_step_hint(
     while the trainer is genuinely progressing. Through the CLI alone that is indistinguishable from
     a hung run, and the obvious reaction -- cancel and relaunch -- throws away a healthy paid GPU.
     Only fires for a *training* stage carrying a step, since a setup stage has no step to be stale.
+
+    Supersedes the generic quiet hint at the same age: both explain the same silence, but that one
+    sends you to ``runs log``, which reads the very heartbeats that went stale.
     """
     if not running or heartbeat_age_seconds is None:
         return None
@@ -726,19 +731,21 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         )
         if warmup:
             pairs.append(("warmup", warmup))
+    stale_step = _stale_step_hint(
+        hb,
+        heartbeat_age_seconds,
+        running=running,
+        current_attempt=heartbeat_is_current_attempt(obj, hb),
+    )
     age = _humanize_age_seconds(heartbeat_age_seconds)
     if age:
-        if running and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
+        # the progress row already explains this silence, and does it better: the quiet hint sends you
+        # to `runs log`, which reads the same frozen heartbeats. show one or the other, never both.
+        if running and not stale_step and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
             age += _dim(f"  ({_QUIET_HEARTBEAT_HINT})")
         pairs.append(("heartbeat", age))
-        stale_step = _stale_step_hint(
-            hb,
-            heartbeat_age_seconds,
-            running=running,
-            current_attempt=heartbeat_is_current_attempt(obj, hb),
-        )
-        if stale_step:
-            pairs.append(("progress", stale_step))
+    if stale_step:
+        pairs.append(("progress", stale_step))
     return pairs
 
 
