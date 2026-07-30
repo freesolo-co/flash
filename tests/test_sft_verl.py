@@ -747,7 +747,10 @@ def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypat
     )
     monkeypatch.setattr(sft_verl, "_probe_gpu_in_subprocess", lambda *args, **kwargs: {"memory_gb": 24, "capability": [8, 9]})
     monkeypatch.setattr(sft_verl, "_model_arch_dims", lambda *args, **kwargs: (1024, 24))
-    monkeypatch.setattr(sft_verl, "resolve_verl_python", lambda workdir: "/venv/bin/python")
+    monkeypatch.setattr(sft_verl, "resolve_verl_python", lambda *a, **k: "/venv/bin/python")
+    monkeypatch.setattr(sft_verl, "resolve_verl_loggers", lambda python_bin: ["console"])
+    # torch is not installed in this test env; the real seeding is covered in test_training_controls.
+    monkeypatch.setattr(sft_verl, "seed_training_rngs", lambda seed: None)
     monkeypatch.setattr(sft_verl, "_cached_model_path", lambda model, revision: model)
     monkeypatch.setattr(sft_verl, "_restore_verl_resume", lambda local_dir: 1)
     monkeypatch.setattr(sft_verl, "_VerlCheckpointWatcher", Watcher)

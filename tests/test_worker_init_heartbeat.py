@@ -1040,23 +1040,19 @@ def test_rl_init_wraps_trainer_build_in_liveness_heartbeat():
     assert 'liveness_heartbeat("rl_initializing")' in inspect.getsource(rl.run_rl)
 
 
-def test_sft_init_wraps_trainer_build_in_liveness_heartbeat():
-    from flash.engine.worker import sft
-
-    assert 'liveness_heartbeat("sft_initializing")' in inspect.getsource(sft.run_sft)
-
-
 @pytest.mark.parametrize(
     ("modname", "outer", "stage"),
     [
         ("flash.engine.worker.rl", "run_rl", "rl_step"),
-        ("flash.engine.worker.sft", "run_sft", "sft_step"),
+        ("flash.engine.worker.sft_verl", "run_sft_verl", "sft_step"),
     ],
 )
 def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
     mod = importlib.import_module(modname)
     src = inspect.getsource(getattr(mod, outer))
-    assert f'liveness_heartbeat(\n            "{stage}",\n            progress=' in src, (
+    # formatting-robust: the wrap sits at different nesting depths across backends, so match the
+    # call shape rather than a fixed indent (the sibling quiet-phase test does the same).
+    assert re.search(rf'liveness_heartbeat\(\s*"{re.escape(stage)}",\s*progress=', src), (
         f"{outer} must wrap trainer.train() in liveness_heartbeat({stage!r}, progress=...) — "
         "without the wrap the cold first step emits no real heartbeat and looks like a hang, and "
         "without progress= the daemon can win the throttled upload slot with a bare liveness ping "
@@ -1066,7 +1062,9 @@ def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
         f"{outer} must stamp the trainer global step on daemon heartbeats (progress_step=True) so "
         "the poller's step gate and cancel billing see the true step"
     )
-    assert "global_step" in src
+    # the step has to come from the trainer's own counter, not a local tick. trl exposed it in-process
+    # as global_step; verl trains in a subprocess and parses it back out into progress["step"].
+    assert "global_step" in src or 'progress["step"]' in src
 
 
 def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
@@ -1082,8 +1080,8 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
     ("modname", "outer", "stages"),
     [
         (
-            "flash.engine.worker.sft",
-            "run_sft",
+            "flash.engine.worker.sft_verl",
+            "run_sft_verl",
             ("sft_data_loading", "sft_finalizing"),
         ),
         (
@@ -1115,9 +1113,12 @@ def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
     )
 
 
+# SFT is intentionally absent: chalk kernels are installed against an in-process trainer model, and
+# the verl SFT path launches training as a subprocess, so there is no in-process model to patch and
+# no *_initializing window to wrap. rl still builds its trainer in-process and keeps the guarantee.
 @pytest.mark.parametrize(
     ("modname", "outer"),
-    [("flash.engine.worker.sft", "run_sft"), ("flash.engine.worker.rl", "run_rl")],
+    [("flash.engine.worker.rl", "run_rl")],
 )
 def test_chalk_kernel_install_runs_inside_init_liveness_wrap(modname, outer):
     """install_chalk_kernels can JIT-compile for minutes right after trainer init; it must run

@@ -224,22 +224,34 @@ def backend_env_key(spec: JobSpec) -> str:
     return f"FLASH_{spec.phase.upper()}_BACKEND"
 
 
+# phases whose worker has no backend selector left: run_sft and run_opd delegate to the verl worker
+# unconditionally, so no [worker_env] key can route them anywhere else. grpo is absent because
+# rl.py still reads FLASH_RL_BACKEND and defaults to trl.
+VERL_ONLY_PHASES: frozenset[str] = frozenset({"sft", "opd"})
+
+
 def effective_backend(spec: JobSpec) -> str:
     """the training backend this spec will actually run, as the worker resolves it.
 
-    the worker reads FLASH_{SFT,RL,OPD}_BACKEND (default "trl"), and the only route into the worker
-    env is the spec's own [worker_env] table -- build_worker_env starts from an empty dict and
-    forwards a fixed credential allowlist, never the ambient control-plane env. so the backend is a
-    property of the SPEC and a launcher can read it here rather than guessing.
+    sft and opd have no selector at all -- their workers delegate straight to verl -- so they resolve
+    "verl" whatever [worker_env] says. grpo still reads FLASH_RL_BACKEND and defaults to trl, and the
+    only route into the worker env is the spec's own [worker_env] table (build_worker_env starts from
+    an empty dict and forwards a fixed credential allowlist, never the ambient control-plane env), so
+    the backend is a property of the SPEC and a launcher can read it here rather than guessing.
+
+    the per-phase default is load-bearing, not tidiness. it picks the allocator conf, and a verl-only
+    phase that resolved "trl" would take expandable_segments and crash its vLLM rollout outright
+    (cumem.py CuMemAllocator assert) -- and would be refused multi-gpu for a backend that shards.
 
     the lookup is EXACT-CASE on purpose. build_worker_env exports every [worker_env] entry under its
     verbatim key, and the worker reads only the uppercase name, so a case-insensitive match here can
-    disagree with the process that actually runs: given both `flash_opd_backend` and
-    `FLASH_OPD_BACKEND`, folding returns whichever came first while the worker always reads the
-    uppercase one. That divergence is not cosmetic -- it picks the allocator conf, and handing verl
-    expandable_segments crashes its vLLM rollout outright (cumem.py CuMemAllocator assert). Matching
-    the exact key the worker consumes keeps the two definitionally in agreement.
+    disagree with the process that actually runs: given both `flash_rl_backend` and
+    `FLASH_RL_BACKEND`, folding returns whichever came first while the worker always reads the
+    uppercase one. Matching the exact key the worker consumes keeps the two definitionally in
+    agreement.
     """
+    if spec.phase in VERL_ONLY_PHASES:
+        return "verl"
     worker_env = getattr(spec, "worker_env", None) or {}
     value = worker_env.get(backend_env_key(spec))
     return str(value).strip().lower() if value is not None else "trl"

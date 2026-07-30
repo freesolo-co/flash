@@ -169,93 +169,20 @@ def test_marker_decode_rejects_malformed_or_noncanonical_evidence(raw):
         decode_opd_optimizer_start_json(raw, run_id="run-1", attempt=3, seed=42)
 
 
-def test_optimizer_update_orders_marker_before_mutation_exactly_once(monkeypatch):
-    from flash.engine.worker import opd
+def test_marker_upload_failure_is_retriable_and_attempted_exactly_once(monkeypatch):
+    """A failed marker upload must surface as retriable, with the cause intact and no in-place retry.
 
-    events = []
-
-    class Grad:
-        def mul_(self, value):
-            events.append(("rescale", value))
-
-    class Parameter:
-        requires_grad = True
-        grad = Grad()
-
-    parameter = Parameter()
-    model = SimpleNamespace(parameters=lambda: [parameter])
-    optimizer = SimpleNamespace(step=lambda: events.append(("step", None)))
-    torch = SimpleNamespace(
-        nn=SimpleNamespace(
-            utils=SimpleNamespace(
-                clip_grad_norm_=lambda _parameters, value: events.append(("clip", value))
-            )
-        )
-    )
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(
-            publish_opd_optimizer_start_marker=lambda: events.append(("marker", None))
-        ),
-    )
-
-    opt_steps = opd._apply_opd_optimizer_update(
-        model=model,
-        optimizer=optimizer,
-        torch=torch,
-        opt_steps=0,
-        nseq=1,
-        accum_target=2,
-    )
-    opt_steps = opd._apply_opd_optimizer_update(
-        model=model,
-        optimizer=optimizer,
-        torch=torch,
-        opt_steps=opt_steps,
-        nseq=1,
-        accum_target=1,
-    )
-
-    assert opt_steps == 2
-    assert events == [
-        ("rescale", 2.0),
-        ("clip", 1.0),
-        ("marker", None),
-        ("step", None),
-        ("clip", 1.0),
-        ("step", None),
-    ]
-
-
-def test_no_signal_does_not_publish_or_mutate(monkeypatch):
-    from flash.engine.worker import opd
-
-    events = []
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(
-            publish_opd_optimizer_start_marker=lambda: events.append("marker")
-        ),
-    )
-    with pytest.raises(ValueError, match="positive sequence counts"):
-        opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=lambda: []),
-            optimizer=SimpleNamespace(step=lambda: events.append("step")),
-            torch=SimpleNamespace(),
-            opt_steps=0,
-            nseq=0,
-            accum_target=1,
-        )
-    assert events == []
-
-
-def test_marker_upload_failure_prevents_optimizer_step_and_preserves_retriable(monkeypatch):
-    from flash.engine.worker import hf, opd
+    This used to drive trl's `_apply_opd_optimizer_update`, which published the marker itself. verl
+    owns the optimizer step now, so the publish is reached through the plugin's `optimizer.step`
+    wrapper -- the raise below propagates out of that wrapper before the real step, which
+    `test_optimizer_step_is_blocked_when_marker_publication_fails` asserts on the plugin side.
+    What is unique here, and unchanged by the migration, is the publish contract itself: one upload
+    attempt (a retry could double-commit an ambiguous marker) and a retriable classification, so the
+    supervisor reschedules instead of burning the attempt.
+    """
+    from flash.engine.worker import hf
     from flash.engine.worker.perf import RetriableInfraError
 
-    events = []
     uploads = []
     failure = RetriableInfraError("required upload failed")
 
@@ -276,35 +203,24 @@ def test_marker_upload_failure_prevents_optimizer_step_and_preserves_retriable(m
             _remaining_worker_wall_seconds=lambda: None,
         ),
     )
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(publish_opd_optimizer_start_marker=hf.publish_opd_optimizer_start_marker),
-    )
-    torch = SimpleNamespace(
-        nn=SimpleNamespace(
-            utils=SimpleNamespace(clip_grad_norm_=lambda *_args: events.append("clip"))
-        )
-    )
+
     with pytest.raises(RetriableInfraError) as caught:
-        opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=lambda: []),
-            optimizer=SimpleNamespace(step=lambda: events.append("step")),
-            torch=torch,
-            opt_steps=0,
-            nseq=1,
-            accum_target=1,
-        )
+        hf.publish_opd_optimizer_start_marker()
+
     assert caught.value.__cause__ is failure
     assert len(uploads) == 1
-    assert events == ["clip"]
 
 
-def test_ambiguous_marker_upload_is_not_retried_or_applied(monkeypatch):
-    from flash.engine.worker import hf, opd
+def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
+    """A lost commit response must not be retried, and its diagnostic must not carry the HF token.
+
+    The dangerous case is a commit that landed while the response was lost: retrying could publish a
+    second marker for the same attempt, and the underlying error text embeds the Authorization header.
+    Both guarantees live in `publish_opd_optimizer_start_marker` (single attempt, `sanitize_diagnostic`
+    at limit 500), which is why this survives the trl deletion unchanged -- only the caller moved.
+    """
+    from flash.engine.worker import hf
     from flash.engine.worker.perf import RetriableInfraError
-
-    events = []
 
     class CommitThenLoseFirstResponse:
         def __init__(self):
@@ -333,26 +249,8 @@ def test_ambiguous_marker_upload_is_not_retried_or_applied(monkeypatch):
             _remaining_worker_wall_seconds=lambda: None,
         ),
     )
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(publish_opd_optimizer_start_marker=hf.publish_opd_optimizer_start_marker),
-    )
-    torch = SimpleNamespace(
-        nn=SimpleNamespace(
-            utils=SimpleNamespace(clip_grad_norm_=lambda *_args: events.append("clip"))
-        )
-    )
-
     with pytest.raises(RetriableInfraError) as caught:
-        opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=lambda: []),
-            optimizer=SimpleNamespace(step=lambda: events.append("step")),
-            torch=torch,
-            opt_steps=0,
-            nseq=1,
-            accum_target=1,
-        )
+        hf.publish_opd_optimizer_start_marker()
 
     assert isinstance(caught.value.__cause__, TimeoutError)
     assert "marker-secret" not in str(caught.value)
@@ -363,7 +261,6 @@ def test_ambiguous_marker_upload_is_not_retried_or_applied(monkeypatch):
     assert api.committed == canonical_opd_optimizer_start_json(
         run_id="run-ambiguous", attempt=2, seed=42
     )
-    assert events == ["clip"]
 
 
 def test_worker_marker_rejects_empty_repo(monkeypatch):
@@ -915,10 +812,17 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     ]
 
 
-def test_ambiguous_marker_upload_prevents_step_and_blocks_replacement(monkeypatch, tmp_path):
+def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypatch, tmp_path):
+    """An ambiguous marker upload must still leave evidence that blocks a replacement worker.
+
+    This is the end-to-end half of the ambiguity contract: the commit landed but the response was
+    lost, so the run cannot prove it did NOT mutate. The published marker is what a later replacement
+    reads to fail closed before allocating a GPU. Only the publish caller moved to verl -- the
+    evidence and the gate it feeds are unchanged, so this drives the marker publish directly.
+    """
     import flash.providers.allocator as allocator
     import flash.runner as runner
-    from flash.engine.worker import hf, opd
+    from flash.engine.worker import hf
     from flash.engine.worker.perf import RetriableInfraError
     from flash.runner import lifecycle
 
@@ -936,29 +840,9 @@ def test_ambiguous_marker_upload_prevents_step_and_blocks_replacement(monkeypatc
             _remaining_worker_wall_seconds=lambda: None,
         ),
     )
-    monkeypatch.setattr(
-        opd,
-        "_w",
-        SimpleNamespace(publish_opd_optimizer_start_marker=hf.publish_opd_optimizer_start_marker),
-    )
-    events = []
-    torch = SimpleNamespace(
-        nn=SimpleNamespace(
-            utils=SimpleNamespace(clip_grad_norm_=lambda *_args: events.append("clip"))
-        )
-    )
-
     with pytest.raises(RetriableInfraError, match="required upload"):
-        opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=lambda: []),
-            optimizer=SimpleNamespace(step=lambda: events.append("step")),
-            torch=torch,
-            opt_steps=0,
-            nseq=1,
-            accum_target=1,
-        )
+        hf.publish_opd_optimizer_start_marker()
 
-    assert events == ["clip"]
     marker_path = opd_optimizer_start_marker_path("ambiguous-upload", 0)
     assert private_hf.files[marker_path] == canonical_opd_optimizer_start_json(
         run_id="ambiguous-upload", attempt=0, seed=42

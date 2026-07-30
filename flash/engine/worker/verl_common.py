@@ -168,6 +168,32 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     return py
 
 
+def resolve_verl_loggers(python_bin: str) -> list[str]:
+    """verl's ``trainer.logger`` list, gated on the interpreter that actually logs.
+
+    verl logs from its own interpreter, so wandb must be importable THERE, not in flash's env. The
+    prebuilt worker image's /opt/verl-venv does not install wandb, and a preset FLASH_VERL_PYTHON is
+    returned by resolve_verl_python untouched (flash does not own that interpreter), so a run with
+    WANDB_API_KEY set would otherwise ask verl for a logger it cannot import and die at logger init
+    on a paid GPU. Fall back to console instead: losing the W&B mirror beats losing the run.
+
+    Never inits a flash-side run -- flash does not train in-process on this path, so it would stay
+    empty.
+    """
+    if not os.environ.get("WANDB_API_KEY"):
+        return ["console"]
+    has_wandb = (
+        subprocess.run([python_bin, "-c", "import wandb"], capture_output=True).returncode == 0
+    )
+    if not has_wandb:
+        print(
+            "[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; "
+            "using console logger only"
+        )
+        return ["console"]
+    return ["console", "wandb"]
+
+
 def resolve_checkpoint_actor_dir(step_dir: str) -> str:
     """return the directory inside ``global_step_N`` that holds the saved model + ``huggingface/``.
 

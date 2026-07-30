@@ -284,13 +284,17 @@ def test_verl_rollout_never_gets_expandable_segments(algorithm, phase):
 
 @pytest.mark.parametrize(
     ("algorithm", "phase", "expect_expandable"),
-    [("opd", "opd", True), ("sft", "sft", True), ("grpo", "rl", False)],
+    [("opd", "opd", False), ("sft", "sft", True), ("grpo", "rl", False)],
 )
-def test_trl_backend_keeps_its_per_algorithm_alloc_conf(algorithm, phase, expect_expandable):
-    """the verl carve-out must not change the TRL path: OPD/SFT keep the anti-fragmentation
-    expandable allocator they were given for large HF generate/logit tensors, and GRPO keeps the
-    non-expandable conf its colocate sleep engine needs."""
-    for backend in (None, "trl"):  # omitted key resolves to trl
+def test_alloc_conf_follows_the_backend_each_phase_actually_runs(algorithm, phase, expect_expandable):
+    """with no key set, each phase must get the conf for the trainer it will really run.
+
+    sft and opd delegate to verl unconditionally, so opd -- which builds a vLLM rollout -- must get
+    the non-expandable conf even with no [worker_env] at all. sft keeps expandable: its verl trainer
+    is pure FSDP with no rollout, so it wants the anti-fragmentation allocator for large tensors.
+    grpo still resolves trl by default and keeps the non-expandable conf its colocate sleep engine
+    needs. a stale "trl" key on a verl-only phase must not change any of this."""
+    for backend in (None, "trl"):  # omitted key resolves to trl for grpo, verl for sft/opd
         env = _worker_env_for(algorithm, phase, backend)
         assert ("expandable_segments" in env["PYTORCH_ALLOC_CONF"]) is expect_expandable
 
@@ -325,9 +329,9 @@ def test_worker_sleep_upgrade_leaves_the_verl_conf_alone(monkeypatch):
 @pytest.mark.parametrize(
     ("first_key", "first_value", "second_key", "second_value"),
     [
-        ("flash_opd_backend", "trl", "FLASH_OPD_BACKEND", "verl"),
-        ("FLASH_OPD_BACKEND", "verl", "flash_opd_backend", "trl"),
-        ("flash_opd_backend", "verl", "FLASH_OPD_BACKEND", "trl"),
+        ("flash_rl_backend", "trl", "FLASH_RL_BACKEND", "verl"),
+        ("FLASH_RL_BACKEND", "verl", "flash_rl_backend", "trl"),
+        ("flash_rl_backend", "verl", "FLASH_RL_BACKEND", "trl"),
     ],
 )
 def test_backend_resolution_matches_the_key_the_worker_reads(
@@ -337,7 +341,9 @@ def test_backend_resolution_matches_the_key_the_worker_reads(
     resolver must key on the exact same name. a case-folded lookup returns whichever duplicate came
     first, which disagrees with the worker in both directions: fold->trl / worker->verl hands verl
     the expandable conf that crashes its CuMemAllocator, and fold->verl / worker->trl silently runs
-    a different trainer than the launcher recorded (codex[bot])."""
+    a different trainer than the launcher recorded (codex[bot]).
+
+    grpo is the only phase this can still bite: sft/opd resolve verl with no key read at all."""
     from flash.providers._worker import build_worker_env
     from flash.spec import JobSpec, effective_backend
 
@@ -345,13 +351,13 @@ def test_backend_resolution_matches_the_key_the_worker_reads(
         {
             "model": "m",
             "seed": 0,
-            "algorithm": "opd",
+            "algorithm": "grpo",
             "worker_env": {first_key: first_value, second_key: second_value},
         }
     )
     env = build_worker_env(spec, 0)
     # the worker's own resolution, reproduced exactly: os.environ.get(KEY, "trl")
-    worker_reads = env.get("FLASH_OPD_BACKEND", "trl").strip().lower()
+    worker_reads = env.get("FLASH_RL_BACKEND", "trl").strip().lower()
 
     assert effective_backend(spec) == worker_reads
     if worker_reads == "verl":
@@ -380,17 +386,45 @@ def test_allocator_conf_follows_a_backend_delivered_as_a_runtime_secret(declared
     is not the one about to run, and a secret-supplied verl would crash on the CuMemAllocator assert.
 
     the undeclared case is the control: an undeclared key is not exported, so the worker reads trl and
-    the expandable conf is correct. the invariant under test is agreement, not a fixed conf."""
+    the expandable conf is correct. the invariant under test is agreement, not a fixed conf.
+
+    grpo carries this now: opd has no selector for a secret to override."""
     from flash.providers._worker import build_worker_env
     from flash.spec import JobSpec
 
-    body: dict = {"model": "m", "seed": 0, "algorithm": "opd"}
+    body: dict = {"model": "m", "seed": 0, "algorithm": "grpo"}
     if declared:
-        body["environment"] = {"secrets": ["FLASH_OPD_BACKEND"]}
+        body["environment"] = {"secrets": ["FLASH_RL_BACKEND"]}
     spec = JobSpec.from_dict(body)
-    env = build_worker_env(spec, 0, runtime_secrets={"FLASH_OPD_BACKEND": "verl"})
+    env = build_worker_env(spec, 0, runtime_secrets={"FLASH_RL_BACKEND": "verl"})
 
-    worker_reads = env.get("FLASH_OPD_BACKEND", "trl").strip().lower()
+    worker_reads = env.get("FLASH_RL_BACKEND", "trl").strip().lower()
     assert worker_reads == ("verl" if declared else "trl")
-    # a verl OPD rollout must never see expandable_segments; a trl one must keep it
-    assert ("expandable_segments" in env["PYTORCH_CUDA_ALLOC_CONF"]) is (worker_reads == "trl")
+    # neither a verl nor a trl GRPO colocate engine may see expandable_segments
+    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
+
+
+@pytest.mark.parametrize("secret_backend", ["trl", "verl", "bogus"])
+def test_a_runtime_secret_cannot_route_a_verl_only_phase(secret_backend):
+    """opd declares no selector, so a launch-time secret must not move it.
+
+    the secret is still EXPORTED (build_worker_env forwards declared secrets verbatim), but run_opd
+    delegates to verl without reading it. honoring it in the allocator choice would pick a conf for
+    a backend that cannot run -- "trl" would hand verl's rollout the expandable conf that trips the
+    CuMemAllocator assert before step 1."""
+    from flash.providers._worker import build_worker_env
+    from flash.spec import JobSpec, effective_backend
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "m",
+            "seed": 0,
+            "algorithm": "opd",
+            "environment": {"secrets": ["FLASH_OPD_BACKEND"]},
+        }
+    )
+    env = build_worker_env(spec, 0, runtime_secrets={"FLASH_OPD_BACKEND": secret_backend})
+
+    assert effective_backend(spec) == "verl"
+    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
+    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
