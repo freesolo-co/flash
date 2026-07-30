@@ -136,6 +136,14 @@ class _FakeClient:
             }
         ]
 
+    def deployment_for(self, run_id: str) -> dict | None:
+        self.calls.append(("deployment_for", run_id))
+        for entry in self.deployments():
+            deployment = entry.get("deployment") or {}
+            if entry.get("run_id") == run_id.split("/", 1)[0]:
+                return {**deployment, "run_id": entry["run_id"]}
+        return None
+
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
         return {"choices": [{"message": {"content": "42"}}]}
@@ -1304,6 +1312,401 @@ def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> 
     err = capsys.readouterr().err
     assert "deployment failed: smoke generation failed" in err
     assert "once it is ready" not in err
+
+
+def _queued_deploy(monkeypatch, fake_client) -> None:
+    """Make POST deploy return what the control plane really returns: a queued record."""
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "queued"},
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+
+
+def test_deploy_without_wait_returns_while_still_queued(fake_client, monkeypatch, capsys) -> None:
+    """No --wait keeps the old behaviour: return immediately, do not poll."""
+    _queued_deploy(monkeypatch, fake_client)
+
+    assert _run(["models", "deploy", "flash-1"]) == 0
+    assert not any(c[0] == "deployment_for" for c in fake_client.calls)
+    assert "deployment state is 'queued'" in capsys.readouterr().err
+
+
+def test_deploy_wait_polls_until_the_revision_is_servable(fake_client, monkeypatch, capsys) -> None:
+    """--wait must not return while the requested revision is still queued.
+
+    deploy returns as soon as the record is persisted, which is normally before the new revision
+    can serve a token, so a caller that starts evaluating on that return hits the old revision or
+    an error. The wait is what makes the printed record mean "ready".
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    states = iter([{"state": "smoke_testing"}, {"state": "reconciling"}, {"state": "ready"}])
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: next(states), raising=False
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    out, err = capsys.readouterr()
+    assert "ready" in out
+    assert "queued" not in err
+    assert "ctrl-c stops waiting, not the deployment" in err
+
+
+def test_deploy_wait_stops_on_a_failed_revision(fake_client, monkeypatch, capsys) -> None:
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {"state": "failed", "error": "smoke generation failed"},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert "deployment failed: smoke generation failed" in capsys.readouterr().err
+
+
+def test_deploy_wait_gives_up_at_the_timeout_without_claiming_success(
+    fake_client, monkeypatch, capsys
+) -> None:
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {"state": "smoke_testing"},
+        raising=False,
+    )
+
+    # exit 1, not 0: --wait's contract is "the revision is servable when i return", and a timeout
+    # is precisely the case where it is not. exiting 0 here is what lets
+    # `deploy --wait && evaluate` proceed against a revision that never became servable.
+    assert _run(["models", "deploy", "flash-1", "--wait", "0.01"]) == 1
+    err = capsys.readouterr().err
+    assert "still 'smoke_testing' after 0.01s" in err
+    assert "flash models deployments" in err
+
+
+def test_deploy_wait_ends_when_the_deployment_stops_being_listed(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A run drops out of the listing once its deployment is gone, so that is terminal."""
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+    )
+
+    # the last record seen was still queued, so the requested revision never became servable.
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert "no longer an active deployment" in capsys.readouterr().err
+
+
+def test_deploy_wait_survives_a_transient_control_plane_error(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """One failed poll must not fail a deploy that is progressing fine."""
+    _queued_deploy(monkeypatch, fake_client)
+    results = iter([cli.commands.ClientError("503"), {"state": "ready"}])
+
+    def _next(run_id, timeout=None):
+        value = next(results)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(fake_client, "deployment_for", _next, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert "ready" in capsys.readouterr().out
+
+
+def test_deploy_wait_zero_polls_once_instead_of_being_treated_as_no_wait(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """`--wait 0` is an explicit bound, not an absent flag.
+
+    Gating on truthiness makes 0.0 indistinguishable from None, so the one value that means
+    "check, but do not block" silently became "do not check at all" and exited 0 on a queued
+    record.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {"state": "smoke_testing"},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 1
+    assert "waiting up to 0s" in capsys.readouterr().err
+
+
+def test_deploy_wait_rejects_a_restored_previous_revision(fake_client, monkeypatch, capsys) -> None:
+    """A failed redeploy leaves a `ready` record for the PREVIOUS revision.
+
+    mark_deployment_failed restores the old deployment verbatim and records the failure only in
+    last_deploy_error, so trusting the state word reports success while the requested checkpoint
+    is not the one serving.
+    """
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {
+            "run_id": run_id,
+            "state": "queued",
+            "requested_at": "2026-07-29T02:00:00Z",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {
+            "state": "ready",
+            "requested_at": "2026-07-29T01:00:00Z",
+            "last_deploy_error": "adapter load failed",
+        },
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    err = capsys.readouterr().err
+    assert "did not become servable" in err
+    assert "adapter load failed" in err
+
+
+def test_deploy_wait_accepts_a_ready_revision_carrying_a_stale_error(
+    fake_client, monkeypatch
+) -> None:
+    """A last_deploy_error from an EARLIER attempt must not fail the attempt that succeeded.
+
+    The stamps match here, so this record is the revision that was just asked for; treating any
+    recorded error as failure would make every retry-after-failure report failure forever.
+    """
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {
+            "run_id": run_id,
+            "state": "queued",
+            "requested_at": "2026-07-29T02:00:00Z",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {
+            "state": "ready",
+            "requested_at": "2026-07-29T02:00:00Z",
+            "last_deploy_error": "a previous attempt failed",
+        },
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+
+
+def test_deploy_wait_bounds_each_poll_by_the_remaining_time(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """An unbounded read inside a short wait overshoots the deadline the user set.
+
+    The client default is 60s, so `--wait 5` could block roughly a minute inside a single stalled
+    request while reporting that it waited five seconds.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    seen: list[float | None] = []
+
+    def _poll(run_id, timeout=None):
+        seen.append(timeout)
+        return {"state": "ready"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 0
+    assert seen == [pytest.approx(5.0, abs=0.5)]
+
+
+def test_deploy_wait_zero_actually_reads_the_current_state(fake_client, monkeypatch) -> None:
+    """`--wait 0` means "check once, do not block" -- it must issue that one read.
+
+    The deadline was evaluated before the first poll, so a zero budget was already expired on entry
+    and deployment_for never ran. Readiness was then judged from the POST body, which is `queued` on
+    every normal async deploy, so `--wait 0` could not succeed even against a ready revision.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    polls: list[str] = []
+
+    def _poll(run_id, timeout=None):
+        polls.append(run_id)
+        return {"state": "ready"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 0
+    assert polls == ["flash-1"], polls
+
+
+def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
+    fake_client, monkeypatch
+) -> None:
+    """A sleep that consumes the whole budget must end the wait, not fund one more read.
+
+    The remaining time was computed once before sleeping, so the post-sleep request still went out
+    with the 1.0s floor: `--wait 0.1` against a stalled plane blocked for over a second past the
+    bound it advertised.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    # the sleep is what burns the budget, exactly as a real one would.
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    seen: list[float | None] = []
+
+    def _poll(run_id, timeout=None):
+        seen.append(timeout)
+        return {"state": "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0.1"]) == 1
+    # exactly one read: the up-front one-shot. the post-sleep read is past the deadline.
+    assert seen == [pytest.approx(0.1, abs=0.001)], seen
+
+
+@pytest.mark.parametrize("state", ["revocation_failed", "some_state_a_newer_plane_added"])
+def test_deploy_wait_fails_closed_on_a_terminal_state_that_is_not_ready(
+    fake_client, monkeypatch, capsys, state
+) -> None:
+    """Leaving the busy set is not the same as being servable.
+
+    `revocation_failed` is a real persisted state (a concurrent undeploy whose backend cleanup
+    failed), and an unknown state arrives on any client/server skew. Both are non-busy, so gating
+    success on "not busy" exited 0 with nothing actually serving.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {"state": state},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    err = capsys.readouterr().err
+    assert "not\nservable" in err or "not servable" in err, err
+    assert "once it is ready" not in err, err
+
+
+def test_deploy_wait_rejects_a_superseding_deploy_that_carries_no_error(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A concurrent deploy for the same run reaches ready on ITS checkpoint, with no error at all.
+
+    Returning early whenever last_deploy_error was absent meant the stamps were never compared on
+    exactly the case that needs them, so `deploy --wait && evaluate` reported success and then
+    evaluated the other shell's revision.
+    """
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {
+            "run_id": run_id,
+            "state": "queued",
+            "requested_at": "2026-07-29T02:00:00Z",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        # ready, no error, different attempt: someone else's deploy.
+        lambda run_id, timeout=None: {
+            "state": "ready",
+            "requested_at": "2026-07-29T03:00:00Z",
+        },
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert "once it is ready" not in capsys.readouterr().err
+
+
+def test_deploy_notes_name_this_channels_executable(fake_client, monkeypatch, capsys) -> None:
+    """The dev channel installs `flash-dev`; a hardcoded `flash ...` hint is not runnable there."""
+    monkeypatch.setattr(cli.commands, "CLI_NAME", "flash-dev")
+    _queued_deploy(monkeypatch, fake_client)
+
+    assert _run(["models", "deploy", "flash-1"]) == 0
+    err = capsys.readouterr().err
+    assert "flash-dev models deployments" in err, err
+    assert "`flash models" not in err, err
+
+
+def test_deploy_wait_stops_retrying_a_rejected_key(fake_client, monkeypatch, capsys) -> None:
+    """401/403 answers the same way every time, so polling through it just burns the timeout.
+
+    The broad ClientError catch treated a permanent rejection as a transient blip and retried to
+    the full default 30-minute deadline before reporting "still queued".
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    calls: list[int] = []
+
+    def _denied(run_id, timeout=None):
+        calls.append(1)
+        raise cli.commands.ApiError(403, "forbidden")
+
+    monkeypatch.setattr(fake_client, "deployment_for", _denied, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert len(calls) == 1
+    assert "cannot check flash-1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "-1"])
+def test_deploy_wait_rejects_a_timeout_that_would_never_expire(fake_client, value, capsys) -> None:
+    """`float` accepts nan and inf, and a NaN deadline makes every `remaining <= 0` false.
+
+    The loop then polls forever while the user believes they set a bound, which is worse than the
+    unbounded default because the printed timeout says otherwise. Written as `--wait=VALUE` so a
+    leading-dash value reaches the validator instead of being read as another option.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        _run(["models", "deploy", "flash-1", f"--wait={value}"])
+    assert excinfo.value.code == 2
+    assert "--wait" in capsys.readouterr().err
+
+
+def test_deploy_wait_before_the_run_id_names_the_real_mistake(fake_client, capsys) -> None:
+    """`--wait` takes an optional value, so `deploy --wait flash-1` eats the run id.
+
+    argparse cannot hand the token back, so the error has to say which argument was swallowed;
+    the bare "invalid float value: 'flash-1'" reads as if the run id itself were malformed.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        _run(["models", "deploy", "--wait", "flash-1"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "if 'flash-1' is the run id" in err
+    assert "deploy flash-1 --wait" in err
+
+
+def test_deploy_wait_skips_polling_for_a_dry_run(fake_client, monkeypatch, capsys) -> None:
+    """A dry run creates no deployment, so there is nothing to wait on."""
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "dry_run"},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--dry-run", "--wait"]) == 0
+    assert not any(c[0] == "deployment_for" for c in fake_client.calls)
+    assert "ctrl-c stops waiting" not in capsys.readouterr().err
 
 
 def test_log_follow_progress_includes_heartbeat_age() -> None:
