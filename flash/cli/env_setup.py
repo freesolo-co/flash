@@ -513,7 +513,9 @@ def cmd_env_setup(args) -> int:
             f"{opd_multiturn_note}"
             'model = "Qwen/Qwen3.5-4B"\n'
             f"{project_line}"
-            'algorithm = "opd"   # on-policy distillation from a managed Fireworks teacher (default GLM 5.2)\n\n'
+            'algorithm = "opd"   # on-policy distillation from a managed Fireworks teacher (default GLM 5.2)\n'
+            f"{thinking_line}"
+            "\n"
             "# Environment: upload this project folder with\n"
             f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
             "# The teacher and its Fireworks key are platform-managed — nothing to set up or export.\n"

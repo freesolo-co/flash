@@ -1030,6 +1030,36 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     assert "configs/opd.toml" in capsys.readouterr().out
 
 
+def test_env_setup_reasoning_emits_parseable_opd_config(monkeypatch, tmp_path) -> None:
+    """The reasoning opd.toml must still be valid TOML with the key at top level.
+
+    `thinking` is a root key, not a `[train]` one, so it has to be written before the first table
+    header. Asserting only on the substring would pass just as happily with the line stranded under
+    `[train]` or glued to the `algorithm` line.
+    """
+    import tomllib
+
+    monkeypatch.chdir(tmp_path)
+    assert (
+        _run(
+            [
+                "env",
+                "setup",
+                "--project",
+                "11111111-1111-4111-8111-111111111111",
+                "--multi-turn",
+                "--reasoning",
+            ]
+        )
+        == 0
+    )
+
+    for name in ("configs/opd.toml", "configs/rl.toml", "configs/sft.toml"):
+        parsed = tomllib.loads((tmp_path / name).read_text())
+        assert parsed["thinking"] is True, name
+        assert "thinking" not in parsed.get("train", {}), name
+
+
 def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
     # Non-interactive (pytest stdin is not a tty) with no flags stays on today's scaffold: no
     # reasoning knobs land in either config.
@@ -1037,8 +1067,10 @@ def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
     rl = (tmp_path / "configs/rl.toml").read_text()
     sft = (tmp_path / "configs/sft.toml").read_text()
+    opd = (tmp_path / "configs/opd.toml").read_text()
     assert "thinking = true" not in rl
     assert "thinking = true" not in sft
+    assert "thinking = true" not in opd
     assert "max_completion_tokens" not in rl
     assert "EnvironmentSingleTurn" in (tmp_path / "environment.py").read_text()
 
@@ -1051,13 +1083,20 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
     )
     rl = (tmp_path / "configs/rl.toml").read_text()
     sft = (tmp_path / "configs/sft.toml").read_text()
+    opd = (tmp_path / "configs/opd.toml").read_text()
     assert "thinking = true" in rl
     assert "thinking = true" in sft
+    # opd too. `thinking` is algorithm-agnostic in the spec and the opd worker reads it to pick a
+    # reasoning parser, so a scaffold that emitted it for two of the three algorithms would hand a
+    # user asking for reasoning an opd config that silently trains without it.
+    assert "thinking = true" in opd
     # GRPO raises the generation budget so reasoning does not truncate the answer.
     assert "max_completion_tokens = 2048" in rl
     # SFT can't share a token budget it doesn't generate; it gets the gold think-tag guidance instead.
     assert "warn_missing_think_tags" in sft
     assert "max_completion_tokens" not in sft
+    # nor opd, whose worker never reads that key -- emitting it would advertise a knob with no effect.
+    assert "max_completion_tokens" not in opd
 
 
 def test_env_setup_no_reasoning_flag_is_explicit_off(monkeypatch, tmp_path) -> None:
