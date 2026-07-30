@@ -129,13 +129,30 @@ def test_nvlink_classification_is_by_form_factor():
     # sxm datacenter parts carry nvlink.
     assert has_nvlink("A100 SXM")
     assert has_nvlink("A100 SXM 40GB")
-    # pcie boards and geforce parts do not. "H100" is the pcie board runpod provisions, and the
-    # 4090 dropped the nvlink connector entirely.
-    assert not has_nvlink("H100")
+    assert has_nvlink("H100")
+    # geforce parts do not; the 4090 dropped the nvlink connector entirely. l40s is a pcie board.
     assert not has_nvlink("RTX 4090")
     assert not has_nvlink("L40S")
     # an unclassified class must fall to the conservative side rather than raise.
     assert not has_nvlink("some-unlisted-gpu")
+
+
+def test_nvlink_classification_tracks_the_provisioned_board():
+    """Classification must follow the pin a MULTI-CARD run actually lands on.
+
+    Multi-card provisioning is runpod-only, and runpod pins H100 to the HBM3 sxm part while
+    negating the pcie/NVL boards in the same pool. Assert against those pins rather than restating
+    the classification, so re-pinning a class to a different board fails here instead of silently
+    pricing it on an interconnect it no longer has.
+    """
+    from flash.cost.facts import has_nvlink
+    from flash.providers.base import GPU_INFO
+    from flash.providers.runpod.gpus import _POOL_MEMBERS_MISSING_FROM_SDK
+
+    assert GPU_INFO["H100"].enum_member == "NVIDIA_H100_80GB_HBM3"  # sxm, not the pcie board
+    assert has_nvlink("H100")
+    # the non-sxm members of the same runpod pool are negated, so a pin cannot land on them.
+    assert _POOL_MEMBERS_MISSING_FROM_SDK["ADA_80_PRO"] == ("NVIDIA H100 PCIe", "NVIDIA H100 NVL")
 
 
 def test_multi_card_speedup_is_interconnect_aware():

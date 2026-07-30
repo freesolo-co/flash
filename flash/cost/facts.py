@@ -48,13 +48,22 @@ _DEFAULT_TFLOPS = 100.0
 # membership is by form factor -- sxm datacenter parts carry nvlink, pcie boards and every geforce
 # part do not (the 4090 dropped nvlink entirely). anything absent is treated as pcie, which is the
 # conservative side: it under-credits a combination rather than ranking it on bandwidth it lacks.
-# note the "H100" entry above is the pcie board runpod provisions, so it is deliberately not here.
+#
+# classify by the board a MULTI-CARD run actually lands on. multi-card provisioning is runpod-only
+# (vast and lambda have no gpu_count path), so what matters per class is runpod's pin, not the
+# cheapest board the class can serve a single-gpu run on.
 _NVLINK_CLASSES: frozenset[str] = frozenset(
     {
         # MEASURED: 2x A100-SXM4-80GB on RunPod reached 1.7675x (see MULTI_CARD_SCALING_NVLINK).
         "A100 SXM",
         # same sxm4 board and nvlink fabric as the 80gb part, less hbm only.
         "A100 SXM 40GB",
+        # runpod pins H100 to NVIDIA_H100_80GB_HBM3 (providers/base.py) -- the sxm part, with
+        # nvlink. the pcie and NVL boards in runpod's ADA_80_PRO pool are explicitly NEGATED by
+        # providers/runpod/gpus.py, so a multi-card H100 combination lands on sxm silicon. the
+        # measured-tflops comment on the H100 entry above refers to a single-gpu PCIe rental and
+        # says nothing about which board a multi-card run gets.
+        "H100",
         # sxm parts with nvlink/nvswitch by form factor. INFERRED, not measured -- no multi-card
         # benchmark has been run on either class.
         "H200",
