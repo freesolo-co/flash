@@ -935,6 +935,12 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
     thing it measures, and the profiler also needs a worker thread to bound a hung call, which
     such an env must not be given. The cost of skipping is one unmeasured latency in the log.
 
+    Note the flag is read here as covering ``sft_completion`` too, though the adapter documents it
+    against ``reward()``. This hook is the only caller of ``sft_completion`` in a grpo run, so state
+    it advances starves nothing downstream; what the flag is standing in for is the narrower case of
+    a hook that lazily builds a thread-affine handle shared with the scorer. One declared signal for
+    "do not touch me off-thread" covers both, and no env currently distinguishes them.
+
     Advisory only, and never fatal -- it must not be able to break a run it is only measuring.
     """
     try:
@@ -966,9 +972,21 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
                 lambda ex=example: assistant_completion_text(env.sft_completion(ex)), remaining
             )
             if ok is None:
+                # the shared deadline is spent either way, so there is no timing budget left and
+                # this returns regardless. report how far it got: "no reference completion could be
+                # gathered" is false once an earlier example has already yielded one, and a skip
+                # reason that misstates what happened sends a reader after the wrong env hook.
+                #
+                # count only the USABLE ones, by the same test the profiler itself applies. a failed
+                # call still appends its empty placeholder to keep example indices aligned, and a
+                # succeeded-but-blank one is dropped downstream by ``text.strip()``; counting either
+                # would claim references were gathered that nothing could be profiled from -- exactly
+                # as misleading as the message this replaced, in the opposite direction.
+                usable = sum(1 for _, text in samples if text and text.strip())
                 print(
                     "[rl-verl] reward profiling skipped: env.sft_completion did not return within "
-                    f"{_PROFILE_BUDGET_S:.0f}s, so no reference completion could be gathered",
+                    f"{_PROFILE_BUDGET_S:.0f}s ({usable} usable reference completion(s) gathered "
+                    "before the deadline)",
                     flush=True,
                 )
                 return None
