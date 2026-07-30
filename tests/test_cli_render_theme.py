@@ -668,6 +668,14 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     assert "last one UPLOADED" in out
     assert "before treating this as a stall" in out
 
+    # the dev channel installs the executable as `flash-dev` and points at staging, so a hardcoded
+    # `flash runs log` is either not installed or follows an unrelated production run.
+    monkeypatch.setattr(render, "CLI_NAME", "flash-dev")
+    assert "flash-dev runs log" in render.run_status(stale)
+    monkeypatch.undo()
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
     # the reported incident ages sit inside the 900s throttle window; a gate at 900s would stay
     # silent on exactly the runs that prompted the fix.
     for incident_age in (559, 687):

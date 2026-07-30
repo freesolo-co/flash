@@ -704,7 +704,8 @@ def _stale_step_hint(
     return (
         "the step above is the last one UPLOADED, not necessarily the one training is on; "
         "a throttled worker can hold it for many minutes while the trainer advances normally. "
-        "check flash runs log <run-id> -f for worker output (or your [wandb] run, if configured) "
+        f"check {CLI_NAME} runs log <run-id> -f for worker output "
+        "(or your [wandb] run, if configured) "
         "before treating this as a stall"
     )
 
