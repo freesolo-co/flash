@@ -436,6 +436,17 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         step = heartbeat.get("step")
         if step is not None:
             parts.append(f"step={step}")
+        # a preemption relaunches the run on fresh hardware from step 0 while `state` stays
+        # "running", so the step counter silently rewinds and the earlier progress is gone. the
+        # attempt counter is the one field that distinguishes that from normal progress, so show it
+        # once the run is past its first attempt rather than leaving a rewind unexplained. attempts
+        # are 0-based (flash/providers/runpod/jobs.py stamps no retry suffix on attempt 0), so any
+        # nonzero value is already a relaunch.
+        from flash.providers._poll import _attempt_int
+
+        attempt = _attempt_int(heartbeat.get("attempt"))
+        if attempt:
+            parts.append(f"attempt={attempt}")
         # live heartbeat age so a long quiet phase reads as "alive, throttled" not "frozen".
         # minute granularity: the non-TTY follow path prints a line whenever this string changes,
         # so a seconds-precision age would emit one line per poll.
