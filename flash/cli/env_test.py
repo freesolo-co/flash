@@ -19,6 +19,11 @@ _DEFAULT_EPISODES = 3
 # parse failure means the user typed unquoted words; text containing any of them was reaching for
 # TOML syntax and a parse failure means they got it wrong.
 _TOML_STRUCTURAL_CHARS = frozenset("\"'[]{}=,\n")
+# the characters that make a TOML KEY mean something other than its literal spelling: `.` nests,
+# quotes make a bare key hold characters it otherwise could not. deliberately narrower than
+# _TOML_STRUCTURAL_CHARS, which describes values -- a key is checked before the `=` split, so the
+# structural characters of a value are not applicable to it.
+_TOML_KEY_STRUCTURAL_CHARS = frozenset(".\"'")
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:
@@ -181,10 +186,15 @@ def _reject_unsubmittable_param(key: str, value: object) -> None:
     into a ``datetime.date``. The equivalent config keeps that object in ``EnvironmentSpec.params``
     and the submit fails later at ``json.dumps(body)`` in ``ApiClient._request()``. Approving it
     here would mean the gate passed on a config that cannot be submitted at all.
+
+    ``allow_nan=False`` because the default does NOT raise on ``nan``/``inf``: it emits the
+    non-standard tokens ``NaN`` and ``Infinity``, which are not JSON at all. `--param
+    threshold=nan` therefore passed the gate and produced a request body a strict parser rejects
+    (codex[bot]). Raised as ValueError, which is a separate exception from the TypeError above.
     """
     try:
-        json.dumps(value)
-    except TypeError as exc:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as exc:
         raise ValueError(
             f"--param {key} is not JSON-serializable and could not be submitted "
             f"in [environment.params]: {exc}"
@@ -222,6 +232,33 @@ def _parse_param_value(key: str, raw: str) -> object:
     return parsed
 
 
+def _reject_unmirrorable_param_key(key: str) -> None:
+    """Reject a ``--param`` name whose TOML meaning this flag cannot reproduce.
+
+    The left side of a `[environment.params]` entry is a TOML key, not a literal name: dotted and
+    quoted spellings denote structure. `difficulty.level = 3` in a config is
+    ``{"difficulty": {"level": 3}}``, but taking the source spelling literally forwarded
+    ``{"difficulty.level": 3}`` instead -- a different call, which an environment accepting
+    ``**kwargs`` swallows without ever exercising the nested parameter the run trains on. The gate
+    then passes on input it never actually tested (codex[bot]).
+
+    Rejected rather than mirrored. Params are splatted as keyword arguments
+    (``load_freesolo_environment(..., **params)``, flash/envs/registry.py), so a nested table is
+    not expressible as one `--param` in the first place: `difficulty` would have to arrive as a
+    whole dict. `--param difficulty={level = 3}` already says that exactly, and is what the error
+    points at, so mirroring here would add a second spelling for something the flag can already
+    express faithfully.
+    """
+    if not (set(key) & _TOML_KEY_STRUCTURAL_CHARS):
+        return
+    outer = key.split(".", 1)[0].strip("\"'") or key
+    raise ValueError(
+        f"--param {key} uses TOML key syntax that denotes structure, which this flag cannot "
+        f"forward faithfully. pass the containing table as one value instead, for example "
+        f"--param {outer}='{{ level = 3 }}'"
+    )
+
+
 def _env_params(args) -> dict:
     """Build the ``load_environment()`` kwargs from ``--split`` / ``--param KEY=VALUE``.
 
@@ -235,6 +272,7 @@ def _env_params(args) -> dict:
         key = key.strip()
         if not sep or not key:
             raise ValueError(f"--param must be KEY=VALUE (got {item!r})")
+        _reject_unmirrorable_param_key(key)
         params[key] = _parse_param_value(key, raw)
     split = getattr(args, "split", None)
     if split is not None:

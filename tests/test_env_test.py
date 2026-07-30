@@ -545,6 +545,47 @@ def test_env_test_json_incompatible_param_types_are_rejected(monkeypatch, tmp_pa
     assert "not JSON-serializable" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("value", ["threshold=nan", "threshold=inf", "threshold=-inf"])
+def test_env_test_non_finite_param_floats_are_rejected(monkeypatch, tmp_path, capsys, value):
+    # tomllib accepts nan/inf, and json.dumps does NOT raise on them -- it emits the non-standard
+    # tokens NaN and Infinity. so this passed the gate and produced a request body that is not
+    # JSON, which a strict parser rejects on submit and again when the value comes back in
+    # RunStatus.spec. serializable is not the same test as valid.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    assert "not JSON-serializable" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["difficulty.level=3", '"weird key"=1', "a.b.c=1"])
+def test_env_test_param_keys_that_denote_toml_structure_are_rejected(
+    monkeypatch, tmp_path, capsys, value
+):
+    # the left side of an [environment.params] entry is a TOML key, so `difficulty.level = 3` in a
+    # config means {"difficulty": {"level": 3}}. forwarding the source spelling literally sent
+    # {"difficulty.level": 3} instead, and an environment taking **kwargs swallows that without
+    # ever exercising the nested parameter -- the gate passes on a call training never makes.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    assert "TOML key syntax" in capsys.readouterr().err
+
+
+def test_env_test_a_nested_param_passes_as_one_inline_table(monkeypatch, tmp_path):
+    # the rejection above is only correct if the flag can still express the nested call, otherwise
+    # it would be removing a capability rather than fixing a misforward. this is the spelling the
+    # error message points at, so it has to produce the structure the config would.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=["difficulty={level = 3}"])) == 0
+    assert seen["kwargs"]["difficulty"] == {"level": 3}
+
+
 def test_env_test_param_with_trailing_assignment_is_rejected(monkeypatch, tmp_path, capsys):
     # a newline makes `v = <value>` a two-line document that tomllib accepts, so indexing only "v"
     # keeps max_rows and silently drops strict -- the gate would then validate a parameter set the
