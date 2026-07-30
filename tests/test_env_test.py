@@ -8,7 +8,14 @@ from pathlib import Path
 import pytest
 
 import flash.cli as cli
-from flash.cli.env_test import _CONTROL_CANDIDATES, cmd_env_test
+from flash.cli.env_test import (
+    _CONTROL_CANDIDATES,
+    _SYNTHETIC_CONTROL_ALPHABET,
+    _control_is_disjoint,
+    _Score,
+    _synthetic_control,
+    cmd_env_test,
+)
 
 
 class _SingleTurnEnv:
@@ -1067,3 +1074,269 @@ def test_env_test_thinking_reference_is_excluded_from_the_reward_gate(
     assert "1/1 episodes passed contract checks" in captured.out
     assert "overall: PASS" in captured.out
     assert "cannot rank completions" not in captured.err
+
+
+def test_per_turn_vectors_with_equal_sums_are_not_reported_as_flat():
+    # build_per_turn_advantages centres each turn index against its own group mean, so (1, 0)
+    # against (0, 1) produces nonzero opposing advantages at BOTH turns. reducing the vectors to
+    # one scalar made the sums tie and reported usable per-turn credit as a grader that cannot rank.
+    gold = _Score(episode=1.0, turns=(1.0, 0.0))
+    control = _Score(episode=1.0, turns=(0.0, 1.0))
+
+    assert gold.separates_from(control)
+    assert control.separates_from(gold)
+    # neither DOMINATES: worse at one turn and better at another is not "worse" in any direction
+    # the trainer reads, so the inverted finding must not fire either.
+    assert not gold.ranks_below(control)
+    assert not control.ranks_below(gold)
+
+
+def test_per_turn_vector_that_dominates_still_ranks():
+    # the ranking direction still has to work: no better anywhere and worse somewhere IS worse.
+    gold = _Score(episode=1.0, turns=(1.0, 1.0))
+    control = _Score(episode=1.0, turns=(0.0, 1.0))
+
+    assert control.ranks_below(gold)
+    assert gold.outranks(control)
+    assert control.separates_from(gold)
+
+
+def test_a_larger_sum_is_not_a_ranking():
+    # the companion to the equal-sum case, and the one a sum rule gets WRONG rather than ties on:
+    # the control's sum is the larger, but it is worse at turn 0 and better at turn 1, so the group
+    # centring gives it advantages in both directions and it outranks the gold answer at neither.
+    # reading the sums here reports a working grader as inverted.
+    gold = _Score(episode=1.0, turns=(1.0, 0.0))
+    control = _Score(episode=1.0, turns=(0.0, 5.0))
+
+    assert sum(control.turns or ()) > sum(gold.turns or ())
+    assert not gold.ranks_below(control)
+    assert not control.ranks_below(gold)
+    assert gold.separates_from(control)
+
+
+def test_identical_per_turn_vectors_are_still_flat():
+    # the gate must keep firing on a genuinely unrankable grader.
+    gold = _Score(episode=1.0, turns=(1.0, 0.0))
+    control = _Score(episode=1.0, turns=(1.0, 0.0))
+
+    assert not gold.separates_from(control)
+    assert not gold.ranks_below(control)
+    assert not control.ranks_below(gold)
+
+
+@pytest.mark.parametrize(
+    "control",
+    [
+        _Score(episode=1.0, turns=(1.0,)),
+        _Score(episode=1.0, turns=None),
+    ],
+)
+def test_incomparable_per_turn_shapes_carry_no_evidence(control):
+    # the trainer compares turns positionally, so a different-length vector (or a missing one)
+    # against an equal episode score is an ABSENCE of evidence. reporting it as flat would mark a
+    # working per-turn grader unrankable.
+    gold = _Score(episode=1.0, turns=(1.0, 0.0))
+
+    assert not control.is_comparable_with(gold)
+    assert not gold.is_comparable_with(control)
+
+
+def test_differing_episode_scores_are_comparable_whatever_the_turn_shapes():
+    # the episode scalar alone settles it, so turn shape is irrelevant and the episode is not
+    # excluded from the gate.
+    gold = _Score(episode=1.0, turns=(1.0, 0.0))
+    control = _Score(episode=0.0, turns=None)
+
+    assert control.is_comparable_with(gold)
+    assert control.ranks_below(gold)
+
+
+def test_env_test_control_with_a_shorter_turn_vector_carries_no_evidence(
+    monkeypatch, tmp_path, capsys
+):
+    # end-to-end companion to the is_comparable_with unit tests. a control that stops the rollout
+    # early scores a SHORTER per-turn vector than the two-turn gold replay at the same episode
+    # score. the trainer compares turns positionally, so those vectors say nothing about each other
+    # -- counting the episode as controlled reported a working per-turn grader as unable to rank.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ShortControlRolloutEnv(_MultiTurnEnv):
+        def env_reply(self, messages, state):
+            # a wrong first turn ends the exchange, so the control rollout emits one turn where the
+            # gold replay emits two.
+            said = [m["content"] for m in state["messages"] if m.get("role") == "assistant"]
+            if said and said[-1] != "first":
+                state["done"] = True
+                return []
+            return super().env_reply(messages, state)
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            rewards = []
+            for _example, state in items:
+                said = [m["content"] for m in state["messages"] if m.get("role") == "assistant"]
+                # identical episode score either way; only the vector LENGTH differs.
+                rewards.append(RolloutReward(episode=0.5, turns=tuple(1.0 for _ in said)))
+            return rewards
+
+    _patch_loader(monkeypatch, _ShortControlRolloutEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "cannot rank completions" not in captured.err
+
+
+def test_env_test_gold_answer_colliding_with_every_fixed_control_is_still_controlled(
+    monkeypatch, tmp_path, capsys
+):
+    # a gold answer drawing on several alphabets disqualifies the whole fixed control set at once:
+    # "answer" rejects the english candidate, "z" the repeated-z one, "0" the repeated-zero one.
+    # returning None there excluded the episode, so a constant grader passed unexamined.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ConstantGraderEnv(_SingleTurnEnv):
+        def dataset(self):
+            return [{"input": "q", "output": "answer z 0"}]
+
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            return 1.0
+
+    env = _ConstantGraderEnv()
+    _patch_loader(monkeypatch, env)
+
+    # every fixed candidate is unusable for this gold answer...
+    assert not any(_control_is_disjoint(c, "answer z 0") for c in _CONTROL_CANDIDATES)
+    # ...so without a fallback the episode carried no control at all and the constant grader passed.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "cannot rank completions" in captured.err
+
+
+def test_synthetic_control_is_disjoint_from_the_gold_answer():
+    control = _synthetic_control(["answer z 0"])
+
+    assert control is not None
+    assert _control_is_disjoint(control, "answer z 0")
+
+
+def test_synthetic_control_is_none_when_the_gold_text_uses_every_character():
+    # no character is left to build a provably-wrong control from, so the episode must still be
+    # excluded rather than controlled against text that might be correct.
+    exhaustive = _SYNTHETIC_CONTROL_ALPHABET
+
+    assert _synthetic_control([exhaustive]) is None
+
+
+class _NonFiniteControlScorerEnv(_SingleTurnEnv):
+    """A grader that scores its own reference finitely and anything else NaN.
+
+    `_score_control` maps a raised exception to 0.0 for single-turn (mirroring reward_fn), so a
+    non-finite score is the shape that actually reaches the caller. Legitimate for sft/opd/opsd,
+    whose workers never call the scorer at all; a real defect for grpo, whose reward_fn grades
+    arbitrary policy completions.
+    """
+
+    def reward(self, completion, example, state=None):
+        self.completions.append(completion)
+        if completion != example.get("output", ""):
+            return float("nan")
+        return 1.0
+
+
+def test_env_test_control_that_cannot_be_graded_does_not_fail_a_non_reward_algorithm(
+    monkeypatch, tmp_path, capsys
+):
+    # scoring the control raised, and that propagated out as a failed EPISODE -- so the run reported
+    # overall: FAIL and the algorithm gate below never got to soften it. the failure is a fact about
+    # the control, not about the episode the driver had already replayed successfully.
+    env_dir = _environment_dir(tmp_path)
+    env = _NonFiniteControlScorerEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "overall: PASS" in captured.out
+    # the episode is not silently dropped: the missing evidence is reported.
+    assert "could not score a deliberately wrong answer" in captured.err
+    # ...and it is not counted as flat, which would be a finding the evidence does not support.
+    assert "cannot rank completions" not in captured.err
+
+
+def test_env_test_control_that_cannot_be_graded_still_fails_grpo(monkeypatch, tmp_path, capsys):
+    # grpo's reward_fn does grade arbitrary completions, so a scorer that cannot score them is a
+    # real defect and must keep failing. this is what stops the fix above from swallowing a live bug.
+    env_dir = _environment_dir(tmp_path)
+    env = _NonFiniteControlScorerEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_control_that_cannot_be_graded_still_fails_when_the_algorithm_is_unset(
+    monkeypatch, tmp_path, capsys
+):
+    # unset is unknown intent, not a promise that nothing grades, so the exemption must not extend
+    # to it -- otherwise omitting --algorithm would hide a scorer grpo is about to break on.
+    env_dir = _environment_dir(tmp_path)
+    env = _NonFiniteControlScorerEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_flat_reward_still_warns_for_a_non_reward_algorithm(monkeypatch, tmp_path, capsys):
+    # a scorer that GRADES the controls fine but ranks them equal is a different case: the evidence
+    # exists, so the flat finding must still be reported (as a warning, since sft never reads it).
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(reward=1.0, wrong_reward=1.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "cannot rank completions" in captured.err
+    assert [c for c in env.completions if c in _CONTROL_CANDIDATES]
+
+
+def test_env_test_equal_sum_per_turn_vectors_are_not_failed_as_flat(monkeypatch, tmp_path, capsys):
+    # end-to-end companion to the _Score unit tests: a grader whose gold and control vectors have
+    # the same sum but differ positionally ((1, 0) against (0, 1)) does rank under the per-turn
+    # trainer, since each turn index is centred against its own group mean. reducing the vectors to
+    # one scalar made the sums tie and failed a working environment.
+    env_dir = _environment_dir(tmp_path)
+
+    class _EqualSumPerTurnEnv(_MultiTurnEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            rewards = []
+            for example, state in items:
+                gold = {turn["content"] for turn in example["output"]}
+                said = [
+                    message["content"]
+                    for message in state["messages"]
+                    if message.get("role") == "assistant"
+                ]
+                # gold replays both reference turns and earns (1, 0); a control matches neither and
+                # earns (0, 1). identical episode score, identical sum, different vectors.
+                correct = [1.0 if text in gold else 0.0 for text in said]
+                turns = (1.0, 0.0) if any(correct) else (0.0, 1.0)
+                rewards.append(RolloutReward(episode=0.5, turns=turns))
+            return rewards
+
+    _patch_loader(monkeypatch, _EqualSumPerTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "cannot rank completions" not in captured.err
+    # and not misread as inverted either: neither vector dominates the other.
+    assert "reward direction" not in captured.err

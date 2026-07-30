@@ -31,6 +31,10 @@ _CONTROL_CANDIDATES = (
     "z" * 64,
     "0" * 64,
 )
+# drawn on when every fixed candidate collides with the gold answer. single characters, so a control
+# built from one of them shares no word with any gold text by construction.
+_SYNTHETIC_CONTROL_ALPHABET = "zqxjkvwy0123456789bcdfghlmnprstu"
+_SYNTHETIC_CONTROL_WIDTH = 64
 _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
 
@@ -53,19 +57,54 @@ class _Score:
             math.isfinite(value) for value in self.turns or ()
         )
 
+    def is_comparable_with(self, other: _Score) -> bool:
+        """Report whether these two scores carry evidence about each other at all.
+
+        `build_per_turn_advantages` compares turns positionally, so vectors of different lengths --
+        or one present and one absent -- cannot be read against each other. That is an absence of
+        evidence, not a finding: the caller excludes such an episode from the gate rather than
+        counting it as unrankable (cursor).
+        """
+        if self.episode != other.episode:
+            return True
+        mine, theirs = self.turns, other.turns
+        if mine is None and theirs is None:
+            return True
+        if mine is None or theirs is None:
+            return False
+        return len(mine) == len(theirs)
+
     def ranks_below(self, other: _Score) -> bool:
-        """Report whether this score is separated from `other` in the direction training reads."""
+        """Report whether this score is unambiguously worse in the direction training reads."""
         if self.episode != other.episode:
             return self.episode < other.episode
-        # equal episodes still rank when per-turn credit separates them, and the trainer compares
-        # turns positionally, so differing lengths are not comparable evidence either way.
         mine, theirs = self.turns, other.turns
         if mine is None or theirs is None or len(mine) != len(theirs):
             return False
-        return sum(mine) < sum(theirs)
+        # positional dominance, not the sum. `build_per_turn_advantages` centres each turn index
+        # against its own group mean, so being worse at one turn and better at another is not
+        # "worse" in any direction the trainer reads -- only being no better anywhere and worse
+        # somewhere is (codex[bot]).
+        pairs = tuple(zip(mine, theirs, strict=True))
+        return all(m <= t for m, t in pairs) and any(m < t for m, t in pairs)
 
     def outranks(self, other: _Score) -> bool:
         return other.ranks_below(self)
+
+    def separates_from(self, other: _Score) -> bool:
+        """Report whether training could tell these two completions apart at all.
+
+        Distinct per-turn vectors that neither dominate -- (1, 0) against (0, 1) -- still produce
+        nonzero opposing advantages at both turns, because each turn is centred independently. They
+        rank in no direction yet are plainly separable, so the flat gate asks this rather than
+        reading "nothing ranks below gold" as "the grader cannot rank" (codex[bot]).
+        """
+        if self.episode != other.episode:
+            return True
+        mine, theirs = self.turns, other.turns
+        if mine is None or theirs is None or len(mine) != len(theirs):
+            return False
+        return mine != theirs
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:
@@ -312,6 +351,27 @@ def _control_is_disjoint(control: str, reference: str) -> bool:
     return not any(word in lowered for word in gold.split())
 
 
+def _synthetic_control(references: list[str]) -> str | None:
+    """Build a wrong answer for gold text that collides with every fixed control, or None.
+
+    Repeats a single character the gold answers never use. That character cannot appear in any gold
+    word, so `_control_is_disjoint` holds by construction rather than by luck, and the repetition
+    keeps the control long enough to be an implausible answer for an open-ended task. Returns None
+    when the references between them use the whole alphabet, so the caller still excludes an episode
+    it cannot control rather than inventing evidence.
+    """
+    used = {character for reference in references for character in reference.casefold()}
+    for character in _SYNTHETIC_CONTROL_ALPHABET:
+        if character in used:
+            continue
+        control = character * _SYNTHETIC_CONTROL_WIDTH
+        # cheap belt-and-braces: the caller's own disjointness rule is the contract, so ask it
+        # rather than trusting the construction to stay equivalent to it.
+        if all(_control_is_disjoint(control, reference) for reference in references):
+            return control
+    return None
+
+
 def _grade_single_turn(env, completion: str, example: dict) -> float:
     """Score one single-turn completion through the same dispatch the GRPO worker uses.
 
@@ -413,6 +473,14 @@ def _negative_control_rewards(env, example: dict, references: list[str]) -> list
         # whole transcript: a control matching any single turn is not a wrong episode.
         if all(_control_is_disjoint(control, reference) for reference in scorable)
     ]
+    # a gold answer drawing on several alphabets can disqualify the whole fixed set at once -- one
+    # word rejects the English candidate, a "z" the repeated-z one, a "0" the repeated-zero one --
+    # and returning None there excludes the episode, letting even a constant grader pass unexamined.
+    # so synthesize a control from a character the gold answer does not use (codex[bot]).
+    if not usable:
+        synthetic = _synthetic_control(scorable)
+        if synthetic is not None:
+            usable = [synthetic]
     scores = [_score_control(env, example, control, env.multi_turn) for control in usable]
     return scores or None
 
@@ -439,6 +507,19 @@ def _grades_completions(args) -> bool:
     if not algorithm or not str(algorithm).strip():
         return False
     return normalize_algorithm(str(algorithm).strip()) in _REWARD_CONSUMING_ALGORITHMS
+
+
+def _never_grades(args) -> bool:
+    """Whether this run's worker provably never calls the environment's scorer.
+
+    The strict complement of "may grade", and NOT the negation of `_grades_completions`: that folds
+    an unset algorithm in with the non-reward ones because neither is grounds to FAIL, whereas here
+    an unset algorithm is unknown intent and must keep failing on a scorer it cannot exercise.
+    """
+    algorithm = getattr(args, "algorithm", None)
+    if not algorithm or not str(algorithm).strip():
+        return False
+    return normalize_algorithm(str(algorithm).strip()) not in _REWARD_CONSUMING_ALGORITHMS
 
 
 def cmd_env_test(args) -> int:
@@ -477,6 +558,7 @@ def cmd_env_test(args) -> int:
     controlled = 0
     scored_flat = 0
     inverted = 0
+    control_errors: list[str] = []
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
         failure: str | None = None
@@ -496,11 +578,21 @@ def cmd_env_test(args) -> int:
                 # finite scalar, so an env may legitimately score its reference 0.0 with worse
                 # completions below it. what makes a grader unusable for RL is that it cannot
                 # SEPARATE a good completion from a bad one, so score wrong answers and compare.
-                # scored inside this guard because a non-finite control breaks the same reward
-                # contract as a non-finite gold score and must fail the episode the same way.
-                controls = _negative_control_rewards(
-                    env, example, record["reference_turns"] or record["responses"][:1]
-                )
+                try:
+                    controls = _negative_control_rewards(
+                        env, example, record["reference_turns"] or record["responses"][:1]
+                    )
+                except (Exception, SystemExit) as exc:
+                    # a control that cannot be graded is a real defect wherever the scorer is
+                    # actually called, and an unknown algorithm is not grounds to assume it is not
+                    # -- so both keep failing the episode. only an algorithm whose worker provably
+                    # never grades (sft/opd/opsd) is exempt: a reference-only scorer is legitimate
+                    # there, and this is a fact about the CONTROL rather than about the episode the
+                    # driver already replayed successfully (codex[bot]).
+                    if not _never_grades(args):
+                        raise
+                    control_errors.append(str(exc) or exc.__class__.__name__)
+                    controls = None
         except (Exception, SystemExit) as exc:
             failure = str(exc) or exc.__class__.__name__
 
@@ -521,7 +613,11 @@ def cmd_env_test(args) -> int:
         # (multi-turn, or no control disjoint from the gold text), so the episode carries no
         # evidence either way. counting it as controlled would let the gate below speak for
         # episodes it never tested.
+        # a control whose per-turn shape cannot be read against the gold answer's is not evidence
+        # that the grader is flat, so drop it rather than let it dilute the episode (cursor).
         if controls is not None and reward is not None:
+            controls = [control for control in controls if control.is_comparable_with(reward)]
+        if controls and reward is not None:
             controlled += 1
             if any(control.outranks(reward) for control in controls):
                 # strictly worse than a deliberately wrong answer. GRPO maximizes this number, so
@@ -538,7 +634,7 @@ def cmd_env_test(args) -> int:
                     render.warn(message) if render.styled() else f"warning: {message}",
                     file=sys.stderr,
                 )
-            elif not any(control.ranks_below(reward) for control in controls):
+            elif not any(control.separates_from(reward) for control in controls):
                 scored_flat += 1
                 message = (
                     f"replay gold answer and {len(controls)} deliberately wrong answer(s) all "
@@ -552,6 +648,18 @@ def cmd_env_test(args) -> int:
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
         return _err("overall: FAIL")
+    if control_errors:
+        # not silent: the reward check ran on less evidence than it looks like it did, and a
+        # reference-only grader is worth knowing about before the algorithm ever changes to grpo.
+        message = (
+            f"{len(control_errors)} episode(s) could not score a deliberately wrong answer "
+            f"({control_errors[0]}), so the reward check skipped them. this scorer would fail "
+            "under --algorithm grpo, which does grade arbitrary completions."
+        )
+        print(
+            render.warn(message) if render.styled() else f"warning: {message}",
+            file=sys.stderr,
+        )
     # a grader that hands every deliberately wrong answer the same score as its own gold answer on
     # every sampled episode cannot rank completions at all: a broken reward function or a missing
     # runtime dependency, not a hard dataset. one that ranks them ABOVE gold is worse still, since
