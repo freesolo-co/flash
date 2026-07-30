@@ -90,12 +90,24 @@ def _dim(s: str) -> str:
     return _style("2", s)
 
 
-def format_identity(me: dict) -> str:
-    """Render the stored key's identity as an aligned card (not raw JSON)."""
+def format_identity(
+    me: dict,
+    api_url: str | None = None,
+    api_url_source: str | None = None,
+) -> str:
+    """Render the stored key's identity as an aligned card (not raw JSON).
+
+    ``api_url`` is the other half of "where does this command land": a config with only an api_key
+    falls back to the channel default, which is production. Show the resolved control plane and
+    where it was resolved from, so neither half of the destination is implicit.
+    """
     rows = [(label, str(me[field])) for field, label in _ROWS if me.get(field)]
     prefix = me.get("key_prefix")
     kind = _KIND_LABEL.get(me.get("kind", ""), me.get("kind") or "api key")
     rows.append(("key", f"{prefix}{_glyph('…', '...')} {_dim(f'({kind})')}" if prefix else kind))
+    if api_url:
+        value = f"{api_url} {_dim(f'({api_url_source})')}" if api_url_source else api_url
+        rows.append(("plane", value))
     width = max(len(label) for label, _ in rows)
     return "\n".join(f"  {_dim(label.ljust(width))}  {value}" for label, value in rows)
 
@@ -109,8 +121,13 @@ def login_ok(me: dict | None) -> str:
     return _safe(f"{head}\n\n{format_identity(me)}")
 
 
-def whoami(me: dict) -> str:
-    return _safe(f"{_bold('logged in to flash')}\n\n{format_identity(me)}")
+def whoami(
+    me: dict,
+    api_url: str | None = None,
+    api_url_source: str | None = None,
+) -> str:
+    card = format_identity(me, api_url, api_url_source)
+    return _safe(f"{_bold('logged in to flash')}\n\n{card}")
 
 
 def login_failed(reason: str) -> str:
