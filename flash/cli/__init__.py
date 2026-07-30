@@ -13,6 +13,7 @@ from flash import __version__
 from flash._channel import CLI_NAME
 from flash._logging import configure_logging
 from flash._update_check import emit_update_notice, maybe_start_update_check
+from flash.catalog import ALGORITHMS
 from flash.cli import render
 
 # package-level command imports remain available through flash.cli.
@@ -314,6 +315,15 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=".",
         help="local environment directory or environment.py path",
+    )
+    env_test.add_argument(
+        "--algorithm",
+        default=None,
+        help=(
+            "algorithm the environment is for, matching [train] algorithm "
+            f"({', '.join(ALGORITHMS)}). only the reward-consuming ones check that the grader "
+            "can rank completions; sft never calls reward()"
+        ),
     )
     env_test.set_defaults(func=cmd_env_test)
 
