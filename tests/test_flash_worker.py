@@ -63,11 +63,16 @@ def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
 
 
-def test_build_worker_env_opd_uses_expandable_allocator(monkeypatch):
-    """Regression (codex[bot]): OPD has NO vLLM sleep engine (that's GRPO-only) and allocates large HF
-    generate/logit tensors like SFT, so it must get the anti-fragmentation expandable allocator — NOT
-    the sleep-safe non-expandable RL conf. OPD was previously lumped with RL (`not in ("sft",)`) and
-    fragmented / OOM'd on a GPU the VRAM estimate said would fit. GRPO stays non-expandable."""
+def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
+    """OPD must get the sleep-safe NON-expandable allocator conf, like GRPO.
+
+    This inverts an earlier regression test, and the inversion is the point. Under trl, OPD drove its
+    own HF generate loop with no sleep engine, so the anti-fragmentation expandable allocator was
+    right. run_opd now delegates to verl unconditionally, and verl leaves rollout.enable_sleep_mode
+    defaulted True -- so the engine always builds a CuMemAllocator, which asserts outright on
+    expandable_segments (vllm cumem.py, pytorch#147851). An OPD run with the old conf dies before
+    step 1. SFT keeps expandable: its verl trainer is pure FSDP and builds no rollout at all.
+    """
     from flash.providers.runpod.train import build_worker_env
     from flash.spec import JobSpec, TrainSpec
 
@@ -80,9 +85,9 @@ def test_build_worker_env_opd_uses_expandable_allocator(monkeypatch):
         seed=0,
     )
     env = build_worker_env(opd_spec, 0)
-    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
-    assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
-    # GRPO still ships the sleep-safe non-expandable conf (unchanged by this fix).
+    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
+    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
+    # GRPO still ships the sleep-safe non-expandable conf.
     grpo_env = build_worker_env(_spec(), 0)
     assert "expandable_segments" not in grpo_env["PYTORCH_CUDA_ALLOC_CONF"]
 
@@ -547,86 +552,38 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
     assert askpass_paths
 
 
-def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
-    """guard completion-only masking, chunked nll, and the existing sft optimizations together."""
+def test_sft_verl_keeps_the_optimizations_that_survived_the_trl_deletion():
+    """The verl SFT path must still carry the sizing/memory optimizations, not just train.
+
+    The previous version of this test read run_sft's source. That body was trl's and is deleted:
+    run_sft now delegates to run_sft_verl. Rather than drop the coverage, assert against the module
+    that really runs. Three of the old assertions are intentionally NOT reproduced -- chalk kernel
+    installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
+    properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
+    """
     import inspect
 
-    from flash.engine.worker import sft
+    from flash.engine.worker import sft, sft_verl
 
-    src = inspect.getsource(sft.run_sft)
-    prep_src = inspect.getsource(sft._render_tokenize_sft_batch)
-    output_src = inspect.getsource(sft._prepare_sft_examples)
+    # run_sft is now a pure delegation: no backend selector, no trainer of its own.
+    assert "run_sft_verl()" in inspect.getsource(sft.run_sft)
 
-    # completion-only loss is on and the old false literal for that key is gone
-    assert '"completion_only_loss": True' in src
-    assert '"completion_only_loss": False' not in src
-    # the parallel prep path preserves the prompt boundary and pre-tokenized representation
-    assert "completion_mask_from_ids(" in prep_src
-    assert '"completion_mask":' in prep_src
-    assert "tokenize_for_packing(" in prep_src
-    assert '"completion_mask": row["completion_mask"]' in output_src
-    assert "_prepare_sft_examples(" in src
-    assert "Dataset.from_list(_pretok)" in src
-    # both flash custom-packing paths thread the completion mask through the packer
-    assert src.count("pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)") == 2
-
-    # example packing (all three backends: trl bfd, sdpa 4d-mask, gdn varlen)
-    assert 'cfg_kwargs["packing"] = True' in src  # TRL bfd (pure-attn FA2)
-    assert "BlockDiagonalCollator(pad_token_id=tok.pad_token_id)" in src  # SDPA 4D-mask
-    assert "emit_varlen=True" in src  # GDN varlen
-    assert "model_is_pure_attention" in src
-    assert "gdn_packing_available" in src
-    # (tokenize_for_packing now lives in the parallel prep path asserted above.)
-    # chalk standalone RMSNorm/SwiGLU/RoPE stay enabled; chalk flce is OFF on the trl SFT path (returns
-    # logits=None, which trl's SFTTrainer.compute_loss can't consume). when _sft_fused is true, trl's own
-    # chunked_nll owns the output-head loss; the microbatch/grad-accum are sized up front for the chosen path.
-    assert "install_chalk_kernels(" in src
-    assert "fused_ce=False" in src
-    assert "_sft_fused = sft_chunked_nll_enabled(model_id) and not multimodal" in src
-    assert '"loss_type": "chunked_nll" if _sft_fused else "nll"' in src
-    assert "_prepare_chunked_nll_model(sft_model, tok, _lora_config)" in src
-    assert 'cfg_kwargs["use_liger_kernel"] = False' in src
-    assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
-    # LoRA+ (B-matrix LR ratio)
-    assert "create_loraplus_optimizer" in src
-    assert "_lp_ratio" in src
-    # large-vocab logits cap (per-device micro-batch sizing)
-    assert "sft_grad_accum(" in src
-    # PR #538 finding (worker/quote SFT vocab drift): the worker must size the realized batch through the
-    # SAME revision-aware resolver the cost quote priced with (cost/spec.py _sft_realized_batch ->
-    # resolve_vocab_size on the same (model, revision)). sizing via the revision-blind vocab_size_for made a
-    # revision-pinned run's realized batch drift from its quote. resolve once, reuse for the packing path.
-    assert "_sft_vocab = resolve_vocab_size(model_id, model_revision)" in src
-    assert "vocab=_sft_vocab" in src
+    src = inspect.getsource(sft_verl)
+    # completion-only supervision survives, as verl's loss_mask rather than trl's completion_mask.
+    assert "_pretokenize_completion_only(" in src
+    assert "completion_mask_from_ids(" in src
+    assert '"loss_mask": tokenized["completion_mask"]' in src
+    # revision-aware vocab resolution: the worker must size the realized batch through the SAME
+    # resolver the cost quote priced with, else a revision-pinned run drifts from its quote.
+    assert "resolve_vocab_size(" in src
     assert "vocab_size_for(model_id)" not in src
-    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. the gc decision uses the safe
-    # realized maximum after packing, not the configured cap, and remains conservative on unknown memory.
-    assert "grad_checkpointing_on(\n        model_id,\n        _runtime_max_len," in src
-    assert '"gradient_checkpointing": _grad_ckpt' in src
-    # Reentrant recompute for MoE / GatedDeltaNet (same rule as GRPO's rl.py, #429/#432): those
-    # architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
-    # non-reentrant's metadata-equality assert kills the first backward. Dense stays non-reentrant.
-    assert '"use_reentrant": grpo_use_reentrant(model_id)' in src
-    assert '"optim": fused_optim_name()' in src
-
-
-def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
-    """When TRL bfd packing stays ON, grad_accum must be re-derived from the ~ex/block estimate so
-    the effective batch stays in EXAMPLES — otherwise bfd bins ~ex_per_block examples per row and
-    inflates the effective batch ~ex_per_block-fold (undertraining). The SDPA/GDN packing paths
-    already do this; pin that the bfd path does too, AFTER the packing-finalization block."""
-    import inspect
-
-    from flash.engine.worker import sft
-
-    src = inspect.getsource(sft.run_sft)
-    # the shared packed-path re-derivation uses the bfd ex/block estimate after backend selection.
-    assert "_bfd_preview = pack_dataset(" in src
-    assert 'strategy="bfd"' in src
-    assert 'f"[sft] {_packing_kind} packing:' in src
-    assert "if _packed_examples_per_block is not None:" in src
-    assert "per_device_bs * _packed_examples_per_block" in src
-    assert 'cfg_kwargs["gradient_accumulation_steps"] = grad_accum' in src
+    # per-device micro-batch / grad-accum sizing for the large-vocab logits cap.
+    assert "sft_grad_accum(" in src
+    # gradient checkpointing, with the MoE/GDN reentrant rule shared with grpo.
+    assert "grad_checkpointing_on(" in src
+    assert "grpo_use_reentrant(" in src
+    # LoRA+ survives (verl builds the optimizer itself, but flash still supplies the grouping).
+    assert "create_loraplus_optimizer" in src
 
 
 def test_trl_collator_masks_prompt_from_pretokenized_rows():

@@ -20,7 +20,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.opd import _gkd_loss_from_logps
 from flash.engine.worker.opd_verl import (
     _BridgePrompt,
     _build_opd_child_env,
@@ -67,6 +66,35 @@ from flash.engine.worker.opd_verl_structured import (
 from flash.engine.worker.tokenizer_align import TeacherToken
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION
 from flash.opd_verl_validation import validate_opd_verl_structured_outputs
+
+
+def _reference_groupwise_reverse_kl(sp_t, groups, kl_coef=1.0):
+    """Straight-line reference for the groupwise reverse-KL used by the equivalence tests below.
+
+    Deliberately written as an INDEPENDENT formulation rather than imported from the worker: the
+    point of the equivalence assertions is to pin verl's vectorized implementation to the objective
+    on paper, and an oracle that shares code with the thing it checks can drift with it and still
+    agree. Per group g over student token indices I_g, the coefficient is
+    ``kl_coef * (sum_{i in I_g} sp_i - teacher_logsum_g) / |I_g|``, applied to each member token and
+    averaged over all grouped tokens. The coefficient uses DETACHED student logprobs, so the
+    gradient flows only through the trailing factor -- that asymmetry is the objective, not an
+    optimization, so a reference that differentiates both factors would disagree by design.
+    """
+    import torch
+
+    if sp_t is None or not groups:
+        return None
+    terms = []
+    for s_idx, teacher_logsum in groups:
+        if not s_idx:
+            continue
+        idx = [int(i) for i in s_idx]
+        student_logsum = sum(sp_t[i].detach() for i in idx)
+        coeff = kl_coef * (student_logsum - float(teacher_logsum)) / len(idx)
+        terms.extend(coeff * sp_t[i] for i in idx)
+    if not terms:
+        return None
+    return torch.stack(terms).mean()
 
 
 def _write_mutation_failure_after_start(start, classification, message):
@@ -218,7 +246,7 @@ def _aggregate_seq_mean_token_mean(values, response_mask):
     return sequence_losses.mean()
 
 
-def test_groupwise_reverse_kl_scalar_and_analytic_gradient_match_legacy():
+def test_groupwise_reverse_kl_scalar_and_analytic_gradient_match_reference():
     torch = pytest.importorskip("torch")
     student = torch.tensor(
         [[-0.4, -0.8, -1.2, -2.0], [-0.3, -0.9, -1.1, -1.7]],
@@ -239,19 +267,19 @@ def test_groupwise_reverse_kl_scalar_and_analytic_gradient_match_legacy():
     verl_loss = _aggregate_seq_mean_token_mean(values, response_mask)
     verl_gradient = torch.autograd.grad(verl_loss, student, retain_graph=True)[0]
 
-    legacy_losses = [
-        _gkd_loss_from_logps(
+    reference_losses = [
+        _reference_groupwise_reverse_kl(
             student[row],
             [([0], float(teacher_logsums[row, 0])), ([1, 2], float(teacher_logsums[row, 1]))],
             kl_coef=coef,
         )
         for row in range(2)
     ]
-    legacy_loss = torch.stack(legacy_losses).mean()
-    legacy_gradient = torch.autograd.grad(legacy_loss, student)[0]
+    reference_loss = torch.stack(reference_losses).mean()
+    reference_gradient = torch.autograd.grad(reference_loss, student)[0]
 
-    assert torch.allclose(verl_loss, legacy_loss, atol=1e-12, rtol=1e-12)
-    assert torch.allclose(verl_gradient, legacy_gradient, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(verl_loss, reference_loss, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(verl_gradient, reference_gradient, atol=1e-12, rtol=1e-12)
     assert torch.equal(verl_gradient[:, 3], torch.zeros(2, dtype=torch.float64))
 
 
@@ -325,9 +353,9 @@ def test_dynamic_microbatches_refresh_global_batch_info_and_match_flash_sequence
             )
             _set_current_global_batch_info(config, data)
         actual = torch.stack(micro_losses).sum()
-        legacy = torch.stack(
+        reference = torch.stack(
             [
-                _gkd_loss_from_logps(
+                _reference_groupwise_reverse_kl(
                     student[row],
                     [
                         (
@@ -346,7 +374,7 @@ def test_dynamic_microbatches_refresh_global_batch_info_and_match_flash_sequence
             ]
         ).mean()
         actual_gradient = torch.autograd.grad(actual, student, retain_graph=True)[0]
-        legacy_gradient = torch.autograd.grad(legacy, student)[0]
+        reference_gradient = torch.autograd.grad(reference, student)[0]
 
         assert config.global_batch_info == {
             "dp_size": 1,
@@ -354,10 +382,10 @@ def test_dynamic_microbatches_refresh_global_batch_info_and_match_flash_sequence
             "global_batch_size": global_batch_size,
             "loss_scale_factor": None,
         }
-        assert torch.allclose(actual, legacy, atol=1e-12, rtol=1e-12)
-        assert torch.allclose(actual_gradient, legacy_gradient, atol=1e-12, rtol=1e-12)
+        assert torch.allclose(actual, reference, atol=1e-12, rtol=1e-12)
+        assert torch.allclose(actual_gradient, reference_gradient, atol=1e-12, rtol=1e-12)
         observed.append(float(actual.detach()))
-        expected.append(float(legacy.detach()))
+        expected.append(float(reference.detach()))
 
     assert observed == pytest.approx(expected, abs=1e-12, rel=1e-12)
     assert len(steps[0]["student"]) != len(steps[1]["student"])
@@ -2034,6 +2062,52 @@ def test_fully_forced_groups_encode_as_no_signal_and_are_filtered():
     assert _full_sequence_signal_sequences(full_sequence_ids).tolist() == [False]
     assert bridge.forced_tokens == 2
     assert bridge.dropped_forced_groups == 2
+
+
+def test_dropped_forced_groups_renormalize_over_surviving_tokens_only():
+    """A dropped forced span must re-normalize the reverse-KL, not leave a shrunken sum.
+
+    Ported from the TRL OPD suite, where the same invariant was asserted over
+    ``_prepare_gkd_groups`` / ``_gkd_loss_from_logps``. In verl the two halves live in one place:
+    ``group_ids`` of -1 exclude the forced positions, and the ``response_count / selected_count``
+    rescale (opd_verl_plugin.py:135) restores the denominator. The load-bearing claim is that a row
+    whose forced tokens were dropped scores EXACTLY as a row that only ever held the survivors --
+    without that rescale, verl's seq-mean-token-mean aggregation would divide the surviving signal
+    by the full response length and silently shrink the loss in proportion to how much was forced.
+    """
+    torch = pytest.importorskip("torch")
+
+    # tokens 0 and 3 fully-forced (group -1 = no signal); tokens 1,2 form one surviving group.
+    student = torch.tensor([[-0.5, -1.0, -1.5, -2.0]], dtype=torch.float64, requires_grad=True)
+    teacher_logsums = torch.tensor([[0.0, -2.0, -2.0, 0.0]], dtype=torch.float64)
+    group_ids = torch.tensor([[-1, 1, 1, -1]])
+    response_mask = torch.ones_like(student, dtype=torch.bool)
+
+    masked = _aggregate_seq_mean_token_mean(
+        _flash_groupwise_reverse_kl_values(
+            student, teacher_logsums, group_ids, response_mask, 0.25
+        ),
+        response_mask,
+    )
+
+    # the same group, in a row that never carried the forced positions at all.
+    survivors = torch.tensor([[-1.0, -1.5]], dtype=torch.float64, requires_grad=True)
+    survivor_mask = torch.ones_like(survivors, dtype=torch.bool)
+    survivor_loss = _aggregate_seq_mean_token_mean(
+        _flash_groupwise_reverse_kl_values(
+            survivors,
+            torch.tensor([[-2.0, -2.0]], dtype=torch.float64),
+            torch.tensor([[1, 1]]),
+            survivor_mask,
+            0.25,
+        ),
+        survivor_mask,
+    )
+
+    assert torch.allclose(masked, survivor_loss, atol=1e-12, rtol=1e-12)
+    # and the dropped positions carry no gradient -- they are excluded, not merely down-weighted.
+    gradient = torch.autograd.grad(masked, student)[0]
+    assert torch.equal(gradient[0, [0, 3]], torch.zeros(2, dtype=torch.float64))
 
 
 def test_partially_forced_alignment_group_is_kept_whole():
@@ -4072,6 +4146,29 @@ def test_marker_publication_failure_reaches_all_ranks_before_optimizer_step(
     assert updates == []
 
 
+def test_bridge_publishes_the_marker_exactly_once_across_concurrent_ranks():
+    """The bridge gate must collapse every rank's first-mutation notice into one marker publish.
+
+    trl drove the marker from a single-process optimizer helper (_apply_opd_optimizer_update), so
+    "exactly once" was trivially true and tested there. verl runs one worker per rank and each wraps
+    its own optimizer, so N ranks race into notify_mutation at the first step -- and a second publish
+    would commit a duplicate marker for the attempt. The _mutation_lock + _mutation_notified gate is
+    what makes that safe, and it had no direct coverage: the tests above drive the plugin-side
+    wrapper, which stops at one notice per rank, not one notice per run.
+    """
+    calls = []
+    bridge = _text_bridge(_BridgeTeacher(), mutation_callback=lambda: calls.append(True))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda _rank: bridge.notify_mutation(), range(8)))
+
+    assert calls == [True]
+    # a later notice is still a no-op: the marker is published once per attempt, not once per step.
+    bridge.notify_mutation()
+    assert calls == [True]
+    assert bridge.mutation_failure is None
+
+
 def test_first_parent_mutation_failure_is_replayed_to_all_ranks_without_steps():
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -4599,6 +4696,26 @@ def test_overrides_bound_transfer_queue_storage_to_one_unit():
     # the run forever before a gpu is touched. flash's trainer is single-node: one unit.
     overrides = dict(value.split("=", 1) for value in build_opd_verl_overrides(_config()))
     assert overrides["transfer_queue.backend.SimpleStorage.num_data_storage_units"] == "1"
+
+
+def test_opd_rollout_reserves_the_fp8_kv_cache_its_sizing_assumes():
+    """The OPD engine must ask vLLM for fp8 KV, because vram.py already sized the run for it.
+
+    `_opd_fp8_adjust` halves an OPD requirement once it clears the largest non-fp8 card, on the
+    premise that the colocated rollout reserves an fp8 cache. That premise was supplied by the trl
+    engine (opd_vllm.py set kv_cache_dtype="fp8" on cc >= 8.9), which is deleted -- run_opd now
+    delegates to verl unconditionally. Without this override the allocator reserves an fp8-sized
+    pool while vLLM allocates a bf16 one: double the real KV, OOM at rollout init on a card sizing
+    called sufficient. The two must move together or not at all.
+    """
+    on = dict(value.split("=", 1) for value in build_opd_verl_overrides(_config(fp8_kv=True)))
+    assert on["+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype"] == "fp8"
+
+    # bf16 is the conservative default: no flag, no key (sizing only discounts when the run is
+    # provably modern-card-only, so an un-probed run must not claim an fp8 pool it did not request).
+    for cfg in (_config(), _config(fp8_kv=False)):
+        off = dict(value.split("=", 1) for value in build_opd_verl_overrides(cfg))
+        assert not [k for k in off if "kv_cache_dtype" in k]
 
 
 def test_remote_distillation_config_declares_every_field_post_init_assigns():
@@ -5163,17 +5280,72 @@ def test_plugin_identifiers_remain_provider_neutral():
         assert f"_{name}" not in source
 
 
-def test_opd_backend_selector_routes_to_verl(monkeypatch):
+def test_opd_delegates_to_verl_with_no_selector_left(monkeypatch):
+    """run_opd has no backend selector: it calls verl unconditionally.
+
+    Replaces the FLASH_OPD_BACKEND selector test. The TRL OPD body is gone, so there is nothing
+    left to select between and no env key can route the phase anywhere else.
+    """
     import flash.engine.worker.opd as opd_mod
     import flash.engine.worker.opd_verl as ov
+
     called = []
     monkeypatch.setattr(ov, "run_opd_verl", lambda *a, **k: called.append(True))
-    monkeypatch.setenv("FLASH_OPD_BACKEND", "verl")
+    monkeypatch.setenv("FLASH_OPD_BACKEND", "bogus")
     opd_mod.run_opd()
     assert called == [True]
-    monkeypatch.setenv("FLASH_OPD_BACKEND", "bogus")
-    with pytest.raises(RuntimeError, match="not a known opd backend"):
-        opd_mod.run_opd()
+
+
+def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch):
+    """An OPD spec must resolve backend "verl" and a NON-expandable allocator conf.
+
+    This is the regression the TRL deletion exposed. `effective_backend` defaulted to "trl" for any
+    phase whose worker_env carried no selector, and _worker.py maps a non-verl OPD run to
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. verl leaves rollout.enable_sleep_mode
+    defaulted True, so the engine always builds a CuMemAllocator, which asserts outright on
+    expandable_segments (cumem.py, pytorch#147851) -- the run would die before step 1.
+
+    A [worker_env] selector must not be able to reintroduce it either: run_opd delegates to verl
+    unconditionally, so honoring the key would pick an allocator for a backend that cannot run.
+    """
+    from flash.providers._worker import build_worker_env
+    from flash.spec import JobSpec, effective_backend
+
+    def _spec(worker_env=None):
+        payload = {
+            "run_id": "r-alloc",
+            "algorithm": "opd",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_policy": "catalog",
+            "environment": {"repo": "x/y", "name": "e"},
+            "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
+            "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
+        }
+        if worker_env is not None:
+            payload["worker_env"] = worker_env
+        return JobSpec.from_dict(payload)
+
+    for worker_env in (None, {"FLASH_OPD_BACKEND": "trl"}, {"FLASH_OPD_BACKEND": "bogus"}):
+        spec = _spec(worker_env)
+        assert spec.phase == "opd"
+        assert effective_backend(spec) == "verl", worker_env
+        alloc = build_worker_env(spec, spec.seed)["PYTORCH_CUDA_ALLOC_CONF"]
+        assert "expandable_segments" not in alloc, (worker_env, alloc)
+
+    # sft is verl-only too, but it builds no rollout engine at all, so expandable segments stay.
+    sft = JobSpec.from_dict(
+        {
+            "run_id": "r-sft",
+            "algorithm": "sft",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_policy": "catalog",
+            "environment": {"repo": "x/y", "name": "e"},
+            "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
+            "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
+        }
+    )
+    assert effective_backend(sft) == "verl"
+    assert build_worker_env(sft, sft.seed)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 
 def test_worker_fails_closed_on_tool_env(monkeypatch):
@@ -5362,3 +5534,65 @@ def test_stalled_thread_probe_reports_a_thread_that_is_gone_instead_of_raising()
     thread.join(10)
     assert plugin._describe_stalled_thread(thread.ident) == "stack unavailable"
     assert plugin._describe_stalled_thread(None) == "stack unavailable"
+
+
+def test_opd_missing_managed_teacher_key_fails_before_the_gpu_probe(monkeypatch):
+    """A missing managed teacher key must fail before any paid GPU work starts.
+
+    Ported from the TRL OPD suite (`test_opd_missing_teacher_key_raises_platform_managed_error`),
+    where the same guard was asserted against `run_opd`. It is a COST guard, not just a validation
+    one: the key is platform-injected, so its absence is a platform-side failure that can only ever
+    end the run -- reaching `_probe_gpu_in_subprocess` would rent a card for a run guaranteed to
+    fail, and `prefetch_model` would then spend minutes pulling weights before anything noticed.
+    The monkeypatched probe asserts rather than returns, so ordering is proved, not assumed.
+    """
+    from flash.engine.worker import opd_verl as opd_mod
+
+    env = SimpleNamespace(
+        is_tool_env=False,
+        multi_turn=False,
+        dataset=lambda: [{"question": "2+2"}],
+        prompt_messages=lambda _record: [{"role": "user", "content": "2+2"}],
+    )
+    train = SimpleNamespace(
+        init_from_adapter="",
+        max_examples=1,
+        teacher_model="",
+        epochs=1,
+        temperature=None,
+        save_at_steps=(),
+        stop_sequences=(),
+        structured_outputs="",
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(
+            SEED=0,
+            THINKING=False,
+            require_active_env=lambda: env,
+            JOB_SPEC=SimpleNamespace(
+                train=train,
+                model="Qwen/Qwen3.5-4B",
+                model_revision="",
+                model_policy="catalog",
+                gpu=SimpleNamespace(type=None),
+            ),
+            heartbeat=lambda *args, **kwargs: None,
+            gpu_diagnostics=lambda **_kwargs: {},
+            prefetch_model=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("model prefetch must not be reached")
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_probe_gpu_in_subprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("gpu allocation must not be reached")
+        ),
+    )
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="managed teacher api key is missing"):
+        opd_mod.run_opd_verl()

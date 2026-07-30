@@ -263,12 +263,24 @@ def test_qwen35_moe_chunked_nll_preserves_plain_objective():
     assert chunked_out.logits is None
 
 
-def test_chunked_nll_forces_preload_before_model_validation():
-    from flash.engine.worker.sft import run_sft
+def test_sft_worker_requests_the_fused_loss_its_sizing_assumes():
+    """The SFT worker must enable a dense-logit-free loss, because vram.py already sized for it.
 
-    source = inspect.getsource(run_sft)
-    assert "force=_sft_fused" in source
-    assert source.index("force=_sft_fused") < source.index("_prepare_chunked_nll_model(")
+    `sft_chunked_nll_enabled` drops the dense [batch, seq, vocab] logits term from the estimate and
+    raises the micro-batch cap for the listed families. trl supplied that property via chunked_nll
+    (this test used to assert the preload ordering around `_prepare_chunked_nll_model`); verl supplies
+    it via fused kernels + liger. Either is fine, but the worker must request one -- a plain-nll run
+    against a fused-sized reservation materializes logits the estimate never budgeted and OOMs.
+    """
+    from flash.engine.vram import sft_chunked_nll_enabled
+    from flash.engine.worker import sft_verl
+
+    source = inspect.getsource(sft_verl)
+    assert '"model.use_fused_kernels=true"' in source
+    assert '"use_liger": True' in source
+    # the discount is not universal, so the gate must still be a real allowlist, not a constant.
+    assert sft_chunked_nll_enabled("Qwen/Qwen3.5-4B")
+    assert not sft_chunked_nll_enabled("meta-llama/Llama-3.1-8B")
 
 
 def test_chunked_nll_rejects_trainable_output_head():

@@ -1479,6 +1479,17 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         # "seed" entry, so it wins. `++` because the sub-key is absent from the composed node.
         # per-request sampling is seeded separately by the plugin's deterministic_rollout_seed.
         f"++actor_rollout_ref.rollout.engine_kwargs.vllm.seed={_hydra_val(config.get('seed', 42))}",
+        # fp8 kv cache, exactly as the deleted trl colocate engine reserved it (it set
+        # kv_cache_dtype="fp8" on cc >= 8.9) and as rl_verl.py does for grpo. this is not an
+        # optimization: flash/engine/vram.py sizes an opd run against an fp8 kv pool once the
+        # requirement clears the largest non-fp8 card, so a bf16 cache here would allocate twice the
+        # kv the allocator reserved and OOM at rollout init on a card sizing called sufficient.
+        # the caller resolves the flag (cc probe + gdn exclusion); absent/false means bf16.
+        *(
+            ["+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8"]
+            if config.get("fp8_kv")
+            else []
+        ),
         "data.dataloader_num_workers=0",
         "data.image_key=images",
         "data.return_raw_chat=true",
@@ -2322,6 +2333,22 @@ def run_opd_verl(spec=None) -> None:
         loggers.append("wandb")
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
+    # fp8 kv cache on ada/hopper+ (cc >= 8.9), matching rl_verl's grpo gate -- but NOT for hybrid
+    # linear-attention (gdn) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a plain kv
+    # tensor and crashes on the hybrid cache under verl's sleep/wake, which opd leaves enabled.
+    # the vram estimator applies an fp8 discount to opd above the non-fp8 card ceiling, so this must
+    # stay in lockstep with it: bf16 here against an fp8-sized reservation OOMs at rollout init.
+    try:
+        import torch as _torch_cc
+
+        from flash.engine.worker.packing import model_is_gdn_hybrid
+
+        _cc_ok = bool(
+            _torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9)
+        )
+        fp8_kv = _cc_ok and not model_is_gdn_hybrid(model_id, revision=model_revision)
+    except Exception:  # no cuda / probe failure -> conservative bf16 kv
+        fp8_kv = False
 
     plugin_path = os.path.join(shim_dir, "flash_opd_verl_plugin.py")
     shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_verl_plugin.py"), plugin_path)
@@ -2404,6 +2431,7 @@ def run_opd_verl(spec=None) -> None:
             "multi_turn": multi_turn,
             "thinking": bool(_w.THINKING),
             "structured_outputs": structured_outputs,
+            "fp8_kv": fp8_kv,
             "loggers": loggers,
         }
         overrides = build_opd_verl_overrides(config)

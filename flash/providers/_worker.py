@@ -16,6 +16,7 @@ from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.spec import (
     RESERVED_WORKER_ENV_KEYS,
+    VERL_ONLY_PHASES,
     JobSpec,
     backend_env_key,
     effective_backend,
@@ -229,8 +230,14 @@ def _resolved_backend(spec: JobSpec, runtime_secrets: dict[str, str] | None) -> 
     picks an allocator for a backend that is not the one about to run -- a secret-supplied ``verl``
     would take the expandable conf and crash its vLLM rollout on the CuMemAllocator assert
     (codex[bot]). Resolve against the same precedence the export uses: secret wins, else the spec.
+
+    A phase whose worker has no selector left (sft, opd) is not overridable at all: the secret would
+    still be exported, but run_sft/run_opd delegate to verl unconditionally and never read it, so
+    honoring it here would pick an allocator for a backend that cannot run.
     """
     backend = effective_backend(spec)
+    if spec.phase in VERL_ONLY_PHASES:
+        return backend
     key = backend_env_key(spec)
     if key.upper() in RESERVED_WORKER_ENV_KEYS:
         return backend

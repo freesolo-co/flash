@@ -456,8 +456,11 @@ _SFT_CHUNKED_NLL_TOKENS = 256
 _LIGER_MIN_PARAMS_B = 3.0
 _LIGER_LONG_CTX_TOKENS = 2048
 
-# trl 1.6 chunked_nll is validated against these model families. other models keep plain nll
-# until their output-head and backbone traversal are covered by the same parity tests.
+# the fused, dense-logit-free sft loss is validated against these model families. other models keep
+# plain nll until their output-head and backbone traversal are covered by the same parity tests.
+# the implementation moved from trl's chunked_nll to verl's use_fused_kernels + use_liger (set
+# unconditionally in engine/worker/sft_verl.py); the sizing property -- no dense [b, s, vocab]
+# logits tensor -- is what this set gates, and it holds for both.
 _SFT_CHUNKED_NLL_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-0.8B",
@@ -470,7 +473,7 @@ _SFT_CHUNKED_NLL_MODELS = frozenset(
 
 
 def sft_chunked_nll_enabled(model_id: str) -> bool:
-    """whether the sft worker uses trl's dense-logit-free chunked nll path."""
+    """whether the sft worker uses a dense-logit-free fused loss path."""
     return model_id in _SFT_CHUNKED_NLL_MODELS
 
 
@@ -1010,7 +1013,8 @@ def model_required_vram_gb(
         """Re-size an OPD requirement with an fp8 KV cache once the run is provably modern-card-only.
 
         The colocated OPD vLLM rollout engine reserves an fp8 KV cache on cc >= 8.9 hardware
-        (engine/worker/opd_vllm.py), but the estimate defaults to a bf16 KV pool. Any OPD run needing
+        (engine/worker/opd_verl.py sends engine_kwargs.vllm.kv_cache_dtype=fp8), but the estimate
+        defaults to a bf16 KV pool. Any OPD run needing
         more VRAM than the biggest non-fp8 validated card (the 80 GB A100) can ONLY land on a modern
         (cc >= 8.9) card, so that bf16 pool is a phantom: it doubles the real KV and wrongly rejects
         full-context / grouped OPD configs on the 35B that actually fit a B200. Halve it — but only
@@ -1043,9 +1047,9 @@ def model_required_vram_gb(
     vllm_concurrency = (
         opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
     )
-    # trl chunked_nll removes ignored positions before the lm head and projects valid tokens in
-    # bounded chunks. size validated qwen sft jobs without a dense [batch, seq, vocab] term; models
-    # outside that validated set keep the conservative plain-nll estimate and micro-batch cap.
+    # the fused sft loss removes ignored positions before the lm head and projects valid tokens
+    # without materializing dense logits. size validated qwen sft jobs without a [batch, seq, vocab]
+    # term; models outside that validated set keep the conservative plain-nll estimate and cap.
     sft_fused_ce = None if is_grpo else sft_chunked_nll_enabled(model_id)
     if info is not None:
         params_b = info.params_b
