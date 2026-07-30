@@ -309,11 +309,23 @@ class ChildOutputTail:
 
     def __init__(self, limit: int = CHILD_TAIL_LINES) -> None:
         self._lines: collections.deque[str] = collections.deque(maxlen=limit)
+        self._written = 0
 
     def record(self, line: str) -> None:
         text = line.rstrip("\n")
         if text:
             self._lines.append(text[:_CHILD_TAIL_LINE_CHARS])
+            self._written += 1
+
+    @property
+    def written(self) -> int:
+        """how many non-empty lines the child has produced, ever.
+
+        monotonic and independent of the retention limit, which is what makes it usable as a
+        staleness signal: a child looping on the same line still advances this, and a child that
+        has gone silent cannot advance it even though its retained tail stays fully populated.
+        """
+        return self._written
 
     def tail(self, limit: int | None = None) -> list[str]:
         """the retained lines, oldest first, optionally narrowed to the most recent ``limit``."""
@@ -323,8 +335,41 @@ class ChildOutputTail:
         return lines
 
 
+class ChildTailStaleness:
+    """tracks how long a child has been silent, across the ticks that sample its tail.
+
+    the tail alone cannot answer the question a stall actually poses. a child still loading shards
+    and a child wedged forever both present a fully populated tail whose newest line is plausible,
+    so the only thing separating them is whether the tail CHANGED between two dumps -- and a
+    stateless report throws that comparison away, leaving it to be reconstructed by hand from
+    consecutive heartbeats after the money is already spent (ISSUES VERL-067).
+
+    holding the previous line count here turns that into a number the first dump already carries.
+    """
+
+    def __init__(self) -> None:
+        self._written = -1
+        self._since = 0
+
+    def observe(self, written: int) -> int:
+        """record this tick's line count; return consecutive ticks with no new output.
+
+        0 means the child spoke since the last observation. n>0 means it has been silent for n
+        ticks, which is the signal that separates a slow start from a wedge.
+        """
+        if written != self._written:
+            self._written = written
+            self._since = 0
+        else:
+            self._since += 1
+        return self._since
+
+
 def stall_tail_fields(
-    step: int, tail: ChildOutputTail, limit: int = STALL_TAIL_LINES
+    step: int,
+    tail: ChildOutputTail,
+    limit: int = STALL_TAIL_LINES,
+    staleness: ChildTailStaleness | None = None,
 ) -> dict[str, object]:
     """heartbeat fields carrying the child's last words, but only while it has made no progress.
 
@@ -333,12 +378,27 @@ def stall_tail_fields(
     stream, and that is exactly the window a setup stall lands in -- the child prints its complaint,
     nobody collects the parent's stdout, and the run dies to a watchdog with zero evidence.
 
+    with ``staleness`` supplied, the payload also carries ``child_tail_silent_ticks``: how many
+    consecutive samples produced no new child output. the tail says what the child last said; this
+    says whether it is still saying anything, which is the difference between a slow start and a
+    wedge. without it the two are indistinguishable in a single heartbeat and have to be told apart
+    by hand-diffing consecutive dumps.
+
     returns an empty dict once ``step`` advances, or when the child has said nothing yet.
     """
     if step > 0:
         return {}
     recent = tail.tail(limit=limit)
-    return {"child_tail": recent} if recent else {}
+    if not recent:
+        # observed even with nothing to report, so a child that starts talking later is measured
+        # from its first line rather than from whenever the payload happened to become non-empty.
+        if staleness is not None:
+            staleness.observe(tail.written)
+        return {}
+    fields: dict[str, object] = {"child_tail": recent}
+    if staleness is not None:
+        fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
+    return fields
 
 
 def run_verl_training(
