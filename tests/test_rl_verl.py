@@ -1570,6 +1570,53 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
     assert staged == [1, 2, 3, 4]
 
 
+def test_staging_failure_does_not_strand_an_earlier_publishable_step(tmp_path, monkeypatch):
+    # a sweep can find several new checkpoints at once, and exporting one of them can fail (a corrupt
+    # shard, a full disk, an OOM in model_merger). publishing only after the whole sweep finished let
+    # that failure abort the thread with earlier, fully exported adapters still local-only -- and the
+    # same window swallows a preemption during the resume upload that runs between the two. each step
+    # is therefore made durable as soon as it is staged and permitted.
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    published: list[int] = []
+    monkeypatch.setattr(
+        rl_verl._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+
+    def _stage_failing_on_step_2(self, step, path):
+        if int(step) == 2:
+            raise RuntimeError("model_merger ran out of memory")
+        return f"{path}-adapter"
+
+    monkeypatch.setattr(rl_verl._VerlResumeUploader, "_stage_deployable", _stage_failing_on_step_2)
+    monkeypatch.setattr(
+        rl_verl._VerlResumeUploader,
+        "_publish_staged",
+        lambda self, step, adapter_dir: (
+            published.append(int(step)),
+            self.published_steps.add(step),
+        )[0],
+    )
+    for step in (1, 2):
+        (local_dir / f"global_step_{step}").mkdir()
+    _write_step(local_dir, 2)
+    uploader = rl_verl._VerlResumeUploader(
+        str(local_dir), resume_step=0, required_steps=(1, 2), had_gradient=lambda: True
+    )
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and uploader._error is None:
+            time.sleep(0.01)
+    finally:
+        uploader.stop()
+    # step 1 was exported before step 2 failed, so it must already be durable. the run still fails --
+    # step 2 was required -- but a retry does not have to redo step 1, and step 1 is servable.
+    assert published == [1]
+    with pytest.raises(RuntimeError, match="verl resume uploader failed"):
+        uploader.raise_if_incomplete()
+
+
 def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, monkeypatch):
     # a zero-spread run withholds every required deployable by design. checking completeness first
     # would raise on artifacts the gate is deliberately holding, reporting a checkpoint-publication

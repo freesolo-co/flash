@@ -1088,6 +1088,20 @@ class _VerlResumeUploader:
         _w.publish_deployable_checkpoint(adapter_dir, step, required=True, _provenance_ready=True)
         self.published_steps.add(step)
 
+    def _publish_ready(self) -> None:
+        """publish every staged step the gate now permits, oldest first.
+
+        driven off staged_steps rather than the pending sweep, so a step whose verl checkpoint has
+        since been pruned is still publishable: everything the upload needs already lives under
+        export_root. the gate is read once per call, so a spread recorded during a slow export is
+        honoured on the same pass that produced it.
+        """
+        if not self._deployable_allowed():
+            return
+        for step in sorted(self.staged_steps):
+            if step not in self.published_steps:
+                self._publish_staged(step, self.staged_steps[step])
+
     def _run(self) -> None:
         # a failed resume upload must not fail the run: the policy is still trained and published at
         # the end, and the only loss is having to restart from an earlier step after a preemption.
@@ -1112,6 +1126,11 @@ class _VerlResumeUploader:
                         and step not in self.staged_steps
                     ):
                         self.staged_steps[step] = self._stage_deployable(step, path)
+                        # published here, not once the sweep ends: staging a later step can raise,
+                        # and the resume upload below can be interrupted by a preemption. either
+                        # would leave an already-exported adapter local-only, so each step is made
+                        # durable as soon as it is both staged and permitted.
+                        self._publish_ready()
                     # the resume upload is NOT gated on gradient evidence: it is internal retry
                     # scaffolding rather than a servable artifact, and with exact save_at_steps these
                     # are often the only on-disk checkpoints, so skipping it would leave a run
@@ -1125,14 +1144,10 @@ class _VerlResumeUploader:
                         except Exception as error:
                             print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
                     self.processed_steps.add(step)
-                # publication is driven off staged_steps rather than _pending, so a step whose verl
-                # checkpoint has since been pruned is still publishable: everything the upload needs
-                # already lives under export_root. read the gate once per sweep, after staging, so a
-                # spread recorded during a slow export is honoured on this pass.
-                if self._deployable_allowed():
-                    for step in sorted(self.staged_steps):
-                        if step not in self.published_steps:
-                            self._publish_staged(step, self.staged_steps[step])
+                # a step staged while the gate was shut is published by a later sweep, so this runs
+                # every pass and not only when something was staged: the gate opens on the first
+                # varying-reward group, which is usually a sweep that finds no new checkpoint.
+                self._publish_ready()
                 # `stopping`, not a fresh read: the sweep above is the full pass over everything
                 # stop() had made visible, and only after running it may the loop exit. staged
                 # steps still awaiting the gate cannot hold the loop open -- with the gate shut they
