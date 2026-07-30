@@ -139,8 +139,12 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     # and the turn counter rises every turn until it reaches the cap, so a cooperatively-
     # stepping env terminates here exactly as it would in training; no separate
     # non-termination guard is needed.
+    from flash.engine.multiturn_rollout import _final_env_step
+
     hard_cap = int(env.max_turns)
     turns = 0
+    # mirrors the worker's own flag: True while the newest turn has not been through env_reply.
+    env_step_pending = False
     while True:
         if policy == "replay" and turns < len(reference_turns):
             content = reference_turns[turns]
@@ -148,11 +152,13 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
             content = _ECHO_RESPONSE
         record["responses"].append(content)
         env.record_model_turn(state, content)
+        env_step_pending = True
         turns += 1
         record["turns"] = turns
         if turns >= hard_cap or env.rollout_done(state, max_turns=hard_cap):
             break
         env_msgs = env.env_reply(state["messages"], state)
+        env_step_pending = False
         if not env_msgs:
             break
         # the env's own reply messages feed the chat template for the next turn in the real
@@ -162,6 +168,11 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
         if env.rollout_done(state, max_turns=hard_cap):
             break
 
+    # the driver-side exits above stop before the inter-turn env_reply, so the last replayed turn
+    # is still unapplied. call the worker's own close-out rather than a copy of it: this command
+    # exists to catch a contract break before a paid run does, and it can only do that while it
+    # scores the state the run would score. reusing the helper is what keeps the two in step.
+    _final_env_step(env, state["messages"], state, hard_cap, pending=env_step_pending)
     record["reward"] = float(env.reward("", example, state))
 
 
