@@ -129,10 +129,22 @@ def _turn_is_representable(message: dict) -> bool:
         return False
     content = message.get("content")
     if isinstance(content, str):
-        return True
+        # a gold answer carrying reasoning markup is graded by the run as `graded_text` leaves it,
+        # which strips the <think> span under a thinking config (flash/engine/worker/rl.py). this
+        # command has no run config to tell it whether thinking is on, so it can neither reproduce
+        # that text nor rule it out: an exact-answer grader would score both this raw reference and
+        # every control zero and report a working env as unable to rank. treat it as a replay the
+        # driver cannot reproduce faithfully, which is what the flag already means (codex[bot]).
+        return "<think>" not in content and "</think>" not in content
     if isinstance(content, list):
         # text blocks survive extraction verbatim; anything else (an image block) is dropped.
-        return all(isinstance(block, dict) and block.get("type") == "text" for block in content)
+        return all(
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and "<think>" not in str(block.get("text") or "")
+            and "</think>" not in str(block.get("text") or "")
+            for block in content
+        )
     # bare null content with no tool_calls carries no payload at all, so replaying it as the
     # empty string loses nothing. only a null that stands in for tool_calls (above) is lossy.
     return content is None
