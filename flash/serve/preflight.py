@@ -85,6 +85,21 @@ def resolve_smoke_completion_tokens(spec: JobSpec) -> int:
         # sft ignores max_completion_tokens (it is a rollout-only knob), so honouring it here would
         # cap the smoke below what the run can legitimately generate: a 2048-context sft run with a
         # leftover max_completion_tokens=320 trains valid long reasoning it could never deploy.
+        #
+        # the recipe value is the DEFAULT, not the budget. the worker bounds its packed block by an
+        # explicit max_context_tokens and only falls back to the recipe when none is set
+        # (flash/engine/worker/sft.py), so resolving to the recipe unconditionally sized the smoke
+        # for a run that was never trained: an 8192-context adapter got 2048 tokens, came back
+        # finish_reason="length", and the truncation guard rejected a checkpoint that answered
+        # correctly (codex[bot]). mirror the worker's own resolution instead.
+        #
+        # not subtracting a prompt allowance is deliberate. the packed limit spans prompt and
+        # completion, so this over-allocates by the length of _SMOKE_PROMPT -- the safe direction,
+        # since only an under-allocation can fail a good checkpoint, and the caller already clamps
+        # to what serving can actually deliver.
+        context = spec.train.max_context_tokens
+        if context is not None and int(context) > 0:
+            return int(context)
         return int(RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
     if positive_explicit is not None:
         return positive_explicit

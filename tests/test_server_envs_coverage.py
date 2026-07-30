@@ -751,6 +751,39 @@ def test_thinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default(
     assert resolve_smoke_completion_tokens(spec) == RECIPE.sft.max_seq_len_thinking
 
 
+def test_sft_smoke_budget_follows_an_explicit_context_over_the_recipe_default():
+    from flash.serve.preflight import resolve_smoke_completion_tokens
+
+    # the worker bounds the packed block by max_context_tokens and only falls back to the recipe
+    # when it is unset (flash/engine/worker/sft.py), so the smoke has to resolve the same way.
+    # sizing an 8192-context run at the 2048 recipe default truncated the smoke and rejected a
+    # checkpoint that answered correctly.
+    assert RECIPE.sft.max_seq_len_thinking < 8192
+    spec = _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=8192)
+    assert resolve_smoke_completion_tokens(spec) == 8192
+
+    # a shorter explicit context is honoured too -- the point is that the worker's number wins,
+    # not that the budget only ever grows.
+    short = _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=512)
+    assert resolve_smoke_completion_tokens(short) == 512
+
+    # non-thinking takes the same path.
+    assert (
+        resolve_smoke_completion_tokens(
+            _smoke_spec(thinking=False, algorithm="sft", max_context_tokens=4096)
+        )
+        == 4096
+    )
+
+    # a non-positive value is not a budget, so the recipe default still applies.
+    assert (
+        resolve_smoke_completion_tokens(
+            _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=0)
+        )
+        == RECIPE.sft.max_seq_len_thinking
+    )
+
+
 def test_nonthinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default():
     from flash.serve.preflight import resolve_smoke_completion_tokens
 
