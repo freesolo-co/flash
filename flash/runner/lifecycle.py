@@ -425,11 +425,15 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
 
 
 def _projected_retry_class(candidates, failed_providers, tried_classes, chosen, *, cache_drop: bool):
-    """The class the NEXT attempt actually selects, given the failure this one is about to record.
+    """The class the NEXT attempt is expected to select, given the failure this one records.
 
     Mirrors the bookkeeping at the bottom of the retry loop: a cache-drop retry leaves both sets
     untouched (same class, cold), any other retry marks this class tried and its provider failed.
     Only valid off the OOM path, where the escalation floor rewrites the candidate list first.
+
+    Expected, not guaranteed: the next attempt calls ``allocate()`` again, and providers that build
+    candidates from live capacity can drop this class or surface a cheaper one. Callers must word it
+    as a projection.
     """
     if not candidates:
         return None
@@ -903,21 +907,30 @@ def _submit_seed_supervised(
             res.failure,
             cache_drop=first_cache_drop,
         )
-        # name the class the retry will ACTUALLY land on. on_last_gpu only says no UNTRIED class
-        # remains -- it does NOT mean this class is reused: with several fitting classes the picker
-        # clamps back to the cheapest already-tried one (A100 PCIe, A100 SXM, then A100 PCIe again).
-        # so re-run the picker against the sets this failure is about to update instead of assuming.
+        # name the class the retry will ACTUALLY land on. on_last_gpu only says no further class
+        # escalation follows -- it does NOT mean this class is reused: with several fitting classes
+        # the picker clamps back to the cheapest already-tried one (A100 PCIe, A100 SXM, then A100
+        # PCIe again). so re-run the picker against the sets this failure is about to update.
+        #
+        # projected off the CURRENT candidate list, which the next attempt rebuilds by calling
+        # allocate() again. lambda/vast rebuild from live capacity and pricing, so the named class
+        # can disappear or lose to a newly available one -- word it as the expected target, not a
+        # guarantee. a cache-drop retry projects too: it leaves both sets untouched and so reuses
+        # this class cold, which is exactly the escalation the generic line failed to describe.
         projected = None
-        if will_retry and not oom_mode and chosen is not None and current_on_last_gpu["value"]:
+        if will_retry and not oom_mode and chosen is not None:
             projected = _projected_retry_class(
                 cands, failed_providers, tried_classes, chosen, cache_drop=first_cache_drop
             )
         if projected is not None:
             same = (projected.provider, projected.gpu) == (chosen.provider, chosen.gpu)
+            no_escalation = (
+                ", no untried GPU class fits this run" if current_on_last_gpu["value"] else ""
+            )
             retry_target = (
-                f"retrying on {projected.gpu} @ {projected.provider}"
-                f"{' again' if same else ''}, no untried GPU class fits this run "
-                "(resume from last checkpoint)"
+                f"expecting to retry on {projected.gpu} @ {projected.provider}"
+                f"{' again' if same else ''}{no_escalation} (resume from last checkpoint; "
+                "reallocated against live capacity, so the class may change)"
             )
         else:
             retry_target = "retrying (resume from last checkpoint)"

@@ -820,20 +820,22 @@ def poll_job(
     Uses setup_grace_s (large) until first training heartbeat, then stall_after_s (tight).
     Fails fast on THROTTLED/UNHEALTHY workers and jobs stuck IN_QUEUE past queue_grace_s.
 
-    ``on_last_gpu`` says there is no untried class left to walk to, so a capacity failure reports the
-    retry it will actually get (same class again) instead of promising a next-best GPU.
+    ``on_last_gpu`` says no further GPU-class escalation follows, so a capacity failure states that
+    instead of promising a next-best GPU. It does not assert that a retry happens, nor which class
+    one would use: the supervisor owns the candidate list and the retry budget, and logs both.
     """
 
     if not handle.job_id:
         raise ValueError("endpoint-only RunPod handles cannot be polled")
 
     say = make_say(log)
-    # on_last_gpu says no UNTRIED class is left to walk to, so "next-best GPU" is a false promise.
-    # it does NOT say which class the retry reuses -- the picker can clamp back to a cheaper
-    # already-tried one, and only the supervisor holds the candidate list needed to know. so state
-    # the exhaustion the provider can actually see; lifecycle names the projected class.
+    # on_last_gpu means "no further GPU-class escalation follows", so "next-best GPU" is a false
+    # promise. it is NOT a class-exhaustion signal: the supervisor also sets it when the infra retry
+    # budget runs out, which can happen with classes still untried. and it says nothing about WHICH
+    # class a retry reuses -- the picker can clamp back to a cheaper already-tried one. so claim
+    # neither exhaustion nor a retry here; the supervisor owns both and logs them next.
     next_gpu_note = (
-        "retrying with no untried GPU class left to walk to"
+        "no further GPU-class escalation follows"
         if on_last_gpu
         else "retrying on the next-best GPU"
     )

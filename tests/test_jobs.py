@@ -5566,16 +5566,32 @@ def _poll_in_queue_forever(monkeypatch, **poll_kwargs):
 
 def test_capacity_detail_does_not_promise_a_next_best_gpu_on_the_last_class(monkeypatch):
     """LS-008/AT-013: the capacity failure detail claimed 'retrying on the next-best GPU' even when
-    the picker had no untried fitting class left. On the last GPU it must report the exhaustion.
+    no further class escalation followed. On the last GPU it must report that instead.
 
-    It must NOT name a class: on_last_gpu says nothing about WHICH class the retry reuses (the picker
+    It must NOT name a class: on_last_gpu says nothing about WHICH class a retry reuses (the picker
     can clamp back to a cheaper already-tried one), and only the supervisor holds the candidate list
     needed to know -- so a "same class" promise here would be the same false claim in new words."""
     res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
     assert res.failure == "no_capacity"
     assert "next-best" not in res.detail, res.detail
-    assert "no untried GPU class left to walk to" in res.detail, res.detail
+    assert "no further GPU-class escalation follows" in res.detail, res.detail
     assert "same class" not in res.detail, res.detail
+
+
+def test_capacity_detail_claims_neither_a_retry_nor_class_exhaustion(monkeypatch):
+    """The supervisor sets on_last_gpu for TWO different reasons: no untried class remains, or the
+    infra retry budget is spent. The second can fire with classes still untried, and it is also the
+    case where ``can_retry()`` returns false and the lifecycle logs ``not retrying``.
+
+    A detail that asserted either "no untried class" or "retrying" would therefore contradict the
+    real candidate set and the real retry decision on that path. poll_job can see neither, so it
+    states only the escalation fact it does know and leaves both claims to the supervisor."""
+    res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
+    assert res.failure == "no_capacity"
+    # not a retry promise: this detail is also emitted on the attempt that ends the run.
+    assert "retrying" not in res.detail, res.detail
+    # not a class-exhaustion claim: untried classes can remain when the budget is what ran out.
+    assert "untried" not in res.detail, res.detail
 
 
 def test_reattached_last_gpu_job_words_capacity_like_the_direct_submit(monkeypatch):
