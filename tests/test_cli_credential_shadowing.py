@@ -66,7 +66,7 @@ def test_shadowed_login_silent_when_never_logged_in(monkeypatch):
     assert client_config.shadowed_login_warning() is None
 
 
-def test_org_mutating_command_warns(monkeypatch, capsys):
+def test_org_binding_command_warns(monkeypatch, capsys):
     monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
     args = argparse.Namespace(func=cmd_train)
 
