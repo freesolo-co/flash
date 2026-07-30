@@ -921,11 +921,24 @@ def _balanced_thinking_content(message: dict) -> str:
     """
     content = str(message.get("content") or "")
     reasoning = message.get("reasoning_content")
-    if not isinstance(reasoning, str) or not reasoning:
+    if not isinstance(reasoning, str):
+        # absent or null: serving never split the tags out, so there is nothing to fold back in.
+        # an explicitly EMPTY string is a different case -- see below -- so this tests the type,
+        # not falsiness: `""` means the model closed its block immediately, which still needs a pair.
         return content
-    if "</think>" in content:
-        # already balanced, or serving never split the tags out: don't nest a second block.
+    if "<think>" in content:
+        # a real opener means the block is already balanced: don't nest a second one.
         return content
+    close = content.find("</think>")
+    if close >= 0:
+        # a closing tag with NO opener is the exact defect this helper repairs, not evidence of a
+        # balanced block -- the opener was rendered into the prompt. whatever precedes the close is
+        # reasoning the serving build left inline, so re-open around it and keep it exactly once;
+        # `reasoning_content` here is a duplicate of that same text, not additional reasoning.
+        inline_reasoning = content[:close]
+        return f"<think>{inline_reasoning or reasoning}</think>{content[close + len('</think>') :]}"
+    # an empty reasoning string reaches here and still gets a balanced pair: a thinking consumer
+    # splits the answer on `</think>`, so emitting the bare answer would read as no answer at all.
     return f"<think>{reasoning}</think>{content}"
 
 
@@ -1017,10 +1030,17 @@ def _openai_stream_content(lines: Iterator[str]) -> Iterator[str]:
                 yield str(reasoning)
             content = delta.get("content") or ""
             if content:
+                content = str(content)
                 if reasoning_open:
                     reasoning_open = False
+                    # a compatibility build can emit reasoning on its own field AND retain the
+                    # sampled close at the head of the first content delta. synthesising another
+                    # one there yields `<think>reasoned</think></think>answer`, so let the delta's
+                    # own tag close the block when it supplies one.
+                    if content.startswith("</think>"):
+                        content = content.removeprefix("</think>")
                     yield "</think>"
-                yield str(content)
+                yield content
     if reasoning_open:
         # generation stopped inside the reasoning block (a length cap, usually). still close it:
         # an unbalanced opener is the same defect as the unbalanced closer, mirrored.
