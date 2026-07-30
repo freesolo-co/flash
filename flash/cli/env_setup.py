@@ -395,8 +395,14 @@ def cmd_env_setup(args) -> int:
     # otherwise ask on a terminal; else off.
     rl = Path("configs/rl.toml")
     sft = Path("configs/sft.toml")
+    opd = Path("configs/opd.toml")
+    # All THREE configs persist `thinking`, so all three must anchor it and all three must be named in
+    # the deletion guidance. Anchoring on a subset lets a user follow this warning literally, delete
+    # exactly what it names, and end up with the deleted configs rewritten one way and the unnamed one
+    # still holding the old setting -- the same silent cross-algorithm mismatch, just relocated.
+    reasoning_configs = (rl, opd, sft)
     existing_reasoning: bool | None = None
-    for cfg in (rl, sft):
+    for cfg in reasoning_configs:
         if cfg.exists():
             existing_reasoning = "thinking = true" in cfg.read_text(encoding="utf-8")
             break
@@ -405,9 +411,11 @@ def cmd_env_setup(args) -> int:
         if flag_reason is not None and flag_reason != existing_reasoning:
             have = "reasoning" if existing_reasoning else "no reasoning"
             want = "reasoning" if flag_reason else "no-reasoning"
+            # name every config that exists, so deleting exactly what this lists cannot leave one behind.
+            stale = ", ".join(str(c) for c in reasoning_configs if c.exists())
             msg = (
                 f"existing configs are {have}; keeping them and ignoring --{want}. "
-                f"Delete configs/rl.toml and configs/sft.toml first to re-scaffold with --{want}."
+                f"Delete {stale} first to re-scaffold with --{want}."
             )
             print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
         reasoning = existing_reasoning
@@ -448,8 +456,11 @@ def cmd_env_setup(args) -> int:
         'id = ""\n\n'
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
-    # `thinking = true` opts the run into reasoning mode. Reasoning shares the generation budget with
-    # the answer, so GRPO also gets a raised completion budget. These strings are empty when reasoning
+    # `thinking = true` opts the run into reasoning mode, and is algorithm-agnostic: all three configs
+    # carry it, since all three workers read it. Only GRPO also gets a raised completion budget --
+    # reasoning shares that budget with the answer, and GRPO's non-thinking default is 320 tokens.
+    # OPD needs no such line because it raises its own budget under thinking (512 -> 1536, via
+    # `opd_completion_len`), and SFT does not generate at all. These strings are empty when reasoning
     # is off, keeping the default scaffold byte-for-byte identical.
     thinking_line = "thinking = true\n" if reasoning else ""
     rl_reasoning_train = (
@@ -513,7 +524,9 @@ def cmd_env_setup(args) -> int:
             f"{opd_multiturn_note}"
             'model = "Qwen/Qwen3.5-4B"\n'
             f"{project_line}"
-            'algorithm = "opd"   # on-policy distillation from a managed Fireworks teacher (default GLM 5.2)\n\n'
+            'algorithm = "opd"   # on-policy distillation from a managed Fireworks teacher (default GLM 5.2)\n'
+            f"{thinking_line}"
+            "\n"
             "# Environment: upload this project folder with\n"
             f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
             "# The teacher and its Fireworks key are platform-managed — nothing to set up or export.\n"
