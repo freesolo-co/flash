@@ -48,6 +48,7 @@ from flash.engine.worker.opd_verl_plugin import (
     _bridge_score_payload,
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
+    _init_transfer_queue,
     _multi_modal_image_count,
     _post_json,
     _raw_prompt_has_image_block,
@@ -5229,3 +5230,69 @@ def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
     ]
     assert "parse_verl_metric" in calls
     assert "_metric_value" not in calls
+
+
+def test_transfer_queue_init_passes_the_config_through_and_returns():
+    seen = []
+    _init_transfer_queue(lambda conf: seen.append(conf), {"backend": "SimpleStorage"}, timeout_s=30)
+    assert seen == [{"backend": "SimpleStorage"}]
+
+
+def test_transfer_queue_init_that_never_returns_fails_with_the_resource_state(monkeypatch):
+    # the wedge this bounds: tq.init reserves its controller and storage units through ray and waits
+    # with no timeout, so an unsatisfiable reservation stops the run before a single gpu is touched --
+    # silently, because tq's logger defaults to WARNING. without a deadline the run burns the whole
+    # setup grace period at 0% gpu and is reported as a generic stall.
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    monkeypatch.setattr(
+        plugin,
+        "_describe_ray_resources",
+        lambda: "cluster CPU=1.0 GPU=1.0, free CPU=0.0 GPU=0.0",
+    )
+    release = threading.Event()
+    with pytest.raises(RuntimeError, match="transfer_queue init did not finish") as excinfo:
+        _init_transfer_queue(lambda conf: release.wait(60), None, timeout_s=0.2)
+    # the message must carry the resource state: "it timed out" alone does not distinguish an
+    # unschedulable reservation from a slow start, which is the whole diagnosis.
+    assert "free CPU=0.0" in str(excinfo.value)
+    release.set()
+
+
+def test_transfer_queue_init_failure_propagates_unwrapped():
+    # a real tq.init error must not be reported as a timeout, and must not be swallowed by the worker
+    # thread it now runs on.
+    class Boom(RuntimeError):
+        pass
+
+    def _raise(conf):
+        raise Boom("controller refused the sampler")
+
+    with pytest.raises(Boom, match="controller refused the sampler"):
+        _init_transfer_queue(_raise, None, timeout_s=30)
+
+
+def test_ray_resource_probe_reports_the_cluster_and_free_counts(monkeypatch):
+    # ray is only present inside the verl child image, so the probe is exercised against a stub. the
+    # message must name both totals and free counts: a wedged reservation is diagnosed by the gap.
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    stub = types.ModuleType("ray")
+    stub.cluster_resources = lambda: {"CPU": 8.0, "GPU": 1.0}
+    stub.available_resources = lambda: {"CPU": 0.0, "GPU": 1.0}
+    monkeypatch.setitem(sys.modules, "ray", stub)
+    described = plugin._describe_ray_resources()
+    assert "cluster CPU=8.0 GPU=1.0" in described
+    assert "free CPU=0.0 GPU=1.0" in described
+
+
+def test_ray_resource_probe_never_raises_on_the_timeout_path(monkeypatch):
+    # _describe_ray_resources only runs while building a failure message, so a probe error there would
+    # replace the diagnosis it exists to produce.
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    stub = types.ModuleType("ray")
+    stub.cluster_resources = lambda: (_ for _ in ()).throw(RuntimeError("ray is gone"))
+    stub.available_resources = lambda: {}
+    monkeypatch.setitem(sys.modules, "ray", stub)
+    assert "ray resources unreadable" in plugin._describe_ray_resources()

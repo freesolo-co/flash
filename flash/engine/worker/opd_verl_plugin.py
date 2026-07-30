@@ -20,6 +20,7 @@ import tempfile
 import types
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -612,6 +613,72 @@ def _wrap_optimizer_with_mutation_notice(optimizer, url: str, token: str):
     return optimizer
 
 
+_TQ_INIT_TIMEOUT_S = 600.0
+
+
+def _describe_ray_resources() -> str:
+    """summarise ray's cluster and free resources, or say why they could not be read.
+
+    this is only ever called on the timeout path, so it must not raise: a probe failure here would
+    replace the diagnosis it exists to produce.
+    """
+    import ray
+
+    try:
+        total = ray.cluster_resources()
+        free = ray.available_resources()
+    except Exception as error:  # pragma: no cover - defensive, ray is up by this point
+        return f"ray resources unreadable: {type(error).__name__}: {error}"
+    return (
+        f"cluster CPU={total.get('CPU')} GPU={total.get('GPU')}, "
+        f"free CPU={free.get('CPU')} GPU={free.get('GPU')}"
+    )
+
+
+def _init_transfer_queue(init: Callable[[Any], Any], conf: Any, timeout_s: float = _TQ_INIT_TIMEOUT_S) -> None:
+    """run verl's transfer-queue init under a deadline, reporting the resource state on timeout.
+
+    verl force-enables TransferQueue on the opd entry point (main_ppo_sync.main sets
+    transfer_queue.enable = True with no opt-out), so this runs before a single gpu is touched. tq.init
+    has three separate unbounded waits, none of which can be observed from outside:
+
+      - get_placement_group blocks in ray.get(pg.ready()) until every 1-cpu storage bundle is placed,
+      - process_zmq_server_info blocks in ray.get on the controller, itself a 1-cpu actor scheduled
+        outside any placement group,
+      - _init_from_existing spins `while conf is None` on get_config against a controller that may
+        never publish one.
+
+    all three are silent: tq's get_logger defaults to WARNING and TQ_LOGGING_LEVEL is unset here, so
+    every progress line inside tq.init is suppressed. a wedge therefore presents as a run that reaches
+    the ray banner and then stops, burning the full setup grace period at 0% gpu before the plane
+    calls it a stall -- with no indication that transfer_queue was even involved.
+
+    the thread is a daemon and is deliberately not joined after the timeout: it is parked inside an
+    unbounded ray.get that no signal will interrupt, and the exception below fails the run anyway.
+    """
+    import threading
+
+    failure: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            init(conf)
+        except BaseException as error:  # surfaced below, on the caller's thread
+            failure.append(error)
+
+    thread = threading.Thread(target=_run, name="flash-tq-init", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        raise RuntimeError(
+            f"verl transfer_queue init did not finish within {timeout_s:.0f}s; "
+            f"{_describe_ray_resources()}. tq.init reserves its controller and storage units through "
+            "ray and waits without a timeout, so this is a scheduling problem rather than a slow start"
+        )
+    if failure:
+        raise failure[0]
+
+
 def _install_verl_extensions() -> None:
     import numpy as np
     import ray
@@ -1018,7 +1085,7 @@ def _install_verl_extensions() -> None:
 
         def run(self, config):
             OmegaConf.resolve(config)
-            tq.init(config.transfer_queue)
+            _init_transfer_queue(tq.init, config.transfer_queue)
             trainer = None
             try:
                 self.add_actor_rollout_worker(config)
