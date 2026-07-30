@@ -19,7 +19,9 @@ Three things this deliberately does NOT do:
   the clock starts rather than averaged in, because a median over a mixed set silently inherits
   their speed while still reporting itself trustworthy.
 - it does not wait indefinitely. a hung grader is bounded by the same budget as a slow one, so
-  the ceiling this promises holds even when a call never returns.
+  the ceiling this promises holds even when a call never returns. the caller gathering the sample
+  completions is usually calling user code too, so ``call_bounded`` is public: the ceiling has to
+  cover everything the profiler causes to run, not only the part it times.
 """
 
 from __future__ import annotations
@@ -64,24 +66,28 @@ class RewardProfile:
         return base
 
 
-def _call_bounded(fn: Callable[[], object], timeout_s: float) -> tuple[bool | None, float]:
-    """Run ``fn`` and stop waiting after ``timeout_s``. Returns (ok, elapsed).
+def call_bounded(fn: Callable[[], object], timeout_s: float) -> tuple[bool | None, float, object]:
+    """Run ``fn`` and stop waiting after ``timeout_s``. Returns (ok, elapsed, value).
 
     ``ok`` is True on success, False if it raised, and None if it was still running at the
-    deadline. A stuck call cannot be killed in python, so it is abandoned on a daemon thread: it
-    stops blocking us and it cannot hold interpreter exit open. Callers must only reach here for
-    envs that declare a thread-safe scorer -- see the guard in the verl worker -- since this moves
-    the call off the calling thread.
+    deadline; ``value`` is ``fn``'s result on success and None otherwise. A stuck call cannot be
+    killed in python, so it is abandoned on a daemon thread: it stops blocking us and it cannot
+    hold interpreter exit open. Callers must only reach here for envs that declare a thread-safe
+    scorer -- see the guard in the verl worker -- since this moves the call off the calling thread.
+
+    Public because the caller that gathers the sample completions is calling user code too, and
+    an unbounded step before a bounded one leaves the pair unbounded.
     """
-    outcome: dict[str, bool] = {}
+    outcome: dict[str, object] = {}
 
     def _run() -> None:
         try:
-            fn()
+            result = fn()
         except BaseException:  # the caller only needs pass/fail, not the type
             outcome["ok"] = False
         else:
             outcome["ok"] = True
+            outcome["value"] = result
 
     thread = threading.Thread(target=_run, daemon=True)
     started = time.perf_counter()
@@ -89,8 +95,8 @@ def _call_bounded(fn: Callable[[], object], timeout_s: float) -> tuple[bool | No
     thread.join(timeout_s)
     elapsed = time.perf_counter() - started
     if thread.is_alive():
-        return None, elapsed
-    return outcome.get("ok", False), elapsed
+        return None, elapsed, None
+    return bool(outcome.get("ok", False)), elapsed, outcome.get("value")
 
 
 def profile_reward_latency(
@@ -137,7 +143,9 @@ def profile_reward_latency(
             break
         # bind the loop vars into the lambda: the call runs on another thread, so a late-binding
         # closure could read the next iteration's sample.
-        ok, elapsed = _call_bounded(lambda i=index, text=completion: score_one(i, text), remaining)
+        ok, elapsed, _ = call_bounded(
+            lambda i=index, text=completion: score_one(i, text), remaining
+        )
         if ok is None:
             # still running at the deadline: it tells us grading is at least this slow, but not
             # how much slower, so it is a failure rather than a data point.

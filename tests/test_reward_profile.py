@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -102,8 +103,6 @@ def test_a_hung_grader_cannot_outlast_the_budget():
     forever, which is the opposite of the bounded-delay promise. A hung call is counted as a
     failure rather than a data point: it proves grading is at least this slow, not how slow.
     """
-    import threading
-
     release = threading.Event()
 
     def hangs(index: int, completion: str) -> float:
@@ -339,6 +338,36 @@ def test_worker_hook_uses_the_envs_assistant_text_semantics(capsys):
 
     assert graded, "hook never called the scorer"
     assert set(graded) == {"4"}, graded  # not "{'type': 'text', ...}", not the user turn
+
+
+def test_a_hung_sft_completion_cannot_outlast_the_hook_budget(monkeypatch):
+    """Reference extraction is user code too, so it shares the profiler's deadline.
+
+    FreesoloEnvAdapter.sft_completion delegates to the env's own hook, which can block on i/o
+    exactly like a grader can. It runs BEFORE the timing phase, so bounding only the timing phase
+    leaves the startup delay this hook adds unbounded -- the ceiling would be advertised but not
+    held. The budget is patched down so the test costs a fraction of a second rather than 30.
+    """
+    from flash.engine.worker import rl_verl
+
+    monkeypatch.setattr(rl_verl, "_PROFILE_BUDGET_S", 0.15)
+    release = threading.Event()
+
+    class HangingEnv:
+        def sft_completion(self, example):
+            release.wait(30.0)  # a blocking fetch that never comes back
+            return [{"role": "assistant", "content": "4"}]
+
+    def score_one(index: int, completion: str) -> float:
+        return 1.0
+
+    started = time.perf_counter()
+    try:
+        rl_verl._log_reward_profile(HangingEnv(), score_one, [{"id": i} for i in range(4)], 32)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 2.0, f"extraction ran outside the budget ({elapsed:.1f}s)"
+    finally:
+        release.set()  # let the abandoned worker thread exit
 
 
 def test_profiling_does_not_pollute_the_training_sample_buffer():

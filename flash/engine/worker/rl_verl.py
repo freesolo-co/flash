@@ -828,6 +828,11 @@ def score_single_turn(
     return float(r)
 
 
+# the total startup delay this hook is allowed to add, covering reference extraction AND timing.
+# both call user code, so one shared ceiling is the only number that means anything to a caller.
+_PROFILE_BUDGET_S = 30.0
+
+
 def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_step: int) -> None:
     """Measure this env's real grading latency once, before training starts, and report it.
 
@@ -839,6 +844,11 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
     Profiles against each example's own reference completion rather than blank text: an empty
     string does not exercise a grader, so a blank-text profile measures the early-return.
 
+    Bounded by ``_PROFILE_BUDGET_S`` end to end. Both halves call into user code -- gathering a
+    reference completion runs the env's own ``sft_completion``, grading runs its scorer -- so they
+    share one deadline. Bounding only the half that gets timed would still let this hook stall
+    startup forever on the half that does not.
+
     SKIPPED for an env that declares ``reward_thread_safe = False``. That flag means the scorer
     keeps mutable or thread-bound state (flash/envs/adapter.py documents it), so grading extra
     completions before training starts could advance a counter, consume a quota or warm a cache,
@@ -849,7 +859,7 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
     Advisory only, and never fatal -- it must not be able to break a run it is only measuring.
     """
     try:
-        from flash.engine.reward_profile import profile_reward_latency
+        from flash.engine.reward_profile import call_bounded, profile_reward_latency
         from flash.multimodal import assistant_completion_text
 
         if not getattr(env, "reward_thread_safe", True):
@@ -860,19 +870,35 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
             )
             return
 
+        # sft_completion reaches user code (FreesoloEnvAdapter delegates to the env's own hook), so
+        # it can block on i/o exactly like a grader can. it shares the profiler's deadline instead
+        # of running before it: bounding only the timing phase would leave the startup delay this
+        # hook adds unbounded, which is the ceiling the docstring promises.
+        deadline = time.perf_counter() + _PROFILE_BUDGET_S
         samples: list[tuple[int, str]] = []
         for index, example in enumerate(rollout_examples[:4]):
-            try:
-                # the env's own assistant-text semantics: takes the last assistant turn and
-                # flattens openai-style text blocks. hand-rolling this stringifies block dicts
-                # into a python repr and mixes in user/system turns.
-                text = assistant_completion_text(env.sft_completion(example))
-            except Exception:
-                text = ""
-            samples.append((index, text))
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            # the env's own assistant-text semantics: takes the last assistant turn and
+            # flattens openai-style text blocks. hand-rolling this stringifies block dicts
+            # into a python repr and mixes in user/system turns.
+            ok, _, messages = call_bounded(
+                lambda ex=example: assistant_completion_text(env.sft_completion(ex)), remaining
+            )
+            if ok is None:
+                print(
+                    "[rl-verl] reward profiling skipped: env.sft_completion did not return within "
+                    f"{_PROFILE_BUDGET_S:.0f}s, so no reference completion could be gathered",
+                    flush=True,
+                )
+                return
+            samples.append((index, messages if ok and isinstance(messages, str) else ""))
         if not samples:
             return
-        profile = profile_reward_latency(score_one, samples)
+        profile = profile_reward_latency(
+            score_one, samples, budget_s=max(0.0, deadline - time.perf_counter())
+        )
         print(f"[rl-verl] {profile.describe()}", flush=True)
         if profile.trustworthy and completions_per_step > 0:
             per_step_s = profile.seconds_per_completion * completions_per_step
