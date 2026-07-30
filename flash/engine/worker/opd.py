@@ -1,13 +1,13 @@
 """On-policy distillation entry point (algorithm="opd") and the knob/prompt helpers it shares.
 
-``run_opd`` delegates to ``opd_verl.run_opd_verl``, which owns the whole training path: rollout,
+``run_opd`` delegates to ``opd_train.run_opd_train``, which owns the whole training path: rollout,
 teacher scoring, and the groupwise reverse-KL backward. What stays here is the part the verl worker
 imports rather than reimplements — ``OpdKnobs`` / ``_resolve_opd_knobs`` (the [train] table's
 resolved view), ``_thinking_prefill_text`` (the reasoning-block opener the teacher prompt must
 match), and ``_drop_fully_forced_groups`` (grammar-forced spans carry no student choice, so they
 carry no signal).
 
-On the distillation objective itself, see ``opd_verl`` for the implementation and
+On the distillation objective itself, see ``opd_train`` for the implementation and
 ``tokenizer_align`` for the cross-tokenizer bridge: teacher and student tokenize the same completion
 differently, so their distributions are compared over SHARED DECODED-TEXT SPANS using only
 realized-token logprobs, which is exact across arbitrary tokenizer mismatch.
@@ -182,6 +182,6 @@ def _drop_fully_forced_groups(groups, forced):
 
 def run_opd():
     """Run OPD. verl is the only backend; this module keeps the knob and prompt helpers it shares."""
-    from flash.engine.worker.opd_verl import run_opd_verl
+    from flash.engine.worker.opd_train import run_opd_train
 
-    run_opd_verl()
+    run_opd_train()

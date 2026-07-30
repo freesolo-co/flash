@@ -121,7 +121,7 @@ def _uses_vllm_mistral_tokenizer(repo_files: tuple[str, ...]) -> bool:
     return any(_MISTRAL_TOKENIZER_FILE.search(path) is not None for path in repo_files)
 
 
-def validate_opd_verl_structured_outputs(
+def validate_opd_structured_outputs(
     structured_outputs: str | None,
     *,
     model_id: str,

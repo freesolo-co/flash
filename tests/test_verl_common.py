@@ -241,10 +241,10 @@ def test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork():
 
 
 def test_verl_pin_matches_the_version_opd_requires_exactly():
-    # the pin MUST stay on the verl 0.8.0 base. opd_verl_plugin patches 0.8.0 internals and imports
+    # the pin MUST stay on the verl 0.8.0 base. opd_plugin patches 0.8.0 internals and imports
     # verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, so a pin built on a newer base
     # installs a verl that fails opd's exact-version gate and cannot import its own entrypoint.
-    from flash.engine.worker import opd_verl_plugin as plugin
+    from flash.engine.worker import opd_plugin as plugin
 
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
     # asserting the constant alone would let a newer-base commit land silently, so bind the pinned
