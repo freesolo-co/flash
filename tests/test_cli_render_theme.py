@@ -685,3 +685,33 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     # terminal runs are not progressing, so the reassurance would be wrong.
     done = dict(stale, state="done")
     assert "last one UPLOADED" not in render.run_status(done)
+
+    # step 0 is the cold first step: no optimizer update landed, so there is no hidden later step.
+    step_zero = dict(
+        base, last_heartbeat={"stage": "rl_step", "step": 0, "ts": _time.time() - 1200}
+    )
+    assert "last one UPLOADED" not in render.run_status(step_zero)
+
+    # opd_step force-commits at the 60s floor, so an old one is a real stall, not reporting lag.
+    opd = dict(base, last_heartbeat={"stage": "opd_step", "step": 4, "ts": _time.time() - 1200})
+    assert "last one UPLOADED" not in render.run_status(opd)
+
+    # a heartbeat from a superseded attempt describes a dead worker, not throttled progress.
+    superseded = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "rl_step", "step": 1, "attempt": 1, "ts": _time.time() - 1200},
+    )
+    assert "last one UPLOADED" not in render.run_status(superseded)
+
+    # ...but the live attempt still gets the reassurance.
+    live = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "rl_step", "step": 1, "attempt": 2, "ts": _time.time() - 1200},
+    )
+    assert "last one UPLOADED" in render.run_status(live)
+
+    # w&b is optional, so the advice must name a signal that always exists.
+    assert "flash runs log" in out
+    assert "if configured" in out

@@ -657,11 +657,18 @@ _QUIET_HEARTBEAT_HINT = (
 # carries is stale reporting, not a stalled trainer -- the distinction that decides whether someone
 # cancels a healthy paid run.
 _STALE_STEP_AFTER_S = 900.0
-_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step", "opd_step", "opsd_step"})
+# only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
+# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older than
+# 900s means a long step, failed uploads, or a real stall -- not reporting lag (codex[bot]).
+_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step"})
 
 
 def _stale_step_hint(
-    heartbeat: dict, heartbeat_age_seconds: float | None, *, running: bool
+    heartbeat: dict,
+    heartbeat_age_seconds: float | None,
+    *,
+    running: bool,
+    current_attempt: bool = True,
 ) -> str | None:
     """Say a frozen training step is stale reporting, not a stalled trainer.
 
@@ -672,16 +679,28 @@ def _stale_step_hint(
     """
     if not running or heartbeat_age_seconds is None:
         return None
+    # a heartbeat from a superseded attempt describes a dead worker's step; calling that ordinary
+    # throttled progress hides that the replacement has published nothing (codex[bot]).
+    if not current_attempt:
+        return None
     if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
         return None
     if str(heartbeat.get("stage") or "") not in _TRAINING_STEP_STAGES:
         return None
-    if heartbeat.get("step") is None:
+    # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
+    # later hidden step for the reassurance to point at. reuse the shared step-gated predicate rather
+    # than a bare presence check (codex[bot]).
+    from flash.providers._poll import is_training_heartbeat
+
+    if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None
+    # w&b is optional (no WANDB_API_KEY disables it), and the status payload does not say whether it
+    # is on, so phrase it as one option and always name a signal that exists (codex[bot]).
     return (
         "the step above is the last one UPLOADED, not necessarily the one training is on; "
         "a throttled worker can hold it for many minutes while the trainer advances normally. "
-        "confirm against your [wandb] run before treating this as a stall"
+        "check flash runs log <run-id> -f for worker output (or your [wandb] run, if configured) "
+        "before treating this as a stall"
     )
 
 
@@ -712,7 +731,12 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         if running and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
             age += _dim(f"  ({_QUIET_HEARTBEAT_HINT})")
         pairs.append(("heartbeat", age))
-        stale_step = _stale_step_hint(hb, heartbeat_age_seconds, running=running)
+        stale_step = _stale_step_hint(
+            hb,
+            heartbeat_age_seconds,
+            running=running,
+            current_attempt=heartbeat_is_current_attempt(obj, hb),
+        )
         if stale_step:
             pairs.append(("progress", stale_step))
     return pairs
