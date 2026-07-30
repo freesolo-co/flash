@@ -1909,3 +1909,177 @@ def test_capability_guards_admit_the_supported_single_turn_text_env(monkeypatch)
     # guard that fires on every env would fail here instead of passing the four tests above.
     inp = _capability_resolve(monkeypatch, _capability_env())
     assert inp["max_prompt_len"] > 0
+
+
+# ---------------------- measured reward latency in train_meta ----------------------
+def _resolved_inputs_for_notes(monkeypatch):
+    """A resolved single-turn input dict, offline.
+
+    Mirrors the resolver fixture above: _resolve_single_turn_inputs needs a loaded env, a spec and
+    a tokenizer, none of which exist in a unit test.
+    """
+    from flash.engine.worker._pkg import W
+    from flash.spec import JobSpec
+
+    class _Env:
+        multi_turn = False
+        is_tool_env = False
+
+        def dataset(self):
+            return [{"index": i} for i in range(33)]
+
+        def prompt_messages(self, ex):
+            return [{"role": "user", "content": f"question {ex['index']}"}]
+
+    class _Tokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return messages[0]["content"]
+
+        def __call__(self, text, **kwargs):
+            return SimpleNamespace(input_ids=[1])
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "train": {"batch_size": 16, "epochs": 2},
+        }
+    )
+    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(W, "SEED", 42, raising=False)
+    monkeypatch.setattr(W, "THINKING", False, raising=False)
+    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
+    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
+    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
+    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
+    monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 40960)
+    return rl_verl._resolve_single_turn_inputs()
+
+
+def _profile(seconds: float, *, trustworthy: bool = True):
+    """A RewardProfile shaped like the profiler's real output."""
+    from flash.engine.reward_profile import RewardProfile
+
+    return RewardProfile(
+        seconds_per_completion=seconds,
+        samples=0 if not trustworthy else 3,
+        degenerate=False,
+        failures=0,
+    )
+
+
+def test_train_notes_record_the_measured_grading_latency(monkeypatch):
+    """The measurement has to outlive the log line to be usable by anything downstream.
+
+    A latency that only reaches stdout cannot price a run or place one: the cost model would keep
+    using its single 1.0s average for an env just measured at 0.02s.
+    """
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    notes = rl_verl._build_verl_train_notes(
+        inp,
+        steps_run=5,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        reward_profile=_profile(0.25),
+        train_wall=100.0,
+    )
+    assert notes["reward_seconds_per_completion"] == 0.25
+
+
+def test_train_notes_omit_an_untrustworthy_profile(monkeypatch):
+    """A profile that measured nothing must record None, not a number.
+
+    RewardProfile.trustworthy is False when no sample graded successfully; writing its 0.0 into
+    train_meta would read downstream as a genuinely instant grader.
+    """
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    notes = rl_verl._build_verl_train_notes(
+        inp,
+        steps_run=5,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        reward_profile=_profile(0.0, trustworthy=False),
+        train_wall=100.0,
+    )
+    assert notes["reward_seconds_per_completion"] is None
+    assert notes["reward_gpu_idle_fraction"] is None
+
+
+def test_train_notes_report_idle_fraction_from_the_runs_own_step_wall(monkeypatch):
+    """The idle share is computed from measured wall time, not from the cost model's estimate.
+
+    Deriving it from the modelled step would report the estimator's own opinion back to it, which
+    is exactly the number an operator would want to CHECK against reality.
+    """
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    completions = inp["prompts_per_step"] * inp["group_size"]
+    # a step wall of 10s, of which grading accounts for 8s -> 80% idle.
+    latency = 8.0 / completions
+    notes = rl_verl._build_verl_train_notes(
+        inp,
+        steps_run=10,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        reward_profile=_profile(latency),
+        train_wall=100.0,
+    )
+    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
+
+
+def test_idle_fraction_is_none_when_grading_exceeds_the_measured_step(monkeypatch):
+    """Grading that fills the whole step leaves no gpu-bound remainder to divide.
+
+    The profile and the observed wall disagree here (a warm-up latency that no longer holds, or a
+    step wall dominated by something else), and neither can arbitrate, so the honest record is no
+    reading rather than a fabricated 100%.
+    """
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    completions = inp["prompts_per_step"] * inp["group_size"]
+    notes = rl_verl._build_verl_train_notes(
+        inp,
+        steps_run=10,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        # 20s of grading inside a 10s measured step
+        reward_profile=_profile(20.0 / completions),
+        train_wall=100.0,
+    )
+    assert notes["reward_gpu_idle_fraction"] is None
+
+
+def test_the_profile_hook_returns_its_reading_to_the_caller():
+    """_log_reward_profile must RETURN the profile, not only print it.
+
+    Asserted against the real hook rather than a fixture: the wiring under test is that the run
+    body can capture what the profiler measured.
+    """
+
+    class Env:
+        def sft_completion(self, example):
+            return [{"role": "assistant", "content": "an answer worth grading"}]
+
+    profile = rl_verl._log_reward_profile(
+        Env(), lambda index, completion: 1.0, [{"id": i} for i in range(4)], 32
+    )
+    assert profile is not None
+    assert profile.trustworthy
+
+
+def test_the_run_body_passes_the_measured_profile_into_train_meta():
+    """The captured profile must actually reach the notes builder.
+
+    Source-level, because reaching this line in a live run needs a gpu. Without it the hook could
+    return a profile that the run body drops on the floor, and every other test here would still
+    pass while train_meta always recorded None.
+    """
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    assert "reward_profile = _log_reward_profile(" in src, "the hook's reading is discarded"
+    assert "reward_profile=reward_profile" in src, "the reading never reaches train_meta"

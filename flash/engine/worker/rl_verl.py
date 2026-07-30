@@ -367,6 +367,40 @@ def _build_verl_training_cfg(
     }
 
 
+def _measured_idle_fraction(
+    reward_profile,
+    *,
+    completions_per_step: int,
+    steps_run: int,
+    train_wall: float,
+) -> float | None:
+    """Share of a step the gpu spent waiting on grading, from this run's OWN numbers.
+
+    Both inputs are measured rather than modelled: the per-completion latency comes from the
+    warm-up profile against the real env, and the gpu-bound half is the observed step wall minus
+    the grading it contains. A modelled step time would report the estimator's opinion of the run
+    back to the estimator, which cannot then be used to check it.
+
+    None whenever the reading would not mean anything -- no trustworthy profile, no completed step,
+    or grading that accounts for the entire step wall (which makes the gpu-bound remainder zero or
+    negative, i.e. the step wall and the profile disagree and neither can arbitrate).
+    """
+    if reward_profile is None or not reward_profile.trustworthy:
+        return None
+    steps = max(0, int(steps_run))
+    completions = max(0, int(completions_per_step))
+    if steps <= 0 or completions <= 0 or train_wall <= 0:
+        return None
+    step_wall = train_wall / steps
+    reward_s = reward_profile.seconds_per_completion * completions
+    gpu_seconds = step_wall - reward_s
+    if gpu_seconds <= 0:
+        return None
+    from flash.engine.reward_profile import gpu_idle_fraction
+
+    return gpu_idle_fraction(reward_profile.seconds_per_completion, completions, gpu_seconds)
+
+
 def _build_verl_train_notes(
     inp: dict,
     *,
@@ -382,6 +416,8 @@ def _build_verl_train_notes(
     wandb_run_name: str | None = None,
     wandb_url: str | None = None,
     wandb_id: str | None = None,
+    reward_profile=None,
+    train_wall: float = 0.0,
 ) -> dict:
     return {
         "backend": "verl",
@@ -435,6 +471,22 @@ def _build_verl_train_notes(
         # wandb.run, verl from the child marker (see verl_common.render_wandb_link_shim).
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
+        # what this env's grader actually cost, and what share of a step the gpu spent waiting on
+        # it. measured, not modelled: the cost model prices every grader at one global average
+        # (1.0 s/completion) spanning regex graders to llm judges, and those two sit at opposite
+        # ends of the utilization range. None when the profile was skipped or untrustworthy --
+        # recording a number with nothing behind it is worse than recording no number.
+        "reward_seconds_per_completion": (
+            reward_profile.seconds_per_completion
+            if reward_profile is not None and reward_profile.trustworthy
+            else None
+        ),
+        "reward_gpu_idle_fraction": _measured_idle_fraction(
+            reward_profile,
+            completions_per_step=inp["prompts_per_step"] * inp["group_size"],
+            steps_run=steps_run,
+            train_wall=train_wall,
+        ),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],
@@ -833,8 +885,13 @@ def score_single_turn(
 _PROFILE_BUDGET_S = 30.0
 
 
-def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_step: int) -> None:
+def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_step: int):
     """Measure this env's real grading latency once, before training starts, and report it.
+
+    Returns the ``RewardProfile`` when one was measured, else None. The reading is RETURNED as
+    well as printed because a log line cannot be read by the cost model or by a scheduler: this
+    env's latency is what separates a compute-bound run from a latency-bound one, and that is a
+    placement input, not just an observability line.
 
     Single-turn grading is serial, so it is pure gpu-idle wall time -- at the default 64x8 shape a
     1s grader idles the gpu for ~80% of every step. The cost model has to guess that number from
@@ -868,7 +925,7 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
                 "so grading it early could change the rewards training sees",
                 flush=True,
             )
-            return
+            return None
 
         # sft_completion reaches user code (FreesoloEnvAdapter delegates to the env's own hook), so
         # it can block on i/o exactly like a grader can. it shares the profiler's deadline instead
@@ -892,10 +949,10 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
                     f"{_PROFILE_BUDGET_S:.0f}s, so no reference completion could be gathered",
                     flush=True,
                 )
-                return
+                return None
             samples.append((index, messages if ok and isinstance(messages, str) else ""))
         if not samples:
-            return
+            return None
         profile = profile_reward_latency(
             score_one, samples, budget_s=max(0.0, deadline - time.perf_counter())
         )
@@ -908,8 +965,10 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
                 "all of it gpu-idle.",
                 flush=True,
             )
+        return profile
     except Exception as exc:
         print(f"[rl-verl] reward profiling skipped: {exc}", flush=True)
+        return None
 
 
 # --------------------------------------------------------------------------------------------
@@ -1785,7 +1844,7 @@ def run_rl_verl():
             raise_on_error=True,
         )
 
-    _log_reward_profile(
+    reward_profile = _log_reward_profile(
         env,
         _score_for_profile,
         rollout_examples,
@@ -2097,5 +2156,7 @@ def run_rl_verl():
             wandb_run_name=experiment_name if "wandb" in loggers else None,
             wandb_url=wandb_link.get("wandb_url"),
             wandb_id=wandb_link.get("wandb_id"),
+            reward_profile=reward_profile,
+            train_wall=train_wall,
         ),
     )
