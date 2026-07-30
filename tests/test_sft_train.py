@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.engine.worker.sft import _pretokenize_completion_only
-from flash.engine.worker.sft_verl import (
+from flash.engine.worker.sft_train import (
     _LORAPLUS_READY_MARKER,
     _VERL_OPTIMIZER_IMPL,
     _VERL_OPTIMIZER_NAME,
@@ -21,7 +21,7 @@ from flash.engine.worker.sft_verl import (
     _render_sft_sitecustomize,
     _serialize_multimodal_inputs,
     _write_sft_parquet,
-    build_sft_verl_overrides,
+    build_sft_overrides,
     render_loraplus_shim,
 )
 
@@ -63,7 +63,7 @@ def _as_map(overrides):
 
 
 def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
-    overrides = _as_map(build_sft_verl_overrides(_cfg()))
+    overrides = _as_map(build_sft_overrides(_cfg()))
     assert overrides == {
         "data.train_files": "/w/train.parquet",
         "data.val_files": "/w/val.parquet",
@@ -137,12 +137,12 @@ def test_sft_engine_strategy_stays_fsdp2():
     into the 16x group B and silently corrupt the learning rates, so the DTensor problem
     above must not be "fixed" by downgrading the strategy.
     """
-    assert _as_map(build_sft_verl_overrides(_cfg()))["engine.strategy"] == "fsdp2"
+    assert _as_map(build_sft_overrides(_cfg()))["engine.strategy"] == "fsdp2"
 
 
 def test_optimizer_eps_merges_into_override_config():
     overrides = _as_map(
-        build_sft_verl_overrides(
+        build_sft_overrides(
             _cfg(optimizer_kwargs={"amsgrad": True}, eps=1e-6)
         )
     )
@@ -150,15 +150,15 @@ def test_optimizer_eps_merges_into_override_config():
 
 
 def test_small_lr_renders_fixed_point_not_scientific():
-    overrides = _as_map(build_sft_verl_overrides(_cfg(lr=5e-5)))
+    overrides = _as_map(build_sft_overrides(_cfg(lr=5e-5)))
     assert overrides["optim.lr"] == "0.00005"
 
 
 def test_steps_xor_epochs_is_enforced():
     with pytest.raises(ValueError, match="exactly one"):
-        build_sft_verl_overrides(_cfg(total_training_steps=120, total_epochs=3))
+        build_sft_overrides(_cfg(total_training_steps=120, total_epochs=3))
     with pytest.raises(ValueError, match="exactly one"):
-        build_sft_verl_overrides(_cfg(total_training_steps=None, total_epochs=None))
+        build_sft_overrides(_cfg(total_training_steps=None, total_epochs=None))
 
 
 class _ExactTokenizer:
@@ -524,7 +524,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
 
 def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_path):
     import flash.engine.worker as worker
-    from flash.engine.worker import sft_verl
+    from flash.engine.worker import sft_train
 
     checkpoint_dir = tmp_path / "checkpoints" / "global_step_5"
     actor_dir = checkpoint_dir / "actor"
@@ -537,7 +537,7 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
         exported.append((actor, adapter, kwargs))
         os.makedirs(adapter, exist_ok=True)
 
-    monkeypatch.setattr(sft_verl, "_export_checkpoint_adapter", fake_export)
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
     monkeypatch.setattr(
         worker,
         "publish_deployable_checkpoint",
@@ -550,7 +550,7 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
         return True
 
     monkeypatch.setattr(worker, "upload_resume_checkpoint", fake_upload)
-    watcher = sft_verl._VerlCheckpointWatcher(
+    watcher = sft_train._VerlCheckpointWatcher(
         local_dir=str(tmp_path / "checkpoints"),
         export_root=str(tmp_path / "exports"),
         python_bin="/verl/python",
@@ -572,7 +572,7 @@ def test_checkpoint_watcher_exports_the_sft_layout(monkeypatch, tmp_path):
     # this is the layout verl's sft trainer actually writes: shards + huggingface/ directly under
     # global_step_N. exporting <dir>/actor here hands the merger a path that does not exist.
     import flash.engine.worker as worker
-    from flash.engine.worker import sft_verl
+    from flash.engine.worker import sft_train
 
     checkpoint_dir = tmp_path / "checkpoints" / "global_step_5"
     (checkpoint_dir / "huggingface").mkdir(parents=True)
@@ -584,7 +584,7 @@ def test_checkpoint_watcher_exports_the_sft_layout(monkeypatch, tmp_path):
         exported.append(actor)
         os.makedirs(adapter, exist_ok=True)
 
-    monkeypatch.setattr(sft_verl, "_export_checkpoint_adapter", fake_export)
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
     monkeypatch.setattr(
         worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
     )
@@ -593,7 +593,7 @@ def test_checkpoint_watcher_exports_the_sft_layout(monkeypatch, tmp_path):
         "upload_resume_checkpoint",
         lambda step, checkpoint, **kwargs: (kwargs["before_upload"](), True)[1],
     )
-    watcher = sft_verl._VerlCheckpointWatcher(
+    watcher = sft_train._VerlCheckpointWatcher(
         local_dir=str(tmp_path / "checkpoints"),
         export_root=str(tmp_path / "exports"),
         python_bin="/verl/python",
@@ -609,7 +609,7 @@ def test_checkpoint_watcher_exports_the_sft_layout(monkeypatch, tmp_path):
 
 def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
     import flash.engine.worker as worker
-    from flash.engine.worker import sft_verl
+    from flash.engine.worker import sft_train
 
     class Api:
         def file_exists(self, *, filename, **kwargs):
@@ -619,12 +619,12 @@ def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
     monkeypatch.setattr(worker, "hf_prefix", lambda: "sft/run")
     monkeypatch.setattr(worker, "hf_api", Api)
 
-    assert sft_verl._durable_required_save_steps((3, 5, 9), 5) == {3}
+    assert sft_train._durable_required_save_steps((3, 5, 9), 5) == {3}
 
 
-def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
+def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
     import flash.engine.worker as worker
-    from flash.engine.worker import sft_verl
+    from flash.engine.worker import sft_train
 
     spec = SimpleNamespace(
         model="Qwen/Qwen3.5-0.8B",
@@ -741,22 +741,22 @@ def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypat
         lambda **kwargs: captured.__setitem__("meta", kwargs),
     )
     monkeypatch.setattr(
-        sft_verl,
+        sft_train,
         "liveness_heartbeat",
         lambda *args, **kwargs: contextlib.nullcontext(),
     )
-    monkeypatch.setattr(sft_verl, "_probe_gpu_in_subprocess", lambda *args, **kwargs: {"memory_gb": 24, "capability": [8, 9]})
-    monkeypatch.setattr(sft_verl, "_model_arch_dims", lambda *args, **kwargs: (1024, 24))
-    monkeypatch.setattr(sft_verl, "resolve_verl_python", lambda *a, **k: "/venv/bin/python")
-    monkeypatch.setattr(sft_verl, "resolve_verl_loggers", lambda python_bin: ["console"])
+    monkeypatch.setattr(sft_train, "_probe_gpu_in_subprocess", lambda *args, **kwargs: {"memory_gb": 24, "capability": [8, 9]})
+    monkeypatch.setattr(sft_train, "_model_arch_dims", lambda *args, **kwargs: (1024, 24))
+    monkeypatch.setattr(sft_train, "resolve_verl_python", lambda *a, **k: "/venv/bin/python")
+    monkeypatch.setattr(sft_train, "resolve_verl_loggers", lambda python_bin: ["console"])
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
-    monkeypatch.setattr(sft_verl, "seed_training_rngs", lambda seed: None)
-    monkeypatch.setattr(sft_verl, "_cached_model_path", lambda model, revision: model)
-    monkeypatch.setattr(sft_verl, "_restore_verl_resume", lambda local_dir: 1)
-    monkeypatch.setattr(sft_verl, "_VerlCheckpointWatcher", Watcher)
-    monkeypatch.setattr(sft_verl, "_NvidiaSmiPeakSampler", PeakSampler)
+    monkeypatch.setattr(sft_train, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setattr(sft_train, "_cached_model_path", lambda model, revision: model)
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir: 1)
+    monkeypatch.setattr(sft_train, "_VerlCheckpointWatcher", Watcher)
+    monkeypatch.setattr(sft_train, "_NvidiaSmiPeakSampler", PeakSampler)
     monkeypatch.setattr(
-        sft_verl,
+        sft_train,
         "latest_global_step_dir",
         lambda local_dir: (os.path.join(local_dir, "global_step_2"), 2),
     )
@@ -768,7 +768,7 @@ def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypat
         with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb") as file:
             file.write(b"adapter")
 
-    monkeypatch.setattr(sft_verl, "_export_checkpoint_adapter", fake_export)
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         captured["command"] = command
@@ -779,9 +779,9 @@ def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypat
         heartbeat()
         return 0
 
-    monkeypatch.setattr(sft_verl, "run_verl_training", fake_training)
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
 
-    sft_verl.run_sft_verl(spec)
+    sft_train.run_sft_train(spec)
 
     assert captured["command"][:3] == ["/venv/bin/python", "-m", "torch.distributed.run"]
     assert "--nproc-per-node=2" in captured["command"]
@@ -806,7 +806,7 @@ def test_run_sft_verl_orchestrates_exact_dataset_and_resume_accounting(monkeypat
 def test_overrides_enable_fused_linear_ce_for_long_context():
     # 32k contexts must not materialize [tokens, vocab] logits; the fused torch-backend
     # linear-CE computes loss from hidden states in chunks (numerically exact CE).
-    o = build_sft_verl_overrides(_cfg(max_length=32768))
+    o = build_sft_overrides(_cfg(max_length=32768))
     assert "model.use_fused_kernels=true" in o
     assert "model.fused_kernel_options.impl_backend=torch" in o
     assert "data.max_length=32768" in o
@@ -826,9 +826,9 @@ def test_sft_line_handler_reads_metrics_through_the_shared_parser():
     import inspect
     import textwrap
 
-    import flash.engine.worker.sft_verl as sv
+    import flash.engine.worker.sft_train as sv
 
-    source = textwrap.dedent(inspect.getsource(sv.run_sft_verl))
+    source = textwrap.dedent(inspect.getsource(sv.run_sft_train))
     handler = next(
         node
         for node in ast.walk(ast.parse(source))
@@ -848,7 +848,7 @@ def test_sft_line_handler_reads_metrics_through_the_shared_parser():
 
 def test_sft_drops_a_non_finite_loss_instead_of_poisoning_the_heartbeat():
     """a nan loss serializes as bare NaN, which strict json consumers reject."""
-    import flash.engine.worker.sft_verl as sv
+    import flash.engine.worker.sft_train as sv
 
     assert sv.parse_verl_metric("step:2 - train/loss:nan - train/lr:1e-05", "train/loss") is None
     assert sv.parse_verl_metric("step:2 - train/loss:inf", "train/loss") is None

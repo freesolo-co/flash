@@ -27,11 +27,11 @@ from typing import Any
 from packaging.version import Version
 
 try:
-    from flash_opd_verl_multiturn import build_flash_multi_turn_agent_loop
-    from flash_opd_verl_structured import StructuredOutputReplay, canonical_structured_spec
+    from flash_opd_multiturn import build_flash_multi_turn_agent_loop
+    from flash_opd_structured import StructuredOutputReplay, canonical_structured_spec
 except ImportError:
-    from flash.engine.worker.opd_verl_multiturn import build_flash_multi_turn_agent_loop
-    from flash.engine.worker.opd_verl_structured import (
+    from flash.engine.worker.opd_multiturn import build_flash_multi_turn_agent_loop
+    from flash.engine.worker.opd_structured import (
         StructuredOutputReplay,
         canonical_structured_spec,
     )

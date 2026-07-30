@@ -1,6 +1,6 @@
 """SFT entry point and the dataset helpers the verl worker shares.
 
-``run_sft`` delegates to ``sft_verl.run_sft_verl``, which owns tokenization, packing, and training.
+``run_sft`` delegates to ``sft_train.run_sft_train``, which owns tokenization, packing, and training.
 What stays here is what that worker imports rather than reimplements: example selection, the
 completion-only pretokenizer, model-arch dims, the token accounting used to detect an under-run, and
 the image-completion rejection.
@@ -145,6 +145,6 @@ def _reject_image_completion(completion) -> None:
 
 def run_sft():
     """Run SFT. verl is the only backend; this module keeps the dataset helpers it shares."""
-    from flash.engine.worker.sft_verl import run_sft_verl
+    from flash.engine.worker.sft_train import run_sft_train
 
-    run_sft_verl()
+    run_sft_train()

@@ -1044,7 +1044,7 @@ def test_rl_init_wraps_trainer_build_in_liveness_heartbeat():
     ("modname", "outer", "stage"),
     [
         ("flash.engine.worker.rl", "run_rl", "rl_step"),
-        ("flash.engine.worker.sft_verl", "run_sft_verl", "sft_step"),
+        ("flash.engine.worker.sft_train", "run_sft_train", "sft_step"),
     ],
 )
 def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
@@ -1080,8 +1080,8 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
     ("modname", "outer", "stages"),
     [
         (
-            "flash.engine.worker.sft_verl",
-            "run_sft_verl",
+            "flash.engine.worker.sft_train",
+            "run_sft_train",
             ("sft_data_loading", "sft_finalizing"),
         ),
         (
