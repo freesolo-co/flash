@@ -92,7 +92,10 @@ def test_blank_completions_are_excluded_from_a_mixed_set():
     profile = profile_reward_latency(realistic, mixed, max_samples=3)
     assert not profile.degenerate
     assert profile.trustworthy
-    assert profile.samples == 2  # 3 real minus the discarded warm-up
+    # 3 real references, all of them measured: the references are cycled to fill the call plan, so
+    # the warm-up no longer costs one of them. this used to read 2 -- the pool was sliced, and any
+    # run whose reference count equalled max_samples came up one measured call short.
+    assert profile.samples == 3
     assert profile.seconds_per_completion == pytest.approx(0.02, abs=0.008)
 
 
@@ -417,3 +420,104 @@ def test_score_single_turn_can_propagate_errors_for_the_profiler():
     # profiling path: propagated
     with pytest.raises(RuntimeError):
         score_single_turn(Env(), "text", {}, raise_on_error=True, **kwargs)
+
+
+def test_a_single_reference_still_produces_a_reading():
+    """One retained prompt is a valid grpo shape and must not profile as unmeasured.
+
+    resolve_grpo_prompts_per_step (flash/engine/worker/grpo.py) explicitly supports a
+    single-prompt dataset. Slicing the sample list would spend that one reference on the discarded
+    warm-up, leaving no timed call and reporting that nothing graded -- false, since grading
+    succeeded. Cycling the available references keeps every valid dataset size measurable.
+    """
+    seen: list[int] = []
+    profile = profile_reward_latency(_sleeper(0.002, record=seen), _samples(1), max_samples=3)
+
+    assert profile.samples == 3, "the single reference was not reused for the measured calls"
+    assert len(seen) == 4  # warm-up + 3 measured, all against the one available example
+    assert seen == [0, 0, 0, 0]
+    assert profile.trustworthy
+    assert "no sample graded successfully" not in profile.describe()
+
+
+def test_an_outlier_timeout_voids_the_whole_reading():
+    """A hang that outruns every finished call cannot be outvoted by the fast ones.
+
+    Warm-up and two measured calls return in ~2ms, then the fourth never comes back. Reporting the
+    2ms median would advertise the quick half of a grader that also has a half taking at least
+    5000x longer -- precisely the understatement this module exists to prevent.
+    """
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def fast_then_hangs(index: int, completion: str) -> float:
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            end = time.perf_counter() + 0.002
+            while time.perf_counter() < end:
+                pass
+            return 1.0
+        release.wait(30.0)  # never set during the test
+        return 1.0
+
+    try:
+        profile = profile_reward_latency(fast_then_hangs, _samples(8), max_samples=4, budget_s=0.5)
+        assert profile.timed_out
+        assert not profile.trustworthy, "a fast median was published despite an unbounded call"
+        assert profile.seconds_per_completion == 0.0
+        assert "unmeasured" in profile.describe()
+        # the message must not claim nothing graded: two calls did.
+        assert "no sample graded successfully" not in profile.describe()
+    finally:
+        release.set()
+
+
+def test_a_uniformly_slow_grader_still_reports_its_latency():
+    """Budget exhaustion mid-call is not evidence of an anomaly, so it must not void the reading.
+
+    A grader slow enough that the budget expires partway through a later call is exactly the case
+    worth pricing -- it is the one that idles the gpu. Voiding here would mean the slower a grader
+    gets, the less likely the profiler is to say anything about it. The abandoned call ran no
+    longer than the calls that finished, so the completed samples remain representative.
+    """
+    # ~0.05s per call against a 0.17s budget: warm-up + 2 measured fit, the next is cut off
+    # mid-flight having run less than a completed call did.
+    profile = profile_reward_latency(_sleeper(0.05), _samples(8), max_samples=6, budget_s=0.17)
+
+    assert not profile.timed_out, "budget exhaustion was mistaken for an anomalous call"
+    assert profile.samples >= 1
+    assert profile.trustworthy
+    assert profile.seconds_per_completion == pytest.approx(0.05, abs=0.03)
+
+
+def test_hook_timeout_message_reports_references_already_gathered(monkeypatch, capsys):
+    """The skip reason must not claim nothing was gathered when something was.
+
+    The deadline is shared, so the hook returns either way -- what is being fixed is the stated
+    reason. A reader told "no reference completion could be gathered" goes looking for an env that
+    returns nothing, when the real fault is a hook that returned twice and then stalled.
+    """
+    from flash.engine.worker import rl_verl
+
+    monkeypatch.setattr(rl_verl, "_PROFILE_BUDGET_S", 0.3)
+    release = threading.Event()
+    calls = {"n": 0}
+
+    class SlowThirdEnv:
+        def sft_completion(self, example):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                release.wait(30.0)  # stalls only after two references are in hand
+            return [{"role": "assistant", "content": "4"}]
+
+    def score_one(index: int, completion: str) -> float:
+        return 1.0
+
+    try:
+        rl_verl._log_reward_profile(SlowThirdEnv(), score_one, [{"id": i} for i in range(4)], 32)
+        out = capsys.readouterr().out
+        assert "did not return within" in out, out
+        assert "2 reference completion(s) gathered" in out, out
+        assert "no reference completion could be gathered" not in out, out
+    finally:
+        release.set()
