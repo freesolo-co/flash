@@ -908,6 +908,18 @@ def _retryable_smoke_unavailable(
     return RetryableServingUnavailable(str(code), retry_after_seconds)
 
 
+def _is_balanced_inline_block(content: str) -> bool:
+    """Whether ``content`` already carries a reasoning block that opens before it closes.
+
+    Ordering is the whole point. A structured answer may contain the literal ``<think>`` -- a
+    ``choice`` constraint equal to it, or JSON quoting it -- and asking only whether that substring
+    appears anywhere reports such an answer as balanced, so it is returned with no close tag and the
+    thinking smoke then rejects the deployment (codex[bot]).
+    """
+    opened = content.find("<think>")
+    return opened >= 0 and content.find("</think>", opened + len("<think>")) >= 0
+
+
 def _balanced_thinking_content(message: dict) -> str:
     """Fold a split-out ``reasoning_content`` back into a balanced ``<think>...</think>`` block.
 
@@ -921,22 +933,39 @@ def _balanced_thinking_content(message: dict) -> str:
     """
     content = str(message.get("content") or "")
     reasoning = message.get("reasoning_content")
-    if not isinstance(reasoning, str):
-        # absent or null: serving never split the tags out, so there is nothing to fold back in.
-        # an explicitly EMPTY string is a different case -- see below -- so this tests the type,
-        # not falsiness: `""` means the model closed its block immediately, which still needs a pair.
-        return content
-    if "<think>" in content:
-        # a real opener means the block is already balanced: don't nest a second one.
+    if _is_balanced_inline_block(content):
+        # a real opener ahead of its close means the block is already balanced: don't nest a second
+        # one. testing for the opener ANYWHERE instead treats a structured answer that merely
+        # contains the literal `<think>` -- a `choice` constraint equal to it, JSON quoting it --
+        # as balanced, and returns it with no closing tag at all (codex[bot]).
         return content
     close = content.find("</think>")
-    if close >= 0:
-        # a closing tag with NO opener is the exact defect this helper repairs, not evidence of a
-        # balanced block -- the opener was rendered into the prompt. whatever precedes the close is
-        # reasoning the serving build left inline, so re-open around it and keep it exactly once;
-        # `reasoning_content` here is a duplicate of that same text, not additional reasoning.
-        inline_reasoning = content[:close]
-        return f"<think>{inline_reasoning or reasoning}</think>{content[close + len('</think>') :]}"
+    if not isinstance(reasoning, str):
+        # absent or null: serving never split the tags out. an explicitly EMPTY string is a
+        # different case -- see below -- so this tests the type, not falsiness: `""` means the model
+        # closed its block immediately, which still needs a pair.
+        #
+        # a legacy serving build predating the split leaves `reasoned</think>answer` inline with no
+        # field at all, and version skew (control plane upgraded first, or FREESOLO_SERVING_URL
+        # pointing at an older backend) still produces it. with no field to contradict it, an
+        # unbalanced close can only be the sampled delimiter, so re-open around the text before it
+        # and that shape balances too (codex[bot]).
+        if close >= 0:
+            return f"<think>{content[:close]}</think>{content[close + len('</think>') :]}"
+        return content
+    if close >= 0 and content[:close] in ("", reasoning):
+        # the close is the sampled delimiter, in the two shapes that prove it: nothing before it
+        # (the opener went into the prompt), or text before it that DUPLICATES `reasoning_content`
+        # (a compatibility build emitted the reasoning both inline and on the field). keep the
+        # reasoning exactly once and hand back the answer that follows.
+        #
+        # any other prefix is answer text that merely mentions `</think>`, and falls through to be
+        # wrapped whole. splitting on the first close regardless rewrote such an answer into the
+        # reasoning slot and dropped the real reasoning entirely; the streaming path already draws
+        # the line here, and only accepts a close at the head of the first content delta
+        # (_openai_stream_content, test_streamed_content_keeps_a_close_tag_that_is_not_the_block_
+        # delimiter) -- so this is the non-streaming twin of a rule that already existed (cursor).
+        return f"<think>{reasoning}</think>{content[close + len('</think>') :]}"
     # an empty reasoning string reaches here and still gets a balanced pair: a thinking consumer
     # splits the answer on `</think>`, so emitting the bare answer would read as no answer at all.
     return f"<think>{reasoning}</think>{content}"

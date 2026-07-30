@@ -617,6 +617,21 @@ def _run_deployment_smoke(
     answer = (
         _thinking_structured_answer(content) if constraint and spec.thinking else content.strip()
     )
+    if spec.thinking and not constraint:
+        # `_smoke_provenance` rejects an empty generation, but flash now folds the split-out
+        # reasoning back into a balanced `<think>...</think>` block before it gets there
+        # (flash/serve/deploy.py). A run whose reasoning exhausted the token budget therefore
+        # arrives as a NONEMPTY string wrapping an empty answer, and would activate a deployment
+        # whose smoke never produced one. The structured path already rejects that via
+        # `_thinking_structured_answer`; restore the same answer-presence signal here (codex[bot]).
+        #
+        # Deliberately conditioned on a close tag being PRESENT, which is what marks the content as
+        # reconstructed. Content with no block at all is the pre-existing unreconstructed shape --
+        # `_smoke_provenance`'s own non-empty check still covers it, and requiring a close here
+        # would newly reject smokes this PR does not affect.
+        closed = content.find("</think>")
+        if closed >= 0 and not content[closed + len("</think>") :].strip():
+            raise ServingError("smoke generation returned no answer after </think>")
     if constraint:
         _validate_structured_smoke(answer, constraint, deadline=deadline, budget_s=budget_s)
     if time.monotonic() > deadline:
