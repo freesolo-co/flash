@@ -2,8 +2,8 @@
 
 A grpo step is two halves that do not overlap: the card generates and updates, then it sits idle
 while the env grades the completions one at a time. ``step_seconds_split`` already reports those
-halves separately. At the default 8x4 shape a 0.85s sandbox grader leaves an H100 idle for ~82% of
-every step, and a 3.1s llm judge for ~94%.
+halves separately. Priced through it for a 4B model at the default 8x4 shape, a 0.85s sandbox grader
+leaves an H100 idle for 88% of every step, and a 3.1s llm judge for 96%.
 
 That idle is schedulable. Runs placed on the same cards interleave: while run A waits on its
 grader, run B has the card to itself. The latency that decides this is a MEASURED one --
@@ -184,7 +184,10 @@ def plan_colocation(
     def fits(group: tuple[RunShape, ...]) -> bool:
         return vram_capacity_gb <= 0 or sum(r.vram_gb for r in group) <= vram_capacity_gb
 
-    free = sorted(runs, key=lambda r: (-r.duty_cycle, r.label))
+    def by_duty(pool: list[RunShape]) -> list[RunShape]:
+        return sorted(pool, key=lambda r: (-r.duty_cycle, r.label))
+
+    free = by_duty(runs)
     placements: list[Placement] = []
     solo: list[RunShape] = []
 
@@ -214,8 +217,15 @@ def plan_colocation(
         placement = evaluate_placement(group)
         if placement.worth_sharing:
             placements.append(placement)
+        elif len(group) > 1:
+            # the seed could not be placed profitably, but the runs it drew in may still pair well
+            # with each other -- their gain was measured against THIS group, not against every group
+            # they could have joined. strand only the seed and return the rest to the pool, or a
+            # marginal admission would take its partners down with it.
+            solo.append(seed)
+            free = by_duty([*free, *group[1:]])
         else:
-            solo.extend(group)
+            solo.append(seed)
 
     placements.sort(key=lambda p: (-p.throughput_gain, p.labels))
     solo.sort(key=lambda r: r.label)

@@ -173,6 +173,29 @@ def test_a_run_is_refused_when_admitting_it_would_lower_the_groups_throughput():
     assert [r.label for r in solo] == ["middling"]
 
 
+def test_an_unprofitable_seed_releases_its_partners_instead_of_stranding_them():
+    # a marginal admission must not take its partners down with it. the seed draws in a run because
+    # that admission improves THIS group, the group still misses the threshold, and the whole thing
+    # is discarded -- so a pair that would have shared profitably with each other never gets built.
+    # the runs the seed collected have only been measured against the seed's group, never against
+    # every group they could have joined, so they go back in the pool rather than to solo.
+    seed = _shape("s_busiest", 0.95, 0.05)
+    mid = _shape("c_mid", 0.86, 0.14)
+    least = _shape("a_least", 0.84, 0.16)
+
+    # the fixture only bites if the greedy path really walks into the trap: the seed's best
+    # admission has to be an improvement that still lands under the threshold.
+    seeded_pair = evaluate_placement((seed, least))
+    assert seeded_pair.throughput_gain > evaluate_placement((seed,)).throughput_gain
+    assert not seeded_pair.worth_sharing, "fixture must represent a marginal, discarded group"
+    assert evaluate_placement((mid, least)).worth_sharing, "the released pair must be profitable"
+
+    placements, solo = plan_colocation([seed, mid, least])
+    assert [p.labels for p in placements] == [("c_mid", "a_least")]
+    assert [r.label for r in solo] == ["s_busiest"]
+    assert len(placements) + len(solo) == 2, "three runs must fit on two cards, not three"
+
+
 def test_seeding_with_the_busiest_run_pairs_it_off_instead_of_stranding_it():
     # three idle judges and one compute-bound run. seeding from the busiest run gives the compute
     # run a partner; seeding from the most idle would pair the judges together first and strand the
