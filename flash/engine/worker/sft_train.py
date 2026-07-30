@@ -131,11 +131,11 @@ def _optimizer_override_config(cfg: dict) -> dict:
     return override
 
 
-def build_sft_verl_overrides(cfg: dict) -> list[str]:
+def build_sft_overrides(cfg: dict) -> list[str]:
     """build hydra overrides for verl's ``sft_trainer_engine.yaml`` config."""
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in cfg]
     if missing:
-        raise KeyError(f"build_sft_verl_overrides missing required cfg keys: {missing}")
+        raise KeyError(f"build_sft_overrides missing required cfg keys: {missing}")
     steps = cfg.get("total_training_steps")
     epochs = cfg.get("total_epochs")
     if bool(steps) == bool(epochs):
@@ -974,7 +974,7 @@ class _NvidiaSmiPeakSampler:
         return round(self.peak_mib / 1024, 3)
 
 
-def run_sft_verl(spec=None) -> None:
+def run_sft_train(spec=None) -> None:
     """run flash sft through verl's out-of-process fsdp trainer."""
     from flash.catalog import MODELS, resolve_vocab_size
     from flash.engine.vram import sft_grad_accum
@@ -1283,7 +1283,7 @@ def run_sft_verl(spec=None) -> None:
         "total_training_steps": update_horizon if max_steps > 0 else None,
         "total_epochs": epochs if max_steps <= 0 else None,
     }
-    overrides = build_sft_verl_overrides(config)
+    overrides = build_sft_overrides(config)
 
     shim_source = _render_sft_sitecustomize(
         seed=config["seed"],

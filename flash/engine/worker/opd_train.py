@@ -40,14 +40,14 @@ from flash.engine.worker.opd_gkd import (
     _trim_trailing_stop,
     student_tokens_with_offsets,
 )
-from flash.engine.worker.opd_verl_multiturn import (
+from flash.engine.worker.opd_multiturn import (
     EnvGlueTokenizer,
     _dedup_seam_terminator,
     validate_glue_template,
     validate_teacher_messages,
 )
 from flash.engine.worker.rng import seed_training_rngs
-from flash.engine.worker.sft_verl import (
+from flash.engine.worker.sft_train import (
     _build_verl_child_env,
     _cached_model_path,
     _durable_required_save_steps,
@@ -1452,11 +1452,11 @@ _REQUIRED_OVERRIDE_KEYS = (
 )
 
 
-def build_opd_verl_overrides(config: dict) -> list[str]:
+def build_opd_overrides(config: dict) -> list[str]:
     """Render the exact verl 0.8.0 synchronous PPO and distillation config surface."""
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in config]
     if missing:
-        raise KeyError(f"build_opd_verl_overrides missing required config keys: {missing}")
+        raise KeyError(f"build_opd_overrides missing required config keys: {missing}")
     # the full sequence length the engine is sized for. the caller derives max_prompt_length by
     # carving max_response_length out of this same value, so the token budget, the prompt filter,
     # and the engine always agree.
@@ -1567,7 +1567,7 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
         "critic.enable=false",
         "reward.reward_model.enable=false",
-        "distillation._target_=flash_opd_verl_plugin.FlashRemoteDistillationConfig",
+        "distillation._target_=flash_opd_plugin.FlashRemoteDistillationConfig",
         "distillation.enabled=true",
         "distillation.n_gpus_per_node=0",
         "distillation.nnodes=0",
@@ -1666,7 +1666,7 @@ def _build_opd_child_env(
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
         {
-            "VERL_USE_EXTERNAL_MODULES": "flash_opd_verl_plugin",
+            "VERL_USE_EXTERNAL_MODULES": "flash_opd_plugin",
             "FLASH_OPD_BRIDGE_URL": bridge_url,
             "FLASH_OPD_BRIDGE_TOKEN": bridge_token,
             "FLASH_OPD_SEED": str(int(seed)),
@@ -2071,7 +2071,7 @@ def _generation_eos_from_cached_config(model_id: str, model_revision: str, token
     return _generation_eos_ids(model_like, tokenizer)
 
 
-def run_opd_verl(spec=None) -> None:
+def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
     from flash.engine.worker.teacher import TeacherClient
     from flash.multimodal import (
@@ -2111,9 +2111,9 @@ def run_opd_verl(spec=None) -> None:
         )
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
-    from flash.opd_verl_validation import validate_opd_verl_structured_outputs
+    from flash.opd_validation import validate_opd_structured_outputs
 
-    structured_validation = validate_opd_verl_structured_outputs(
+    structured_validation = validate_opd_structured_outputs(
         knobs.structured_outputs,
         model_id=model_id,
         model_revision=model_revision,
@@ -2362,21 +2362,21 @@ def run_opd_verl(spec=None) -> None:
     except Exception:  # no cuda / probe failure -> conservative bf16 kv
         fp8_kv = False
 
-    plugin_path = os.path.join(shim_dir, "flash_opd_verl_plugin.py")
-    shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_verl_plugin.py"), plugin_path)
-    structured_helper_path = os.path.join(shim_dir, "flash_opd_verl_structured.py")
+    plugin_path = os.path.join(shim_dir, "flash_opd_plugin.py")
+    shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_plugin.py"), plugin_path)
+    structured_helper_path = os.path.join(shim_dir, "flash_opd_structured.py")
     shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "opd_verl_structured.py"),
+        os.path.join(os.path.dirname(__file__), "opd_structured.py"),
         structured_helper_path,
     )
-    multiturn_helper_path = os.path.join(shim_dir, "flash_opd_verl_multiturn.py")
+    multiturn_helper_path = os.path.join(shim_dir, "flash_opd_multiturn.py")
     shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "opd_verl_multiturn.py"),
+        os.path.join(os.path.dirname(__file__), "opd_multiturn.py"),
         multiturn_helper_path,
     )
-    entry_path = os.path.join(shim_dir, "flash_opd_verl_entry.py")
+    entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
     with open(entry_path, "w", encoding="utf-8") as file:
-        file.write("import verl\nfrom flash_opd_verl_plugin import main\nmain()\n")
+        file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
     opd_shim_source = _render_opd_sitecustomize(
         save_at_steps=knobs.save_at_steps,
         total_steps=update_horizon,
@@ -2446,7 +2446,7 @@ def run_opd_verl(spec=None) -> None:
             "fp8_kv": fp8_kv,
             "loggers": loggers,
         }
-        overrides = build_opd_verl_overrides(config)
+        overrides = build_opd_overrides(config)
         progress_state = _OpdProgressState(resume_state)
         watcher = _OpdVerlCheckpointWatcher(
             local_dir=local_dir,

@@ -281,7 +281,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-o
     && uv cache clean
 
 # flash-attn is REQUIRED in here, not best-effort like it is in the main interpreter above. All three
-# backends hard-enable remove-padding (rl_verl.py:138, sft_verl.py:145, opd_verl.py:1458), and verl's
+# backends hard-enable remove-padding (rl_verl.py:138, sft_train.py:145, opd_train.py:1458), and verl's
 # CUDA remove-padding path imports flash_attn.bert_padding UNGUARDED
 # (verl/utils/attention_utils.py:30, torch_functional.py:627,657). There is no SDPA fallback on that
 # path: without the module the run dies at the first training batch, which the import-only assert
@@ -293,7 +293,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
-# (rl_verl -> main_ppo, opd_verl_plugin -> main_ppo_sync, sft_verl -> sft_trainer; note it is
+# (rl_verl -> main_ppo, opd_plugin -> main_ppo_sync, sft_train -> sft_trainer; note it is
 # sft_trainer, NOT fsdp_sft_trainer, which does not exist in this pin), the vLLM rollout modules
 # where a version mismatch would surface, and the fork-only rollout field the GRPO path emits as a
 # hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this

@@ -18,9 +18,9 @@ def test_sft_worker_requests_the_fused_loss_its_sizing_assumes():
     there is no in-process model to patch and nothing left of ours for those to cover.
     """
     from flash.engine.vram import sft_chunked_nll_enabled
-    from flash.engine.worker import sft_verl
+    from flash.engine.worker import sft_train
 
-    source = inspect.getsource(sft_verl)
+    source = inspect.getsource(sft_train)
     assert '"model.use_fused_kernels=true"' in source
     assert '"use_liger": True' in source
     # the discount is not universal, so the gate must still be a real allowlist, not a constant.

@@ -53,7 +53,7 @@ from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import sanitize_rollout_text
-from flash.engine.worker.sft_verl import _hydra_val, _NvidiaSmiPeakSampler
+from flash.engine.worker.sft_train import _hydra_val, _NvidiaSmiPeakSampler
 from flash.engine.worker.verl_common import (
     VERL_REQUIREMENT,
     agent_loop_workers,
@@ -599,7 +599,7 @@ def render_exact_save_steps_shim(save_at_steps: tuple[int, ...], total_steps: in
 
     this drops the writes flash never asked for, so only the required steps (and the last step,
     which the run's final publish needs) reach disk. the sft verl backend already does exactly this
-    (sft_verl.py); this is the same suppression on the ppo driver.
+    (sft_train.py); this is the same suppression on the ppo driver.
 
     ``RayPPOTrainer._save_checkpoint`` takes no step argument -- it reads ``self.global_steps`` --
     so the filter reads it off the instance rather than a parameter. returning early is safe
