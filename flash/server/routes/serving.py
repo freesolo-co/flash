@@ -587,6 +587,11 @@ def _run_deployment_smoke(
         )
         if serving_capacity is not None:
             max_tokens = min(max_tokens, serving_capacity)
+    # a run trained with stop_sequences terminates on its delimiter and need never emit EOS. without
+    # forwarding them the smoke generates past the answer to max_tokens, comes back
+    # finish_reason="length", and the truncation guard below rejects a checkpoint that answered
+    # correctly.
+    stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -603,6 +608,7 @@ def _run_deployment_smoke(
                     expected_checkpoint=expected_checkpoint,
                     timeout_s=timeout_s,
                     retry_unavailable=True,
+                    stop=stop_sequences or None,
                 )
 
             result = _bounded_call(

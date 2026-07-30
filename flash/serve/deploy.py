@@ -917,11 +917,14 @@ def chat(
     expected_checkpoint: str | None = None,
     timeout_s: float | None = None,
     retry_unavailable: bool = False,
+    stop: list[str] | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
     ``timeout_s`` overrides the default 30-minute request timeout. deployment smoke also enables
     recognized unavailable-envelope classification so its caller can retry within one deadline.
+    ``stop`` carries the run's own stop sequences so a model trained to terminate on a delimiter
+    rather than EOS finishes on ``stop`` instead of running to ``max_tokens``.
     """
     base = serving_openai_base_url()
     body = {
@@ -931,6 +934,8 @@ def chat(
         "temperature": float(temperature),
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
     }
+    if stop:
+        body["stop"] = [str(value) for value in stop]
     # follow_redirects + max_redirects=100: Modal 303-redirects slow cold-start requests across
     # several poll cycles before the result is ready.
     headers = _internal_key_header()

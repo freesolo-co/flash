@@ -439,6 +439,7 @@ def _smoke_spec(
     constraint: dict | None = None,
     max_completion_tokens: int | None = None,
     algorithm: str = "grpo",
+    stop_sequences: tuple[str, ...] = (),
 ):
     return types.SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
@@ -447,6 +448,7 @@ def _smoke_spec(
         train=types.SimpleNamespace(
             max_completion_tokens=max_completion_tokens,
             structured_outputs="" if constraint is None else json.dumps(constraint),
+            stop_sequences=stop_sequences,
         ),
     )
 
@@ -599,6 +601,78 @@ def test_run_deployment_smoke_rejects_truncated_thinking_without_a_grammar(monke
 
     with pytest.raises(ServingError, match="smoke generation was truncated at the maximum token"):
         _run_smoke(_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192))
+
+
+def test_run_deployment_smoke_forwards_configured_stop_sequences(monkeypatch):
+    """A run trained with stop_sequences terminates on its delimiter and need never emit EOS. If the
+    smoke does not forward them, serving generates past the answer to max_tokens and returns
+    finish_reason='length' -- and the truncation guard above then rejects a checkpoint that answered
+    correctly, making every such thinking run undeployable."""
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("<think>2+2 is 4</think><answer>4</answer>")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(
+        _smoke_spec(
+            algorithm="grpo",
+            thinking=True,
+            max_completion_tokens=8192,
+            stop_sequences=("</answer>",),
+        )
+    )
+
+    assert calls[0]["stop"] == ["</answer>"]
+
+
+def test_run_deployment_smoke_sends_no_stop_when_none_configured(monkeypatch):
+    """An unconfigured run must not send stop=[]: an empty list is a different request than an
+    absent key on some OpenAI surfaces, and the run never asked for a delimiter."""
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(_smoke_spec(thinking=False))
+
+    assert calls[0]["stop"] is None
+
+
+def test_chat_body_carries_stop_sequences(monkeypatch):
+    """The stop sequences must reach the wire body, not just the flash-side call."""
+    from flash.serve import deploy as _deploy
+
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    class _Client:
+        def post(self, url, json=None, headers=None, timeout=None):
+            sent.update(json or {})
+            return _Resp()
+
+    monkeypatch.setattr(_deploy, "serving_openai_base_url", lambda: "https://serving.example/v1")
+    monkeypatch.setattr(_deploy, "_internal_key_header", dict)
+    monkeypatch.setattr(_deploy, "_chat_http_client", _Client)
+
+    _deploy.chat("run-1", [{"role": "user", "content": "hi"}], stop=["</answer>"])
+    assert sent["stop"] == ["</answer>"]
+
+    sent.clear()
+    _deploy.chat("run-1", [{"role": "user", "content": "hi"}])
+    assert "stop" not in sent
 
 
 def test_zero_completion_budget_resolves_to_thinking_recipe_default():
