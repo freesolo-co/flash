@@ -542,7 +542,7 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     pytest.importorskip("datasets")
     from datasets import Dataset
 
-    from flash.engine.worker import sft_verl
+    from flash.engine.worker import sft_train
 
     completions = [
         [{"role": "assistant", "content": "red"}],
@@ -563,7 +563,7 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     # the normalizer must actually be applied on the training path, not merely importable: a mixed
     # str/list `content` column makes Arrow infer a struct type and drops one shape at write time.
     assert "completion_messages = text_only_prompt_messages(completion_messages)" in inspect.getsource(
-        sft_verl
+        sft_train
     )
 
 

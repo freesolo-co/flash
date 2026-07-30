@@ -459,7 +459,7 @@ _LIGER_LONG_CTX_TOKENS = 2048
 # the fused, dense-logit-free sft loss is validated against these model families. other models keep
 # plain nll until their output-head and backbone traversal are covered by the same parity tests.
 # the implementation moved from trl's chunked_nll to verl's use_fused_kernels + use_liger (set
-# unconditionally in engine/worker/sft_verl.py); the sizing property -- no dense [b, s, vocab]
+# unconditionally in engine/worker/sft_train.py); the sizing property -- no dense [b, s, vocab]
 # logits tensor -- is what this set gates, and it holds for both.
 _SFT_CHUNKED_NLL_MODELS = frozenset(
     {
@@ -1041,7 +1041,7 @@ def model_required_vram_gb(
         """Re-size an OPD requirement with an fp8 KV cache once the run is provably modern-card-only.
 
         The colocated OPD vLLM rollout engine reserves an fp8 KV cache on cc >= 8.9 hardware
-        (engine/worker/opd_verl.py sends engine_kwargs.vllm.kv_cache_dtype=fp8), but the estimate
+        (engine/worker/opd_train.py sends engine_kwargs.vllm.kv_cache_dtype=fp8), but the estimate
         defaults to a bf16 KV pool. Any OPD run needing
         more VRAM than the biggest non-fp8 validated card (the 80 GB A100) can ONLY land on a modern
         (cc >= 8.9) card, so that bf16 pool is a phantom: it doubles the real KV and wrongly rejects
@@ -1049,7 +1049,7 @@ def model_required_vram_gb(
         while the fp8-sized requirement still clears the non-fp8 ceiling, so the discount can never
         pull the run back onto a card that would NOT use fp8 (which would then OOM).
 
-        Skipped entirely for GDN hybrids: both workers refuse fp8 KV for them (opd_verl.py,
+        Skipped entirely for GDN hybrids: both workers refuse fp8 KV for them (opd_train.py,
         rl_verl.py), so their cache really is bf16 and the discount would admit a run onto a card
         that cannot hold it."""
         from flash.providers.base import max_non_fp8_kv_vram_gb

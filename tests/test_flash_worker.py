@@ -552,23 +552,23 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
     assert askpass_paths
 
 
-def test_sft_verl_keeps_the_optimizations_that_survived_the_trl_deletion():
+def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     """The verl SFT path must still carry the sizing/memory optimizations, not just train.
 
     The previous version of this test read run_sft's source. That body was trl's and is deleted:
-    run_sft now delegates to run_sft_verl. Rather than drop the coverage, assert against the module
+    run_sft now delegates to run_sft_train. Rather than drop the coverage, assert against the module
     that really runs. Three of the old assertions are intentionally NOT reproduced -- chalk kernel
     installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
     properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
     """
     import inspect
 
-    from flash.engine.worker import sft, sft_verl
+    from flash.engine.worker import sft, sft_train
 
     # run_sft is now a pure delegation: no backend selector, no trainer of its own.
-    assert "run_sft_verl()" in inspect.getsource(sft.run_sft)
+    assert "run_sft_train()" in inspect.getsource(sft.run_sft)
 
-    src = inspect.getsource(sft_verl)
+    src = inspect.getsource(sft_train)
     # completion-only supervision survives, as verl's loss_mask rather than trl's completion_mask.
     assert "_pretokenize_completion_only(" in src
     assert "completion_mask_from_ids(" in src

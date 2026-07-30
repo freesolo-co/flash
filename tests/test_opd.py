@@ -62,7 +62,7 @@ def test_drop_fully_forced_groups_keeps_a_partially_forced_span():
 # The two normalization tests that stood here asserted over TRL's `_prepare_gkd_groups` /
 # `_gkd_loss_from_logps`. verl carries the same invariant in one place instead of two, and it is now
 # proved against the shipped implementation in
-# test_opd_verl.py::test_dropped_forced_groups_renormalize_over_surviving_tokens_only.
+# test_opd_train.py::test_dropped_forced_groups_renormalize_over_surviving_tokens_only.
 
 
 def _install_student_loader_fakes(monkeypatch, *, causal_raises=False, vl_raises=False):
@@ -595,9 +595,9 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
     # an incompatible model must fail before any paid GPU work starts.
     import inspect
 
-    from flash.engine.worker.opd_verl import run_opd_verl
+    from flash.engine.worker.opd_train import run_opd_train
 
-    source = inspect.getsource(run_opd_verl)
+    source = inspect.getsource(run_opd_train)
     validation = 'validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)'
 
     assert source.index(validation) < source.index("_probe_gpu_in_subprocess(")
@@ -1157,15 +1157,15 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
     """
     import inspect
 
-    from flash.engine.worker import opd_verl
+    from flash.engine.worker import opd_train
 
-    src = inspect.getsource(opd_verl.run_opd_verl)
+    src = inspect.getsource(opd_train.run_opd_train)
     assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
     assert "get_device_capability() >= (8, 9)" in src
 
     # and the override is emitted only when the resolved flag is true, so a bf16 worker never sends
     # fp8 (an absent key means bf16, which is the conservative direction).
-    assert 'if config.get("fp8_kv")' in inspect.getsource(opd_verl.build_opd_verl_overrides)
+    assert 'if config.get("fp8_kv")' in inspect.getsource(opd_train.build_opd_overrides)
 
 
 def test_opd_oversized_reject_names_the_knobs_to_shrink():
@@ -2392,7 +2392,7 @@ def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(
     fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     import flash.engine.worker.teacher as teacher_mod
-    from flash.engine.worker import opd_verl as opd_mod
+    from flash.engine.worker import opd_train as opd_mod
 
     env = SimpleNamespace(
         is_tool_env=False,
@@ -2448,4 +2448,4 @@ def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(
     # propagate. The type carries no behavioral difference -- `_worker_failure_flags` branches only on
     # RetriableInfraError/GitHubRateLimitError and CUDA OOM, so both are fatal and non-retriable.
     with pytest.raises(ValueError, match=r"requires .*kimi-k2\.6"):
-        opd_mod.run_opd_verl()
+        opd_mod.run_opd_train()

@@ -909,7 +909,7 @@ def test_rl_wires_vl_full_lora_base_loader():
     # SFT is not covered here any more: verl loads the base itself in its trainer subprocess from
     # model.path, so there is no in-process model for the worker to hand over. The SFT-side half of
     # this invariant -- that the resolved lora_rank and target_modules actually reach verl instead of
-    # falling back to its defaults -- is covered by the override-map assertion in test_sft_verl.py.
+    # falling back to its defaults -- is covered by the override-map assertion in test_sft_train.py.
     import inspect
 
     from flash.engine.worker import rl
