@@ -16,11 +16,27 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
+from flash._channel import CLI_NAME
+
 from . import render
 from ._tty import TtyStatusLine
 
 if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
+
+
+def _quote_shell_token(token: str) -> str:
+    """Quote one argv token for the shell the user is most likely to paste it back into.
+
+    ``shlex.quote`` is POSIX-only: it wraps in single quotes, which cmd.exe passes through as
+    literal characters rather than grouping, so a suggested command with a space would split
+    there. This package is declared OS-independent, so pick the quoting per platform.
+    """
+    if os.name == "nt":
+        import subprocess
+
+        return subprocess.list2cmdline([token])
+    return shlex.quote(token)
 
 
 def _atomic_write_bytes(out: Path, data: bytes | bytearray) -> None:
@@ -108,25 +124,50 @@ def cmd_env_pull(args) -> int:
                 # in-env path deliberately, so telling them to drop it would abandon the file they
                 # asked for and silently turn this into a whole-environment download.
                 hint = ""
-                if not args.output:
-                    # shell-quote: the directory that triggered this can contain spaces or
-                    # metacharacters, and an unquoted `-o into here` splits into two arguments.
-                    quoted = shlex.quote(str(out))
+                # ...and only when the POSITIONAL is itself the directory. a bare
+                # basename collision is not evidence the user meant a destination: `env pull ns/env
+                # assets/config` with a local ./config/ is a real single-file pull, and telling that
+                # user to drop `assets/config` would abandon the file they asked for and aim
+                # --force at an unrelated directory.
+                positional_is_the_dir = Path(args.path.replace("\\", "/")) == out
+                if not args.output and positional_is_the_dir:
+                    # attached `--output=X`, not `-o X`: a directory whose basename starts with a
+                    # dash (./-dest -> -dest) is read by argparse as an option and rejected with
+                    # "expected one argument". quoting alone does not help -- the attached form
+                    # does, because the value cannot start the token. quote the whole token so it
+                    # also survives spaces and metacharacters on the way back through a shell.
+                    quoted = _quote_shell_token(f"--output={out}")
                     # the whole-environment path refuses any nonempty destination, so recommending
                     # it verbatim into a populated directory just trades this error for the next.
                     if any(out.iterdir()):
-                        hint = (
-                            f"\nhint: {out}{os.sep} is a directory, and the second positional is a "
-                            f"path INSIDE the environment, not a destination. to download the whole "
-                            f"environment, pass a destination with -o; {out}{os.sep} is not empty, so "
-                            f"choose a new path or replace its contents: "
-                            f"flash env pull {env_id} -o {quoted} --force"
-                        )
+                        # ...and --force is not the answer either when the destination contains the
+                        # cwd: ensure_environment_pull_destination_available() rejects that outright
+                        # rather than deleting the directory the user is standing in. ask the guard
+                        # itself so this cannot drift from the rule it is describing.
+                        from flash.envs.pull import _cwd_is_inside
+
+                        if _cwd_is_inside(out):
+                            hint = (
+                                f"\nhint: {out}{os.sep} is a directory, and the second positional "
+                                f"is a path INSIDE the environment, not a destination. to download "
+                                f"the whole environment, pass a destination with -o -- but not "
+                                f"{out}{os.sep}, which contains the current working directory and "
+                                f"cannot be replaced even with --force. choose a separate path: "
+                                f"{CLI_NAME} env pull {env_id} --output=DEST"
+                            )
+                        else:
+                            hint = (
+                                f"\nhint: {out}{os.sep} is a directory, and the second positional "
+                                f"is a path INSIDE the environment, not a destination. to download "
+                                f"the whole environment, pass a destination with -o; {out}{os.sep} "
+                                f"is not empty, so choose a new path or replace its contents: "
+                                f"{CLI_NAME} env pull {env_id} {quoted} --force"
+                            )
                     else:
                         hint = (
                             f"\nhint: to download the whole environment into {out}{os.sep}, "
                             f"drop the second positional and pass it as the destination: "
-                            f"flash env pull {env_id} -o {quoted}"
+                            f"{CLI_NAME} env pull {env_id} {quoted}"
                         )
                 print(
                     f"refusing to overwrite directory {out} with a file "

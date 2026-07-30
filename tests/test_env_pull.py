@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import stat
 import tarfile
 import urllib.parse
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from flash._channel import CLI_NAME
 from flash.cli.envpush import cmd_env_pull
 from flash.envs import loader as adapter
 from flash.envs.pull import environment_local_dirname
@@ -163,7 +165,7 @@ def test_cmd_env_pull_positional_dir_names_the_destination_form(monkeypatch, tmp
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert "-o into-here" in err
+    assert "--output=into-here" in err
     assert "david-freesolo-co/stuff" in err
 
 
@@ -202,7 +204,109 @@ def test_cmd_env_pull_positional_dir_hint_is_shell_quoted(monkeypatch, tmp_path,
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert "-o 'into here'" in err
+    assert "'--output=into here'" in err
+
+
+def _hint_command(err: str) -> str:
+    """The suggested command from the hint line, as the user would copy it."""
+    for line in err.splitlines():
+        if " env pull " in line and "hint" in line:
+            return line[line.index(f"{CLI_NAME} env pull ") :]
+    raise AssertionError(f"no hint command in:\n{err}")
+
+
+def _parse_as_cli(command: str) -> Namespace:
+    """Round-trip a suggested command through a POSIX shell split and the real `env pull` parser.
+
+    A hint is only useful if pasting it back works, so assert against the parser the user would
+    actually hit rather than against the string we happened to build.
+    """
+    from flash.cli import _build_parser
+
+    argv = shlex.split(command)
+    assert argv[:3] == [CLI_NAME, "env", "pull"], argv
+    return _build_parser().parse_args(argv[1:])
+
+
+def test_cmd_env_pull_dash_prefixed_dir_hint_survives_the_parser(monkeypatch, tmp_path, capsys):
+    """A destination whose basename starts with `-` must not be read back as an option.
+
+    `-o -dest` makes argparse fail with "expected one argument", so the remedy would be rejected by
+    the same parser that produced the error. Quoting does not fix it -- the attached `--output=`
+    form does, because the value can no longer start its own token.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "-dest").mkdir()
+
+    rc = cmd_env_pull(_margs(path="./-dest", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    parsed = _parse_as_cli(_hint_command(err))
+    assert parsed.output == "-dest"
+    assert parsed.path is None
+
+
+def test_cmd_env_pull_positional_dir_hint_round_trips_through_the_parser(
+    monkeypatch, tmp_path, capsys
+):
+    """The suggested command must parse back to a whole-env pull aimed at that same directory."""
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into here").mkdir()
+
+    rc = cmd_env_pull(_margs(path="into here", output=None, force=False))
+
+    assert rc == 1
+    parsed = _parse_as_cli(_hint_command(capsys.readouterr().err))
+    assert parsed.output == "into here"
+    assert parsed.path is None
+
+
+def test_cmd_env_pull_basename_collision_keeps_the_single_file_diagnostic(
+    monkeypatch, tmp_path, capsys
+):
+    """A local dir sharing the positional's BASENAME is not evidence of a mistaken destination.
+
+    `env pull ns/env assets/config` with a local ./config/ is a genuine single-file pull whose
+    output name happens to collide. Telling that user to drop the positional would abandon the file
+    they asked for, and the nonempty branch would aim --force at an unrelated directory.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "keep.txt").write_text("mine")
+
+    rc = cmd_env_pull(_margs(path="assets/config", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "needs -o to be a FILE path" in err
+    assert "drop the second positional" not in err
+    assert "--force" not in err
+
+
+def test_cmd_env_pull_cwd_destination_hint_does_not_offer_force(monkeypatch, tmp_path, capsys):
+    """`env pull ns/env .` cannot be fixed with --force, so the hint must not suggest it.
+
+    ensure_environment_pull_destination_available() refuses to replace any directory containing the
+    cwd, even with overwrite=True, so the generic nonempty remedy would fail a second time.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "existing.txt").write_text("keep me")
+
+    rc = cmd_env_pull(_margs(path=".", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "contains the current working directory" in err
+    # scoped to the SUGGESTED COMMAND, not the whole message: naming --force to say it would not
+    # help here is the point of this branch. what must not happen is offering it as the remedy.
+    command = _hint_command(err)
+    assert "--force" not in command, command
+    assert _parse_as_cli(command).path is None
 
 
 def test_cmd_env_pull_positional_nonempty_dir_hint_says_how_to_replace_it(
