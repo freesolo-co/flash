@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import math
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-from flash.catalog import normalize_algorithm, samples_on_policy
+from flash.catalog import normalize_algorithm
 
 from . import render
 from .envpush import _err, _resolve_local_env_entrypoint
 
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
+# the algorithms whose worker actually calls the environment's scorer. only rl.py reads a reward
+# (env.scores_breakdown / env.reward) and only multiturn_rollout.py scores a rollout; the opd and
+# opsd workers consume dataset(), prompt_messages(), and sft_completion() and never grade anything.
+# so a placeholder scorer is a real defect for grpo and legitimate for every other algorithm, and
+# samples_on_policy -- which is about sampling student completions, not grading them -- is the
+# wrong question to ask here (codex[bot]).
+_REWARD_CONSUMING_ALGORITHMS = frozenset({"grpo"})
 _ECHO_RESPONSE = "test"
 # wrong completions offered to the flat-reward check below as negative controls. deliberately not
 # _ECHO_RESPONSE: that string already stands for "there is no gold answer to replay", and reusing
@@ -27,15 +35,46 @@ _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
 
 
+@dataclass(frozen=True)
+class _Score:
+    """One graded completion, as the trainer would see it.
+
+    ``turns`` is the per-turn reward vector a multi-turn env may expose alongside the episode
+    scalar; it is None for single-turn scoring and whenever the env offers no usable per-turn
+    rewards. Two scores are "the same" for the flat-reward gate only when both parts match, so an
+    env that ranks purely through per-turn credit is not mistaken for one that cannot rank.
+    """
+
+    episode: float
+    turns: tuple[float, ...] | None = None
+
+    def is_finite(self) -> bool:
+        return math.isfinite(self.episode) and all(
+            math.isfinite(value) for value in self.turns or ()
+        )
+
+    def ranks_below(self, other: _Score) -> bool:
+        """Report whether this score is separated from `other` in the direction training reads."""
+        if self.episode != other.episode:
+            return self.episode < other.episode
+        # equal episodes still rank when per-turn credit separates them, and the trainer compares
+        # turns positionally, so differing lengths are not comparable evidence either way.
+        mine, theirs = self.turns, other.turns
+        if mine is None or theirs is None or len(mine) != len(theirs):
+            return False
+        return sum(mine) < sum(theirs)
+
+    def outranks(self, other: _Score) -> bool:
+        return other.ranks_below(self)
+
+
 def _check_messages(messages: object, label: str) -> list[dict]:
     """Validate that `messages` is a well-formed chat message list and return it."""
     if not isinstance(messages, list) or not messages:
         raise ValueError(f"{label} is not well-formed: {label} must be a non-empty list")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
-            raise ValueError(
-                f"{label} is not well-formed: {label} message {index} must be a dict"
-            )
+            raise ValueError(f"{label} is not well-formed: {label} message {index} must be a dict")
         role = message.get("role")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(
@@ -44,8 +83,7 @@ def _check_messages(messages: object, label: str) -> list[dict]:
             )
         if role.strip().lower() not in _ALLOWED_ROLES:
             raise ValueError(
-                f"{label} is not well-formed: {label} message {index} "
-                f"has unsupported role {role!r}"
+                f"{label} is not well-formed: {label} message {index} has unsupported role {role!r}"
             )
         if "content" not in message:
             raise ValueError(
@@ -183,7 +221,7 @@ def _drive_single_turn(env, example: dict, record: dict) -> None:
     # against. the earlier assistant turns are already excluded from the gate via partial_replay.
     record["reference_turns"] = [response] if policy == "replay" else []
     record["turns"] = 1
-    record["reward"] = float(env.reward(response, example))
+    record["reward"] = _Score(episode=_grade_single_turn(env, response, example))
 
 
 def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str]]:
@@ -241,7 +279,7 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     if policy == "replay" and len(responses) != len(reference_turns):
         record["partial_replay"] = True
 
-    record["reward"] = float(env.reward("", example, state))
+    record["reward"] = _grade_rollout(env, example, state, len(responses))
 
 
 def _control_is_disjoint(control: str, reference: str) -> bool:
@@ -262,36 +300,80 @@ def _control_is_disjoint(control: str, reference: str) -> bool:
     return not any(word in lowered for word in gold.split())
 
 
-def _score_control(env, example: dict, control: str, multi_turn: bool) -> float:
+def _grade_single_turn(env, completion: str, example: dict) -> float:
+    """Score one single-turn completion through the same dispatch the GRPO worker uses.
+
+    ``flash/engine/worker/rl.py`` prefers ``scores_breakdown(...)["total"]`` and only falls back to
+    ``reward()``. An environment whose real composite grader lives in ``scores_breakdown`` while
+    ``reward`` is inherited or a placeholder would otherwise be judged here on a scorer training
+    never calls -- failing a working environment, or passing a broken one (codex[bot]).
+    """
+    if hasattr(env, "scores_breakdown"):
+        return float(env.scores_breakdown(completion, example, None).get("total", 0.0))
+    return float(env.reward(completion, example, None))
+
+
+def _grade_rollout(env, example: dict, state: dict, turn_count: int) -> _Score:
+    """Score a terminal rollout through the multi-turn worker's own path.
+
+    The multi-turn trainer never calls ``env.reward`` itself: it calls ``score_rollouts``
+    (flash/engine/multiturn_rollout.py), which routes through ``rollout_rewards_many`` and returns a
+    typed reward carrying optional per-turn values. ``scores_breakdown`` is single-turn only and is
+    deliberately not consulted here.
+
+    The per-turn values are what make this more than a scalar. Under
+    ``credit_assignment = "per_turn"`` the trainer credits each assistant turn by its own
+    group-relative reward (``GRPOPerTurnTrainer``, selected in flash/engine/worker/rl.py), so an env
+    may hold the episode score constant while the per-turn vector still separates a gold rollout
+    from a wrong one. Reading the episode scalar alone would report that env as unable to rank while
+    training learns from it perfectly well (codex[bot]).
+    """
+    from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
+
+    request = RolloutScoreRequest(example=example, state=state, turn_count=turn_count)
+    reward = score_rollouts(env, [request])[0]
+    return _Score(episode=float(reward.episode), turns=reward.turns)
+
+
+def _score_control(env, example: dict, control: str, multi_turn: bool) -> _Score:
     """Score one deliberately wrong answer the way training would score it.
 
-    A grader that raises here is not inconclusive: GRPO's reward_fn catches exactly that and scores
-    the completion 0.0 (flash/engine/worker/rl.py), so training would see a real number. Record that
-    same 0.0, otherwise a row that genuinely separates gold from wrong is dropped and a later tied
-    row can fail the whole sample alone.
+    For single-turn GRPO a grader that raises is not inconclusive: ``reward_fn`` catches exactly
+    that and scores the completion 0.0 (flash/engine/worker/rl.py), so training would see a real
+    number. Record that same 0.0, otherwise a row that genuinely separates gold from wrong is
+    dropped and a later tied row can fail the whole sample alone.
+
+    Multi-turn is the opposite contract and must not be flattened into it: the rollout path calls
+    ``score_rollouts`` directly (flash/engine/multiturn_rollout.py) with no except branch, so a
+    scorer that raises there aborts the run. Swallowing it here would report a wrong episode as
+    cleanly separated at 0.0 and pass an environment that cannot survive its first rollout, so let
+    it propagate and fail the episode (codex[bot]).
+
+    ``SystemExit`` propagates in both modes. ``reward_fn`` catches only ``Exception``, so a grader
+    that exits on an unexpected completion kills training rather than scoring it zero -- and the
+    gold replay is already failed for exactly that (codex[bot]).
 
     Raises ValueError when the grader returns a non-finite score, which is the same contract
     violation the gold answer is already failed for: the policy reaches this scorer with completions
     no more expected than these, and NaN or infinity there yields unusable samples.
     """
-    try:
-        if multi_turn:
-            # a multi-turn reward reads the accumulated rollout state, so a comparable wrong
-            # episode has to be driven, not assembled -- replay the same loop answering `control`
-            # at every turn.
-            state, _ = _run_rollout(env, example, lambda _index: control)
-            score = float(env.reward("", example, state))
-        else:
-            score = float(env.reward(control, example))
-    except (Exception, SystemExit):
-        # mirrors reward_fn's own except branch: the run would score this 0.0 and carry on.
-        score = 0.0
-    if not math.isfinite(score):
-        raise ValueError(f"reward is not finite for a non-reference completion: {score}")
+    if multi_turn:
+        # a multi-turn reward reads the accumulated rollout state, so a comparable wrong episode has
+        # to be driven, not assembled -- replay the same loop answering `control` at every turn.
+        state, responses = _run_rollout(env, example, lambda _index: control)
+        score = _grade_rollout(env, example, state, len(responses))
+    else:
+        try:
+            score = _Score(episode=_grade_single_turn(env, control, example))
+        except Exception:
+            # mirrors reward_fn's own except branch: the run would score this 0.0 and carry on.
+            score = _Score(episode=0.0)
+    if not score.is_finite():
+        raise ValueError(f"reward is not finite for a non-reference completion: {score.episode}")
     return score
 
 
-def _negative_control_rewards(env, example: dict, references: list[str]) -> list[float] | None:
+def _negative_control_rewards(env, example: dict, references: list[str]) -> list[_Score] | None:
     """Score deliberately wrong answers, or None when that is not meaningful.
 
     This is the comparison that makes the flat-reward gate scale-independent: a grader is unusable
@@ -305,12 +387,19 @@ def _negative_control_rewards(env, example: dict, references: list[str]) -> list
     Returns None when no control is provably wrong for this example, so the caller can exclude the
     episode instead of drawing a conclusion the evidence does not support.
     """
+    # a text-free gold turn (a native tool call, an image-only block) carries no text a control
+    # could collide with, so it cannot make a control unusable. keeping it would send every
+    # candidate through _control_is_disjoint's empty-gold guard, return None for the episode, and
+    # silently exclude it from the gate -- letting a flat grader pass unexamined (codex[bot]).
+    scorable = [reference for reference in references if reference.strip()]
+    if not scorable:
+        return None
     usable = [
         control
         for control in _CONTROL_CANDIDATES
         # every gold turn has to be wrong under the control, since a multi-turn reward reads the
         # whole transcript: a control matching any single turn is not a wrong episode.
-        if all(_control_is_disjoint(control, reference) for reference in references)
+        if all(_control_is_disjoint(control, reference) for reference in scorable)
     ]
     scores = [_score_control(env, example, control, env.multi_turn) for control in usable]
     return scores or None
@@ -323,19 +412,21 @@ def _load_failure(reason: str) -> int:
 
 
 def _grades_completions(args) -> bool:
-    """Whether the run this environment is for will actually call ``env.reward()``.
+    """Whether the run this environment is for will actually grade a completion.
 
     The SFT worker builds rows from ``dataset()``, ``prompt_messages()`` and ``sft_completion()``
-    and never scores anything (``flash/engine/worker/sft.py``), so an SFT-only environment may
-    legitimately ship a placeholder scorer that returns one constant. Failing that on reward
-    quality would reject a working environment, and this command has no config to infer intent
-    from -- hence the explicit flag. Unset means "unknown", which is not grounds to fail; the
-    ranking check still reports its finding as a warning.
+    and never scores anything (``flash/engine/worker/sft.py``); the OPD and OPSD workers read the
+    same hooks and distil against a teacher, so they never grade either. Only GRPO reaches a scorer
+    (``flash/engine/worker/rl.py``, ``flash/engine/multiturn_rollout.py``). Any of the others may
+    legitimately ship a placeholder scorer that returns one constant, and failing that on reward
+    quality would reject a working environment. This command has no config to infer intent from --
+    hence the explicit flag. Unset means "unknown", which is not grounds to fail; the ranking check
+    still reports its finding as a warning.
     """
     algorithm = getattr(args, "algorithm", None)
     if not algorithm or not str(algorithm).strip():
         return False
-    return samples_on_policy(normalize_algorithm(str(algorithm).strip()))
+    return normalize_algorithm(str(algorithm).strip()) in _REWARD_CONSUMING_ALGORITHMS
 
 
 def cmd_env_test(args) -> int:
@@ -384,8 +475,10 @@ def cmd_env_test(args) -> int:
             else:
                 _drive_single_turn(env, example, record)
             reward = record["reward"]
-            if reward is None or not math.isfinite(reward):
-                raise ValueError(f"reward is not finite: {reward}")
+            if reward is None or not reward.is_finite():
+                raise ValueError(
+                    f"reward is not finite: {reward if reward is None else reward.episode}"
+                )
             if record["policy"] == "replay" and not record["partial_replay"]:
                 # the absolute value of a gold reward proves nothing: the contract accepts any
                 # finite scalar, so an env may legitimately score its reference 0.0 with worse
@@ -400,7 +493,7 @@ def cmd_env_test(args) -> int:
             failure = str(exc) or exc.__class__.__name__
 
         reward = record["reward"]
-        reward_text = "n/a" if reward is None else f"{reward:.6f}"
+        reward_text = "n/a" if reward is None else f"{reward.episode:.6f}"
         print(
             f"episode {index}: policy={record['policy']} "
             f"turns={record['turns']} reward={reward_text}"
@@ -418,24 +511,26 @@ def cmd_env_test(args) -> int:
         # episodes it never tested.
         if controls is not None and reward is not None:
             controlled += 1
-            if any(control > reward for control in controls):
+            if any(control.outranks(reward) for control in controls):
                 # strictly worse than a deliberately wrong answer. GRPO maximizes this number, so
                 # the run would train away from the gold answers -- a broken reward direction is
                 # worse than a flat one, and no amount of separation elsewhere redeems it.
                 inverted += 1
+                highest = max(control.episode for control in controls)
                 message = (
-                    f"a deliberately wrong answer scored higher ({max(controls):.6f}) than the "
-                    f"replayed gold answer ({reward:.6f}); the reward direction looks inverted"
+                    f"a deliberately wrong answer scored higher ({highest:.6f}) than the "
+                    f"replayed gold answer ({reward.episode:.6f}); the reward direction looks "
+                    "inverted"
                 )
                 print(
                     render.warn(message) if render.styled() else f"warning: {message}",
                     file=sys.stderr,
                 )
-            elif all(control == reward for control in controls):
+            elif not any(control.ranks_below(reward) for control in controls):
                 scored_flat += 1
                 message = (
                     f"replay gold answer and {len(controls)} deliberately wrong answer(s) all "
-                    f"scored {reward:.6f}; check the reward function"
+                    f"scored {reward.episode:.6f}; check the reward function"
                 )
                 print(
                     render.warn(message) if render.styled() else f"warning: {message}",
