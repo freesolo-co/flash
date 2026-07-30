@@ -852,8 +852,6 @@ def cmd_chat(args) -> int:
     system = getattr(args, "system", None)
     if system:
         messages.insert(0, {"role": "system", "content": system})
-    if render.styled():
-        print(render.chat_label())
     wrote = False
     for chunk in client.chat_stream(
         chat_target,
@@ -861,6 +859,12 @@ def cmd_chat(args) -> int:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
     ):
+        # the label waits for the first chunk: printing it up front would leave `assistant` on
+        # stdout when the stream turns out to be empty, so a styled run (a tty, or FLASH_STYLE=1)
+        # would exit 1 with non-empty stdout and break the same health check this failure exists
+        # to make possible.
+        if not wrote and render.styled():
+            print(render.chat_label())
         print(chunk, end="", flush=True)
         wrote = True
     if not wrote:
@@ -871,7 +875,7 @@ def cmd_chat(args) -> int:
         print(
             f"no response text from {chat_target}: the request succeeded but the model returned "
             "nothing. the deployment may be unhealthy or still starting; check "
-            f"`{CLI_NAME} models list` and retry.",
+            f"`{CLI_NAME} models deployments` and retry.",
             file=sys.stderr,
         )
         return 1

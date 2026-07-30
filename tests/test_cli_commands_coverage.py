@@ -245,3 +245,41 @@ def test_chat_fails_when_the_stream_carries_no_text(monkeypatch, capsys) -> None
     assert result == 1
     assert captured.out == ""
     assert "no response text from flash-1" in captured.err
+
+    # `models list` enumerates supported base models and carries no deployment state, so it cannot
+    # investigate either condition this message names. `models deployments` is the one that can.
+    assert f"{commands.CLI_NAME} models deployments" in captured.err
+    assert "models list" not in captured.err
+
+
+def test_chat_keeps_stdout_empty_when_a_styled_stream_carries_no_text(monkeypatch, capsys) -> None:
+    """The empty-stream contract is "exit 1 with empty stdout", and styling must not break it.
+
+    Styling turns on automatically on a tty and explicitly via FLASH_STYLE=1, so this is the
+    default interactive path, not an edge case. Printing the `assistant` label before the first
+    chunk leaves it on stdout when the stream turns out to be empty, which is precisely what a
+    caller capturing output through a PTY would then have to treat as a response.
+    """
+
+    class EmptyChatClient:
+        def chat_stream(self, run_id, messages, **kwargs):
+            return iter(())
+
+    monkeypatch.setattr(commands, "client_from_config", EmptyChatClient)
+    monkeypatch.setattr(commands.render, "styled", lambda: True)
+    monkeypatch.setattr(commands.render, "chat_label", lambda: "assistant-label")
+
+    result = commands.cmd_chat(
+        SimpleNamespace(
+            run_id="flash-1",
+            message="hello",
+            system=None,
+            temperature=0.0,
+            max_tokens=32,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert "no response text from flash-1" in captured.err
