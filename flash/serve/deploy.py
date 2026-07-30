@@ -987,8 +987,12 @@ def chat_stream(
     temperature: float = 0.0,
     max_tokens: int = 512,
     thinking: bool = False,
+    stop: list[str] | None = None,
 ) -> Iterator[str]:
-    """Yield text deltas from the freesolo OpenAI-compatible streaming endpoint."""
+    """Yield text deltas from the freesolo OpenAI-compatible streaming endpoint.
+
+    ``stop`` carries the run's own stop sequences, as in ``chat``.
+    """
     base = serving_openai_base_url()
     body = {
         "model": run_id,
@@ -998,6 +1002,8 @@ def chat_stream(
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
         "stream": True,
     }
+    if stop:
+        body["stop"] = [str(value) for value in stop]
     with _stream_http_client().stream(
         "POST",
         f"{base}/chat/completions",

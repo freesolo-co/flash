@@ -1429,6 +1429,12 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             status_code=400,
             detail=f"max_tokens must be a positive integer, got {max_tokens}",
         )
+    # the same stops the deployment smoke verified with: a run trained to terminate on a delimiter
+    # rather than EOS would otherwise pass verification and then run to max_tokens, or emit trailing
+    # text past its answer, on every real request.
+    stop_sequences = [
+        str(value) for value in (getattr(spec.train, "stop_sequences", ()) or ())
+    ] or None
     try:
         if payload.get("stream") is True:
             return StreamingResponse(
@@ -1438,6 +1444,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                     temperature=temperature,
                     max_tokens=max_tokens,
                     thinking=spec.thinking,
+                    stop=stop_sequences,
                 ),
                 media_type="text/plain; charset=utf-8",
             )
@@ -1447,6 +1454,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             temperature=temperature,
             max_tokens=max_tokens,
             thinking=spec.thinking,
+            stop=stop_sequences,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc
