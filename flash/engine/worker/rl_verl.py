@@ -798,7 +798,9 @@ def score_single_turn(
             {
                 "raw": solution_str,
                 "completion": graded,
-                "thinking": _w.thinking_text(solution_str, prompt_opened_thinking=prompt_opened_thinking),
+                "thinking": _w.thinking_text(
+                    solution_str, prompt_opened_thinking=prompt_opened_thinking
+                ),
             }
             if thinking
             else None
@@ -808,13 +810,55 @@ def score_single_turn(
         else:
             r = float(env.reward(graded, ex, state))
     except Exception as exc:  # env scoring must not kill the run
-        print(f"[rl-verl] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0", flush=True)
+        print(
+            f"[rl-verl] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0", flush=True
+        )
         return 0.0
     if think_penalty > 0 and thinking:
         r -= think_penalty * _w.think_token_count(
             solution_str, tok, prompt_opened_thinking=prompt_opened_thinking
         )
     return float(r)
+
+
+def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_step: int) -> None:
+    """Measure this env's real grading latency once, before training starts, and report it.
+
+    Single-turn grading is serial, so it is pure gpu-idle wall time -- at the default 64x8 shape a
+    1s grader idles the gpu for ~80% of every step. The cost model has to guess that number from
+    one global average spanning regex graders to llm judges; this prints what it actually is for
+    THIS env, so a mispriced run is visible in the log instead of only in the bill.
+
+    Profiles against each example's own reference completion rather than blank text: an empty
+    string does not exercise a grader, so a blank-text profile understates real latency.
+
+    Advisory only, and never fatal -- it must not be able to break a run it is only measuring.
+    """
+    try:
+        from flash.engine.reward_profile import profile_reward_latency
+
+        samples: list[tuple[int, str]] = []
+        for index, example in enumerate(rollout_examples[:4]):
+            try:
+                messages = env.sft_completion(example) or []
+                text = "".join(str(m.get("content") or "") for m in messages)
+            except Exception:
+                text = ""
+            samples.append((index, text))
+        if not samples:
+            return
+        profile = profile_reward_latency(score_one, samples)
+        print(f"[rl-verl] {profile.describe()}", flush=True)
+        if profile.trustworthy and completions_per_step > 0:
+            per_step_s = profile.seconds_per_completion * completions_per_step
+            print(
+                f"[rl-verl] serial reward grading costs ~{per_step_s:.0f}s per step "
+                f"({completions_per_step} completions x {profile.seconds_per_completion:.3f}s), "
+                "all of it gpu-idle.",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[rl-verl] reward profiling skipped: {exc}", flush=True)
 
 
 # --------------------------------------------------------------------------------------------
@@ -843,7 +887,9 @@ def start_reward_server(score_by_index, *, example_count: int):
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
                 index = int(payload["index"])
                 if index < 0 or index >= example_count:
-                    raise IndexError(f"reward example index {index} is outside [0, {example_count})")
+                    raise IndexError(
+                        f"reward example index {index} is outside [0, {example_count})"
+                    )
                 with score_lock:
                     score = float(score_by_index(index, payload.get("solution_str", "")))
             except Exception as exc:
@@ -878,7 +924,9 @@ def _resolve_verl_loggers(python_bin: str) -> str:
         subprocess.run([python_bin, "-c", "import wandb"], capture_output=True).returncode == 0
     )
     if not has_wandb:
-        print("[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; using console logger only")
+        print(
+            "[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; using console logger only"
+        )
     return "console,wandb" if has_wandb else "console"
 
 
@@ -909,9 +957,20 @@ def _export_peft_adapter(
     merge_env["TRANSFORMERS_OFFLINE"] = "1"
     merge_env["HF_HUB_DISABLE_XET"] = "1"
     subprocess.run(
-        [python_bin, "-m", "verl.model_merger", "merge", "--backend", "fsdp",
-         "--local_dir", ckpt_actor_dir, "--target_dir", merge_out],
-        check=True, env=merge_env,
+        [
+            python_bin,
+            "-m",
+            "verl.model_merger",
+            "merge",
+            "--backend",
+            "fsdp",
+            "--local_dir",
+            ckpt_actor_dir,
+            "--target_dir",
+            merge_out,
+        ],
+        check=True,
+        env=merge_env,
     )
     lora_dir = os.path.join(merge_out, "lora_adapter")
     if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
@@ -1142,7 +1201,10 @@ class _VerlResumeUploader:
                         try:
                             _w.upload_resume_checkpoint(step, path)
                         except Exception as error:
-                            print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
+                            print(
+                                f"[rl-verl] resume checkpoint upload failed at step {step}: {error}",
+                                flush=True,
+                            )
                     self.processed_steps.add(step)
                 # a step staged while the gate was shut is published by a later sweep, so this runs
                 # every pass and not only when something was staged: the gate opens on the first
@@ -1253,7 +1315,9 @@ def _latest_global_step_dir(local_dir: str) -> tuple[str, int]:
     return best, best_step
 
 
-def _stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:
+def _stamp_adapter_dir_provenance(
+    adapter_dir: str, model_id: str, model_revision: str = ""
+) -> None:
     """stamp the saved adapter's immutable base identity into adapter_config.json.
 
     dir-based analogue of _w.stamp_adapter_provenance (which needs an in-memory peft model). same
@@ -1338,7 +1402,9 @@ def _resolve_single_turn_inputs():
             "use the trl backend or add actor_rollout_ref.model.lora_dropout support."
         )
     gcfg = _w.grpo_overrides()
-    prompts_per_step = int(_t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step)
+    prompts_per_step = int(
+        _t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step
+    )
     group_size = int(gcfg.get("group_size") or rl.group_size)
     _gcfg_temp = gcfg.get("temperature")
     temperature = float(_gcfg_temp if _gcfg_temp is not None else rl.sampling_temperature)
@@ -1354,7 +1420,9 @@ def _resolve_single_turn_inputs():
             flush=True,
         )
     mask_truncated_completions = _w.grpo_mask_truncated_completions(_t)
-    learning_rate = float(_t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate)
+    learning_rate = float(
+        _t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate
+    )
     # warm-start forbids lora_rank, so a set init_from_adapter already raised above; read rank/alpha
     # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
     lora_rank = int(_t.lora_rank) if (_t and _t.lora_rank) else int(RECIPE.lora.rank)
@@ -1432,7 +1500,9 @@ def _resolve_single_turn_inputs():
         )
     prompt_budget = vllm_max_len - max_completion
     if prompt_budget <= 0:
-        raise ValueError("engine length leaves no room for the completion; raise max_context_tokens")
+        raise ValueError(
+            "engine length leaves no room for the completion; raise max_context_tokens"
+        )
 
     prompts = []
     for ex, messages in zip(train, message_prompts, strict=True):
@@ -1551,8 +1621,10 @@ def run_rl_verl():
         _shared = _shared_weight_cache_dir()
         try:
             model_path_for_verl = _snap(
-                inp["model_id"], revision=inp["model_revision"],
-                cache_dir=_shared, local_files_only=True,
+                inp["model_id"],
+                revision=inp["model_revision"],
+                cache_dir=_shared,
+                local_files_only=True,
             )
         except Exception:
             model_path_for_verl = _snap(
@@ -1567,7 +1639,9 @@ def run_rl_verl():
     indices = [int(r["example_idx"]) for r in ds_rows]
     # ground_truth is a verl-schema placeholder only; the reward bridge scores by example_idx
     # against the live env and never reads it.
-    ground_truths = [str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples]
+    ground_truths = [
+        str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples
+    ]
 
     workdir = f"/tmp/rl_verl_seed{_w.SEED}"
     os.makedirs(workdir, exist_ok=True)
@@ -1628,8 +1702,11 @@ def run_rl_verl():
     def _score(index: int, solution_str: str) -> float:
         ex = rollout_examples[int(index)]
         score = score_single_turn(
-            env, solution_str, ex,
-            tok=tok, thinking=bool(_w.THINKING),
+            env,
+            solution_str,
+            ex,
+            tok=tok,
+            thinking=bool(_w.THINKING),
             prompt_opened_thinking=inp["prompt_opened_thinking"],
             think_penalty=inp["think_penalty"],
         )
@@ -1637,6 +1714,10 @@ def run_rl_verl():
             recent_samples.append((solution_str, score))
             del recent_samples[:-64]
         return score
+
+    _log_reward_profile(
+        env, _score, rollout_examples, int(inp["prompts_per_step"]) * int(inp["group_size"])
+    )
 
     server, reward_url = start_reward_server(_score, example_count=len(rollout_examples))
     # bound before the try so the finally can always ask whether it was started.
@@ -1724,9 +1805,7 @@ def run_rl_verl():
             # worker's own spread history cannot speak for them; let it publish as before and leave
             # the verdict to the same abstention _check_grpo_had_a_gradient makes.
             had_gradient=(
-                None
-                if resume_step
-                else lambda: any(spread > 0.0 for spread in adv_spread_history)
+                None if resume_step else lambda: any(spread > 0.0 for spread in adv_spread_history)
             ),
         )
         resume_uploader.credit_durable_required_steps(resume_step)
@@ -1767,7 +1846,10 @@ def run_rl_verl():
         ):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env_for_verl,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env_for_verl,
                 start_new_session=True,
             )
             try:
@@ -1844,7 +1926,9 @@ def run_rl_verl():
                     proc.wait(timeout=10)
                 raise
         if rc != 0:
-            raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
+            raise RuntimeError(
+                f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
+            )
         # the gradient verdict runs here, ahead of required-save completeness, because a zero-spread
         # run withholds every required deployable BY DESIGN: checking completeness first would raise
         # on artifacts the gate is deliberately holding and report a checkpoint-publication failure
@@ -1879,7 +1963,9 @@ def run_rl_verl():
     # publication symptom.
     actor_dir, steps_run = _latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
-        raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")
+        raise RuntimeError(
+            f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
+        )
 
     with liveness_heartbeat(
         "rl_finalizing",
@@ -1888,7 +1974,9 @@ def run_rl_verl():
         progress_step=True,
         keepalive=True,
     ):
-        _export_peft_adapter(actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin)
+        _export_peft_adapter(
+            actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
+        )
         tok.save_pretrained(adapter_dir)
         _stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
@@ -1914,8 +2002,11 @@ def run_rl_verl():
         train_tokens=0,
         heartbeat_fields={"metrics_last": list(metrics_last)},
         generated_tokens=int(
-            sum(resp_len_history) / max(1, len(resp_len_history))
-            * steps_run * inp["prompts_per_step"] * inp["group_size"]
+            sum(resp_len_history)
+            / max(1, len(resp_len_history))
+            * steps_run
+            * inp["prompts_per_step"]
+            * inp["group_size"]
         )
         if resp_len_history
         else 0,
