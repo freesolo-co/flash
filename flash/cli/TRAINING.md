@@ -326,10 +326,22 @@ is the _expected_ steady state, not a symptom. Upload failures can stretch the g
 `flash runs status` says so itself once the heartbeat passes 5 minutes — _"heartbeat uploads
 are throttled; quiet is not dead"_.
 
-So treat age as a threshold, not a verdict:
+**The threshold is algorithm-dependent: OPD is far tighter than 15 min.** The 900 s figure is
+the throttle for an ordinary stage ping. OPD's post-update ping is issued with `force=True`,
+which bypasses that throttle and is instead bounded by the forced-commit floor of **60 s**
+(`_HB_FORCE_MIN_INTERVAL_S`), gated on the step having advanced. So an OPD run that is still
+applying updates re-publishes roughly every optimizer step, subject only to that 60 s floor —
+and an OPD heartbeat stuck for several minutes already means updates have stopped, which is
+exactly the window the 15 min guidance below would tell you to ignore on a billed run.
 
-- _Under ~15 min:_ tells you nothing is wrong. Do not act.
-- _Well past ~15 min:_ suspicious, still not conclusive. Corroborate before deciding —
+So treat age as a threshold, not a verdict, and pick the threshold for the algorithm:
+
+- _OPD, past ~2-3 min in a stepping stage (`opd_step`):_ act. Updates should be re-publishing
+  at the 60 s floor, so a multi-minute gap is already anomalous rather than expected quiet.
+  (Setup and rollout stages — `opd_model_load`, `opd_filtering_prompts`, `opd_vllm_initializing`
+  — are liveness-driven and legitimately quieter; the tight threshold is for stepping.)
+- _Otherwise, under ~15 min:_ tells you nothing is wrong. Do not act.
+- _Otherwise, well past ~15 min:_ suspicious, still not conclusive. Corroborate before deciding —
   check the provider/attempt state and follow `flash runs log <run-id> -f`, which streams
   independently of the heartbeat upload cycle. A retry that has already started will show a
   new attempt.
@@ -893,8 +905,13 @@ every run, the last two matter more the smaller the model:
 
 - **Train fewer steps (highest leverage, every size).** The student typically peaks early — often
   around ~20 optimizer steps — and every step after is pure over-sharpening that _lowers_ accuracy
-  while _raising_ the loop rate. Cut `max_examples` (or `epochs`) so the run stops before the collapse,
-  and deploy an early **checkpoint** (`flash runs checkpoint <run>`, `flash models deploy <run>/step-N`) rather
+  while _raising_ the loop rate. **Which knob to cut depends on whether your config sets `max_steps`.**
+  A positive `max_steps` is the authoritative update count (`resolve_update_horizon()` returns it and
+  ignores the derived horizon), so with one set, cutting `max_examples` or `epochs` does not shorten
+  training at all — you would rerun the identical overlong horizon at the same cost. Lower or remove
+  `max_steps` instead. Only when the horizon is _derived_ (no `max_steps`, or `max_steps = 0`) does
+  cutting `max_examples` (or `epochs`) stop the run before the collapse. Either way,
+  deploy an early **checkpoint** (`flash runs checkpoint <run>`, `flash models deploy <run>/step-N`) rather
   than the final adapter. This helped at every size tested — a 4B went 42% acc / 44% loop at full
   length -> **74% / 0% at step 20**, and even models that never looped came out equal-or-better at the
   earlier checkpoint. When in doubt, sweep a few checkpoints and pick the best, don't assume the last
