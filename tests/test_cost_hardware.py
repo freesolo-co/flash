@@ -121,3 +121,79 @@ def test_effective_train_tflops_is_peak_for_uncapped_classes():
         # only b200 is capped; every other class keeps its peak.
         expected = effective_train_tflops("H200") if name == "B200" else gpu_tflops(name)
         assert effective_train_tflops(name) == expected
+
+
+def test_nvlink_classification_is_by_form_factor():
+    from flash.cost.facts import has_nvlink
+
+    # sxm datacenter parts carry nvlink.
+    assert has_nvlink("A100 SXM")
+    assert has_nvlink("A100 SXM 40GB")
+    assert has_nvlink("H100")
+    # geforce parts do not; the 4090 dropped the nvlink connector entirely. l40s is a pcie board.
+    assert not has_nvlink("RTX 4090")
+    assert not has_nvlink("L40S")
+    # an unclassified class must fall to the conservative side rather than raise.
+    assert not has_nvlink("some-unlisted-gpu")
+
+
+def test_nvlink_classification_tracks_the_provisioned_board():
+    """Classification must follow the pin a MULTI-CARD run actually lands on.
+
+    Multi-card provisioning is runpod-only, and runpod pins H100 to the HBM3 sxm part while
+    negating the pcie/NVL boards in the same pool. Assert against those pins rather than restating
+    the classification, so re-pinning a class to a different board fails here instead of silently
+    pricing it on an interconnect it no longer has.
+    """
+    from flash.cost.facts import has_nvlink
+    from flash.providers.base import GPU_INFO
+    from flash.providers.runpod.gpus import _POOL_MEMBERS_MISSING_FROM_SDK
+
+    assert GPU_INFO["H100"].enum_member == "NVIDIA_H100_80GB_HBM3"  # sxm, not the pcie board
+    assert has_nvlink("H100")
+    # the non-sxm members of the same runpod pool are negated, so a pin cannot land on them.
+    assert _POOL_MEMBERS_MISSING_FROM_SDK["ADA_80_PRO"] == ("NVIDIA H100 PCIe", "NVIDIA H100 NVL")
+
+
+def test_multi_card_speedup_is_interconnect_aware():
+    from flash.cost.analytical import multi_card_speedup
+
+    # MEASURED on runpod with one identical 2-card fsdp benchmark per interconnect:
+    #   nvlink 2x A100-SXM4-80GB 1.7675x, pcie 2x L40S 1.4212x.
+    # the model must land near each measurement, not split the difference with one constant.
+    assert multi_card_speedup(2, "A100 SXM") == pytest.approx(1.7675, abs=0.05)
+    assert multi_card_speedup(2, "RTX 4090") == pytest.approx(1.4212, abs=0.05)
+    # one card is exactly one card on any fabric.
+    for name in ("A100 SXM", "RTX 4090", "unknown"):
+        assert multi_card_speedup(1, name) == 1.0
+
+
+def test_pcie_scaling_is_never_credited_nvlink_bandwidth():
+    """The invariant the measurement exists to protect.
+
+    A pcie pair delivered 1.42x where the old global 0.85 constant claimed 1.70x. Crediting that
+    difference lets a 2-card pcie combination win a ranking on scaling it does not have, and then
+    bills both cards for the longer wall time. Assert the ORDERING, so recalibrating either
+    constant cannot silently reintroduce the inversion.
+    """
+    from flash.cost.analytical import multi_card_speedup
+
+    for n in (2, 3, 4):
+        assert multi_card_speedup(n, "RTX 4090") < multi_card_speedup(n, "A100 SXM")
+        # and neither may ever claim linear scaling, which no fabric delivers.
+        assert multi_card_speedup(n, "A100 SXM") < n
+
+
+def test_multi_card_speedup_never_decreases_with_card_count():
+    """Adding a card must never model as slower.
+
+    The raw geometric curve turns back down below ~0.72 scaling (at the measured pcie 0.71: 3 cards
+    1.512x, 4 cards 1.432x). Left unclamped the allocator would price a 4-card pcie combination as
+    slower than a 3-card one and reject cards that do add throughput. No real fabric loses aggregate
+    throughput when a card is added; the extrapolation flattens, it does not reverse.
+    """
+    from flash.cost.analytical import multi_card_speedup
+
+    for name in ("A100 SXM", "RTX 4090", "H100", "unlisted-class"):
+        vals = [multi_card_speedup(n, name) for n in range(1, 9)]
+        assert vals == sorted(vals), f"{name} speedup decreases: {vals}"
