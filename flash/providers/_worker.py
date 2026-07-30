@@ -44,6 +44,10 @@ WORKER_DEPS = [
     # (force_vllm_backend_for_sm120). No-op on non-Blackwell archs.
     "flashinfer-python==0.6.6",
     "bitsandbytes>=0.49",
+    # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
+    # FLASH_VERL_PYTHON is unset. sft and opd are verl-only, so on the no-image path that call is
+    # unconditional and a missing `uv` fails the run with FileNotFoundError before training.
+    "uv>=0.5",
     "datasets>=4.7,<6",
     # >=0.2.54: includes robust JSONL loading and corrected package metadata.
     FREESOLO_WORKER_SPEC,

@@ -1010,12 +1010,21 @@ def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
     assert 141 < need <= 180
 
 
-def test_opd_35b_full_context_group1_fits_b200():
-    """a full-context group-1 35b opd run fits the b200 with conservative kv sizing."""
+def test_opd_35b_full_context_group1_is_rejected_because_it_only_fits_under_fp8():
+    """A full-context group-1 35B OPD run does NOT fit any card, and must be rejected at parse time.
+
+    This config used to route to the B200 on the strength of an fp8-KV discount. The 35B is a GDN
+    hybrid and the OPD worker refuses fp8 KV for those (vllm's init_fp8_kv_scales crashes on the
+    hybrid cache under verl's sleep/wake), so the run really allocates a bf16 cache. The discount
+    was therefore admitting a run onto a card that cannot hold it, to OOM at rollout init on a paid
+    GPU. Rejecting it during sizing is the correct outcome: the numbers below are exactly why.
+    """
+    import math
+
     from flash.catalog import MODELS, vocab_size_for
     from flash.engine.vram import estimate_vram_gb, model_required_vram_gb
     from flash.providers.allocator import vram_headroom
-    from flash.providers.base import cheapest_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError, cheapest_gpu
 
     moe = "Qwen/Qwen3.6-35B-A3B"
     info = MODELS[moe]
@@ -1027,9 +1036,11 @@ def test_opd_35b_full_context_group1_fits_b200():
         "lora_rank": 32,
     }
     need = model_required_vram_gb(moe, "opd", train=train, headroom=vram_headroom())
-    assert need <= 180
-    assert cheapest_gpu(need) == "B200"
-    # fp8 kv keeps the dense-image-safe estimate within b200; the conservative bf16 kv estimate does not.
+    biggest = max(g.vram_gb for g in GPU_INFO.values() if g.validated)
+    assert need > biggest
+    with pytest.raises(UnsupportedGpuError):
+        cheapest_gpu(need)
+    # the discount is what used to admit it: fp8 lands under the 180 gb b200, bf16 does not.
     kw = {
         "seq_len": 4096,
         "max_tokens": 2048,
@@ -1041,9 +1052,10 @@ def test_opd_35b_full_context_group1_fits_b200():
     }
     fp8 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=True, **kw)
     bf16 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=False, **kw)
-    assert fp8 < bf16
     hr = vram_headroom()
     assert fp8 * hr <= 180 < bf16 * hr
+    # and the routed requirement must be the bf16 one, since that is the cache the worker allocates.
+    assert need >= math.ceil(bf16 * hr)
 
 
 def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():

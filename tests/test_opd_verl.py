@@ -5139,6 +5139,30 @@ def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
     assert '"opt_steps": len(final_accounting["loss_curve"]),' in notes
 
 
+def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
+    """An all-over-budget dataset must fail before the multi-GB prefetch, not after it.
+
+    The prompt budget comes from `max_context_tokens - max_completion` and the prompt ids come from
+    the tokenizer, so "every prompt is over budget" is decidable from files that weigh kilobytes.
+    Running `prefetch_model` first spends tens of GB of download and minutes of paid worker time to
+    reach a verdict the tokenizer already had. The deleted trl trainer filtered first; this pins the
+    verl path to the same order.
+
+    `_generation_eos_from_cached_config` reads the snapshot with local_files_only, so it is allowed
+    to sit after the prefetch -- but the budget check must not.
+    """
+    import inspect
+
+    from flash.engine.worker.opd_verl import run_opd_verl
+
+    source = inspect.getsource(run_opd_verl)
+    budget_raise = source.index('raise RuntimeError("every OPD prompt exceeds the configured')
+    prefetch = source.index("_w.prefetch_model(")
+    assert budget_raise < prefetch
+    # and the eos read, which needs the downloaded snapshot, must follow the prefetch.
+    assert prefetch < source.index("_generation_eos_from_cached_config(")
+
+
 def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
     import inspect
 
@@ -5592,6 +5616,8 @@ def test_opd_missing_managed_teacher_key_fails_before_the_gpu_probe(monkeypatch)
             AssertionError("gpu allocation must not be reached")
         ),
     )
+    # torch is not installed in this test env; the real seeding is covered in test_training_controls.
+    monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
     monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
 
     with pytest.raises(RuntimeError, match="managed teacher api key is missing"):

@@ -34,6 +34,9 @@ gpu = [
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
     "accelerate>=1.4",
+    # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
+    # FLASH_VERL_PYTHON is unset. sft and opd are verl-only, so that call is unconditional here.
+    "uv>=0.5",
     # Worker runtime: Freesolo environment loading and HF checkpoint I/O.
     "datasets>=2.19",
     "freesolo>=0.2.60",

@@ -542,6 +542,18 @@ def grpo_kv_floor_gb(
     return upper
 
 
+def _declares_linear_attention(model_info) -> bool:
+    """True for a GDN hybrid, using the catalog rather than a network config fetch.
+
+    The two vLLM rollout workers refuse an fp8 KV cache for these models (vllm's fp8 wake path
+    init_fp8_kv_scales assumes a plain kv tensor and crashes on the hybrid cache), so sizing must
+    not apply the fp8 discount to them or it reserves half the cache the run allocates. This is the
+    offline half of engine/worker/packing.py:model_is_gdn_hybrid, which probes the HF config; the
+    catalog carries num_linear_attention_layers for every model it routes.
+    """
+    return int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0
+
+
 def _rollout_kv_floor_gb(
     params_b: float,
     vllm_max_len: int,
@@ -561,6 +573,8 @@ def _rollout_kv_floor_gb(
     )
     from flash.providers.base import max_non_fp8_kv_vram_gb
 
+    if _declares_linear_attention(model_info):
+        return floor
     ceiling = max_non_fp8_kv_vram_gb()
     if floor <= ceiling:
         return floor
@@ -1019,9 +1033,15 @@ def model_required_vram_gb(
         (cc >= 8.9) card, so that bf16 pool is a phantom: it doubles the real KV and wrongly rejects
         full-context / grouped OPD configs on the 35B that actually fit a B200. Halve it — but only
         while the fp8-sized requirement still clears the non-fp8 ceiling, so the discount can never
-        pull the run back onto a card that would NOT use fp8 (which would then OOM)."""
+        pull the run back onto a card that would NOT use fp8 (which would then OOM).
+
+        Skipped entirely for GDN hybrids: both workers refuse fp8 KV for them (opd_verl.py,
+        rl_verl.py), so their cache really is bf16 and the discount would admit a run onto a card
+        that cannot hold it."""
         from flash.providers.base import max_non_fp8_kv_vram_gb
 
+        if _declares_linear_attention(model_info):
+            return need
         ceiling = max_non_fp8_kv_vram_gb()
         if need <= ceiling:
             return need

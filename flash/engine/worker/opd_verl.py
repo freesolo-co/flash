@@ -46,6 +46,7 @@ from flash.engine.worker.opd_verl_multiturn import (
     validate_glue_template,
     validate_teacher_messages,
 )
+from flash.engine.worker.rng import seed_training_rngs
 from flash.engine.worker.sft_verl import (
     _build_verl_child_env,
     _cached_model_path,
@@ -76,6 +77,7 @@ from flash.engine.worker.verl_common import (
     parse_verl_metric,
     parse_wandb_link,
     render_wandb_link_shim,
+    resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
     stall_tail_fields,
@@ -2120,6 +2122,12 @@ def run_opd_verl(spec=None) -> None:
     )
     structured_outputs = structured_validation.constraint
     model_vocab_size = structured_validation.model_vocab_size
+    # the child trainer is seeded through its own config, but the environment's dataset /
+    # prompt_messages calls run HERE in the parent. an unseeded parent can build a different prompt
+    # pool across attempts, whose fingerprint then rejects a valid resume checkpoint. seed just
+    # before the first env call that can consume randomness, so the cheap fail-closed guards above
+    # still raise without paying for the torch import.
+    seed_training_rngs(_w.SEED)
     train = list(env.dataset())
     if not train:
         raise RuntimeError("opd environment dataset is empty")
@@ -2151,7 +2159,6 @@ def run_opd_verl(spec=None) -> None:
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
     processor = None
     if multimodal:
@@ -2168,7 +2175,6 @@ def run_opd_verl(spec=None) -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     thinking_prefill = _thinking_prefill_text(tokenizer)
-    eos_token_ids = _generation_eos_from_cached_config(model_id, model_revision, tokenizer)
     requested_len = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
     # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
     # clamping only the engine would admit prompts sized against the unclamped budget and then fail
@@ -2253,6 +2259,13 @@ def run_opd_verl(spec=None) -> None:
             )
     if not prompts:
         raise RuntimeError("every OPD prompt exceeds the configured prompt budget")
+    # weights come AFTER the budget filter: a dataset whose every prompt is over budget is a
+    # deterministic input error, and downloading tens of GB before raising it burns paid worker
+    # minutes for a verdict the tokenizer already had. the tokenizer/processor/config loads above
+    # fetch kilobytes, not weights, so they are cheap to run first.
+    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
+    # reads the snapshot with local_files_only, so it has to follow the prefetch.
+    eos_token_ids = _generation_eos_from_cached_config(model_id, model_revision, tokenizer)
     prompts_per_step = min(knobs.prompts_per_step, len(prompts))
     derived_steps = on_policy_steps(
         epochs=knobs.epochs,
@@ -2324,13 +2337,12 @@ def run_opd_verl(spec=None) -> None:
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
     warmstart_adapter = _warmstart_adapter_path(model_id, model_revision, lora_rank)
-    python_bin = resolve_verl_python(workdir)
+    python_bin = resolve_verl_python(workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY")))
     model_path = _cached_model_path(model_id, model_revision)
     gpu_count = int(getattr(spec.gpu, "count", 1) or 1)
     save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else knobs.save_every
-    loggers = ["console"]
-    if os.environ.get("WANDB_API_KEY"):
-        loggers.append("wandb")
+    # verl logs from python_bin, so gate wandb on THAT interpreter (see resolve_verl_loggers).
+    loggers = resolve_verl_loggers(python_bin)
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
     # fp8 kv cache on ada/hopper+ (cc >= 8.9), matching rl_verl's grpo gate -- but NOT for hybrid
