@@ -740,9 +740,12 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
     deadline = time.monotonic() + timeout
     latest = deployment
     first = True
+    # set once the wait enters its final window, so the read funded by that window's split is the
+    # last one. see the sleep below: without a stop the split repeats down to clock granularity.
+    final_read = False
     while True:
         remaining = deadline - time.monotonic()
-        if remaining <= 0 and not first:
+        if not first and (remaining <= 0 or final_read):
             break
         if not first:
             # hold back a slice of the budget for the read this sleep precedes, so a revision that
@@ -750,9 +753,21 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             # rather than reported as queued. reserving a fixed slice (rather than sleeping a
             # fraction of the remainder) is what makes this terminate: a fraction leaves a positive
             # remainder forever, while this drives the remainder to the slice and then to zero.
+            #
+            # the reservation has to apply to the final window too. subtracting only when the slice
+            # EXCEEDS the reserve meant a remainder at or under it was slept in full and the
+            # post-sleep deadline check ended the wait with no further read: `--wait 1` reported a
+            # revision that went ready mid-window as still queued and exited 1, and every longer
+            # wait carried the same blind spot through its last second (cursor, codex[bot]). split
+            # that window instead, and take the split as the wait's last sleep -- repeating it would
+            # be the fraction this comment already rejects, terminating only on the clock's
+            # granularity while issuing an unbounded number of reads inside one second.
             slice_seconds = min(_DEPLOY_POLL_SECONDS, remaining)
             if slice_seconds > _DEPLOY_FINAL_READ_SECONDS:
                 slice_seconds -= _DEPLOY_FINAL_READ_SECONDS
+            else:
+                slice_seconds /= 2
+                final_read = True
             time.sleep(slice_seconds)
             remaining = deadline - time.monotonic()
             # the sleep can consume the whole budget. issuing the read anyway, with the fallback

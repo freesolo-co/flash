@@ -1553,28 +1553,41 @@ def test_deploy_wait_zero_actually_reads_the_current_state(fake_client, monkeypa
 def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
     fake_client, monkeypatch
 ) -> None:
-    """A sleep that consumes the whole budget must end the wait, not fund one more read.
+    """No read may still be running past the deadline the caller set.
 
     The remaining time was computed once before sleeping, so the post-sleep request still went out
     with the 1.0s floor: `--wait 0.1` against a stalled plane blocked for over a second past the
     bound it advertised.
+
+    Asserted as "every read finishes by the deadline" rather than as a read COUNT. The count was a
+    proxy for it under the original behaviour, where the only way to be late was an extra read; it
+    stopped tracking the invariant once the final window began funding a read of its own, which is
+    a bounded read strictly inside the deadline rather than an overshoot. Keeping the count would
+    have made this test forbid the fix to the blind spot it shares a loop with.
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
     monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
     # the sleep is what burns the budget, exactly as a real one would.
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
-    seen: list[float | None] = []
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+    reads: list[tuple[float, float | None]] = []
 
     def _poll(run_id, timeout=None):
-        seen.append(timeout)
+        reads.append((clock["t"], timeout))
         return {"state": "queued"}
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
     assert _run(["models", "deploy", "flash-1", "--wait", "0.1"]) == 1
-    # exactly one read: the up-front one-shot. the post-sleep read is past the deadline.
-    assert seen == [pytest.approx(0.1, abs=0.001)], seen
+    assert reads, "the wait issued no read at all"
+    # a read starting at `start` and bounded by `bound` occupies the plane until start+bound, so
+    # that sum is what has to stay within the advertised wait. this is the assertion the 1.0s floor
+    # violated: it put a 0.1s wait on the hook for a full second.
+    for start, bound in reads:
+        assert bound is not None, reads
+        assert start + bound <= 0.1 + 0.001, reads
 
 
 @pytest.mark.parametrize("state", ["revocation_failed", "some_state_a_newer_plane_added"])
@@ -1659,6 +1672,59 @@ def test_deploy_wait_observes_readiness_inside_a_short_window(fake_client, monke
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
     assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 0
+
+
+def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, monkeypatch) -> None:
+    """The last second of a wait must still be watched, not slept through.
+
+    The per-sleep reserve was subtracted only when the slice EXCEEDED it, so a remainder at or under
+    the reserve was slept whole and the deadline check ended the wait with no further read. `--wait
+    1` therefore could not succeed at all against an async deploy -- one read at t=0, then a full
+    second of sleep -- and every longer wait was blind through its final second.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    def _poll(run_id, timeout=None):
+        # ready half a second into the one-second window.
+        return {"state": "ready" if clock["t"] >= 0.5 else "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 0
+
+
+def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeypatch) -> None:
+    """Splitting the final window must be the wait's last sleep, not a converging series.
+
+    Reserving a FRACTION of the remainder rather than a fixed slice never drives the remainder to
+    zero, so the loop terminates only on the clock's granularity. Against a stalled plane that is an
+    unbounded burst of reads inside the last second -- the failure mode the fixed reserve was chosen
+    to avoid, reintroduced at the one point the reserve does not apply.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+    reads = []
+
+    def _poll(run_id, timeout=None):
+        reads.append(clock["t"])
+        # never settles: the wait has to end on its own budget, not on the plane's answer.
+        return {"state": "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 1
+    # the up-front read plus the one the split funds. a fractional reserve makes this grow without
+    # bound; asserting the exact count is what keeps the split from silently becoming that.
+    assert len(reads) == 2, reads
 
 
 def test_deploy_wait_zero_does_not_block_past_its_own_bound(fake_client, monkeypatch) -> None:
