@@ -37,6 +37,43 @@ def test_negative_inputs_are_rejected():
         _shape("bad", 1.0, 1.0, vram_gb=-1.0)
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["gpu_seconds", "reward_seconds", "vram_gb"])
+def test_non_finite_inputs_are_rejected(field, bad):
+    # every ordering comparison against nan is false, so a nan passes a `< 0` check untouched. the
+    # sign checks cannot be the ones that catch this.
+    kwargs = {"label": "bad", "gpu_seconds": 1.0, "reward_seconds": 1.0, "vram_gb": 1.0}
+    kwargs[field] = bad
+    with pytest.raises(ValueError, match=f"{field} must be a finite number"):
+        RunShape(**kwargs)
+
+
+def test_a_non_finite_run_cannot_be_priced_as_free_card_time():
+    # the specific unsafe outcome the finite check exists to prevent: a nan duty cycle makes
+    # sum(duty) nan, and max(1.0, nan) is 1.0 in cpython -- so an infinitely expensive run would be
+    # reported inside a profitable pair as though it consumed no card time at all. assert on the
+    # construction site, because by the time a bad shape exists the arithmetic already looks clean.
+    with pytest.raises(ValueError, match="gpu_seconds must be a finite number"):
+        plan_colocation(
+            [
+                RunShape(label="bad", gpu_seconds=float("inf"), reward_seconds=1.0),
+                RunShape(label="good", gpu_seconds=0.1, reward_seconds=0.9),
+            ]
+        )
+
+
+def test_max_tenants_cannot_exceed_the_validated_sharing_model():
+    # max_tenants is a limit on what the efficiency model can honestly say, not a default a caller
+    # may raise: 0.9 ** (n - 1) past four tenants is extrapolation, and five idle runs would
+    # otherwise come back as one confident five-member placement.
+    runs = [_shape(f"idle{i}", 0.05, 0.95) for i in range(5)]
+    with pytest.raises(ValueError, match="exceeds the 4-tenant limit"):
+        plan_colocation(runs, max_tenants=5)
+    # the boundary itself stays usable.
+    placements, _ = plan_colocation(runs, max_tenants=4)
+    assert max(len(p.runs) for p in placements) == 4
+
+
 def test_efficiency_decays_with_each_added_tenant():
     # a solo run pays nothing; every additional tenant multiplies the penalty again.
     assert sharing_efficiency(1) == pytest.approx(1.0)

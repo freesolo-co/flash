@@ -25,6 +25,7 @@ code, no provider calls. It decides placement; it does not perform it.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # sharing is never free: concurrent processes on one card contend for sm time, memory bandwidth and
@@ -63,6 +64,18 @@ class RunShape:
     vram_gb: float = 0.0
 
     def __post_init__(self) -> None:
+        # nan and inf must be caught HERE rather than left to the comparisons below. every ordering
+        # test against nan is false, so a nan sails through a `< 0` check, and its duty cycle is nan
+        # too -- which `max(1.0, nan)` silently resolves to 1.0, pricing the run at NO card time and
+        # reporting an infinitely expensive run inside a profitable group. a bad profile or a
+        # divide-by-zero upstream must fail loudly, not produce a placement that looks fine.
+        for name, value in (
+            ("gpu_seconds", self.gpu_seconds),
+            ("reward_seconds", self.reward_seconds),
+            ("vram_gb", self.vram_gb),
+        ):
+            if not math.isfinite(value):
+                raise ValueError(f"{self.label}: {name} must be a finite number, got {value!r}")
         if self.gpu_seconds < 0 or self.reward_seconds < 0:
             raise ValueError(f"{self.label}: step seconds cannot be negative")
         if self.vram_gb < 0:
@@ -180,6 +193,15 @@ def plan_colocation(
         raise ValueError("run labels must be unique: they are what identifies a placement")
     if max_tenants < 1:
         raise ValueError("max_tenants must be at least 1")
+    if max_tenants > _MAX_TENANTS:
+        # _MAX_TENANTS is a limit on what the efficiency model can honestly say, not a default the
+        # caller may raise. past it, 0.9 ** (n - 1) is extrapolating beyond anything the multi-card
+        # work measured, and the arithmetic here represents neither allocator fragmentation nor kv
+        # eviction. a caller asking for more would get a confident number with nothing behind it.
+        raise ValueError(
+            f"max_tenants={max_tenants} exceeds the {_MAX_TENANTS}-tenant limit the sharing "
+            "efficiency model is valid for"
+        )
 
     def fits(group: tuple[RunShape, ...]) -> bool:
         return vram_capacity_gb <= 0 or sum(r.vram_gb for r in group) <= vram_capacity_gb
