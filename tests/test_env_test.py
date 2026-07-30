@@ -517,6 +517,48 @@ def test_env_test_malformed_structured_param_fails_instead_of_becoming_a_string(
     assert "is not a valid TOML value" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("value", ["filters=]", "filters=}", "filters=1,2]", "x=a=b"])
+def test_env_test_malformed_param_without_an_opening_delimiter_is_rejected(
+    monkeypatch, tmp_path, capsys, value
+):
+    # malformedness is not signalled by the first character: `filters=]` opens nothing yet is still
+    # invalid TOML, so deciding by opening delimiter alone let it through as the literal string "]".
+    # the test is whether the value reaches for TOML structure at all, not how it starts.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    assert "is not a valid TOML value" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["cutoff=2026-01-01", "at=07:32:00", "when=2026-01-01T07:32:00"])
+def test_env_test_json_incompatible_param_types_are_rejected(monkeypatch, tmp_path, capsys, value):
+    # TOML has date/time types JSON does not, so these parse cleanly into datetime objects. the
+    # equivalent [environment.params] keeps the object and the submit dies at json.dumps(body) in
+    # ApiClient._request(), so passing here would approve a config that cannot be submitted at all.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    assert "not JSON-serializable" in capsys.readouterr().err
+
+
+def test_env_test_param_with_trailing_assignment_is_rejected(monkeypatch, tmp_path, capsys):
+    # a newline makes `v = <value>` a two-line document that tomllib accepts, so indexing only "v"
+    # keeps max_rows and silently drops strict -- the gate would then validate a parameter set the
+    # user never asked for. shell and CI quoting produce this without anyone typing a newline.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=["max_rows=5\nstrict=true"])) == 1
+    assert "kwargs" not in seen
+    err = capsys.readouterr().err
+    assert "more than one assignment" in err
+    assert "strict" in err
+
+
 def test_env_test_bare_unquoted_param_still_falls_back_to_a_string(monkeypatch, tmp_path):
     # the common case stays convenient: unquoted text is not valid TOML but is what users type.
     env_dir = _environment_dir(tmp_path)
@@ -526,12 +568,55 @@ def test_env_test_bare_unquoted_param_still_falls_back_to_a_string(monkeypatch, 
     assert seen["kwargs"] == {"name": "hard mode"}
 
 
+def test_env_test_well_formed_structured_params_still_load(monkeypatch, tmp_path):
+    # the rejections above must not cost the valid structured forms [environment.params] supports,
+    # or tightening the gate would just move the false failures to the other side.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+    args = _args(
+        env_dir,
+        param=["filters=[1, 2]", "opts={a = 1}", 'name="hello world"', "ratio=0.5", "neg=-3"],
+    )
+
+    assert cmd_env_test(args) == 0
+    assert seen["kwargs"] == {
+        "filters": [1, 2],
+        "opts": {"a": 1},
+        "name": "hello world",
+        "ratio": 0.5,
+        "neg": -3,
+    }
+
+
 def test_env_test_split_flag_overrides_param_split(monkeypatch, tmp_path):
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 
     assert cmd_env_test(_args(env_dir, split="eval", param=["split=train"])) == 0
     assert seen["kwargs"] == {"split": "eval"}
+
+
+@pytest.mark.parametrize("split", ["", "   "])
+def test_env_test_explicitly_blank_split_is_rejected(monkeypatch, tmp_path, capsys, split):
+    # `--split "$SPLIT"` with an unset variable is an explicit request for a split. treating it as
+    # absent leaves a --param split=... in effect, so the gate validates a different split than the
+    # command named -- passing on a dataset the run never trains on, which is this flag's whole job.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, split=split, param=["split=validation"])) == 1
+    assert "kwargs" not in seen
+    assert "--split requires a non-empty split name" in capsys.readouterr().err
+
+
+def test_env_test_omitted_split_still_leaves_a_param_split_in_effect(monkeypatch, tmp_path):
+    # not passing --split at all is different from passing it blank: there is no conflict to
+    # resolve, so [environment.params]-style `--param split=` remains the user's stated intent.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=["split=validation"])) == 0
+    assert seen["kwargs"] == {"split": "validation"}
 
 
 def test_env_test_malformed_param_fails_before_loading(monkeypatch, tmp_path, capsys):

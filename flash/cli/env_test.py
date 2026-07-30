@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import tomllib
@@ -14,6 +15,10 @@ _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ECHO_RESPONSE = "test"
 _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
+# characters that give a TOML value structure. text containing none of them is a bare string, so a
+# parse failure means the user typed unquoted words; text containing any of them was reaching for
+# TOML syntax and a parse failure means they got it wrong.
+_TOML_STRUCTURAL_CHARS = frozenset("\"'[]{}=,\n")
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:
@@ -169,6 +174,54 @@ def _load_failure(reason: str) -> int:
     return _err("overall: FAIL")
 
 
+def _reject_unsubmittable_param(key: str, value: object) -> None:
+    """Reject a parsed TOML value that ``[environment.params]`` could not actually submit.
+
+    TOML has date/time types that JSON does not, so ``--param cutoff=2026-01-01`` parses cleanly
+    into a ``datetime.date``. The equivalent config keeps that object in ``EnvironmentSpec.params``
+    and the submit fails later at ``json.dumps(body)`` in ``ApiClient._request()``. Approving it
+    here would mean the gate passed on a config that cannot be submitted at all.
+    """
+    try:
+        json.dumps(value)
+    except TypeError as exc:
+        raise ValueError(
+            f"--param {key} is not JSON-serializable and could not be submitted "
+            f"in [environment.params]: {exc}"
+        ) from exc
+
+
+def _parse_param_value(key: str, raw: str) -> object:
+    """Parse one ``--param`` value the way ``[environment.params]`` would parse it.
+
+    Bare unquoted text is not valid TOML but is what users type most often, so it falls back to a
+    string. Everything else must parse, because silently keeping a malformed structured value as a
+    literal string would validate the environment against parameters the equivalent config entry
+    could never load -- the offline gate would pass on input training rejects.
+    """
+    value = raw.strip()
+    try:
+        document = tomllib.loads(f"v = {value}")
+    except tomllib.TOMLDecodeError as exc:
+        # the fallback is an allowlist, not a blocklist of opening delimiters: `filters=]` opens
+        # nothing yet is still malformed TOML, and blocklisting only the openers let it through as
+        # the literal string "]". a bare string is text with no TOML structural character in it.
+        if value and not (set(value) & _TOML_STRUCTURAL_CHARS):
+            return value
+        raise ValueError(f"--param {key} is not a valid TOML value: {exc}") from exc
+    # a value containing a newline makes `v = <value>` a multi-line document, so tomllib accepts
+    # `max_rows=5\nstrict=true` as two assignments and taking only "v" drops the second silently.
+    if set(document) != {"v"}:
+        extra = ", ".join(sorted(set(document) - {"v"}))
+        raise ValueError(
+            f"--param {key} contains more than one assignment ({extra}); "
+            "pass one KEY=VALUE per --param"
+        )
+    parsed = document["v"]
+    _reject_unsubmittable_param(key, parsed)
+    return parsed
+
+
 def _env_params(args) -> dict:
     """Build the ``load_environment()`` kwargs from ``--split`` / ``--param KEY=VALUE``.
 
@@ -182,21 +235,17 @@ def _env_params(args) -> dict:
         key = key.strip()
         if not sep or not key:
             raise ValueError(f"--param must be KEY=VALUE (got {item!r})")
-        # parse as a toml value so types match [environment.params]; fall back to a bare string
-        # for unquoted text, which is what users type most often.
-        value = raw.strip()
-        try:
-            params[key] = tomllib.loads(f"v = {value}")["v"]
-        except tomllib.TOMLDecodeError as exc:
-            # only bare unquoted text may fall back. a value that opens a quote, array, or inline
-            # table is structured but malformed, and silently keeping it as a literal string would
-            # validate parameters the equivalent [environment.params] entry could never load.
-            if value[:1] in {'"', "'", "[", "{"}:
-                raise ValueError(f"--param {key} is not a valid TOML value: {exc}") from exc
-            params[key] = value
+        params[key] = _parse_param_value(key, raw)
     split = getattr(args, "split", None)
-    if split and str(split).strip():
-        params["split"] = str(split).strip()
+    if split is not None:
+        # distinguish "not passed" from "passed empty". `--split "$SPLIT"` with an unset variable
+        # is an explicit request for a split, and treating it as absent leaves a `--param
+        # split=...` in effect -- so the gate silently validates a different split than the one the
+        # command asked for, which is the failure this flag exists to prevent.
+        split = str(split).strip()
+        if not split:
+            raise ValueError("--split requires a non-empty split name")
+        params["split"] = split
     return params
 
 
