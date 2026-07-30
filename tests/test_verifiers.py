@@ -1353,6 +1353,14 @@ def test_a_final_response_override_reaches_both_views(monkeypatch):
     assert state["response_text"] == "env says 7"
     assert state["raw_response_text"] == "env says 7"
 
+    # equality alone would pass on a bare str, and a bare str is the defect: a thinking-aware
+    # score_episode reading .thinking would raise on exactly the episodes an env terminates by
+    # overriding. the model's reasoning from this turn survives the override that replaced its
+    # answer, since the env supplied the answer but did not produce the reasoning.
+    assert state["response_text"].raw == "env says 7"
+    assert state["response_text"].thinking == "let me work it out"
+    assert env._episode_from_state(state).response_text.thinking == "let me work it out"
+
 
 def test_rl_hands_the_derived_opener_flag_to_the_env():
     """The env cannot derive the flag (no tokenizer, no rendered prompt); rl.py must pass it.

@@ -467,8 +467,23 @@ class FreesoloEnvironment(BaseEnvironment):
         if step.final_response_text is not None:
             # the env overrode the episode's answer, so it is already the text to grade -- do not
             # strip it. keep the raw view in step with it for any later turn.
-            state["response_text"] = step.final_response_text
-            state["raw_response_text"] = str(step.final_response_text)
+            final = str(step.final_response_text)
+            # wrap rather than assign the bare string: a plain str has no .raw/.thinking, so a
+            # thinking-aware score_episode would lose the model's reasoning on exactly the episodes
+            # an env terminates by overriding (the scaffolded StarterMultiTurnEnv does this on a
+            # correct guess). the override text is the answer, so .completion is it; .thinking stays
+            # the model's own from this turn, which the override replaced but did not produce.
+            previous = state.get("response_text")
+            state["response_text"] = (
+                _ScoredResponseText(
+                    final,
+                    raw=final,
+                    thinking=getattr(previous, "thinking", None),
+                )
+                if self.thinking
+                else final
+            )
+            state["raw_response_text"] = final
         state["turn"] = int(state.get("turn", 0)) + 1
         if step.metadata:
             state.setdefault("step_metadata", []).append(step.metadata)
