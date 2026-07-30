@@ -7,8 +7,6 @@ policy/reference update.
 
 from __future__ import annotations
 
-import math
-
 from flash.providers.allocator import required_vram_gb, vram_headroom
 
 from .facts import (
@@ -58,9 +56,21 @@ MOE_STEP_OVERHEAD_S = 2.0  # routing/dispatch/kernel-launch overhead an MoE pays
 COMPILE_MOE_SFT_S = 35.0
 COMPILE_MOE_ROLLOUT_S = 48.0  # GRPO / OPD (adds vLLM cudagraph capture)
 
-# Reward grading is CONCURRENT: a step's completions score in parallel slots, so the reward
-# wall is ceil(completions / slots) waves x latency, not completions x latency.
-REWARD_CONCURRENCY = 16.0
+# Single-turn grpo scores a step's completions SERIALLY, so the reward wall is the full
+# completions x latency sum. this is not an accident of either backend, it is a deliberate contract:
+# the trl reward_fn walks its completions in one loop (worker/rl.py), and the verl reward bridge
+# takes a global lock around the env call precisely so "the flash env sees sequential calls,
+# matching the trl reward path" (worker/rl_verl.py). the serialization protects envs whose scorers
+# are not thread-safe, so it cannot be removed to match a faster model.
+#
+# a concurrency divisor here was a flat 16x understatement of the reward term, and reward time lands
+# in the FIXED half of a step -- the half no gpu choice can shorten. under-counting it makes a
+# latency-bound judge env look gpu-bound, which over-weights raw flops and rents a fast card whose
+# speed the run cannot use. multi-turn envs do score concurrently, but multi-turn is unknowable at
+# quote time (RunConfig has no such field, and deciding it means LOADING user env code inside a
+# pricing function that is deliberately offline). serial is therefore the conservative default: for
+# a concurrent env it over-states fixed time, which can only steer the allocator to a cheaper card,
+# never to a more expensive one it cannot exploit.
 
 # Cold-start overhead (seconds): container boot + deps + model load (+ vLLM init for GRPO).
 #
@@ -234,17 +244,16 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
-    # GRPO step = rollout (G completions/prompt) + concurrent reward grading + policy/ref update.
+    # GRPO step = rollout (G completions/prompt) + serial reward grading + policy/ref update.
     completions = n.batch_size * n.group_size
     gen_tokens = completions * n.completion_len
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * update_mfu)
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
-    reward_s = (
-        math.ceil(completions / REWARD_CONCURRENCY) * latency
-    )  # ceil: a partial wave still costs one latency
-    # reward grading runs off-gpu in concurrent waves, so like the opd teacher it is fixed wall time
-    # no card choice changes. a grpo step dominated by it is latency-bound, not compute-bound.
+    # every completion is scored, one at a time (see the serial-scoring note above).
+    reward_s = completions * latency
+    # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
+    # changes. a grpo step dominated by it is latency-bound, not compute-bound.
     return gen_s + update_s, overhead + reward_s
 
 
