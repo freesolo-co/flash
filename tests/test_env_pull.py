@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from flash._channel import CLI_NAME
+from flash.cli import envpush
 from flash.cli.envpush import cmd_env_pull
 from flash.envs import loader as adapter
 from flash.envs.pull import environment_local_dirname
@@ -262,6 +263,70 @@ def test_cmd_env_pull_positional_dir_hint_round_trips_through_the_parser(
     parsed = _parse_as_cli(_hint_command(capsys.readouterr().err))
     assert parsed.output == "into here"
     assert parsed.path is None
+
+
+def test_cmd_env_pull_absolute_positional_dir_is_diagnosed(monkeypatch, tmp_path, capsys):
+    """An absolute mistaken destination must be recognized before it is reduced to its basename.
+
+    `env pull ns/env /tmp/into-here` is the same user error as the relative form, but `out` is
+    already `Path("into-here")` by the time the check ran, so comparing against `out` could never
+    match: the command downloaded the package and failed with an unrelated invalid-path error
+    instead of the hint that explains what went wrong.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    absolute = tmp_path / "into-here"
+    absolute.mkdir()
+
+    rc = cmd_env_pull(_margs(path=str(absolute), output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "drop the second positional" in err
+    # the suggested destination must be the directory the user actually named, not its basename --
+    # a bare `into-here` would aim the whole-env download at a different path in the cwd.
+    parsed = _parse_as_cli(_hint_command(err))
+    assert parsed.output == str(absolute)
+    assert parsed.path is None
+
+
+def test_cmd_env_pull_hint_omits_a_command_cmd_exe_would_mangle(monkeypatch, tmp_path, capsys):
+    """On Windows a destination holding cmd.exe metacharacters gets no copy-pasteable command.
+
+    `list2cmdline` implements MS C-runtime argv quoting, not cmd.exe escaping, so `foo&bar` comes
+    back unquoted and pasting the hint would run `bar` as a separate command. Emitting no command is
+    strictly better than emitting one that executes unintended text.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.setattr(envpush.os, "name", "nt")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "foo&bar").mkdir()
+
+    rc = cmd_env_pull(_margs(path="foo&bar", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "drop the second positional" in err
+    # the directory is still NAMED so the user knows which one is meant; what must not appear is a
+    # runnable command carrying the unescaped metacharacter.
+    assert "foo&bar" in err
+    assert "--output=foo&bar" not in err
+    assert "--output=DEST" in err
+
+
+def test_cmd_env_pull_hint_still_quotes_a_windows_destination_with_a_space(
+    monkeypatch, tmp_path, capsys
+):
+    """Refusing metacharacter destinations must not cost the ordinary Windows quoting case."""
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.setattr(envpush.os, "name", "nt")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into here").mkdir()
+
+    rc = cmd_env_pull(_margs(path="into here", output=None, force=False))
+
+    assert rc == 1
+    assert '"--output=into here"' in capsys.readouterr().err
 
 
 def test_cmd_env_pull_basename_collision_keeps_the_single_file_diagnostic(
