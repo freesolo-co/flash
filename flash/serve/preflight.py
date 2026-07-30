@@ -68,23 +68,45 @@ def validate_structured_output_patterns(constraint: dict) -> None:
             raise ValueError(f"{field} is invalid: {exc}") from exc
 
 
-def resolve_effective_completion_tokens(spec: JobSpec) -> int:
-    """Resolve the run's positive explicit or recipe-default completion-token budget."""
+def resolve_smoke_completion_tokens(spec: JobSpec) -> int:
+    """Resolve the deployment smoke's completion budget for one generation.
+
+    This sizes a single smoke request, not the run's training context. sft is the reason the two
+    cannot share a number: an sft run has no completion budget of its own, because the worker
+    trains one packed prompt+completion block bounded by ``max_context_tokens``. Feeding that
+    packed limit back as a completion budget double-counts the prompt, so sft derives its smoke
+    budget from the sft recipe instead and ``max_context_tokens`` stays a context check.
+    """
+    explicit = spec.train.max_completion_tokens
+    positive_explicit = int(explicit) if explicit is not None and int(explicit) > 0 else None
+    if spec.algorithm == "opd":
+        return opd_completion_len(positive_explicit, spec.thinking)
+    if spec.algorithm == "sft":
+        # sft ignores max_completion_tokens (it is a rollout-only knob), so honouring it here would
+        # cap the smoke below what the run can legitimately generate: a 2048-context sft run with a
+        # leftover max_completion_tokens=320 trains valid long reasoning it could never deploy.
+        return int(RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
+    if positive_explicit is not None:
+        return positive_explicit
+    recipe = RECIPE.rl
+    return int(recipe.max_completion_len_thinking if spec.thinking else recipe.max_completion_len)
+
+
+def resolve_effective_completion_tokens(spec: JobSpec) -> int | None:
+    """Resolve the completion budget the serving context guard must fit, if the run has one.
+
+    Returns ``None`` for sft: its ``max_context_tokens`` already spans prompt and completion, and
+    the guard checks that separately. Returning a number here would compare a whole-sequence limit
+    against completion-only capacity and reject a spec that fits the serving cap exactly.
+    """
+    if spec.algorithm == "sft":
+        return None
     explicit = spec.train.max_completion_tokens
     positive_explicit = int(explicit) if explicit is not None and int(explicit) > 0 else None
     if spec.algorithm == "opd":
         return opd_completion_len(positive_explicit, spec.thinking)
     if positive_explicit is not None:
         return positive_explicit
-    if spec.algorithm == "sft":
-        # sft has no completion budget of its own: the worker trains one packed prompt+completion
-        # block bounded by max_context_tokens, defaulting to RECIPE.sft (2048 thinking / 1024).
-        # falling through to the rl default would hand a thinking sft run 1536 tokens and truncate
-        # a completion it was trained to produce, so derive the budget from sft's own limit.
-        context = spec.train.max_context_tokens
-        if context is not None and int(context) > 0:
-            return int(context)
-        return int(RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
     recipe = RECIPE.rl
     return int(recipe.max_completion_len_thinking if spec.thinking else recipe.max_completion_len)
 
