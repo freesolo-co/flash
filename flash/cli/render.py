@@ -699,13 +699,24 @@ def _stale_step_hint(
 
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None
-    # w&b is optional (no WANDB_API_KEY disables it), and the status payload does not say whether it
-    # is on, so phrase it as one option and always name a signal that exists (codex[bot]).
+    # do NOT send them to `runs log -f` for worker output. it streams the control-plane log, which
+    # carries orchestration events rather than trainer progress, and the worker console it does
+    # print comes from _print_worker_output AFTER the run reaches a terminal state
+    # (flash/cli/commands.py cmd_log) -- so it cannot answer this question while the run is live.
+    # even reaching for that artifact mid-follow would not help: the worker uploads it on a 3600s
+    # interval (_CONSOLE_UPLOAD_INTERVAL_S), an hour of staleness against a hint that fires at 300s
+    # (codex[bot]).
+    #
+    # the always-available signal is the `age` row this hint hangs off, which is rendered from the
+    # same payload and therefore cannot be missing: below the 900s upload throttle the quiet is
+    # fully explained by throttling, so the age itself is what tells the user whether they have
+    # waited long enough to conclude anything. w&b stays as the optional live cross-check -- the
+    # trainer writes it directly rather than through the throttled upload -- hence "if configured".
     return (
         "the step above is the last one UPLOADED, not necessarily the one training is on; "
         "a throttled worker can hold it for many minutes while the trainer advances normally. "
-        f"check {CLI_NAME} runs log <run-id> -f for worker output "
-        "(or your [wandb] run, if configured) "
+        "uploads are held up to 15 min, so compare the age above against that "
+        "(and your [wandb] run, if configured) "
         "before treating this as a stall"
     )
 

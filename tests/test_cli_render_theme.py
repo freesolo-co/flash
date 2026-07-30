@@ -668,11 +668,11 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     assert "last one UPLOADED" in out
     assert "before treating this as a stall" in out
 
-    # the dev channel installs the executable as `flash-dev` and points at staging, so a hardcoded
-    # `flash runs log` is either not installed or follows an unrelated production run.
-    monkeypatch.setattr(render, "CLI_NAME", "flash-dev")
-    assert "flash-dev runs log" in render.run_status(stale)
-    monkeypatch.undo()
+    # the hint must not send the user to `runs log` for worker output: cmd_log prints the worker
+    # console only after the run reaches a terminal state, and the console artifact itself uploads
+    # hourly, so neither can answer "is it still training?" at the 300s the hint fires.
+    assert "runs log" not in out
+    assert "worker output" not in out
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
 
@@ -733,6 +733,9 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     )
     assert "last one UPLOADED" in render.run_status(live)
 
-    # w&b is optional, so the advice must name a signal that always exists.
-    assert "flash runs log" in out
+    # w&b is optional, so the advice must name a signal that always exists. `runs log` was that
+    # signal until it turned out it cannot answer the question while the run is live (see the
+    # `runs log` assertion above); the heartbeat age row can, is rendered from the same payload,
+    # and so is never absent.
+    assert "the age above" in out
     assert "if configured" in out
