@@ -52,6 +52,7 @@ from flash.cli.traces import (
     RECORDS_FORMAT,
     cmd_traces_export,
 )
+from flash.spec import CREDIT_ASSIGNMENTS, DEFAULT_CREDIT_ASSIGNMENT
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -323,6 +324,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "algorithm the environment is for, matching [train] algorithm "
             f"({', '.join(ALGORITHMS)}). only the reward-consuming ones check that the grader "
             "can rank completions; sft never calls reward()"
+        ),
+    )
+    env_test.add_argument(
+        "--credit-assignment",
+        default=None,
+        choices=CREDIT_ASSIGNMENTS,
+        help=(
+            "credit assignment the run will use, matching [train] credit_assignment "
+            f"(default {DEFAULT_CREDIT_ASSIGNMENT}). only per_turn reads an environment's per-turn "
+            "reward vectors, so only there do they count as the grader separating completions"
         ),
     )
     env_test.set_defaults(func=cmd_env_test)
