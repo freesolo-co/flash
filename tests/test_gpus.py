@@ -279,12 +279,21 @@ def test_grpo_kv_floor_escalates_large_group_long_context():
     assert model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"group_size": 8}) <= 36
 
 
-def test_opd_kv_floor_uses_fp8_above_non_fp8_ceiling():
+def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
+    """The fp8 KV discount must NOT apply to a linear-attention (GDN) model.
+
+    Both vLLM rollout workers refuse an fp8 KV cache for GDN hybrids (vllm's fp8 wake path
+    init_fp8_kv_scales assumes a plain kv tensor and crashes on the hybrid cache), so their cache
+    really is bf16. Discounting it reserves half the cache the run allocates, which admits the run
+    onto a card that cannot hold it -- it then OOMs at rollout init on a paid GPU. Every model in
+    the flash catalog is currently a GDN hybrid, so the routed requirement must be the bf16 floor.
+    """
     from flash.catalog import MODELS
     from flash.engine.vram import grpo_kv_floor_gb, model_required_vram_gb
     from flash.providers.base import max_non_fp8_kv_vram_gb
 
     info = MODELS["Qwen/Qwen3.5-2B"]
+    assert info.num_linear_attention_layers > 0
     concurrency = 8 * 16
     ceiling = max_non_fp8_kv_vram_gb()
     bf16_floor = grpo_kv_floor_gb(
@@ -310,9 +319,10 @@ def test_opd_kv_floor_uses_fp8_above_non_fp8_ceiling():
         train={"batch_size": 8, "group_size": 16, "max_context_tokens": 4096},
     )
 
+    # the discount is real and would be decisive here, which is why skipping it matters.
+    assert fp8_floor < bf16_floor
     assert bf16_floor > ceiling
-    assert fp8_floor > ceiling
-    assert fp8_floor <= need < bf16_floor
+    assert need >= bf16_floor
 
 
 def test_pinned_revision_retains_calibrated_vram_floors(monkeypatch):

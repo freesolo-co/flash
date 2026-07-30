@@ -820,8 +820,10 @@ def test_run_rl_publishes_final_step_as_deployable_checkpoint():
 
 
 def test_run_sft_publishes_final_step_as_deployable_checkpoint():
-    src = _finalize_src("flash.engine.worker.sft", "run_sft")
-    assert "save_pretrained(adapter_dir)" in src
-    # SFT derives the final step from trainer state (no _steps_run var) and publishes it.
-    assert "global_step" in src
-    assert "publish_deployable_checkpoint(adapter_dir, _final_step)" in src
+    # The invariant lives in the verl worker, which owns the whole SFT path; `run_sft` is a one-line
+    # delegation to it. Asserting on the delegator's source would pass on any body at all, so this
+    # follows the wiring to where the adapter is actually exported and published.
+    src = _finalize_src("flash.engine.worker.sft_verl", "run_sft_verl")
+    assert "_export_checkpoint_adapter(" in src
+    assert '_w.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
+    assert "_w.publish_deployable_checkpoint(adapter_dir, final_step)" in src

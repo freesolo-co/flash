@@ -1178,8 +1178,8 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
 
 
 # backends whose trainer shards one job across gpu.count > 1 cards. the verl workers launch
-# nproc-per-node == gpu.count ranks and set ulysses sequence parallelism; the trl workers are
-# single-process and never read gpu.count, so a count > 1 trl job would bill n cards to train on 1.
+# nproc-per-node == gpu.count ranks and set ulysses sequence parallelism; the trl grpo worker is
+# single-process and never reads gpu.count, so a count > 1 trl job would bill n cards to train on 1.
 _MULTI_GPU_BACKENDS: frozenset[str] = frozenset({"verl"})
 
 # providers that actually provision gpu.count cards on ONE machine. runpod forwards gpu_count into
@@ -1189,18 +1189,19 @@ _MULTI_GPU_PROVIDERS: frozenset[str] = frozenset({"runpod"})
 
 
 # backend_env_key/effective_backend live in flash.spec so the launcher's alloc-conf choice and this
-# gate cannot disagree about which trainer a spec runs. the resolution defaults SILENTLY: an omitted
-# key selects "trl" without any error, and exporting the variable next to the control plane has no
-# effect on submitted runs. recording the result in effective_preparation makes the choice auditable
-# after the fact instead of only inferable from the [worker_env] table.
+# gate cannot disagree about which trainer a spec runs. only grpo still resolves through a key, and
+# it defaults SILENTLY: an omitted FLASH_RL_BACKEND selects "trl" without any error, and exporting
+# the variable next to the control plane has no effect on submitted runs. recording the result in
+# effective_preparation makes the choice auditable after the fact instead of only inferable from the
+# [worker_env] table.
 
 
 def _require_supported_gpu_count(spec: JobSpec) -> None:
     """reject gpu.count > 1 unless this spec's backend shards AND its provider rents n cards.
 
-    gpu.count provisions and bills n cards, so both halves must hold or the run overbills: a trl
-    backend spawns one process and leaves n-1 cards idle, and vast/lambda ignore the count entirely
-    so an n-rank verl trainer would land on a single rented card and fail or thrash.
+    gpu.count provisions and bills n cards, so both halves must hold or the run overbills: the trl
+    grpo backend spawns one process and leaves n-1 cards idle, and vast/lambda ignore the count
+    entirely so an n-rank verl trainer would land on a single rented card and fail or thrash.
     """
     count = getattr(spec.gpu, "count", 1)
     if count <= 1:

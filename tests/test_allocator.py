@@ -795,6 +795,8 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
             "H200",
         ),
         (
+            # b200, not h200: every catalog model is a gdn hybrid, so the opd rollout runs a bf16 kv
+            # cache (the worker refuses fp8 for them) and sizing must reserve the full cache.
             "max_context_24576",
             {
                 "epochs": 1,
@@ -802,7 +804,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "max_completion_tokens": 128,
                 "lora_rank": 32,
             },
-            "H200",
+            "B200",
         ),
         (
             "group_size_8",
