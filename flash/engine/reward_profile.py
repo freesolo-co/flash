@@ -56,10 +56,10 @@ class RewardProfile:
 
         A profile flagged ``timed_out`` is untrustworthy no matter how many samples succeeded
         around it. That flag is set only for a call abandoned at the deadline that had ALREADY run
-        longer than every call that finished -- an outlier of unknown size, which the median of the
-        fast calls would paper over. A grader that is uniformly slow enough to exhaust the budget
-        mid-call is not flagged, because there the measured calls are representative and the only
-        thing that ran out was time.
+        longer than a TYPICAL call that finished -- an outlier of unknown size, which the median of
+        the fast calls would paper over. A grader that is uniformly slow enough to exhaust the
+        budget mid-call is not flagged, because there the measured calls are representative and the
+        only thing that ran out was time.
         """
         return (
             self.samples > 0
@@ -134,15 +134,18 @@ def profile_reward_latency(
 
     ``samples`` are (example_index, completion_text) pairs drawn from the run's own data. Blank
     texts are dropped before timing: grading an empty string measures the early-return, not the
-    grader. Whatever non-blank references remain are cycled to fill the call plan, so a run holding
-    a single prompt is still measurable instead of spending its only reference on the warm-up.
+    grader. Each surviving reference is graded at most ONCE -- a memoizing scorer would serve a
+    repeat from its cache, and timing that would report grading as nearly free. When there are more
+    references than ``max_samples`` the first is a discarded warm-up; when there are not, it is kept
+    as the measurement, so a run holding a single prompt is measurable rather than spending its only
+    reference on setup.
 
     Bounded twice over -- by ``max_samples`` and by ``budget_s``, the latter covering time spent
     INSIDE a call as well as between calls -- so a slow or hung grader delays training by a known
     ceiling rather than an unknown one. Never raises: a profiler that can fail the run it is trying
     to price is worse than no profiler, so scorer failures are counted and reported. A call
-    abandoned at the deadline having already outrun every completed call voids the profile rather
-    than being outvoted by the fast ones -- see ``RewardProfile.trustworthy``.
+    abandoned at the deadline having already outrun a typical completed call voids the profile
+    rather than being outvoted by the fast ones -- see ``RewardProfile.trustworthy``.
 
     Returns the MEDIAN, not the mean. At these sample counts one slow outlier (a retried http call,
     a cold cache) moves a mean far more than it moves the truth.
@@ -160,11 +163,24 @@ def profile_reward_latency(
     failures = 0
     started = time.perf_counter()
 
-    # cycle rather than slice: a run with a single retained prompt (a shape
-    # ``resolve_grpo_prompts_per_step`` explicitly supports) has exactly one reference, and slicing
-    # would spend it on the discarded warm-up and report that nothing graded. repeating it costs one
-    # extra call and keeps every valid dataset size measurable.
-    planned = [real[call % len(real)] for call in range(max_samples + _WARMUP_CALLS)]
+    # regrading an input is not a second sample of it. a scorer that memoizes by (example,
+    # completion) -- which the expensive graders most worth profiling are the likeliest to do --
+    # serves every repeat from its cache, so repeats would time the cache and publish a near-zero
+    # latency for a grader that trains against novel completions at full cost. that error points the
+    # dangerous way: it reads as "grading is free", which packs more runs onto a card that cannot
+    # carry them.
+    #
+    # so each reference is graded exactly once, and the warm-up is spent only when there is a
+    # reference to spare. below that, the first call IS the measurement: it is the only one whose
+    # input the grader has not already seen. it carries the one-time setup cost the warm-up normally
+    # absorbs, which overstates -- the safe direction here, and from two references up the median
+    # leaves it at one end where it cannot set the reading.
+    if len(real) > max_samples:
+        planned = real[: max_samples + _WARMUP_CALLS]
+        warmup_calls = _WARMUP_CALLS
+    else:
+        planned = real
+        warmup_calls = 0
 
     for call, (index, completion) in enumerate(planned):
         remaining = budget_s - (time.perf_counter() - started)
@@ -180,16 +196,22 @@ def profile_reward_latency(
             # ``elapsed``, so what it means depends entirely on how that compares to what already
             # finished:
             #
-            # - longer than every completed call: a genuine outlier of unknown size. the median of
-            #   the fast calls would advertise the quick half of a grader that also has a slow
-            #   half, so the reading is voided.
-            # - within the range already observed: the budget simply ran out mid-call. the call was
-            #   behaving normally and carries no evidence of an anomaly, so the measured calls still
-            #   stand. voiding here would mean a genuinely slow grader -- 9s/completion fits three
-            #   calls in the budget but not four -- could never produce a profile at all, and slow
-            #   graders are exactly the ones whose idle cost is worth knowing.
+            # - longer than a TYPICAL completed call: it is not behaving like the others, and the
+            #   median of those others would advertise the quick half of a grader that also has a
+            #   slow half. voided.
+            # - no slower than typical: the budget simply ran out mid-call, carrying no evidence of
+            #   an anomaly, so the measured calls stand. voiding here would mean a uniformly slow
+            #   grader -- 9s/completion fits three calls in a 30s budget but not four -- could never
+            #   produce a profile at all, and slow graders are exactly the ones whose idle cost is
+            #   worth knowing.
+            #
+            # compared against the median rather than the max: one slow call raises a max above
+            # anything the remaining budget could fit, after which NO hang can exceed it and every
+            # subsequent one reads as ordinary budget exhaustion. durations of 50ms, 1ms, 1ms then a
+            # hang would have published the 1ms median. the median moves only if most calls are
+            # slow, which is precisely the uniformly-slow case that must stay measurable.
             failures += 1
-            if not durations or elapsed > max(durations):
+            if not durations or elapsed > statistics.median(durations):
                 return RewardProfile(
                     0.0, len(durations), degenerate=False, failures=failures, timed_out=True
                 )
@@ -198,7 +220,7 @@ def profile_reward_latency(
             # a grader that raises on a sample tells us nothing about its latency.
             failures += 1
             continue
-        if call < _WARMUP_CALLS:
+        if call < warmup_calls:
             continue  # warm-up: paid once, never paid again, so not representative
         durations.append(elapsed)
 

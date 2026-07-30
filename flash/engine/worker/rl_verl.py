@@ -897,9 +897,15 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
                 # this returns regardless. report how far it got: "no reference completion could be
                 # gathered" is false once an earlier example has already yielded one, and a skip
                 # reason that misstates what happened sends a reader after the wrong env hook.
+                #
+                # count only the USABLE ones. a failed call still appends its empty placeholder to
+                # keep example indices aligned, and counting those would claim references were
+                # gathered when every attempt had in fact failed -- exactly as misleading as the
+                # message this replaced, in the opposite direction.
+                usable = sum(1 for _, text in samples if text)
                 print(
                     "[rl-verl] reward profiling skipped: env.sft_completion did not return within "
-                    f"{_PROFILE_BUDGET_S:.0f}s ({len(samples)} reference completion(s) gathered "
+                    f"{_PROFILE_BUDGET_S:.0f}s ({usable} usable reference completion(s) gathered "
                     "before the deadline)",
                     flush=True,
                 )

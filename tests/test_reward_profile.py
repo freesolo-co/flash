@@ -428,16 +428,46 @@ def test_a_single_reference_still_produces_a_reading():
     resolve_grpo_prompts_per_step (flash/engine/worker/grpo.py) explicitly supports a
     single-prompt dataset. Slicing the sample list would spend that one reference on the discarded
     warm-up, leaving no timed call and reporting that nothing graded -- false, since grading
-    succeeded. Cycling the available references keeps every valid dataset size measurable.
+    succeeded. Below the warm-up threshold the first call is kept AS the measurement.
     """
     seen: list[int] = []
     profile = profile_reward_latency(_sleeper(0.002, record=seen), _samples(1), max_samples=3)
 
-    assert profile.samples == 3, "the single reference was not reused for the measured calls"
-    assert len(seen) == 4  # warm-up + 3 measured, all against the one available example
-    assert seen == [0, 0, 0, 0]
+    assert profile.samples == 1, "the single reference produced no measured call"
+    # graded exactly once: a repeat would time the scorer's cache, not the scorer.
+    assert seen == [0]
     assert profile.trustworthy
     assert "no sample graded successfully" not in profile.describe()
+
+
+def test_references_are_never_graded_twice():
+    """A repeat measures the scorer's cache, not the scorer.
+
+    An expensive grader -- the kind whose idle cost is worth knowing -- is the likeliest to memoize
+    by (example, completion). Filling the call plan by repeating inputs would serve every repeat
+    from that cache and publish a near-zero latency for a grader that trains against novel
+    completions at full price. The error points the dangerous way: it reads as "grading is free",
+    which packs more runs onto a card that cannot carry them.
+    """
+    seen: list[int] = []
+    profile = profile_reward_latency(_sleeper(0.002, record=seen), _samples(2), max_samples=3)
+
+    assert len(seen) == len(set(seen)), f"an example was graded more than once: {seen}"
+    assert profile.samples == 2
+    assert profile.trustworthy
+
+
+def test_the_warmup_is_discarded_only_when_a_reference_can_be_spared():
+    """With references to spare the first call is still setup, not a measurement.
+
+    The warm-up rule is not abandoned by the single-reference case -- it is conditioned on there
+    being a spare. Given more references than max_samples, the first is discarded exactly as before.
+    """
+    seen: list[int] = []
+    profile = profile_reward_latency(_sleeper(0.002, record=seen), _samples(4), max_samples=3)
+
+    assert len(seen) == 4  # warm-up + 3 measured
+    assert profile.samples == 3, "the warm-up was counted as a measurement"
 
 
 def test_an_outlier_timeout_voids_the_whole_reading():
@@ -468,6 +498,41 @@ def test_an_outlier_timeout_voids_the_whole_reading():
         assert "unmeasured" in profile.describe()
         # the message must not claim nothing graded: two calls did.
         assert "no sample graded successfully" not in profile.describe()
+    finally:
+        release.set()
+
+
+def test_one_slow_call_does_not_license_every_later_hang():
+    """A hang must be judged against a typical call, not against the slowest one seen.
+
+    Comparing to max(durations) lets a single slow call raise the bar above anything the remaining
+    budget could fit -- after which NO hang can exceed it, and every one reads as ordinary budget
+    exhaustion. Here one measured call takes ~150ms and the rest ~1ms, leaving the hang less than
+    150ms of budget, so a max-based rule would publish the ~1ms median for a grader whose last call
+    never returned at all.
+    """
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def one_slow_then_fast_then_hangs(index: int, completion: str) -> float:
+        calls["n"] += 1
+        if calls["n"] >= 5:
+            release.wait(30.0)  # never set during the test
+            return 1.0
+        # call 1 is the discarded warm-up; call 2 is a MEASURED ~150ms outlier that lands in
+        # durations, then two ~1ms calls. the budget then leaves less than 150ms for the hang, so a
+        # max-based rule cannot fire and would publish the ~1ms median.
+        end = time.perf_counter() + (0.15 if calls["n"] == 2 else 0.001)
+        while time.perf_counter() < end:
+            pass
+        return 1.0
+
+    try:
+        profile = profile_reward_latency(
+            one_slow_then_fast_then_hangs, _samples(8), max_samples=5, budget_s=0.23
+        )
+        assert profile.timed_out, "an early slow call masked a genuine hang"
+        assert not profile.trustworthy
     finally:
         release.set()
 
@@ -517,7 +582,42 @@ def test_hook_timeout_message_reports_references_already_gathered(monkeypatch, c
         rl_verl._log_reward_profile(SlowThirdEnv(), score_one, [{"id": i} for i in range(4)], 32)
         out = capsys.readouterr().out
         assert "did not return within" in out, out
-        assert "2 reference completion(s) gathered" in out, out
+        assert "2 usable reference completion(s) gathered" in out, out
         assert "no reference completion could be gathered" not in out, out
+    finally:
+        release.set()
+
+
+def test_hook_timeout_message_does_not_count_failed_references(monkeypatch, capsys):
+    """A failed call still occupies a slot, and counting it would claim a reference it never had.
+
+    Failed attempts append an empty placeholder to keep example indices aligned with the samples
+    list. Reporting that raw length would say references were gathered when every attempt failed --
+    as misleading as the "no reference could be gathered" message this replaced, in the opposite
+    direction.
+    """
+    from flash.engine.worker import rl_verl
+
+    monkeypatch.setattr(rl_verl, "_PROFILE_BUDGET_S", 0.3)
+    release = threading.Event()
+    calls = {"n": 0}
+
+    class FailsThenStallsEnv:
+        def sft_completion(self, example):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                release.wait(30.0)
+            raise RuntimeError("hook is broken")  # the first two produce nothing usable
+
+    def score_one(index: int, completion: str) -> float:
+        return 1.0
+
+    try:
+        rl_verl._log_reward_profile(
+            FailsThenStallsEnv(), score_one, [{"id": i} for i in range(4)], 32
+        )
+        out = capsys.readouterr().out
+        assert "did not return within" in out, out
+        assert "0 usable reference completion(s) gathered" in out, out
     finally:
         release.set()
