@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from flash.engine.reward_profile import gpu_idle_fraction, profile_reward_latency
@@ -57,18 +59,66 @@ def test_blank_completions_are_reported_degenerate_not_trusted():
     slow, and the cost model would then price 80% of the step as free.
     """
     profile = profile_reward_latency(_sleeper(0.001), _samples(6, text="   "), max_samples=3)
-    assert profile.samples == 3
+    assert profile.samples == 0  # nothing real was graded, so there is no reading
     assert profile.degenerate
     assert not profile.trustworthy
-    assert "DEGENERATE" in profile.describe()
+    assert "unmeasured" in profile.describe()
 
 
-def test_mixed_completions_are_not_degenerate():
-    """Only an ALL-blank sample set is degenerate; one real completion is enough to exercise it."""
-    mixed = [(0, ""), (1, ""), (2, "real output"), (3, "")]
-    profile = profile_reward_latency(_sleeper(0.001), mixed, max_samples=3)
+def test_blank_completions_are_excluded_from_a_mixed_set():
+    """A blank timing must not enter the statistic even when other samples are real.
+
+    The earlier version of this asserted only that a mixed set is NOT degenerate, which let blank
+    timings into the median: three instant blanks and one slow real grading produce a fast median
+    that still reports `trustworthy`, which is exactly the under-reading the degenerate flag exists
+    to prevent. Blanks are dropped before timing, so only real completions are measured.
+
+    The scorer here behaves like a real grader -- it returns immediately on blank input and costs
+    20ms on real text -- because that is what makes the two models disagree on the NUMBER and not
+    just the sample count. Keeping blanks yields a median near 0 while still reporting trustworthy;
+    dropping them yields ~20ms.
+    """
+
+    def realistic(index: int, completion: str) -> float:
+        if not completion.strip():
+            return 0.0  # a regex grader finds nothing in blank text and returns at once
+        end = time.perf_counter() + 0.02
+        while time.perf_counter() < end:
+            pass
+        return 1.0
+
+    mixed = [(0, ""), (1, "  "), (2, ""), (3, "real one"), (4, "real two"), (5, "real three")]
+    profile = profile_reward_latency(realistic, mixed, max_samples=3)
     assert not profile.degenerate
     assert profile.trustworthy
+    assert profile.samples == 2  # 3 real minus the discarded warm-up
+    assert profile.seconds_per_completion == pytest.approx(0.02, abs=0.008)
+
+
+def test_a_hung_grader_cannot_outlast_the_budget():
+    """The budget must bound time spent INSIDE a call, not just the gap before one.
+
+    Checking the deadline only between calls means one grader that never returns blocks training
+    forever, which is the opposite of the bounded-delay promise. A hung call is counted as a
+    failure rather than a data point: it proves grading is at least this slow, not how slow.
+    """
+    import threading
+
+    release = threading.Event()
+
+    def hangs(index: int, completion: str) -> float:
+        release.wait(30.0)  # never set during the test
+        return 1.0
+
+    started = time.perf_counter()
+    try:
+        profile = profile_reward_latency(hangs, _samples(6), max_samples=3, budget_s=0.15)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 2.0, f"budget did not bound the in-flight call ({elapsed:.1f}s)"
+        assert profile.failures >= 1
+        assert not profile.trustworthy
+    finally:
+        release.set()  # let the abandoned worker thread exit
 
 
 def test_scorer_errors_are_counted_never_raised():
@@ -215,7 +265,7 @@ def test_worker_hook_profiles_against_reference_completions_and_never_raises(cap
     assert graded, "hook never called the scorer"
     assert all(t.startswith("reference for") for t in graded), graded
     assert "reward profile:" in out
-    assert "DEGENERATE" not in out  # real reference text was graded
+    assert "unmeasured" not in out  # real reference text was graded
     assert "per step" in out
     assert "32 completions" in out
 
@@ -229,3 +279,112 @@ def test_worker_hook_profiles_against_reference_completions_and_never_raises(cap
             raise RuntimeError("no reference available")
 
     _log_reward_profile(BrokenEnv(), score_one, examples, 32)  # must not raise
+
+
+def test_worker_hook_skips_an_env_whose_scorer_is_not_thread_safe(capsys):
+    """reward_thread_safe = False means the scorer keeps mutable state, so it must NOT be profiled.
+
+    Profiling grades real completions on the SAME live env training will use. For an opted-out env
+    (flash/envs/adapter.py documents the contract) that can advance a counter, consume an api
+    quota or warm a cache before the first rollout, changing the rewards training then receives.
+    A measurement that moves the thing it measures is worse than a missing measurement.
+    """
+    from flash.engine.worker.rl_verl import _log_reward_profile
+
+    class StatefulEnv:
+        reward_thread_safe = False
+
+        def __init__(self):
+            self.calls = 0
+
+        def sft_completion(self, example):
+            return [{"role": "assistant", "content": "reference"}]
+
+    env = StatefulEnv()
+
+    def score_one(index: int, completion: str) -> float:
+        env.calls += 1
+        return 1.0
+
+    _log_reward_profile(env, score_one, [{"id": i} for i in range(4)], 32)
+    out = capsys.readouterr().out
+
+    assert env.calls == 0, "profiling touched a scorer that declared itself unsafe to race"
+    assert "reward_thread_safe" in out  # the skip is reported, not silent
+
+
+def test_worker_hook_uses_the_envs_assistant_text_semantics(capsys):
+    """Reference text must come from flash.multimodal.assistant_completion_text.
+
+    A hand-rolled ''.join over every message's `content` breaks two ways: openai-style text blocks
+    (`[{"type": "text", "text": "4"}]`) stringify into a python repr, and non-assistant turns get
+    concatenated into the graded text. Both hand the grader something no rollout would produce.
+    """
+    from flash.engine.worker.rl_verl import _log_reward_profile
+
+    class BlockEnv:
+        def sft_completion(self, example):
+            return [
+                {"role": "user", "content": "what is 2+2?"},
+                {"role": "assistant", "content": [{"type": "text", "text": "4"}]},
+            ]
+
+    graded: list[str] = []
+
+    def score_one(index: int, completion: str) -> float:
+        graded.append(completion)
+        return 1.0
+
+    _log_reward_profile(BlockEnv(), score_one, [{"id": i} for i in range(4)], 32)
+
+    assert graded, "hook never called the scorer"
+    assert set(graded) == {"4"}, graded  # not "{'type': 'text', ...}", not the user turn
+
+
+def test_profiling_does_not_pollute_the_training_sample_buffer():
+    """The profiler must not be handed training's own _score closure.
+
+    _score appends to recent_samples, the buffer the per-step completion dump reads, so profiling
+    through it would seed the training log with gradings that never came from a rollout.
+
+    Asserted against the worker's SOURCE rather than by calling it. Both closures live inside
+    run_rl_verl, which needs a model, a dataset and a verl interpreter to reach -- and the obvious
+    alternative (build a fake scorer in the test and check it left a local list empty) is
+    unfailable: it asserts on a fixture the test itself wrote, and passes with the bug restored.
+    This is the weaker kind of test, so it is scoped to the one line that decides the wiring.
+    """
+    import inspect
+
+    from flash.engine.worker.rl_verl import run_rl_verl
+
+    source = inspect.getsource(run_rl_verl)
+    call = source[source.index("_log_reward_profile(") :]
+    call = call[: call.index(")")]
+    assert "_score_for_profile" in call, call
+    assert "env, _score," not in call, call  # training's buffered closure, not the profiling one
+
+
+def test_score_single_turn_can_propagate_errors_for_the_profiler():
+    """raise_on_error lets the profiler tell a real 0.0 from a failed grading.
+
+    Training keeps the swallow-to-0.0 contract so one bad completion never kills a run. But the
+    profiler needs the opposite: if every grading raises and it sees 0.0 returned quickly, it
+    reports a fast, confident latency for a grader that is entirely down.
+    """
+    from flash.engine.worker.rl_verl import score_single_turn
+
+    class Env:
+        def reward(self, graded, ex, state):
+            raise RuntimeError("grader is down")
+
+    kwargs = {
+        "tok": None,
+        "thinking": False,
+        "prompt_opened_thinking": False,
+        "think_penalty": 0.0,
+    }
+    # training path: swallowed, scored 0.0
+    assert score_single_turn(Env(), "text", {}, **kwargs) == 0.0
+    # profiling path: propagated
+    with pytest.raises(RuntimeError):
+        score_single_turn(Env(), "text", {}, raise_on_error=True, **kwargs)

@@ -785,12 +785,17 @@ def score_single_turn(
     thinking: bool,
     prompt_opened_thinking: bool,
     think_penalty: float,
+    raise_on_error: bool = False,
 ) -> float:
     """score one single-turn text completion exactly as the trl reward path does.
 
     mirrors run_rl.reward_fn's single-turn text branch: graded text -> env.scores_breakdown
     (preferred) or env.reward, minus the optional thinking-length penalty. env scoring errors
     are swallowed to 0.0 so a bad completion never kills the run.
+
+    ``raise_on_error`` re-raises instead, for callers that must tell a real 0.0 score apart from a
+    failed grading. training never sets it; the latency profiler does, because a swallowed error
+    turns a grader that is failing on every call into a fast, confident, wrong reading.
     """
     try:
         graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
@@ -810,6 +815,8 @@ def score_single_turn(
         else:
             r = float(env.reward(graded, ex, state))
     except Exception as exc:  # env scoring must not kill the run
+        if raise_on_error:
+            raise
         print(
             f"[rl-verl] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0", flush=True
         )
@@ -830,18 +837,36 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
     THIS env, so a mispriced run is visible in the log instead of only in the bill.
 
     Profiles against each example's own reference completion rather than blank text: an empty
-    string does not exercise a grader, so a blank-text profile understates real latency.
+    string does not exercise a grader, so a blank-text profile measures the early-return.
+
+    SKIPPED for an env that declares ``reward_thread_safe = False``. That flag means the scorer
+    keeps mutable or thread-bound state (flash/envs/adapter.py documents it), so grading extra
+    completions before training starts could advance a counter, consume a quota or warm a cache,
+    and change the rewards training then receives. A measurement must not be able to move the
+    thing it measures, and the profiler also needs a worker thread to bound a hung call, which
+    such an env must not be given. The cost of skipping is one unmeasured latency in the log.
 
     Advisory only, and never fatal -- it must not be able to break a run it is only measuring.
     """
     try:
         from flash.engine.reward_profile import profile_reward_latency
+        from flash.multimodal import assistant_completion_text
+
+        if not getattr(env, "reward_thread_safe", True):
+            print(
+                "[rl-verl] reward profiling skipped: env declares reward_thread_safe = False, "
+                "so grading it early could change the rewards training sees",
+                flush=True,
+            )
+            return
 
         samples: list[tuple[int, str]] = []
         for index, example in enumerate(rollout_examples[:4]):
             try:
-                messages = env.sft_completion(example) or []
-                text = "".join(str(m.get("content") or "") for m in messages)
+                # the env's own assistant-text semantics: takes the last assistant turn and
+                # flattens openai-style text blocks. hand-rolling this stringifies block dicts
+                # into a python repr and mixes in user/system turns.
+                text = assistant_completion_text(env.sft_completion(example))
             except Exception:
                 text = ""
             samples.append((index, text))
@@ -1715,8 +1740,30 @@ def run_rl_verl():
             del recent_samples[:-64]
         return score
 
+    def _score_for_profile(index: int, solution_str: str) -> float:
+        """the same grading path as _score, minus training's own bookkeeping.
+
+        deliberately NOT _score: that appends to recent_samples, so profiling would seed the
+        per-step completion dump with gradings that never came from a rollout. it also propagates
+        scoring errors instead of scoring them 0.0, so a grader failing on every call reports as a
+        failure rather than as a fast latency.
+        """
+        return score_single_turn(
+            env,
+            solution_str,
+            rollout_examples[int(index)],
+            tok=tok,
+            thinking=bool(_w.THINKING),
+            prompt_opened_thinking=inp["prompt_opened_thinking"],
+            think_penalty=inp["think_penalty"],
+            raise_on_error=True,
+        )
+
     _log_reward_profile(
-        env, _score, rollout_examples, int(inp["prompts_per_step"]) * int(inp["group_size"])
+        env,
+        _score_for_profile,
+        rollout_examples,
+        int(inp["prompts_per_step"]) * int(inp["group_size"]),
     )
 
     server, reward_url = start_reward_server(_score, example_count=len(rollout_examples))
