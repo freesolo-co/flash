@@ -31,6 +31,7 @@ from flash.engine.steps import (
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.packing import completion_mask_from_ids
+from flash.engine.worker.rng import seed_training_rngs
 from flash.engine.worker.sft import (
     _model_arch_dims,
     _pretokenize_completion_only,
@@ -46,6 +47,7 @@ from flash.engine.worker.verl_common import (
     parse_wandb_link,
     render_wandb_link_shim,
     resolve_checkpoint_actor_dir,
+    resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
     stamp_adapter_dir_provenance,
@@ -979,6 +981,10 @@ def run_sft_verl(spec=None) -> None:
 
     spec = spec or _w.JOB_SPEC
     env = _w.require_active_env()
+    # the child trainer is seeded through its shim, but the environment's dataset/completion calls
+    # run HERE in the parent. without this the documented top-level seed no longer reproduces sft
+    # targets for any env whose row construction uses python/numpy randomness.
+    seed_training_rngs(_w.SEED)
     started_at = time.time()
     _w.heartbeat("sft_start", gpu=_w.gpu_diagnostics(include_torch=False))
     gpu_probe = _probe_gpu_in_subprocess(
@@ -1233,11 +1239,10 @@ def run_sft_verl(spec=None) -> None:
         gradient_checkpointing and _w.grpo_use_reentrant(model_id)
     )
 
-    python_bin = resolve_verl_python(workdir)
+    python_bin = resolve_verl_python(workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY")))
     model_path = _cached_model_path(model_id, model_revision)
-    loggers = ["console"]
-    if os.environ.get("WANDB_API_KEY"):
-        loggers.append("wandb")
+    # verl logs from python_bin, so gate wandb on THAT interpreter (see resolve_verl_loggers).
+    loggers = resolve_verl_loggers(python_bin)
     project_name = (
         (spec.wandb.project if spec and spec.wandb else None) or "flash"
     )

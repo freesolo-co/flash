@@ -64,6 +64,7 @@ from flash.engine.worker.verl_common import (
     parse_verl_step_metrics,
     parse_wandb_link,
     render_wandb_link_shim,
+    resolve_verl_loggers,
     resolve_verl_python,
     verl_supports_rollout_field,
 )
@@ -1064,20 +1065,8 @@ def start_reward_server(score_by_index, *, example_count: int):
 # verl interpreter + checkpoint export.
 # --------------------------------------------------------------------------------------------
 def _resolve_verl_loggers(python_bin: str) -> str:
-    """verl's ``trainer.logger`` list. verl logs from its own interpreter, so enable the wandb
-    logger only when WANDB_API_KEY is set AND wandb is importable in that interpreter; otherwise
-    console-only. this never inits a flash-side run (flash does not train in-process on this path,
-    so a flash-side run would stay empty) and never aborts verl when its env lacks wandb."""
-    if not os.environ.get("WANDB_API_KEY"):
-        return "console"
-    has_wandb = (
-        subprocess.run([python_bin, "-c", "import wandb"], capture_output=True).returncode == 0
-    )
-    if not has_wandb:
-        print(
-            "[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; using console logger only"
-        )
-    return "console,wandb" if has_wandb else "console"
+    """verl's ``trainer.logger`` list, as the comma-joined form this module's override emits."""
+    return ",".join(resolve_verl_loggers(python_bin))
 
 
 def _export_peft_adapter(

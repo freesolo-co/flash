@@ -785,6 +785,11 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
         "thinking": False,
         "train": {
             **SPEC["train"],
+            # the 35b is a gdn hybrid, so opd sizes it with a bf16 kv cache (the worker refuses fp8
+            # for them). at the default 8 prompts/step this config needs 186 gb and no card fits, so
+            # the valid-context case would fail allocation instead of exercising the ordering this
+            # test is about. 4 fits the b200 and leaves the context contract unchanged.
+            "batch_size": 4,
             "max_completion_tokens": max_completion_tokens,
             "structured_outputs": {"choice": ["4"]},
         },
