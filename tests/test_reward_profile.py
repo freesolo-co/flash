@@ -92,10 +92,9 @@ def test_blank_completions_are_excluded_from_a_mixed_set():
     profile = profile_reward_latency(realistic, mixed, max_samples=3)
     assert not profile.degenerate
     assert profile.trustworthy
-    # 3 real references, all of them measured: the references are cycled to fill the call plan, so
-    # the warm-up no longer costs one of them. this used to read 2 -- the pool was sliced, and any
-    # run whose reference count equalled max_samples came up one measured call short.
-    assert profile.samples == 3
+    # 3 real references, one spent as the warm-up: its setup cost is not steady-state grading, and
+    # at these counts it cannot be averaged away.
+    assert profile.samples == 2
     assert profile.seconds_per_completion == pytest.approx(0.02, abs=0.008)
 
 
@@ -453,21 +452,55 @@ def test_references_are_never_graded_twice():
     profile = profile_reward_latency(_sleeper(0.002, record=seen), _samples(2), max_samples=3)
 
     assert len(seen) == len(set(seen)), f"an example was graded more than once: {seen}"
-    assert profile.samples == 2
+    # two references, one spent as the warm-up. cycling would have produced 4 gradings from 2 inputs.
+    assert profile.samples == 1
     assert profile.trustworthy
 
 
-def test_the_warmup_is_discarded_only_when_a_reference_can_be_spared():
-    """With references to spare the first call is still setup, not a measurement.
+def test_the_warmup_is_discarded_whenever_a_second_reference_exists():
+    """The cold call is spent as setup as soon as there is anything else to measure.
 
-    The warm-up rule is not abandoned by the single-reference case -- it is conditioned on there
-    being a spare. Given more references than max_samples, the first is discarded exactly as before.
+    The warm-up rule is not abandoned by the single-reference case -- it is suspended for it alone.
+    Given references to spare the first is discarded exactly as before, and given exactly two it is
+    STILL discarded, because two measured calls is the worst case for a cold outlier rather than a
+    safe one.
     """
     seen: list[int] = []
     profile = profile_reward_latency(_sleeper(0.002, record=seen), _samples(4), max_samples=3)
-
     assert len(seen) == 4  # warm-up + 3 measured
     assert profile.samples == 3, "the warm-up was counted as a measurement"
+
+    seen.clear()
+    profile = profile_reward_latency(_sleeper(0.002, record=seen), _samples(2), max_samples=3)
+    assert seen == [0, 1], "both references should still be graded, one of them as the warm-up"
+    assert profile.samples == 1, "with a second reference to measure, the cold call is not a sample"
+
+
+def test_a_cold_first_call_cannot_set_a_two_reference_reading():
+    """A median of two values is their MEAN, so a cold outlier would land squarely in the middle.
+
+    This is the case the warm-up exists for and the one where skipping it does the most damage: a
+    scorer paying 100x setup on its first call and running fast afterwards would, if both calls were
+    measured, publish roughly half the setup cost as its steady-state grading latency -- and mark it
+    trustworthy. Above two measured calls the median leaves an outlier at an end; at exactly two
+    there is no end for it to sit at.
+    """
+    calls = {"n": 0}
+
+    def slow_setup_then_fast(index: int, completion: str) -> float:
+        calls["n"] += 1
+        end = time.perf_counter() + (0.1 if calls["n"] == 1 else 0.001)
+        while time.perf_counter() < end:
+            pass
+        return 1.0
+
+    profile = profile_reward_latency(slow_setup_then_fast, _samples(2), max_samples=3)
+
+    assert profile.trustworthy
+    # the ~1ms warm call, not the ~50ms average of a 100ms setup and a 1ms grading.
+    assert profile.seconds_per_completion < 0.02, (
+        f"the cold call set the reading: {profile.seconds_per_completion:.4f}s"
+    )
 
 
 def test_an_outlier_timeout_voids_the_whole_reading():
@@ -615,6 +648,40 @@ def test_hook_timeout_message_does_not_count_failed_references(monkeypatch, caps
     try:
         rl_verl._log_reward_profile(
             FailsThenStallsEnv(), score_one, [{"id": i} for i in range(4)], 32
+        )
+        out = capsys.readouterr().out
+        assert "did not return within" in out, out
+        assert "0 usable reference completion(s) gathered" in out, out
+    finally:
+        release.set()
+
+
+def test_hook_timeout_message_does_not_count_blank_references(monkeypatch, capsys):
+    """A whitespace-only completion is dropped by the profiler, so it is not a gathered reference.
+
+    ``profile_reward_latency`` rejects these with ``text.strip()`` -- grading an empty string times
+    the early return, not the grader. A count that admitted them would name a reference the profiler
+    would have discarded, sending a reader after the wrong hook.
+    """
+    from flash.engine.worker import rl_verl
+
+    monkeypatch.setattr(rl_verl, "_PROFILE_BUDGET_S", 0.3)
+    release = threading.Event()
+    calls = {"n": 0}
+
+    class BlankThenStallsEnv:
+        def sft_completion(self, example):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                release.wait(30.0)
+            return "   \n\t "  # succeeds, but nothing here can be profiled
+
+    def score_one(index: int, completion: str) -> float:
+        return 1.0
+
+    try:
+        rl_verl._log_reward_profile(
+            BlankThenStallsEnv(), score_one, [{"id": i} for i in range(4)], 32
         )
         out = capsys.readouterr().out
         assert "did not return within" in out, out

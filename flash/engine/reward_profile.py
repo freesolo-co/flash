@@ -135,10 +135,10 @@ def profile_reward_latency(
     ``samples`` are (example_index, completion_text) pairs drawn from the run's own data. Blank
     texts are dropped before timing: grading an empty string measures the early-return, not the
     grader. Each surviving reference is graded at most ONCE -- a memoizing scorer would serve a
-    repeat from its cache, and timing that would report grading as nearly free. When there are more
-    references than ``max_samples`` the first is a discarded warm-up; when there are not, it is kept
-    as the measurement, so a run holding a single prompt is measurable rather than spending its only
-    reference on setup.
+    repeat from its cache, and timing that would report grading as nearly free. The first call is a
+    discarded warm-up whenever a second reference exists, since its setup cost is not steady-state
+    grading; a run holding a single reference keeps it as the measurement rather than spending its
+    only one on setup.
 
     Bounded twice over -- by ``max_samples`` and by ``budget_s``, the latter covering time spent
     INSIDE a call as well as between calls -- so a slow or hung grader delays training by a known
@@ -170,17 +170,19 @@ def profile_reward_latency(
     # dangerous way: it reads as "grading is free", which packs more runs onto a card that cannot
     # carry them.
     #
-    # so each reference is graded exactly once, and the warm-up is spent only when there is a
-    # reference to spare. below that, the first call IS the measurement: it is the only one whose
-    # input the grader has not already seen. it carries the one-time setup cost the warm-up normally
-    # absorbs, which overstates -- the safe direction here, and from two references up the median
-    # leaves it at one end where it cannot set the reading.
-    if len(real) > max_samples:
-        planned = real[: max_samples + _WARMUP_CALLS]
-        warmup_calls = _WARMUP_CALLS
-    else:
-        planned = real
-        warmup_calls = 0
+    # so each reference is graded exactly once, and the warm-up is spent whenever a second reference
+    # exists to measure instead. the cold call is not a sample of steady-state grading: it carries
+    # import, connection setup and cache fill that no later call pays again, and it cannot be
+    # averaged away at these counts. two measured calls are the worst case for that -- a median of
+    # two is their MEAN, so a scorer with 5s of setup and 10ms warm calls would publish 2.5s and
+    # persist it as trustworthy. from three measured calls up the cold one sits at an end where it
+    # cannot set the reading, but by then it has already been discarded anyway.
+    #
+    # a lone reference is the one exception: spending it would leave nothing measured at all. there
+    # the first call IS the measurement, overstating by the setup it carries -- the safe direction,
+    # since overstating grading cost packs FEWER runs onto a card rather than more.
+    warmup_calls = _WARMUP_CALLS if len(real) > 1 else 0
+    planned = real[: max_samples + warmup_calls]
 
     for call, (index, completion) in enumerate(planned):
         remaining = budget_s - (time.perf_counter() - started)
