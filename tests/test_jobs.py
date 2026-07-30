@@ -511,7 +511,7 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     # Never scheduled (no capacity) is reported distinctly from a scheduled-then-stalled worker.
     assert res.failure == "no_capacity"
     assert "IN_QUEUE" in res.detail
-    assert "next-best GPU" in res.detail
+    assert "GPU-class escalation may follow" in res.detail
 
 
 def test_capacity_grace_scales_with_gpu_walk_position():
@@ -5635,10 +5635,16 @@ def test_reattached_last_gpu_job_words_capacity_like_the_direct_submit(monkeypat
     assert captured["on_last_gpu"] is False
 
 
-def test_capacity_detail_still_promises_next_best_when_one_exists(monkeypatch):
-    """With classes left to walk the original escalation message is correct, so it must survive the
-    fix. Deliberately relies on the default rather than passing on_last_gpu, to guard the normal path
-    both before and after the change."""
+def test_capacity_detail_promises_no_retry_when_a_next_class_exists(monkeypatch):
+    """The false branch must be exactly as neutral as the true one. It originally read "retrying on
+    the next-best GPU", which asserts BOTH a retry and a class walk -- and a cache-drop retry fires
+    with on_last_gpu false while deliberately reselecting the SAME class, so that wording
+    contradicted the action line printed beneath it (see
+    test_cache_drop_retry_names_the_same_class_it_reselects).
+
+    Deliberately relies on the default rather than passing on_last_gpu, to guard the normal path."""
     res = _poll_in_queue_forever(monkeypatch)
     assert res.failure == "no_capacity"
-    assert "retrying on the next-best GPU" in res.detail, res.detail
+    assert "GPU-class escalation may follow" in res.detail, res.detail
+    assert "retrying" not in res.detail, res.detail
+    assert "next-best" not in res.detail, res.detail

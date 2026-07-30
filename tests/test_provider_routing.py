@@ -1157,6 +1157,25 @@ def _retry_action_line(log_text: str, attempt: int) -> str:
     raise AssertionError(f"no action line for attempt={attempt} in:\n{log_text}")
 
 
+def _retry_block(log_text: str, attempt: int) -> str:
+    """The action line plus the failure detail printed with it, as one string.
+
+    The two come from a single print and are read together, so a claim in one contradicts a claim in
+    the other. This is the unit to assert on when the point is that they AGREE. It stops at the
+    closing `---` so the next attempt's allocation summary -- which legitimately says
+    `next-best: <class>` about the candidate list -- stays out (see `_retry_action_line`).
+    """
+    lines = log_text.splitlines()
+    marker = f"attempt={attempt} failed"
+    for i, line in enumerate(lines):
+        if marker in line:
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() == "---" and j > i + 1:
+                    return "\n".join(lines[i : j + 1])
+            return "\n".join(lines[i:])
+    raise AssertionError(f"no action line for attempt={attempt} in:\n{log_text}")
+
+
 def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monkeypatch):
     """LS-008/AT-013: a capacity failure on the LAST fitting class used to say the run was 'retrying
     on the next-best GPU' while the picker had nowhere to walk and re-selected that same class. The
@@ -1296,6 +1315,61 @@ def test_cache_drop_retry_names_the_same_class_it_reselects(orch, monkeypatch):
     assert "next-best" not in action, action
 
 
+def test_cache_drop_failure_detail_does_not_contradict_the_action_line(orch, monkeypatch):
+    """The failure detail and the action line are printed in the SAME log block, so they have to
+    agree. A cache-drop retry runs with on_last_gpu false (classes remain untried), and poll_job's
+    false branch used to read 'retrying on the next-best GPU' -- while the action line directly
+    beneath named the same class being reselected. One block, two contradictory retry targets.
+
+    poll_job holds neither the retry budget nor the candidate list, so it cannot know a cache drop is
+    coming; the fix is to make the detail state only the escalation fact and leave the target to the
+    supervisor. Asserts on the block as a whole, which is what an operator actually reads."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    candidates = (
+        Candidate("runpod", "H100", 0.49, 48),
+        Candidate("runpod", "RTX Pro 6000", 0.50, 96),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    # the real poll_job wording, not a hand-written stand-in: build the clause with the production
+    # helper so a regression in it fails this test rather than being masked by a copied string.
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **kw):
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        if getattr(run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME:
+            note = rp_jobs.capacity_escalation_note(on_last_gpu)
+            return PollResult(
+                False,
+                failure="no_capacity",
+                detail=f"never scheduled: job stuck IN_QUEUE for 900s (no RunPod capacity for the "
+                f"pinned GPU class); {note}",
+            )
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    block = _retry_block(log.getvalue(), 0)
+    assert "expecting to retry on H100 @ runpod again" in block, block
+    # the whole point: nothing in this block may promise a walk the supervisor is not making. scoped
+    # to the block, since the allocation summary outside it names the next-best CANDIDATE legitimately.
+    assert "next-best" not in block, block
+    assert "GPU-class escalation may follow" in block, block
+
+
 def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, monkeypatch):
     """The projection reads the CURRENT candidate list, but the next attempt calls allocate() again.
     Providers that rebuild candidates from live capacity can drop the named class or surface a
@@ -1340,4 +1414,6 @@ def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, mon
     action = _retry_action_line(log.getvalue(), 0)
     assert "expecting to retry on H200 @ runpod" in action, action
     assert "the class may change" in action, action
-    assert "retrying on H200" not in action, "stated a projected class as the confirmed retry target"
+    assert "retrying on H200" not in action, (
+        "stated a projected class as the confirmed retry target"
+    )

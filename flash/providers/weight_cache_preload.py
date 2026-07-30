@@ -130,7 +130,7 @@ def _has_worker(workers: dict | None) -> bool | None:
       ``_only_unhealthy_workers`` is what separates that case out on its own timer.
 
     ``throttled`` is deliberately NOT counted. ``jobs.py`` classifies a sustained throttled worker as
-    ``no_capacity`` ("retrying on the next-best GPU"), which is exactly the condition this poller
+    ``no_capacity`` (a capacity failure on the pinned class), which is exactly the condition this poller
     exists to catch: RunPod is not scheduling the pinned class here. Treating it as capacity would
     make a preload sit the full timeout on a datacenter that will never run it.
 
@@ -220,6 +220,7 @@ def _preload_one_dc(
 
     dc = DataCenter.from_string(dc_id)
     vol_name = weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, dc)
+
     # Pass a factory, not a prebuilt dict: SDK stamps an account-scoped id onto NetworkVolume, so each
     # failover attempt must build a fresh volume.
     def _endpoint_kwargs():
@@ -275,7 +276,12 @@ def _preload_one_dc(
             poll_interval_s,
         )
         if result.get("error"):
-            return {"datacenter": dc_id, "status": "error", "error": result["error"], "result": result}
+            return {
+                "datacenter": dc_id,
+                "status": "error",
+                "error": result["error"],
+                "result": result,
+            }
         if result.get("failed"):
             return {"datacenter": dc_id, "status": "partial", "result": result}
         return {"datacenter": dc_id, "status": "ok", "result": result}
@@ -442,14 +448,16 @@ def warm_weight_cache(
     for r in results:
         if r.get("status") != "partial":
             continue
-        failed = ((r.get("result") or {}).get("failed") or {})
+        failed = (r.get("result") or {}).get("failed") or {}
         for model_id, detail in sorted(failed.items()):
             logger.warning("preload %s: %s FAILED: %s", r["datacenter"], model_id, detail)
     if starved:
         # Actionable: these stay cold until re-run with a class the DC actually stocks.
         logger.warning(
             "no %s capacity in %s -- re-run those with --datacenters %s --gpu <class>",
-            gpu, ", ".join(starved), ",".join(starved),
+            gpu,
+            ", ".join(starved),
+            ",".join(starved),
         )
     return results
 
@@ -465,7 +473,9 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
 
     # Explicit [] is a no-op — never widen zero DCs to the whole fleet.
     if datacenters is not None and not datacenters:
-        logger.info("teardown: empty datacenter scope — nothing to reclaim (refusing to widen to all)")
+        logger.info(
+            "teardown: empty datacenter scope — nothing to reclaim (refusing to widen to all)"
+        )
         return []
     pool = rp_keys.keys()
     if not pool:
@@ -478,7 +488,8 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
 
     dc_ids = datacenters if datacenters else [dc.value for dc in weight_cache_datacenters()]
     targets = {
-        weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, DataCenter.from_string(d)) for d in dc_ids
+        weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, DataCenter.from_string(d))
+        for d in dc_ids
     }
 
     async def _names(client) -> set:
@@ -499,8 +510,11 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
         gone = [name for name in to_delete if name not in remaining]
         still = [name for name in to_delete if name in remaining]
         if still:
-            logger.warning("teardown: %d cache volume(s) FAILED to delete (still present): %s",
-                           len(still), ", ".join(sorted(still)))
+            logger.warning(
+                "teardown: %d cache volume(s) FAILED to delete (still present): %s",
+                len(still),
+                ", ".join(sorted(still)),
+            )
         return gone
 
     multi = len(pool) > 1
@@ -518,7 +532,9 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
         logger.warning(
             "teardown: %d of %d RunPod account(s) failed to sweep (%s) — their cache volumes may "
             "still be billed; re-run teardown once the key(s) are valid",
-            len(failed_accounts), len(pool), ", ".join(failed_accounts),
+            len(failed_accounts),
+            len(pool),
+            ", ".join(failed_accounts),
         )
     return deleted
 
@@ -616,13 +632,16 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> tuple[list[list], bool
         if time.time() >= deadline:
             logger.warning(
                 "warm lambda: capacity planning budget (%ds) exhausted; skipping remaining "
-                "class(es) %s", int(_LAMBDA_PLANNING_BUDGET_S), ", ".join(classes[classes.index(cls):]),
+                "class(es) %s",
+                int(_LAMBDA_PLANNING_BUDGET_S),
+                ", ".join(classes[classes.index(cls) :]),
             )
             complete = False
             break
         try:
             candidates = lambda_jobs.usable_instances(
-                cls, **deadline_kwargs(lambda_jobs.usable_instances, deadline),
+                cls,
+                **deadline_kwargs(lambda_jobs.usable_instances, deadline),
             )
         except Exception as exc:
             logger.warning("warm lambda: usable_instances(%s) failed (skipping): %s", cls, exc)
@@ -656,12 +675,12 @@ def _lambda_provisioned_regions() -> set[str]:
 
     try:
         fses = lambda_api.list_filesystems(
-            **deadline_kwargs(
-                lambda_api.list_filesystems, time.time() + _LAMBDA_SNAPSHOT_BUDGET_S
-            ),
+            **deadline_kwargs(lambda_api.list_filesystems, time.time() + _LAMBDA_SNAPSHOT_BUDGET_S),
         )
     except Exception as exc:
-        logger.warning("warm lambda: list_filesystems failed, cannot report unreachable regions: %s", exc)
+        logger.warning(
+            "warm lambda: list_filesystems failed, cannot report unreachable regions: %s", exc
+        )
         return set()
     return {
         (fs.get("region") or {}).get("name")
@@ -674,7 +693,9 @@ def _ensure_status_repo(token: str | None) -> None:
     """Create the preload status dataset repo if absent. RAISES on failure — call before launching."""
     from huggingface_hub import HfApi
 
-    HfApi(token=token).create_repo(_PRELOAD_STATUS_REPO, repo_type="dataset", exist_ok=True, private=True)
+    HfApi(token=token).create_repo(
+        _PRELOAD_STATUS_REPO, repo_type="dataset", exist_ok=True, private=True
+    )
 
 
 def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
@@ -682,12 +703,20 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
     from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
     from flash.spec import JobSpec
 
-    return JobSpec.from_dict({
-        "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": run_id,
-        "train": {"hf_repo": _PRELOAD_STATUS_REPO},
-        "gpu": {"type": gpu, "max_wall_seconds": max(60, int(wall_s)),
-                "network_volume": WEIGHT_CACHE_VOLUME_NAME, "network_volume_gb": WEIGHT_CACHE_VOLUME_GB},
-    })
+    return JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "sft",
+            "run_id": run_id,
+            "train": {"hf_repo": _PRELOAD_STATUS_REPO},
+            "gpu": {
+                "type": gpu,
+                "max_wall_seconds": max(60, int(wall_s)),
+                "network_volume": WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume_gb": WEIGHT_CACHE_VOLUME_GB,
+            },
+        }
+    )
 
 
 def _region_filesystem_is_listed(region: str, deadline: float) -> bool:
@@ -753,8 +782,11 @@ def _ensure_region_filesystem(region: str, deadline: float) -> str:
             return "listed"
         # Created, but the launcher's listing would still miss it. One cold cycle for this region is
         # recoverable; a duplicate filesystem is billed until someone notices it by hand.
-        logger.warning("warm lambda/%s: filesystem created but not yet listed; skipping this cycle "
-                       "so the launcher cannot create a duplicate", region)
+        logger.warning(
+            "warm lambda/%s: filesystem created but not yet listed; skipping this cycle "
+            "so the launcher cannot create a duplicate",
+            region,
+        )
         return "doubtful"
     except Exception as exc:
         # No credentials means no request was ever sent, so nothing can have been created. Treating
@@ -763,8 +795,12 @@ def _ensure_region_filesystem(region: str, deadline: float) -> str:
         if not _lambda_is_reachable(exc):
             logger.info("warm lambda/%s: skipping filesystem pre-check (%s)", region, exc)
             return "unreachable"
-        logger.warning("warm lambda/%s: filesystem could not be confirmed (%s); skipping this cycle "
-                       "so the launcher cannot create a duplicate", region, exc)
+        logger.warning(
+            "warm lambda/%s: filesystem could not be confirmed (%s); skipping this cycle "
+            "so the launcher cannot create a duplicate",
+            region,
+            exc,
+        )
         return "doubtful"
 
 
@@ -777,8 +813,9 @@ def _lambda_is_reachable(exc: Exception) -> bool:
     return "not configured" not in str(exc).lower()
 
 
-def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
-                              timeout_s: int, poll_interval_s: float) -> dict:
+def _warm_one_lambda_instance(
+    lambda_jobs, candidates: list, models: list, timeout_s: int, poll_interval_s: float
+) -> dict:
     """Launch a download-only preload instance in one Lambda region, poll its status marker, then
     ALWAYS terminate. One region failing never aborts the others.
 
@@ -809,15 +846,15 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
         if fs_state == "doubtful":
             # Launching now would let the launcher's own listing miss and create a duplicate that is
             # billed forever. A region left cold this cycle just downloads on first use.
-            return _result("error", error="filesystem unconfirmed; skipped to avoid a duplicate create")
+            return _result(
+                "error", error="filesystem unconfirmed; skipped to avoid a duplicate create"
+            )
         # One anchor for everything downstream: the driver's poll deadline, the reap deadline
         # embedded in the run_id, and the instance's own wall cap all start here and all run for
         # effective_s, so no clock is ahead of another.
         deadline = time.time() + effective_s
         # Embed reap deadline in the run_id so orphan sweep can free the box if this driver dies.
-        run_id = preload_instance_run_id(
-            "lambda", region, int(deadline), uuid.uuid4().hex[:6]
-        )
+        run_id = preload_instance_run_id("lambda", region, int(deadline), uuid.uuid4().hex[:6])
         spec = launch_err = None
         for cand in candidates:
             # Rebuild per class: the spec carries the GPU, so reusing the cheap one's spec would
@@ -841,8 +878,9 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
                 # class here shares one run_id -- launching again could pay for two. This error
                 # exists precisely to forbid another create, so it must stop the ladder, not walk it.
                 launch_err = exc
-                logger.warning("warm lambda/%s: ambiguous create, not trying another class: %s",
-                               region, exc)
+                logger.warning(
+                    "warm lambda/%s: ambiguous create, not trying another class: %s", region, exc
+                )
                 break
             except Exception as exc:
                 # no capacity / launch reject. Walking to the next class is safe here: the doubtful
@@ -857,12 +895,18 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
         if launch_err is not None or spec is None:
             return _result("error", error=f"launch: {launch_err}")
         prefix = f"{spec.phase}/{run_id}"
-        reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
-                                     min_interval_s=max(5.0, poll_interval_s))
+        reader = make_hf_text_reader(
+            _PRELOAD_STATUS_REPO,
+            f"{prefix}/preload_result.json",
+            min_interval_s=max(5.0, poll_interval_s),
+        )
         # Also watch the attempt marker: if the box dies early the failmark is the only signal (avoids
         # polling to full timeout on a dead box). Completion file is authoritative when present.
-        fail_reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/lambda_attempt0.json",
-                                          min_interval_s=max(5.0, poll_interval_s))
+        fail_reader = make_hf_text_reader(
+            _PRELOAD_STATUS_REPO,
+            f"{prefix}/lambda_attempt0.json",
+            min_interval_s=max(5.0, poll_interval_s),
+        )
         logger.info("warm lambda/%s: launched preload (%d models)", region, len(models))
         text = None
         while time.time() < deadline:
@@ -889,7 +933,9 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
                     text = reader(force=True)
                     if text:
                         break
-                    return _result("error", error=f"box failed early: {fail.get('error') or 'see boot log'}")
+                    return _result(
+                        "error", error=f"box failed early: {fail.get('error') or 'see boot log'}"
+                    )
             time.sleep(max(5.0, poll_interval_s))
         if not text:
             return _result("timeout")
@@ -907,9 +953,13 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
                 lambda_jobs.terminate_run_instances(run_id)
 
 
-def warm_instances(models: list | None = None, gpu: str | None = None,
-                   timeout_s: int = _PRELOAD_TIMEOUT_S, poll_interval_s: float = 20.0,
-                   max_workers: int = 4) -> list[dict]:
+def warm_instances(
+    models: list | None = None,
+    gpu: str | None = None,
+    timeout_s: int = _PRELOAD_TIMEOUT_S,
+    poll_interval_s: float = 20.0,
+    max_workers: int = 4,
+) -> list[dict]:
     """Warm Lambda caches: one download-only launch per region with capacity. Returns status per region."""
     models = models or catalog_model_ids()
     token = os.environ.get("HF_TOKEN")
@@ -940,7 +990,8 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
         logger.warning("warm: no Lambda capacity right now (nothing to warm)")
         return []
     logger.info(
-        "warm lambda: %d region(s) -> %s", len(targets),
+        "warm lambda: %d region(s) -> %s",
+        len(targets),
         ", ".join(
             f"{getattr(cands[0], 'region', '?')}={'/'.join(getattr(c, 'gpu', '?') for c in cands)}"
             for cands in targets
@@ -958,8 +1009,9 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
         # Each region gets its whole cheapest-first list, not one pre-picked class, so the launcher
         # can fall through to a pricier class rather than leaving the region cold.
         futs = [
-            ex.submit(_warm_one_lambda_instance, lambda_jobs, cands, models,
-                      timeout_s, poll_interval_s)
+            ex.submit(
+                _warm_one_lambda_instance, lambda_jobs, cands, models, timeout_s, poll_interval_s
+            )
             for cands in targets
         ]
         results = [f.result() for f in as_completed(futs)]
@@ -1014,7 +1066,10 @@ def _cold_lambda_regions(provisioned: set[str], results: list[dict]) -> tuple[li
 
 
 def _log_unreachable_lambda_regions(
-    provisioned: set[str], results: list[dict], *, planned: bool = True,
+    provisioned: set[str],
+    results: list[dict],
+    *,
+    planned: bool = True,
 ) -> list[str]:
     """Warn about every region whose cache is not fully warm. Returns them sorted, for printing.
 
@@ -1056,7 +1111,9 @@ def provision_lambda_filesystems(name: str | None = None) -> list[str]:
             lambda_api.ensure_filesystem(target, region, deadline_at=time.time() + 300.0)
             done.append(f"lambda:{region}")
         except Exception as exc:
-            logger.warning("provision: lambda ensure_filesystem(%s, %s) failed: %s", target, region, exc)
+            logger.warning(
+                "provision: lambda ensure_filesystem(%s, %s) failed: %s", target, region, exc
+            )
     return done
 
 
@@ -1070,49 +1127,61 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--models", help="comma-separated HF model ids (default: whole catalog)")
     ap.add_argument("--datacenters", help="comma-separated DC ids (default: all storage DCs)")
     ap.add_argument(
-        "--gpu", default=None,
+        "--gpu",
+        default=None,
         help="GPU class for the preload worker. Defaults are per-mode: RunPod warm -> "
-             f"{_PRELOAD_GPU!r}; --warm-instances -> the cheapest class each region actually stocks, "
-             f"tried in the order {' -> '.join(_LAMBDA_PRELOAD_GPU_LADDER)}, so a region with no "
-             "cheap capacity is warmed on a pricier class instead of being skipped. Pass this to "
-             "pin ONE class everywhere and disable that fallback (a region that does not stock it "
-             "is then left cold). Defaulting to None (not a sentinel string) lets you explicitly "
-             "pick even a default GPU without it being mistaken for 'no override'.",
+        f"{_PRELOAD_GPU!r}; --warm-instances -> the cheapest class each region actually stocks, "
+        f"tried in the order {' -> '.join(_LAMBDA_PRELOAD_GPU_LADDER)}, so a region with no "
+        "cheap capacity is warmed on a pricier class instead of being skipped. Pass this to "
+        "pin ONE class everywhere and disable that fallback (a region that does not stock it "
+        "is then left cold). Defaulting to None (not a sentinel string) lets you explicitly "
+        "pick even a default GPU without it being mistaken for 'no override'.",
     )
-    ap.add_argument("--timeout-s", type=int, default=_PRELOAD_TIMEOUT_S,
-                    help="per-DC job timeout (default sized for a fully cold whole-catalog warm)")
     ap.add_argument(
-        "--max-workers", type=int, default=4,
+        "--timeout-s",
+        type=int,
+        default=_PRELOAD_TIMEOUT_S,
+        help="per-DC job timeout (default sized for a fully cold whole-catalog warm)",
+    )
+    ap.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
         help="datacenters warmed concurrently. Each one deploys a preload endpoint, so this MUST stay "
-             "under your RunPod endpoint/worker quota (the documented default is 5); the default of 4 "
-             "leaves a 1-slot buffer. Raise it only if your account quota is higher.",
+        "under your RunPod endpoint/worker quota (the documented default is 5); the default of 4 "
+        "leaves a 1-slot buffer. Raise it only if your account quota is higher.",
     )
     ap.add_argument("--dry-run", action="store_true", help="print the plan, provision nothing")
     ap.add_argument(
-        "--provision", action="store_true",
+        "--provision",
+        action="store_true",
         help="CREATE the Lambda weight-cache filesystem in every region (pure API, no GPU) and "
-             "exit; RunPod volumes are auto-created by the eager deploy/warm. Run before --teardown's "
-             "inverse to set up all storage up front.",
+        "exit; RunPod volumes are auto-created by the eager deploy/warm. Run before --teardown's "
+        "inverse to set up all storage up front.",
     )
     ap.add_argument(
-        "--warm-instances", action="store_true",
+        "--warm-instances",
+        action="store_true",
         help="WARM the Lambda caches: one download-only GPU launch per region with "
-             "capacity now (needs the merged worker image carrying the bootstrap preload branch).",
+        "capacity now (needs the merged worker image carrying the bootstrap preload branch).",
     )
     ap.add_argument(
-        "--teardown", action="store_true",
+        "--teardown",
+        action="store_true",
         help="DELETE the weight-cache storage on every provider (reclaim standing storage) and exit. "
-             "With --datacenters it is SCOPED to that RunPod-DC subset only (Lambda caches "
-             "are left intact, since DC ids don't map to their region namespace).",
+        "With --datacenters it is SCOPED to that RunPod-DC subset only (Lambda caches "
+        "are left intact, since DC ids don't map to their region namespace).",
     )
     args = ap.parse_args(argv)
 
     selected_modes = [
-        name for name, on in (
+        name
+        for name, on in (
             ("--provision", args.provision),
             ("--warm-instances", args.warm_instances),
             ("--teardown", args.teardown),
-        ) if on
+        )
+        if on
     ]
     if len(selected_modes) > 1:
         ap.error(f"{', '.join(selected_modes)} are mutually exclusive — pass exactly one mode")
@@ -1123,20 +1192,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.models and not args.teardown and not args.provision:
         off_catalog = [m for m in models if m not in set(catalog)]
         if off_catalog:
-            print("--models: refusing to preload off-catalog model id(s) into the shared cache: "
-                  f"{', '.join(off_catalog)} — only public catalog models may be warmed (private/gated "
-                  "repos would leak onto the platform-wide shared volume). They download cold on first "
-                  "use instead.")
+            print(
+                "--models: refusing to preload off-catalog model id(s) into the shared cache: "
+                f"{', '.join(off_catalog)} — only public catalog models may be warmed (private/gated "
+                "repos would leak onto the platform-wide shared volume). They download cold on first "
+                "use instead."
+            )
             return 2
     # `--datacenters ""` must error, not silently widen to a full fleet teardown.
     dcs_given = args.datacenters is not None
-    parsed_dcs = (
-        [d.strip() for d in args.datacenters.split(",") if d.strip()] if dcs_given else []
-    )
+    parsed_dcs = [d.strip() for d in args.datacenters.split(",") if d.strip()] if dcs_given else []
     if dcs_given and not parsed_dcs:
-        print("--datacenters was given but parsed to no datacenter ids — refusing to run "
-              "(an empty scope would delete the WHOLE RunPod fleet); drop --datacenters for a full "
-              "teardown, or pass real DC ids.")
+        print(
+            "--datacenters was given but parsed to no datacenter ids — refusing to run "
+            "(an empty scope would delete the WHOLE RunPod fleet); drop --datacenters for a full "
+            "teardown, or pass real DC ids."
+        )
         return 2
     scoped = bool(parsed_dcs)
 
@@ -1149,8 +1220,10 @@ def main(argv: list[str] | None = None) -> int:
             print("would provision Lambda filesystems in every region")
             return 0
         provisioned = provision_lambda_filesystems()
-        print(f"provisioned {len(provisioned)} Lambda filesystem(s): "
-              f"{', '.join(provisioned) or '(none: no Lambda key or no regions)'}")
+        print(
+            f"provisioned {len(provisioned)} Lambda filesystem(s): "
+            f"{', '.join(provisioned) or '(none: no Lambda key or no regions)'}"
+        )
         return 0
     if args.warm_instances:
         if args.dry_run:
@@ -1158,8 +1231,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         incomplete = ""
         try:
-            results = warm_instances(models=models, gpu=args.gpu,
-                                     timeout_s=args.timeout_s, max_workers=args.max_workers)
+            results = warm_instances(
+                models=models, gpu=args.gpu, timeout_s=args.timeout_s, max_workers=args.max_workers
+            )
         except IncompleteWarmPlanError as exc:
             # Still print the per-region lines below: those launches ran and were paid for, and a
             # bare traceback would hide which regions are now warm. The run is reported as
@@ -1175,16 +1249,20 @@ def main(argv: list[str] | None = None) -> int:
             if incomplete:
                 print(f"0 regions warmed — {incomplete}")
                 return 1
-            print("0 regions warmed — no Lambda region had capacity to warm right now "
-                  "(weights download cold on first run). Nothing launched.")
+            print(
+                "0 regions warmed — no Lambda region had capacity to warm right now "
+                "(weights download cold on first run). Nothing launched."
+            )
             return 0
         failed = [r for r in results if r.get("status") not in ("ok",)]
         for r in results:
             # Name the GPU: without --gpu the ladder picks per region, so this is the only place the
             # operator can see which paid class each region actually billed.
             gpu_note = f" on {r['gpu']}" if r.get("gpu") else ""
-            print(f"  {r['provider']}/{r['region']}: {r['status']}{gpu_note}"
-                  + (f" ({r.get('error')})" if r.get("error") else ""))
+            print(
+                f"  {r['provider']}/{r['region']}: {r['status']}{gpu_note}"
+                + (f" ({r.get('error')})" if r.get("error") else "")
+            )
         print(f"{len(results) - len(failed)}/{len(results)} regions warmed")
         if incomplete:
             # NOT "N/N regions warmed ... exit 0": the denominator counts only the regions we could
@@ -1195,6 +1273,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.teardown:
         if scoped:
             from runpod_flash.core.resources.datacenter import DataCenter
+
             bad = []
             for d in parsed_dcs:
                 try:
@@ -1202,14 +1281,21 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception:
                     bad.append(d)
             if bad:
-                print(f"--teardown --datacenters: invalid datacenter id(s): {', '.join(bad)} "
-                      "— refusing to run (nothing deleted)")
+                print(
+                    f"--teardown --datacenters: invalid datacenter id(s): {', '.join(bad)} "
+                    "— refusing to run (nothing deleted)"
+                )
                 return 2
         if args.dry_run:
-            scope_desc = (f"{len(parsed_dcs)} datacenter(s): {', '.join(parsed_dcs)}"
-                          if scoped else "every RunPod storage datacenter")
-            print(f"would delete the RunPod weight-cache volumes in {scope_desc}"
-                  + ("" if scoped else " + every Lambda filesystem named flash-weights"))
+            scope_desc = (
+                f"{len(parsed_dcs)} datacenter(s): {', '.join(parsed_dcs)}"
+                if scoped
+                else "every RunPod storage datacenter"
+            )
+            print(
+                f"would delete the RunPod weight-cache volumes in {scope_desc}"
+                + ("" if scoped else " + every Lambda filesystem named flash-weights")
+            )
             return 0
         deleted: list[str] = []
         try:
@@ -1233,12 +1319,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     results = warm_weight_cache(
-        models=models, datacenters=dcs, gpu=args.gpu or _PRELOAD_GPU,
-        timeout_s=args.timeout_s, max_workers=args.max_workers,
+        models=models,
+        datacenters=dcs,
+        gpu=args.gpu or _PRELOAD_GPU,
+        timeout_s=args.timeout_s,
+        max_workers=args.max_workers,
     )
     failed = [r for r in results if r.get("status") != "ok"]
     for r in results:
-        print(f"  {r['datacenter']}: {r['status']}" + (f" ({r.get('error')})" if r.get("error") else ""))
+        print(
+            f"  {r['datacenter']}: {r['status']}"
+            + (f" ({r.get('error')})" if r.get("error") else "")
+        )
     print(f"{len(results) - len(failed)}/{len(results)} datacenters warmed")
     return 1 if failed else 0
 
