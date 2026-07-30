@@ -1401,6 +1401,86 @@ def test_deploy_wait_ends_when_the_deployment_stops_being_listed(
     assert "no longer an active deployment" in capsys.readouterr().err
 
 
+def test_deploy_wait_reports_a_rollback_to_a_different_checkpoint_step(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """An absent revision is not always a deleted one.
+
+    `deployment_for` matches the checkpoint step, so a failed `deploy RUN/step-40` that the plane
+    rolled back to step-20 reads as absent exactly like a deletion does. Reporting it as "no longer
+    an active deployment" named the wrong event and threw away `last_deploy_error`, which is the
+    only record of why step-40 did not take -- the restored record carries no `failed` state.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "queued", "requested_at": "T1"},
+        raising=False,
+    )
+    # the requested revision is gone from the listing; the predecessor is what is serving.
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "deployments",
+        lambda timeout=None: [
+            {
+                "run_id": "flash-1",
+                "deployment": {
+                    "run_id": "flash-1",
+                    "checkpoint_step": 20,
+                    "state": "ready",
+                    "requested_at": "T0",
+                    "last_deploy_error": "smoke test failed",
+                },
+            }
+        ],
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1/step-40", "--wait", "5"]) == 1
+    err = capsys.readouterr().err
+    assert "smoke test failed" in err, err
+    assert "previously deployed revision is still serving" in err, err
+    # the wrong explanation must be gone, not merely accompanied by the right one.
+    assert "no longer an active deployment" not in err, err
+
+
+@pytest.mark.parametrize(
+    ("rows", "why"),
+    [
+        ([], "genuinely deleted"),
+        (
+            [{"run_id": "other", "deployment": {"run_id": "other", "last_deploy_error": "x"}}],
+            "another run entirely",
+        ),
+        (
+            [{"run_id": "flash-1", "deployment": {"run_id": "flash-1", "checkpoint_step": 20}}],
+            "same run, no recorded error, so nothing ties it to this request",
+        ),
+    ],
+)
+def test_deploy_wait_still_reports_a_vanished_deployment_as_vanished(
+    fake_client, monkeypatch, capsys, rows, why
+) -> None:
+    """The rollback lookup must not swallow the deletion case it was added beside.
+
+    Matching on the run id alone is deliberately wider than `deployment_for`, so each of these has
+    to stay out: without the `last_deploy_error` requirement this would report an unrelated or
+    concurrently-deployed revision as this command's rollback.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+    )
+    monkeypatch.setattr(fake_client, "deployments", lambda timeout=None: rows, raising=False)
+
+    assert _run(["models", "deploy", "flash-1/step-40", "--wait", "5"]) == 1
+    assert "no longer an active deployment" in capsys.readouterr().err, why
+
+
 def test_deploy_wait_survives_a_transient_control_plane_error(
     fake_client, monkeypatch, capsys
 ) -> None:

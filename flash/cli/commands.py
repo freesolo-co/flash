@@ -801,6 +801,17 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             if current is None:
                 # the listing drops a run once its deployment is gone, so vanishing mid-wait is
                 # terminal, not slow; continuing here would just burn the whole timeout.
+                #
+                # "absent" and "gone", though, are not the same thing. deployment_for matches on
+                # the checkpoint step too, so a redeploy that FAILED and rolled the run back to a
+                # different revision also reads as absent: `mark_deployment_failed` restores the
+                # predecessor verbatim, and the restored record carries the predecessor's step.
+                # reporting that as "no longer an active deployment" names the wrong event and
+                # drops `last_deploy_error`, the only record of why the requested revision did not
+                # make it (codex[bot]). look for the run's other revision before saying it vanished.
+                other = _rollback_record(client, run_id, budget)
+                if other is not None:
+                    return other
                 print(
                     f"warning: {run_id} is no longer an active deployment; "
                     f"run `{CLI_NAME} models deployments` to check what happened",
@@ -816,6 +827,52 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
         file=sys.stderr,
     )
     return latest
+
+
+def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
+    """The run's currently-listed revision when it is NOT the one that was requested.
+
+    Only meaningful once the requested revision is absent from the listing. A failed cross-step
+    redeploy leaves exactly this shape: the run is still deployed, on its previous checkpoint,
+    with `last_deploy_error` explaining why the new one did not take.
+
+    Returned as-is rather than reshaped to look like the requested revision. The caller compares
+    attempt identity (`_deployment_attempt_failed`) and prints the record, so handing back the
+    predecessor's real step and stamp is what makes both report the rollback instead of claiming
+    the requested checkpoint is live.
+    """
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(run_id)
+    if parsed is None:
+        return None
+    base_run_id, step = parsed
+    if step is None:
+        # the request was for the final adapter, which is the run's only unstepped revision. an
+        # absent record there means gone, not rolled back.
+        return None
+    try:
+        entries = client.deployments(timeout=timeout)
+    except (ApiError, ClientError):
+        # this runs on the way out of a wait that has already ended; a failed lookup just means we
+        # fall back to the original "no longer active" message rather than failing the command.
+        return None
+    # deployment_for is no help here: it resolves an exact revision, so asking it for the bare run
+    # id means "the final adapter" (step None) and it rejects the rolled-back step just as it
+    # rejected the requested one. match on the run id alone and let the caller judge identity.
+    for entry in entries or ():
+        listed = entry.get("deployment") or {}
+        if base_run_id not in (listed.get("run_id"), entry.get("run_id")):
+            continue
+        if not listed.get("last_deploy_error"):
+            # without a recorded error there is nothing tying this revision to the requested one's
+            # disappearance, and reporting an unrelated deployment as this command's rollback would
+            # be the "settle on whichever revision is listed" defect the step filter exists to stop.
+            continue
+        if not listed.get("run_id") and entry.get("run_id"):
+            listed = {**listed, "run_id": entry["run_id"]}
+        return listed
+    return None
 
 
 def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
