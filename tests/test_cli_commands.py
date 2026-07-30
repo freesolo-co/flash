@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import tomllib
 import types
 
 import pytest
@@ -1037,8 +1038,6 @@ def test_env_setup_reasoning_emits_parseable_opd_config(monkeypatch, tmp_path) -
     header. Asserting only on the substring would pass just as happily with the line stranded under
     `[train]` or glued to the `algorithm` line.
     """
-    import tomllib
-
     monkeypatch.chdir(tmp_path)
     assert (
         _run(
@@ -1058,6 +1057,39 @@ def test_env_setup_reasoning_emits_parseable_opd_config(monkeypatch, tmp_path) -
         parsed = tomllib.loads((tmp_path / name).read_text())
         assert parsed["thinking"] is True, name
         assert "thinking" not in parsed.get("train", {}), name
+
+
+def test_env_setup_reasoning_conflict_names_every_stale_config(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Deleting exactly what the conflict warning names must not leave a config behind.
+
+    All three configs persist `thinking`, so a user who follows this warning literally has to end up
+    with three consistent configs. If the warning named only a subset, the unnamed one would keep the
+    old setting while the others were rewritten -- the same silent cross-algorithm mismatch the
+    `thinking` emission fixes, just moved one step later.
+    """
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    assert _run(["env", "setup", *project, "--reasoning"]) == 0
+    capsys.readouterr()
+
+    # a rerun that disagrees warns instead of rewriting, and must name every config holding the state.
+    assert _run(["env", "setup", *project, "--no-reasoning"]) == 0
+    warning = capsys.readouterr().err
+    assert "ignoring --no-reasoning" in warning
+    for name in ("configs/rl.toml", "configs/opd.toml", "configs/sft.toml"):
+        assert name in warning, f"{name} missing from: {warning}"
+
+    # follow the instruction exactly: delete what it named, nothing more.
+    named = [w.strip(" ,.") for w in warning.split() if w.startswith("configs/")]
+    for name in named:
+        (tmp_path / name).unlink()
+    assert _run(["env", "setup", *project, "--no-reasoning"]) == 0
+
+    for name in ("configs/rl.toml", "configs/opd.toml", "configs/sft.toml"):
+        parsed = tomllib.loads((tmp_path / name).read_text())
+        assert "thinking" not in parsed, f"{name} kept reasoning after a --no-reasoning re-scaffold"
 
 
 def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:

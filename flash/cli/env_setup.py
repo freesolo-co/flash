@@ -395,8 +395,14 @@ def cmd_env_setup(args) -> int:
     # otherwise ask on a terminal; else off.
     rl = Path("configs/rl.toml")
     sft = Path("configs/sft.toml")
+    opd = Path("configs/opd.toml")
+    # All THREE configs persist `thinking`, so all three must anchor it and all three must be named in
+    # the deletion guidance. Anchoring on a subset lets a user follow this warning literally, delete
+    # exactly what it names, and end up with the deleted configs rewritten one way and the unnamed one
+    # still holding the old setting -- the same silent cross-algorithm mismatch, just relocated.
+    reasoning_configs = (rl, opd, sft)
     existing_reasoning: bool | None = None
-    for cfg in (rl, sft):
+    for cfg in reasoning_configs:
         if cfg.exists():
             existing_reasoning = "thinking = true" in cfg.read_text(encoding="utf-8")
             break
@@ -405,9 +411,11 @@ def cmd_env_setup(args) -> int:
         if flag_reason is not None and flag_reason != existing_reasoning:
             have = "reasoning" if existing_reasoning else "no reasoning"
             want = "reasoning" if flag_reason else "no-reasoning"
+            # name every config that exists, so deleting exactly what this lists cannot leave one behind.
+            stale = ", ".join(str(c) for c in reasoning_configs if c.exists())
             msg = (
                 f"existing configs are {have}; keeping them and ignoring --{want}. "
-                f"Delete configs/rl.toml and configs/sft.toml first to re-scaffold with --{want}."
+                f"Delete {stale} first to re-scaffold with --{want}."
             )
             print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
         reasoning = existing_reasoning
