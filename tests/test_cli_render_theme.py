@@ -640,3 +640,48 @@ def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
     # canonical int identities: exact match shows, mismatch suppresses
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 2}) is True
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 1}) is False
+
+
+def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
+    """A frozen step on a throttled worker must not read as a stalled trainer (AS-018/AS-019).
+
+    The pre-existing quiet hint points at `flash runs log`, which reads the same uploaded
+    heartbeats -- so when the step counter is what went stale, that advice is a dead end.
+    """
+    import time as _time
+
+    from flash.cli import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+    }
+
+    stale = dict(
+        base, last_heartbeat={"stage": "rl_step", "step": 1, "ts": _time.time() - 1200}
+    )
+    out = render.run_status(stale)
+    assert "last one UPLOADED" in out
+    assert "before treating this as a stall" in out
+
+    # a step that is merely throttled-quiet, not stale, must stay silent.
+    fresh = dict(base, last_heartbeat={"stage": "rl_step", "step": 73, "ts": _time.time() - 400})
+    assert "last one UPLOADED" not in render.run_status(fresh)
+
+    # a SETUP stage has no step to be stale about -- it gets the warmup/quiet hints instead.
+    setup = dict(
+        base, last_heartbeat={"stage": "sft_initializing", "ts": _time.time() - 1200}
+    )
+    assert "last one UPLOADED" not in render.run_status(setup)
+
+    # a training stage with no step reported yet has nothing to qualify.
+    stepless = dict(base, last_heartbeat={"stage": "rl_step", "ts": _time.time() - 1200})
+    assert "last one UPLOADED" not in render.run_status(stepless)
+
+    # terminal runs are not progressing, so the reassurance would be wrong.
+    done = dict(stale, state="done")
+    assert "last one UPLOADED" not in render.run_status(done)
