@@ -25,10 +25,29 @@ if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
 
 
-# cmd.exe metacharacters. `list2cmdline` implements MS C-runtime *argv* quoting, which is what a
-# program's argument parser undoes -- it is not command-line escaping, so it leaves these untouched
-# and cmd.exe would act on them before the program ever runs.
-_CMD_METACHARACTERS = frozenset('&|<>^()!"%')
+# windows shell metacharacters. `list2cmdline` implements MS C-runtime *argv* quoting, which is what
+# a program's argument parser undoes -- it is not command-line escaping, so it leaves these
+# untouched and the shell would act on them before the program ever runs.
+#
+# the set covers cmd.exe AND powershell, because we cannot tell which one the user will paste into:
+# `os.name == "nt"` says nothing about the shell, and powershell is the default terminal on current
+# windows. `foo;calc` passed the cmd-only set and rendered as `--output=foo;calc`, which powershell
+# splits at the semicolon and runs `calc` as its own statement (codex). the extra members --
+# `;{}[]$``,'` and whitespace-adjacent `@#` -- are powershell-only operators, quoting characters,
+# and expansion sigils.
+_CMD_METACHARACTERS = frozenset('&|<>^()!"%' + ";{}[]$`,'@#")
+
+
+def _on_windows() -> bool:
+    """Whether to quote for a Windows shell.
+
+    A module-local seam so a test can simulate Windows without assigning to ``os.name``. That
+    assignment is process-wide, and on python 3.11 -- which CI runs -- ``pathlib`` reads it at
+    instantiation, so every later ``Path(...)`` raised ``NotImplementedError: cannot instantiate
+    'WindowsPath' on your system`` and the offline job failed before reaching the assertions. It
+    does NOT raise on 3.12, so the pattern looks fine locally and only breaks in CI (codex).
+    """
+    return os.name == "nt"
 
 
 def _quote_shell_token(token: str) -> str:
@@ -41,7 +60,7 @@ def _quote_shell_token(token: str) -> str:
     Returns an empty string when the token cannot be made safely pasteable, so the caller can drop
     the copy-pasteable form rather than emit a command that would execute something else.
     """
-    if os.name != "nt":
+    if not _on_windows():
         return shlex.quote(token)
     import subprocess
 
@@ -145,9 +164,23 @@ def cmd_env_pull(args) -> int:
             # meant a destination: `env pull ns/env assets/config` with a local ./config/ is a real
             # single-file pull, and telling that user to drop `assets/config` would abandon the file
             # they asked for and aim --force at an unrelated directory.
+            #
+            # ...and only a positional that could BE a destination. a multi-component relative path
+            # names a location inside the environment, and `assets/config` happening to exist
+            # locally as a directory does not make it one: on `is_dir()` alone that real single-file
+            # pull was refused, and its nonempty branch aimed a whole-env --force replace at the
+            # local ./assets/config the user never mentioned. a destination is written as its own
+            # name (`into here`, `./-dest`, `.`) or absolute, which is exactly `positional == out`
+            # plus the absolute form that `out` has already reduced to a basename (cursor).
+            could_be_destination = positional == out or positional.is_absolute()
             mistaken_dest = (
                 positional
-                if not args.output and positional.is_dir() and not positional.is_symlink()
+                if (
+                    not args.output
+                    and could_be_destination
+                    and positional.is_dir()
+                    and not positional.is_symlink()
+                )
                 else None
             )
             if mistaken_dest is not None:
