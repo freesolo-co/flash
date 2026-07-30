@@ -16,7 +16,7 @@ import flash.serve.deploy as deploy
 def _sse(*deltas: dict) -> list[str]:
     import json
 
-    lines = [f'data: {json.dumps({"choices": [{"delta": d}]})}' for d in deltas]
+    lines = [f"data: {json.dumps({'choices': [{'delta': d}]})}" for d in deltas]
     lines.append("data: [DONE]")
     return lines
 
@@ -43,9 +43,10 @@ def test_an_explicitly_empty_reasoning_string_still_gets_a_balanced_pair():
     answer at all -- a thinking structured-output deployment then fails its smoke test despite
     the model having answered correctly.
     """
-    assert deploy._balanced_thinking_content(
-        {"content": "plain", "reasoning_content": ""}
-    ) == "<think></think>plain"
+    assert (
+        deploy._balanced_thinking_content({"content": "plain", "reasoning_content": ""})
+        == "<think></think>plain"
+    )
 
 
 def test_content_that_already_closes_a_block_is_not_nested_again():
@@ -75,6 +76,66 @@ def test_a_real_opener_is_left_alone():
     # a genuinely balanced block must pass through untouched, with no second pair.
     message = {"content": "<think>r</think>answer", "reasoning_content": "r"}
     assert deploy._balanced_thinking_content(message) == "<think>r</think>answer"
+
+
+def test_an_answer_mentioning_the_close_tag_keeps_its_reasoning():
+    """A close tag mid-answer is answer text, not the block delimiter.
+
+    Splitting on the first `</think>` anywhere rewrote such an answer into the reasoning slot and
+    DROPPED the real reasoning: `<think>answer about </think> tags` -- the reasoning "r" is gone and
+    the answer is now the reasoning. The streaming path already only accepts a close at the head of
+    the first content delta (`test_streamed_content_keeps_a_close_tag_that_is_not_the_block_
+    delimiter`); this is its non-streaming twin.
+    """
+    message = {"content": "answer about </think> tags", "reasoning_content": "r"}
+    out = deploy._balanced_thinking_content(message)
+
+    assert out == "<think>r</think>answer about </think> tags"
+    # the reasoning survives, and the answer is not promoted into the reasoning slot.
+    assert out.startswith("<think>r</think>")
+    # and both paths agree on this input.
+    streamed = "".join(
+        deploy._openai_stream_content(
+            iter(_sse({"reasoning_content": "r"}, {"content": "answer about </think> tags"}))
+        )
+    )
+    assert out == streamed
+
+
+def test_an_answer_that_is_the_literal_open_tag_is_still_closed():
+    """A structured answer may BE `<think>` -- a `choice` constraint equal to it, or JSON quoting it.
+
+    Asking only whether the opener appears anywhere reported that answer as an already-balanced
+    block and returned it with no close tag, after which
+    `flash/server/routes/serving.py::_thinking_structured_answer` rejects the deployment smoke.
+    Balance means an opener that precedes a close, not the mere presence of the substring.
+    """
+    message = {"content": "<think>", "reasoning_content": "r"}
+    out = deploy._balanced_thinking_content(message)
+
+    assert out == "<think>r</think><think>"
+    # the answer survives after the delimiter, which is what the smoke's answer split reads.
+    assert out.split("</think>", 1)[1] == "<think>"
+
+
+def test_a_legacy_inline_block_without_the_split_field_is_still_balanced():
+    """Version skew: control plane upgraded ahead of the serving backend.
+
+    A backend predating the split leaves `reasoned</think>answer` in `content` with no
+    `reasoning_content` field at all. With no field to contradict it an unbalanced close can only be
+    the sampled delimiter, so the block is re-opened around the text before it rather than handed
+    back malformed.
+    """
+    out = deploy._balanced_thinking_content({"content": "reasoned</think>answer"})
+
+    assert out == "<think>reasoned</think>answer"
+    assert out.count("<think>") == 1
+    assert out.count("</think>") == 1
+
+
+def test_a_legacy_answer_without_any_block_is_still_returned_verbatim():
+    # the skew branch must not invent a block for a plain answer that never had one.
+    assert deploy._balanced_thinking_content({"content": "plain answer"}) == "plain answer"
 
 
 def test_payload_balancing_rewrites_every_choice_in_place():
