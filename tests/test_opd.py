@@ -1059,6 +1059,29 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     assert not supports_fp8_kv(cheapest_gpu(need))  # ...on the A100 (sm80), which does NOT use fp8 KV
 
 
+def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
+    """The worker's fp8 flag must follow the cc probe AND the GDN exclusion, because vram.py's
+    _opd_fp8_adjust sizes OPD against an fp8 KV pool above the non-fp8 card ceiling.
+
+    Pins the flag itself rather than a VRAM number: the sizing side discounts unconditionally, so
+    this is the half that decides whether the reservation matches the cache. GDN hybrids are excluded
+    because vllm's fp8-kv wake path (init_fp8_kv_scales) crashes on the hybrid cache. The residual
+    GDN sizing mismatch that exclusion leaves behind is tracked in ISSUES.md as VERL-084, not fixed
+    here: correcting it rejects 35B configurations that run on a B200 today.
+    """
+    import inspect
+
+    from flash.engine.worker import opd_verl
+
+    src = inspect.getsource(opd_verl.run_opd_verl)
+    assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
+    assert "get_device_capability() >= (8, 9)" in src
+
+    # and the override is emitted only when the resolved flag is true, so a bf16 worker never sends
+    # fp8 (an absent key means bf16, which is the conservative direction).
+    assert 'if config.get("fp8_kv")' in inspect.getsource(opd_verl.build_opd_verl_overrides)
+
+
 def test_opd_oversized_reject_names_the_knobs_to_shrink():
     """When even the biggest GPU can't hold an OPD run, the reject must be actionable: it names that
     OPD is resident-only (trainer + colocated vLLM student = two weight copies + rollout KV) and the
