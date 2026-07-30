@@ -1095,7 +1095,11 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
     # SFT can't share a token budget it doesn't generate; it gets the gold think-tag guidance instead.
     assert "warn_missing_think_tags" in sft
     assert "max_completion_tokens" not in sft
-    # nor opd, whose worker never reads that key -- emitting it would advertise a knob with no effect.
+    # nor opd -- not because the knob is inert there (opd honors it, via `_resolve_opd_knobs` ->
+    # `opd_completion_len` at flash/engine/vram.py:97, which feeds verl's max_response_length) but
+    # because opd ALREADY raises its own budget under thinking: 512 -> 1536. Writing a literal would
+    # pin what the recipe should choose, and would go stale the moment that default moves. GRPO needs
+    # the line only because its non-thinking default is 320, too tight to leave to a scaffold reader.
     assert "max_completion_tokens" not in opd
 
 

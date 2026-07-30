@@ -448,8 +448,11 @@ def cmd_env_setup(args) -> int:
         'id = ""\n\n'
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
-    # `thinking = true` opts the run into reasoning mode. Reasoning shares the generation budget with
-    # the answer, so GRPO also gets a raised completion budget. These strings are empty when reasoning
+    # `thinking = true` opts the run into reasoning mode, and is algorithm-agnostic: all three configs
+    # carry it, since all three workers read it. Only GRPO also gets a raised completion budget --
+    # reasoning shares that budget with the answer, and GRPO's non-thinking default is 320 tokens.
+    # OPD needs no such line because it raises its own budget under thinking (512 -> 1536, via
+    # `opd_completion_len`), and SFT does not generate at all. These strings are empty when reasoning
     # is off, keeping the default scaffold byte-for-byte identical.
     thinking_line = "thinking = true\n" if reasoning else ""
     rl_reasoning_train = (
