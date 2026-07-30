@@ -575,10 +575,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# commands that create or mutate organization-scoped state. a shadowed login silently puts these in
-# the wrong org, so they warn; read-only commands stay quiet, and `flash whoami` already shows the
-# key source in its own output.
-_ORG_MUTATING_COMMANDS = frozenset(
+# commands that bind work to an organization: either they write to it, or they resolve a project
+# with the ambient key and bake it into local artifacts that later writes inherit. a shadowed login
+# silently binds these to the wrong org, so they warn. commands whose only effect is output the user
+# reads stay quiet, and `flash whoami` already shows the key source in its own output.
+_ORG_BINDING_COMMANDS = frozenset(
     {
         cmd_train,
         cmd_deploy,
@@ -588,13 +589,19 @@ _ORG_MUTATING_COMMANDS = frozenset(
         cmd_projects_create,
         cmd_env_push,
         cmd_env_delete,
+        # remotely read-only, but both pick a project from the ambient key and write it into the
+        # working tree: `traces export` fills dataset/train.jsonl, `env setup` embeds the project
+        # uuid in the generated configs. warning only at the later `train` is too late, because the
+        # wrong org is already scaffolded in by then.
+        cmd_traces_export,
+        cmd_env_setup,
     }
 )
 
 
 def _warn_if_login_shadowed(args) -> None:
-    """Surface an ambient FREESOLO_API_KEY that redirects a mutating command to another org."""
-    if getattr(args, "func", None) not in _ORG_MUTATING_COMMANDS:
+    """Surface an ambient FREESOLO_API_KEY that binds a command to another org."""
+    if getattr(args, "func", None) not in _ORG_BINDING_COMMANDS:
         return
     # `train --cost` is catalog-only: it never loads credentials or reaches an organization, so a
     # warning that names the environment key's org would describe a request this command never makes.

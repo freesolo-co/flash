@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
 import flash.cli as cli
 import flash.client.config as client_config
 from flash.cli.commands import cmd_train, cmd_whoami
+from flash.cli.env_setup import cmd_env_setup
+from flash.cli.traces import cmd_traces_export
 
 
 def _patch_saved_key(monkeypatch, saved: str | None) -> None:
@@ -29,6 +33,12 @@ def test_shadowed_login_warns_on_genuine_mismatch(monkeypatch):
     assert warning is not None
     assert "FREESOLO_API_KEY" in warning
     assert "flash whoami" in warning
+
+    # the dev channel installs the executable as `flash-dev`, so a hardcoded `flash whoami` names a
+    # binary that is not installed. asserting the substring alone would not catch it: "flash whoami"
+    # is a substring of "flash-dev whoami" only in the other direction, so pin the interpolation.
+    monkeypatch.setattr(client_config, "CLI_NAME", "flash-dev")
+    assert "flash-dev whoami" in client_config.shadowed_login_warning()
 
 
 def test_shadowed_login_silent_when_key_matches_saved_login(monkeypatch):
@@ -86,10 +96,10 @@ def test_read_only_command_stays_quiet(monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_every_org_mutating_command_is_registered():
-    # a new write command must opt in explicitly; this pins the current set so an addition that
-    # forgets the warning shows up as a failing test rather than a silent wrong-org write.
-    names = {command.__name__ for command in cli._ORG_MUTATING_COMMANDS}
+def test_every_org_binding_command_is_registered():
+    # a new org-binding command must opt in explicitly; this pins the current set so an addition
+    # that forgets the warning shows up as a failing test rather than a silent wrong-org write.
+    names = {command.__name__ for command in cli._ORG_BINDING_COMMANDS}
     assert names == {
         "cmd_train",
         "cmd_deploy",
@@ -99,7 +109,22 @@ def test_every_org_mutating_command_is_registered():
         "cmd_projects_create",
         "cmd_env_push",
         "cmd_env_delete",
+        "cmd_traces_export",
+        "cmd_env_setup",
     }
+
+
+@pytest.mark.parametrize("handler", [cmd_traces_export, cmd_env_setup])
+def test_project_scaffolding_command_warns(monkeypatch, capsys, handler):
+    # neither writes to the org remotely, but both resolve a project with the ambient key and land
+    # it in the working tree: dataset/train.jsonl for the export, the project uuid in the generated
+    # configs for setup. by the time a later `train` warns, the wrong org is already scaffolded in.
+    monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
+    args = argparse.Namespace(func=handler)
+
+    cli._warn_if_login_shadowed(args)
+
+    assert "shadowed!" in capsys.readouterr().err
 
 
 def test_whoami_reports_the_key_source(monkeypatch, capsys):

@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .._channel import CHANNEL
+from .._channel import CHANNEL, CLI_NAME
 from .._fileio import read_json_or_empty, secure_json_write
 
 PROD_API_URL = "https://flash.freesolo.co"
@@ -66,7 +66,8 @@ def shadowed_login_warning() -> str | None:
     return (
         f"FREESOLO_API_KEY is set and overrides the login saved in {CONFIG_PATH}; "
         "this command runs against the env var's organization. "
-        "Run `flash whoami` to confirm the org, or unset FREESOLO_API_KEY to use the saved login."
+        f"Run `{CLI_NAME} whoami` to confirm the org, "
+        "or unset FREESOLO_API_KEY to use the saved login."
     )
 
 
