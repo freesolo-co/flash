@@ -1393,6 +1393,33 @@ def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
     assert "attempt=2" in progress
 
 
+def test_log_follow_progress_names_the_attempt_before_the_first_heartbeat() -> None:
+    """The relaunch has to be named while the replacement worker is still cold.
+
+    An attempt preempted before it published a ping leaves `last_heartbeat` absent while
+    `remote.attempt` has already advanced. Resolving the attempt inside the heartbeat block made
+    the line print a bare `running` for the whole cold start -- silent through exactly the window
+    the attempt counter exists to explain, and the window a user is most likely to be watching.
+    """
+    from flash.cli.commands import _log_follow_progress
+
+    state, progress = _log_follow_progress(
+        {"state": "running", "remote": {"attempt": 1}, "last_heartbeat": None},
+        "running",
+    )
+    assert state == "running"
+    assert "attempt=1" in progress, progress
+    # nothing heartbeat-sourced exists to qualify, so the marker would have nothing to cover.
+    assert "(prev attempt)" not in progress, progress
+
+    # still 0-based with no heartbeat: a first attempt stays unannotated.
+    _, first = _log_follow_progress(
+        {"state": "running", "remote": {"attempt": 0}, "last_heartbeat": None},
+        "running",
+    )
+    assert "attempt=" not in first, first
+
+
 def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
     """stage/step come from the heartbeat, attempt from `remote` -- during a relaunch those differ.
 
@@ -1419,6 +1446,14 @@ def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
     assert "step=455" in progress
     assert "attempt=1" in progress
     assert "(prev attempt)" in progress, progress
+
+    # the marker's scope is positional, so ordering is the contract: everything before it came
+    # from the superseded ping, everything after is live. `hb=` has to sit inside that span --
+    # the age is the old worker's ping too, so a fresh `hb=<1m` printed past the marker reads as
+    # the replacement worker being alive when nothing has been heard from it at all.
+    assert progress.index("step=455") < progress.index("(prev attempt)"), progress
+    assert progress.index("hb=") < progress.index("(prev attempt)"), progress
+    assert progress.index("(prev attempt)") < progress.index("attempt=1"), progress
 
     # a heartbeat from the live attempt is not stale, so nothing is marked.
     _, current = _log_follow_progress(

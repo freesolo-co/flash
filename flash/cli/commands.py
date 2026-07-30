@@ -420,6 +420,29 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     state = str(status.get("state") or fallback_state or "unknown")
     parts = [state]
     heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
+    # a preemption relaunches the run on fresh hardware from step 0 while `state` stays "running",
+    # so the step counter silently rewinds and the earlier progress is gone. the attempt counter is
+    # the one field that distinguishes that from normal progress, so show it once the run is past
+    # its first attempt rather than leaving a rewind unexplained. attempts are 0-based
+    # (flash/providers/runpod/jobs.py stamps no retry suffix on attempt 0), so any nonzero value is
+    # already a relaunch.
+    #
+    # resolved OUTSIDE the heartbeat block. an attempt preempted before it published its first ping
+    # leaves `last_heartbeat` None while `remote.attempt` has already advanced, and nesting this
+    # under the heartbeat printed a bare `running` for the whole cold start -- silent through
+    # exactly the relaunch this line exists to explain (codex[bot]).
+    #
+    # prefer the live attempt from `remote` over the heartbeat's: during the relaunch window
+    # `remote.attempt` has already advanced while `last_heartbeat` is still the superseded worker's
+    # ping, so reading the heartbeat leaves the first preemption unlabelled (stale attempt 0) and
+    # names the *previous* attempt on later ones. `remote` is absent on planes that do not surface
+    # it, hence the heartbeat fallback.
+    from flash.providers._poll import _attempt_int
+
+    remote = status.get("remote")
+    attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
+    if attempt is None and isinstance(heartbeat, dict):
+        attempt = _attempt_int(heartbeat.get("attempt"))
     if isinstance(heartbeat, dict):
         heartbeat_age_seconds = render._heartbeat_age_seconds(heartbeat.get("ts"))
         # stage and step come from the heartbeat, attempt from `remote` below. during the relaunch
@@ -444,35 +467,25 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         step = heartbeat.get("step")
         if step is not None:
             parts.append(f"step={step}")
-        if stale_heartbeat and (stage or step is not None):
-            # one marker for the whole heartbeat-sourced group rather than a suffix on each field:
-            # the staleness is a property of the ping, not of any one value it carried.
-            parts.append("(prev attempt)")
-        # a preemption relaunches the run on fresh hardware from step 0 while `state` stays
-        # "running", so the step counter silently rewinds and the earlier progress is gone. the
-        # attempt counter is the one field that distinguishes that from normal progress, so show it
-        # once the run is past its first attempt rather than leaving a rewind unexplained. attempts
-        # are 0-based (flash/providers/runpod/jobs.py stamps no retry suffix on attempt 0), so any
-        # nonzero value is already a relaunch.
-        from flash.providers._poll import _attempt_int
-
-        # prefer the live attempt from `remote` over the heartbeat's. during the relaunch window
-        # this line exists to explain, `remote.attempt` has already advanced while `last_heartbeat`
-        # is still the superseded worker's ping, so reading the heartbeat leaves the first
-        # preemption unlabelled (stale attempt 0) and names the *previous* attempt on later ones.
-        # `remote` is absent on planes that do not surface it, hence the heartbeat fallback.
-        remote = status.get("remote")
-        attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
-        if attempt is None:
-            attempt = _attempt_int(heartbeat.get("attempt"))
-        if attempt:
-            parts.append(f"attempt={attempt}")
         # live heartbeat age so a long quiet phase reads as "alive, throttled" not "frozen".
         # minute granularity: the non-TTY follow path prints a line whenever this string changes,
         # so a seconds-precision age would emit one line per poll.
         if heartbeat_age_seconds is not None:
             mins = int(heartbeat_age_seconds // 60)
             parts.append(f"hb={mins}m" if mins else "hb=<1m")
+        if stale_heartbeat and (stage or step is not None or heartbeat_age_seconds is not None):
+            # one marker for the whole heartbeat-sourced group rather than a suffix on each field:
+            # the staleness is a property of the ping, not of any one value it carried.
+            #
+            # it TRAILS the group, and `attempt=` is appended after it, so the split is positional:
+            # everything before the marker came from the superseded ping, everything after is live.
+            # covering `hb=` matters as much as covering the step -- that age is the old worker's
+            # ping too, so a fresh `hb=<1m` printed outside the marker read as the replacement
+            # worker being alive when nothing had been heard from it at all, the opposite of what
+            # the age is there to say (cursor).
+            parts.append("(prev attempt)")
+    if attempt:
+        parts.append(f"attempt={attempt}")
     realized = status.get("realized_cost_usd")
     if realized is not None:
         if isinstance(realized, (int, float)):
