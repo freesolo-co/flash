@@ -241,9 +241,7 @@ def test_env_test_single_turn_replays_reference_and_passes(monkeypatch, tmp_path
     assert "overall: PASS" in out
 
 
-def test_env_test_auto_falls_back_to_echo_for_empty_reference(
-    monkeypatch, tmp_path, capsys
-):
+def test_env_test_auto_falls_back_to_echo_for_empty_reference(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "say anything", "output": ""}], reward=0.0)
     _patch_loader(monkeypatch, env)
@@ -335,9 +333,7 @@ def test_env_test_multi_turn_terminates_and_scores(monkeypatch, tmp_path, capsys
     assert "1/1 episodes passed contract checks" in out
 
 
-def test_env_test_multi_turn_replays_text_free_turn_positionally(
-    monkeypatch, tmp_path, capsys
-):
+def test_env_test_multi_turn_replays_text_free_turn_positionally(monkeypatch, tmp_path, capsys):
     # dropping the null tool-call turn would shift "third" into its slot and misgrade; the
     # driver must replay ["first", "", "third"] positionally.
     env_dir = _environment_dir(tmp_path)
@@ -345,7 +341,9 @@ def test_env_test_multi_turn_replays_text_free_turn_positionally(
     _patch_loader(monkeypatch, env)
 
     assert cmd_env_test(_args(env_dir)) == 0
-    assert env.recorded == ["first", "", "third"]
+    # only the gold replay is asserted: the negative controls each drive their own rollout through
+    # the same loop, so they append further turns after it.
+    assert env.recorded[:3] == ["first", "", "third"]
     out = capsys.readouterr().out
     assert "overall: PASS" in out
 
@@ -426,9 +424,7 @@ def test_env_test_malformed_prompt_fails_contract(monkeypatch, tmp_path, capsys)
     assert "overall: FAIL" in captured.err
 
 
-def test_env_test_multi_turn_malformed_env_reply_fails_contract(
-    monkeypatch, tmp_path, capsys
-):
+def test_env_test_multi_turn_malformed_env_reply_fails_contract(monkeypatch, tmp_path, capsys):
     # a non-empty but malformed env reply must fail the episode: those messages become
     # chat-template input for the next turn in the real rollout and would break remotely
     env_dir = _environment_dir(tmp_path)
@@ -688,7 +684,9 @@ def test_env_test_partial_flat_rewards_warn_but_pass(monkeypatch, tmp_path, caps
     assert "all 2 replayed episode(s)" not in captured.err
 
 
-def test_env_test_unrepresentable_gold_turn_is_excluded_from_the_gate(monkeypatch, tmp_path, capsys):
+def test_env_test_unrepresentable_gold_turn_is_excluded_from_the_gate(
+    monkeypatch, tmp_path, capsys
+):
     # a native tool-call turn (content=None + tool_calls) cannot be replayed as text: the driver
     # sends an empty turn stripped of the call. a grader that correctly rejects that mutilated
     # transcript scores zero, which says nothing about the reward function, so it must not trip
@@ -907,3 +905,136 @@ def test_env_test_systemexit_from_reward_fails_contract(monkeypatch, tmp_path, c
     assert "0/1 episodes passed contract checks" in captured.out
     assert "failed contract checks" in captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_env_test_grades_through_scores_breakdown_when_present(monkeypatch, tmp_path, capsys):
+    # the grpo worker prefers scores_breakdown(...)["total"] and only falls back to reward()
+    # (flash/engine/worker/rl.py). an env whose real composite grader lives there while reward() is
+    # an inherited placeholder must be judged on the scorer training actually calls: grading it on
+    # the placeholder would report a working environment as unable to rank.
+    env_dir = _environment_dir(tmp_path)
+
+    class _BreakdownEnv(_SingleTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.breakdown_completions = []
+
+        def reward(self, completion, example, state=None):
+            # the placeholder: flat, and would trip the gate if it were the one consulted.
+            self.completions.append(completion)
+            return 0.0
+
+        def scores_breakdown(self, completion, example, state=None):
+            self.breakdown_completions.append(completion)
+            gold = example.get("output", "")
+            return {"total": 1.0 if gold and completion == gold else 0.0, "format": 0.0}
+
+    env = _BreakdownEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=1 reward=1.000000" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "cannot rank completions" not in captured.err
+    # the composite grader saw the gold answer and every control; the placeholder saw nothing.
+    assert "4" in env.breakdown_completions
+    assert env.completions == []
+
+
+def test_env_test_opd_placeholder_reward_warns_instead_of_failing(monkeypatch, tmp_path, capsys):
+    # the opd worker consumes dataset()/prompt_messages()/sft_completion() and never reads a reward
+    # (no .reward( or scores_breakdown call exists in flash/engine/worker/opd.py), so a placeholder
+    # scorer is not a defect there. gating on samples_on_policy instead of on who consumes the
+    # reward would fail this working environment.
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0, wrong_reward=0.0))
+
+    assert cmd_env_test(_args(env_dir, algorithm="opd")) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" not in captured.err
+    assert "cannot rank completions" in captured.err
+
+
+def test_env_test_multi_turn_scorer_error_fails_instead_of_scoring_zero(
+    monkeypatch, tmp_path, capsys
+):
+    # the multi-turn path calls score_rollouts directly (flash/engine/multiturn_rollout.py) with no
+    # except branch, so a scorer that raises there aborts the run. swallowing it here as 0.0 would
+    # report the wrong episode as cleanly separated and pass an env that cannot survive its first
+    # rollout.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ControlRaisesEnv(_MultiTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.scored_state = state
+            said = [
+                message["content"]
+                for message in state["messages"]
+                if message.get("role") == "assistant"
+            ]
+            if any(text in _CONTROL_CANDIDATES for text in said):
+                raise RuntimeError("scorer cannot handle this rollout")
+            return 0.5
+
+    _patch_loader(monkeypatch, _ControlRaisesEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "0/1 episodes passed contract checks" in captured.out
+    assert "scorer cannot handle this rollout" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_text_free_gold_turn_still_reaches_the_reward_gate(monkeypatch, tmp_path, capsys):
+    # a text-free gold turn (a native tool call) carries no text a control could collide with, so it
+    # cannot make a control unusable. keeping it in control selection would trip the empty-gold
+    # guard, return None for the episode, and silently exclude it from the gate -- letting this flat
+    # grader pass unexamined.
+    env_dir = _environment_dir(tmp_path)
+    env = _TextFreeMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "cannot rank completions" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_per_turn_credit_separates_a_flat_episode_score(monkeypatch, tmp_path, capsys):
+    # under credit_assignment="per_turn" the trainer credits each assistant turn by its own
+    # group-relative reward (GRPOPerTurnTrainer, selected in flash/engine/worker/rl.py), so an env
+    # may hold the episode scalar constant while the per-turn vector still ranks gold above wrong.
+    # reading the scalar alone would call that env unable to rank while training learns from it.
+    env_dir = _environment_dir(tmp_path)
+
+    class _PerTurnCreditEnv(_MultiTurnEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            rewards = []
+            for example, state in items:
+                gold = {turn["content"] for turn in example["output"]}
+                said = [
+                    message["content"]
+                    for message in state["messages"]
+                    if message.get("role") == "assistant"
+                ]
+                # constant episode score; all the ranking signal lives in the per-turn vector.
+                rewards.append(
+                    RolloutReward(
+                        episode=0.5,
+                        turns=tuple(1.0 if text in gold else 0.0 for text in said),
+                    )
+                )
+            return rewards
+
+    _patch_loader(monkeypatch, _PerTurnCreditEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=2 reward=0.500000" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "cannot rank completions" not in captured.err
