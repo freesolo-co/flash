@@ -1071,15 +1071,89 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     assert not supports_fp8_kv(cheapest_gpu(need))  # ...on the A100 (sm80), which does NOT use fp8 KV
 
 
+def test_gdn_fp8_exclusion_survives_a_pinned_revision():
+    """The GDN fp8 exclusion must key off the model, not off the sizing struct, which pinning nulls.
+
+    `sizing_info = None if model_revision else info` (vram.py) drops to generic architecture sizing
+    for a pinned commit. That is right for geometry and wrong for attention family: a pinned commit
+    of a GDN hybrid is still a GDN hybrid, and the worker's runtime gate reads the pinned config and
+    refuses fp8 KV regardless. A guard reading only that nulled struct silently stopped excluding
+    every pinned run -- reserving the fp8 half of a cache vLLM allocates in bf16, which is the
+    under-reserving direction: measured, a pinned 35B at ctx1024/g16 was admitted onto a 180 GB B200
+    at 179 GB when its true bf16 need is 192 GB.
+    """
+    import math
+    from unittest import mock
+
+    from flash.catalog import MODELS, vocab_size_for
+    from flash.engine import vram as vram_module
+    from flash.engine.vram import (
+        _declares_linear_attention,
+        estimate_vram_gb,
+        model_required_vram_gb,
+    )
+    from flash.providers.allocator import vram_headroom
+
+    # the guard itself, at the exact input the pinned path hands it.
+    assert _declares_linear_attention(None, "Qwen/Qwen3.6-35B-A3B")
+    # and it must not fire without evidence: no id, or an id the catalog does not route.
+    assert not _declares_linear_attention(None, "")
+    assert not _declares_linear_attention(None, "meta-llama/Llama-3.1-8B")
+
+    # end to end: the pinned reservation must cover the bf16 KV cache vLLM really allocates.
+    #
+    # Deliberately NOT asserted against the unpinned number: generic sizing inflates the pinned
+    # estimate enough that `pinned >= unpinned` holds even with the discount wrongly applied (179 vs
+    # 171 as measured), so that comparison cannot fail and would not be a test. The bf16 estimate is
+    # the quantity the discount actually halves, so it is the one that discriminates.
+    train = {
+        "max_context_tokens": 1024,
+        "max_completion_tokens": 512,
+        "batch_size": 1,
+        "group_size": 16,
+        "lora_rank": 32,
+    }
+    gdn = "Qwen/Qwen3.6-35B-A3B"
+    hr = vram_headroom()
+    # generic architecture sizing (model_info=None) is what the pinned path uses, so the baseline
+    # has to be computed the same way or it is not the number under test.
+    bf16_need = math.ceil(
+        estimate_vram_gb(
+            MODELS[gdn].params_b,
+            "opd",
+            "bf16",
+            seq_len=1024,
+            max_tokens=512,
+            batch_size=1,
+            group_size=16,
+            lora_rank=32,
+            vocab=vocab_size_for(gdn),
+            active_params_b=0.0,
+            fp8_kv=False,
+            model_info=None,
+        )
+        * hr
+    )
+    # a real pin resolves geometry over the network; stub it to the catalog's own numbers so the
+    # only thing that varies is the nulled sizing_info -- which is the variable under test.
+    with mock.patch.object(
+        vram_module,
+        "_validated_revision_geometry",
+        lambda mid, rev, info: (info.params_b, info.vocab_size),
+    ):
+        pinned = model_required_vram_gb(
+            gdn, "opd", train=train, headroom=hr, model_revision="a" * 40
+        )
+    assert pinned >= bf16_need
+
+
 def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
     """The worker's fp8 flag must follow the cc probe AND the GDN exclusion, because vram.py's
     _opd_fp8_adjust sizes OPD against an fp8 KV pool above the non-fp8 card ceiling.
 
-    Pins the flag itself rather than a VRAM number: the sizing side discounts unconditionally, so
-    this is the half that decides whether the reservation matches the cache. GDN hybrids are excluded
-    because vllm's fp8-kv wake path (init_fp8_kv_scales) crashes on the hybrid cache. The residual
-    GDN sizing mismatch that exclusion leaves behind is tracked in ISSUES.md as VERL-084, not fixed
-    here: correcting it rejects 35B configurations that run on a B200 today.
+    Pins the flag itself rather than a VRAM number: this is the worker half of the pair whose sizing
+    half is asserted by test_gdn_fp8_exclusion_survives_a_pinned_revision. GDN hybrids are excluded
+    because vllm's fp8-kv wake path (init_fp8_kv_scales) crashes on the hybrid cache.
     """
     import inspect
 

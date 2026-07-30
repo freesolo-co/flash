@@ -542,7 +542,7 @@ def grpo_kv_floor_gb(
     return upper
 
 
-def _declares_linear_attention(model_info) -> bool:
+def _declares_linear_attention(model_info, model_id: str = "") -> bool:
     """True for a GDN hybrid, using the catalog rather than a network config fetch.
 
     The two vLLM rollout workers refuse an fp8 KV cache for these models (vllm's fp8 wake path
@@ -550,8 +550,21 @@ def _declares_linear_attention(model_info) -> bool:
     not apply the fp8 discount to them or it reserves half the cache the run allocates. This is the
     offline half of engine/worker/packing.py:model_is_gdn_hybrid, which probes the HF config; the
     catalog carries num_linear_attention_layers for every model it routes.
+
+    ``model_id`` is the fallback the pinned-revision path needs. A pinned commit drops to generic
+    architecture sizing (``sizing_info = None``), which is right for geometry but wrong here:
+    attention family is a property of the model, not of the commit, and the worker's runtime gate
+    reads the pinned config and refuses fp8 all the same. Consulting the catalog by id keeps the two
+    in agreement instead of handing pinned GDN runs a discount their cache never takes.
     """
-    return int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0
+    if int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0:
+        return True
+    if not model_id:
+        return False
+    from flash.catalog import MODELS
+
+    catalog_info = MODELS.get(model_id)
+    return int(getattr(catalog_info, "num_linear_attention_layers", 0) or 0) > 0
 
 
 def _rollout_kv_floor_gb(
@@ -561,6 +574,7 @@ def _rollout_kv_floor_gb(
     *,
     active_params_b: float | None = None,
     model_info=None,
+    model_id: str = "",
     preserve_legacy_floor: bool = False,
 ) -> int:
     floor = grpo_kv_floor_gb(
@@ -573,7 +587,7 @@ def _rollout_kv_floor_gb(
     )
     from flash.providers.base import max_non_fp8_kv_vram_gb
 
-    if _declares_linear_attention(model_info):
+    if _declares_linear_attention(model_info, model_id):
         return floor
     ceiling = max_non_fp8_kv_vram_gb()
     if floor <= ceiling:
@@ -1040,7 +1054,7 @@ def model_required_vram_gb(
         that cannot hold it."""
         from flash.providers.base import max_non_fp8_kv_vram_gb
 
-        if _declares_linear_attention(model_info):
+        if _declares_linear_attention(model_info, model_id):
             return need
         ceiling = max_non_fp8_kv_vram_gb()
         if need <= ceiling:
@@ -1161,6 +1175,7 @@ def model_required_vram_gb(
                     vllm_concurrency,
                     active_params_b=active_b,
                     model_info=sizing_info,
+                    model_id=model_id,
                     preserve_legacy_floor=is_opd,
                 ),
             )
@@ -1185,7 +1200,11 @@ def model_required_vram_gb(
         floor_gb = 24 if params_b <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
         if is_opd and params_b >= 2.0:
             floor_gb = max(floor_gb, int(_OPD_VLLM_COLOCATE_FLOOR_GB))
-        need = max(need, floor_gb, _rollout_kv_floor_gb(params_b, seq_len, vllm_concurrency))
+        need = max(
+            need,
+            floor_gb,
+            _rollout_kv_floor_gb(params_b, seq_len, vllm_concurrency, model_id=model_id),
+        )
     return need
 
 
