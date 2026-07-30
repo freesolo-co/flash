@@ -1348,8 +1348,8 @@ def test_a_final_response_override_reaches_both_views(monkeypatch):
     env.record_model_turn(state, _THINK_COMPLETION)
     env.env_reply(state["messages"], state)
 
-    # the override is the answer, so it is not stripped -- and the raw view tracks it, or a later
-    # step_episode would be handed a turn the env already superseded.
+    # the override is the answer, so it is not stripped -- and the STEPPING view tracks it, or a
+    # later step_episode would be handed a turn the env already superseded.
     assert state["response_text"] == "env says 7"
     assert state["raw_response_text"] == "env says 7"
 
@@ -1357,9 +1357,57 @@ def test_a_final_response_override_reaches_both_views(monkeypatch):
     # score_episode reading .thinking would raise on exactly the episodes an env terminates by
     # overriding. the model's reasoning from this turn survives the override that replaced its
     # answer, since the env supplied the answer but did not produce the reasoning.
-    assert state["response_text"].raw == "env says 7"
     assert state["response_text"].thinking == "let me work it out"
     assert env._episode_from_state(state).response_text.thinking == "let me work it out"
+
+    # .raw is the model's emission, NOT the override -- see the dedicated test below. asserting it
+    # here as "env says 7" is what made the scorer-facing raw view track the stepping view.
+    assert state["response_text"].raw == _THINK_COMPLETION
+
+
+def test_a_final_response_override_keeps_the_models_raw_output_for_scorers(monkeypatch):
+    """`.raw` is the model's original output, so an env override must not overwrite it.
+
+    The documented contract (flash/cli/training_doc.py) defines `.raw` as the original raw model
+    output, and it is the one view a scorer cannot reconstruct once it is gone: `.completion` and
+    `str(response_text)` are both the override already. Assigning the override to `.raw` also left
+    the object incoherent -- an env-authored `.raw` paired with the model's own `.thinking`, so
+    `.raw` did not contain the reasoning `.thinking` was extracted from.
+
+    Distinct from the stepping view: `state["raw_response_text"]` SHOULD carry the override, so a
+    later turn steps the env on the answer it substituted. The two are asserted together here
+    because keeping them apart is the whole point.
+    """
+
+    class _OverridingEnv(_SteppingMultiTurnEnv):
+        def step_episode(self, example, messages, assistant_response):
+            last = str(messages[-1].get("content", "")) if messages else ""
+            self.stepped.append((assistant_response, last))
+            return _EnvironmentStepResult(
+                done=True,
+                messages=(),
+                final_response_text="env says 7",
+            )
+
+    sdk_env = _OverridingEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+    state = env.new_rollout_state(example)
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env.env_reply(state["messages"], state)
+
+    scored = env._episode_from_state(state).response_text
+    # what the scorer grades is the override...
+    assert str(scored) == "env says 7"
+    assert scored.completion == "env says 7"
+    # ...but a scorer that explicitly inspects what the model emitted still gets it, reasoning and
+    # all -- including the reasoning `.thinking` was taken from.
+    assert scored.raw == _THINK_COMPLETION
+    assert scored.thinking == "let me work it out"
+    assert scored.thinking in scored.raw
+    # the stepping view is the override, deliberately: it is what a later step_episode receives.
+    assert state["raw_response_text"] == "env says 7"
 
 
 def test_rl_hands_the_derived_opener_flag_to_the_env():
