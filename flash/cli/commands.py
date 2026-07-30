@@ -442,6 +442,12 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         if heartbeat_age_seconds is not None:
             mins = int(heartbeat_age_seconds // 60)
             parts.append(f"hb={mins}m" if mins else "hb=<1m")
+    # what this run has committed to spend so far. while it is live that is the submit-time quote,
+    # since the settled charge is not written until the terminal transition -- following a run for an
+    # hour and never seeing a cost is how a user loses track of what it is costing.
+    amount, is_estimate = render.run_cost(status)
+    if amount or is_estimate:
+        parts.append(f"cost={'~' if is_estimate else ''}${amount:.4f}")
     realized = status.get("realized_cost_usd")
     if realized is not None:
         if isinstance(realized, (int, float)):
@@ -621,9 +627,10 @@ def cmd_runs(args) -> int:
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
         where = render.gpu_label(spec, r.get("remote") or {})
+        amount, is_estimate = render.run_cost(r)
+        cost = f"{'~' if is_estimate else ''}{amount:.4f}"
         print(
-            f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "
-            f"{r.get('cost_usd', 0.0):>8.4f}  {where:<22}  {model}"
+            f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  {cost:>8}  {where:<22}  {model}"
         )
     return 0
 

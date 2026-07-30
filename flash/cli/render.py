@@ -334,6 +334,33 @@ def money(value: float, decimals: int = 4) -> str:
     return _paint(f"${value:.{decimals}f}", _TEAL)
 
 
+# the states after which `cost_usd` is the settled charge. before one of these the field is still
+# 0.0, because the server only writes it on the terminal transition. kept here rather than imported
+# from flash.runner so this module stays stdlib-only; the set is asserted against the runner's
+# TERMINAL_STATES in the test suite so the two cannot drift.
+_SETTLED_COST_STATES = frozenset({"done", "failed", "cancelled", "dry_run", "deployed"})
+
+
+def run_cost(obj: dict) -> tuple[float, bool]:
+    """The cost to show for a run, and whether it is a pre-settlement estimate.
+
+    ``cost_usd`` is only written when a run reaches a terminal state, so a run that is queued or
+    training reports 0.0 -- which reads as "this has cost nothing", exactly when the GPU is billing.
+    The submit-time quote is already on the record as ``estimated_cost_usd``; prefer it while the
+    run is live so current spend is never understated as free.
+    """
+    settled = float(obj.get("cost_usd") or 0.0)
+    if str(obj.get("state") or "") in _SETTLED_COST_STATES:
+        return settled, False
+    if settled:
+        # a live run that has already accrued a measured cost: that number beats the submit quote.
+        return settled, True
+    quote = obj.get("estimated_cost_usd")
+    if isinstance(quote, (int, float)):
+        return float(quote), True
+    return settled, False
+
+
 def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
     """Aligned ``key · value`` panel; keys dimmed and padded to a common width."""
     rows = [(k, v) for k, v in pairs if v is not None]
@@ -495,12 +522,15 @@ def runs_table(runs: list[dict]) -> str:
         algorithm = str(spec.get("algorithm") or "-").upper()
         where = gpu_label(spec, r.get("remote") or {})
         color, uni, ascii_dot = _STATE_STYLE.get(str(r.get("state", "")).lower(), (_GRAY, "•", "-"))
+        amount, is_estimate = run_cost(r)
+        # `~` marks the submit-time quote for a run that has not settled, so a column of live runs
+        # does not read as a column of free ones.
         body.append(
             [
                 (r["run_id"], _ACCENT2),
                 (f"{_glyph(uni, ascii_dot)} {r.get('state', '')}", color),
                 (algorithm, _GRAY),
-                (f"${r.get('cost_usd', 0.0):.4f}", _TEAL),
+                (f"{'~' if is_estimate else ''}${amount:.4f}", _TEAL),
                 (where, _GRAY),
                 model,
             ]
@@ -684,12 +714,16 @@ def run_status(obj: dict) -> str:
     """A curated status panel for `flash runs status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
     where = gpu_label(spec, obj.get("remote") or {}) or None
+    amount, is_estimate = run_cost(obj)
+    cost = (
+        f"{money(amount)} {_dim('(estimate, run in progress)')}" if is_estimate else money(amount)
+    )
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),
         ("algorithm", (spec.get("algorithm") or "").upper() or None),
         ("gpu", where),
-        ("cost", money(obj.get("cost_usd", 0.0))),
+        ("cost", cost),
     ]
     realized = obj.get("realized_cost_usd")
     if realized is not None:
