@@ -1636,6 +1636,88 @@ def test_deploy_wait_rejects_a_superseding_deploy_that_carries_no_error(
     assert "once it is ready" not in capsys.readouterr().err
 
 
+def test_deploy_wait_observes_readiness_inside_a_short_window(fake_client, monkeypatch) -> None:
+    """Sleeping the entire remainder spends the budget without ever looking again.
+
+    With a `--wait 5` and a 5s poll interval, the first read saw `queued`, the sleep consumed all
+    five seconds, and the deadline check exited: a revision that became ready one second in was
+    still reported as queued and the command exited 1.
+    """
+    # _queued_deploy stubs sleep to a no-op, so install the clock AFTER it: a frozen monotonic with
+    # a non-advancing sleep is an infinite poll, which is a broken test rather than a caught defect.
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    def _poll(run_id, timeout=None):
+        # ready one second into the five-second window.
+        return {"state": "ready" if clock["t"] >= 1.0 else "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 0
+
+
+def test_deploy_wait_zero_does_not_block_past_its_own_bound(fake_client, monkeypatch) -> None:
+    """`--wait 0` advertises "check once, do not block", so its one read must be bounded tightly.
+
+    A ten-second fixed budget let a stalled plane hold a zero-second wait for ten seconds, which is
+    the same overshoot the per-poll bound exists to prevent, just smaller.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    seen: list[float | None] = []
+
+    def _poll(run_id, timeout=None):
+        seen.append(timeout)
+        return {"state": "ready"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 0
+    assert seen == [pytest.approx(1.0, abs=0.001)], seen
+
+
+def test_deploy_wait_rejects_a_synchronous_failure_that_returns_the_restored_revision(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A synchronous deploy returns the FINISHED record, never the queued attempt.
+
+    Under FLASH_DEPLOY_SYNC the POST answers after the job ran, so on failure it returns the
+    restored previous `ready` revision. requested and final are then the same row, their stamps
+    match by construction, and comparing identity accepted a deploy that never happened.
+    """
+    settled = {
+        "run_id": "flash-1",
+        "state": "ready",
+        "requested_at": "2026-07-29T01:00:00Z",
+        "last_deploy_error": "adapter load failed",
+    }
+    monkeypatch.setattr(fake_client, "deploy", lambda run_id, **_: dict(settled), raising=False)
+    # non-busy on arrival, so _await_deployment returns it without polling at all.
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: dict(settled), raising=False
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    err = capsys.readouterr().err
+    assert "did not become servable" in err, err
+    assert "adapter load failed" in err, err
+
+
+def test_deploy_wait_accepts_a_synchronous_success(fake_client, monkeypatch) -> None:
+    """The synchronous check keys on a recorded error, so a clean sync deploy still succeeds."""
+    settled = {"run_id": "flash-1", "state": "ready", "requested_at": "2026-07-29T02:00:00Z"}
+    monkeypatch.setattr(fake_client, "deploy", lambda run_id, **_: dict(settled), raising=False)
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: dict(settled), raising=False
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+
+
 def test_deploy_notes_name_this_channels_executable(fake_client, monkeypatch, capsys) -> None:
     """The dev channel installs `flash-dev`; a hardcoded `flash ...` hint is not runnable there."""
     monkeypatch.setattr(cli.commands, "CLI_NAME", "flash-dev")

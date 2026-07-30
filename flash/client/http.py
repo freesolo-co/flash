@@ -641,6 +641,11 @@ class ApiClient:
                 # None is the final adapter, an int is RUN/step-N (see the deployments renderer).
                 if (listed if listed is None else int(listed)) != step:
                     continue
+            if not deployment.get("run_id") and entry.get("run_id"):
+                # on the row-level shape the id lives on the row, not the nested record we return.
+                # `models deploy --wait` prints this record in place of the POST body, so without
+                # the id styled output renders an empty run field and the json omits it entirely.
+                deployment = {**deployment, "run_id": entry["run_id"]}
             return deployment
         return None
 

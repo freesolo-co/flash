@@ -709,10 +709,14 @@ _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 # rather than let `deploy --wait && evaluate` proceed against nothing.
 _DEPLOYMENT_READY_STATES = frozenset({"ready", "deployed"})
 _DEPLOY_POLL_SECONDS = 5.0
-# `--wait 0` still owes the caller its one read, and a read needs a positive timeout. this bounds
-# that single request without falling back to the client's 60s default, which is the overshoot the
-# per-poll bound exists to prevent.
-_DEPLOY_ZERO_WAIT_READ_SECONDS = 10.0
+# `--wait 0` still owes the caller its one read, and a read needs a positive timeout. keep that
+# bound short enough that "check once, do not block" stays true against a stalled plane: a longer
+# fixed budget just moves the overshoot the per-poll bound exists to prevent.
+_DEPLOY_ZERO_WAIT_READ_SECONDS = 1.0
+# withheld from each sleep so the read that follows it starts inside the deadline. without this the
+# sleep spends the whole remainder and the wait ends on the deadline check having never looked
+# again, so a revision that went ready early in a short window reads as queued.
+_DEPLOY_FINAL_READ_SECONDS = 1.0
 # an auth or authorization rejection answers the same way every time; polling through it just
 # spends the whole timeout to arrive at the identical error.
 _PERMANENT_POLL_STATUSES = frozenset({401, 403})
@@ -741,10 +745,18 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
         if remaining <= 0 and not first:
             break
         if not first:
-            time.sleep(min(_DEPLOY_POLL_SECONDS, remaining))
+            # hold back a slice of the budget for the read this sleep precedes, so a revision that
+            # becomes ready early in a window no longer than one poll interval is still observed
+            # rather than reported as queued. reserving a fixed slice (rather than sleeping a
+            # fraction of the remainder) is what makes this terminate: a fraction leaves a positive
+            # remainder forever, while this drives the remainder to the slice and then to zero.
+            slice_seconds = min(_DEPLOY_POLL_SECONDS, remaining)
+            if slice_seconds > _DEPLOY_FINAL_READ_SECONDS:
+                slice_seconds -= _DEPLOY_FINAL_READ_SECONDS
+            time.sleep(slice_seconds)
             remaining = deadline - time.monotonic()
-            # the sleep can consume the whole budget. issuing the read anyway, with the 1s floor
-            # below, is how `--wait 0.1` came to block for over a second: check again after waking.
+            # the sleep can consume the whole budget. issuing the read anyway, with the fallback
+            # bound below, is how `--wait 0.1` came to block for over a second: check after waking.
             if remaining <= 0:
                 break
         # `--wait 0` is documented as "check once, do not block", so the first read happens before
@@ -754,8 +766,9 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
         try:
             # bound the read by what is left of the wait. the client's default timeout is 60s, so
             # an unbounded poll inside `--wait 5` blocks far past the deadline the user set. a
-            # blanket 1s floor would do the same to shorter waits, so only the zero-budget one-shot
-            # gets a fixed bound; every other read honours the remainder exactly.
+            # blanket 1s floor would do the same to shorter waits, so only the expired-budget read
+            # -- which is just the zero-wait one-shot -- takes the fixed bound; every other read
+            # honours the remainder exactly.
             budget = remaining if remaining > 0 else _DEPLOY_ZERO_WAIT_READ_SECONDS
             current = client.deployment_for(run_id, timeout=budget)
         except ApiError as exc:
@@ -765,23 +778,23 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
                 # answers identically every time, and then reports it as "still queued".
                 print(f"warning: cannot check {run_id}: {exc}", file=sys.stderr)
                 return latest
-            continue
         except ClientError:
             # a transient control-plane blip must not fail a deploy that is otherwise progressing;
             # keep polling to the deadline and report whatever we last saw.
-            continue
-        if current is None:
-            # the listing drops a run once its deployment is gone, so vanishing mid-wait is
-            # terminal, not slow; continuing here would just burn the whole timeout.
-            print(
-                f"warning: {run_id} is no longer an active deployment; "
-                f"run `{CLI_NAME} models deployments` to check what happened",
-                file=sys.stderr,
-            )
-            return latest
-        latest = current
-        if str(current.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
-            return current
+            pass
+        else:
+            if current is None:
+                # the listing drops a run once its deployment is gone, so vanishing mid-wait is
+                # terminal, not slow; continuing here would just burn the whole timeout.
+                print(
+                    f"warning: {run_id} is no longer an active deployment; "
+                    f"run `{CLI_NAME} models deployments` to check what happened",
+                    file=sys.stderr,
+                )
+                return latest
+            latest = current
+            if str(current.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
+                return current
     print(
         f"warning: still {str(latest.get('state') or 'unknown')!r} after {timeout:g}s; "
         f"run `{CLI_NAME} models deployments` to keep checking {run_id}",
@@ -803,6 +816,14 @@ def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
         return True
     asked = requested.get("requested_at")
     got = final.get("requested_at")
+    # a POST that already answered with a settled record ran the deployment synchronously
+    # (FLASH_DEPLOY_SYNC, flash/server/routes/serving.py), so it returned the FINISHED row and never
+    # exposed the queued attempt. `requested` and `final` are then the same row and their stamps
+    # match by construction -- a restored previous revision compares equal to itself and reads as
+    # success. the recorded error is the only evidence left, and a deploy that really succeeded
+    # writes a fresh record that carries none, so this cannot fire on one.
+    if str(requested.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
+        return bool(final.get("last_deploy_error"))
     # a differing stamp means the record on the plane belongs to some other deploy request. that
     # happens without any error at all: a concurrent `deploy` for the same run supersedes this one
     # and reaches ready on ITS checkpoint, and reading only last_deploy_error would call that this

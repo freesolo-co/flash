@@ -769,7 +769,23 @@ def test_deployment_for_matches_a_run_id_on_the_listing_row(monkeypatch):
         lambda timeout=None: [{"run_id": "flash-1", "deployment": {"state": "queued"}}],
     )
 
-    assert client.deployment_for("flash-1") == {"state": "queued"}
+    # the row's id is carried onto the returned record: `models deploy --wait` prints this in place
+    # of the POST body, so dropping it renders an empty run field and omits it from the json.
+    assert client.deployment_for("flash-1") == {"state": "queued", "run_id": "flash-1"}
+
+
+def test_deployment_for_keeps_a_run_id_already_on_the_nested_record(monkeypatch):
+    """The nested id wins when both shapes carry one; the row must not overwrite it."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    monkeypatch.setattr(
+        client,
+        "deployments",
+        lambda timeout=None: [
+            {"run_id": "flash-1", "deployment": {"state": "ready", "run_id": "flash-1"}}
+        ],
+    )
+
+    assert client.deployment_for("flash-1") == {"state": "ready", "run_id": "flash-1"}
 
 
 def test_deployment_for_requires_the_requested_checkpoint_step(monkeypatch):
@@ -789,7 +805,11 @@ def test_deployment_for_requires_the_requested_checkpoint_step(monkeypatch):
     )
 
     assert client.deployment_for("flash-1/step-40") is None
-    assert client.deployment_for("flash-1/step-20") == {"state": "ready", "checkpoint_step": 20}
+    assert client.deployment_for("flash-1/step-20") == {
+        "state": "ready",
+        "checkpoint_step": 20,
+        "run_id": "flash-1",
+    }
     # the bare run id is the FINAL adapter, which the plane lists as a null step -- a checkpoint
     # revision must not answer for it either.
     assert client.deployment_for("flash-1") is None
@@ -806,7 +826,11 @@ def test_deployment_for_matches_the_final_adapters_null_step(monkeypatch):
         ],
     )
 
-    assert client.deployment_for("flash-1") == {"state": "ready", "checkpoint_step": None}
+    assert client.deployment_for("flash-1") == {
+        "state": "ready",
+        "checkpoint_step": None,
+        "run_id": "flash-1",
+    }
     assert client.deployment_for("flash-1/step-40") is None
 
 
