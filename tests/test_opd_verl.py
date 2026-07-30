@@ -5260,6 +5260,10 @@ def test_transfer_queue_init_that_never_returns_fails_with_the_resource_state(mo
     # wait from the other two, but the controller ray.get and the get_config spin look identical from
     # outside -- only the stack tells them apart. here the init is parked in Event.wait.
     assert "stalled at wait (threading.py:" in str(excinfo.value)
+    # the message must NOT claim the cause is capacity: two of the three waits stall with ample free
+    # resources, and asserting a scheduling failure would send an operator to the wrong remediation.
+    assert "only the first is a capacity problem" in str(excinfo.value)
+    assert "so this is a scheduling problem" not in str(excinfo.value)
     release.set()
 
 
@@ -5283,11 +5287,30 @@ def test_ray_resource_probe_reports_the_cluster_and_free_counts(monkeypatch):
 
     stub = types.ModuleType("ray")
     stub.cluster_resources = lambda: {"CPU": 8.0, "GPU": 1.0}
-    stub.available_resources = lambda: {"CPU": 0.0, "GPU": 1.0}
+    stub.available_resources = lambda: {"CPU": 2.0, "GPU": 1.0}
     monkeypatch.setitem(sys.modules, "ray", stub)
     described = plugin._describe_ray_resources()
     assert "cluster CPU=8.0 GPU=1.0" in described
-    assert "free CPU=0.0 GPU=1.0" in described
+    assert "free CPU=2.0 GPU=1.0" in described
+
+
+def test_ray_resource_probe_reports_a_fully_consumed_resource_as_zero(monkeypatch):
+    # ray DROPS a resource key from available_resources() once it is fully allocated rather than
+    # reporting 0.0 -- verified against ray 2.56.1: consuming every cpu removes "CPU" from the mapping.
+    # that is the exhaustion case this probe exists to name, so rendering it as "free CPU=None" would
+    # read as a broken probe at the exact moment the diagnosis matters. an earlier version of this test
+    # hardcoded zero-valued keys in the stub and so could not have caught it.
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    stub = types.ModuleType("ray")
+    stub.cluster_resources = lambda: {"CPU": 8.0}
+    stub.available_resources = lambda: {"memory": 1.0}
+    monkeypatch.setitem(sys.modules, "ray", stub)
+    described = plugin._describe_ray_resources()
+    assert "free CPU=0.0" in described
+    # a node with no gpu omits the key from cluster_resources() too, and 0.0 describes that correctly.
+    assert "cluster CPU=8.0 GPU=0.0" in described
+    assert "None" not in described
 
 
 def test_ray_resource_probe_never_raises_on_the_timeout_path(monkeypatch):

@@ -619,6 +619,12 @@ _TQ_INIT_TIMEOUT_S = 600.0
 def _describe_ray_resources() -> str:
     """summarise ray's cluster and free resources, or say why they could not be read.
 
+    ray drops a resource key from available_resources() once it is fully allocated rather than reporting
+    it as zero -- verified against ray 2.56.1, where consuming every cpu removes 'CPU' from the mapping
+    entirely. that is exactly the exhaustion this probe exists to name, so a missing key reads as 0.0
+    instead of None. cluster_resources() omits a resource the node does not have at all, which 0.0 also
+    describes correctly.
+
     this is only ever called on the timeout path, so it must not raise: a probe failure here would
     replace the diagnosis it exists to produce.
     """
@@ -630,8 +636,8 @@ def _describe_ray_resources() -> str:
     except Exception as error:  # pragma: no cover - defensive, ray is up by this point
         return f"ray resources unreadable: {type(error).__name__}: {error}"
     return (
-        f"cluster CPU={total.get('CPU')} GPU={total.get('GPU')}, "
-        f"free CPU={free.get('CPU')} GPU={free.get('GPU')}"
+        f"cluster CPU={total.get('CPU', 0.0)} GPU={total.get('GPU', 0.0)}, "
+        f"free CPU={free.get('CPU', 0.0)} GPU={free.get('GPU', 0.0)}"
     )
 
 
@@ -695,8 +701,9 @@ def _init_transfer_queue(init: Callable[[Any], Any], conf: Any, timeout_s: float
         raise RuntimeError(
             f"verl transfer_queue init did not finish within {timeout_s:.0f}s; "
             f"stalled at {_describe_stalled_thread(thread.ident)}; {_describe_ray_resources()}. "
-            "tq.init reserves its controller and storage units through ray and waits without a timeout, "
-            "so this is a scheduling problem rather than a slow start"
+            "tq.init waits without a timeout in three places -- an unplaceable storage placement group, "
+            "a controller rpc that never returns, and a spin on a controller that never publishes its "
+            "config -- so read the stalled frame: only the first is a capacity problem"
         )
     if failure:
         raise failure[0]
