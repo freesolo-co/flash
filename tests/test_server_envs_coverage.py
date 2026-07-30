@@ -438,6 +438,7 @@ def _smoke_spec(
     thinking: bool,
     constraint: dict | None = None,
     max_completion_tokens: int | None = None,
+    max_context_tokens: int | None = None,
     algorithm: str = "grpo",
     stop_sequences: tuple[str, ...] = (),
 ):
@@ -447,6 +448,7 @@ def _smoke_spec(
         thinking=thinking,
         train=types.SimpleNamespace(
             max_completion_tokens=max_completion_tokens,
+            max_context_tokens=max_context_tokens,
             structured_outputs="" if constraint is None else json.dumps(constraint),
             stop_sequences=stop_sequences,
         ),
@@ -685,6 +687,46 @@ def test_zero_completion_budget_resolves_to_thinking_recipe_default():
     )
 
     assert resolve_effective_completion_tokens(spec) == 1536
+
+
+def test_thinking_sft_budget_comes_from_sft_context_not_the_rl_default():
+    from flash.engine.recipe import RECIPE
+    from flash.serve.preflight import resolve_effective_completion_tokens
+
+    spec = _smoke_spec(thinking=True, algorithm="sft")
+
+    # the rl thinking default (1536) is shorter than what sft actually trains, so resolving to it
+    # would truncate the smoke and reject a checkpoint that answered correctly.
+    assert RECIPE.rl.max_completion_len_thinking < RECIPE.sft.max_seq_len_thinking
+    assert resolve_effective_completion_tokens(spec) == RECIPE.sft.max_seq_len_thinking
+
+
+def test_nonthinking_sft_budget_comes_from_sft_context_not_the_rl_default():
+    from flash.engine.recipe import RECIPE
+    from flash.serve.preflight import resolve_effective_completion_tokens
+
+    spec = _smoke_spec(thinking=False, algorithm="sft")
+
+    assert resolve_effective_completion_tokens(spec) == RECIPE.sft.max_seq_len
+
+
+def test_sft_budget_honors_configured_context_tokens():
+    from flash.serve.preflight import resolve_effective_completion_tokens
+
+    spec = _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=4096)
+
+    assert resolve_effective_completion_tokens(spec) == 4096
+
+
+def test_rollout_budget_ignores_context_tokens():
+    from flash.engine.recipe import RECIPE
+    from flash.serve.preflight import resolve_effective_completion_tokens
+
+    # grpo budgets the completion, not the whole rollout, so max_context_tokens must not become
+    # its completion budget the way it does for sft.
+    spec = _smoke_spec(thinking=True, algorithm="grpo", max_context_tokens=4096)
+
+    assert resolve_effective_completion_tokens(spec) == RECIPE.rl.max_completion_len_thinking
 
 
 def test_run_deployment_smoke_retries_recognized_cold_503(monkeypatch):

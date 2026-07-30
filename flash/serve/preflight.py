@@ -76,6 +76,15 @@ def resolve_effective_completion_tokens(spec: JobSpec) -> int:
         return opd_completion_len(positive_explicit, spec.thinking)
     if positive_explicit is not None:
         return positive_explicit
+    if spec.algorithm == "sft":
+        # sft has no completion budget of its own: the worker trains one packed prompt+completion
+        # block bounded by max_context_tokens, defaulting to RECIPE.sft (2048 thinking / 1024).
+        # falling through to the rl default would hand a thinking sft run 1536 tokens and truncate
+        # a completion it was trained to produce, so derive the budget from sft's own limit.
+        context = spec.train.max_context_tokens
+        if context is not None and int(context) > 0:
+            return int(context)
+        return int(RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
     recipe = RECIPE.rl
     return int(recipe.max_completion_len_thinking if spec.thinking else recipe.max_completion_len)
 
