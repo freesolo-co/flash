@@ -1986,7 +1986,7 @@ def test_train_notes_record_the_measured_grading_latency(monkeypatch):
         reward_history=[],
         loss_curve=[],
         reward_profile=_profile(0.25),
-        train_wall=100.0,
+        step_intervals=[10.0],
     )
     assert notes["reward_seconds_per_completion"] == 0.25
 
@@ -2005,7 +2005,7 @@ def test_train_notes_omit_an_untrustworthy_profile(monkeypatch):
         reward_history=[],
         loss_curve=[],
         reward_profile=_profile(0.0, trustworthy=False),
-        train_wall=100.0,
+        step_intervals=[10.0],
     )
     assert notes["reward_seconds_per_completion"] is None
     assert notes["reward_gpu_idle_fraction"] is None
@@ -2028,7 +2028,7 @@ def test_train_notes_report_idle_fraction_from_the_runs_own_step_wall(monkeypatc
         reward_history=[],
         loss_curve=[],
         reward_profile=_profile(latency),
-        train_wall=100.0,
+        step_intervals=[10.0] * 10,
     )
     assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
 
@@ -2050,9 +2050,91 @@ def test_idle_fraction_is_none_when_grading_exceeds_the_measured_step(monkeypatc
         loss_curve=[],
         # 20s of grading inside a 10s measured step
         reward_profile=_profile(20.0 / completions),
-        train_wall=100.0,
+        step_intervals=[10.0] * 10,
     )
     assert notes["reward_gpu_idle_fraction"] is None
+
+
+def test_idle_fraction_ignores_steps_this_worker_did_not_run(monkeypatch):
+    """A resumed run must divide by ITS steps, not by the checkpoint's absolute step number.
+
+    steps_run comes from the checkpoint directory and counts every step the run has ever taken;
+    the wall clock only ever covers this session. A worker resuming at 90 and training to 100
+    walled ten steps, and charging those seconds against a hundred understates each step by 10x --
+    which inflates the idle share toward 100% and would route the run to a co-location tier it
+    cannot sustain. Feeding the measured intervals removes the term entirely.
+    """
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    completions = inp["prompts_per_step"] * inp["group_size"]
+    latency = 8.0 / completions
+    notes = rl_verl._build_verl_train_notes(
+        inp,
+        # the checkpoint says 100 steps; this worker observed ten, each a real 10s step.
+        steps_run=100,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        reward_profile=_profile(latency),
+        step_intervals=[10.0] * 10,
+    )
+    # unchanged from the fresh-run case above: resume does not move the reading.
+    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
+
+
+def test_idle_fraction_is_unmoved_by_one_slow_step(monkeypatch):
+    """A checkpoint save lands inside a single step interval and must not set the verdict.
+
+    Every save-step gap carries an upload that the other steps never pay. Averaging lets one such
+    step drag the whole reading -- here a 200s outlier among 10s steps would report ~28s/step and
+    flip an 80% idle run to 29%. The median needs MOST steps to be slow before it moves.
+    """
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    completions = inp["prompts_per_step"] * inp["group_size"]
+    latency = 8.0 / completions
+    notes = rl_verl._build_verl_train_notes(
+        inp,
+        steps_run=10,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        reward_profile=_profile(latency),
+        step_intervals=[10.0] * 9 + [200.0],
+    )
+    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
+
+
+def test_idle_fraction_is_none_when_no_step_was_timed(monkeypatch):
+    """A run that never emitted two step lines has no measured step to divide by.
+
+    One step line yields zero intervals by design (the span before it is engine startup), and a
+    run that died in its first step yields none at all. Both must record no reading rather than
+    fall back to a modelled step, which is the number this metric exists to check.
+    """
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    completions = inp["prompts_per_step"] * inp["group_size"]
+    notes = rl_verl._build_verl_train_notes(
+        inp,
+        steps_run=1,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        reward_profile=_profile(8.0 / completions),
+        step_intervals=[],
+    )
+    assert notes["reward_gpu_idle_fraction"] is None
+
+
+def test_step_intervals_exclude_the_span_before_the_first_step():
+    """Engine init, weight load and cudagraph capture precede the first step line.
+
+    That span is setup, paid once, and often larger than a step. Counting it as a step would
+    inflate the step wall and understate the idle share on exactly the short runs where the
+    startup cost dominates. N step lines bound N-1 steps, never N.
+    """
+    assert rl_verl._step_intervals([100.0, 110.0, 122.0]) == [10.0, 12.0]
+    # a single step line bounds no whole step: nothing is known about what came before it or after.
+    assert rl_verl._step_intervals([100.0]) == []
+    assert rl_verl._step_intervals([]) == []
 
 
 def test_the_profile_hook_returns_its_reading_to_the_caller():

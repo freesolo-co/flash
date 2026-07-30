@@ -15,12 +15,14 @@ scope raises rather than silently training on a different contract.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import math
 import os
 import random
 import re
 import shutil
+import statistics
 import subprocess
 import threading
 import time
@@ -367,12 +369,23 @@ def _build_verl_training_cfg(
     }
 
 
+def _step_intervals(step_line_times: list[float]) -> list[float]:
+    """Wall-clock length of each step, from the times its metric lines arrived.
+
+    N step lines bound N-1 whole steps. The span BEFORE the first line is not one of them: it holds
+    engine init, weight load and cudagraph capture, which a later step never pays again. Nothing is
+    known about the span after the last line either, since the run may have been cancelled mid-step.
+    """
+    return [
+        later - earlier for earlier, later in itertools.pairwise(step_line_times) if later > earlier
+    ]
+
+
 def _measured_idle_fraction(
     reward_profile,
     *,
     completions_per_step: int,
-    steps_run: int,
-    train_wall: float,
+    step_intervals: list[float],
 ) -> float | None:
     """Share of a step the gpu spent waiting on grading, from this run's OWN numbers.
 
@@ -381,17 +394,27 @@ def _measured_idle_fraction(
     the grading it contains. A modelled step time would report the estimator's opinion of the run
     back to the estimator, which cannot then be used to check it.
 
+    ``step_intervals`` are the wall-clock gaps between consecutive step metric lines, so each one
+    is a real step and nothing else. ``train_wall / steps_run`` is NOT a step wall and cannot
+    substitute: it charges subprocess startup and the checkpoint-upload drain to the numerator,
+    while ``steps_run`` is the absolute checkpoint step, so a run resuming at 90 and training to
+    100 would divide ten steps of wall time by a hundred.
+
+    The MEDIAN, not the mean: any single step can absorb a checkpoint save or a lazily compiled
+    kernel, and one such step would drag a mean far enough to change the verdict. A median needs
+    most steps to be slow before it moves.
+
     None whenever the reading would not mean anything -- no trustworthy profile, no completed step,
     or grading that accounts for the entire step wall (which makes the gpu-bound remainder zero or
     negative, i.e. the step wall and the profile disagree and neither can arbitrate).
     """
     if reward_profile is None or not reward_profile.trustworthy:
         return None
-    steps = max(0, int(steps_run))
     completions = max(0, int(completions_per_step))
-    if steps <= 0 or completions <= 0 or train_wall <= 0:
+    intervals = [float(gap) for gap in step_intervals if gap > 0]
+    if completions <= 0 or not intervals:
         return None
-    step_wall = train_wall / steps
+    step_wall = statistics.median(intervals)
     reward_s = reward_profile.seconds_per_completion * completions
     gpu_seconds = step_wall - reward_s
     if gpu_seconds <= 0:
@@ -417,7 +440,7 @@ def _build_verl_train_notes(
     wandb_url: str | None = None,
     wandb_id: str | None = None,
     reward_profile=None,
-    train_wall: float = 0.0,
+    step_intervals: list[float] | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -484,8 +507,7 @@ def _build_verl_train_notes(
         "reward_gpu_idle_fraction": _measured_idle_fraction(
             reward_profile,
             completions_per_step=inp["prompts_per_step"] * inp["group_size"],
-            steps_run=steps_run,
-            train_wall=train_wall,
+            step_intervals=step_intervals or [],
         ),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
@@ -1965,6 +1987,13 @@ def run_rl_verl():
         resp_len_history: list[float] = []
         loss_curve: list[float] = []
         last_dump_step = [-1]
+        # when each step metric line arrived. verl's LocalLogger emits exactly one such line per
+        # optimizer step, so the gaps between them are whole steps and nothing else -- the only
+        # honest denominator for the reward idle fraction. train_wall/steps_run is not: it charges
+        # subprocess startup and the checkpoint-upload drain to the numerator, and steps_run is the
+        # ABSOLUTE checkpoint step while the wall is session-only, so a resumed run divides this
+        # session's seconds by every step the checkpoint ever took.
+        step_line_times: list[float] = []
         # per-step backlog for `flash runs log -f`, rebuilt from verl's own step lines because its
         # trainer runs out of process and cannot host trl's callback. read by the liveness thread
         # below, so mutate it in place (append_step_metrics) rather than rebinding.
@@ -2006,6 +2035,7 @@ def run_rl_verl():
                                 )
                     step_metrics = parse_verl_step_metrics(line)
                     if step_metrics is not None:
+                        step_line_times.append(time.time())
                         # a run constant rather than a verl metric, so it is stamped here the way
                         # trl's callback reads it off args.max_completion_length.
                         step_metrics["max_completion_tokens"] = inp["max_completion"]
@@ -2157,6 +2187,6 @@ def run_rl_verl():
             wandb_url=wandb_link.get("wandb_url"),
             wandb_id=wandb_link.get("wandb_id"),
             reward_profile=reward_profile,
-            train_wall=train_wall,
+            step_intervals=_step_intervals(step_line_times),
         ),
     )
