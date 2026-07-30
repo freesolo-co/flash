@@ -635,6 +635,27 @@ def _describe_ray_resources() -> str:
     )
 
 
+def _describe_stalled_thread(ident: int | None, depth: int = 4) -> str:
+    """render the innermost frames of a thread that is still parked, or say why they are unavailable.
+
+    which of tq.init's three waits is stuck is not decidable from ray's resource counts alone: a
+    satisfied placement group rules out the first, but the controller ray.get and the get_config spin
+    look identical from outside. the wedged thread is still alive at this point, so its own frames name
+    the wait directly. like the resource probe, this runs only on the failure path and must not raise.
+    """
+    import sys
+    import traceback
+
+    try:
+        frame = sys._current_frames().get(ident) if ident is not None else None
+        if frame is None:
+            return "stack unavailable"
+        frames = traceback.extract_stack(frame)[-depth:]
+        return " <- ".join(f"{f.name} ({f.filename.rsplit('/', 1)[-1]}:{f.lineno})" for f in reversed(frames))
+    except Exception as error:  # pragma: no cover - defensive, the thread is alive by construction
+        return f"stack unreadable: {type(error).__name__}: {error}"
+
+
 def _init_transfer_queue(init: Callable[[Any], Any], conf: Any, timeout_s: float = _TQ_INIT_TIMEOUT_S) -> None:
     """run verl's transfer-queue init under a deadline, reporting the resource state on timeout.
 
@@ -654,7 +675,8 @@ def _init_transfer_queue(init: Callable[[Any], Any], conf: Any, timeout_s: float
     calls it a stall -- with no indication that transfer_queue was even involved.
 
     the thread is a daemon and is deliberately not joined after the timeout: it is parked inside an
-    unbounded ray.get that no signal will interrupt, and the exception below fails the run anyway.
+    unbounded ray.get that no signal will interrupt, and the exception below fails the run anyway. that
+    is also what makes its stack readable here, which is the only thing that tells the three waits apart.
     """
     import threading
 
@@ -672,8 +694,9 @@ def _init_transfer_queue(init: Callable[[Any], Any], conf: Any, timeout_s: float
     if thread.is_alive():
         raise RuntimeError(
             f"verl transfer_queue init did not finish within {timeout_s:.0f}s; "
-            f"{_describe_ray_resources()}. tq.init reserves its controller and storage units through "
-            "ray and waits without a timeout, so this is a scheduling problem rather than a slow start"
+            f"stalled at {_describe_stalled_thread(thread.ident)}; {_describe_ray_resources()}. "
+            "tq.init reserves its controller and storage units through ray and waits without a timeout, "
+            "so this is a scheduling problem rather than a slow start"
         )
     if failure:
         raise failure[0]

@@ -5256,6 +5256,10 @@ def test_transfer_queue_init_that_never_returns_fails_with_the_resource_state(mo
     # the message must carry the resource state: "it timed out" alone does not distinguish an
     # unschedulable reservation from a slow start, which is the whole diagnosis.
     assert "free CPU=0.0" in str(excinfo.value)
+    # and it must name the frame the thread is parked in. resource counts separate the placement-group
+    # wait from the other two, but the controller ray.get and the get_config spin look identical from
+    # outside -- only the stack tells them apart. here the init is parked in Event.wait.
+    assert "stalled at wait (threading.py:" in str(excinfo.value)
     release.set()
 
 
@@ -5296,3 +5300,42 @@ def test_ray_resource_probe_never_raises_on_the_timeout_path(monkeypatch):
     stub.available_resources = lambda: {}
     monkeypatch.setitem(sys.modules, "ray", stub)
     assert "ray resources unreadable" in plugin._describe_ray_resources()
+
+
+def test_stalled_thread_probe_names_the_frame_the_thread_is_parked_in():
+    # the point of the probe: identify WHICH of tq.init's three unbounded waits is stuck. a placement
+    # group that never fills, a ray.get on the controller, and the `while conf is None` get_config spin
+    # are indistinguishable from ray's resource counts, so the parked frame is the only discriminator.
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _park_in_a_named_frame():
+        entered.set()
+        release.wait(60)
+
+    thread = threading.Thread(target=_park_in_a_named_frame, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(10)
+        described = plugin._describe_stalled_thread(thread.ident)
+    finally:
+        release.set()
+        thread.join(10)
+    # innermost frame first, so the wait itself leads and its caller follows -- that ordering is what
+    # makes the message readable in a log line.
+    assert described.startswith("wait (threading.py:")
+    assert "_park_in_a_named_frame" in described
+
+
+def test_stalled_thread_probe_reports_a_thread_that_is_gone_instead_of_raising():
+    # a thread can finish between the is_alive check and the probe. that must degrade to a note in the
+    # failure message, not an exception that replaces the timeout diagnosis.
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    thread = threading.Thread(target=lambda: None, daemon=True)
+    thread.start()
+    thread.join(10)
+    assert plugin._describe_stalled_thread(thread.ident) == "stack unavailable"
+    assert plugin._describe_stalled_thread(None) == "stack unavailable"
