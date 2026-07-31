@@ -330,18 +330,29 @@ class RewardObservabilityBuffer:
     trainer is a child process, so its reward bridge fills this from the scoring server's threads
     while the heartbeat drains it from the liveness thread -- the lock below is the whole reason
     this is an object rather than three locals.
+
+    Both signals describe a GENERATION, so both are published per generation rather than per
+    heartbeat. trl gets that boundary for free (its callback fires at ``on_log``, after the step is
+    scored); here the caller supplies it via ``close_generation``. Draining on the heartbeat cadence
+    instead would publish whichever completions happened to be graded when a 30s tick landed --
+    a latency-biased subset -- and stamp samples left over from earlier generations with the
+    current step (codex[bot]).
     """
 
-    # how many per-completion breakdowns may queue between drains. one generation is
-    # prompts_per_step * group_size completions and the drain runs on the heartbeat cadence, so this
-    # holds several generations' worth -- a normal drain never truncates, while a run whose
-    # heartbeat has stopped draining cannot grow the buffer without limit.
+    # how many per-completion breakdowns may queue between generations. one generation is
+    # prompts_per_step * group_size completions, so this holds several generations' worth -- a
+    # normal boundary never truncates, while a run whose steps have stopped arriving cannot grow
+    # the buffer without limit.
     _PENDING_BREAKDOWN_LIMIT = 4096
     _SAMPLE_BUFFER_LIMIT = 64
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        # gradings since the last boundary; they belong to the generation still being scored.
         self._samples: list[tuple[Any, Any, float]] = []
+        # the last COMPLETE generation, with the step it was logged under. only these publish.
+        self._published: list[tuple[Any, Any, float]] = []
+        self._published_step: int | None = None
         self._pending_breakdowns: list[dict[str, float] | None] = []
         self._latest_metrics: dict[str, float] = {}
 
@@ -357,30 +368,55 @@ class RewardObservabilityBuffer:
             self._pending_breakdowns.extend(breakdowns)
             del self._pending_breakdowns[: -self._PENDING_BREAKDOWN_LIMIT]
 
-    def latest(self) -> tuple[Any, Any, float] | None:
-        """The most recently scored ``(prompt, completion, reward)``, for a per-step log preview."""
-        with self._lock:
-            return self._samples[-1] if self._samples else None
+    def close_generation(self, step: int) -> None:
+        """Seal everything graded since the last boundary as generation ``step``'s output.
 
-    def heartbeat_fields(self, *, step: int | None = None) -> dict:
+        Call once per new trainer step. This is the only place the breakdown drain happens, so a
+        published mean always covers a whole generation rather than the subset that had finished
+        when a heartbeat fired.
+
+        A boundary with no gradings leaves the previous generation published under its OWN step: a
+        step that generated nothing must not relabel older samples as newly generated.
+        """
+        with self._lock:
+            _latest_named_reward_metrics(self._pending_breakdowns, self._latest_metrics)
+            if self._samples:
+                self._published = self._samples
+                self._published_step = int(step)
+                self._samples = []
+
+    def latest(self) -> tuple[Any, Any, float] | None:
+        """The most recently scored ``(prompt, completion, reward)``, for a per-step log preview.
+
+        Falls back to the published generation so the preview does not blank out depending on
+        whether the caller logs it before or after closing the generation."""
+        with self._lock:
+            if self._samples:
+                return self._samples[-1]
+            return self._published[-1] if self._published else None
+
+    def heartbeat_fields(self) -> dict:
         """The bounded ``reward_metrics`` / ``sampled_completions`` fragment of one heartbeat.
+
+        Non-destructive: every heartbeat between two generations republishes that generation's
+        reading. ``close_generation`` owns the drain.
 
         Metrics are bounded here (name sanitization, 12-metric cap). Samples are not: unlike the trl
         callback -- which bounds an opaque caller-supplied list -- these come straight from
-        ``select_rollout_samples``, which already sanitizes and caps at three, so
-        ``_bounded_sampled_completions`` would be a no-op over its own output.
+        ``select_rollout_samples``, which already sanitizes, drops non-finite scalars, and caps at
+        three, so ``_bounded_sampled_completions`` would be a no-op over its own output.
 
         Empty signals are omitted rather than sent as ``{}``/``[]``: a renderer tells "no metrics
         this step" apart from "this backend does not report them" by the key's absence.
         """
         with self._lock:
-            # one acquisition covering both reads, or the payload tears: a grading landing between
-            # the drain and the snapshot rides this payload's samples while its breakdown stays
-            # pending for the next drain, so the two fields would describe different gradings.
-            # only the snapshot is taken here -- building the samples sanitizes full untruncated
-            # text, which must not run while the scoring threads want the lock.
-            metrics = _latest_named_reward_metrics(self._pending_breakdowns, self._latest_metrics)
-            rows = list(self._samples)
+            # one acquisition covering both reads, or the payload tears: the two fields would
+            # describe different generations. only the snapshot is taken here -- building the
+            # samples sanitizes full untruncated text, which must not run while the scoring
+            # threads want the lock.
+            metrics = dict(self._latest_metrics)
+            rows = list(self._published)
+            step = self._published_step
         fields: dict = {}
         bounded_metrics = _bounded_reward_metrics(metrics)
         if bounded_metrics:

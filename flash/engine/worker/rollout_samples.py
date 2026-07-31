@@ -9,6 +9,7 @@ multimodal parts are replaced with placeholders. Sizes are already bounded by th
 
 from __future__ import annotations
 
+import math
 import sys
 from collections.abc import Iterable
 from typing import Any
@@ -110,10 +111,17 @@ def build_rollout_sample(
         "completion": sanitize_rollout_text(completion_text),
         "generated_at_step": step,
     }
-    if reward is not None:
-        record["reward"] = float(reward)
-    if loss is not None:
-        record["loss"] = float(loss)
+    # this is the one place the scalar is coerced, so it is the one place a non-finite one can be
+    # created. omit rather than publish it: json.dumps writes bare NaN/Infinity, which is not json,
+    # and a strict reader rejects the whole heartbeat over it -- losing the step's other fields too.
+    # a sample without its scalar is then skipped by the reader, so a diverged step publishes fewer
+    # samples rather than a payload that will not parse.
+    for key, value in (("reward", reward), ("loss", loss)):
+        if value is None:
+            continue
+        scalar = float(value)
+        if math.isfinite(scalar):
+            record[key] = scalar
     return record
 
 

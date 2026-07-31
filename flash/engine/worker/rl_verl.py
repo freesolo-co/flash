@@ -1208,8 +1208,17 @@ def score_single_turn(
     metrics. a failed grading appends ``None``, which the mean counts as a zero for every name the
     other completions did report, exactly as trl does; the caller owns the list's lock and bound.
     """
-    collect_breakdown = breakdowns is not None and hasattr(env, "scores_breakdown")
+    # optimistic until the probe answers: a probe that RAISES is itself a failed grading, and the
+    # except branch has to be able to record it -- omitting it instead would drop this completion
+    # from the denominator and bias every named metric high. narrowed the instant the probe returns.
+    collect_breakdown = breakdowns is not None
     try:
+        # probe INSIDE the guard: `scores_breakdown` may be a property or a proxy whose lookup
+        # raises something other than AttributeError, and out here that escapes into the reward http
+        # handler -- the verl child reads a bridge failure and aborts the run, when this function's
+        # whole contract is to turn an env scoring fault into 0.0.
+        has_breakdown = hasattr(env, "scores_breakdown")
+        collect_breakdown = collect_breakdown and has_breakdown
         graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
         state = (
             {
@@ -1222,7 +1231,7 @@ def score_single_turn(
             if thinking
             else None
         )
-        if hasattr(env, "scores_breakdown"):
+        if has_breakdown:
             breakdown = env.scores_breakdown(graded, ex, state)
             # convert total FIRST: a breakdown whose total is not a number is a failed grading, and
             # recording its named components would credit metrics to a completion that scored 0.0.
@@ -1463,7 +1472,12 @@ class MultiTurnBridge:
             # snapshot under the same lock that guards the session: `step` mutates this list in
             # place, and a concurrent episode's turn would otherwise be read mid-append.
             prompt = list(state.get("prompt") or ())
-            transcript = list(state.get("messages") or ())
+            # the episode transcript, NOT the whole message list: new_rollout_state seeds `messages`
+            # with a copy of `prompt` and appends turns onto it, so publishing it whole would repeat
+            # the prompt inside `completion` when it already rides the sample as `prompt_tail`.
+            # slice by length rather than by equality -- an env may legitimately produce a turn that
+            # matches a prompt message, and dropping it would silently truncate the episode.
+            transcript = list(state.get("messages") or ())[len(prompt) :]
         # per-turn credit is a separate invariant (it needs a custom verl advantage estimator), so
         # only the episode reward crosses back. nan is score_rollouts' unscorable marker; verl has
         # no equivalent, and a nan would propagate into the group baseline and poison every other
@@ -2717,9 +2731,13 @@ def run_rl_verl():
 
             trl publishes both from a TrainerCallback on the trainer's own thread. verl's trainer is
             out of process, so this is called from the liveness thread and from the stdout loop
-            instead -- draining the buffer the reward bridge fills on its server threads.
+            instead -- reading the buffer the reward bridge fills on its server threads.
+
+            read-only: the generation boundary below owns the drain, so a 30s liveness tick landing
+            mid-generation republishes the last complete reading instead of publishing whichever
+            completions happened to be graded by then.
             """
-            return observability.heartbeat_fields(step=step_box[0] or None)
+            return observability.heartbeat_fields()
 
         with liveness_heartbeat(
             "rl_step",
@@ -2746,6 +2764,11 @@ def run_rl_verl():
                         step_box[0] = int(m.group(1))
                         # dump one sample completion per new step to the flash log (matches trl #607).
                         if step_box[0] != last_dump_step[0]:
+                            # the generation boundary: verl logs this line once its step is scored,
+                            # so everything the reward bridge buffered since the last one is that
+                            # step's complete output. seal it before the preview reads `latest`, so
+                            # both the log line and the heartbeat describe the same generation.
+                            observability.close_generation(step_box[0])
                             samp = observability.latest()
                             if samp:
                                 last_dump_step[0] = step_box[0]
