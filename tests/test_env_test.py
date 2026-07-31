@@ -3327,3 +3327,119 @@ def test_a_tool_environment_exposing_no_tools_still_allows_per_turn_credit(
 
     assert cmd_env_test(_args(env_dir, algorithm="grpo", credit_assignment="per_turn")) == 0
     assert "is not supported for tool-calling" not in capsys.readouterr().err
+
+
+class _SingleTurnNativeToolEnv(_SingleTurnEnv):
+    """A single-turn tool env exposing tools: native-scored in training, like a multi-turn one.
+
+    `reward()` is a RANKING placeholder and `reward_from_messages` is the real, flat grader, so
+    only reading the hook the run actually uses can fail this env.
+    """
+
+    is_tool_env = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.graded: list[list[dict]] = []
+
+    def tools(self):
+        return [lambda x: x]
+
+    def reward(self, completion, example, state=None):  # ranking placeholder, never called
+        return 1.0 if completion == example.get("output", "") else 0.0
+
+    def reward_from_messages(self, completion, example):
+        self.graded.append([dict(m) for m in completion])
+        return 0.0
+
+
+def test_a_single_turn_native_tool_environment_is_graded_by_reward_from_messages(
+    monkeypatch, tmp_path, capsys
+):
+    # rl.py:433 joins the two with `or` -- `is_message_completion and (is_multi_turn or
+    # is_tool_env)` -- so a single-turn tool env exposing tools is scored as an episode by
+    # reward_from_messages exactly as a multi-turn one is (tests/test_grpo_params.py:820).
+    # grading it through reward() let this ranking placeholder report PASS for an env whose real
+    # grader is flat (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnNativeToolEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert env.graded, "the native grader was never called"
+    assert "cannot rank completions" in captured.err
+    assert "reward=0.000000" in captured.out
+
+
+def test_a_single_turn_native_tool_grader_is_handed_the_gold_trajectory(monkeypatch, tmp_path):
+    # what trl's tool loop hands the grader is the generated messages, so the gold trajectory is
+    # forwarded whole rather than flattened to its last assistant text.
+    env_dir = _environment_dir(tmp_path)
+    rows = [{"input": "look it up", "output": "4"}]
+    env = _SingleTurnNativeToolEnv(rows=rows)
+    trajectory = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"name": "lookup", "arguments": {"q": "x"}}],
+        },
+        {"role": "tool", "name": "lookup", "content": "4"},
+        {"role": "assistant", "content": "4"},
+    ]
+    env.sft_completion = lambda example: [dict(m) for m in trajectory]
+    _patch_loader(monkeypatch, env)
+
+    cmd_env_test(_args(env_dir, algorithm="grpo"))
+
+    assert env.graded, "the native grader was never called"
+    assert env.graded[0] == trajectory, "the trajectory was flattened before it reached the grader"
+    # the controls keep that trajectory and are wrong only in the final answer, so what they test
+    # is whether the grader can RANK rather than whether it tolerates a bare one-message envelope.
+    assert all(len(seen) == len(trajectory) for seen in env.graded[1:])
+    assert [seen[-1]["content"] for seen in env.graded[1:]] != ["4"] * (len(env.graded) - 1)
+
+
+def test_a_single_turn_non_tool_environment_is_still_graded_by_reward(monkeypatch, tmp_path):
+    # the negative control on the dispatch: an ordinary single-turn env has no tool loop, so it
+    # must keep reaching reward()/scores_breakdown. an over-eager native route breaks every
+    # ordinary env, which has no reward_from_messages at all.
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert env.replayed == ["4"], "the ordinary single-turn grader was not called"
+
+
+def test_the_scorer_dispatch_reuses_the_validated_tools_snapshot(monkeypatch, tmp_path, capsys):
+    # production calls the hook once (rl.py:816). a one-shot tools() -- tools on the first call,
+    # empty after -- was native-scored in training but rollout-scored here, so an unused ranking
+    # rollout scorer produced PASS for an env whose real reward_from_messages is flat (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _OneShotToolsEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def __init__(self):
+            super().__init__()
+            self.tools_calls = 0
+            self.native_graded = 0
+
+        def tools(self):
+            self.tools_calls += 1
+            return [lambda x: x] if self.tools_calls == 1 else []
+
+        def reward_from_messages(self, completion, example):
+            self.native_graded += 1
+            return 0.0
+
+    env = _OneShotToolsEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert env.tools_calls == 1, (
+        f"tools() was called {env.tools_calls} times, production calls it once"
+    )
+    assert env.native_graded, "the second snapshot rerouted scoring away from the native grader"
+    assert "cannot rank completions" in capsys.readouterr().err
