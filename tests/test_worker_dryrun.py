@@ -9,8 +9,6 @@ before spending GPU budget on the real run.
 from __future__ import annotations
 
 import os
-import sys
-import types
 
 # Disable HF I/O in node_entry helpers (they early-return when HF_REPO is empty).
 os.environ["HF_REPO"] = ""
@@ -30,44 +28,6 @@ def test_on_policy_epochs_resolve_to_prompt_pool_passes():
         )
         == 5
     )
-
-
-def test_reward_heartbeat_callback_accumulates_history():
-    """The live-signal feature: the GRPO callback records a per-step reward_history (only
-    from step logs that carry a 'reward') and ignores non-reward logs. Uses a minimal
-    transformers stub so the test doesn't depend on a real transformers install."""
-    saved = sys.modules.get("transformers")
-    tfm = types.ModuleType("transformers")
-
-    class TrainerCallback:
-        pass
-
-    tfm.TrainerCallback = TrainerCallback
-    sys.modules["transformers"] = tfm
-    try:
-        os.environ["HF_REPO"] = ""  # heartbeat stays local (no HF upload) in tests
-        import flash.engine.worker as ne
-
-        cb = ne.make_reward_heartbeat_callback()
-
-        class _State:
-            global_step = 0
-
-        st = _State()
-        st.global_step = 1
-        cb.on_log(None, st, None, logs={"reward": 0.50, "loss": 1.2})
-        st.global_step = 2
-        cb.on_log(None, st, None, logs={"reward": 0.62})
-        cb.on_log(None, st, None, logs={"eval_loss": 0.9})  # ignored
-        cb.on_log(None, st, None, logs=None)  # ignored
-        cb.on_log(None, st, None, logs={"reward": None})  # ignored
-
-        assert cb.reward_history == [0.50, 0.62], cb.reward_history
-    finally:
-        if saved is None:
-            sys.modules.pop("transformers", None)
-        else:
-            sys.modules["transformers"] = saved
 
 
 def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):

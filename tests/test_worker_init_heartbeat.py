@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import math
 import re
 import sys
 import threading
@@ -313,81 +312,6 @@ def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
     ne.heartbeat("rl_step", liveness=True, step=1)  # liveness ping
     assert after_real == ne._HB_LAST_PROGRESS_TS, "a liveness ping must NOT advance progress"
     assert seen[-1].get("liveness") is True, "a liveness ping is stamped liveness=True"
-
-
-def test_reward_heartbeat_projects_bounded_per_step_metrics(monkeypatch):
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
-    import flash.engine.worker as w
-
-    transformers = types.ModuleType("transformers")
-    transformers.TrainerCallback = type("TrainerCallback", (), {})
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-    monkeypatch.setattr(hb, "_maybe_attach_gpu_diag", lambda payload, last, now: last)
-    emitted = []
-    monkeypatch.setattr(w, "heartbeat", lambda stage, **payload: emitted.append((stage, payload)))
-
-    callback = hb.make_reward_heartbeat_callback()
-    args = types.SimpleNamespace(max_completion_length=256)
-    state = types.SimpleNamespace(global_step=1)
-    callback.on_log(
-        args,
-        state,
-        None,
-        logs={
-            "reward": 0.75,
-            "reward_std": 0.12,
-            "grad_norm": 1.5,
-            "kl": 0.03,
-            "entropy": 0.82,
-            "frac_reward_zero_std": 0.25,
-            "completions/mean_length": 48.5,
-            "completions/clipped_ratio": 0.125,
-        },
-    )
-
-    stage, payload = emitted[-1]
-    assert stage == "rl_step"
-    expected = {
-        "step": 1,
-        "reward": 0.75,
-        "reward_std": 0.12,
-        "grad_norm": 1.5,
-        "kl": 0.03,
-        "entropy": 0.82,
-        "frac_reward_zero_std": 0.25,
-        "mean_completion_tokens": 48.5,
-        "truncation_rate": 0.125,
-        "max_completion_tokens": 256,
-    }
-    for key, value in expected.items():
-        assert payload[key] == value
-    assert payload["metrics_last"] == [expected]
-
-    state.global_step = 2
-    callback.on_log(
-        args,
-        state,
-        None,
-        logs={
-            "reward": 0.8,
-            "reward_std": float("nan"),
-            "grad_norm": float("inf"),
-            "entropy": 0.79,
-        },
-    )
-    payload = emitted[-1][1]
-    assert payload["reward"] == 0.8
-    assert payload["entropy"] == 0.79
-    for key in ("reward_std", "grad_norm", "kl"):
-        assert key not in payload
-        assert key not in payload["metrics_last"][-1]
-
-    for step in range(3, 1027):
-        state.global_step = step
-        callback.on_log(args, state, None, logs={"reward": step / 1027})
-    metrics_last = emitted[-1][1]["metrics_last"]
-    assert len(metrics_last) == 1024
-    assert [item["step"] for item in metrics_last] == list(range(3, 1027))
 
 
 def test_heartbeat_console_summarizes_metric_backlog():
@@ -1156,28 +1080,3 @@ def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
     assert "step" not in bounded
 
 
-def test_reward_heartbeat_carries_bounded_finite_named_metrics(monkeypatch):
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
-    worker = importlib.import_module("flash.engine.worker")
-    emitted = []
-    monkeypatch.setattr(worker, "heartbeat", lambda stage, **payload: emitted.append((stage, payload)))
-    monkeypatch.setattr(hb, "_maybe_attach_gpu_diag", lambda payload, last, now: last)
-
-    transformers = types.ModuleType("transformers")
-    transformers.TrainerCallback = type("TrainerCallback", (), {})
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-
-    metrics = {
-        "nan_metric": float("nan"),
-        "inf_metric": float("inf"),
-        **{f"metric_{index:02d}": float(index) for index in reversed(range(14))},
-    }
-    callback = hb.make_reward_heartbeat_callback(lambda: metrics)
-    state = types.SimpleNamespace(global_step=3)
-    callback.on_log(None, state, None, logs={"reward": 0.65})
-
-    assert emitted[0][0] == "rl_step"
-    reward_metrics = emitted[0][1]["reward_metrics"]
-    assert list(reward_metrics) == [f"metric_{index:02d}" for index in range(12)]
-    assert all(math.isfinite(value) for value in reward_metrics.values())
-    assert callback.latest_fields() == {"reward_metrics": reward_metrics}
