@@ -2134,6 +2134,82 @@ def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, 
     assert "errors=1 (excluded from pass_rate and mean_score)" in output
 
 
+def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path) -> None:
+    """A multimodal case must reach the backend as the prompt training built, images included.
+
+    `prompt_messages()` is only half of it: every worker then runs `normalize_prompt_images`
+    (flash/engine/worker/rl.py, sft.py, opd.py). Sending the raw messages dropped a record's
+    top-level `image` entirely, so the suite graded a text-only prompt, and handed an
+    environment's package-relative path to a remote backend that cannot read the evaluator's disk.
+
+    Both halves are asserted because they fail differently: the top-level image is *missing*, and
+    the block-borne path is *present but unusable*.
+    """
+    image_module = pytest.importorskip("PIL.Image")
+
+    env_package = tmp_path / "pkg"
+    dataset = env_package / "dataset"
+    dataset.mkdir(parents=True)
+    image_module.new("RGB", (2, 2), (255, 0, 0)).save(dataset / "cat.png", format="PNG")
+
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'vision'\n"
+        "    def cases(self):\n"
+        # one case carries the image as top-level metadata, the other as an env-emitted block
+        "        return [EvalCase(id='top', input='what is this?', expected='cat',\n"
+        "                         metadata={'image': 'dataset/cat.png'}),\n"
+        "                EvalCase(id='block', input='what is this?', expected='cat')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Environment:
+        package_root = str(env_package)
+
+        def prompt_messages(self, example):
+            if example.get("id") != "block":
+                return [{"role": "user", "content": example["input"]}]
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": example["input"]},
+                        {"type": "image_url", "image_url": {"url": "dataset/cat.png"}},
+                    ],
+                }
+            ]
+
+    sent: list[list[dict]] = []
+
+    class Client:
+        def get_run(self, run_id):
+            return {"spec": {}}
+
+        def chat_stream(self, target, messages, **kwargs):
+            sent.append(messages)
+            yield "cat"
+
+    monkeypatch.setattr(
+        "flash.envs.loader.load_freesolo_environment", lambda _path, **_k: Environment()
+    )
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 0
+
+    assert len(sent) == 2
+    for messages in sent:
+        blocks = messages[0]["content"]
+        # the top-level image used to vanish here, leaving a bare string and a text-only grade
+        assert isinstance(blocks, list), f"expected content blocks, got {blocks!r}"
+        images = [b for b in blocks if b.get("type") == "image_url"]
+        assert len(images) == 1
+        url = images[0]["image_url"]["url"]
+        # a data URI, not "dataset/cat.png": the backend has no access to this filesystem
+        assert url.startswith("data:image/png;base64,"), url
+
+
 def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path, capsys) -> None:
     """Graders must see what training graded, and only when the run actually reasons.
 
