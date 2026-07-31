@@ -84,10 +84,10 @@ def test_supported_algorithms_still_get_the_export_remedy(capsys):
 def test_every_shipped_worker_actually_reaches_wandb():
     """Tell users to export a key only while every worker can really use one.
 
-    The remedy has to stay truthful: if an algorithm ships whose worker makes no
-    wandb_report_to()/wandb_run_info() call, "Export WANDB_API_KEY" would clear the warning while
-    the paid run still logs nowhere. Assert against the worker modules themselves rather than a
-    hand-maintained list, which is how the previous opsd entry outlived the algorithm it named.
+    The remedy has to stay truthful: if an algorithm ships whose worker never calls
+    wandb_report_to(), "Export WANDB_API_KEY" would clear the warning while the paid run still logs
+    nowhere. Assert against the worker modules themselves rather than a hand-maintained list, which
+    is how the previous opsd entry outlived the algorithm it named.
     """
     import inspect
     from pathlib import Path
@@ -101,7 +101,10 @@ def test_every_shipped_worker_actually_reaches_wandb():
         # JobSpec.phase is the algorithm -> worker-module mapping (grpo runs the rl worker)
         module = worker_dir / f"{JobSpec(algorithm=algorithm).phase}.py"
         source = module.read_text()
-        if "wandb_report_to" not in source and "wandb_run_info" not in source:
+        # wandb_report_to() is the call that starts the run. wandb_run_info() only reads whichever
+        # run is already live and returns {} when none is, so a worker holding just that one would
+        # still log nowhere -- accepting it as evidence would let the warning lie again.
+        if "wandb_report_to" not in source:
             without_wandb.add(algorithm)
 
     # an empty catalog would satisfy the assertion below without having checked anything, so the
