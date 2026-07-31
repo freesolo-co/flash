@@ -327,6 +327,7 @@ def cmd_env_delete(args) -> int:
 
 
 _ENV_ENTRYPOINT = "environment.py"
+_ENV_EVALUATIONS_SIDECAR = "evaluations.py"
 _ENV_SYSPATH_BOOTSTRAP = (
     "import os as _flash_os, sys as _flash_sys\n"
     "_flash_sys.path.insert(0, _flash_os.path.dirname(__file__))\n"
@@ -494,6 +495,16 @@ def _iter_env_sidecar_files(
                 doc, env_root=env_root, entrypoint=entrypoint
             ):
                 yield doc, doc.relative_to(env_root)
+        # the eval sidecar ships with its entrypoint. `env eval` loads evaluations.py next to an
+        # exact .py target, so omitting it here would publish an environment whose suite passed
+        # locally and is simply absent once pushed.
+        sidecar = env_root / _ENV_EVALUATIONS_SIDECAR
+        if (
+            sidecar.is_file()
+            and sidecar != entrypoint
+            and not _ignore_env_push_path(sidecar, env_root=env_root, entrypoint=entrypoint)
+        ):
+            yield sidecar, sidecar.relative_to(env_root)
         roots = [
             env_root / name
             for name in ("dataset", "datasets")
@@ -659,7 +670,15 @@ def _resolve_local_env_entrypoint(path: str | Path) -> tuple[Path, Path, Path, b
         elif (src / "pyproject.toml").is_file():
             raise ValueError(f"{src} has a pyproject.toml but no environment.py entrypoint")
         else:
-            modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
+            # evaluations.py is a known sidecar, never an entrypoint. counting it here would
+            # make adding one break a legacy single-module package that resolved fine before:
+            # the directory would suddenly hold "multiple top-level .py modules" and be rejected
+            # before either file is read.
+            modules = [
+                p
+                for p in sorted(src.glob("*.py"))
+                if not p.name.startswith("__") and p.name != _ENV_EVALUATIONS_SIDECAR
+            ]
             if len(modules) != 1:
                 raise ValueError(
                     f"{src} has no environment.py and "

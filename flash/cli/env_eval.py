@@ -234,10 +234,20 @@ def cmd_env_eval(args) -> int:
     from flash.envs.loader import load_freesolo_environment
     from flash.schema import parse_adapter_revision, parse_checkpoint_ref
 
-    # checked before the suites run so a missing project id fails in a second rather than
-    # after a long paid evaluation whose results would then have nowhere to go.
-    if args.upload and not (args.project or "").strip():
-        return _err("--upload requires --project PROJECT_ID")
+    # checked before the suites run so a bad project id fails in a second rather than after a
+    # long paid evaluation whose results would then have nowhere to go. the id is validated
+    # here, not just checked for emptiness: upload_eval_run requires a canonical UUID, so a
+    # malformed one would otherwise buy every model request and be rejected at the end -- and
+    # because upload failure deliberately does not change the verdict, it would still print
+    # `overall: PASS` with nothing recorded.
+    from flash.spec import require_project_id
+
+    project_id = ""
+    if args.upload:
+        try:
+            project_id = require_project_id(args.project)
+        except (TypeError, ValueError) as exc:
+            return _err(f"--upload requires a valid --project PROJECT_ID: {exc}")
     if args.project and not args.upload:
         return _err("--project only applies with --upload")
 
@@ -313,7 +323,7 @@ def cmd_env_eval(args) -> int:
             _upload_report(
                 report,
                 cases,
-                project_id=args.project,
+                project_id=project_id,
                 environment_reference=str(entrypoint.parent),
                 target=args.target,
                 started_at=started_at,
