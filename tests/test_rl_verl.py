@@ -3829,6 +3829,65 @@ def test_the_queue_of_unnamed_generations_is_bounded():
 
 
 @pytest.mark.usefixtures("_identity_graded")
+def test_an_eviction_does_not_shift_every_later_step_onto_the_wrong_generation():
+    """Dropping the oldest queued generation is not enough: its `step:N` line still arrives.
+
+    Handing that line to the oldest SURVIVOR consumes a generation whose own line is still coming,
+    so the offset never closes -- every step for the rest of the run publishes the next generation's
+    output under the previous step's number. One eviction, permanently wrong diagnostics (cursor,
+    codex[bot]).
+    """
+    limit = RewardObservabilityBuffer._SEALED_QUEUE_LIMIT
+    buffer = RewardObservabilityBuffer(generation_size=1)
+    for i in range(limit + 1):  # one more than the queue holds: generation 0 is evicted
+        buffer.record(f"prompt-{i}", f"gen-{i}", float(i))
+
+    assert len(buffer._sealed_by_count) == limit
+
+    # stdout catches up and names them in order. the line for the evicted generation is spent on it.
+    published = []
+    for step in range(1, limit + 2):
+        buffer.close_generation(step)
+        published.append(buffer._published[-1][1] if buffer._published else None)
+
+    # step 1's generation is genuinely gone, so its reading is stale rather than another
+    # generation's. every step after it is matched to the generation that actually produced it.
+    assert published[0] is None
+    assert published[1:] == [f"gen-{i}" for i in range(1, limit + 1)]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_step_preview_reads_the_generation_that_step_published():
+    """The caller closes the generation and then previews it under that same step number.
+
+    A late `step:N` line arrives with generation N+1 already scoring, so the newest recorded sample
+    belongs to N+1. Previewing that labels N+1's completion as step N -- the mislabelling the queue
+    exists to prevent, reintroduced one line later, and disagreeing with the heartbeat about the
+    very same step (codex[bot]).
+    """
+    buffer = RewardObservabilityBuffer(generation_size=2)
+    buffer.record("p", "gen1-a", 1.0)
+    buffer.record("p", "gen1-b", 1.0)  # generation 1 sealed by count
+    buffer.record("p", "gen2-a", 9.0)  # generation 2 already scoring; `step:1` still in the pipe
+
+    buffer.close_generation(1)
+
+    assert buffer.latest()[1] == "gen1-b", "the preview labelled the next generation as this step"
+    # and the heartbeat agrees with it, which is the point of reading the published generation.
+    fields = buffer.heartbeat_fields()
+    assert [s["completion"] for s in fields["sampled_completions"]] == ["gen1-a", "gen1-b"]
+
+
+def test_a_preview_before_the_first_boundary_still_shows_a_rollout():
+    # the fallback direction: with nothing published yet, the open generation is all there is, and
+    # blanking the preview would read as "no rollouts" rather than "no boundary yet".
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "first", 0.5)
+
+    assert buffer.latest() == ("p", "first", 0.5)
+
+
+@pytest.mark.usefixtures("_identity_graded")
 def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request():
     """`record` runs OUTSIDE `score_single_turn`'s error guard, so anything it raises 400s the
     reward request and aborts the run. An int larger than a float can hold raises OverflowError,

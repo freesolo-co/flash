@@ -365,6 +365,10 @@ class RewardObservabilityBuffer:
         self._sealed_by_count: list[
             tuple[list[tuple[Any, Any, float]], dict[str, float] | None]
         ] = []
+        # generations dropped from that queue before any step line named them. the step lines that
+        # WOULD have named them still arrive, and each one has to be spent on the generation it
+        # names, so the count is what keeps every later step matched to its own output.
+        self._dropped_unnamed = 0
         # gradings since the last boundary; they belong to the generation still being scored.
         self._samples: list[tuple[Any, Any, float]] = []
         # the last COMPLETE generation, with the step it was logged under. only these publish.
@@ -421,7 +425,14 @@ class RewardObservabilityBuffer:
                 # a child that has stopped printing step lines is not going to claim these. drop the
                 # OLDEST, the same direction `_samples` evicts: what survives is what the model is
                 # doing now, rather than a window frozen at the moment stdout went quiet.
-                del self._sealed_by_count[: -self._SEALED_QUEUE_LIMIT]
+                dropped = len(self._sealed_by_count) - self._SEALED_QUEUE_LIMIT
+                if dropped > 0:
+                    del self._sealed_by_count[:dropped]
+                    # their step lines are still coming. counting the drops lets `close_generation`
+                    # spend one line per dropped generation instead of handing it the next survivor,
+                    # which would offset every remaining step for the rest of the run (cursor,
+                    # codex[bot]).
+                    self._dropped_unnamed += dropped
 
     def _close(self) -> tuple[list[tuple[Any, Any, float]], dict[str, float] | None]:
         """Take the open generation's samples and mean metrics. Caller holds the lock.
@@ -477,7 +488,14 @@ class RewardObservabilityBuffer:
         step that generated nothing must not relabel older samples as newly generated.
         """
         with self._lock:
-            if self._sealed_by_count:
+            if self._dropped_unnamed:
+                # this line names a generation the queue already dropped. it is spent here rather
+                # than on the oldest survivor: that generation's own line is still to come, and
+                # publishing it now would shift it and every one after it for the rest of the run.
+                # the reading stays on the last generation that was named, which is stale by a known
+                # number of steps rather than confidently wrong (cursor, codex[bot]).
+                self._dropped_unnamed -= 1
+            elif self._sealed_by_count:
                 # the count already sealed this step's generation, and what is open now belongs to
                 # a LATER one -- sealing again here is exactly the leak this avoids. this line names
                 # the oldest generation still waiting for one, so a stdout delivery that falls a
@@ -490,14 +508,21 @@ class RewardObservabilityBuffer:
             # did produce them: relabelling would republish old text as freshly generated.
 
     def latest(self) -> tuple[Any, Any, float] | None:
-        """The most recently scored ``(prompt, completion, reward)``, for a per-step log preview.
+        """One ``(prompt, completion, reward)`` from the PUBLISHED generation, for a step preview.
 
-        Falls back to the published generation so the preview does not blank out depending on
-        whether the caller logs it before or after closing the generation."""
+        The caller prints this under the step it just closed, so it reads what that step published
+        rather than what is being scored now. Those differ exactly when the step line is late: the
+        next generation is already recording, and preferring it would label its completion with the
+        previous step's number -- the same mislabelling the queue exists to prevent, reintroduced one
+        line later, and disagreeing with the heartbeat over the very same step (codex[bot]).
+
+        Falls back to the open generation only before anything has been published, so a caller that
+        previews before the first boundary still sees a rollout instead of nothing.
+        """
         with self._lock:
-            if self._samples:
-                return self._samples[-1]
-            return self._published[-1] if self._published else None
+            if self._published:
+                return self._published[-1]
+            return self._samples[-1] if self._samples else None
 
     def heartbeat_fields(self) -> dict:
         """The bounded ``reward_metrics`` / ``sampled_completions`` fragment of one heartbeat.
