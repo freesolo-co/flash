@@ -1116,6 +1116,25 @@ def test_env_setup_does_not_overwrite_existing_evaluations(monkeypatch, tmp_path
     assert existing.read_text() == "# keep this evaluation sidecar\n"
 
 
+def test_env_setup_leaves_a_custom_environment_without_a_starter_suite(
+    monkeypatch, tmp_path
+) -> None:
+    """Rerun beside a user's own environment.py and no starter evaluations.py appears.
+
+    The starter suite grades `7 + 5`. Dropped next to an unrelated environment it publishes a
+    check that measures nothing -- and `env push` now ships evaluations.py, so it would travel."""
+    monkeypatch.chdir(tmp_path)
+    custom = tmp_path / "environment.py"
+    custom.write_text("# my own environment\n")
+
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+
+    assert custom.read_text() == "# my own environment\n"
+    assert not (tmp_path / "evaluations.py").exists()
+    # the rest of the scaffold still lands: this is about the suite, not about refusing to run
+    assert (tmp_path / "configs/rl.toml").is_file()
+
+
 def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path, capsys) -> None:
     """`flash env setup --multi-turn` scaffolds all three configs (sft/rl/opd). opd now supports
     multi-turn (it rolls out each episode and distils every assistant turn), so the multi-turn opd.toml
@@ -1131,7 +1150,11 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     assert "EnvironmentMultiTurn" in env_py  # genuinely a multi-turn scaffold
     evaluations_text = (tmp_path / "evaluations.py").read_text()
     assert "load_evaluations(environment=None)" in evaluations_text
-    assert "self.environment.reward(response, example)" in evaluations_text
+    # the multi-turn scaffold gets its own suite. `reward(response, example)` with no episode state
+    # sends `_score_one` down the single-turn branch (flash/envs/adapter.py:237-243), which grades an
+    # EMPTY transcript -- the arithmetic suite scored this guess-the-number env 1.0 on "12".
+    assert "self.environment.reward(response, example)" not in evaluations_text
+    assert "step_episode" in evaluations_text
     # the docstring documents all three algorithms train off the multi-turn env (no opd carve-out)
     assert "distils EVERY assistant turn" in env_py
     assert "single-turn only" not in env_py

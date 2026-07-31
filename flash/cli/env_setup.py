@@ -109,6 +109,76 @@ def load_evaluations(environment=None):
     return [StarterEvaluationSuite(environment)]
 '''
 
+_STARTER_EVALUATIONS_MULTITURN_PY = '''\
+"""Held-out checks for this multi-turn environment.
+
+Run them against a deployed model with `flash env eval TARGET .`. This file is
+published beside environment.py by `flash env push --project PROJECT_UUID --name my-env .`.
+
+`env eval` sends one prompt and grades one reply, so these cases check the FIRST
+assistant action rather than a finished episode: given the opening prompt, does the
+model emit the single integer `step_episode` needs to advance the game? That is a real
+held-out check of the action format the episode depends on, and it is the honest scope
+of a single-shot evaluation. Episode-level reward is what GRPO optimizes through
+`score_episode`; validate it offline with `flash env test`.
+
+Do NOT grade these by calling `environment.reward(response, example)`: with no episode
+state that call scores an empty transcript, so an unrelated answer can score 1.0 and
+publish a green check that measured nothing.
+"""
+
+from __future__ import annotations
+
+from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult
+
+LOW, HIGH = 1, 100
+
+
+class StarterFirstActionSuite(BaseEvalSuite):
+    name = "starter-first-action"
+
+    def __init__(self, environment=None):
+        self.environment = environment
+
+    def cases(self):
+        return [
+            EvalCase(
+                id="opening-guess",
+                input=(
+                    f"I picked a secret whole number between {LOW} and {HIGH}.\\n"
+                    "Reply with a single integer per turn. I will say 'higher', "
+                    "'lower', or 'correct'. You have 5 guesses."
+                ),
+            )
+        ]
+
+    def score(self, case, response):
+        # exactly the parse `step_episode` runs on an assistant turn: a reply it cannot
+        # read wastes a turn on a re-prompt, so parseability is the thing worth measuring.
+        try:
+            guess = int(response.strip().split()[0])
+        except (ValueError, IndexError):
+            return EvalResult(
+                case_id=case.id,
+                passed=False,
+                score=0.0,
+                response=response,
+                reason="first turn is not a single integer, so step_episode cannot read it",
+            )
+        in_range = LOW <= guess <= HIGH
+        return EvalResult(
+            case_id=case.id,
+            passed=in_range,
+            score=1.0 if in_range else 0.0,
+            response=response,
+            reason=None if in_range else f"guess {guess} is outside {LOW}-{HIGH}",
+        )
+
+
+def load_evaluations(environment=None):
+    return [StarterFirstActionSuite(environment)]
+'''
+
 
 _STARTER_ENV_MULTITURN_PY = '''\
 """Starter Freesolo multi-turn environment.
@@ -472,10 +542,19 @@ def cmd_env_setup(args) -> int:
         f"{'exported from your traces' if traces_jsonl else 'the starter dataset has 2'}"
         f"{'' if traces_jsonl else ' (raise as your dataset grows)'}\n"
     )
-    if not starter_env.exists():
+    wrote_starter_env = not starter_env.exists()
+    if wrote_starter_env:
         starter_env.write_text(env_py)
-    if not starter_evaluations.exists():
-        starter_evaluations.write_text(_STARTER_EVALUATIONS_PY.replace("PROJECT_UUID", project_id))
+    # only alongside the starter environment it grades. rerun in a directory with a custom
+    # environment.py, this used to drop in the arithmetic suite anyway, which then called that
+    # env's reward with an unrelated `7 + 5` example -- a published check measuring nothing
+    # (codex[bot]). the multi-turn scaffold gets its own suite: a single-shot eval cannot grade
+    # a finished episode, so it checks the first action's format instead.
+    if wrote_starter_env and not starter_evaluations.exists():
+        evaluations_py = (
+            _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY
+        )
+        starter_evaluations.write_text(evaluations_py.replace("PROJECT_UUID", project_id))
     project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
         "# Environment: upload this project folder with\n"
