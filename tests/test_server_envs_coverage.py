@@ -945,6 +945,57 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         _run_smoke(spec)
 
 
+def test_unconstrained_thinking_smoke_rejects_a_reconstructed_empty_answer(monkeypatch):
+    """An answerless thinking generation must not activate a deployment.
+
+    `_smoke_provenance` rejects an empty generation, but flash now folds the split-out
+    `reasoning_content` back into a balanced block before it gets there
+    (flash/serve/deploy.py::_balanced_thinking_content). Reasoning that exhausts the token budget
+    therefore arrives as a NONEMPTY `<think>...</think>` wrapping an empty answer, which sails past
+    the emptiness check. `_thinking_answer` asserts an answer exists for every thinking smoke;
+    before it did, only the grammar-constrained path checked, so an unconstrained deployment could
+    go live on a smoke that produced no answer at all.
+
+    Both ways of arriving answerless are covered, because they are rejected by different guards: a
+    budget exhaustion carries finish_reason "length" and is caught by the truncation check, while a
+    run whose stop_sequence fires mid-reasoning carries "stop" and reaches `_thinking_answer`.
+    """
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>reasoned but ran out of budget</think>", "length"),
+    )
+
+    with pytest.raises(ServingError, match="truncated at the maximum token length"):
+        _run_smoke(_smoke_spec(thinking=True))
+
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>reasoned, then the stop sequence fired</think>"),
+    )
+
+    with pytest.raises(ServingError, match="no answer after"):
+        _run_smoke(_smoke_spec(thinking=True))
+
+
+def test_unconstrained_thinking_smoke_accepts_an_answer_after_the_block(monkeypatch):
+    # the companion direction: a reconstructed block WITH an answer after it still passes, so the
+    # check above rejects answerlessness rather than reconstruction.
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>reasoned</think>The answer is 4"),
+    )
+
+    out = _run_smoke(_smoke_spec(thinking=True))
+
+    # the sample is the ANSWER, not the whole generation: reasoning is what the deployment must not
+    # be judged on, and it is already reported through thinking_tag.
+    assert out["verify_sample"] == "The answer is 4"
+    assert out["thinking_tag"] is True
+
+
 @pytest.mark.parametrize(
     ("constraint", "content", "sample"),
     [
