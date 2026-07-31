@@ -239,9 +239,7 @@ def test_eval_result_rejects_a_pass_that_also_reports_an_error() -> None:
     # excluded it and failed the command, the console printed PASS, and the upload recorded
     # `success: true` beside the error (codex[bot]). one contract, checked where it is built.
     with pytest.raises(ValueError, match="passed must be False when an error is reported"):
-        EvalResult(
-            case_id="a", passed=True, score=1.0, response="4", error="judge unavailable"
-        )
+        EvalResult(case_id="a", passed=True, score=1.0, response="4", error="judge unavailable")
 
     # a failed result carrying an error is the normal shape and still builds.
     errored = EvalResult(
@@ -401,7 +399,10 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
         def deployments(self):
             self.deployment_calls.append("deployments")
             return [
-                {"run_id": "flash-1", "deployment": {"state": "ready", "adapter_revision": revision}}
+                {
+                    "run_id": "flash-1",
+                    "deployment": {"state": "ready", "adapter_revision": revision},
+                }
             ]
 
         def chat_stream(self, target, messages, **kwargs):
@@ -431,8 +432,10 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
     [
         (None, "is not deployed"),
         ({"state": "ready"}, "has no valid immutable adapter revision"),
-        ({"state": "ready", "adapter_revision": "other-run@final." + "b" * 40},
-         "has no valid immutable adapter revision"),
+        (
+            {"state": "ready", "adapter_revision": "other-run@final." + "b" * 40},
+            "has no valid immutable adapter revision",
+        ),
     ],
     ids=["absent", "no-revision", "another-runs-revision"],
 )
@@ -744,7 +747,8 @@ def test_env_eval_upload_rejects_an_inaccessible_project_before_paying(
     env_dir = _upload_env_dir(tmp_path)
 
     assert (
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID]) == 1
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 1
     )
     captured = capsys.readouterr().err
     assert "--upload requires a valid --project" in captured
@@ -768,7 +772,8 @@ def test_env_eval_upload_requires_credentials_before_paying(monkeypatch, tmp_pat
     env_dir = _upload_env_dir(tmp_path)
 
     assert (
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID]) == 1
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 1
     )
     assert "not logged in" in capsys.readouterr().err
 
@@ -1577,7 +1582,9 @@ def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_pat
 
     def _abort() -> None:
         # 130 is the CLI's own KeyboardInterrupt exit code.
-        assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--concurrency", "2"]) == 130
+        assert (
+            cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--concurrency", "2"]) == 130
+        )
         returned.set()
 
     aborting = threading.Thread(target=_abort, daemon=True)
@@ -1794,9 +1801,7 @@ def test_env_eval_rejects_non_finite_temperature(monkeypatch, capsys) -> None:
     assert "must be a finite number" in capsys.readouterr().err
 
 
-def test_env_eval_uploads_each_suite_with_its_own_start_time(
-    monkeypatch, tmp_path
-) -> None:
+def test_env_eval_uploads_each_suite_with_its_own_start_time(monkeypatch, tmp_path) -> None:
     # every suite uploads as its own run. sharing one timestamp backdates each later run to
     # before the earlier suites ran and inflates its dashboard duration with their work.
     env_dir = _environment_dir(tmp_path)
@@ -1834,9 +1839,7 @@ def test_env_eval_uploads_each_suite_with_its_own_start_time(
     assert starts[1] > starts[0]
 
 
-def test_env_eval_reports_upload_timeout_without_a_traceback(
-    monkeypatch, tmp_path, capsys
-) -> None:
+def test_env_eval_reports_upload_timeout_without_a_traceback(monkeypatch, tmp_path, capsys) -> None:
     # a socket timeout surfaces as a bare TimeoutError, not a URLError. untranslated it escapes
     # the upload handler after the whole paid evaluation ran, replacing the promised nonfatal
     # message and final verdict with a traceback. the real upload path runs here, so the socket

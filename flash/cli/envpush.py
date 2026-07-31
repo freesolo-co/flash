@@ -581,9 +581,7 @@ def _iter_env_sidecar_files(
                 if (
                     (package / "__init__.py").is_file()
                     and not package.is_symlink()
-                    and not _ignore_env_push_path(
-                        package, env_root=env_root, entrypoint=entrypoint
-                    )
+                    and not _ignore_env_push_path(package, env_root=env_root, entrypoint=entrypoint)
                 ):
                     for root, dirs, files in os.walk(
                         package, topdown=True, followlinks=False, onerror=_raise_walk_error
