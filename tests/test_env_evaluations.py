@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -757,3 +758,134 @@ def test_evaluation_sidecar_load_does_not_grow_sys_path(tmp_path) -> None:
     load_evaluation_suites(env_dir)
 
     assert sys.path == after_first
+
+
+def test_case_ids_stay_unique_when_a_raw_id_looks_like_a_suffix(tmp_path) -> None:
+    # ids "x", "x", "x#2" disambiguate the second "x" to "x#2", which is already a raw id. a
+    # counter that does not re-check produces two "x#2" entries, so the uploaded payload and
+    # the printed report collapse two graded cases into one and silently drop a result.
+    from flash.cli.env_eval import _case_ids
+
+    cases = [
+        EvalCase(id="x", input="a"),
+        EvalCase(id="x", input="b"),
+        EvalCase(id="x#2", input="c"),
+    ]
+
+    ids = _case_ids(cases)
+
+    assert len(set(ids)) == len(ids)
+    assert ids[0] == "x"
+
+
+def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path) -> None:
+    # a scorer that installs a signal-based timeout raises "signal only works in main thread"
+    # off-thread. serializing with a lock still runs it in a worker, so the failure would be
+    # recorded as the model failing every case rather than as a broken harness.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "import threading\n"
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'threads'\n"
+        "    def cases(self): return [EvalCase(id=str(i), input='q') for i in range(4)]\n"
+        "    def score(self, case, response):\n"
+        "        assert threading.current_thread() is threading.main_thread(), 'scored off-thread'\n"
+        "        return 1.0\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "ok"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--concurrency", "4"]) == 0
+
+
+def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -> None:
+    # generation completes out of order under --concurrency. pairing results with case ids by
+    # completion order rather than submission index would hand each result another case's id,
+    # mislabelling every graded case in the report and the upload.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'ordered'\n"
+        "    def cases(self):\n"
+        "        return [EvalCase(id=str(i), input=str(i)) for i in range(6)]\n"
+        "    def score(self, case, response):\n"
+        "        return EvalResult(case_id=case.id, passed=case.input == response,\n"
+        "                          score=1.0, response=response)\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class SlowFirstClient:
+        def chat_stream(self, target, messages, **kwargs):
+            content = messages[0]["content"]
+            # case 0 finishes last, so completion order is the reverse of submission order.
+            time.sleep(0.05 if content == "0" else 0.0)
+            yield content
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", SlowFirstClient)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--concurrency", "6"]) == 0
+
+
+def test_load_evaluations_accepts_a_positional_only_environment(tmp_path) -> None:
+    # `load_evaluations(environment, /)` declares the parameter but cannot take it by name.
+    # filtering on membership alone raises TypeError; dropping it instead would hand the suite
+    # environment=None, silently downgrading a real scorer to substring matching.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'positional'\n"
+        "    def __init__(self, environment): self.environment = environment\n"
+        "    def cases(self): return [EvalCase(input='2+2', expected='4')]\n"
+        "def load_evaluations(environment, /): return [Suite(environment)]\n"
+    )
+    marker = object()
+
+    suites = load_evaluation_suites(env_dir, environment=marker)
+
+    assert suites[0].environment is marker
+
+
+def test_env_eval_forwards_environment_params_to_the_loader(monkeypatch, tmp_path) -> None:
+    # an environment whose load_environment() requires a param cannot load without it, and one
+    # that branches on --split would be graded against a different dataset than it trains on.
+    env_dir = _upload_env_dir(tmp_path)
+    seen: dict = {}
+
+    def _loader(path, **kwargs):
+        seen.update(kwargs)
+        return object()
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", _loader)
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert (
+        cli.main(
+            [
+                "env",
+                "eval",
+                "flash-1",
+                str(env_dir),
+                "--split",
+                "held_out",
+                "--param",
+                "difficulty=3",
+            ]
+        )
+        == 0
+    )
+
+    assert seen == {"split": "held_out", "difficulty": 3}
