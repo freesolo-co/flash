@@ -23,7 +23,7 @@ import types
 
 import pytest
 
-from flash.engine.worker.verl_common import parse_wandb_link, render_wandb_link_shim
+from flash.engine.worker.backend_common import parse_wandb_link, render_wandb_link_shim
 
 _URL = "https://wandb.ai/acme/flash/runs/abc123"
 _ID = "abc123"
@@ -198,7 +198,7 @@ def _emitted_notes_keys(module: str) -> set[str]:
     return keys
 
 
-@pytest.mark.parametrize("module", ["sft_train.py", "opd_train.py", "rl_verl.py"])
+@pytest.mark.parametrize("module", ["sft_train.py", "opd_train.py", "rl_train.py"])
 def test_every_verl_backend_emits_the_wandb_link_keys(module):
     # all three run wandb.init out of process, so all three need the marker channel. one backend
     # quietly missing it is invisible to the consumer-side contract test.

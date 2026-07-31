@@ -1,4 +1,4 @@
-"""CPU unit tests for the shared verl subprocess harness (verl_common)."""
+"""CPU unit tests for the shared verl subprocess harness (backend_common)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker import verl_common as vc
+from flash.engine.worker import backend_common as vc
 
 
 @pytest.mark.parametrize(
@@ -105,7 +105,7 @@ def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_pa
     # a worker IMAGE can export FLASH_VERL_PYTHON itself, and [worker_env] can only SET a key, never
     # delete one -- so omitting it from a spec leaves the image's interpreter in place. an empty
     # value is the only way a run can say "ignore the image's verl and provision the pinned fork",
-    # and the error at rl_verl.py's mask_truncated_completions gate names exactly this remedy.
+    # and the error at rl_train.py's mask_truncated_completions gate names exactly this remedy.
     calls = []
     monkeypatch.setenv("FLASH_VERL_PYTHON", blank)
     monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
@@ -123,13 +123,13 @@ def test_worker_env_remedies_are_copy_pasteable_toml():
     import re
     import tomllib
 
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
     # only assignment forms -- '[worker_env] can set a key but never delete one' is prose, not a
     # snippet, and carries no '=' to paste.
     pattern = re.compile(r"\[worker_env\][^\n]*?[A-Z_]+\s*=\s*(\"[^\"]*\"|'[^']*')")
-    snippets = [m.group(0) for m in pattern.finditer(inspect.getsource(rl_verl))]
-    assert snippets, "expected rl_verl to advertise at least one [worker_env] remedy"
+    snippets = [m.group(0) for m in pattern.finditer(inspect.getsource(rl_train))]
+    assert snippets, "expected rl_train to advertise at least one [worker_env] remedy"
 
     for snippet in snippets:
         # a valid snippet is the header, a newline, then the assignment -- exactly what we tell users.

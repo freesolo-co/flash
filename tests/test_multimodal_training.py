@@ -590,14 +590,14 @@ def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
     own subprocess, so the ban is injected as a rollout shim rather than a generate kwarg."""
     import inspect
 
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
-    # the shim's own rendering is covered in test_rl_verl.py; what belongs here is the multimodal
+    # the shim's own rendering is covered in test_rl_train.py; what belongs here is the multimodal
     # wiring -- the pad id comes from the PROCESSOR (a text run resolves none) and reaches the shim.
-    resolver = inspect.getsource(rl_verl._resolve_grpo_inputs)
+    resolver = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert "image_pad_token_id = resolve_image_pad_token_id(processor, tok)" in resolver
 
-    entry = inspect.getsource(rl_verl.run_rl_verl)
+    entry = inspect.getsource(rl_train.run_rl_train)
     assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in entry
 
 
