@@ -543,6 +543,33 @@ def _process_group_addressable(pgid: int) -> bool:
     return True
 
 
+# pids this process adopted and killed but could not reap before a teardown deadline expired. each
+# is confirmed ours -- `waitpid` answered for it rather than raising -- and was still running at
+# that point, so it still owes a status. a zombie holds its pid until it is reaped, so nothing
+# recorded here can be recycled behind our back and a later sweep can only ever find the same
+# process it recorded.
+_UNREAPED_STRAGGLERS: set[int] = set()
+
+
+def _reap(pid: int) -> bool:
+    """wait on `pid` without blocking. true once nothing is owed, false while it still owes a status.
+
+    the return value is what distinguishes "reaped" from "ours and still running": `waitpid` answers
+    `(0, 0)` for a live child of ours, which is the one case worth remembering. `ChildProcessError`
+    means the pid was never ours -- the ordinary case anywhere but pid 1 -- and whoever owns it will
+    reap it, so there is nothing left for this process to do either way.
+    """
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return True  # not ours, so no status is owed to this process
+    except (PermissionError, OSError):
+        # cannot wait on it, and retrying later would not change that. dropped rather than tracked
+        # so the straggler set cannot grow without bound on a path that can never clear it.
+        return True
+    return reaped != 0
+
+
 def _reap_group_zombies(pgid: int, skip: int) -> None:
     """wait on any group member this process has adopted, clearing its process-table entry.
 
@@ -557,14 +584,33 @@ def _reap_group_zombies(pgid: int, skip: int) -> None:
     else has a reaper to conflict with.
 
     scoped to the group so it can only ever touch descendants of this teardown, and non-blocking so
-    a member that is merely still running costs nothing. `ChildProcessError` means the pid was never
-    ours, which is the ordinary case anywhere but pid 1.
+    a member that is merely still running costs nothing.
+
+    a member that is ours and STILL RUNNING here is remembered rather than forgotten. SIGKILL cannot
+    be refused but it also cannot be delivered while a process sits in uninterruptible sleep, so one
+    can outlast the drain deadline and only then become a zombie -- after the last wait this
+    teardown performs. without a record no future wait is ever scheduled for it and the entry is
+    permanent on a pid-1 worker (codex[bot]).
     """
     for pid in _process_group_members(pgid) or ():
         if pid == skip:
             continue
-        with contextlib.suppress(ChildProcessError, PermissionError, OSError):
-            os.waitpid(pid, os.WNOHANG)
+        if _reap(pid):
+            _UNREAPED_STRAGGLERS.discard(pid)
+        else:
+            _UNREAPED_STRAGGLERS.add(pid)
+
+
+def _reap_stragglers() -> None:
+    """take the statuses still owed by processes an earlier teardown could not drain.
+
+    this is the future wait that the final in-loop reap cannot schedule for itself: a member still
+    running when its own teardown gave up is cleared by the next one instead. teardowns are frequent
+    on a reused worker -- one per run -- so the entry is transient rather than permanent.
+    """
+    for pid in tuple(_UNREAPED_STRAGGLERS):
+        if _reap(pid):
+            _UNREAPED_STRAGGLERS.discard(pid)
 
 
 def _process_group_alive(pgid: int) -> bool:
@@ -633,6 +679,10 @@ def kill_process_group(proc: subprocess.Popen) -> None:
     group, not off the direct child: the usual shape of this failure is the trainer dying on the term
     while the EngineCore ignores it, so waiting only on the child returns before the survivor is gone.
     """
+    # collect anything a previous teardown killed but could not drain before its deadline. done on
+    # entry rather than on exit because that is when such a process has had the longest to die, and
+    # it runs before the early returns below so no path through this function skips it.
+    _reap_stragglers()
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:

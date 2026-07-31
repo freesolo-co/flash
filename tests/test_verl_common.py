@@ -538,7 +538,34 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
 
 
 # ---------------------- child teardown escalates to SIGKILL ----------------------
-def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored():
+# these tests drive real processes through the real escalation, which needs three kernel features
+# this repo only ever runs teardown on: fork, /proc for group membership, and libc for the subreaper
+# probe. the rest of the suite is os-independent, so guard rather than fail on a platform that
+# cannot answer (codex[bot]). checked at runtime like the /proc/self/maps test in test_worker_stack,
+# instead of on the platform name, so the condition is the capability actually required.
+_needs_process_teardown = pytest.mark.skipif(
+    not hasattr(os, "fork") or not os.path.isdir("/proc"),
+    reason="teardown tests drive real process groups: needs os.fork and /proc",
+)
+
+
+@pytest.fixture
+def quick_teardown_grace(monkeypatch):
+    """shorten the escalation grace so a test that deliberately ignores SIGTERM stays fast.
+
+    every child below refuses the term on purpose, so each one waits out the full production grace
+    before escalating -- 30s of a 30.6s file for three tests. the constant is read from the module
+    at call time, so patching it needs no production seam (codex[bot]).
+
+    it is only ever shortened. what these tests assert is that SIGKILL is what performs the
+    termination and that nothing is left unreaped, and neither depends on how long the grace was.
+    """
+    monkeypatch.setattr(vc, "_TEARDOWN_GRACE_S", 0.5)
+    return 0.5
+
+
+@_needs_process_teardown
+def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored(quick_teardown_grace):
     # the whole point of this helper is the escalation, so the child has to actually ignore SIGTERM.
     # a child that dies on the term would pass just as well against a bare killpg, which is the bug.
     child = subprocess.Popen(
@@ -573,7 +600,8 @@ def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored():
             child.stdout.close()
 
 
-def test_kill_process_group_reaps_a_grandchild_that_outlives_the_leader():
+@_needs_process_teardown
+def test_kill_process_group_reaps_a_grandchild_that_outlives_the_leader(quick_teardown_grace):
     # the real shape of this failure: the verl trainer dies on the term but its vllm EngineCore
     # grandchild ignores it. escalating off proc.wait() alone returns the instant the leader is
     # reaped, leaving the grandchild holding the cuda context -- so drive the escalation off the
@@ -766,7 +794,8 @@ def test_an_empty_snapshot_of_a_gone_group_is_still_drained():
     )
 
 
-def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie():
+@_needs_process_teardown
+def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie(quick_teardown_grace):
     # pid 1 has no init in Dockerfile.worker, so an EngineCore orphaned when the trainer exits is
     # reparented onto the worker. SIGKILL turns it into a zombie that no signal can clear -- only a
     # wait can -- so leaving it costs one permanent process-table entry per failed or cancelled run
@@ -814,6 +843,84 @@ def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie():
             leader.wait(timeout=10)
         if leader.stdout is not None:
             leader.stdout.close()
+
+
+@_needs_process_teardown
+def test_a_straggler_that_dies_after_the_deadline_is_reaped_by_the_next_teardown(monkeypatch):
+    # SIGKILL cannot be refused, but it also cannot be DELIVERED to a process in uninterruptible
+    # sleep. such a member can outlast the drain deadline and turn into a zombie afterwards -- past
+    # the last wait its own teardown performs -- so with no record no future wait is ever scheduled
+    # and the entry is permanent on a pid-1 worker (codex[bot]).
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # pragma: no cover - PR_SET_CHILD_SUBREAPER is linux 3.4+
+        pytest.skip("PR_SET_CHILD_SUBREAPER unavailable")
+    monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs only in the forked child
+        os.setpgid(0, 0)
+        time.sleep(300)
+        os._exit(0)
+    try:
+        os.setpgid(pid, pid)
+        # the state at the drain deadline: the member is ours and STILL RUNNING, so the nonblocking
+        # wait cannot take a status. skip a pid that is not in this group so nothing is excluded.
+        vc._reap_group_zombies(pid, skip=-1)
+        assert pid in vc._UNREAPED_STRAGGLERS, (
+            "a live adopted member was forgotten at the deadline, so no later wait can reap it"
+        )
+
+        # teardown has returned. the member dies only now, exactly as one leaving uninterruptible
+        # sleep with a pending SIGKILL would.
+        os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while os.path.exists(f"/proc/{pid}") and not vc._process_is_zombie(pid):
+            assert time.monotonic() < deadline, "the straggler never exited"
+            time.sleep(0.01)
+
+        # the NEXT teardown is what must collect it, so drive a real one rather than calling the
+        # sweep directly -- otherwise this passes even with the sweep never wired into the path.
+        later = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.exit(0)"], start_new_session=True
+        )
+        later.wait(timeout=10)
+        vc.kill_process_group(later)
+
+        assert not os.path.exists(f"/proc/{pid}"), (
+            "a straggler that died after its deadline was never reaped, leaking a pid per run"
+        )
+        assert pid not in vc._UNREAPED_STRAGGLERS
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
+@_needs_process_teardown
+def test_a_straggler_that_was_never_ours_is_not_tracked_forever(monkeypatch):
+    # the other direction: `waitpid` raising ChildProcessError means the pid was never ours, which
+    # is the ordinary case anywhere but pid 1. remembering those would grow the set without bound
+    # on every teardown, and no wait here could ever clear them.
+    monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+    )
+    try:
+        # a real, live process in its own group -- but reached through a wait that reports it is
+        # not this process's child to reap.
+        def _not_ours(pid, options):
+            raise ChildProcessError()
+
+        monkeypatch.setattr(vc.os, "waitpid", _not_ours)
+        vc._reap_group_zombies(os.getpgid(child.pid), skip=-1)
+        assert not vc._UNREAPED_STRAGGLERS, (
+            "a process this worker cannot reap was tracked anyway, so the set grows unboundedly"
+        )
+    finally:
+        monkeypatch.undo()
+        child.kill()
+        child.wait(timeout=10)
 
 
 def test_grpo_teardown_uses_the_shared_escalating_kill():
