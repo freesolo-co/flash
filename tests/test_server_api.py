@@ -4669,6 +4669,84 @@ def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
     assert resp.json()["state"] == "ready"
 
 
+def test_chat_forwards_trained_stop_sequences(api, monkeypatch):
+    """A run trained with stop_sequences terminates on its delimiter, not EOS. The deployment smoke
+    forwards them, so the adapter verifies and activates -- but if user inference does not, the same
+    model runs on to max_tokens or emits trailing text past its answer on every real request."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    spec = json.loads(json.dumps(SPEC))
+    spec["train"] = {**spec["train"], "stop_sequences": ["</answer>"]}
+    run_id = api.post(
+        "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+
+    seen: dict = {}
+
+    def serve_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["stop"] == ["</answer>"]
+
+
+def test_chat_sends_no_stop_when_run_configured_none(api, monkeypatch):
+    """A run that never configured a delimiter must not receive one."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "b" * 40
+    runner.mark_deployed(
+        run_id,
+        {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+
+    seen: dict = {}
+
+    def serve_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["stop"] is None
+
+
 def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod

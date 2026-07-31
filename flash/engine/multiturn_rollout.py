@@ -156,6 +156,24 @@ def _dedup_seam_terminator(prev_completion_ids: list[int], glue: list[int]) -> l
     return glue
 
 
+def _final_env_step(
+    active_env, messages: list[dict], state: dict, max_turns: int, *, pending: bool
+) -> None:
+    """Give the env the last assistant turn when the DRIVER, not the env, ended the episode.
+
+    The turn loops stop on the turn cap and on token-budget exhaustion *before* the inter-turn
+    ``env_reply``, so a stateful environment would score a board or transcript missing the last thing
+    the model did. The env step still has to run; only the inter-turn glue is skipped, because no
+    further model turn is conditioned on the reply.
+
+    ``pending`` is False once the last generated turn has already been through ``env_reply`` (an env
+    that replied with nothing, a natural finish, a glue overflow) — stepping again there would be a
+    spurious extra move. ``rollout_done`` covers the env having declared the episode over."""
+    if not pending or active_env.rollout_done(state, max_turns):
+        return
+    active_env.env_reply(messages, state)
+
+
 def rollout_one(
     *,
     example: dict,
@@ -182,6 +200,8 @@ def rollout_one(
     turn_spans: list[tuple[int, int]] = []
 
     turns = 0
+    # True while the newest assistant turn has not been through env_reply yet.
+    env_step_pending = False
     while True:
         max_new = per_turn_max_tokens
         if token_budget is not None:
@@ -190,6 +210,7 @@ def rollout_one(
                 break
             max_new = min(max_new, remaining)
         asst_ids, asst_lp, text = generate(cur_ids, max_new)
+        env_step_pending = True
         turn_start = len(completion_ids)
         completion_ids.extend(asst_ids)
         turn_spans.append((turn_start, len(completion_ids)))
@@ -205,6 +226,7 @@ def rollout_one(
         if turns >= max_turns or active_env.rollout_done(state, max_turns):
             break
         env_msgs = active_env.env_reply(messages, state)
+        env_step_pending = False
         if not env_msgs:
             break
         messages.extend(env_msgs)
@@ -220,6 +242,7 @@ def rollout_one(
         env_mask.extend([0] * len(glue))
         cur_ids.extend(glue)
 
+    _final_env_step(active_env, messages, state, max_turns, pending=env_step_pending)
     score = score_rollouts(
         active_env,
         [RolloutScoreRequest(example=example, state=state, turn_count=len(turn_spans))],
@@ -282,6 +305,8 @@ def rollout_one_records(
     records: list[TurnRecord] = []
 
     turns = 0
+    # True while the newest assistant turn has not been through env_reply yet.
+    env_step_pending = False
     while True:
         completion_so_far = len(cur_ids) - len(prompt_ids)
         max_new = per_turn_max_tokens
@@ -295,6 +320,7 @@ def rollout_one_records(
         prefix_ids = list(cur_ids)
         context_messages = [dict(m) for m in messages]
         gen = generate(prefix_ids, max(1, max_new))
+        env_step_pending = True
         if on_turn_generated is not None:
             on_turn_generated()
         records.append({"prefix_ids": prefix_ids, "gen": gen, "context_messages": context_messages})
@@ -306,6 +332,9 @@ def rollout_one_records(
         # episode: it's recorded (counted) but not distilled, and continuing from a broken turn is
         # pointless (the student can't end its turn / said nothing).
         if getattr(gen, "truncated", False) or getattr(gen, "skip", False):
+            # NOT a move: a turn the student couldn't terminate, or said nothing in, must not reach
+            # the env — so it is deliberately excluded from the final close-out step below.
+            env_step_pending = False
             break
         asst_ids = getattr(gen, "completion_ids", None) or []
         cur_ids.extend(asst_ids)
@@ -315,6 +344,7 @@ def rollout_one_records(
         if turns >= max_turns or active_env.rollout_done(state, max_turns):
             break
         env_msgs = active_env.env_reply(messages, state)
+        env_step_pending = False
         if not env_msgs:
             break
         messages.extend(env_msgs)
@@ -326,6 +356,7 @@ def rollout_one_records(
             break
         cur_ids.extend(glue)
 
+    _final_env_step(active_env, messages, state, max_turns, pending=env_step_pending)
     return records
 
 
@@ -338,6 +369,7 @@ class _RolloutState:
         "cur_ids",
         "done",
         "env_mask",
+        "env_step_pending",
         "example",
         "images",
         "logprobs",
@@ -362,6 +394,8 @@ class _RolloutState:
         self.turns = 0
         self.budget = budget
         self.done = False
+        # True while the newest assistant turn has not been through env_reply yet.
+        self.env_step_pending = False
 
     def result(self, reward: float, turn_rewards: list[float] | None) -> RolloutResult:
         return {
@@ -386,6 +420,7 @@ def _advance_after_turn(
     max_turns: int,
 ) -> None:
     """Fold one assistant turn into ``r`` and run its env step. Sets ``r.done`` when finished."""
+    r.env_step_pending = True
     turn_start = len(r.completion_ids)
     r.completion_ids.extend(asst_ids)
     r.turn_spans.append((turn_start, len(r.completion_ids)))
@@ -402,6 +437,7 @@ def _advance_after_turn(
         r.done = True
         return
     env_msgs = active_env.env_reply(r.messages, r.state)
+    r.env_step_pending = False
     if not env_msgs:
         r.done = True
         return
@@ -684,6 +720,14 @@ def rollout_async(
         to_env.put(None)
         worker.join()
 
+    for rollout in rollouts:
+        _final_env_step(
+            active_env,
+            rollout.messages,
+            rollout.state,
+            max_turns,
+            pending=rollout.env_step_pending,
+        )
     requests = [
         RolloutScoreRequest(
             example=rollout.example,

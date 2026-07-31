@@ -884,8 +884,6 @@ def processor_prompt_token_count(
 def validate_multimodal_training(model_id: str, algorithm: str, *, multi_turn: bool = False) -> None:
     from flash.catalog import supports_image_training
 
-    if algorithm == "opsd":
-        raise ValueError("opsd phase 1 does not support image-bearing training records")
     if not supports_image_training(model_id):
         raise ValueError(f"{model_id} does not support image-bearing training records")
     if algorithm == "opd" and multi_turn:
