@@ -52,6 +52,7 @@ from flash.cli.traces import (
     RECORDS_FORMAT,
     cmd_traces_export,
 )
+from flash.client.config import shadowed_login_warning
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -611,6 +612,44 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# commands that bind work to an organization: either they write to it, or they resolve a project
+# with the ambient key and bake it into local artifacts that later writes inherit. a shadowed login
+# silently binds these to the wrong org, so they warn. commands whose only effect is output the user
+# reads stay quiet, and `flash whoami` already shows the key source in its own output.
+_ORG_BINDING_COMMANDS = frozenset(
+    {
+        cmd_train,
+        cmd_deploy,
+        cmd_undeploy,
+        cmd_export,
+        cmd_cancel,
+        cmd_projects_create,
+        cmd_env_push,
+        cmd_env_delete,
+        # remotely read-only, but both pick a project from the ambient key and write it into the
+        # working tree: `traces export` fills dataset/train.jsonl, `env setup` embeds the project
+        # uuid in the generated configs. warning only at the later `train` is too late, because the
+        # wrong org is already scaffolded in by then.
+        cmd_traces_export,
+        cmd_env_setup,
+    }
+)
+
+
+def _warn_if_login_shadowed(args) -> None:
+    """Surface an ambient FREESOLO_API_KEY that binds a command to another org."""
+    if getattr(args, "func", None) not in _ORG_BINDING_COMMANDS:
+        return
+    # `train --cost` is catalog-only: it never loads credentials or reaches an organization, so a
+    # warning that names the environment key's org would describe a request this command never makes.
+    if getattr(args, "cost", False):
+        return
+    message = shadowed_login_warning()
+    if not message:
+        return
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
@@ -618,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
     update_check = maybe_start_update_check()
+    _warn_if_login_shadowed(args)
     try:
         return args.func(args)
     except _USER_ERRORS as exc:
