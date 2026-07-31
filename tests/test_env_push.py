@@ -174,6 +174,32 @@ def test_push_single_py_module_carries_an_imported_sibling_package(monkeypatch, 
     assert "unused_pkg/__init__.py" not in files
 
 
+def test_push_ships_the_package_when_a_module_of_the_same_name_shadows_it(monkeypatch, tmp_path):
+    """With both graders.py and graders/, `import graders` is the package -- so ship the package.
+
+    Python's path finder checks directories before same-named modules. Yielding the .py first and
+    skipping the package published the file the sidecar never imports and dropped the one it does,
+    so the pushed environment raised ModuleNotFoundError on `graders.rules`.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from graders.rules import score\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    (tmp_path / "graders.py").write_text("SHADOWED = True\n")
+    graders = tmp_path / "graders"
+    graders.mkdir()
+    (graders / "__init__.py").write_text("")
+    (graders / "rules.py").write_text("def score(value): return True\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "graders/rules.py" in files
+    assert "graders/__init__.py" in files
+
+
 def test_push_dir_infers_entrypoint_ignoring_the_evaluations_sidecar(monkeypatch, tmp_path):
     # a legacy package whose sole module is custom.py resolved fine before evaluations.py
     # existed. counting the sidecar as a candidate entrypoint makes adding one turn that
