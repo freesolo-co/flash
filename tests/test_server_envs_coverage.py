@@ -979,6 +979,35 @@ def test_unconstrained_thinking_smoke_rejects_a_reconstructed_empty_answer(monke
         _run_smoke(_smoke_spec(thinking=True))
 
 
+def test_thinking_smoke_accepts_a_tagless_answer_only_under_the_open_model_policy(monkeypatch):
+    """A model whose template flash cannot verify must not be undeployable for omitting the tag.
+
+    `flash.schema` warns and proceeds when the catalog reports `thinking == "unknown"`, which only
+    the open-model policy produces. Such a run may answer with no `<think>` block at all, so the
+    strict requirement would reject a correct answer and strand the trained adapter. Every catalog
+    model keeps the strict path, since for those the missing tag really does mean the reasoning
+    never closed.
+    """
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
+
+    strict = _smoke_spec(thinking=True)
+    with pytest.raises(ServingError, match="never closed its reasoning"):
+        _run_smoke(strict)
+
+    unknown = _smoke_spec(thinking=True)
+    unknown.model = "some-org/not-in-the-catalog"
+    unknown.model_policy = "allow"
+    out = _run_smoke(unknown)
+    assert out["verify_sample"] == "4"
+    assert out["thinking_tag"] is False
+
+    # the relaxed branch still rejects a run that answered nothing, which is the defect the strict
+    # requirement exists to catch. only the tag demand is lifted, not the answer demand.
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("   "))
+    with pytest.raises(ServingError, match="no content"):
+        _run_smoke(unknown)
+
+
 def test_unconstrained_thinking_smoke_accepts_an_answer_after_the_block(monkeypatch):
     # the companion direction: a reconstructed block WITH an answer after it still passes, so the
     # check above rejects answerlessness rather than reconstruction.
