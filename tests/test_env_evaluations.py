@@ -283,6 +283,185 @@ def test_env_eval_rejects_invalid_target_before_loading(monkeypatch, capsys) -> 
     assert "invalid evaluation target" in capsys.readouterr().err
 
 
+def _upload_env_dir(tmp_path: Path, *, dead_case: bool = False) -> Path:
+    """An env whose suite has one passing case, optionally plus one that never generates."""
+    env_dir = _environment_dir(tmp_path)
+    extra = "        EvalCase(id='dead', input='dead', expected='dead'),\n" if dead_case else ""
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'math'\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id='sum', input='2+2', expected='4'),\n"
+        f"{extra}"
+        "    ]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    return env_dir
+
+
+class _RecordingUpload:
+    """Stands in for flash.client.upload_eval_run, capturing the kwargs it was called with."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"ok": True, "eval_run_id": "run-1"}
+
+
+def _patch_upload(monkeypatch, uploader) -> None:
+    monkeypatch.setattr("flash.client.upload_eval_run", uploader, raising=False)
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
+
+
+def test_env_eval_upload_requires_a_project_id(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
+    )
+    env_dir = _upload_env_dir(tmp_path)
+
+    # the guard must fire before any generation happens, so no paid work is wasted.
+    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--upload"]) == 1
+    assert "--upload requires --project" in capsys.readouterr().err
+
+
+def test_env_eval_project_without_upload_is_rejected(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
+    )
+    env_dir = _upload_env_dir(tmp_path)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--project", "p-1"]) == 1
+    assert "--project only applies with --upload" in capsys.readouterr().err
+
+
+def test_env_eval_without_upload_never_calls_the_api(monkeypatch, tmp_path) -> None:
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir)]) == 0
+    # the default must stay local-only: evaluating without --upload writes nothing.
+    assert uploader.calls == []
+
+
+def test_env_eval_upload_sends_every_case_with_the_project_id(monkeypatch, tmp_path) -> None:
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 0
+    )
+
+    assert len(uploader.calls) == 1
+    call = uploader.calls[0]
+    assert call["project_id"] == "proj-9"
+    assert call["suite_name"] == "math"
+    assert call["model"] == "flash-1"
+    assert [case["case_id"] for case in call["cases"]] == ["sum"]
+    assert call["cases"][0]["success"] is True
+    assert call["cases"][0]["actual"] == "4"
+    assert call["cases"][0]["expected"] == "4"
+
+
+def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path) -> None:
+    env_dir = _upload_env_dir(tmp_path, dead_case=True)
+
+    class PartialClient:
+        def chat_stream(self, target, messages, **kwargs):
+            if messages[0]["content"] == "dead":
+                raise ConnectionError("connection reset")
+            yield "4"
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", PartialClient)
+    _patch_upload(monkeypatch, uploader)
+
+    # the suite fails overall because one case never generated...
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 1
+    )
+
+    # ...but both cases are still uploaded, and the failure carries its error rather than
+    # arriving as a silent zero the server would average in as real model behaviour.
+    cases = {case["case_id"]: case for case in uploader.calls[0]["cases"]}
+    assert set(cases) == {"sum", "dead"}
+    assert cases["dead"]["error"] is not None
+    assert "generation failed" in cases["dead"]["error"]
+    assert cases["sum"]["error"] is None
+
+
+def test_env_eval_upload_failure_does_not_relabel_a_passing_suite(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    from flash.client import ClientError
+
+    def failing_upload(**kwargs):
+        raise ClientError("freesolo is unreachable")
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, failing_upload)
+
+    # the suite genuinely passed; a failed upload is reported but must not turn it into a
+    # FAIL, which would read as the model having gotten the answer wrong.
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 0
+    )
+    captured = capsys.readouterr()
+    assert "upload failed" in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_eval_upload_without_login_reports_the_missing_key(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    monkeypatch.setattr("flash.client.upload_eval_run", uploader, raising=False)
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", None))
+
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 0
+    )
+    assert "not logged in" in capsys.readouterr().err
+    # no key means no request was attempted at all.
+    assert uploader.calls == []
+
+
 def test_env_eval_blank_stream_errors_without_scoring(monkeypatch, tmp_path, capsys) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
