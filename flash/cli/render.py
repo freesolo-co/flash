@@ -90,12 +90,19 @@ def _dim(s: str) -> str:
     return _style("2", s)
 
 
-def format_identity(me: dict) -> str:
-    """Render the stored key's identity as an aligned card (not raw JSON)."""
+def format_identity(me: dict, key_source: str | None = None) -> str:
+    """Render the stored key's identity as an aligned card (not raw JSON).
+
+    ``key_source`` names where the key came from. The org shown here is whichever org that key
+    belongs to, so an ambient ``FREESOLO_API_KEY`` can point every command at a different org than
+    the saved login without any authentication failure. Naming the source makes that visible.
+    """
     rows = [(label, str(me[field])) for field, label in _ROWS if me.get(field)]
     prefix = me.get("key_prefix")
     kind = _KIND_LABEL.get(me.get("kind", ""), me.get("kind") or "api key")
     rows.append(("key", f"{prefix}{_glyph('…', '...')} {_dim(f'({kind})')}" if prefix else kind))
+    if key_source:
+        rows.append(("from", key_source))
     width = max(len(label) for label, _ in rows)
     return "\n".join(f"  {_dim(label.ljust(width))}  {value}" for label, value in rows)
 
@@ -109,8 +116,8 @@ def login_ok(me: dict | None) -> str:
     return _safe(f"{head}\n\n{format_identity(me)}")
 
 
-def whoami(me: dict) -> str:
-    return _safe(f"{_bold('logged in to flash')}\n\n{format_identity(me)}")
+def whoami(me: dict, key_source: str | None = None) -> str:
+    return _safe(f"{_bold('logged in to flash')}\n\n{format_identity(me, key_source)}")
 
 
 def login_failed(reason: str) -> str:
@@ -440,7 +447,14 @@ def version(value: str) -> str:
 def submitted(run_id: str) -> str:
     """The `flash train` hand-off note (printed to stderr before logs start streaming)."""
     head = ok(f"run {_paint(run_id, _ACCENT2)} submitted")
-    hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash runs log {run_id} --follow`")
+    # "detaches" alone reads as "stops it" to anyone who has not been bitten by it yet, and the
+    # next move after that misreading is a second `flash train` and a second bill. Say it keeps
+    # running, and name the command that actually stops it.
+    hint = _dim(
+        f"following logs: Ctrl-C detaches (the run keeps going and keeps billing); "
+        f"resume with `{CLI_NAME} runs log {run_id} --follow`, "
+        f"stop with `{CLI_NAME} runs cancel {run_id}`"
+    )
     return _safe(f"{head}\n{hint}")
 
 
@@ -648,6 +662,79 @@ def warmup_message(
     )
 
 
+# the throttle hint points at `runs log`, which reads the SAME uploaded heartbeats -- so when the
+# step counter itself is what has gone stale, that advice sends you to an equally frozen surface.
+_QUIET_HEARTBEAT_HINT = (
+    "heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f"
+)
+# a throttled training step is never guaranteed current: the worker holds mid-training commits for
+# up to _HB_MIN_INTERVAL_S (900s), so from upload until the next commit the displayed step lags by an
+# unknown amount. gate on the same age at which the panel already flags the quiet (300s) rather than
+# on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that window,
+# where a 900s gate would stay silent and leave only the dead-end quiet hint (codex[bot]).
+_STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
+# only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
+# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older than
+# 900s means a long step, failed uploads, or a real stall -- not reporting lag (codex[bot]).
+_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step"})
+
+
+def _stale_step_hint(
+    heartbeat: dict,
+    heartbeat_age_seconds: float | None,
+    *,
+    running: bool,
+    current_attempt: bool = True,
+) -> str | None:
+    """Say a frozen training step is stale reporting, not a stalled trainer.
+
+    A throttled worker can leave ``step`` pinned at its first training heartbeat for many minutes
+    while the trainer is genuinely progressing. Through the CLI alone that is indistinguishable from
+    a hung run, and the obvious reaction -- cancel and relaunch -- throws away a healthy paid GPU.
+    Only fires for a *training* stage carrying a step, since a setup stage has no step to be stale.
+
+    Supersedes the generic quiet hint at the same age: both explain the same silence, but that one
+    sends you to ``runs log``, which reads the very heartbeats that went stale.
+    """
+    if not running or heartbeat_age_seconds is None:
+        return None
+    # a heartbeat from a superseded attempt describes a dead worker's step; calling that ordinary
+    # throttled progress hides that the replacement has published nothing (codex[bot]).
+    if not current_attempt:
+        return None
+    if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
+        return None
+    if str(heartbeat.get("stage") or "") not in _TRAINING_STEP_STAGES:
+        return None
+    # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
+    # later hidden step for the reassurance to point at. reuse the shared step-gated predicate rather
+    # than a bare presence check (codex[bot]).
+    from flash.providers._poll import is_training_heartbeat
+
+    if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
+        return None
+    # do NOT send them to `runs log -f` for worker output. it streams the control-plane log, which
+    # carries orchestration events rather than trainer progress, and the worker console it does
+    # print comes from _print_worker_output AFTER the run reaches a terminal state
+    # (flash/cli/commands.py cmd_log) -- so it cannot answer this question while the run is live.
+    # even reaching for that artifact mid-follow would not help: the worker uploads it on a 3600s
+    # interval (_CONSOLE_UPLOAD_INTERVAL_S), an hour of staleness against a hint that fires at 300s
+    # (codex[bot]).
+    #
+    # the always-available signal is the `age` row this hint hangs off, which is rendered from the
+    # same payload and therefore cannot be missing: below the 900s upload throttle the quiet is
+    # fully explained by throttling, so the age itself is what tells the user whether they have
+    # waited long enough to conclude anything. w&b stays as the optional live cross-check -- the
+    # trainer writes it directly rather than through the throttled upload -- hence "if configured".
+    return (
+        "the step above is the last one UPLOADED, not necessarily the one training is on; "
+        "a throttled worker can hold it for many minutes while the trainer advances normally. "
+        "uploads are held up to 15 min, so compare the age above against that "
+        "(and your [wandb] run, if configured) "
+        "before treating this as a stall"
+    )
+
+
 def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
     hb = obj.get("last_heartbeat")
@@ -670,13 +757,21 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         )
         if warmup:
             pairs.append(("warmup", warmup))
+    stale_step = _stale_step_hint(
+        hb,
+        heartbeat_age_seconds,
+        running=running,
+        current_attempt=heartbeat_is_current_attempt(obj, hb),
+    )
     age = _humanize_age_seconds(heartbeat_age_seconds)
     if age:
-        if running and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
-            age += _dim(
-                "  (heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f)"
-            )
+        # the progress row already explains this silence, and does it better: the quiet hint sends you
+        # to `runs log`, which reads the same frozen heartbeats. show one or the other, never both.
+        if running and not stale_step and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
+            age += _dim(f"  ({_QUIET_HEARTBEAT_HINT})")
         pairs.append(("heartbeat", age))
+    if stale_step:
+        pairs.append(("progress", stale_step))
     return pairs
 
 
