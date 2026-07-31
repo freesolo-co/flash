@@ -49,6 +49,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
+    RewardObservabilityBuffer,
     liveness_heartbeat,
 )
 from flash.engine.worker.hf import _deployable_adapter_on_hf
@@ -56,7 +57,10 @@ from flash.engine.worker.multiturn_glue import validate_glue_template
 from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
-from flash.engine.worker.rollout_samples import sanitize_rollout_text
+from flash.engine.worker.rollout_samples import (
+    sample_completion_text,
+    sanitize_rollout_text,
+)
 from flash.engine.worker.sft_train import (
     _hydra_val,
     _materialize_verl_images,
@@ -696,6 +700,119 @@ _STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
 _STRUCTURED_OUTPUTS_MARKER = "[flash-verl] rollout structured outputs active"
 _EXACT_SAVE_STEPS_MARKER = "[flash-verl] exact save steps active"
 _IMAGE_PAD_BAN_MARKER = "[flash-verl] image-pad token banned from rollouts"
+_KL_REF_ADAPTER_MARKER = "[flash-verl] kl reference anchored to the warm-start adapter"
+
+
+def render_kl_ref_adapter_shim(warmstart: bool) -> str:
+    """return the sitecustomize source that anchors verl's kl reference to the warm-start adapter.
+
+    verl computes reference logprobs on the actor whenever lora is active (``ref_in_actor`` in
+    ray_trainer.py is ``lora_rank > 0 or lora_adapter_path is not None``, always true on flash) and
+    marks that call ``no_lora_adapter=True``, which engine_workers.py turns into
+    ``engine.disable_adapter()`` -- the BARE BASE. for a fresh-start run that is correct. for a
+    warm-started run it is not: the kl term would pull the policy back toward the base and undo the
+    sft adapter the run was told to continue, which is why the warm-start + kl combination was
+    refused until now. trl instead snapshots a frozen reference adapter and evaluates the reference
+    under it (rl.py's grpo path); this ports that behavior.
+
+    the snapshot is registered as NON-PERSISTENT BUFFERS rather than as a second peft adapter's
+    parameters, which is what keeps it out of every downstream consumer:
+
+    - ``named_parameters()`` never sees it, so fsdp does not flatten it and the optimizer cannot
+      train it (a trainable reference would drift with the policy and anchor nothing).
+    - ``state_dict()`` never sees it, so it stays out of the saved shards. that matters more than
+      it looks: verl's merger does not call ``save_pretrained`` for the adapter, it hand-builds one
+      from every state-dict key containing ``lora_`` and derives ``target_modules`` from
+      ``key.split(".")[-3]`` (base_model_merger.save_lora_adapter). a second adapter's keys do not
+      match its ``.default.weight`` rewrite, so they would resolve to ``lora_A``/``lora_B`` and ship
+      a deliverable adapter with bogus target modules.
+    - a resumed run reloads the same shards with ``strict=True``; absent keys would fail that load.
+      the snapshot is rebuilt from ``lora_adapter_path``, which flash passes on every warm-start
+      run including a resume, so the anchor re-forms identically rather than being restored.
+
+    the swap is ``BaseTunerLayer._active_adapter``, not peft's ``set_adapter``: ``set_adapter``
+    flips ``requires_grad`` on both adapters, and verl wraps fsdp1 with ``use_orig_params=false``
+    where that breaks flat-param uniformity. writing ``_active_adapter`` changes zero flags and
+    restores the policy forward bit-exactly.
+    """
+    if not warmstart:
+        return ""
+    return f'''
+from contextlib import contextmanager as _flash_ref_contextmanager
+
+import torch.nn as _flash_ref_nn
+from peft.tuners.tuners_utils import BaseTunerLayer as _flash_ref_tuner_layer
+from verl.workers.engine.fsdp import transformer_impl as _flash_ref_impl
+
+_FLASH_REF_ADAPTER = "flash_kl_ref"
+
+
+def _flash_ref_snapshot(module):
+    """freeze a copy of the warm-start adapter under a second, non-trainable adapter name."""
+    if _FLASH_REF_ADAPTER in getattr(module, "peft_config", {{}}):
+        return module
+    module.add_adapter(_FLASH_REF_ADAPTER, module.peft_config[module.active_adapter])
+    for name, param in module.named_parameters():
+        if ".default." in name:
+            twin = module.get_parameter(name.replace(".default.", f".{{_FLASH_REF_ADAPTER}}."))
+            twin.data.copy_(param.data)
+    # demote the snapshot from parameters to non-persistent buffers. lora_A/lora_B are ModuleDicts
+    # keyed by adapter name, so the snapshot's leaves are exactly the ones under our key.
+    demoted = 0
+    for container in module.modules():
+        if isinstance(container, _flash_ref_nn.ModuleDict) and _FLASH_REF_ADAPTER in container:
+            leaf = container[_FLASH_REF_ADAPTER]
+            for attr, value in list(leaf.named_parameters(recurse=False)):
+                frozen = value.detach().clone()
+                delattr(leaf, attr)
+                leaf.register_buffer(attr, frozen, persistent=False)
+                demoted += 1
+    if not demoted:
+        raise RuntimeError("flash kl reference snapshot found no adapter weights to freeze")
+    print({_KL_REF_ADAPTER_MARKER!r} + " " + repr(demoted), flush=True)
+    return module
+
+
+_flash_ref_original_build_lora = _flash_ref_impl.FSDPEngine._build_lora_module
+
+
+def _flash_ref_build_lora_module(self, module):
+    # after the warm-start adapter is loaded, before _build_fsdp_module wraps it.
+    return _flash_ref_snapshot(_flash_ref_original_build_lora(self, module))
+
+
+@_flash_ref_contextmanager
+def _flash_ref_use_ref_adapter(module):
+    """activate the frozen snapshot without touching any requires_grad flag."""
+    layers = [m for m in module.modules() if isinstance(m, _flash_ref_tuner_layer)]
+    if not layers:
+        raise RuntimeError("flash kl reference: no lora layers on the actor module")
+    saved = [layer._active_adapter for layer in layers]
+    for layer in layers:
+        layer._active_adapter = [_FLASH_REF_ADAPTER]
+    try:
+        yield
+    finally:
+        for layer, previous in zip(layers, saved, strict=True):
+            layer._active_adapter = previous
+
+
+def _flash_ref_disable_adapter(self):
+    # this shim is only written for a warm start, so the snapshot must exist. falling back to the
+    # stock disable_adapter() here would silently anchor the kl term to the base -- the exact
+    # defect this patch removes -- and the run would look healthy while training the wrong thing.
+    module = self.module
+    inner = getattr(module, "_fsdp_wrapped_module", module)
+    if _FLASH_REF_ADAPTER not in getattr(inner, "peft_config", {{}}):
+        raise RuntimeError(
+            "flash kl reference adapter missing: expected " + _FLASH_REF_ADAPTER + " on the actor"
+        )
+    return _flash_ref_use_ref_adapter(module)
+
+
+_flash_ref_impl.FSDPEngine._build_lora_module = _flash_ref_build_lora_module
+_flash_ref_impl.FSDPEngine.disable_adapter = _flash_ref_disable_adapter
+'''
 
 
 def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
@@ -909,6 +1026,136 @@ if not getattr(
 '''
 
 
+def render_per_turn_credit_shim(per_turn_credit: bool) -> str:
+    """return the sitecustomize source that gives verl trl's per-turn group-relative credit.
+
+    verl credits a whole episode: ``compute_grpo_outcome_advantage`` centres one scalar per rollout
+    against its group and broadcasts it across every response token. trl's per-turn mode centres
+    each TURN against the same turn of its group siblings, so a good turn inside a bad episode
+    still gets positive advantage.
+
+    this wraps ``compute_advantage`` rather than registering a custom estimator. a registered
+    estimator would be the tidier hook, but ``compute_advantage`` forwards ``non_tensor_batch`` to
+    exactly one estimator by name (``if adv_estimator in (AdvantageEstimator.GDPO, "gdpo")``), so a
+    custom one could never see the spans it needs. wrapping keeps stock grpo as the baseline and
+    overwrites only the token axis, which is the same shape as trl's GRPOPerTurnTrainer overriding
+    its parent's scalar advantages.
+
+    the fallback is per GROUP, not per row: grpo centres each rollout against its group, so a group
+    holding a mix of per-turn and episode credit would compare quantities of different scales. one
+    unusable row therefore drops its whole group to episode credit.
+    """
+    if not per_turn_credit:
+        return ""
+    return '''
+import torch as _flash_pt_torch
+from verl.trainer.ppo import ray_trainer as _flash_pt_ray_trainer
+
+_flash_pt_original_compute_advantage = _flash_pt_ray_trainer.compute_advantage
+_flash_pt_logged = False
+
+
+def _flash_pt_rows(non_tensor_batch, batch_size):
+    """per-row (spans, turns) or None when this batch carries no usable per-turn metadata."""
+    spans_column = non_tensor_batch.get("flash_turn_spans")
+    rewards_column = non_tensor_batch.get("flash_turn_rewards")
+    if spans_column is None or rewards_column is None:
+        return None
+    if len(spans_column) != batch_size or len(rewards_column) != batch_size:
+        return None
+    rows = []
+    for spans, turns in zip(spans_column, rewards_column):
+        if spans is None or turns is None or len(spans) != len(turns):
+            # a row the loop could not align. keep the row so its group can be identified and
+            # dropped whole, rather than silently centring the rest against a smaller sample.
+            rows.append(None)
+            continue
+        rows.append(
+            (
+                tuple((int(start), int(end)) for start, end in spans),
+                tuple(float(value) for value in turns),
+            )
+        )
+    return rows
+
+
+def _flash_pt_per_turn_advantages(rows, index, episode_advantages):
+    """centre each turn against the same turn of its group; returns [B, width].
+
+    starts from stock grpo's own output and overwrites only the rows of groups that earned
+    per-turn credit. a group that falls back therefore keeps the exact tensor grpo produced rather
+    than a reconstruction of it -- there is no scalar to recover, so nothing can drift.
+    """
+    advantages = episode_advantages.clone()
+    groups = {}
+    for row_index, uid in enumerate(index):
+        groups.setdefault(uid, []).append(row_index)
+    for member_indexes in groups.values():
+        if any(rows[row_index] is None for row_index in member_indexes):
+            continue
+        for row_index in member_indexes:
+            advantages[row_index] = 0.0
+        turn_total = max(len(rows[row_index][1]) for row_index in member_indexes)
+        for turn_index in range(turn_total):
+            scoring = [
+                row_index
+                for row_index in member_indexes
+                if turn_index < len(rows[row_index][1])
+                and rows[row_index][0][turn_index][1] > rows[row_index][0][turn_index][0]
+            ]
+            if not scoring:
+                # every member emitted nothing for this turn; an empty turn carries no signal and
+                # must not skew the baseline for the members that did emit one.
+                continue
+            baseline = sum(rows[row_index][1][turn_index] for row_index in scoring) / len(scoring)
+            for row_index in scoring:
+                start, end = rows[row_index][0][turn_index]
+                advantages[row_index, start:end] = rows[row_index][1][turn_index] - baseline
+    return advantages
+
+
+def _flash_pt_compute_advantage(data, *args, **kwargs):
+    global _flash_pt_logged
+    data = _flash_pt_original_compute_advantage(data, *args, **kwargs)
+    episode = data.batch.get("advantages")
+    if episode is None or episode.dim() != 2:
+        return data
+    batch_size, width = episode.shape
+    rows = _flash_pt_rows(data.non_tensor_batch, batch_size)
+    if rows is None or all(row is None for row in rows):
+        return data
+    index = data.non_tensor_batch.get("uid")
+    if index is None or len(index) != batch_size:
+        return data
+    for row in rows:
+        if row is None:
+            continue
+        for start, end in row[0]:
+            if not 0 <= start <= end <= width:
+                raise ValueError(
+                    f"turn span [{start}, {end}) exceeds the response width {width}"
+                )
+    advantages = _flash_pt_per_turn_advantages(rows, index, episode)
+    if not bool(_flash_pt_torch.isfinite(advantages).all()):
+        raise ValueError("per-turn advantages must be finite")
+    # keep the response mask authoritative: glue tokens sit inside a turn span only when the
+    # environment reply was appended mid-turn, and they must never carry gradient.
+    response_mask = data.batch.get("response_mask")
+    if response_mask is not None:
+        advantages = advantages * response_mask.to(dtype=advantages.dtype)
+    data.batch["advantages"] = advantages
+    # returns feeds the critic, which grpo does not use; stock grpo sets it to the same tensor.
+    data.batch["returns"] = advantages
+    if not _flash_pt_logged:
+        print("[rl-verl] multi-turn per-turn group-relative credit is active", flush=True)
+        _flash_pt_logged = True
+    return data
+
+
+_flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage
+'''
+
+
 def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
     """return the sitecustomize source that adds trl's top-entropy token masking to verl.
 
@@ -1075,6 +1322,7 @@ def score_single_turn(
     prompt_opened_thinking: bool,
     think_penalty: float,
     raise_on_error: bool = False,
+    breakdowns: list[dict[str, float] | None] | None = None,
 ) -> float:
     """score one single-turn text completion exactly as the trl reward path does.
 
@@ -1085,8 +1333,25 @@ def score_single_turn(
     ``raise_on_error`` re-raises instead, for callers that must tell a real 0.0 score apart from a
     failed grading. training never sets it; the latency profiler does, because a swallowed error
     turns a grader that is failing on every call into a fast, confident, wrong reading.
+
+    ``breakdowns`` collects this completion's per-name reward components for the ``reward_metrics``
+    heartbeat field. appended to only when the env actually exposes ``scores_breakdown`` -- an env
+    with a plain scalar ``reward`` has no components, and appending an empty dict for it would put a
+    real denominator under no numerators and publish a flat 0 for a run that simply has no named
+    metrics. a failed grading appends ``None``, which the mean counts as a zero for every name the
+    other completions did report, exactly as trl does; the caller owns the list's lock and bound.
     """
+    # optimistic until the probe answers: a probe that RAISES is itself a failed grading, and the
+    # except branch has to be able to record it -- omitting it instead would drop this completion
+    # from the denominator and bias every named metric high. narrowed the instant the probe returns.
+    collect_breakdown = breakdowns is not None
     try:
+        # probe INSIDE the guard: `scores_breakdown` may be a property or a proxy whose lookup
+        # raises something other than AttributeError, and out here that escapes into the reward http
+        # handler -- the verl child reads a bridge failure and aborts the run, when this function's
+        # whole contract is to turn an env scoring fault into 0.0.
+        has_breakdown = hasattr(env, "scores_breakdown")
+        collect_breakdown = collect_breakdown and has_breakdown
         graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
         state = (
             {
@@ -1099,13 +1364,20 @@ def score_single_turn(
             if thinking
             else None
         )
-        if hasattr(env, "scores_breakdown"):
-            r = float(env.scores_breakdown(graded, ex, state).get("total", 0.0))
+        if has_breakdown:
+            breakdown = env.scores_breakdown(graded, ex, state)
+            # convert total FIRST: a breakdown whose total is not a number is a failed grading, and
+            # recording its named components would credit metrics to a completion that scored 0.0.
+            r = float(breakdown.get("total", 0.0))
+            if collect_breakdown:
+                breakdowns.append(breakdown)
         else:
             r = float(env.reward(graded, ex, state))
     except Exception as exc:  # env scoring must not kill the run
         if raise_on_error:
             raise
+        if collect_breakdown:
+            breakdowns.append(None)
         print(
             f"[rl-verl] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0", flush=True
         )
@@ -1236,12 +1508,27 @@ class MultiTurnBridge:
     episode, keyed by the id the child mints. the env's own rollout state is the source of truth
     for turn budget, doneness, and the terminal episode that gets scored -- exactly the state the
     trl driver accumulates, so both backends score the same object.
+
+    ``on_episode_scored(prompt, transcript, reward)`` receives each scored episode so the caller can
+    surface it as a rollout sample. multi-turn has no per-completion breakdown to report -- the env
+    scores a whole episode through ``rollout_rewards_many``, which returns a scalar -- so only the
+    sample side of the reward observability pair applies here, exactly as on the trl path.
     """
 
-    def __init__(self, env, examples: list[dict], *, max_turns: int) -> None:
+    def __init__(
+        self,
+        env,
+        examples: list[dict],
+        *,
+        max_turns: int,
+        per_turn_credit: bool = False,
+        on_episode_scored: Callable[[object, object, float], None] | None = None,
+    ) -> None:
         self._env = env
         self._examples = examples
         self._max_turns = int(max_turns)
+        self._per_turn_credit = bool(per_turn_credit)
+        self._on_episode_scored = on_episode_scored
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every env touch below happens under this lock, matching the single-turn path's contract.
         self._lock = threading.Lock()
@@ -1288,6 +1575,14 @@ class MultiTurnBridge:
             # append a truncated or empty assistant message to the transcript that gets scored.
             # the child stops on the same condition, so this only decides what the env sees.
             if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
+                # it is still the turn the model generated and the child trained on, so it is kept
+                # for the DIAGNOSTIC transcript. dropping it entirely would publish an empty
+                # completion for a first-turn truncation -- the one sample worth reading, since it
+                # is the failure being diagnosed (codex[bot]).
+                session["aborted_turn"] = {
+                    "role": "assistant",
+                    "content": str(payload.get("completion_text") or ""),
+                }
                 return {"terminal": True, "messages": []}
             self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
             if self._env.rollout_done(state, self._max_turns):
@@ -1306,26 +1601,50 @@ class MultiTurnBridge:
         turn_count = int(payload["turn_count"])
         with self._lock:
             session = self._session(payload)
+            state = session["state"]
             reward = score_rollouts(
                 self._env,
                 [
                     RolloutScoreRequest(
                         example=session["example"],
-                        state=session["state"],
+                        state=state,
                         turn_count=turn_count,
                     )
                 ],
             )[0]
-        # per-turn credit is a separate invariant (it needs a custom verl advantage estimator), so
-        # only the episode reward crosses back. nan is score_rollouts' unscorable marker; verl has
-        # no equivalent, and a nan would propagate into the group baseline and poison every other
-        # rollout in the group, so an unscorable episode scores 0.0 the way a failed single-turn
-        # grading does.
+            # snapshot under the same lock that guards the session: `step` mutates this list in
+            # place, and a concurrent episode's turn would otherwise be read mid-append.
+            prompt = list(state.get("prompt") or ())
+            # the episode transcript, NOT the whole message list: new_rollout_state seeds `messages`
+            # with a copy of `prompt` and appends turns onto it, so publishing it whole would repeat
+            # the prompt inside `completion` when it already rides the sample as `prompt_tail`.
+            # slice by length rather than by equality -- an env may legitimately produce a turn that
+            # matches a prompt message, and dropping it would silently truncate the episode.
+            transcript = list(state.get("messages") or ())[len(prompt) :]
+            # the aborted turn never entered `messages` -- the env must not score it -- but the
+            # child trained on its tokens, so the sample shows what was actually generated.
+            aborted = session.get("aborted_turn")
+            if aborted is not None:
+                transcript.append(aborted)
+        # nan is score_rollouts' unscorable marker; verl has no equivalent, and a nan would
+        # propagate into the group baseline and poison every other rollout in the group, so an
+        # unscorable episode scores 0.0 the way a failed single-turn grading does.
         episode = float(reward.episode)
         if not math.isfinite(episode):
             print("[rl-verl] multi-turn episode unscorable; scoring 0.0", flush=True)
             episode = 0.0
-        return {"score": episode}
+        if self._on_episode_scored is not None:
+            # outside the lock: the callback is the caller's buffer, which has its own lock, and
+            # nesting them in this order would invert the single-turn path's acquisition order.
+            self._on_episode_scored(prompt, transcript, episode)
+        if not self._per_turn_credit:
+            return {"score": episode}
+        # score_rollouts already validated the vector against turn_count and canonicalised an
+        # unusable one to None (multiturn_reward_scoring), so nothing further is checked here.
+        # None means this episode falls back to episode credit; the shim widens that fallback to
+        # the whole group so a group is never centred on a mix of the two.
+        turns = None if reward.turns is None else [float(value) for value in reward.turns]
+        return {"score": episode, "turns": turns}
 
     def close(self, payload: dict) -> dict:
         with self._lock:
@@ -1919,18 +2238,18 @@ def _resolve_grpo_inputs():
     # itself while accepting the key ("per-turn is equivalent to per-episode for single-turn
     # environments", rl.py). match that: log it, do not reject.
     #
-    # multi-turn is different. verl credits the episode: the agent loop returns one sequence with
-    # one reward on its last token. per-turn credit needs a custom advantage estimator AND turn
-    # spans plumbed into it (verl's generic estimator branch does not forward non_tensor_batch), so
-    # it is a separate change. reject rather than downgrade -- silently training per-episode when
-    # the config asks for per-turn is the worse failure.
+    # on multi-turn it centres each turn against the same turn of its group siblings instead of
+    # broadcasting one episode advantage across the transcript. the agent loop records a token span
+    # per turn, the bridge returns the env's per-turn vector alongside the episode reward, and a
+    # shim rewrites the advantage tensor after stock grpo has run; see
+    # render_per_turn_credit_shim.
     credit_assignment = getattr(_t, "credit_assignment", DEFAULT_CREDIT_ASSIGNMENT) if _t else None
-    if credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
-        if multi_turn:
-            raise RuntimeError(
-                f"verl grpo credits the whole episode; credit_assignment={credit_assignment} is "
-                "not supported for multi-turn environments"
-            )
+    per_turn_credit = bool(
+        credit_assignment
+        and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT
+        and multi_turn
+    )
+    if credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT and not multi_turn:
         print(
             f"[rl-verl] credit assignment: {credit_assignment} is equivalent to "
             f"{DEFAULT_CREDIT_ASSIGNMENT} for single-turn environments",
@@ -1973,12 +2292,6 @@ def _resolve_grpo_inputs():
     # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
     warmstart_adapter = ""
     if _t and getattr(_t, "init_from_adapter", ""):
-        if kl_coef > 0:
-            raise RuntimeError(
-                "warm-start (init_from_adapter) with kl_penalty_coef>0 anchors the kl reference to "
-                "the sft adapter; the verl backend's reference is the base, so this is not yet "
-                "supported. set kl_penalty_coef=0, or use the trl backend for kl-anchored warm-start."
-            )
         from flash.engine.worker.adapter import _download_adapter
 
         warmstart_adapter = _download_adapter(_t.init_from_adapter)
@@ -2203,6 +2516,7 @@ def _resolve_grpo_inputs():
         "think_penalty": think_penalty,
         "kl_coef": kl_coef,
         "entropy_quantile": entropy_quantile,
+        "per_turn_credit": per_turn_credit,
         "stop_sequences": stop_sequences,
         "structured_outputs": structured_outputs,
         "max_completion": max_completion,
@@ -2334,10 +2648,14 @@ def run_rl_verl():
         part
         for part in (
             render_entropy_quantile_shim(inp["entropy_quantile"]),
+            render_per_turn_credit_shim(inp["per_turn_credit"]),
             render_stop_sequences_shim(inp["stop_sequences"]),
             render_image_pad_ban_shim(inp["image_pad_token_id"]),
             render_structured_outputs_shim(inp["structured_outputs"]),
             render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"]),
+            render_kl_ref_adapter_shim(
+                bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
+            ),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
             # which is resolved after this file is written. the shim is inert either way -- it only
             # fires when verl actually calls wandb.init, which requires wandb in the logger list.
@@ -2356,16 +2674,26 @@ def run_rl_verl():
     if inp["multi_turn"]:
         copy_multi_turn_child_modules(shim_dir)
 
-    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. also keep a
-    # rolling buffer of recent (completion, score) so the training loop can dump one sample per step
-    # to the flash log, matching the trl path's #607 per-step completion dump.
-    recent_samples: list[tuple[str, float]] = []
+    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. the buffer
+    # carries what trl's reward TrainerCallback carries -- recent rollouts for the per-step log dump
+    # and `sampled_completions`, plus per-name components for `reward_metrics` (#607).
+    # the generation size lets the buffer close each generation on the scoring thread that finishes
+    # it, rather than when the child's `step:N` line reaches this process: those are the same
+    # completions but not the same instant, and the next generation scores in between. verl is run
+    # with test_freq=-1 and val_before_train=False, so every completion reaching the bridge is a
+    # training rollout and the count is exact.
+    observability = RewardObservabilityBuffer(
+        generation_size=int(inp["prompts_per_step"]) * int(inp["group_size"]),
+    )
     # filled from the child's marker line; stays empty when wandb is off (see render_wandb_link_shim).
     wandb_link: dict[str, str | None] = {}
-    _samples_lock = threading.Lock()
 
     def _score(index: int, solution_str: str) -> float:
         ex = rollout_examples[int(index)]
+        # graded BEFORE the buffer is touched: grading calls user code and can block on i/o for
+        # seconds while verl scores many rollouts at once, and RewardObservabilityBuffer.record
+        # takes a lock every grading in the run would then serialize behind.
+        breakdowns: list[dict[str, float] | None] = []
         score = score_single_turn(
             env,
             solution_str,
@@ -2374,16 +2702,15 @@ def run_rl_verl():
             thinking=bool(_w.THINKING),
             prompt_opened_thinking=inp["prompt_opened_thinking"],
             think_penalty=inp["think_penalty"],
+            breakdowns=breakdowns,
         )
-        with _samples_lock:
-            recent_samples.append((solution_str, score))
-            del recent_samples[:-64]
+        observability.record(message_prompts[int(index)], solution_str, score, breakdowns)
         return score
 
     def _score_for_profile(index: int, solution_str: str) -> float:
         """the same grading path as _score, minus training's own bookkeeping.
 
-        deliberately NOT _score: that appends to recent_samples, so profiling would seed the
+        deliberately NOT _score: that buffers the rollout, so profiling would seed the
         per-step completion dump with gradings that never came from a rollout. it also propagates
         scoring errors instead of scoring them 0.0, so a grader failing on every call reports as a
         failure rather than as a fast latency.
@@ -2414,7 +2741,13 @@ def run_rl_verl():
     )
 
     multi_turn_bridge = (
-        MultiTurnBridge(env, rollout_examples, max_turns=int(inp["max_turns"]))
+        MultiTurnBridge(
+            env,
+            rollout_examples,
+            max_turns=int(inp["max_turns"]),
+            per_turn_credit=bool(inp["per_turn_credit"]),
+            on_episode_scored=observability.record,
+        )
         if inp["multi_turn"]
         else None
     )
@@ -2555,10 +2888,24 @@ def run_rl_verl():
         # below, so mutate it in place (append_step_metrics) rather than rebinding.
         metrics_last: list[dict] = []
         sent_first_metrics = False
+
+        def _reward_observability() -> dict:
+            """the `reward_metrics` / `sampled_completions` fields for one heartbeat emission.
+
+            trl publishes both from a TrainerCallback on the trainer's own thread. verl's trainer is
+            out of process, so this is called from the liveness thread and from the stdout loop
+            instead -- reading the buffer the reward bridge fills on its server threads.
+
+            read-only: the generation boundary below owns the drain, so a 30s liveness tick landing
+            mid-generation republishes the last complete reading instead of publishing whichever
+            completions happened to be graded by then.
+            """
+            return observability.heartbeat_fields()
+
         with liveness_heartbeat(
             "rl_step",
             progress=_progress,
-            fields=lambda: {"metrics_last": list(metrics_last)},
+            fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
             progress_step=True,
         ):
             # claimed before the child exists, so a grandchild it orphans reparents here and can be
@@ -2584,13 +2931,22 @@ def run_rl_verl():
                         step_box[0] = int(m.group(1))
                         # dump one sample completion per new step to the flash log (matches trl #607).
                         if step_box[0] != last_dump_step[0]:
-                            with _samples_lock:
-                                samp = recent_samples[-1] if recent_samples else None
+                            # the generation boundary: verl logs this line once its step is scored,
+                            # so everything the reward bridge buffered since the last one is that
+                            # step's complete output. seal it before the preview reads `latest`, so
+                            # both the log line and the heartbeat describe the same generation.
+                            observability.close_generation(step_box[0])
+                            # asks for THIS step's rows, not merely the newest: when the line is
+                            # spent on a generation the queue already dropped, nothing is published
+                            # and the previous generation's text would print under this step.
+                            samp = observability.latest_for_step(step_box[0])
                             if samp:
                                 last_dump_step[0] = step_box[0]
-                                preview = " ".join(sanitize_rollout_text(samp[0])[:300].split())
+                                _, completion, reward = samp
+                                text = sanitize_rollout_text(sample_completion_text(completion))
+                                preview = " ".join(text[:300].split())
                                 print(
-                                    f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
+                                    f"[rl-verl] step {step_box[0]} sample (reward={reward:.3f}): {preview}",
                                     flush=True,
                                 )
                     step_metrics = parse_verl_step_metrics(line)
@@ -2617,6 +2973,7 @@ def run_rl_verl():
                                 force=True,
                                 step=step_metrics["step"],
                                 metrics_last=list(metrics_last),
+                                **_reward_observability(),
                                 gpu=gpu_diagnostics(include_torch=False),
                             )
                         # per-step series for train_meta observability parity. these live on the same
