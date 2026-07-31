@@ -77,23 +77,26 @@ class _Score:
             return None
         return tuple(zip(mine, theirs, strict=False))
 
-    def ranks_below(self, other: _Score, *, per_turn: bool) -> bool:
-        """Report whether this score is unambiguously worse in the direction training reads."""
-        if self.episode != other.episode:
-            return self.episode < other.episode
-        if not per_turn:
-            return False
-        pairs = self._overlap(other)
-        if not pairs:
-            return False
-        # positional dominance, not the sum. `build_per_turn_advantages` centres each turn index
-        # against its own group mean, so being worse at one turn and better at another is not
-        # "worse" in any direction the trainer reads -- only being no better anywhere and worse
-        # somewhere is (codex[bot]).
-        return all(m <= t for m, t in pairs) and any(m < t for m, t in pairs)
+    def outranks(self, gold: _Score, *, per_turn: bool) -> bool:
+        """Report whether this deliberately wrong control beats gold where training reads.
 
-    def outranks(self, other: _Score, *, per_turn: bool) -> bool:
-        return other.ranks_below(self, per_turn=per_turn)
+        Asymmetric on purpose. ``_controlled_scores`` admits a control only when it is disjoint from
+        EVERY gold turn, so there is no turn at which this completion legitimately scores above the
+        replayed gold answer. One credited turn above gold is therefore enough: each turn index is
+        centred against its own group mean, so that turn hands the wrong text a positive advantage
+        and training reinforces it there, whatever the control does at the other turns. Requiring it
+        to be no better anywhere let a crossing pair -- gold (1, 0) against control (0, 1) -- pass as
+        "neither dominates" while the trainer rewarded the control at turn 1 (codex[bot]).
+
+        ``per_turn`` is the GROUP's path, not this pair's: the vectors reach an advantage only when
+        every member has one, which is the caller's question to settle.
+        """
+        pairs = self._overlap(gold) if per_turn else None
+        if pairs is None:
+            return self.episode > gold.episode
+        # an empty overlap means a member emitted no credited turn; it earns no advantage anywhere,
+        # so it is evidence of nothing rather than a win.
+        return any(mine > theirs for mine, theirs in pairs)
 
     def separates_from(self, other: _Score, *, per_turn: bool) -> bool:
         """Report whether training could tell these two completions apart at all.
@@ -101,16 +104,22 @@ class _Score:
         Distinct per-turn vectors that neither dominate -- (1, 0) against (0, 1) -- still produce
         nonzero opposing advantages at both turns, because each turn is centred independently. They
         rank in no direction yet are plainly separable, so the flat gate asks this rather than
-        reading "nothing ranks below gold" as "the grader cannot rank" (codex[bot]).
+        reading "nothing outranks gold" as "the grader cannot rank" (codex[bot]).
+
+        On the per-turn path the episode scalar is not consulted at all: `build_per_turn_advantages`
+        REPLACES the episode advantages with centred turn rewards, so identical vectors train
+        identically no matter how far apart the episode scores are. Reading the scalar first
+        reported separation for a grader that produces exactly zero advantage (codex[bot]).
         """
-        if self.episode != other.episode:
-            return True
-        if not per_turn:
-            return False
-        pairs = self._overlap(other)
-        if not pairs:
-            return False
-        return any(m != t for m, t in pairs)
+        pairs = self._overlap(other) if per_turn else None
+        if pairs is None:
+            return self.episode != other.episode
+        return any(mine != theirs for mine, theirs in pairs)
+
+
+def _fmt_turns(score: _Score) -> str:
+    """The per-turn vector as the warning prints it, so a reader sees the numbers that were compared."""
+    return "(" + ", ".join(f"{value:.6f}" for value in score.turns or ()) + ")"
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:
@@ -722,26 +731,55 @@ def cmd_env_test(args) -> int:
         # episodes it never tested.
         if controls and reward is not None:
             controlled += 1
-            if any(control.outranks(reward, per_turn=per_turn) for control in controls):
+            # the group is the gold rollout plus its controls, and `build_per_turn_advantages`
+            # falls back to episode advantages for the WHOLE group as soon as one member lacks a
+            # vector. so the vectors decide only when every member has one; otherwise the episode
+            # scalar is what trains, exactly as in the default credit-assignment mode.
+            group_per_turn = per_turn and all(
+                score.turns is not None for score in (reward, *controls)
+            )
+            if any(control.outranks(reward, per_turn=group_per_turn) for control in controls):
                 # strictly worse than a deliberately wrong answer. GRPO maximizes this number, so
                 # the run would train away from the gold answers -- a broken reward direction is
                 # worse than a flat one, and no amount of separation elsewhere redeems it.
                 inverted += 1
-                highest = max(control.episode for control in controls)
-                message = (
-                    f"a deliberately wrong answer scored higher ({highest:.6f}) than the "
-                    f"replayed gold answer ({reward.episode:.6f}); the reward direction looks "
-                    "inverted"
-                )
+                # report the numbers the verdict actually read. on the per-turn path the episode
+                # scalars are not what trains, and a crossing pair has equal ones -- printing them
+                # would read "1.000000 scored higher than 1.000000".
+                if group_per_turn:
+                    offender = next(
+                        control
+                        for control in controls
+                        if control.outranks(reward, per_turn=group_per_turn)
+                    )
+                    message = (
+                        "a deliberately wrong answer was credited above the replayed gold answer "
+                        f"at a turn the two share (gold turns {_fmt_turns(reward)}, wrong answer "
+                        f"{_fmt_turns(offender)}); the reward direction looks inverted"
+                    )
+                else:
+                    highest = max(control.episode for control in controls)
+                    message = (
+                        f"a deliberately wrong answer scored higher ({highest:.6f}) than the "
+                        f"replayed gold answer ({reward.episode:.6f}); the reward direction looks "
+                        "inverted"
+                    )
                 print(
                     render.warn(message) if render.styled() else f"warning: {message}",
                     file=sys.stderr,
                 )
-            elif not any(control.separates_from(reward, per_turn=per_turn) for control in controls):
+            elif not any(
+                control.separates_from(reward, per_turn=group_per_turn) for control in controls
+            ):
                 scored_flat += 1
+                scored_as = (
+                    f"produced the same per-turn rewards {_fmt_turns(reward)}"
+                    if group_per_turn
+                    else f"scored {reward.episode:.6f}"
+                )
                 message = (
                     f"replay gold answer and {len(controls)} deliberately wrong answer(s) all "
-                    f"scored {reward.episode:.6f}; check the reward function"
+                    f"{scored_as}; check the reward function"
                 )
                 print(
                     render.warn(message) if render.styled() else f"warning: {message}",
