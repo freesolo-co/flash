@@ -1496,9 +1496,7 @@ def test_deploy_wait_reports_a_rollback_from_the_final_adapter(
     assert "no longer an active deployment" not in err, err
 
 
-def test_deploy_wait_rollback_lookup_stays_inside_the_deadline(
-    fake_client, monkeypatch
-) -> None:
+def test_deploy_wait_rollback_lookup_stays_inside_the_deadline(fake_client, monkeypatch) -> None:
     """The rollback read is one more read inside the wait, not a second full-length one.
 
     It runs after a poll that has already spent part of the budget, so bounding it by the
@@ -1530,9 +1528,52 @@ def test_deploy_wait_rollback_lookup_stays_inside_the_deadline(
     for start, bound in reads:
         assert bound is not None, reads
         # the expired case is allowed the zero-wait one-shot bound and nothing wider.
-        assert bound <= max(5.0 - start, cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS) + 0.001, (
-            reads
-        )
+        assert bound <= max(5.0 - start, cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS) + 0.001, reads
+
+
+def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A remainder can be positive and still be too small to read in.
+
+    The bound above keeps this lookup inside the deadline; this one keeps it able to finish. The
+    poll before it lands the wait a hair short of the deadline, so the remainder is positive and
+    tiny -- and passing it through means the listing read times out, `_rollback_record` swallows the
+    error, and the CLI reports the run as vanished instead of printing `last_deploy_error`. The
+    zero-wait floor covers the expired case only, so it does not apply (cursor).
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+    # stop a hair inside the deadline: positive remainder, far too little to complete a read.
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: clock.__setitem__("t", 5.0 - 0.002),
+        raising=False,
+    )
+    rolled_back = {
+        "run_id": "flash-1",
+        "state": "deployed",
+        "checkpoint_step": 20,
+        "last_deploy_error": "adapter load failed",
+    }
+
+    def _listing(timeout=None):
+        # a real client cannot answer inside a bound this small; it raises at it.
+        if timeout is not None and timeout < cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS:
+            raise cli.commands.ClientError("read timed out")
+        return [{"run_id": "flash-1", "deployment": rolled_back}]
+
+    monkeypatch.setattr(fake_client, "deployments", _listing, raising=False)
+
+    assert _run(["models", "deploy", "flash-1/step-40", "--wait", "5"]) == 1
+    err = capsys.readouterr().err
+    assert "adapter load failed" in err, err
+    assert "no longer an active deployment" not in err, err
 
 
 @pytest.mark.parametrize(

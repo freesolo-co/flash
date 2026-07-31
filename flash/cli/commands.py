@@ -816,10 +816,16 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
                 # cursor). the expired case still gets the zero-wait bound rather than being
                 # skipped: classifying rollback against vanished is the difference between
                 # reporting the real failure and naming the wrong event, and it is one read.
+                #
+                # a floor, not just an expired-case fallback: a poll that answered a hair inside the
+                # deadline leaves a remainder that is positive and far too small to read in, so
+                # forwarding it verbatim timed the listing out, `_rollback_record` swallowed the
+                # error, and the run was reported vanished with `last_deploy_error` never printed
+                # (cursor). the same one-read reasoning covers it -- a bound too small to answer in
+                # buys nothing over no lookup at all, and overshoots the deadline by at most the
+                # bound the zero-wait one-shot already spends.
                 left = deadline - time.monotonic()
-                other = _rollback_record(
-                    client, run_id, left if left > 0 else _DEPLOY_ZERO_WAIT_READ_SECONDS
-                )
+                other = _rollback_record(client, run_id, max(left, _DEPLOY_ZERO_WAIT_READ_SECONDS))
                 if other is not None:
                     return other
                 print(
