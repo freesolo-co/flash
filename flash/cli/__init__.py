@@ -42,7 +42,13 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.env_eval import _MAX_CONCURRENCY, bounded_concurrency, cmd_env_eval, positive_int
+from flash.cli.env_eval import (
+    _MAX_CONCURRENCY,
+    bounded_concurrency,
+    cmd_env_eval,
+    finite_float,
+    positive_int,
+)
 from flash.cli.env_setup import cmd_env_setup
 from flash.cli.env_test import cmd_env_test
 from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
@@ -404,7 +410,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="run at most N cases from each selected suite",
     )
-    env_eval.add_argument("--temperature", type=float, default=0.0)
+    env_eval.add_argument("--temperature", type=finite_float, default=0.0)
     env_eval.add_argument("--max-tokens", type=positive_int, default=512, metavar="N")
     env_eval.add_argument(
         "--concurrency",
