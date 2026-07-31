@@ -693,6 +693,119 @@ _STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
 _STRUCTURED_OUTPUTS_MARKER = "[flash-verl] rollout structured outputs active"
 _EXACT_SAVE_STEPS_MARKER = "[flash-verl] exact save steps active"
 _IMAGE_PAD_BAN_MARKER = "[flash-verl] image-pad token banned from rollouts"
+_KL_REF_ADAPTER_MARKER = "[flash-verl] kl reference anchored to the warm-start adapter"
+
+
+def render_kl_ref_adapter_shim(warmstart: bool) -> str:
+    """return the sitecustomize source that anchors verl's kl reference to the warm-start adapter.
+
+    verl computes reference logprobs on the actor whenever lora is active (``ref_in_actor`` in
+    ray_trainer.py is ``lora_rank > 0 or lora_adapter_path is not None``, always true on flash) and
+    marks that call ``no_lora_adapter=True``, which engine_workers.py turns into
+    ``engine.disable_adapter()`` -- the BARE BASE. for a fresh-start run that is correct. for a
+    warm-started run it is not: the kl term would pull the policy back toward the base and undo the
+    sft adapter the run was told to continue, which is why the warm-start + kl combination was
+    refused until now. trl instead snapshots a frozen reference adapter and evaluates the reference
+    under it (rl.py's grpo path); this ports that behavior.
+
+    the snapshot is registered as NON-PERSISTENT BUFFERS rather than as a second peft adapter's
+    parameters, which is what keeps it out of every downstream consumer:
+
+    - ``named_parameters()`` never sees it, so fsdp does not flatten it and the optimizer cannot
+      train it (a trainable reference would drift with the policy and anchor nothing).
+    - ``state_dict()`` never sees it, so it stays out of the saved shards. that matters more than
+      it looks: verl's merger does not call ``save_pretrained`` for the adapter, it hand-builds one
+      from every state-dict key containing ``lora_`` and derives ``target_modules`` from
+      ``key.split(".")[-3]`` (base_model_merger.save_lora_adapter). a second adapter's keys do not
+      match its ``.default.weight`` rewrite, so they would resolve to ``lora_A``/``lora_B`` and ship
+      a deliverable adapter with bogus target modules.
+    - a resumed run reloads the same shards with ``strict=True``; absent keys would fail that load.
+      the snapshot is rebuilt from ``lora_adapter_path``, which flash passes on every warm-start
+      run including a resume, so the anchor re-forms identically rather than being restored.
+
+    the swap is ``BaseTunerLayer._active_adapter``, not peft's ``set_adapter``: ``set_adapter``
+    flips ``requires_grad`` on both adapters, and verl wraps fsdp1 with ``use_orig_params=false``
+    where that breaks flat-param uniformity. writing ``_active_adapter`` changes zero flags and
+    restores the policy forward bit-exactly.
+    """
+    if not warmstart:
+        return ""
+    return f'''
+from contextlib import contextmanager as _flash_ref_contextmanager
+
+import torch.nn as _flash_ref_nn
+from peft.tuners.tuners_utils import BaseTunerLayer as _flash_ref_tuner_layer
+from verl.workers.engine.fsdp import transformer_impl as _flash_ref_impl
+
+_FLASH_REF_ADAPTER = "flash_kl_ref"
+
+
+def _flash_ref_snapshot(module):
+    """freeze a copy of the warm-start adapter under a second, non-trainable adapter name."""
+    if _FLASH_REF_ADAPTER in getattr(module, "peft_config", {{}}):
+        return module
+    module.add_adapter(_FLASH_REF_ADAPTER, module.peft_config[module.active_adapter])
+    for name, param in module.named_parameters():
+        if ".default." in name:
+            twin = module.get_parameter(name.replace(".default.", f".{{_FLASH_REF_ADAPTER}}."))
+            twin.data.copy_(param.data)
+    # demote the snapshot from parameters to non-persistent buffers. lora_A/lora_B are ModuleDicts
+    # keyed by adapter name, so the snapshot's leaves are exactly the ones under our key.
+    demoted = 0
+    for container in module.modules():
+        if isinstance(container, _flash_ref_nn.ModuleDict) and _FLASH_REF_ADAPTER in container:
+            leaf = container[_FLASH_REF_ADAPTER]
+            for attr, value in list(leaf.named_parameters(recurse=False)):
+                frozen = value.detach().clone()
+                delattr(leaf, attr)
+                leaf.register_buffer(attr, frozen, persistent=False)
+                demoted += 1
+    if not demoted:
+        raise RuntimeError("flash kl reference snapshot found no adapter weights to freeze")
+    print({_KL_REF_ADAPTER_MARKER!r} + " " + repr(demoted), flush=True)
+    return module
+
+
+_flash_ref_original_build_lora = _flash_ref_impl.FSDPEngine._build_lora_module
+
+
+def _flash_ref_build_lora_module(self, module):
+    # after the warm-start adapter is loaded, before _build_fsdp_module wraps it.
+    return _flash_ref_snapshot(_flash_ref_original_build_lora(self, module))
+
+
+@_flash_ref_contextmanager
+def _flash_ref_use_ref_adapter(module):
+    """activate the frozen snapshot without touching any requires_grad flag."""
+    layers = [m for m in module.modules() if isinstance(m, _flash_ref_tuner_layer)]
+    if not layers:
+        raise RuntimeError("flash kl reference: no lora layers on the actor module")
+    saved = [layer._active_adapter for layer in layers]
+    for layer in layers:
+        layer._active_adapter = [_FLASH_REF_ADAPTER]
+    try:
+        yield
+    finally:
+        for layer, previous in zip(layers, saved, strict=True):
+            layer._active_adapter = previous
+
+
+def _flash_ref_disable_adapter(self):
+    # this shim is only written for a warm start, so the snapshot must exist. falling back to the
+    # stock disable_adapter() here would silently anchor the kl term to the base -- the exact
+    # defect this patch removes -- and the run would look healthy while training the wrong thing.
+    module = self.module
+    inner = getattr(module, "_fsdp_wrapped_module", module)
+    if _FLASH_REF_ADAPTER not in getattr(inner, "peft_config", {{}}):
+        raise RuntimeError(
+            "flash kl reference adapter missing: expected " + _FLASH_REF_ADAPTER + " on the actor"
+        )
+    return _flash_ref_use_ref_adapter(module)
+
+
+_flash_ref_impl.FSDPEngine._build_lora_module = _flash_ref_build_lora_module
+_flash_ref_impl.FSDPEngine.disable_adapter = _flash_ref_disable_adapter
+'''
 
 
 def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
@@ -1970,12 +2083,6 @@ def _resolve_grpo_inputs():
     # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
     warmstart_adapter = ""
     if _t and getattr(_t, "init_from_adapter", ""):
-        if kl_coef > 0:
-            raise RuntimeError(
-                "warm-start (init_from_adapter) with kl_penalty_coef>0 anchors the kl reference to "
-                "the sft adapter; the verl backend's reference is the base, so this is not yet "
-                "supported. set kl_penalty_coef=0, or use the trl backend for kl-anchored warm-start."
-            )
         from flash.engine.worker.adapter import _download_adapter
 
         warmstart_adapter = _download_adapter(_t.init_from_adapter)
@@ -2335,6 +2442,9 @@ def run_rl_verl():
             render_image_pad_ban_shim(inp["image_pad_token_id"]),
             render_structured_outputs_shim(inp["structured_outputs"]),
             render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"]),
+            render_kl_ref_adapter_shim(
+                bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
+            ),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
             # which is resolved after this file is written. the shim is inert either way -- it only
             # fires when verl actually calls wandb.init, which requires wandb in the logger list.
