@@ -480,6 +480,10 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     def _require_chat_step_selector(self) -> None:
+        # cached after it first succeeds: this is a property of the control plane, not of the
+        # request. `env eval` sends one chat per case, so re-checking each time doubled the
+        # request count and let a single transient /v1/health blip fail an arbitrary case while
+        # the chat endpoint was healthy (codex[bot]).
         if self._chat_step_selector_available:
             return
         capabilities = self.health().get("capabilities")

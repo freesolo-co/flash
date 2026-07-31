@@ -385,14 +385,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=".",
         help="local environment directory or environment.py path",
     )
-    env_eval.add_argument("--suite", help="run only the named evaluation suite")
-    # the same knobs `env test` takes, for the same reason: an environment whose
-    # load_environment() requires a param cannot be loaded without them, and one that branches
-    # on a split would be graded against a different dataset than the run trains on.
+    # the same two knobs `env test` exposes, and for the same reason: an env whose
+    # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated
+    # at all without them, and a held-out suite scored against a differently-configured
+    # environment than the run trains on is not measuring the run (codex[bot]).
     env_eval.add_argument(
         "--split",
-        metavar="NAME",
-        help="dataset split to evaluate, matching [environment.params] split",
+        default=None,
+        help=(
+            "dataset split to evaluate against, matching [environment.params] split "
+            "(default: train)"
+        ),
     )
     env_eval.add_argument(
         "--param",
@@ -404,6 +407,7 @@ def _build_parser() -> argparse.ArgumentParser:
             'values parse as TOML scalars, so 1/true/"x" keep their types'
         ),
     )
+    env_eval.add_argument("--suite", help="run only the named evaluation suite")
     env_eval.add_argument(
         "--max-cases",
         type=positive_int,
