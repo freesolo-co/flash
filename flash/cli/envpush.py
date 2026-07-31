@@ -494,9 +494,15 @@ def _dynamic_import_name(node) -> str | None:
     name = getattr(func, "attr", None) or getattr(func, "id", None)
     if name not in ("import_module", "__import__"):
         return None
-    if not node.args:
-        return None
-    first = node.args[0]
+    # both accept the module as the keyword `name`, and that form imports identically. reading
+    # only the positional argument left `import_module(name="judge")` out of the archive, so the
+    # suite that passed locally -- its directory is importable there -- raised ModuleNotFoundError
+    # on its first published case (codex[bot]).
+    first = (
+        node.args[0]
+        if node.args
+        else next((kw.value for kw in node.keywords if kw.arg == "name"), None)
+    )
     if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
         return None
     # `import_module(".helper", package=...)` is relative; the sidecar directory is not a package,
