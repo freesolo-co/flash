@@ -2487,3 +2487,18 @@ def test_log_follow_progress_omits_cost_when_there_is_nothing_to_show() -> None:
     # no quote and no measured spend: don't print a misleading "cost=$0.0000".
     _state, progress = cli.commands._log_follow_progress({"state": "queued"}, "queued")
     assert "cost=" not in progress
+
+
+def test_log_follow_progress_shows_a_settled_zero_like_the_other_surfaces() -> None:
+    """A terminal $0.0000 is an answer, and the three surfaces have to give the same one.
+
+    `runs list` and `runs status` both print $0.0000 for a settled zero because run_cost returns
+    (0.0, False) there. Suppressing it only in follow made the same finished run read as costed in
+    one place and uncosted in another, which is the inconsistency, not the zero (cursor).
+    """
+    for state in sorted(cli.render.SETTLED_COST_STATES):
+        _state, progress = cli.commands._log_follow_progress(
+            {"state": state, "cost_usd": 0.0}, state
+        )
+        assert "cost=$0.0000" in progress, state
+        assert "~" not in progress, state

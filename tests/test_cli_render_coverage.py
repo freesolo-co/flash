@@ -429,7 +429,7 @@ def test_settled_cost_states_cover_every_runner_terminal_state() -> None:
     """
     from flash.runner import _FINISHED_AT_PRESERVED_STATES
 
-    assert render._SETTLED_COST_STATES == _FINISHED_AT_PRESERVED_STATES
+    assert render.SETTLED_COST_STATES == _FINISHED_AT_PRESERVED_STATES
 
 
 def test_run_cost_prefers_the_quote_while_a_run_is_live() -> None:

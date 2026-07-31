@@ -345,7 +345,7 @@ def money(value: float, decimals: int = 4) -> str:
 # 0.0, because the server only writes it on the terminal transition. kept here rather than imported
 # from flash.runner so this module stays stdlib-only; the set is asserted against the runner's
 # TERMINAL_STATES in the test suite so the two cannot drift.
-_SETTLED_COST_STATES = frozenset({"done", "failed", "cancelled", "dry_run", "deployed"})
+SETTLED_COST_STATES = frozenset({"done", "failed", "cancelled", "dry_run", "deployed"})
 
 
 def run_cost(obj: dict) -> tuple[float, bool]:
@@ -357,7 +357,7 @@ def run_cost(obj: dict) -> tuple[float, bool]:
     run is live so current spend is never understated as free.
     """
     settled = float(obj.get("cost_usd") or 0.0)
-    if str(obj.get("state") or "") in _SETTLED_COST_STATES:
+    if str(obj.get("state") or "") in SETTLED_COST_STATES:
         return settled, False
     if settled:
         # a live run that has already accrued a measured cost: that number beats the submit quote.
