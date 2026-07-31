@@ -128,6 +128,10 @@ def build_flash_grpo_multi_turn_agent_loop(
             response_ids: list[int] = []
             response_mask: list[int] = []
             response_logprobs: list[float] = []
+            # [start, end) of each model turn within response_ids, in turn order. verl right-pads
+            # response_ids on the right (agent_loop._postprocess pads with padding_side="right"),
+            # so these offsets index the response-width advantage tensor unchanged.
+            turn_spans: list[tuple[int, int]] = []
             prefix_ids = list(prompt_ids)
             have_logprobs = True
             generated_seconds = 0.0
@@ -188,7 +192,9 @@ def build_flash_grpo_multi_turn_agent_loop(
                         stop_sequences=stop_sequences,
                     )
                     turn_ids = turn["response_ids"]
+                    turn_start = len(response_ids)
                     response_ids.extend(turn_ids)
+                    turn_spans.append((turn_start, len(response_ids)))
                     response_mask.extend([1] * len(turn_ids))
                     if have_logprobs and generated.log_probs is not None:
                         response_logprobs.extend(list(generated.log_probs[: len(turn_ids)]))
@@ -247,6 +253,21 @@ def build_flash_grpo_multi_turn_agent_loop(
                     ),
                 )
                 reward_score = float(score_payload["score"])
+                # the bridge only sends `turns` when per-turn credit is active and the environment
+                # returned a validated per-turn vector; one entry per turn the bridge was told
+                # about. a count that disagrees with the spans this loop actually emitted cannot be
+                # aligned to tokens, so drop to episode credit rather than guess an alignment.
+                raw_turns = score_payload.get("turns")
+                turn_rewards = None
+                if raw_turns is not None:
+                    if len(raw_turns) == len(turn_spans):
+                        turn_rewards = [float(value) for value in raw_turns]
+                    else:
+                        print(
+                            f"[rl-verl] per-turn rewards ({len(raw_turns)}) do not match emitted "
+                            f"turns ({len(turn_spans)}); falling back to episode credit",
+                            flush=True,
+                        )
             finally:
                 if start_attempted:
                     # best effort: a failing close would mask the real error from the body above,
@@ -273,6 +294,15 @@ def build_flash_grpo_multi_turn_agent_loop(
                 # authoritative and the single-turn custom_reward_function is never consulted for
                 # these rows.
                 reward_score=reward_score,
+                # per-turn credit assignment. the bridge returns one reward per emitted turn when
+                # the environment scores turns and the run asked for per-turn credit; it returns
+                # None otherwise, and the advantage shim then falls back to episode credit for the
+                # whole group. carried through extra_fields because that is the only channel the
+                # agent loop transports into non_tensor_batch (agent_loop._postprocess).
+                extra_fields={
+                    "flash_turn_spans": list(turn_spans),
+                    "flash_turn_rewards": turn_rewards,
+                },
                 metrics={
                     "generate_sequences": generated_seconds,
                     "tool_calls": 0.0,

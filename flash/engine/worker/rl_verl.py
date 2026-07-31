@@ -1023,6 +1023,136 @@ if not getattr(
 '''
 
 
+def render_per_turn_credit_shim(per_turn_credit: bool) -> str:
+    """return the sitecustomize source that gives verl trl's per-turn group-relative credit.
+
+    verl credits a whole episode: ``compute_grpo_outcome_advantage`` centres one scalar per rollout
+    against its group and broadcasts it across every response token. trl's per-turn mode centres
+    each TURN against the same turn of its group siblings, so a good turn inside a bad episode
+    still gets positive advantage.
+
+    this wraps ``compute_advantage`` rather than registering a custom estimator. a registered
+    estimator would be the tidier hook, but ``compute_advantage`` forwards ``non_tensor_batch`` to
+    exactly one estimator by name (``if adv_estimator in (AdvantageEstimator.GDPO, "gdpo")``), so a
+    custom one could never see the spans it needs. wrapping keeps stock grpo as the baseline and
+    overwrites only the token axis, which is the same shape as trl's GRPOPerTurnTrainer overriding
+    its parent's scalar advantages.
+
+    the fallback is per GROUP, not per row: grpo centres each rollout against its group, so a group
+    holding a mix of per-turn and episode credit would compare quantities of different scales. one
+    unusable row therefore drops its whole group to episode credit.
+    """
+    if not per_turn_credit:
+        return ""
+    return '''
+import torch as _flash_pt_torch
+from verl.trainer.ppo import ray_trainer as _flash_pt_ray_trainer
+
+_flash_pt_original_compute_advantage = _flash_pt_ray_trainer.compute_advantage
+_flash_pt_logged = False
+
+
+def _flash_pt_rows(non_tensor_batch, batch_size):
+    """per-row (spans, turns) or None when this batch carries no usable per-turn metadata."""
+    spans_column = non_tensor_batch.get("flash_turn_spans")
+    rewards_column = non_tensor_batch.get("flash_turn_rewards")
+    if spans_column is None or rewards_column is None:
+        return None
+    if len(spans_column) != batch_size or len(rewards_column) != batch_size:
+        return None
+    rows = []
+    for spans, turns in zip(spans_column, rewards_column):
+        if spans is None or turns is None or len(spans) != len(turns):
+            # a row the loop could not align. keep the row so its group can be identified and
+            # dropped whole, rather than silently centring the rest against a smaller sample.
+            rows.append(None)
+            continue
+        rows.append(
+            (
+                tuple((int(start), int(end)) for start, end in spans),
+                tuple(float(value) for value in turns),
+            )
+        )
+    return rows
+
+
+def _flash_pt_per_turn_advantages(rows, index, episode_advantages):
+    """centre each turn against the same turn of its group; returns [B, width].
+
+    starts from stock grpo's own output and overwrites only the rows of groups that earned
+    per-turn credit. a group that falls back therefore keeps the exact tensor grpo produced rather
+    than a reconstruction of it -- there is no scalar to recover, so nothing can drift.
+    """
+    advantages = episode_advantages.clone()
+    groups = {}
+    for row_index, uid in enumerate(index):
+        groups.setdefault(uid, []).append(row_index)
+    for member_indexes in groups.values():
+        if any(rows[row_index] is None for row_index in member_indexes):
+            continue
+        for row_index in member_indexes:
+            advantages[row_index] = 0.0
+        turn_total = max(len(rows[row_index][1]) for row_index in member_indexes)
+        for turn_index in range(turn_total):
+            scoring = [
+                row_index
+                for row_index in member_indexes
+                if turn_index < len(rows[row_index][1])
+                and rows[row_index][0][turn_index][1] > rows[row_index][0][turn_index][0]
+            ]
+            if not scoring:
+                # every member emitted nothing for this turn; an empty turn carries no signal and
+                # must not skew the baseline for the members that did emit one.
+                continue
+            baseline = sum(rows[row_index][1][turn_index] for row_index in scoring) / len(scoring)
+            for row_index in scoring:
+                start, end = rows[row_index][0][turn_index]
+                advantages[row_index, start:end] = rows[row_index][1][turn_index] - baseline
+    return advantages
+
+
+def _flash_pt_compute_advantage(data, *args, **kwargs):
+    global _flash_pt_logged
+    data = _flash_pt_original_compute_advantage(data, *args, **kwargs)
+    episode = data.batch.get("advantages")
+    if episode is None or episode.dim() != 2:
+        return data
+    batch_size, width = episode.shape
+    rows = _flash_pt_rows(data.non_tensor_batch, batch_size)
+    if rows is None or all(row is None for row in rows):
+        return data
+    index = data.non_tensor_batch.get("uid")
+    if index is None or len(index) != batch_size:
+        return data
+    for row in rows:
+        if row is None:
+            continue
+        for start, end in row[0]:
+            if not 0 <= start <= end <= width:
+                raise ValueError(
+                    f"turn span [{start}, {end}) exceeds the response width {width}"
+                )
+    advantages = _flash_pt_per_turn_advantages(rows, index, episode)
+    if not bool(_flash_pt_torch.isfinite(advantages).all()):
+        raise ValueError("per-turn advantages must be finite")
+    # keep the response mask authoritative: glue tokens sit inside a turn span only when the
+    # environment reply was appended mid-turn, and they must never carry gradient.
+    response_mask = data.batch.get("response_mask")
+    if response_mask is not None:
+        advantages = advantages * response_mask.to(dtype=advantages.dtype)
+    data.batch["advantages"] = advantages
+    # returns feeds the critic, which grpo does not use; stock grpo sets it to the same tensor.
+    data.batch["returns"] = advantages
+    if not _flash_pt_logged:
+        print("[rl-verl] multi-turn per-turn group-relative credit is active", flush=True)
+        _flash_pt_logged = True
+    return data
+
+
+_flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage
+'''
+
+
 def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
     """return the sitecustomize source that adds trl's top-entropy token masking to verl.
 
@@ -1388,11 +1518,13 @@ class MultiTurnBridge:
         examples: list[dict],
         *,
         max_turns: int,
+        per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
     ) -> None:
         self._env = env
         self._examples = examples
         self._max_turns = int(max_turns)
+        self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every env touch below happens under this lock, matching the single-turn path's contract.
@@ -1491,11 +1623,9 @@ class MultiTurnBridge:
             aborted = session.get("aborted_turn")
             if aborted is not None:
                 transcript.append(aborted)
-        # per-turn credit is a separate invariant (it needs a custom verl advantage estimator), so
-        # only the episode reward crosses back. nan is score_rollouts' unscorable marker; verl has
-        # no equivalent, and a nan would propagate into the group baseline and poison every other
-        # rollout in the group, so an unscorable episode scores 0.0 the way a failed single-turn
-        # grading does.
+        # nan is score_rollouts' unscorable marker; verl has no equivalent, and a nan would
+        # propagate into the group baseline and poison every other rollout in the group, so an
+        # unscorable episode scores 0.0 the way a failed single-turn grading does.
         episode = float(reward.episode)
         if not math.isfinite(episode):
             print("[rl-verl] multi-turn episode unscorable; scoring 0.0", flush=True)
@@ -1504,7 +1634,14 @@ class MultiTurnBridge:
             # outside the lock: the callback is the caller's buffer, which has its own lock, and
             # nesting them in this order would invert the single-turn path's acquisition order.
             self._on_episode_scored(prompt, transcript, episode)
-        return {"score": episode}
+        if not self._per_turn_credit:
+            return {"score": episode}
+        # score_rollouts already validated the vector against turn_count and canonicalised an
+        # unusable one to None (multiturn_reward_scoring), so nothing further is checked here.
+        # None means this episode falls back to episode credit; the shim widens that fallback to
+        # the whole group so a group is never centred on a mix of the two.
+        turns = None if reward.turns is None else [float(value) for value in reward.turns]
+        return {"score": episode, "turns": turns}
 
     def close(self, payload: dict) -> dict:
         with self._lock:
@@ -2098,18 +2235,18 @@ def _resolve_grpo_inputs():
     # itself while accepting the key ("per-turn is equivalent to per-episode for single-turn
     # environments", rl.py). match that: log it, do not reject.
     #
-    # multi-turn is different. verl credits the episode: the agent loop returns one sequence with
-    # one reward on its last token. per-turn credit needs a custom advantage estimator AND turn
-    # spans plumbed into it (verl's generic estimator branch does not forward non_tensor_batch), so
-    # it is a separate change. reject rather than downgrade -- silently training per-episode when
-    # the config asks for per-turn is the worse failure.
+    # on multi-turn it centres each turn against the same turn of its group siblings instead of
+    # broadcasting one episode advantage across the transcript. the agent loop records a token span
+    # per turn, the bridge returns the env's per-turn vector alongside the episode reward, and a
+    # shim rewrites the advantage tensor after stock grpo has run; see
+    # render_per_turn_credit_shim.
     credit_assignment = getattr(_t, "credit_assignment", DEFAULT_CREDIT_ASSIGNMENT) if _t else None
-    if credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
-        if multi_turn:
-            raise RuntimeError(
-                f"verl grpo credits the whole episode; credit_assignment={credit_assignment} is "
-                "not supported for multi-turn environments"
-            )
+    per_turn_credit = bool(
+        credit_assignment
+        and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT
+        and multi_turn
+    )
+    if credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT and not multi_turn:
         print(
             f"[rl-verl] credit assignment: {credit_assignment} is equivalent to "
             f"{DEFAULT_CREDIT_ASSIGNMENT} for single-turn environments",
@@ -2376,6 +2513,7 @@ def _resolve_grpo_inputs():
         "think_penalty": think_penalty,
         "kl_coef": kl_coef,
         "entropy_quantile": entropy_quantile,
+        "per_turn_credit": per_turn_credit,
         "stop_sequences": stop_sequences,
         "structured_outputs": structured_outputs,
         "max_completion": max_completion,
@@ -2507,6 +2645,7 @@ def run_rl_verl():
         part
         for part in (
             render_entropy_quantile_shim(inp["entropy_quantile"]),
+            render_per_turn_credit_shim(inp["per_turn_credit"]),
             render_stop_sequences_shim(inp["stop_sequences"]),
             render_image_pad_ban_shim(inp["image_pad_token_id"]),
             render_structured_outputs_shim(inp["structured_outputs"]),
@@ -2603,6 +2742,7 @@ def run_rl_verl():
             env,
             rollout_examples,
             max_turns=int(inp["max_turns"]),
+            per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
         )
         if inp["multi_turn"]

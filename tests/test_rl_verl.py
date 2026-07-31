@@ -3232,6 +3232,7 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
     assert src.count("MultiTurnBridge(") == 1
     assert (
         'MultiTurnBridge( env, rollout_examples, max_turns=int(inp["max_turns"]), '
+        'per_turn_credit=bool(inp["per_turn_credit"]), '
         "on_episode_scored=observability.record, )" in src
     )
     assert 'if inp["multi_turn"] else None' in src
@@ -4272,3 +4273,293 @@ def test_nothing_is_previewed_for_a_step_before_the_first_boundary():
     assert buffer.latest() == ("p", "first", 0.5)
     assert buffer.latest_for_step(0) is None
     assert buffer.latest_for_step(1) is None
+
+
+def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
+    """execute the rendered shim against a stub verl and return the advantages it writes.
+
+    executing the source is the only test that can fail for the right reason: the shim's whole job
+    is to replace a module-global that verl calls by name, and a string assertion would pass just
+    as happily on a shim that never installed itself.
+    """
+    import sys
+    from types import ModuleType
+    from types import SimpleNamespace as NS
+
+    batch_size = len(uids)
+    width = episode_advantages.shape[1]
+    spans = np.empty(batch_size, dtype=object)
+    turns = np.empty(batch_size, dtype=object)
+    for row_index, row in enumerate(rows):
+        spans[row_index] = None if row is None else list(row[0])
+        turns[row_index] = None if row is None else list(row[1])
+
+    batch = {"advantages": episode_advantages}
+    if response_mask is not None:
+        batch["response_mask"] = response_mask
+    data = NS(
+        batch=batch,
+        non_tensor_batch={
+            "uid": np.array(uids, dtype=object),
+            "flash_turn_spans": spans,
+            "flash_turn_rewards": turns,
+        },
+    )
+
+    ray_trainer = ModuleType("verl.trainer.ppo.ray_trainer")
+    # stock grpo's contribution: the shim must call through to it and build on what it returns.
+    ray_trainer.compute_advantage = lambda payload, *args, **kwargs: payload
+    ppo = ModuleType("verl.trainer.ppo")
+    ppo.ray_trainer = ray_trainer
+    stubs = {
+        "verl": ModuleType("verl"),
+        "verl.trainer": ModuleType("verl.trainer"),
+        "verl.trainer.ppo": ppo,
+        "verl.trainer.ppo.ray_trainer": ray_trainer,
+    }
+    for name, module in stubs.items():
+        sys.modules[name] = module
+    try:
+        exec(compile(rl_verl.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        # call the module global by name, exactly as ray_trainer.fit does at its call site.
+        out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
+    finally:
+        for name in stubs:
+            sys.modules.pop(name, None)
+    return out.batch["advantages"]
+
+
+def test_per_turn_credit_shim_is_emitted_only_when_per_turn_credit_is_requested():
+    # the default path must put nothing on the child's import path: this shim replaces the
+    # advantage computation itself, so emitting it unconditionally would put every episode-credit
+    # run through a rewrite it never asked for.
+    assert rl_verl.render_per_turn_credit_shim(False) == ""
+    source = rl_verl.render_per_turn_credit_shim(True)
+    assert source
+    assert "_flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage" in source
+
+
+def test_per_turn_credit_shim_centres_each_turn_against_its_group_sibling():
+    pytest.importorskip("torch")
+    import torch
+
+    # two rollouts of the same prompt, two turns each, spans [0,2) and [2,4).
+    # turn 0: 1.0 vs 0.0 -> baseline 0.5 -> +0.5 / -0.5
+    # turn 1: 0.0 vs 1.0 -> baseline 0.5 -> -0.5 / +0.5
+    # the second rollout is the WORSE episode overall on turn 0 yet must still earn positive credit
+    # on turn 1; that inversion is the entire point of per-turn credit and episode credit cannot
+    # produce it.
+    rows = [
+        (((0, 2), (2, 4)), (1.0, 0.0)),
+        (((0, 2), (2, 4)), (0.0, 1.0)),
+    ]
+    advantages = _run_per_turn_shim(
+        rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32)
+    )
+    assert advantages[0].tolist() == [0.5, 0.5, -0.5, -0.5]
+    assert advantages[1].tolist() == [-0.5, -0.5, 0.5, 0.5]
+
+
+def test_per_turn_credit_shim_matches_trl_per_turn_advantages():
+    # the two backends must produce the SAME advantages for the same rollouts, which is what makes
+    # this a port rather than a second implementation. trl's builder is the reference oracle.
+    pytest.importorskip("torch")
+    import torch
+
+    from flash.engine.worker.grpo_perturn_trainer import build_per_turn_advantages
+
+    spans = [[(0, 3), (3, 5)], [(0, 2), (2, 6)]]
+    turns = [[0.25, 0.75], [1.0, 0.5]]
+    expected = build_per_turn_advantages(
+        spans,
+        turns,
+        num_generations=2,
+        completion_len=6,
+        # trl centres the episode itself; per-turn rows never read this, so its value is
+        # irrelevant to the comparison and any finite tensor proves the same thing.
+        episode_advantages=torch.zeros(2, dtype=torch.float32),
+    )
+    got = _run_per_turn_shim(
+        [(tuple(map(tuple, spans[0])), tuple(turns[0])),
+         (tuple(map(tuple, spans[1])), tuple(turns[1]))],
+        ["p0", "p0"],
+        torch.zeros((2, 6), dtype=torch.float32),
+    )
+    assert torch.allclose(got, expected)
+
+
+def test_per_turn_credit_shim_drops_a_whole_group_when_one_row_is_unusable():
+    pytest.importorskip("torch")
+    import torch
+
+    # an unscorable row (bridge returned turns=None) must not leave its group centred on a smaller
+    # sample: the surviving rows would be compared against a baseline built from a different
+    # population than grpo's own. the whole group keeps stock grpo's tensor untouched.
+    episode = torch.tensor([[0.3, 0.3, 0.3, 0.3], [-0.3, -0.3, -0.3, -0.3]], dtype=torch.float32)
+    advantages = _run_per_turn_shim(
+        [(((0, 2), (2, 4)), (1.0, 0.0)), None], ["p0", "p0"], episode.clone()
+    )
+    assert torch.equal(advantages, episode)
+
+
+def test_per_turn_credit_shim_leaves_other_groups_on_episode_credit():
+    pytest.importorskip("torch")
+    import torch
+
+    # the fallback is per group, not per batch: one broken group must not cost every other prompt
+    # in the step its per-turn credit.
+    episode = torch.zeros((4, 4), dtype=torch.float32)
+    episode[2] = 0.7
+    episode[3] = -0.7
+    rows = [
+        (((0, 2), (2, 4)), (1.0, 0.0)),
+        (((0, 2), (2, 4)), (0.0, 1.0)),
+        (((0, 2), (2, 4)), (1.0, 0.0)),
+        None,
+    ]
+    advantages = _run_per_turn_shim(rows, ["p0", "p0", "p1", "p1"], episode.clone())
+    assert advantages[0].tolist() == [0.5, 0.5, -0.5, -0.5]
+    # the broken group kept exactly what stock grpo produced. compared against the input tensor
+    # rather than a literal: 0.7 has no exact float32 representation, so a literal would compare
+    # the shim's output against a value grpo never actually held.
+    assert torch.equal(advantages[2], episode[2])
+    assert torch.equal(advantages[3], episode[3])
+
+
+def test_per_turn_credit_shim_ignores_a_turn_no_group_member_emitted():
+    pytest.importorskip("torch")
+    import torch
+
+    # a zero-width span is a turn the model never produced. it must be excluded from the BASELINE,
+    # not merely written nowhere: one sibling emits turn 1 and the other does not, so the emitting
+    # row is the only member and its advantage is 0.0. counting the absent member would centre it
+    # against a reward for tokens that do not exist -- here (2.0 - (2.0 + 8.0) / 2) = -3.0, a large
+    # negative signal on a turn the model actually produced.
+    rows = [
+        (((0, 2), (2, 4)), (1.0, 2.0)),
+        (((0, 2), (2, 2)), (0.0, 8.0)),
+    ]
+    advantages = _run_per_turn_shim(
+        rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32)
+    )
+    assert advantages[0].tolist() == [0.5, 0.5, 0.0, 0.0]
+    assert advantages[1].tolist() == [-0.5, -0.5, 0.0, 0.0]
+
+
+def test_per_turn_credit_shim_keeps_glue_tokens_out_of_the_gradient():
+    pytest.importorskip("torch")
+    import torch
+
+    # environment replies sit inside the transcript with response_mask 0. a turn span that reaches
+    # over one must not hand it advantage -- the model did not generate those tokens.
+    mask = torch.tensor([[1, 1, 0, 1], [1, 1, 0, 1]], dtype=torch.float32)
+    rows = [
+        (((0, 2), (2, 4)), (1.0, 0.0)),
+        (((0, 2), (2, 4)), (0.0, 1.0)),
+    ]
+    advantages = _run_per_turn_shim(
+        rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32), response_mask=mask
+    )
+    assert advantages[0].tolist() == [0.5, 0.5, 0.0, -0.5]
+    assert advantages[1].tolist() == [-0.5, -0.5, 0.0, 0.5]
+
+
+def test_per_turn_credit_shim_rejects_a_span_past_the_response_width():
+    pytest.importorskip("torch")
+    import torch
+
+    # a span beyond the tensor would silently write nothing (python slicing clamps), training on
+    # episode credit while the logs claim per-turn. fail loudly instead.
+    rows = [(((0, 2), (2, 99)), (1.0, 0.0)), (((0, 2), (2, 4)), (0.0, 1.0))]
+    with pytest.raises(ValueError, match="exceeds the response width"):
+        _run_per_turn_shim(rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32))
+
+
+def test_per_turn_credit_shim_passes_through_a_batch_without_per_turn_metadata():
+    # validation batches and any single-turn rollout carry no spans. the shim must return stock
+    # grpo's tensor untouched rather than zeroing a batch it cannot credit.
+    pytest.importorskip("torch")
+    import sys
+    from types import ModuleType
+    from types import SimpleNamespace as NS
+
+    import torch
+
+    episode = torch.full((2, 3), 0.4, dtype=torch.float32)
+    data = NS(batch={"advantages": episode.clone()}, non_tensor_batch={"uid": np.array(["p0", "p0"], dtype=object)})
+    ray_trainer = ModuleType("verl.trainer.ppo.ray_trainer")
+    ray_trainer.compute_advantage = lambda payload, *args, **kwargs: payload
+    ppo = ModuleType("verl.trainer.ppo")
+    ppo.ray_trainer = ray_trainer
+    stubs = {
+        "verl": ModuleType("verl"),
+        "verl.trainer": ModuleType("verl.trainer"),
+        "verl.trainer.ppo": ppo,
+        "verl.trainer.ppo.ray_trainer": ray_trainer,
+    }
+    for name, module in stubs.items():
+        sys.modules[name] = module
+    try:
+        exec(compile(rl_verl.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
+    finally:
+        for name in stubs:
+            sys.modules.pop(name, None)
+    assert torch.equal(out.batch["advantages"], episode)
+
+
+def test_per_turn_credit_is_resolved_only_for_multi_turn_and_reaches_the_bridge():
+    # single-turn envs cannot express per-turn credit (there is one turn), and trl says so while
+    # accepting the key. the verl resolver must match that, and must no longer REJECT multi-turn.
+    source = inspect.getsource(rl_verl._resolve_grpo_inputs)
+    assert "not supported for multi-turn environments" not in source
+    assert '"per_turn_credit": per_turn_credit' in source
+    run_source = inspect.getsource(rl_verl.run_rl_verl)
+    assert 'render_per_turn_credit_shim(inp["per_turn_credit"])' in run_source
+    assert 'per_turn_credit=bool(inp["per_turn_credit"])' in run_source
+
+
+def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
+    # the loop keys off the presence of `turns`, so an episode-credit run must not send the key at
+    # all: sending it would put every ordinary multi-turn run through the per-turn rewrite.
+    class _Env:
+        max_turns = 2
+
+        def new_rollout_state(self, example):
+            return {"prompt": [], "messages": []}
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            return [RolloutReward(episode=1.0, turns=(0.25, 0.75)) for _ in items]
+
+    examples = [{"question": "q"}]
+    episode_only = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2)
+    per_turn = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2, per_turn_credit=True)
+    for bridge in (episode_only, per_turn):
+        bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
+    assert episode_only.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0}
+    assert per_turn.score({"session_id": "s", "turn_count": 2}) == {
+        "score": 1.0,
+        "turns": [0.25, 0.75],
+    }
+
+
+def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
+    # score_rollouts canonicalises a bad vector to None. the bridge must forward that None rather
+    # than a partial list, so the group falls back cleanly.
+    class _Env:
+        max_turns = 2
+
+        def new_rollout_state(self, example):
+            return {"prompt": [], "messages": []}
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            # one reward for two turns: the validator rejects the count and drops to None.
+            return [RolloutReward(episode=1.0, turns=(0.5,)) for _ in items]
+
+    bridge = rl_verl.MultiTurnBridge(_Env(), [{"question": "q"}], max_turns=2, per_turn_credit=True)
+    bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
+    assert bridge.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0, "turns": None}
