@@ -277,20 +277,39 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
 def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> None:
     """Drop modules this sidecar load imported from its own package directory.
 
-    Only modules that (a) were absent before the load and (b) resolve to a file inside this
-    package directory. A stdlib or third-party module the sidecar imported first stays cached:
-    evicting it would re-execute unrelated code for every later load."""
+    Only modules that (a) were absent before the load and (b) resolve to a file anywhere under
+    this package directory. A stdlib or third-party module the sidecar imported first stays
+    cached: evicting it would re-execute unrelated code for every later load.
+
+    Anywhere under, not directly in: `from graders.rules import score` caches both `graders` and
+    `graders.rules`, and the latter's parent is the package dir's CHILD. Matching only immediate
+    children left it in sys.modules, so the next environment's `graders.rules` resolved to the
+    first one's -- scoring every later suite with another environment's grader, silently
+    (codex[bot])."""
     directory = Path(module_dir).resolve()
     for name in set(sys.modules) - before:
-        origin = getattr(getattr(sys.modules[name], "__spec__", None), "origin", None)
-        if not origin:
+        module = sys.modules[name]
+        origin = getattr(getattr(module, "__spec__", None), "origin", None)
+        if origin:
+            if _is_under(origin, directory):
+                sys.modules.pop(name, None)
             continue
-        try:
-            resolved = Path(origin).resolve()
-        except OSError:
-            continue
-        if resolved.parent == directory:
+        # a namespace package (a sibling dir with no __init__.py) has no origin at all, so an
+        # origin-only test leaves it cached. its __path__ recomputes from sys.path, so imports
+        # through it still resolve correctly, but the module object itself would outlive the
+        # load that created it.
+        search = getattr(module, "__path__", None)
+        if search is not None and any(_is_under(entry, directory) for entry in search):
             sys.modules.pop(name, None)
+
+
+def _is_under(path: str, directory: Path) -> bool:
+    """Whether `path` names a file or directory inside `directory`."""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    return directory in resolved.parents
 
 
 @contextmanager

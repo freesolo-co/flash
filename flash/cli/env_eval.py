@@ -142,6 +142,11 @@ def _score_case(suite, case: EvalCase, case_id: str, response: str) -> EvalResul
         )
 
 
+# the server's own names for a record that is serving traffic versus one still coming up
+# (flash/server/routes/serving.py). a busy record's `adapter_revision` is the INCOMING revision.
+_READY_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
+
+
 def _live_deployment(client, run_id: str) -> dict | None:
     """The revision a bare run id currently serves, whatever step it is on.
 
@@ -154,6 +159,15 @@ def _live_deployment(client, run_id: str) -> dict | None:
         listed = entry.get("deployment") or {}
         if run_id not in (listed.get("run_id"), entry.get("run_id")):
             continue
+        # a queued replacement is listed with the revision it is rolling OUT to, while the
+        # predecessor under `previous_deployment` is the one still answering requests. taking the
+        # busy record graded a revision that was not serving yet, and reported it as the run's
+        # score -- results attributed to the wrong weights (codex[bot]). `flash chat` reads the
+        # predecessor for exactly this reason (`_previous_ready_deployment`).
+        if listed.get("state") not in _READY_DEPLOYMENT_STATES:
+            previous = listed.get("previous_deployment")
+            if isinstance(previous, dict) and previous.get("state") in _READY_DEPLOYMENT_STATES:
+                listed = previous
         # the listing omits undeployed/dry_run rows, so anything here is servable.
         if not listed.get("run_id") and entry.get("run_id"):
             listed = {**listed, "run_id": entry["run_id"]}
@@ -568,6 +582,8 @@ def cmd_env_eval(args) -> int:
         # (codex[bot]). `_case_payload` tolerates a missing case, so a load failure records
         # its error rather than nothing.
         if args.upload:
+            # the errored-case downgrade lives in `_upload_report`, so it covers this call and the
+            # two load-failure ones above rather than only the path that happens to run cases.
             _upload_report(
                 report,
                 cases,
