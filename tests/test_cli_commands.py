@@ -124,7 +124,8 @@ class _FakeClient:
         self.calls.append(("undeploy", run_id))
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
-    def deployments(self) -> list[dict]:
+    def deployments(self, timeout: float | None = None) -> list[dict]:
+        self.calls.append(("deployments", timeout))
         return [
             {
                 "run_id": "flash-1",
@@ -135,6 +136,14 @@ class _FakeClient:
                 },
             }
         ]
+
+    def deployment_for(self, run_id: str) -> dict | None:
+        self.calls.append(("deployment_for", run_id))
+        for entry in self.deployments():
+            deployment = entry.get("deployment") or {}
+            if entry.get("run_id") == run_id.split("/", 1)[0]:
+                return {**deployment, "run_id": entry["run_id"]}
+        return None
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
@@ -601,6 +610,81 @@ def test_log_snapshot_reads_one_offset_page_without_status(fake_client, capsys) 
     out = capsys.readouterr().out
     assert out == "first\n"
     assert calls == [0]
+
+
+def _interrupt_the_stream(monkeypatch, fake_client) -> None:
+    """Make the next poll raise KeyboardInterrupt, i.e. the user pressed ctrl-c mid-stream."""
+
+    def _boom(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fake_client, "get_logs", _boom, raising=False)
+    monkeypatch.setattr(fake_client, "get_run", _boom, raising=False)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["train", "CONFIG"],
+        ["runs", "log", "flash-1", "--follow"],
+        ["runs", "status", "flash-1", "--follow"],
+    ],
+)
+def test_ctrl_c_while_following_says_the_run_is_still_billing(
+    argv, fake_client, monkeypatch, tmp_path, capsys
+) -> None:
+    """Ctrl-C stops the stream, not the run, and the output has to say so.
+
+    The generic handler printed "aborted", which reads as "the run stopped". It did not: the
+    remote run keeps going and keeps billing, so the next thing a user does is re-run
+    `flash train` and pay for a duplicate. Name the run and the command that actually stops it.
+    """
+    config = tmp_path / "sft.toml"
+    config.write_text(
+        "model = 'Qwen/Qwen3.5-0.8B'\nalgorithm = 'sft'\n"
+        "project = '11111111-1111-4111-8111-111111111111'\n"
+        "[environment]\nid = 'github:owner/repo@main:env/environment.py'\n"
+        "[train]\nepochs = 1\nmax_examples = 8\n"
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "create_run",
+        lambda *a, **k: {"run_id": "flash-1", "state": "queued"},
+        raising=False,
+    )
+    _interrupt_the_stream(monkeypatch, fake_client)
+
+    assert _run([str(config) if a == "CONFIG" else a for a in argv]) == 130
+    err = capsys.readouterr().err
+    assert "still going and still billing" in err
+    assert "flash runs cancel flash-1" in err
+    assert "flash runs log flash-1 --follow" in err
+    # the run was never cancelled on the user's behalf -- detaching is not stopping.
+    assert not any(c[0] == "cancel" for c in fake_client.calls)
+
+
+def test_train_submit_note_warns_that_ctrl_c_keeps_billing(
+    fake_client, monkeypatch, tmp_path, capsys
+) -> None:
+    """The hand-off note has to carry the same warning, before anyone reaches for ctrl-c."""
+    config = tmp_path / "sft.toml"
+    config.write_text(
+        "model = 'Qwen/Qwen3.5-0.8B'\nalgorithm = 'sft'\n"
+        "project = '11111111-1111-4111-8111-111111111111'\n"
+        "[environment]\nid = 'github:owner/repo@main:env/environment.py'\n"
+        "[train]\nepochs = 1\nmax_examples = 8\n"
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "create_run",
+        lambda *a, **k: {"run_id": "flash-1", "state": "queued"},
+        raising=False,
+    )
+
+    assert _run(["train", str(config)]) == 0
+    err = capsys.readouterr().err
+    assert "keeps billing" in err
+    assert "flash runs cancel flash-1" in err
 
 
 def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> None:
@@ -1306,6 +1390,756 @@ def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> 
     assert "once it is ready" not in err
 
 
+def _queued_deploy(monkeypatch, fake_client) -> None:
+    """Make POST deploy return what the control plane really returns: a queued record."""
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "queued"},
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+
+
+def test_deploy_without_wait_returns_while_still_queued(fake_client, monkeypatch, capsys) -> None:
+    """No --wait keeps the old behaviour: return immediately, do not poll."""
+    _queued_deploy(monkeypatch, fake_client)
+
+    assert _run(["models", "deploy", "flash-1"]) == 0
+    assert not any(c[0] == "deployment_for" for c in fake_client.calls)
+    assert "deployment state is 'queued'" in capsys.readouterr().err
+
+
+def test_deploy_wait_polls_until_the_revision_is_servable(fake_client, monkeypatch, capsys) -> None:
+    """--wait must not return while the requested revision is still queued.
+
+    deploy returns as soon as the record is persisted, which is normally before the new revision
+    can serve a token, so a caller that starts evaluating on that return hits the old revision or
+    an error. The wait is what makes the printed record mean "ready".
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    states = iter([{"state": "smoke_testing"}, {"state": "reconciling"}, {"state": "ready"}])
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: next(states), raising=False
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    out, err = capsys.readouterr()
+    assert "ready" in out
+    assert "queued" not in err
+    assert "ctrl-c stops waiting, not the deployment" in err
+
+
+def test_deploy_wait_stops_on_a_failed_revision(fake_client, monkeypatch, capsys) -> None:
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {"state": "failed", "error": "smoke generation failed"},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert "deployment failed: smoke generation failed" in capsys.readouterr().err
+
+
+def test_deploy_wait_gives_up_at_the_timeout_without_claiming_success(
+    fake_client, monkeypatch, capsys
+) -> None:
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {"state": "smoke_testing"},
+        raising=False,
+    )
+
+    # exit 1, not 0: --wait's contract is "the revision is servable when i return", and a timeout
+    # is precisely the case where it is not. exiting 0 here is what lets
+    # `deploy --wait && evaluate` proceed against a revision that never became servable.
+    assert _run(["models", "deploy", "flash-1", "--wait", "0.01"]) == 1
+    err = capsys.readouterr().err
+    assert "still 'smoke_testing' after 0.01s" in err
+    assert "flash models deployments" in err
+
+
+def test_deploy_wait_ends_when_the_deployment_stops_being_listed(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A run drops out of the listing once its deployment is gone, so that is terminal."""
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+    )
+
+    # the last record seen was still queued, so the requested revision never became servable.
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert "no longer an active deployment" in capsys.readouterr().err
+
+
+def test_deploy_wait_reports_a_rollback_to_a_different_checkpoint_step(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """An absent revision is not always a deleted one.
+
+    `deployment_for` matches the checkpoint step, so a failed `deploy RUN/step-40` that the plane
+    rolled back to step-20 reads as absent exactly like a deletion does. Reporting it as "no longer
+    an active deployment" named the wrong event and threw away `last_deploy_error`, which is the
+    only record of why step-40 did not take -- the restored record carries no `failed` state.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "queued", "requested_at": "T1"},
+        raising=False,
+    )
+    # the requested revision is gone from the listing; the predecessor is what is serving.
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "deployments",
+        lambda timeout=None: [
+            {
+                "run_id": "flash-1",
+                "deployment": {
+                    "run_id": "flash-1",
+                    "checkpoint_step": 20,
+                    "state": "ready",
+                    "requested_at": "T0",
+                    "last_deploy_error": "smoke test failed",
+                },
+            }
+        ],
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1/step-40", "--wait", "5"]) == 1
+    err = capsys.readouterr().err
+    assert "smoke test failed" in err, err
+    assert "previously deployed revision is still serving" in err, err
+    # the wrong explanation must be gone, not merely accompanied by the right one.
+    assert "no longer an active deployment" not in err, err
+
+
+def test_deploy_wait_reports_a_rollback_from_the_final_adapter(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A bare run id is a revision too, and its failed redeploy rolls back like any other.
+
+    `deploy flash-1` asks for the final adapter, which `parse_checkpoint_ref` reports as step
+    `None`. A run already serving `step-20` whose final-adapter redeploy fails is restored to
+    step-20 by `mark_deployment_failed`, and `deployment_for` rejects the restored record because
+    its non-null step does not match the requested final adapter -- so the bare-run form reads as
+    absent exactly like the `/step-N` form does. Exempting it from the rollback lookup reported the
+    run as vanished and dropped `last_deploy_error`.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "queued", "requested_at": "T1"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "deployments",
+        lambda timeout=None: [
+            {
+                "run_id": "flash-1",
+                "deployment": {
+                    "run_id": "flash-1",
+                    "checkpoint_step": 20,
+                    "state": "ready",
+                    "requested_at": "T0",
+                    "last_deploy_error": "adapter merge failed",
+                },
+            }
+        ],
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 1
+    err = capsys.readouterr().err
+    assert "adapter merge failed" in err, err
+    assert "previously deployed revision is still serving" in err, err
+    assert "no longer an active deployment" not in err, err
+
+
+def test_deploy_wait_rollback_lookup_stays_inside_the_deadline(fake_client, monkeypatch) -> None:
+    """The rollback read is one more read inside the wait, not a second full-length one.
+
+    It runs after a poll that has already spent part of the budget, so bounding it by the
+    remainder computed BEFORE that poll hands it time the wait no longer has: a `--wait 5` whose
+    poll consumed nearly all five seconds could block for close to ten.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    def _poll(run_id, timeout=None):
+        # a stalled plane answers at its bound, which is what leaves nothing for the next read.
+        clock["t"] += timeout if timeout is not None else 0.0
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+    reads: list[tuple[float, float | None]] = []
+
+    def _listing(timeout=None):
+        reads.append((clock["t"], timeout))
+        return []
+
+    monkeypatch.setattr(fake_client, "deployments", _listing, raising=False)
+
+    assert _run(["models", "deploy", "flash-1/step-40", "--wait", "5"]) == 1
+    assert reads, "the vanished branch issued no rollback lookup"
+    for start, bound in reads:
+        assert bound is not None, reads
+        # the expired case is allowed the zero-wait one-shot bound and nothing wider.
+        assert bound <= max(5.0 - start, cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS) + 0.001, reads
+
+
+def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A remainder can be positive and still be too small to read in.
+
+    The bound above keeps this lookup inside the deadline; this one keeps it able to finish. The
+    poll before it lands the wait a hair short of the deadline, so the remainder is positive and
+    tiny -- and passing it through means the listing read times out, `_rollback_record` swallows the
+    error, and the CLI reports the run as vanished instead of printing `last_deploy_error`. The
+    zero-wait floor covers the expired case only, so it does not apply (cursor).
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+    # stop a hair inside the deadline: positive remainder, far too little to complete a read.
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: clock.__setitem__("t", 5.0 - 0.002),
+        raising=False,
+    )
+    rolled_back = {
+        "run_id": "flash-1",
+        "state": "deployed",
+        "checkpoint_step": 20,
+        "last_deploy_error": "adapter load failed",
+    }
+
+    def _listing(timeout=None):
+        # a real client cannot answer inside a bound this small; it raises at it.
+        if timeout is not None and timeout < cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS:
+            raise cli.commands.ClientError("read timed out")
+        return [{"run_id": "flash-1", "deployment": rolled_back}]
+
+    monkeypatch.setattr(fake_client, "deployments", _listing, raising=False)
+
+    assert _run(["models", "deploy", "flash-1/step-40", "--wait", "5"]) == 1
+    err = capsys.readouterr().err
+    assert "adapter load failed" in err, err
+    assert "no longer an active deployment" not in err, err
+
+
+@pytest.mark.parametrize(
+    ("rows", "why"),
+    [
+        ([], "genuinely deleted"),
+        (
+            [{"run_id": "other", "deployment": {"run_id": "other", "last_deploy_error": "x"}}],
+            "another run entirely",
+        ),
+        (
+            [{"run_id": "flash-1", "deployment": {"run_id": "flash-1", "checkpoint_step": 20}}],
+            "same run, no recorded error, so nothing ties it to this request",
+        ),
+    ],
+)
+def test_deploy_wait_still_reports_a_vanished_deployment_as_vanished(
+    fake_client, monkeypatch, capsys, rows, why
+) -> None:
+    """The rollback lookup must not swallow the deletion case it was added beside.
+
+    Matching on the run id alone is deliberately wider than `deployment_for`, so each of these has
+    to stay out: without the `last_deploy_error` requirement this would report an unrelated or
+    concurrently-deployed revision as this command's rollback.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+    )
+    monkeypatch.setattr(fake_client, "deployments", lambda timeout=None: rows, raising=False)
+
+    assert _run(["models", "deploy", "flash-1/step-40", "--wait", "5"]) == 1
+    assert "no longer an active deployment" in capsys.readouterr().err, why
+
+
+def test_deploy_wait_survives_a_transient_control_plane_error(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """One failed poll must not fail a deploy that is progressing fine."""
+    _queued_deploy(monkeypatch, fake_client)
+    results = iter([cli.commands.ClientError("503"), {"state": "ready"}])
+
+    def _next(run_id, timeout=None):
+        value = next(results)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(fake_client, "deployment_for", _next, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert "ready" in capsys.readouterr().out
+
+
+def test_deploy_wait_zero_polls_once_instead_of_being_treated_as_no_wait(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """`--wait 0` is an explicit bound, not an absent flag.
+
+    Gating on truthiness makes 0.0 indistinguishable from None, so the one value that means
+    "check, but do not block" silently became "do not check at all" and exited 0 on a queued
+    record.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {"state": "smoke_testing"},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 1
+    assert "waiting up to 0s" in capsys.readouterr().err
+
+
+def test_deploy_wait_rejects_a_restored_previous_revision(fake_client, monkeypatch, capsys) -> None:
+    """A failed redeploy leaves a `ready` record for the PREVIOUS revision.
+
+    mark_deployment_failed restores the old deployment verbatim and records the failure only in
+    last_deploy_error, so trusting the state word reports success while the requested checkpoint
+    is not the one serving.
+    """
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {
+            "run_id": run_id,
+            "state": "queued",
+            "requested_at": "2026-07-29T02:00:00Z",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {
+            "state": "ready",
+            "requested_at": "2026-07-29T01:00:00Z",
+            "last_deploy_error": "adapter load failed",
+        },
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    err = capsys.readouterr().err
+    assert "did not become servable" in err
+    assert "adapter load failed" in err
+
+
+def test_deploy_wait_accepts_a_ready_revision_carrying_a_stale_error(
+    fake_client, monkeypatch
+) -> None:
+    """A last_deploy_error from an EARLIER attempt must not fail the attempt that succeeded.
+
+    The stamps match here, so this record is the revision that was just asked for; treating any
+    recorded error as failure would make every retry-after-failure report failure forever.
+    """
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {
+            "run_id": run_id,
+            "state": "queued",
+            "requested_at": "2026-07-29T02:00:00Z",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {
+            "state": "ready",
+            "requested_at": "2026-07-29T02:00:00Z",
+            "last_deploy_error": "a previous attempt failed",
+        },
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+
+
+def test_deploy_wait_bounds_each_poll_by_the_remaining_time(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """An unbounded read inside a short wait overshoots the deadline the user set.
+
+    The client default is 60s, so `--wait 5` could block roughly a minute inside a single stalled
+    request while reporting that it waited five seconds.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    seen: list[float | None] = []
+
+    def _poll(run_id, timeout=None):
+        seen.append(timeout)
+        return {"state": "ready"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 0
+    assert seen == [pytest.approx(5.0, abs=0.5)]
+
+
+def test_deploy_wait_zero_actually_reads_the_current_state(fake_client, monkeypatch) -> None:
+    """`--wait 0` means "check once, do not block" -- it must issue that one read.
+
+    The deadline was evaluated before the first poll, so a zero budget was already expired on entry
+    and deployment_for never ran. Readiness was then judged from the POST body, which is `queued` on
+    every normal async deploy, so `--wait 0` could not succeed even against a ready revision.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    polls: list[str] = []
+
+    def _poll(run_id, timeout=None):
+        polls.append(run_id)
+        return {"state": "ready"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 0
+    assert polls == ["flash-1"], polls
+
+
+def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
+    fake_client, monkeypatch
+) -> None:
+    """No read may still be running past the deadline the caller set.
+
+    The remaining time was computed once before sleeping, so the post-sleep request still went out
+    with the 1.0s floor: `--wait 0.1` against a stalled plane blocked for over a second past the
+    bound it advertised.
+
+    Asserted as "every read finishes by the deadline" rather than as a read COUNT. The count was a
+    proxy for it under the original behaviour, where the only way to be late was an extra read; it
+    stopped tracking the invariant once the final window began funding a read of its own, which is
+    a bounded read strictly inside the deadline rather than an overshoot. Keeping the count would
+    have made this test forbid the fix to the blind spot it shares a loop with.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    # the sleep is what burns the budget, exactly as a real one would.
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+    reads: list[tuple[float, float | None]] = []
+
+    def _poll(run_id, timeout=None):
+        reads.append((clock["t"], timeout))
+        return {"state": "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0.1"]) == 1
+    assert reads, "the wait issued no read at all"
+    # a read starting at `start` and bounded by `bound` occupies the plane until start+bound, so
+    # that sum is what has to stay within the advertised wait. this is the assertion the 1.0s floor
+    # violated: it put a 0.1s wait on the hook for a full second.
+    for start, bound in reads:
+        assert bound is not None, reads
+        assert start + bound <= 0.1 + 0.001, reads
+
+
+@pytest.mark.parametrize("state", ["revocation_failed", "some_state_a_newer_plane_added"])
+def test_deploy_wait_fails_closed_on_a_terminal_state_that_is_not_ready(
+    fake_client, monkeypatch, capsys, state
+) -> None:
+    """Leaving the busy set is not the same as being servable.
+
+    `revocation_failed` is a real persisted state (a concurrent undeploy whose backend cleanup
+    failed), and an unknown state arrives on any client/server skew. Both are non-busy, so gating
+    success on "not busy" exited 0 with nothing actually serving.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None: {"state": state},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    err = capsys.readouterr().err
+    assert "not\nservable" in err or "not servable" in err, err
+    assert "once it is ready" not in err, err
+
+
+def test_deploy_wait_rejects_a_superseding_deploy_that_carries_no_error(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A concurrent deploy for the same run reaches ready on ITS checkpoint, with no error at all.
+
+    Returning early whenever last_deploy_error was absent meant the stamps were never compared on
+    exactly the case that needs them, so `deploy --wait && evaluate` reported success and then
+    evaluated the other shell's revision.
+    """
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {
+            "run_id": run_id,
+            "state": "queued",
+            "requested_at": "2026-07-29T02:00:00Z",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        fake_client,
+        "deployment_for",
+        # ready, no error, different attempt: someone else's deploy.
+        lambda run_id, timeout=None: {
+            "state": "ready",
+            "requested_at": "2026-07-29T03:00:00Z",
+        },
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert "once it is ready" not in capsys.readouterr().err
+
+
+def test_deploy_wait_observes_readiness_inside_a_short_window(fake_client, monkeypatch) -> None:
+    """Sleeping the entire remainder spends the budget without ever looking again.
+
+    With a `--wait 5` and a 5s poll interval, the first read saw `queued`, the sleep consumed all
+    five seconds, and the deadline check exited: a revision that became ready one second in was
+    still reported as queued and the command exited 1.
+    """
+    # _queued_deploy stubs sleep to a no-op, so install the clock AFTER it: a frozen monotonic with
+    # a non-advancing sleep is an infinite poll, which is a broken test rather than a caught defect.
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    def _poll(run_id, timeout=None):
+        # ready one second into the five-second window.
+        return {"state": "ready" if clock["t"] >= 1.0 else "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 0
+
+
+def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, monkeypatch) -> None:
+    """The last second of a wait must still be watched, not slept through.
+
+    The per-sleep reserve was subtracted only when the slice EXCEEDED it, so a remainder at or under
+    the reserve was slept whole and the deadline check ended the wait with no further read. `--wait
+    1` therefore could not succeed at all against an async deploy -- one read at t=0, then a full
+    second of sleep -- and every longer wait was blind through its final second.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    def _poll(run_id, timeout=None):
+        # ready half a second into the one-second window.
+        return {"state": "ready" if clock["t"] >= 0.5 else "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 0
+
+
+def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeypatch) -> None:
+    """Splitting the final window must be the wait's last sleep, not a converging series.
+
+    Reserving a FRACTION of the remainder rather than a fixed slice never drives the remainder to
+    zero, so the loop terminates only on the clock's granularity. Against a stalled plane that is an
+    unbounded burst of reads inside the last second -- the failure mode the fixed reserve was chosen
+    to avoid, reintroduced at the one point the reserve does not apply.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+    reads = []
+
+    def _poll(run_id, timeout=None):
+        reads.append(clock["t"])
+        # never settles: the wait has to end on its own budget, not on the plane's answer.
+        return {"state": "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 1
+    # the up-front read plus the one the split funds. a fractional reserve makes this grow without
+    # bound; asserting the exact count is what keeps the split from silently becoming that.
+    assert len(reads) == 2, reads
+
+
+def test_deploy_wait_zero_does_not_block_past_its_own_bound(fake_client, monkeypatch) -> None:
+    """`--wait 0` advertises "check once, do not block", so its one read must be bounded tightly.
+
+    A ten-second fixed budget let a stalled plane hold a zero-second wait for ten seconds, which is
+    the same overshoot the per-poll bound exists to prevent, just smaller.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    seen: list[float | None] = []
+
+    def _poll(run_id, timeout=None):
+        seen.append(timeout)
+        return {"state": "ready"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 0
+    assert seen == [pytest.approx(1.0, abs=0.001)], seen
+
+
+def test_deploy_wait_rejects_a_synchronous_failure_that_returns_the_restored_revision(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A synchronous deploy returns the FINISHED record, never the queued attempt.
+
+    Under FLASH_DEPLOY_SYNC the POST answers after the job ran, so on failure it returns the
+    restored previous `ready` revision. requested and final are then the same row, their stamps
+    match by construction, and comparing identity accepted a deploy that never happened.
+    """
+    settled = {
+        "run_id": "flash-1",
+        "state": "ready",
+        "requested_at": "2026-07-29T01:00:00Z",
+        "last_deploy_error": "adapter load failed",
+    }
+    monkeypatch.setattr(fake_client, "deploy", lambda run_id, **_: dict(settled), raising=False)
+    # non-busy on arrival, so _await_deployment returns it without polling at all.
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: dict(settled), raising=False
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    err = capsys.readouterr().err
+    assert "did not become servable" in err, err
+    assert "adapter load failed" in err, err
+
+
+def test_deploy_wait_accepts_a_synchronous_success(fake_client, monkeypatch) -> None:
+    """The synchronous check keys on a recorded error, so a clean sync deploy still succeeds."""
+    settled = {"run_id": "flash-1", "state": "ready", "requested_at": "2026-07-29T02:00:00Z"}
+    monkeypatch.setattr(fake_client, "deploy", lambda run_id, **_: dict(settled), raising=False)
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: dict(settled), raising=False
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+
+
+def test_deploy_notes_name_this_channels_executable(fake_client, monkeypatch, capsys) -> None:
+    """The dev channel installs `flash-dev`; a hardcoded `flash ...` hint is not runnable there."""
+    monkeypatch.setattr(cli.commands, "CLI_NAME", "flash-dev")
+    _queued_deploy(monkeypatch, fake_client)
+
+    assert _run(["models", "deploy", "flash-1"]) == 0
+    err = capsys.readouterr().err
+    assert "flash-dev models deployments" in err, err
+    assert "`flash models" not in err, err
+
+
+def test_deploy_wait_stops_retrying_a_rejected_key(fake_client, monkeypatch, capsys) -> None:
+    """401/403 answers the same way every time, so polling through it just burns the timeout.
+
+    The broad ClientError catch treated a permanent rejection as a transient blip and retried to
+    the full default 30-minute deadline before reporting "still queued".
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    calls: list[int] = []
+
+    def _denied(run_id, timeout=None):
+        calls.append(1)
+        raise cli.commands.ApiError(403, "forbidden")
+
+    monkeypatch.setattr(fake_client, "deployment_for", _denied, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert len(calls) == 1
+    assert "cannot check flash-1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "-1"])
+def test_deploy_wait_rejects_a_timeout_that_would_never_expire(fake_client, value, capsys) -> None:
+    """`float` accepts nan and inf, and a NaN deadline makes every `remaining <= 0` false.
+
+    The loop then polls forever while the user believes they set a bound, which is worse than the
+    unbounded default because the printed timeout says otherwise. Written as `--wait=VALUE` so a
+    leading-dash value reaches the validator instead of being read as another option.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        _run(["models", "deploy", "flash-1", f"--wait={value}"])
+    assert excinfo.value.code == 2
+    assert "--wait" in capsys.readouterr().err
+
+
+def test_deploy_wait_before_the_run_id_names_the_real_mistake(fake_client, capsys) -> None:
+    """`--wait` takes an optional value, so `deploy --wait flash-1` eats the run id.
+
+    argparse cannot hand the token back, so the error has to say which argument was swallowed;
+    the bare "invalid float value: 'flash-1'" reads as if the run id itself were malformed.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        _run(["models", "deploy", "--wait", "flash-1"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "if 'flash-1' is the run id" in err
+    assert "deploy flash-1 --wait" in err
+
+
+def test_deploy_wait_skips_polling_for_a_dry_run(fake_client, monkeypatch, capsys) -> None:
+    """A dry run creates no deployment, so there is nothing to wait on."""
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "dry_run"},
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--dry-run", "--wait"]) == 0
+    assert not any(c[0] == "deployment_for" for c in fake_client.calls)
+    assert "ctrl-c stops waiting" not in capsys.readouterr().err
+
+
 def test_log_follow_progress_includes_heartbeat_age() -> None:
     """The follow spinner must show a live heartbeat age so a long quiet phase reads as
     "alive, throttled" instead of a frozen line."""
@@ -1333,6 +2167,196 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
     malformed = {"state": "running", "last_heartbeat": {"stage": "sft_step", "ts": "oops"}}
     _, progress = _log_follow_progress(malformed, "unknown")
     assert "hb=" not in progress  # non-numeric ts -> no fabricated age
+
+
+def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
+    """A preemption relaunch rewinds the step counter while the state stays "running", so the
+    follow line must name the attempt or the rewind reads as lost progress with no cause."""
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    # attempts are 0-based, so a first attempt must stay unannotated.
+    first = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
+    }
+    _, progress = _log_follow_progress(first, "unknown")
+    assert "step=455" in progress
+    assert "attempt=" not in progress
+
+    # relaunched on fresh hardware: same state, step back to 0, attempt incremented.
+    relaunched = {
+        "state": "running",
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": "boot", "step": 0, "ts": _time.time(), "attempt": 1},
+    }
+    state, progress = _log_follow_progress(relaunched, "unknown")
+    assert state == "running"
+    assert "step=0" in progress
+    assert "attempt=1" in progress
+
+    malformed = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_step", "ts": _time.time(), "attempt": "two"},
+    }
+    _, progress = _log_follow_progress(malformed, "unknown")
+    assert "attempt=" not in progress  # non-integer attempt -> no fabricated identity
+
+    # the relaunch window this line exists to explain: `remote.attempt` has advanced but the
+    # replacement worker has not published a heartbeat yet, so `last_heartbeat` is still the
+    # superseded attempt's ping. reading the heartbeat here leaves the first preemption entirely
+    # unlabelled (its stale attempt is 0) and names the previous attempt on every later one.
+    mid_relaunch = {
+        "state": "running",
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
+    }
+    _, progress = _log_follow_progress(mid_relaunch, "unknown")
+    assert "attempt=1" in progress
+    # ...and the step it is printed next to belongs to attempt 0, so it must not read as attempt
+    # 1's progress. see test_log_follow_progress_marks_a_stale_heartbeats_fields.
+    assert "(prev attempt)" in progress
+
+    # `remote` is absent on planes that do not surface it, so the heartbeat still has to answer.
+    no_remote = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_step", "step": 12, "ts": _time.time(), "attempt": 2},
+    }
+    _, progress = _log_follow_progress(no_remote, "unknown")
+    assert "attempt=2" in progress
+
+
+@pytest.mark.parametrize("heartbeat_attempt", [0, 1])
+def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
+    heartbeat_attempt: int,
+) -> None:
+    """A supervised retry publishes `remote: null` for its whole allocation window.
+
+    `flash/runner/lifecycle.py` clears `remote` before reserving the replacement attempt and does
+    not persist the new one until the provider handle lands, so throughout that window flash serves
+    a running record whose only attempt identity is the superseded worker's ping. Falling back to it
+    there reintroduced exactly what preferring `remote` was meant to fix: the first retry unlabelled
+    (its stale attempt is 0), later ones naming the *previous* attempt (codex[bot]).
+
+    Both parametrizations are the same window one retry apart, and both must refuse the ping.
+
+    Keyed on an explicit null rather than a missing key, which is what makes it decidable:
+    `on_handle` persists `remote` in the same `_update` that sets `running`, so a running flash
+    record with a heartbeat and no remote is a worker already torn down. An ABSENT `remote` still
+    falls back -- that is a plane which never surfaces the field, covered above.
+    """
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    _, progress = _log_follow_progress(
+        {
+            "state": "running",
+            "remote": None,
+            "last_heartbeat": {
+                "stage": "sft_step",
+                "step": 455,
+                "ts": _time.time(),
+                "attempt": heartbeat_attempt,
+            },
+        },
+        "unknown",
+    )
+    # no identity is claimed: the replacement is not reserved yet, and a wrong number is worse than
+    # none for the one field that exists to explain the rewind.
+    assert "attempt=" not in progress, progress
+    # ...and the ping it did print belongs to the torn-down worker, so it must not read as the
+    # replacement's progress.
+    assert "step=455" in progress, progress
+    assert "(prev attempt)" in progress, progress
+    assert progress.index("step=455") < progress.index("(prev attempt)"), progress
+
+
+def test_log_follow_progress_names_the_attempt_before_the_first_heartbeat() -> None:
+    """The relaunch has to be named while the replacement worker is still cold.
+
+    An attempt preempted before it published a ping leaves `last_heartbeat` absent while
+    `remote.attempt` has already advanced. Resolving the attempt inside the heartbeat block made
+    the line print a bare `running` for the whole cold start -- silent through exactly the window
+    the attempt counter exists to explain, and the window a user is most likely to be watching.
+    """
+    from flash.cli.commands import _log_follow_progress
+
+    state, progress = _log_follow_progress(
+        {"state": "running", "remote": {"attempt": 1}, "last_heartbeat": None},
+        "running",
+    )
+    assert state == "running"
+    assert "attempt=1" in progress, progress
+    # nothing heartbeat-sourced exists to qualify, so the marker would have nothing to cover.
+    assert "(prev attempt)" not in progress, progress
+
+    # still 0-based with no heartbeat: a first attempt stays unannotated.
+    _, first = _log_follow_progress(
+        {"state": "running", "remote": {"attempt": 0}, "last_heartbeat": None},
+        "running",
+    )
+    assert "attempt=" not in first, first
+
+
+def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
+    """stage/step come from the heartbeat, attempt from `remote` -- during a relaunch those differ.
+
+    Printed unqualified, `stage=sft_step step=455 attempt=1` says the replacement worker has run
+    455 steps. It has not: it restarted from zero, and 455 is the superseded worker's last ping.
+    That is the exact rewind the attempt counter was added to explain, reported as if it never
+    happened.
+
+    Marked rather than suppressed: the run did reach step 455, and dropping the fields entirely
+    would read as a worker that has produced nothing.
+    """
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    _, progress = _log_follow_progress(
+        {
+            "state": "running",
+            "remote": {"attempt": 1},
+            "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
+        },
+        "unknown",
+    )
+    assert "step=455" in progress
+    assert "attempt=1" in progress
+    assert "(prev attempt)" in progress, progress
+
+    # the marker's scope is positional, so ordering is the contract: everything before it came
+    # from the superseded ping, everything after is live. `hb=` has to sit inside that span --
+    # the age is the old worker's ping too, so a fresh `hb=<1m` printed past the marker reads as
+    # the replacement worker being alive when nothing has been heard from it at all.
+    assert progress.index("step=455") < progress.index("(prev attempt)"), progress
+    assert progress.index("hb=") < progress.index("(prev attempt)"), progress
+    assert progress.index("(prev attempt)") < progress.index("attempt=1"), progress
+
+    # a heartbeat from the live attempt is not stale, so nothing is marked.
+    _, current = _log_follow_progress(
+        {
+            "state": "running",
+            "remote": {"attempt": 1},
+            "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 1},
+        },
+        "unknown",
+    )
+    assert "step=455" in current
+    assert "(prev attempt)" not in current, current
+
+    # no `remote` means the live attempt is unknown, so staleness is unprovable -- marking there
+    # would label every ordinary heartbeat on a plane that does not surface `remote`.
+    _, no_remote = _log_follow_progress(
+        {
+            "state": "running",
+            "last_heartbeat": {"stage": "sft_step", "step": 12, "ts": _time.time(), "attempt": 2},
+        },
+        "unknown",
+    )
+    assert "(prev attempt)" not in no_remote, no_remote
 
 
 @pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])

@@ -1255,21 +1255,18 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
 
 
 def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatch):
-    import flash.runner as runner_mod
-    import flash.server.app as app_mod
+    # fail inside adapter resolution itself, which is where an internal storage ref can come from.
+    # stubbing the whole of prepare_job instead would assert something broader than this test's
+    # name: that EVERY submit failure is redacted for a warm-start run, including gpu sizing and
+    # budget, which fail identically for the non-warm-start runs that never redacted them.
+    import flash.runner as runner
 
-    # raise the tagged warm-start error: real adapter-resolution failures are raised inside
-    # prepare_job by _prepare_init_from_adapter, which tags everything it raises, so this is the
-    # error shape the route actually sees. use the reloaded module's class, since the api fixture
-    # reloads flash.runner and a bound import here would be a different object.
     internal_ref = "private-owner/private-repo:sft/source-run/checkpoints/step-20"
-    monkeypatch.setattr(
-        app_mod,
-        "prepare_job",
-        lambda *a, **k: (_ for _ in ()).throw(
-            runner_mod.WarmStartPreparationError(f"failed to read {internal_ref}")
-        ),
-    )
+
+    def _boom(spec, **kwargs):
+        raise RuntimeError(f"failed to read {internal_ref}")
+
+    monkeypatch.setattr(runner, "_prepare_init_from_adapter_inner", _boom)
     spec = {
         **SPEC,
         "train": {**SPEC["train"], "init_from_adapter": "source-run/step-20"},
@@ -1286,6 +1283,36 @@ def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatc
     assert "source-run/step-20" in detail
     assert "private-owner" not in resp.text
     assert "private-repo" not in resp.text
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, monkeypatch):
+    # the companion direction to the redaction above. a failure raised OUTSIDE adapter resolution
+    # keeps its own message, so a warm-start run told to check its adapter really has an adapter
+    # problem. the previous broad except rewrote every prepare_job failure into the adapter
+    # message, sending users to re-verify a healthy adapter while the real cause never arrived.
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(
+        app_mod,
+        "prepare_job",
+        lambda *a, **k: (_ for _ in ()).throw(ValueError("no configured provider can provision")),
+    )
+    spec = {
+        **SPEC,
+        "train": {**SPEC["train"], "init_from_adapter": "source-run/step-20"},
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec},
+    )
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "no configured provider can provision" in detail
+    assert "could not be prepared" not in detail
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
@@ -4674,6 +4701,84 @@ def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "ready"
+
+
+def test_chat_forwards_trained_stop_sequences(api, monkeypatch):
+    """A run trained with stop_sequences terminates on its delimiter, not EOS. The deployment smoke
+    forwards them, so the adapter verifies and activates -- but if user inference does not, the same
+    model runs on to max_tokens or emits trailing text past its answer on every real request."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    spec = json.loads(json.dumps(SPEC))
+    spec["train"] = {**spec["train"], "stop_sequences": ["</answer>"]}
+    run_id = api.post(
+        "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+
+    seen: dict = {}
+
+    def serve_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["stop"] == ["</answer>"]
+
+
+def test_chat_sends_no_stop_when_run_configured_none(api, monkeypatch):
+    """A run that never configured a delimiter must not receive one."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "b" * 40
+    runner.mark_deployed(
+        run_id,
+        {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+
+    seen: dict = {}
+
+    def serve_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["stop"] is None
 
 
 def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):

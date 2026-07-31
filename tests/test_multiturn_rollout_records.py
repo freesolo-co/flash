@@ -216,3 +216,32 @@ def test_make_env_glue_rejects_non_verbatim_template():
     glue = make_env_glue(_BadTok(), thinking=False)
     with pytest.raises(ValueError, match="could not uniquely locate its probe"):
         glue([{"role": "user", "content": "obs"}])
+
+
+def test_rollout_one_records_steps_the_env_on_the_final_turn():
+    """LO-004: the OPD episode driver broke at the turn cap BEFORE env_reply, so a stateful env never
+    saw the last assistant turn. The close-out step applies it (no glue: no further model turn)."""
+    calls = {"env_reply": 0}
+
+    class _Env(FakeEnv):
+        def rollout_done(self, state, max_turns):
+            return False  # only the driver's cap ends this episode
+
+        def env_reply(self, messages, state):
+            calls["env_reply"] += 1
+            return super().env_reply(messages, state)
+
+    gen = _records_generator(
+        [_gen_obj([CONTENT["a1"], END], "a1"), _gen_obj([CONTENT["GOOD"], END], "GOOD")]
+    )
+    records = rollout_one_records(
+        example={"answer": "GOOD"},
+        active_env=_Env(),
+        render=render,
+        generate=gen,
+        env_glue=env_glue,
+        max_turns=2,
+        per_turn_max_tokens=8,
+    )
+    assert len(records) == 2
+    assert calls["env_reply"] == 2, "the final assistant turn never reached the environment"

@@ -1042,6 +1042,72 @@ def test_quiet_phases_are_wrapped_in_liveness_heartbeat(modname, outer, stages):
         )
 
 
+def test_sft_config_probes_never_run_outside_a_liveness_wrap():
+    """Regression: ``sft_model_load`` is a ONE-SHOT heartbeat, and the config work that follows it ran
+    with no liveness daemon at all. These calls hit the HF network (AutoConfig arch probes,
+    resolve_vocab_size on a pinned revision), import/smoke CUDA kernels, or bin-pack the whole
+    dataset. Wedged on a socket, any of them left the run pinned to sft_model_load with an idle GPU,
+    still reporting as running, refreshing no status, and never arming the stall stack-dump (which
+    only fires from a liveness thread). Each must run inside SOME liveness wrap."""
+    import ast
+    import textwrap
+
+    from flash.engine.worker import sft
+
+    blocking = {
+        "resolve_vocab_size",  # HF config fetch when a revision is pinned
+        "model_is_pure_attention",  # AutoConfig.from_pretrained
+        "model_is_gdn_hybrid",  # AutoConfig.from_pretrained
+        "gdn_packing_available",  # kernel imports + a CUDA smoke forward
+        "_flash_attn_available",  # imports flash_attn
+        "_model_arch_dims",  # AutoConfig.from_pretrained
+        "pack_dataset",  # trl bfd bin-packing over every row
+        "pack_token_ids",  # block-diagonal packing over every row
+    }
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(sft.run_sft)))
+
+    covered = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        if not any(
+            isinstance(i.context_expr, ast.Call)
+            and getattr(i.context_expr.func, "id", None) == "liveness_heartbeat"
+            for i in node.items
+        ):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call):
+                covered.add(getattr(inner.func, "id", None) or getattr(inner.func, "attr", None))
+
+    called = {
+        getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+    }
+    # guard the guard: a renamed helper must fail here, not silently drop out of the assertion below.
+    assert blocking <= called, f"run_sft no longer calls: {sorted(blocking - called)}"
+
+    assert not (blocking - covered), (
+        "these blocking calls run with NO liveness daemon, so a wedge there looks alive forever: "
+        f"{sorted(blocking - covered)}"
+    )
+
+
+def test_sft_configuring_is_a_setup_stage_on_the_tight_liveness_cadence():
+    """The config span's stage must behave like every other pre-training liveness stage: it keeps the
+    wide setup grace (it has not even loaded the model yet), refreshes status on the faster setup
+    cadence, and is throttled so its 30s re-emit can't blow the HF commit cap."""
+    import flash.engine.worker as ne
+    from flash.providers._poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+
+    assert "sft_configuring" in SETUP_HEARTBEAT_STAGES
+    assert is_training_heartbeat("sft_configuring", 0) is False
+    assert "sft_configuring" in ne._HB_SETUP_LIVENESS_STAGES
+    assert "sft_configuring" in ne._HB_THROTTLED_STAGES
+
+
 def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
     from flash.engine.worker import hf
 
