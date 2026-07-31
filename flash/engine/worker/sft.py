@@ -770,331 +770,339 @@ def run_sft():
                 set(getattr(tok, "all_special_ids", None) or []),
             )
             _pretok = []
-    if _dropped:
-        print(
-            f"[sft] dropped {_dropped} rows with no real completion target "
-            "(sft_max_len truncated away the whole completion, or an empty/content-free completion)"
-        )
-    if not (vl_rows if multimodal else _pretok):
-        raise ValueError(
-            "every SFT example has an empty completion after sft_max_len truncation (nothing to "
-            "train on); increase sft_max_len or shorten the prompts"
-        )
-    ds = Dataset.from_list(vl_rows) if multimodal else Dataset.from_list(_pretok)
-    if _total_tok:
-        print(
-            f"[sft] completion-only loss: masking {_masked_tok}/{_total_tok} "
-            f"({_masked_tok / _total_tok:.0%}) prompt tokens; training on the completion only"
-        )
-    effective_batch = _train_opt("batch_size", RECIPE.sft.effective_batch)
-    # validated qwen models use trl 1.6 chunked_nll: ignored prompt positions are removed before
-    # the lm head and valid tokens are projected in bounded chunks, so no dense [batch, seq, vocab]
-    # tensor is materialized. unsupported model structures keep plain nll (which materializes full
-    # fp32 logits). resolve vocab once so worker and cost quote use the same revision.
-    _sft_vocab = resolve_vocab_size(model_id, model_revision)
-    # chunked_nll's prep (_prepare_chunked_nll_model) and parity tests are text-only and require
-    # flash's text tokenizer; a multimodal run's SFTTrainer uses the vision processor, so gate
-    # chunked_nll off for image runs (they use standard nll) to avoid the prep/processing mismatch.
-    # per_device/grad_accum are sized below in the unified packing-aware block using fused=_sft_fused.
-    _sft_fused = sft_chunked_nll_enabled(model_id) and not multimodal
-    sft_save_default = _train_opt("save_every", 50)
-    out_dir = f"/tmp/sft_seed{_w.SEED}"
-    resume_ckpt = _w.hf_resume_checkpoint()
-
-    max_steps = int(_t.max_steps or 0) if _t else 0
-    save_at_steps = tuple(getattr(_t, "save_at_steps", ()) or ())
-    cfg_kwargs = {
-        "output_dir": out_dir,
-        "num_train_epochs": epochs,
-        "learning_rate": sft_lr,
-        "warmup_ratio": RECIPE.sft.warmup_frac,
-        "logging_steps": 10,
-        "save_steps": sft_save_default,
-        "save_total_limit": 1,
-        # save_only_model=False: saves optimizer/scheduler state so a resumed worker truly continues
-        # instead of re-initializing Adam moments. The deployable snapshot strips trainer state separately.
-        "save_only_model": False,
-        "max_length": sft_max_len,
-        "bf16": True,
-        "report_to": _w.wandb_report_to(),
-        "run_name": _w.wandb_run_name(),
-        "dataloader_num_workers": 4,
-        "dataloader_pin_memory": True,
-        "dataloader_persistent_workers": True,
-        "accelerator_config": {"non_blocking": True},
-        "seed": backend_seed(_w.SEED),
-        # MoE / GatedDeltaNet hybrids re-dispatch tokens (MoE router) or lay out custom-kernel
-        # saved tensors differently on recompute, so non-reentrant checkpointing's metadata-equality
-        # assert fires on the FIRST backward (Qwen3.6-35B-A3B). Mirror the GRPO path (rl.py, #429/#432)
-        # and pick REENTRANT recompute for those; dense models keep the faster non-reentrant path.
-        "gradient_checkpointing_kwargs": {"use_reentrant": grpo_use_reentrant(model_id)},
-        "completion_only_loss": True,
-        "loss_type": "chunked_nll" if _sft_fused else "nll",
-        # remove_unused_columns=False: HF Trainer would otherwise drop completion_mask before
-        # collation, silently reverting all paths to full-transcript loss.
-        "remove_unused_columns": False,
-        "optim": fused_optim_name(),
-    }
-    _sft_config_fields = set(getattr(TRLSFTConfig, "__dataclass_fields__", {}))
-    if "use_liger_kernel" in _sft_config_fields:
-        cfg_kwargs["use_liger_kernel"] = False
-    if max_steps > 0:
-        cfg_kwargs["max_steps"] = max_steps
-    configure_trainer_save_schedule(cfg_kwargs, save_at_steps)
-    # TRL 'bfd' packing: boundary-correct only under FA2/FA3 varlen (SDPA cross-contaminates).
-    # GDN hybrids can't use bfd (no seq_idx to reset causal conv); they pack via the varlen collator.
-    _pure_attn = model_is_pure_attention(model_id, revision=model_revision)
-    _gdn = model_is_gdn_hybrid(model_id, revision=model_revision)
-    _bfd_block_count: int | None = None
-    _fa_ok = _flash_attn_available()
-    if multimodal:
-        _pure_attn = False
-        _gdn = False
-        _fa_ok = False
-        print("[sft] packing disabled for vision-language batches")
-    if _fa_ok and _pure_attn:
-        cfg_kwargs["packing"] = True
-        print("[sft] example packing enabled (FA2 varlen)")
-    elif _fa_ok and _gdn:
-        print(
-            "[sft] TRL bfd packing NOT used for the GatedDeltaNet hybrid (bfd can't reset the conv); "
-            "the cu_seqlens/seq_idx varlen collator handles its packing when both kernels are present."
-        )
-    else:
-        _bfd_why = (
-            "flash_attn not importable" if not _fa_ok else "arch not bfd-safe under FA2 varlen"
-        )
-        print(
-            f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below."
-        )
-    if _memory_mode(model_id, sft_max_len, revision=model_revision):
-        print("[sft] chalk standalone fused kernels scheduled after trainer build")
-    _attn = optimal_attn_impl()
-    # When bfd packing is on, ensure a varlen-capable flash impl; sdpa cross-contaminates packed examples.
-    # _attn=="sdpa" (Blackwell): disable bfd — don't force FA2 (unverified SASS). SDPA-mask path below still packs.
-    # _attn is None (Hopper without FA3): force FA2 if available, else drop packing.
-    if cfg_kwargs.get("packing"):
-        if _attn in ("flash_attention_2", "flash_attention_3"):
-            print(f"[sft] attn_implementation={_attn} (packing boundary-correct varlen)")
-        elif _attn == "sdpa":
-            cfg_kwargs["packing"] = False
+    # everything from here to the trainer build is silent config work: arch probes that hit HF
+    # (AutoConfig, resolve_vocab_size), the bin-packing preview, and the vram sizing math. the
+    # sft_model_load ping above is ONE-SHOT, so unwrapped this whole span emits nothing -- a probe
+    # wedged on a socket leaves the run frozen on a stage that has not even loaded the model yet:
+    # status stops refreshing, the GPU reads idle, and the worker's stall stack-dump never arms
+    # because no liveness thread is running. no progress= : there is no monotonic counter here, and
+    # bare pings deliberately do NOT feed the provider's stall clock, so a real wedge still trips it.
+    with liveness_heartbeat("sft_configuring"):
+        if _dropped:
             print(
-                "[sft] packing disabled: selected attn_implementation=sdpa (no varlen flash backend)"
+                f"[sft] dropped {_dropped} rows with no real completion target "
+                "(sft_max_len truncated away the whole completion, or an empty/content-free completion)"
             )
-        elif _fa_ok:
-            _attn = "flash_attention_2"
-            print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+        if not (vl_rows if multimodal else _pretok):
+            raise ValueError(
+                "every SFT example has an empty completion after sft_max_len truncation (nothing to "
+                "train on); increase sft_max_len or shorten the prompts"
+            )
+        ds = Dataset.from_list(vl_rows) if multimodal else Dataset.from_list(_pretok)
+        if _total_tok:
+            print(
+                f"[sft] completion-only loss: masking {_masked_tok}/{_total_tok} "
+                f"({_masked_tok / _total_tok:.0%}) prompt tokens; training on the completion only"
+            )
+        effective_batch = _train_opt("batch_size", RECIPE.sft.effective_batch)
+        # validated qwen models use trl 1.6 chunked_nll: ignored prompt positions are removed before
+        # the lm head and valid tokens are projected in bounded chunks, so no dense [batch, seq, vocab]
+        # tensor is materialized. unsupported model structures keep plain nll (which materializes full
+        # fp32 logits). resolve vocab once so worker and cost quote use the same revision.
+        _sft_vocab = resolve_vocab_size(model_id, model_revision)
+        # chunked_nll's prep (_prepare_chunked_nll_model) and parity tests are text-only and require
+        # flash's text tokenizer; a multimodal run's SFTTrainer uses the vision processor, so gate
+        # chunked_nll off for image runs (they use standard nll) to avoid the prep/processing mismatch.
+        # per_device/grad_accum are sized below in the unified packing-aware block using fused=_sft_fused.
+        _sft_fused = sft_chunked_nll_enabled(model_id) and not multimodal
+        sft_save_default = _train_opt("save_every", 50)
+        out_dir = f"/tmp/sft_seed{_w.SEED}"
+        resume_ckpt = _w.hf_resume_checkpoint()
+
+        max_steps = int(_t.max_steps or 0) if _t else 0
+        save_at_steps = tuple(getattr(_t, "save_at_steps", ()) or ())
+        cfg_kwargs = {
+            "output_dir": out_dir,
+            "num_train_epochs": epochs,
+            "learning_rate": sft_lr,
+            "warmup_ratio": RECIPE.sft.warmup_frac,
+            "logging_steps": 10,
+            "save_steps": sft_save_default,
+            "save_total_limit": 1,
+            # save_only_model=False: saves optimizer/scheduler state so a resumed worker truly continues
+            # instead of re-initializing Adam moments. The deployable snapshot strips trainer state separately.
+            "save_only_model": False,
+            "max_length": sft_max_len,
+            "bf16": True,
+            "report_to": _w.wandb_report_to(),
+            "run_name": _w.wandb_run_name(),
+            "dataloader_num_workers": 4,
+            "dataloader_pin_memory": True,
+            "dataloader_persistent_workers": True,
+            "accelerator_config": {"non_blocking": True},
+            "seed": backend_seed(_w.SEED),
+            # MoE / GatedDeltaNet hybrids re-dispatch tokens (MoE router) or lay out custom-kernel
+            # saved tensors differently on recompute, so non-reentrant checkpointing's metadata-equality
+            # assert fires on the FIRST backward (Qwen3.6-35B-A3B). Mirror the GRPO path (rl.py, #429/#432)
+            # and pick REENTRANT recompute for those; dense models keep the faster non-reentrant path.
+            "gradient_checkpointing_kwargs": {"use_reentrant": grpo_use_reentrant(model_id)},
+            "completion_only_loss": True,
+            "loss_type": "chunked_nll" if _sft_fused else "nll",
+            # remove_unused_columns=False: HF Trainer would otherwise drop completion_mask before
+            # collation, silently reverting all paths to full-transcript loss.
+            "remove_unused_columns": False,
+            "optim": fused_optim_name(),
+        }
+        _sft_config_fields = set(getattr(TRLSFTConfig, "__dataclass_fields__", {}))
+        if "use_liger_kernel" in _sft_config_fields:
+            cfg_kwargs["use_liger_kernel"] = False
+        if max_steps > 0:
+            cfg_kwargs["max_steps"] = max_steps
+        configure_trainer_save_schedule(cfg_kwargs, save_at_steps)
+        # TRL 'bfd' packing: boundary-correct only under FA2/FA3 varlen (SDPA cross-contaminates).
+        # GDN hybrids can't use bfd (no seq_idx to reset causal conv); they pack via the varlen collator.
+        _pure_attn = model_is_pure_attention(model_id, revision=model_revision)
+        _gdn = model_is_gdn_hybrid(model_id, revision=model_revision)
+        _bfd_block_count: int | None = None
+        _fa_ok = _flash_attn_available()
+        if multimodal:
+            _pure_attn = False
+            _gdn = False
+            _fa_ok = False
+            print("[sft] packing disabled for vision-language batches")
+        if _fa_ok and _pure_attn:
+            cfg_kwargs["packing"] = True
+            print("[sft] example packing enabled (FA2 varlen)")
+        elif _fa_ok and _gdn:
+            print(
+                "[sft] TRL bfd packing NOT used for the GatedDeltaNet hybrid (bfd can't reset the conv); "
+                "the cu_seqlens/seq_idx varlen collator handles its packing when both kernels are present."
+            )
         else:
+            _bfd_why = (
+                "flash_attn not importable" if not _fa_ok else "arch not bfd-safe under FA2 varlen"
+            )
+            print(
+                f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below."
+            )
+        if _memory_mode(model_id, sft_max_len, revision=model_revision):
+            print("[sft] chalk standalone fused kernels scheduled after trainer build")
+        _attn = optimal_attn_impl()
+        # When bfd packing is on, ensure a varlen-capable flash impl; sdpa cross-contaminates packed examples.
+        # _attn=="sdpa" (Blackwell): disable bfd — don't force FA2 (unverified SASS). SDPA-mask path below still packs.
+        # _attn is None (Hopper without FA3): force FA2 if available, else drop packing.
+        if cfg_kwargs.get("packing"):
+            if _attn in ("flash_attention_2", "flash_attention_3"):
+                print(f"[sft] attn_implementation={_attn} (packing boundary-correct varlen)")
+            elif _attn == "sdpa":
+                cfg_kwargs["packing"] = False
+                print(
+                    "[sft] packing disabled: selected attn_implementation=sdpa (no varlen flash backend)"
+                )
+            elif _fa_ok:
+                _attn = "flash_attention_2"
+                print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+            else:
+                cfg_kwargs["packing"] = False
+                print(
+                    "[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA"
+                )
+        _bfd_rows: list[dict] | None = None
+        _packed_examples_per_block: float | None = None
+        if cfg_kwargs.get("packing"):
+            from trl.data_utils import pack_dataset
+
+            # preview with trl's exact bfd implementation so the realized maximum is a safe match for
+            # the blocks the trainer will build, rather than an estimate from a different bin packer.
+            _bfd_preview = pack_dataset(
+                ds.select_columns(["input_ids", "completion_mask"]),
+                sft_max_len,
+                strategy="bfd",
+                map_kwargs={"load_from_cache_file": False},
+            )
+            _bfd_rows = [
+                {"input_ids": ids, "seq_lengths": seq_lengths}
+                for ids, seq_lengths in zip(
+                    _bfd_preview["input_ids"], _bfd_preview["seq_lengths"], strict=True
+                )
+            ]
+            _bfd_block_count = max(1, len(_bfd_rows))
+            _packed_examples_per_block = len(_pretok) / _bfd_block_count
+
+        # 4D block-diagonal SDPA mask packing: for pure-attn models on plain SDPA (e.g. sm120 RTX 5090).
+        # Flash varlen would silently IGNORE the 4D mask — so we downgrade to sdpa when using this path.
+        # GDN hybrids need the next branch (mask alone can't reset their causal conv state).
+        _collator = _vision_collator if multimodal else None
+        _packed_rows: list[dict] | None = None
+        _packing_kind = "bfd" if cfg_kwargs.get("packing") else "unpacked"
+        # Cap at 16384: dense [B,1,T,T] mask is O(T^2) memory; above this packing gains little anyway.
+        _PACK_MASK_MAX_LEN = 16384
+        _mask_pack_ok = sft_max_len <= _PACK_MASK_MAX_LEN
+        _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok)
+        if _sdpa_pack:
+            if _attn in ("flash_attention_2", "flash_attention_3"):
+                print(
+                    f"[sft] packing under SDPA: downgrading {_attn} -> sdpa (a flash kernel ignores the 4D mask)"
+                )
+            _attn = "sdpa"
+            cfg_kwargs["packing"] = False  # we own the packing; TRL must not also pack
+            _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
+            _dk["skip_prepare_dataset"] = True
+            cfg_kwargs["dataset_kwargs"] = _dk
+            _ids = [r["input_ids"] for r in _pretok]
+            _cmask = [r["completion_mask"] for r in _pretok]
+            _packed_rows = pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)
+            ds = Dataset.from_list(_packed_rows)
+            _collator = _SFTTokenCountingCollator(BlockDiagonalCollator(pad_token_id=tok.pad_token_id))
+            _packed_examples_per_block = len(_ids) / max(1, len(_packed_rows))
+            _packing_kind = "sdpa"
+        elif (
+            not cfg_kwargs.get("packing")
+            and _gdn
+            and gdn_packing_available(model_id, revision=model_revision)
+            and _mask_pack_ok
+        ):
+            # GDN hybrid: 4D mask for full-attn layers + cu_seqlens/seq_idx to reset DeltaNet recurrence.
+            # Flash varlen would ignore the 4D mask — downgrade to sdpa for the full-attn layers.
+            if _attn in ("flash_attention_2", "flash_attention_3"):
+                print(
+                    f"[sft] GDN packing under SDPA: downgrading {_attn} -> sdpa for the full-attn layers"
+                )
+            _attn = "sdpa"
             cfg_kwargs["packing"] = False
+            _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
+            _dk["skip_prepare_dataset"] = True
+            cfg_kwargs["dataset_kwargs"] = _dk
+            _ids = [r["input_ids"] for r in _pretok]
+            _cmask = [r["completion_mask"] for r in _pretok]
+            _packed_rows = pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)
+            ds = Dataset.from_list(_packed_rows)
+            _collator = _SFTTokenCountingCollator(
+                BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
+            )
+            _packed_examples_per_block = len(_ids) / max(1, len(_packed_rows))
+            _packing_kind = "gdn"
+        elif not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _mask_pack_ok:
             print(
-                "[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA"
+                f"[sft] packing stays OFF: max_length {sft_max_len} > {_PACK_MASK_MAX_LEN} — the dense "
+                "O(T^2) block-diagonal mask gets too large at long context (unpacked is more memory-"
+                "efficient there, and long rows already fill a block)."
             )
-    _bfd_rows: list[dict] | None = None
-    _packed_examples_per_block: float | None = None
-    if cfg_kwargs.get("packing"):
-        from trl.data_utils import pack_dataset
-
-        # preview with trl's exact bfd implementation so the realized maximum is a safe match for
-        # the blocks the trainer will build, rather than an estimate from a different bin packer.
-        _bfd_preview = pack_dataset(
-            ds.select_columns(["input_ids", "completion_mask"]),
-            sft_max_len,
-            strategy="bfd",
-            map_kwargs={"load_from_cache_file": False},
-        )
-        _bfd_rows = [
-            {"input_ids": ids, "seq_lengths": seq_lengths}
-            for ids, seq_lengths in zip(
-                _bfd_preview["input_ids"], _bfd_preview["seq_lengths"], strict=True
+        elif not multimodal and not cfg_kwargs.get("packing") and not _pure_attn:
+            _why = (
+                "hybrid GatedDeltaNet but the fla/causal_conv1d varlen kernels aren't both importable"
+                if _gdn
+                else "non-full-attention arch (e.g. sliding-window) a block-diagonal mask can't pack"
             )
-        ]
-        _bfd_block_count = max(1, len(_bfd_rows))
-        _packed_examples_per_block = len(_pretok) / _bfd_block_count
-
-    # 4D block-diagonal SDPA mask packing: for pure-attn models on plain SDPA (e.g. sm120 RTX 5090).
-    # Flash varlen would silently IGNORE the 4D mask — so we downgrade to sdpa when using this path.
-    # GDN hybrids need the next branch (mask alone can't reset their causal conv state).
-    _collator = _vision_collator if multimodal else None
-    _packed_rows: list[dict] | None = None
-    _packing_kind = "bfd" if cfg_kwargs.get("packing") else "unpacked"
-    # Cap at 16384: dense [B,1,T,T] mask is O(T^2) memory; above this packing gains little anyway.
-    _PACK_MASK_MAX_LEN = 16384
-    _mask_pack_ok = sft_max_len <= _PACK_MASK_MAX_LEN
-    _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok)
-    if _sdpa_pack:
-        if _attn in ("flash_attention_2", "flash_attention_3"):
             print(
-                f"[sft] packing under SDPA: downgrading {_attn} -> sdpa (a flash kernel ignores the 4D mask)"
+                f"[sft] packing stays OFF: {_why}. (Pure full-attention models pack via the SDPA mask.)"
             )
-        _attn = "sdpa"
-        cfg_kwargs["packing"] = False  # we own the packing; TRL must not also pack
-        _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
-        _dk["skip_prepare_dataset"] = True
-        cfg_kwargs["dataset_kwargs"] = _dk
-        _ids = [r["input_ids"] for r in _pretok]
-        _cmask = [r["completion_mask"] for r in _pretok]
-        _packed_rows = pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)
-        ds = Dataset.from_list(_packed_rows)
-        _collator = _SFTTokenCountingCollator(BlockDiagonalCollator(pad_token_id=tok.pad_token_id))
-        _packed_examples_per_block = len(_ids) / max(1, len(_packed_rows))
-        _packing_kind = "sdpa"
-    elif (
-        not cfg_kwargs.get("packing")
-        and _gdn
-        and gdn_packing_available(model_id, revision=model_revision)
-        and _mask_pack_ok
-    ):
-        # GDN hybrid: 4D mask for full-attn layers + cu_seqlens/seq_idx to reset DeltaNet recurrence.
-        # Flash varlen would ignore the 4D mask — downgrade to sdpa for the full-attn layers.
-        if _attn in ("flash_attention_2", "flash_attention_3"):
+
+        _sizing_rows = _bfd_rows if _packing_kind == "bfd" else _packed_rows or _pretok
+        if multimodal:
+            # vision rows are tokenized by the processor-backed collator, so retain configured-cap sizing.
+            _realized_max_len = sft_max_len
+            _runtime_max_len = sft_max_len
+        else:
+            _realized_max_len = _safe_realized_sft_max_length(_sizing_rows, sft_max_len)
+            _runtime_max_len = _sft_runtime_max_length(
+                _realized_max_len,
+                pad_to_multiple_of=8 if _packing_kind == "sdpa" else 1,
+            )
+        per_device_bs, grad_accum = sft_grad_accum(
+            effective_batch,
+            seq_len=_runtime_max_len,
+            vocab=_sft_vocab,
+            fused=_sft_fused,
+        )
+        if _packing_kind == "sdpa":
+            # cap the real dense mask allocation at 512 mb using its padded runtime width.
+            per_device_bs = max(
+                1,
+                min(per_device_bs, (512 * 1024 * 1024) // (_runtime_max_len * _runtime_max_len)),
+            )
+        elif _packing_kind == "gdn":
+            # the varlen recurrence metadata spans one block and requires a single block per microbatch.
+            per_device_bs = 1
+        if _packed_examples_per_block is not None:
+            grad_accum = max(
+                1,
+                math.ceil(effective_batch / max(1.0, per_device_bs * _packed_examples_per_block)),
+            )
+        else:
+            grad_accum = max(1, math.ceil(effective_batch / per_device_bs))
+        cfg_kwargs["per_device_train_batch_size"] = per_device_bs
+        cfg_kwargs["gradient_accumulation_steps"] = grad_accum
+
+        _is_packed = _packing_kind != "unpacked"
+        if not multimodal:
+            ds = _configure_unpacked_length_sampling(cfg_kwargs, ds, packed=_is_packed)
+        if multimodal:
             print(
-                f"[sft] GDN packing under SDPA: downgrading {_attn} -> sdpa for the full-attn layers"
+                f"[sft] vision-language configured-cap sizing: seq={sft_max_len} "
+                f"pd={per_device_bs} ga={grad_accum}"
             )
-        _attn = "sdpa"
-        cfg_kwargs["packing"] = False
-        _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
-        _dk["skip_prepare_dataset"] = True
-        cfg_kwargs["dataset_kwargs"] = _dk
-        _ids = [r["input_ids"] for r in _pretok]
-        _cmask = [r["completion_mask"] for r in _pretok]
-        _packed_rows = pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)
-        ds = Dataset.from_list(_packed_rows)
-        _collator = _SFTTokenCountingCollator(
-            BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
-        )
-        _packed_examples_per_block = len(_ids) / max(1, len(_packed_rows))
-        _packing_kind = "gdn"
-    elif not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _mask_pack_ok:
-        print(
-            f"[sft] packing stays OFF: max_length {sft_max_len} > {_PACK_MASK_MAX_LEN} — the dense "
-            "O(T^2) block-diagonal mask gets too large at long context (unpacked is more memory-"
-            "efficient there, and long rows already fill a block)."
-        )
-    elif not multimodal and not cfg_kwargs.get("packing") and not _pure_attn:
-        _why = (
-            "hybrid GatedDeltaNet but the fla/causal_conv1d varlen kernels aren't both importable"
-            if _gdn
-            else "non-full-attention arch (e.g. sliding-window) a block-diagonal mask can't pack"
-        )
-        print(
-            f"[sft] packing stays OFF: {_why}. (Pure full-attention models pack via the SDPA mask.)"
-        )
+        elif _is_packed:
+            assert _packed_examples_per_block is not None
+            print(
+                f"[sft] {_packing_kind} packing: {len(_pretok)} examples -> {len(_sizing_rows)} blocks "
+                f"(~{_packed_examples_per_block:.1f} ex/block, "
+                f"{packing_efficiency(_sizing_rows, sft_max_len):.0%} dense); "
+                f"realized_max={_realized_max_len}/{sft_max_len} pd={per_device_bs} ga={grad_accum} "
+                f"(effective batch kept ~{effective_batch} ex)"
+            )
+        else:
+            print(
+                f"[sft] unpacked length grouping enabled: realized_max={_realized_max_len}/{sft_max_len} "
+                f"pd={per_device_bs} ga={grad_accum}"
+            )
+        if not _sft_fused and per_device_bs < min(effective_batch, 4):
+            print(
+                f"[sft] large-vocab logits cap: per_device={per_device_bs} grad_accum={grad_accum} "
+                f"(realized_seq={_realized_max_len}, configured_seq={sft_max_len}, vocab={_sft_vocab}; "
+                f"realized batch {per_device_bs * grad_accum} >= requested {effective_batch})"
+            )
 
-    _sizing_rows = _bfd_rows if _packing_kind == "bfd" else _packed_rows or _pretok
-    if multimodal:
-        # vision rows are tokenized by the processor-backed collator, so retain configured-cap sizing.
-        _realized_max_len = sft_max_len
-        _runtime_max_len = sft_max_len
-    else:
-        _realized_max_len = _safe_realized_sft_max_length(_sizing_rows, sft_max_len)
-        _runtime_max_len = _sft_runtime_max_length(
-            _realized_max_len,
-            pad_to_multiple_of=8 if _packing_kind == "sdpa" else 1,
-        )
-    per_device_bs, grad_accum = sft_grad_accum(
-        effective_batch,
-        seq_len=_runtime_max_len,
-        vocab=_sft_vocab,
-        fused=_sft_fused,
-    )
-    if _packing_kind == "sdpa":
-        # cap the real dense mask allocation at 512 mb using its padded runtime width.
-        per_device_bs = max(
-            1,
-            min(per_device_bs, (512 * 1024 * 1024) // (_runtime_max_len * _runtime_max_len)),
-        )
-    elif _packing_kind == "gdn":
-        # the varlen recurrence metadata spans one block and requires a single block per microbatch.
-        per_device_bs = 1
-    if _packed_examples_per_block is not None:
-        grad_accum = max(
-            1,
-            math.ceil(effective_batch / max(1.0, per_device_bs * _packed_examples_per_block)),
-        )
-    else:
-        grad_accum = max(1, math.ceil(effective_batch / per_device_bs))
-    cfg_kwargs["per_device_train_batch_size"] = per_device_bs
-    cfg_kwargs["gradient_accumulation_steps"] = grad_accum
-
-    _is_packed = _packing_kind != "unpacked"
-    if not multimodal:
-        ds = _configure_unpacked_length_sampling(cfg_kwargs, ds, packed=_is_packed)
-    if multimodal:
-        print(
-            f"[sft] vision-language configured-cap sizing: seq={sft_max_len} "
-            f"pd={per_device_bs} ga={grad_accum}"
-        )
-    elif _is_packed:
-        assert _packed_examples_per_block is not None
-        print(
-            f"[sft] {_packing_kind} packing: {len(_pretok)} examples -> {len(_sizing_rows)} blocks "
-            f"(~{_packed_examples_per_block:.1f} ex/block, "
-            f"{packing_efficiency(_sizing_rows, sft_max_len):.0%} dense); "
-            f"realized_max={_realized_max_len}/{sft_max_len} pd={per_device_bs} ga={grad_accum} "
-            f"(effective batch kept ~{effective_batch} ex)"
-        )
-    else:
-        print(
-            f"[sft] unpacked length grouping enabled: realized_max={_realized_max_len}/{sft_max_len} "
-            f"pd={per_device_bs} ga={grad_accum}"
-        )
-    if not _sft_fused and per_device_bs < min(effective_batch, 4):
-        print(
-            f"[sft] large-vocab logits cap: per_device={per_device_bs} grad_accum={grad_accum} "
-            f"(realized_seq={_realized_max_len}, configured_seq={sft_max_len}, vocab={_sft_vocab}; "
-            f"realized batch {per_device_bs * grad_accum} >= requested {effective_batch})"
-        )
-
-    _gc_card_gb, _gc_cap = 0.0, None
-    try:
-        import torch as _torch_gc
-
-        if _torch_gc.cuda.is_available():
-            _gc_card_gb = _torch_gc.cuda.get_device_properties(0).total_memory / 1e9
-            _gc_cap = _torch_gc.cuda.get_device_capability(0)
-    except Exception:
         _gc_card_gb, _gc_cap = 0.0, None
-    _gc_hidden, _gc_layers = _model_arch_dims(model_id, revision=model_revision)
-    _gc_active_b = float(getattr(MODELS.get(model_id), "active_params_b", 0.0) or 0.0) or None
-    _gc_lora_rank = int(_t.lora_rank if _t and _t.lora_rank else RECIPE.lora.rank)
-    _grad_ckpt = grad_checkpointing_on(
-        model_id,
-        _runtime_max_len,
-        allow_disable=True,
-        card_vram_gb=_gc_card_gb,
-        capability=_gc_cap,
-        active_params_b=_gc_active_b,
-        hidden=_gc_hidden,
-        num_layers=_gc_layers,
-        fused_ce=_sft_fused,
-        per_device_bs=per_device_bs,
-        lora_rank=_gc_lora_rank,
-        revision=model_revision,
-    )
-    cfg_kwargs["gradient_checkpointing"] = _grad_ckpt
+        try:
+            import torch as _torch_gc
 
-    # Explicit bf16 + device_map=None: transformers-5 string loading otherwise falls back to fp32
-    # (2x VRAM) or accelerate-offloads to meta ("expected device meta but got cuda:0" in backward).
-    model_init_kwargs = {
-        "dtype": "bfloat16",
-        "device_map": None,
-        **_w.model_revision_kwargs(model_revision),
-    }
-    if _attn:
-        model_init_kwargs["attn_implementation"] = _attn
-    cfg_kwargs["model_init_kwargs"] = model_init_kwargs
-    examples_per_update = int(cfg_kwargs["per_device_train_batch_size"]) * int(
-        cfg_kwargs["gradient_accumulation_steps"]
-    )
-    derived_steps = sft_update_steps(
-        epochs=epochs,
-        example_count=len(ds),
-        examples_per_update=examples_per_update,
-        packed_block_count=_bfd_block_count if cfg_kwargs.get("packing") else None,
-    )
-    update_horizon = resolve_update_horizon(derived_steps, max_steps)
-    validate_save_steps(save_at_steps, update_horizon)
-    cfg = TRLSFTConfig(**cfg_kwargs)
+            if _torch_gc.cuda.is_available():
+                _gc_card_gb = _torch_gc.cuda.get_device_properties(0).total_memory / 1e9
+                _gc_cap = _torch_gc.cuda.get_device_capability(0)
+        except Exception:
+            _gc_card_gb, _gc_cap = 0.0, None
+        _gc_hidden, _gc_layers = _model_arch_dims(model_id, revision=model_revision)
+        _gc_active_b = float(getattr(MODELS.get(model_id), "active_params_b", 0.0) or 0.0) or None
+        _gc_lora_rank = int(_t.lora_rank if _t and _t.lora_rank else RECIPE.lora.rank)
+        _grad_ckpt = grad_checkpointing_on(
+            model_id,
+            _runtime_max_len,
+            allow_disable=True,
+            card_vram_gb=_gc_card_gb,
+            capability=_gc_cap,
+            active_params_b=_gc_active_b,
+            hidden=_gc_hidden,
+            num_layers=_gc_layers,
+            fused_ce=_sft_fused,
+            per_device_bs=per_device_bs,
+            lora_rank=_gc_lora_rank,
+            revision=model_revision,
+        )
+        cfg_kwargs["gradient_checkpointing"] = _grad_ckpt
+
+        # Explicit bf16 + device_map=None: transformers-5 string loading otherwise falls back to fp32
+        # (2x VRAM) or accelerate-offloads to meta ("expected device meta but got cuda:0" in backward).
+        model_init_kwargs = {
+            "dtype": "bfloat16",
+            "device_map": None,
+            **_w.model_revision_kwargs(model_revision),
+        }
+        if _attn:
+            model_init_kwargs["attn_implementation"] = _attn
+        cfg_kwargs["model_init_kwargs"] = model_init_kwargs
+        examples_per_update = int(cfg_kwargs["per_device_train_batch_size"]) * int(
+            cfg_kwargs["gradient_accumulation_steps"]
+        )
+        derived_steps = sft_update_steps(
+            epochs=epochs,
+            example_count=len(ds),
+            examples_per_update=examples_per_update,
+            packed_block_count=_bfd_block_count if cfg_kwargs.get("packing") else None,
+        )
+        update_horizon = resolve_update_horizon(derived_steps, max_steps)
+        validate_save_steps(save_at_steps, update_horizon)
+        cfg = TRLSFTConfig(**cfg_kwargs)
 
     # LoRA+ (arXiv 2402.12354): B-matrix LR ratio=16, measured -52% train loss. Must override
     # create_optimizer because TRL builds the model inside __init__ (can't pre-build the optimizer).
