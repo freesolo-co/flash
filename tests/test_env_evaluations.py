@@ -1814,38 +1814,12 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
     assert "overall: PASS" in capsys.readouterr().out
 
 
-def test_env_eval_grades_the_answer_not_the_reasoning(monkeypatch, tmp_path, capsys) -> None:
-    # a thinking deployment answers with a balanced `<think>...</think>answer`, and handing the
-    # whole string to the suite failed every case for a scorer that reads the answer strictly --
-    # it saw `<think>` (codex[bot]). training grades the answer-only view, so an evaluation that
-    # grades the raw emission disagrees with training about the same checkpoint.
-    env_dir = _environment_dir(tmp_path)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'strict'\n"
-        "    def cases(self): return [EvalCase(id='c1', input='2+2', expected='4')]\n"
-        "    def score(self, case, response):\n"
-        # the strictness is the point: int() is what a scorer parsing the first token does, and
-        # it raises on the `<` of `<think>` rather than merely scoring 0.
-        "        return int(response.strip()) == int(case.expected)\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-
-    class Client:
-        def chat_stream(self, target, messages, **kwargs):
-            yield "<think>2+2 is 4</think>4"
-
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", Client)
-
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 0
-    assert "overall: PASS" in capsys.readouterr().out
-
-
 def test_env_eval_reports_the_whole_completion_it_graded() -> None:
     # stripping for the scorer must not shorten what is recorded: the reasoning is what makes a
     # failed case diagnosable, so the result keeps the full emission and the upload carries it.
+    # the strip itself is covered by `test_env_eval_strips_reasoning_only_for_a_thinking_run`;
+    # what is pinned here is that the two views stay distinct rather than the stripped answer
+    # overwriting the record.
     from flash.cli.env_eval import _score_case
 
     seen: list[str] = []
@@ -1859,7 +1833,7 @@ def test_env_eval_reports_the_whole_completion_it_graded() -> None:
             return response == "4"
 
     case = EvalCase(id="c1", input="2+2", expected="4")
-    result = _score_case(Suite(), case, "c1", "<think>2+2 is 4</think>4")
+    result = _score_case(Suite(), case, "c1", "<think>2+2 is 4</think>4", thinking=True)
 
     assert seen == ["4"]
     assert result.passed
