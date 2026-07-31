@@ -554,8 +554,14 @@ def cmd_env_test(args) -> int:
         passed += 1
         if record["policy"] == "replay" and reward is not None:
             replayed += 1
-            if reward <= 0.0:
+            # only an exact zero counts toward the blocking gate below. a negative scale is a
+            # legitimate grader -- -1 for a correct reference and -2 for an incorrect completion
+            # still separates them, which is all GRPO's relative advantage needs -- so counting
+            # every non-positive reward as a zero rejected those environments outright
+            # (codex[bot]). the warning stays wider, since it only advises.
+            if reward == 0.0:
                 replayed_zero += 1
+            if reward <= 0.0:
                 message = (
                     f"replay gold answer scored low (reward={reward:.6f}); "
                     "check the reward function"
