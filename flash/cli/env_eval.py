@@ -235,6 +235,8 @@ def _upload_report(
     environment_reference: str,
     target: str,
     started_at: str,
+    status: str = "completed",
+    error: str | None = None,
 ) -> int:
     """Record one suite's results against a project, reporting failures without hiding them.
 
@@ -265,8 +267,8 @@ def _upload_report(
             suite_name=report.name,
             environment_reference=environment_reference,
             model=target,
-            status="completed",
-            error=None,
+            status=status,
+            error=error,
             started_at=started_at,
             cases=payload,
             api_key=api_key,
@@ -306,7 +308,7 @@ def _print_report(report: EvalSuiteReport) -> None:
 
 def cmd_env_eval(args) -> int:
     """Score local held-out suites against one deployed model target."""
-    from flash.client import client_from_config
+    from flash.client import ApiError, ClientError, client_from_config
     from flash.envs.loader import load_freesolo_environment
     from flash.schema import parse_adapter_revision, parse_checkpoint_ref
 
@@ -367,10 +369,35 @@ def cmd_env_eval(args) -> int:
             return _err("overall: FAIL")
 
     client = client_from_config()
-    started_at = datetime.now(UTC).isoformat()
+    evaluation_target = args.target
+    if revision is None and parsed is not None and parsed[1] is None:
+        run_id = parsed[0]
+        try:
+            deployment = client.deployment_for(run_id)
+        except (ApiError, ClientError) as exc:
+            if getattr(args, "debug", False):
+                raise
+            _err(f"env eval failed: could not resolve deployed revision for {run_id}: {exc}")
+            return _err("overall: FAIL")
+        if deployment is None:
+            _err(f"env eval failed: run {run_id} is not deployed")
+            return _err("overall: FAIL")
+        candidate = deployment.get("adapter_revision")
+        resolved = parse_adapter_revision(candidate) if isinstance(candidate, str) else None
+        if resolved is None or resolved[0] != run_id:
+            _err(
+                f"env eval failed: deployment for {run_id} has no valid immutable adapter revision"
+            )
+            return _err("overall: FAIL")
+        evaluation_target = candidate.strip()
+        print(f"resolved evaluation target {run_id} to {evaluation_target}")
+
     reports: list[EvalSuiteReport] = []
     for suite in suites:
-        cases: list[EvalCase] = []
+        # each suite uploads as its own run, so each needs its own start. sharing one timestamp
+        # across suites backdates every later run to before the earlier suites' work and
+        # inflates its dashboard duration by time it did not spend.
+        started_at = datetime.now(UTC).isoformat()
         try:
             cases = validate_evaluation_cases(
                 suite, source=entrypoint.parent / _DEFAULT_EVALUATIONS_PATH
@@ -384,22 +411,48 @@ def cmd_env_eval(args) -> int:
                 name=suite.name,
                 results=(_generation_error("load", f"case loading failed: {reason}"),),
             )
-        else:
-            if not cases:
-                # a suite that graded nothing measured nothing. reporting 0/0 as a pass would
-                # turn an empty or over-filtered suite into a green check nobody looks at again.
-                _err(f"suite {suite.name} has no cases to run")
-                report = EvalSuiteReport(
-                    name=suite.name,
-                    results=(_generation_error("load", "suite produced no cases"),),
+            _print_report(report)
+            reports.append(report)
+            if args.upload:
+                _upload_report(
+                    report,
+                    [],
+                    project_id=project_id,
+                    environment_reference=str(entrypoint.parent),
+                    target=evaluation_target,
+                    started_at=started_at,
+                    status="failed",
+                    error=f"case loading failed: {reason}",
                 )
-            else:
-                if args.max_cases is not None:
-                    cases = cases[: args.max_cases]
-                results = _run_cases(client, args.target, suite, cases, args)
-                for result in results:
-                    _print_case(result)
-                report = EvalSuiteReport(name=suite.name, results=results)
+            continue
+        if not cases:
+            # a suite that graded nothing measured nothing. reporting 0/0 as a pass would
+            # turn an empty or over-filtered suite into a green check nobody looks at again.
+            _err(f"suite {suite.name} has no cases to run")
+            report = EvalSuiteReport(
+                name=suite.name,
+                results=(_generation_error("load", "suite produced no cases"),),
+            )
+            _print_report(report)
+            reports.append(report)
+            if args.upload:
+                _upload_report(
+                    report,
+                    cases,
+                    project_id=project_id,
+                    environment_reference=str(entrypoint.parent),
+                    target=evaluation_target,
+                    started_at=started_at,
+                    status="failed",
+                    error="suite produced no cases",
+                )
+            continue
+        if args.max_cases is not None:
+            cases = cases[: args.max_cases]
+        results = _run_cases(client, evaluation_target, suite, cases, args)
+        for result in results:
+            _print_case(result)
+        report = EvalSuiteReport(name=suite.name, results=results)
         _print_report(report)
         reports.append(report)
         # every report uploads, including the ones that never graded a case. skipping them
@@ -413,7 +466,7 @@ def cmd_env_eval(args) -> int:
                 cases,
                 project_id=project_id,
                 environment_reference=str(entrypoint.parent),
-                target=args.target,
+                target=evaluation_target,
                 started_at=started_at,
             )
 

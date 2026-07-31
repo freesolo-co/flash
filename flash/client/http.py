@@ -130,6 +130,13 @@ def _freesolo_request(
                 "(or set FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+    # a socket timeout surfaces as a bare TimeoutError rather than a URLError, so without this
+    # it escapes as an unexpected exception. callers catch ClientError to report a failure
+    # without changing their own verdict; a traceback instead would lose that.
+    except TimeoutError as exc:
+        raise RequestTimeoutError(
+            f"request to {base}{path} timed out after {timeout}s"
+        ) from exc
     except urllib.error.URLError as exc:
         raise ClientError(
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "
@@ -372,7 +379,7 @@ class ApiClient:
         self.api_key = api_key
         self.timeout = timeout
         self.key_source = key_source
-        self._chat_step_selector_ok = False
+        self._chat_step_selector_available = False
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key:
@@ -476,9 +483,8 @@ class ApiClient:
         # cached after it first succeeds: this is a property of the control plane, not of the
         # request. `env eval` sends one chat per case, so re-checking each time doubled the
         # request count and let a single transient /v1/health blip fail an arbitrary case while
-        # the chat endpoint was healthy (codex[bot]). only a positive result is cached -- a plane
-        # that genuinely lacks the capability keeps failing every call.
-        if self._chat_step_selector_ok:
+        # the chat endpoint was healthy (codex[bot]).
+        if self._chat_step_selector_available:
             return
         capabilities = self.health().get("capabilities")
         if not isinstance(capabilities, list) or _CHAT_STEP_SELECTOR_CAPABILITY not in capabilities:
@@ -487,7 +493,10 @@ class ApiClient:
                 f"{_CHAT_STEP_SELECTOR_CAPABILITY}; use a full immutable adapter revision or "
                 "upgrade the control plane"
             )
-        self._chat_step_selector_ok = True
+        # only a successful capability check is cached, so a transient failure remains visible and
+        # retryable. concurrent first calls may make the same benign request twice; a lock would add
+        # coordination to every client solely to optimize that one startup race.
+        self._chat_step_selector_available = True
 
     def publish_env(
         self,

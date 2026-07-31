@@ -291,6 +291,51 @@ def test_env_test_validates_evaluation_sidecar_offline(monkeypatch, tmp_path, ca
     assert "overall: PASS" in output
 
 
+def test_env_test_rejects_an_empty_evaluation_suite(monkeypatch, tmp_path, capsys):
+    # approving 0/0 contract checks makes the offline gate pass a sidecar that env eval refuses
+    # to run, so the first online use fails after setup already declared the package valid.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'empty'\n"
+        "    def cases(self): return []\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "evaluation suite empty failed contract checks: suite produced no cases" in captured.err
+    assert "0/0 cases passed contract checks" not in captured.out
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_fails_when_a_scorer_reports_an_error(monkeypatch, tmp_path, capsys):
+    # a scorer that returned an error graded nothing. `flash env eval` counts those as errors
+    # and fails the suite, so approving them offline would greenlight exactly the sidecar the
+    # online command refuses -- the gate passing is what hides it.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'judged'\n"
+        "    def cases(self): return [EvalCase(id='a', input='what is 2 + 2?', expected='4')]\n"
+        "    def score(self, case, response_text):\n"
+        "        return EvalResult(case_id='a', passed=False, score=0.0, response=response_text,\n"
+        "                          error='judge unavailable')\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "1/1 case(s) reported a scoring error" in captured.err
+    assert "judge unavailable" in captured.err
+    assert "cases passed contract checks" not in captured.out
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_test_malformed_evaluation_sidecar_fails(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     sidecar = env_dir / "evaluations.py"

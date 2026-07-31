@@ -464,7 +464,8 @@ def cmd_env_setup(args) -> int:
     # dataset (or vice versa); the flag/answer only decides the mode when starting fresh.
     existing_multi: bool | None = None
     anchor = "environment.py"
-    if starter_env.exists():
+    starter_env_exists = starter_env.exists()
+    if starter_env_exists:
         existing_multi = "EnvironmentMultiTurn" in starter_env.read_text(encoding="utf-8")
     elif dataset.exists():
         # No env.py to anchor on, but the starter multi-turn dataset carries a
@@ -542,19 +543,19 @@ def cmd_env_setup(args) -> int:
         f"{'exported from your traces' if traces_jsonl else 'the starter dataset has 2'}"
         f"{'' if traces_jsonl else ' (raise as your dataset grows)'}\n"
     )
-    wrote_starter_env = not starter_env.exists()
-    if wrote_starter_env:
+    if not starter_env_exists:
         starter_env.write_text(env_py)
-    # only alongside the starter environment it grades. rerun in a directory with a custom
-    # environment.py, this used to drop in the arithmetic suite anyway, which then called that
-    # env's reward with an unrelated `7 + 5` example -- a published check measuring nothing
-    # (codex[bot]). the multi-turn scaffold gets its own suite: a single-shot eval cannot grade
-    # a finished episode, so it checks the first action's format instead.
-    if wrote_starter_env and not starter_evaluations.exists():
-        evaluations_py = (
-            _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY
-        )
-        starter_evaluations.write_text(evaluations_py.replace("PROJECT_UUID", project_id))
+        # the starter sidecar only matches the starter environment written in this run. rerun in a
+        # directory holding a custom environment.py, this used to drop in the arithmetic suite
+        # anyway, which then called that env's reward with an unrelated `7 + 5` example -- a
+        # published check measuring nothing (codex[bot]). the multi-turn scaffold gets its own
+        # suite: a single-shot eval cannot grade a finished episode, so it checks the first
+        # action's format instead.
+        if not starter_evaluations.exists():
+            evaluations_py = (
+                _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY
+            )
+            starter_evaluations.write_text(evaluations_py.replace("PROJECT_UUID", project_id))
     project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
         "# Environment: upload this project folder with\n"
@@ -654,7 +655,7 @@ def cmd_env_setup(args) -> int:
         )
     scaffolded = [
         "environment.py",
-        _DEFAULT_EVALUATIONS_PATH,
+        *([_DEFAULT_EVALUATIONS_PATH] if starter_evaluations.exists() else []),
         "dataset/train.jsonl",
         "configs/sft.toml",
         "configs/rl.toml",
