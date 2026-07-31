@@ -72,10 +72,13 @@ def _case_messages(environment, case: EvalCase) -> list[dict]:
     system prompt (flash/envs/adapter.py). Sending only `case.input` would grade the model on a
     prompt no run ever trains on, so a suite could fail purely because the system instructions
     the model was trained under were absent."""
+    example = _evaluation_example(case)
     build = getattr(environment, "prompt_messages", None)
     if not callable(build):
-        return [{"role": "user", "content": case.input}]
-    messages = build(_evaluation_example(case))
+        return _remote_prompt_messages(
+            environment, example, [{"role": "user", "content": case.input}]
+        )
+    messages = build(example)
     if not isinstance(messages, list) or not messages:
         raise TypeError(
             f"environment prompt_messages() returned {type(messages).__name__}, "
@@ -87,7 +90,44 @@ def _case_messages(environment, case: EvalCase) -> list[dict]:
                 f"environment prompt_messages() returned a {type(message).__name__} message, "
                 "expected dicts with role and content"
             )
-    return [dict(message) for message in messages]
+    return _remote_prompt_messages(environment, example, list(messages))
+
+
+def _remote_prompt_messages(environment, example: dict, messages: list[dict]) -> list[dict]:
+    """The prompt as the serving backend must receive it, matching what training builds.
+
+    `prompt_messages()` is only half of training's prompt: every worker then runs
+    `normalize_prompt_images` (flash/engine/worker/rl.py, sft.py, opd.py), which folds a record's
+    top-level `image`/`images` into the first user message and resolves each source to a
+    descriptor. Sending the raw messages dropped top-level images entirely, so a multimodal suite
+    graded a text-only prompt, and forwarded an environment's package-relative path straight to a
+    remote backend that cannot read the evaluator's disk (codex[bot]).
+
+    Descriptors are then rendered as data URIs, the same conversion the image teacher uses to put
+    local images on a remote request (flash/engine/worker/opd.py). Text-only cases -- the vast
+    majority -- return untouched without importing the multimodal machinery at all."""
+    from flash.multimodal import record_has_images
+
+    if not record_has_images(example, messages):
+        return [dict(message) for message in messages]
+    from flash.multimodal import image_descriptors_to_data_uris, normalize_prompt_images
+
+    package_root = getattr(environment, "package_root", None)
+    normalized = normalize_prompt_images(example, messages, package_root)
+    uris = iter(image_descriptors_to_data_uris(normalized.descriptors, package_root))
+    remote: list[dict] = []
+    for message in normalized.messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            copied["content"] = [
+                {"type": "image_url", "image_url": {"url": next(uris)}}
+                if block.get("type") == "image"
+                else block
+                for block in content
+            ]
+        remote.append(copied)
+    return remote
 
 
 def _generate_response(client, target: str, messages: list[dict], args) -> str:
