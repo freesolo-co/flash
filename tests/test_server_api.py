@@ -111,7 +111,7 @@ def api(tmp_path, monkeypatch):
     import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.run_registry as run_registry
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     # The dummy FREESOLO_INTERNAL_KEY also enables the best-effort backend reporting path: a dry-run
     # /v1/runs submit carries an org_id, so runner.submit_job() -> _report_status() ->
     # run_registry._post() would urllib-POST the real backend (or wait out its 10s timeout). Stub the
@@ -6413,7 +6413,7 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": run_id}])
     drained = []
     monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda rid: drained.append(rid) or set())
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
 
     app_mod.recover_runs()
 
@@ -6471,7 +6471,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner, "_run_job_background", lambda recovered: submitted.append(recovered.run_id)
     )
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
 
     app_mod.recover_runs()
 
@@ -6594,7 +6594,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     # Vast is no longer configured -> omitted from configured_providers(); the real get_provider("vast")
     # still exposes run_instances_remaining, so the recorded-but-unconfigurable provider can't be
     # enumerated -> the guard must fail closed rather than declare clear.
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
     monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
 
     app_mod.recover_runs()
@@ -6660,7 +6660,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     # Vast unconfigurable now: the OLD unconditional guard would fail closed here and defer forever. A
     # queued run must resubmit anyway, because it provably never created the phantom the guard protects
     # against. _confirm_run_clear must not even be consulted (Vast enumeration would raise/defer).
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
     monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
 
     app_mod.recover_runs()
@@ -6718,7 +6718,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
 
     import flash.providers as providers_mod
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
 
     app_mod.recover_runs()
 
