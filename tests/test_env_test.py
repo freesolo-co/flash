@@ -2872,7 +2872,9 @@ def test_a_thinking_run_grades_the_state_the_worker_would_build(monkeypatch, tmp
 
     env = _StateReadingEnv()
     _patch_loader(monkeypatch, env)
-    args = cli._build_parser().parse_args(["env", "test", str(env_dir), "--algorithm", "grpo", "--thinking"])
+    args = cli._build_parser().parse_args(
+        ["env", "test", str(env_dir), "--algorithm", "grpo", "--thinking"]
+    )
 
     assert args.func(args) == 0, capsys.readouterr().err
     assert "overall: PASS" in capsys.readouterr().out
@@ -3051,9 +3053,7 @@ def test_a_run_without_thinking_never_reports_the_template_reading(monkeypatch, 
     assert "no closing </think>" not in capsys.readouterr().err
 
 
-def test_a_raising_tools_hook_fails_a_grpo_run_on_per_episode_credit(
-    monkeypatch, tmp_path, capsys
-):
+def test_a_raising_tools_hook_fails_a_grpo_run_on_per_episode_credit(monkeypatch, tmp_path, capsys):
     # the grpo worker calls env.tools() unguarded while building the tool loop (rl.py:816), outside
     # the try/except that scores a raising reward as 0.0, so the run aborts during initialization.
     # checking it only on the per-turn path surfaced it nowhere for a default run, and env test
@@ -3161,6 +3161,10 @@ def test_per_turn_credit_is_refused_for_a_native_tool_environment(monkeypatch, t
 def test_a_tool_environment_on_per_episode_credit_is_not_refused(monkeypatch, tmp_path, capsys):
     # the control: the refusal is about the per-turn COMBINATION, not about tool envs. the default
     # mode trains fine on that path and must still be tested.
+    #
+    # it carries a reward_from_messages because that -- not reward() -- is the hook this run's
+    # scorer calls (flash/engine/worker/rl.py:433-438), and only a ranking one leaves the refusal
+    # as the single thing this control can fail on.
     env_dir = _environment_dir(tmp_path)
 
     class _ToolEnv(_MultiTurnEnv):
@@ -3169,12 +3173,141 @@ def test_a_tool_environment_on_per_episode_credit_is_not_refused(monkeypatch, tm
         def tools(self):
             return [lambda x: x]
 
+        def reward_from_messages(self, completion, example):
+            # the completion interleaves this env's own replies with the generated turns, so the
+            # gold comparison is over the assistant messages only.
+            said = [m.get("content") for m in completion if m.get("role") == "assistant"]
+            return 1.0 if said == [m.get("content") for m in example["output"]] else 0.0
+
     _patch_loader(monkeypatch, _ToolEnv())
 
     assert cmd_env_test(_args(env_dir, algorithm="grpo", credit_assignment="per_episode")) == 0
     captured = capsys.readouterr()
     assert "is not supported for tool-calling" not in captured.err
     assert "episode 1:" in captured.out
+
+
+def test_a_raising_tools_hook_is_a_finding_for_a_single_turn_tool_environment(
+    monkeypatch, tmp_path, capsys
+):
+    # rl.py:816 calls tools() for every is_tool_env, with no multi_turn in the condition, so a
+    # single-turn tool env whose tools() raises aborts during initialization exactly as a
+    # multi-turn one does. gating this command's call on multi_turn reported PASS for it
+    # (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _SingleTurnToolEnv(_SingleTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            raise RuntimeError("tool registry unavailable")
+
+    _patch_loader(monkeypatch, _SingleTurnToolEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "env.tools() raised (RuntimeError: tool registry unavailable)" in captured.err
+    assert "overall: FAIL" in captured.err
+    assert "episode 1:" not in captured.out
+
+
+def test_a_native_tool_environment_is_graded_by_reward_from_messages(monkeypatch, tmp_path, capsys):
+    # a tool env exposing tools is driven through trl's tool loop, whose message completion is
+    # scored by reward_from_messages (rl.py:433-438) -- score_rollouts is never reached. grading it
+    # through the rollout path let a placeholder rollout scorer pass an env whose real grader is
+    # flat (codex[bot]). here the unused rollout scorer ranks and the real one does not, so only
+    # reading the right hook can fail this run.
+    env_dir = _environment_dir(tmp_path)
+
+    class _FlatNativeGraderEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            return [lambda x: x]
+
+        def reward_from_messages(self, completion, example):
+            return 0.0
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            return [RolloutReward(episode=1.0) for _ in items]
+
+    env = _FlatNativeGraderEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
+def test_a_native_tool_grader_is_handed_the_generated_messages_without_the_prompt(
+    monkeypatch, tmp_path, capsys
+):
+    # trl's completion is the generated messages only -- the prompt is not part of it -- so the
+    # opening is dropped as a positional prefix before the grader sees it.
+    env_dir = _environment_dir(tmp_path)
+    seen: list[list[dict]] = []
+
+    class _RecordingNativeEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            return [lambda x: x]
+
+        def reward_from_messages(self, completion, example):
+            seen.append(completion)
+            said = [m.get("content") for m in completion if m.get("role") == "assistant"]
+            return 1.0 if said == [m.get("content") for m in example["output"]] else 0.0
+
+    _patch_loader(monkeypatch, _RecordingNativeEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert seen, "the native grader was never called"
+    for completion in seen:
+        assert {"role": "user", "content": "finish the exchange"} not in completion
+
+
+def test_a_raising_native_tool_grader_is_scored_zero_rather_than_failing_the_episode(
+    monkeypatch, tmp_path, capsys
+):
+    # reward_fn wraps this call in `except Exception` and scores 0.0 (rl.py:462-471), so the run
+    # survives a raising grader. failing here would report a run-surviving grader as run-aborting.
+    # it is still reported: every episode ties at zero, which is the flat-reward finding.
+    env_dir = _environment_dir(tmp_path)
+
+    class _RaisingNativeEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            return [lambda x: x]
+
+        def reward_from_messages(self, completion, example):
+            raise RuntimeError("grader dependency missing")
+
+    _patch_loader(monkeypatch, _RaisingNativeEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "cannot rank completions" in captured.err
+    # scored, not aborted: the episode still reports a reward.
+    assert "episode 1: policy=replay turns=2 reward=0.000000" in captured.out
+
+
+def test_a_non_grpo_run_never_calls_tools_on_a_native_tool_environment(monkeypatch, tmp_path):
+    # sft/opd/opsd read dataset/prompt/sft_completion and never build a tool loop, so tools() is
+    # not their run's problem -- _grpo_rejection leaves it unvalidated for them, and the scoring
+    # dispatch must not call it either.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ExplodingToolsEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            raise AssertionError("tools() must not be called for a non-grpo run")
+
+    _patch_loader(monkeypatch, _ExplodingToolsEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
 
 
 def test_a_tool_environment_exposing_no_tools_still_allows_per_turn_credit(
