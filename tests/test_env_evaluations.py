@@ -90,6 +90,54 @@ def test_load_evaluation_suites_supports_positional_only_factory(tmp_path) -> No
     assert suites[0].environment is marker
 
 
+def _lazy_helper_env(root: Path, label: str) -> Path:
+    """An env whose sidecar imports its sibling helper lazily, inside cases() and score()."""
+    env_dir = root / label
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "helper.py").write_text(f"LABEL = {label!r}\n")
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        f"    name = {label!r}\n"
+        "    def cases(self):\n"
+        "        from helper import LABEL\n"
+        "        return [EvalCase(id=LABEL, input='x', expected='x')]\n"
+        "    def score(self, case, response):\n"
+        "        from helper import LABEL\n"
+        "        return EvalCase and float(response == LABEL)\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    return env_dir
+
+
+def test_lazily_imported_siblings_stay_bound_to_their_own_environment(tmp_path) -> None:
+    """A helper imported inside cases()/score() must be the caller's own, not the last one loaded.
+
+    The sidecar's package directory was left on sys.path so lazy imports would still resolve, and
+    the cleanup ran when the module finished executing -- before cases() or score() had imported
+    anything. So the FIRST package's `helper` stayed cached under its plain name and the second
+    environment silently graded with the first one's cases and the first one's scoring logic. No
+    ImportError, no warning: wrong results that read as legitimate, which is the one failure this
+    module exists to prevent.
+    """
+    first = _lazy_helper_env(tmp_path, "alpha")
+    second = _lazy_helper_env(tmp_path, "beta")
+
+    alpha = load_evaluation_suites(first, environment=None)[0]
+    beta = load_evaluation_suites(second, environment=None)[0]
+
+    # interleaved on purpose: the binding must survive another package being loaded in between.
+    assert [case.id for case in alpha.cases()] == ["alpha"]
+    assert [case.id for case in beta.cases()] == ["beta"]
+    # scoring resolves the sibling independently of cases(), so it is checked independently.
+    assert alpha.score(EvalCase(id="a", input="x", expected="x"), "alpha") == 1.0
+    assert beta.score(EvalCase(id="b", input="x", expected="x"), "beta") == 1.0
+    # and the process is left as it was found, so a long CLI run does not accumulate state.
+    assert [path for path in sys.path if str(tmp_path) in path] == []
+    assert "helper" not in sys.modules
+
+
 def test_load_evaluation_suites_supports_module_fallback(tmp_path) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
@@ -431,6 +479,10 @@ class _RecordingUpload:
 def _patch_upload(monkeypatch, uploader) -> None:
     monkeypatch.setattr("flash.client.upload_eval_run", uploader, raising=False)
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
+    # the accessibility preflight is exercised by its own tests; here it just has to say yes.
+    monkeypatch.setattr(
+        "flash.client.get_project", lambda project_id, _api_key: {"id": project_id}, raising=False
+    )
 
 
 def test_env_eval_records_the_exact_entrypoint_it_graded(monkeypatch, tmp_path) -> None:
@@ -511,6 +563,61 @@ def test_env_eval_upload_rejects_a_non_uuid_project_before_paying(
     captured = capsys.readouterr().err
     assert "--upload requires a valid --project" in captured
     assert "valid UUID" in captured
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_env_eval_upload_rejects_an_inaccessible_project_before_paying(
+    monkeypatch, tmp_path, capsys, status: int
+) -> None:
+    """A well-formed UUID is not a project this caller can upload to.
+
+    Validating only the shape meant a deleted project, or one belonging to another organization,
+    bought every model request and was rejected at upload -- and because upload failure
+    deliberately does not change the verdict, the run still printed `overall: PASS` with nothing
+    recorded anywhere. `env setup` already resolves the project before scaffolding.
+    """
+    from flash.client import ApiError
+
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
+    )
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
+
+    def _denied(project_id, api_key):
+        raise ApiError(status, "denied")
+
+    monkeypatch.setattr("flash.client.get_project", _denied, raising=False)
+    env_dir = _upload_env_dir(tmp_path)
+
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID]) == 1
+    )
+    captured = capsys.readouterr().err
+    assert "--upload requires a valid --project" in captured
+    assert "is not accessible" in captured
+
+
+def test_env_eval_upload_requires_credentials_before_paying(monkeypatch, tmp_path, capsys) -> None:
+    """Uploading without a key cannot be discovered after the suite has already been bought."""
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
+    )
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", ""))
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda project_id, api_key: (_ for _ in ()).throw(
+            AssertionError("no project lookup without a key")
+        ),
+        raising=False,
+    )
+    env_dir = _upload_env_dir(tmp_path)
+
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID]) == 1
+    )
+    assert "not logged in" in capsys.readouterr().err
 
 
 def test_env_eval_project_without_upload_is_rejected(monkeypatch, tmp_path, capsys) -> None:
@@ -790,20 +897,36 @@ def test_env_eval_upload_failure_does_not_relabel_a_passing_suite(
     assert "overall: PASS" in captured.out
 
 
-def test_env_eval_upload_without_login_reports_the_missing_key(
+def test_env_eval_upload_reports_a_key_lost_after_the_suite_ran(
     monkeypatch, tmp_path, capsys
 ) -> None:
+    """Losing the key mid-run reports the failure without discarding the verdict.
+
+    A missing key at startup is now refused before any generation is bought, so this guard is
+    reachable only when the credential disappears while a long evaluation is running -- a logout,
+    a rewritten config, a cleared env var. That is a genuine after-the-fact failure like any
+    network fault, so it must not relabel a suite that actually passed as failing.
+    """
     env_dir = _upload_env_dir(tmp_path)
 
     class Client:
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
+    keys = iter([("url", "key-1")])
+
+    def _load_credentials():
+        # the preflight gets a key; by upload time the user has logged out.
+        return next(keys, ("url", None))
+
     uploader = _RecordingUpload()
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
     monkeypatch.setattr("flash.client.upload_eval_run", uploader, raising=False)
-    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", None))
+    monkeypatch.setattr(
+        "flash.client.get_project", lambda project_id, _api_key: {"id": project_id}, raising=False
+    )
+    monkeypatch.setattr("flash.client.config.load_credentials", _load_credentials)
 
     assert (
         cli.main(
@@ -1465,6 +1588,11 @@ def test_env_eval_reports_upload_timeout_without_a_traceback(
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
+    # only the upload may time out. the project preflight uses the same socket, so leaving it
+    # unpatched would fail the run before it reached the translation under test.
+    monkeypatch.setattr(
+        "flash.client.get_project", lambda project_id, _api_key: {"id": project_id}, raising=False
+    )
     monkeypatch.setattr("urllib.request.urlopen", _timeout)
 
     assert (
