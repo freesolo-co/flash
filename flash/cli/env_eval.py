@@ -288,6 +288,30 @@ def _case_payload(case: EvalCase | None, result: EvalResult) -> dict:
     }
 
 
+def _require_accessible_project(project_id: str) -> str:
+    """The canonical id of a project this caller can actually upload to.
+
+    Raises ClientError when the credentials are missing or the project is not reachable from
+    this organization, so the refusal happens before a single generation is bought."""
+    from flash.client import ApiError, ClientError, get_project
+    from flash.client.config import load_credentials
+
+    _, api_key = load_credentials()
+    if not api_key:
+        raise ClientError(
+            "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
+        )
+    try:
+        return str(get_project(project_id, api_key)["id"])
+    except ApiError as exc:
+        if exc.status not in {403, 404}:
+            raise
+        raise ClientError(
+            f"project {project_id!r} is not accessible; run `flash projects list` "
+            "and pass a project UUID from the current organization"
+        ) from exc
+
+
 def _upload_report(
     report: EvalSuiteReport,
     cases: list[EvalCase],
@@ -390,6 +414,17 @@ def cmd_env_eval(args) -> int:
         try:
             project_id = require_project_id(args.project)
         except (TypeError, ValueError) as exc:
+            return _err(f"--upload requires a valid --project PROJECT_ID: {exc}")
+        # a well-formed UUID is not an accessible project. checking only the shape let a deleted id,
+        # or one belonging to another organization, buy the whole evaluation and be rejected at
+        # upload -- printing `overall: PASS` with nothing recorded, since upload failure
+        # deliberately does not change the verdict. `env setup` already resolves the project this
+        # way before scaffolding anything.
+        try:
+            project_id = _require_accessible_project(project_id)
+        except (ApiError, ClientError) as exc:
+            if getattr(args, "debug", False):
+                raise
             return _err(f"--upload requires a valid --project PROJECT_ID: {exc}")
     if args.project and not args.upload:
         return _err("--project only applies with --upload")
