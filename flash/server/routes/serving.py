@@ -50,7 +50,7 @@ from flash.serve.preflight import (
     SERVING_PROMPT_TOKEN_ALLOWANCE,
     ExternalSchemaReference,
     reject_external_schema_reference,
-    resolve_effective_completion_tokens,
+    resolve_smoke_completion_tokens,
     validate_local_json_schema,
     validate_structured_output_patterns,
 )
@@ -511,16 +511,24 @@ def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> t
     return content, finish
 
 
-def _thinking_structured_answer(content: str) -> str:
+def _thinking_answer(content: str) -> str:
+    """Return the answer a thinking adapter emitted after its reasoning, or reject the smoke.
+
+    Applies to every thinking smoke, not only grammar-constrained ones. A run trained with
+    stop_sequences can emit its delimiter while still reasoning; serving folds that partial
+    reasoning into a nonempty ``<think>`` block, so without this the response passes the
+    empty-content check and activates a checkpoint that answers nothing on real requests. The stop
+    also makes ``finish_reason`` ``"stop"`` rather than ``"length"``, so the truncation guard above
+    cannot see it.
+    """
     closed = content.find("</think>")
     if closed < 0:
         raise ServingError(
-            "structured smoke generation for a thinking adapter never closed its reasoning with "
-            "</think>"
+            "smoke generation for a thinking adapter never closed its reasoning with </think>"
         )
     answer = content[closed + len("</think>") :].strip()
     if not answer:
-        raise ServingError("structured smoke generation returned no answer after </think>")
+        raise ServingError("smoke generation returned no answer after </think>")
     return answer
 
 
@@ -574,13 +582,24 @@ def _run_deployment_smoke(
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
     max_tokens = 256
-    if constraint is not None and spec.thinking:
-        max_tokens = max(256, resolve_effective_completion_tokens(spec))
+    # a thinking adapter spends tokens reasoning BEFORE it emits any content, so 256 buys it a
+    # truncated <think> block and no answer -- the smoke then fails with "returned no content
+    # (finish_reason='length')" and the deployment is rejected. that cost does not depend on
+    # whether a grammar is configured, and resolve_smoke_completion_tokens reads the run's own
+    # budget rather than the constraint, so gating the larger budget on structured_outputs left
+    # every thinking run that uses stop_sequences instead undeployable.
+    if spec.thinking:
+        max_tokens = max(256, resolve_smoke_completion_tokens(spec))
         serving_capacity = serving_completion_token_capacity(
             spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
         )
         if serving_capacity is not None:
             max_tokens = min(max_tokens, serving_capacity)
+    # a run trained with stop_sequences terminates on its delimiter and need never emit EOS. without
+    # forwarding them the smoke generates past the answer to max_tokens, comes back
+    # finish_reason="length", and the truncation guard below rejects a checkpoint that answered
+    # correctly.
+    stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -597,6 +616,7 @@ def _run_deployment_smoke(
                     expected_checkpoint=expected_checkpoint,
                     timeout_s=timeout_s,
                     retry_unavailable=True,
+                    stop=stop_sequences or None,
                 )
 
             result = _bounded_call(
@@ -612,11 +632,12 @@ def _run_deployment_smoke(
             continue
         break
     content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
-    if constraint and spec.thinking and finish == "length":
-        raise ServingError("structured smoke generation was truncated at the maximum token length")
-    answer = (
-        _thinking_structured_answer(content) if constraint and spec.thinking else content.strip()
-    )
+    # truncation is a thinking-budget failure whether or not a grammar is configured: serving
+    # returns the reasoning in reasoning_content, so a run cut off mid-thought still arrives with a
+    # balanced <think>...</think> and passes the empty-content check carrying a non-answer.
+    if spec.thinking and finish == "length":
+        raise ServingError("smoke generation was truncated at the maximum token length")
+    answer = _thinking_answer(content) if spec.thinking else content.strip()
     if constraint:
         _validate_structured_smoke(answer, constraint, deadline=deadline, budget_s=budget_s)
     if time.monotonic() > deadline:
@@ -1414,6 +1435,12 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             status_code=400,
             detail=f"max_tokens must be a positive integer, got {max_tokens}",
         )
+    # the same stops the deployment smoke verified with: a run trained to terminate on a delimiter
+    # rather than EOS would otherwise pass verification and then run to max_tokens, or emit trailing
+    # text past its answer, on every real request.
+    stop_sequences = [
+        str(value) for value in (getattr(spec.train, "stop_sequences", ()) or ())
+    ] or None
     try:
         if payload.get("stream") is True:
             return StreamingResponse(
@@ -1423,6 +1450,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                     temperature=temperature,
                     max_tokens=max_tokens,
                     thinking=spec.thinking,
+                    stop=stop_sequences,
                 ),
                 media_type="text/plain; charset=utf-8",
             )
@@ -1432,6 +1460,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             temperature=temperature,
             max_tokens=max_tokens,
             thinking=spec.thinking,
+            stop=stop_sequences,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc
