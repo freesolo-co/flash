@@ -327,6 +327,10 @@ def cmd_env_delete(args) -> int:
 
 
 _ENV_ENTRYPOINT = "environment.py"
+# the held-out evaluation sidecar (flash/envs/evaluations.py). a known filename beside the
+# entrypoint rather than an environment module: never an entrypoint candidate, and carried
+# alongside the entrypoint on a single-file push the way its docs and dataset are.
+_ENV_EVALUATIONS_SIDECAR = "evaluations.py"
 _ENV_SYSPATH_BOOTSTRAP = (
     "import os as _flash_os, sys as _flash_sys\n"
     "_flash_sys.path.insert(0, _flash_os.path.dirname(__file__))\n"
@@ -477,6 +481,64 @@ def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bo
     return not (path.is_dir() or path.is_file())
 
 
+def _dynamic_import_name(node) -> str | None:
+    """The module a literal `import_module("x")` or `__import__("x")` call names, if any.
+
+    A sidecar importing a sibling dynamically passes local test and eval -- the scope makes the
+    directory importable -- and then fails on its first published case, because the helper was
+    never packaged (codex[bot]). A literal argument is statically knowable, so it is followed like
+    any other import. A computed name is not, and is left to the runtime rather than guessed at."""
+    import ast
+
+    func = node.func
+    name = getattr(func, "attr", None) or getattr(func, "id", None)
+    if name not in ("import_module", "__import__"):
+        return None
+    if not node.args:
+        return None
+    first = node.args[0]
+    if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+        return None
+    # `import_module(".helper", package=...)` is relative; the sidecar directory is not a package,
+    # so only an absolute name can name a sibling this push would carry.
+    return first.value.split(".", 1)[0] or None
+
+
+def _imported_module_names(tree) -> set[str]:
+    """Top-level names a parsed module imports absolutely, statement or literal call."""
+    import ast
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".", 1)[0])
+        elif isinstance(node, ast.Call):
+            dynamic = _dynamic_import_name(node)
+            if dynamic:
+                names.add(dynamic)
+    return names
+
+
+def _helper_imports(helper: Path) -> set[str]:
+    """Top-level names a packaged helper imports, for following its own dependencies.
+
+    A helper that fails to parse is still shipped verbatim: refusing the push over a file the
+    sidecar may never execute would be a harsher failure than the ModuleNotFoundError this
+    lookahead exists to avoid, and the sidecar's own syntax is validated separately."""
+    import ast
+
+    if helper.suffix != ".py":
+        return set()
+    try:
+        return _imported_module_names(
+            ast.parse(helper.read_text(encoding="utf-8"), filename=str(helper))
+        )
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return set()
+
+
 def _iter_env_sidecar_files(
     env_root: Path, *, entrypoint: Path, include_full_tree: bool
 ) -> Iterator[tuple[Path, Path]]:
@@ -485,6 +547,9 @@ def _iter_env_sidecar_files(
 
     roots = [env_root]
     if not include_full_tree:
+        import ast
+
+        yielded: set[Path] = set()
         # a single-file push carries only the entrypoint, its dataset sidecars, and its own
         # docs. ship user-authored docs so the synthesized stub readme does not stand in for
         # real training guidance the user shipped next to the module.
@@ -493,7 +558,89 @@ def _iter_env_sidecar_files(
             if doc.is_file() and not _ignore_env_push_path(
                 doc, env_root=env_root, entrypoint=entrypoint
             ):
+                yielded.add(doc)
                 yield doc, doc.relative_to(env_root)
+        # the eval sidecar ships with its entrypoint. `env eval` loads evaluations.py next to an
+        # exact .py target, so omitting it here would publish an environment whose suite passed
+        # locally and is simply absent once pushed.
+        sidecar = env_root / _ENV_EVALUATIONS_SIDECAR
+        if (
+            sidecar.is_file()
+            and sidecar != entrypoint
+            and not _ignore_env_push_path(sidecar, env_root=env_root, entrypoint=entrypoint)
+        ):
+            yielded.add(sidecar)
+            yield sidecar, sidecar.relative_to(env_root)
+            try:
+                tree = ast.parse(sidecar.read_text(encoding="utf-8"), filename=str(sidecar))
+            except SyntaxError as exc:
+                raise ValueError(
+                    f"{sidecar}: invalid evaluation sidecar syntax: {exc.msg}"
+                ) from exc
+            # walk the whole tree, not just tree.body: the loader deliberately keeps the package
+            # dir on sys.path so a sidecar can import its helpers lazily inside cases() or score()
+            # (flash/envs/evaluations.py). scanning only top-level nodes skips exactly that
+            # pattern, so `env test` passes locally and the pushed environment is missing the
+            # helper the sidecar imports the moment it grades a case.
+            imported_modules = _imported_module_names(tree)
+            # a helper that imports another sibling needs that sibling too: shipping `scorer.py`
+            # without the `thresholds` it imports published an environment that raised
+            # ModuleNotFoundError on its first case, having passed every local check because the
+            # source directory was importable (cursor[bot]). the queue is seeded from the sidecar
+            # and grows only through siblings actually reached, so it stays a closure over files
+            # this push already carries rather than a general dependency resolver.
+            pending = sorted(imported_modules)
+            visited: set[str] = set()
+            while pending:
+                module_name = pending.pop()
+                if module_name in visited:
+                    continue
+                visited.add(module_name)
+                # `from graders.rules import score` resolves to a sibling PACKAGE, not graders.py.
+                # matching only the module spelling published an environment whose sidecar raises
+                # ModuleNotFoundError on its first case, having passed every local check.
+                #
+                # the package is tried FIRST because python's path finder checks directories before
+                # same-named modules: when both exist, `import graders` is the package. shipping the
+                # .py and skipping the package published the file the sidecar never imports while
+                # dropping the one it does (cursor[bot]).
+                package = env_root / module_name
+                if (
+                    (package / "__init__.py").is_file()
+                    and not package.is_symlink()
+                    and not _ignore_env_push_path(package, env_root=env_root, entrypoint=entrypoint)
+                ):
+                    for root, dirs, files in os.walk(
+                        package, topdown=True, followlinks=False, onerror=_raise_walk_error
+                    ):
+                        root_path = Path(root)
+                        dirs[:] = sorted(
+                            name
+                            for name in dirs
+                            if not _ignore_env_push_path(
+                                root_path / name, env_root=env_root, entrypoint=entrypoint
+                            )
+                        )
+                        for name in sorted(files):
+                            child = root_path / name
+                            if child in yielded or _ignore_env_push_path(
+                                child, env_root=env_root, entrypoint=entrypoint
+                            ):
+                                continue
+                            yielded.add(child)
+                            pending.extend(_helper_imports(child))
+                            yield child, child.relative_to(env_root)
+                    continue
+                helper = env_root / f"{module_name}.py"
+                if (
+                    helper.is_file()
+                    and helper != entrypoint
+                    and helper not in yielded
+                    and not _ignore_env_push_path(helper, env_root=env_root, entrypoint=entrypoint)
+                ):
+                    yielded.add(helper)
+                    pending.extend(_helper_imports(helper))
+                    yield helper, helper.relative_to(env_root)
         roots = [
             env_root / name
             for name in ("dataset", "datasets")
@@ -519,12 +666,47 @@ def _iter_env_sidecar_files(
                 yield child, child.relative_to(env_root)
 
 
+def _entrypoint_alias_source(module_name: str) -> str:
+    """The alias module that rebinds a noncanonical entrypoint name to environment.py."""
+    return (
+        "# generated by `flash env push`: this environment's entrypoint was published as\n"
+        f"# {_ENV_ENTRYPOINT}, so `import {module_name}` keeps resolving to the same module.\n"
+        "import sys\n"
+        "\n"
+        "import environment as _environment\n"
+        "\n"
+        "sys.modules[__name__] = _environment\n"
+    )
+
+
+def _write_entrypoint_alias(pkg: Path, *, entrypoint: Path) -> None:
+    """Keep a noncanonical entrypoint importable under the name it had locally.
+
+    Packaging writes the entrypoint's contents as environment.py whatever it was called, so a
+    sidecar doing `from custom import SCORER` -- which resolves locally, and is the only way to
+    reach the entrypoint when it is not named environment.py -- raised ModuleNotFoundError once
+    published (cursor[bot]). The alias rebinds sys.modules rather than re-importing, so the
+    sidecar and the runner share ONE module object and one set of module-level state; importing
+    the source twice would give the sidecar a second copy of every constant it scores against.
+
+    No sibling can collide with the alias: the entrypoint lives in the package root, and
+    `_ignore_env_push_path` excludes it from the sidecar walk, so its name is unclaimed."""
+    if entrypoint.name == _ENV_ENTRYPOINT:
+        return
+    (pkg / entrypoint.name).write_text(_entrypoint_alias_source(entrypoint.stem))
+
+
 def _check_env_push_limits(
     env_root: Path, *, entrypoint: Path, include_full_tree: bool, env_name: str
 ) -> None:
     """Reject oversized source trees before copying or building an in-memory archive."""
     files = 1
     total_bytes = entrypoint.stat().st_size + len(_ENV_SYSPATH_BOOTSTRAP.encode())
+    if entrypoint.name != _ENV_ENTRYPOINT:
+        # the import alias `cmd_env_push` writes beside environment.py counts against the same
+        # member cap the server enforces, so it cannot be free here.
+        files += 1
+        total_bytes += len(_entrypoint_alias_source(entrypoint.stem).encode())
     directories: set[Path] = set()
     has_readme = False
     for child, relative in _iter_env_sidecar_files(
@@ -659,7 +841,15 @@ def _resolve_local_env_entrypoint(path: str | Path) -> tuple[Path, Path, Path, b
         elif (src / "pyproject.toml").is_file():
             raise ValueError(f"{src} has a pyproject.toml but no environment.py entrypoint")
         else:
-            modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
+            # evaluations.py is a known sidecar, never an entrypoint. counting it here would
+            # make adding one break a legacy single-module package that resolved fine before:
+            # the directory would suddenly hold "multiple top-level .py modules" and be rejected
+            # before either file is read.
+            modules = [
+                p
+                for p in sorted(src.glob("*.py"))
+                if not p.name.startswith("__") and p.name != _ENV_EVALUATIONS_SIDECAR
+            ]
             if len(modules) != 1:
                 raise ValueError(
                     f"{src} has no environment.py and "
@@ -714,6 +904,7 @@ def cmd_env_push(args) -> int:
         pkg = Path(tmp)
         module_source = entrypoint.read_text()
         (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
+        _write_entrypoint_alias(pkg, entrypoint=entrypoint)
         _copy_env_sidecars(
             env_root,
             pkg,

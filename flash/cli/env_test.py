@@ -224,6 +224,100 @@ def _load_failure(reason: str) -> int:
     return _err("overall: FAIL")
 
 
+def _evaluation_example(case) -> dict:
+    example = dict(case.metadata or {})
+    example["input"] = case.input
+    example["output"] = case.expected
+    if case.id is not None:
+        example["id"] = case.id
+    return example
+
+
+def _evaluation_response(env, case) -> tuple[str, str]:
+    example = _evaluation_example(case)
+    # build the prompt even though the replayed response does not need it. `flash env eval`
+    # sends every case through prompt_messages() (flash/cli/env_eval.py `_case_messages`), so a
+    # prompt that raises or returns malformed messages for a held-out case is a suite the online
+    # command records a prompt-construction error for. checking only the scorer let this offline
+    # gate print `overall: PASS` for exactly that sidecar (cursor[bot]).
+    build = getattr(env, "prompt_messages", None)
+    if callable(build):
+        _check_messages(build(example), "prompt")
+    reference_turns = _reference_turns(env, example)
+    policy = _resolve_policy(reference_turns)
+    response = (
+        "\n".join(turn for turn in reference_turns if turn)
+        if policy == "replay"
+        else _ECHO_RESPONSE
+    )
+    return policy, response
+
+
+def _check_evaluation_suites(entrypoint: Path, env) -> bool:
+    from flash.envs.evaluations import (
+        _DEFAULT_EVALUATIONS_PATH,
+        EvalSuiteReport,
+        has_evaluations,
+        load_evaluation_suites,
+        normalize_eval_result,
+        validate_evaluation_cases,
+    )
+
+    if not has_evaluations(entrypoint):
+        return True
+    source = entrypoint.parent / _DEFAULT_EVALUATIONS_PATH
+    try:
+        suites = load_evaluation_suites(entrypoint, environment=env)
+    except (Exception, SystemExit) as exc:
+        reason = str(exc) or exc.__class__.__name__
+        _err(f"evaluation checks failed: {reason}")
+        return False
+
+    all_valid = True
+    for suite in suites:
+        results = []
+        try:
+            cases = validate_evaluation_cases(suite, source=source)
+            if not cases:
+                all_valid = False
+                _err(
+                    f"evaluation suite {suite.name} failed contract checks: suite produced no cases"
+                )
+                continue
+            for index, case in enumerate(cases, start=1):
+                _policy, response = _evaluation_response(env, case)
+                scored = suite.score(case, response)
+                result = normalize_eval_result(
+                    case,
+                    response,
+                    scored,
+                    case_id=case.id or str(index),
+                )
+                results.append(result)
+            report = EvalSuiteReport(name=suite.name, results=tuple(results))
+            # a scorer that reported an error did not grade the case. `flash env eval` counts
+            # those as errors and fails the suite, so approving them here would let the offline
+            # gate greenlight exactly the sidecar the online command refuses.
+            errored = [result for result in results if result.error]
+            if errored:
+                all_valid = False
+                detail = ", ".join(f"{result.case_id}: {result.error}" for result in errored)
+                _err(
+                    f"evaluation suite {suite.name} failed contract checks: "
+                    f"{len(errored)}/{report.total} case(s) reported a scoring error ({detail})"
+                )
+                continue
+            print(
+                f"evaluation suite {suite.name}: {report.total}/{report.total} cases "
+                f"passed contract checks mean_score={report.mean_score:.6f}"
+            )
+        except (Exception, SystemExit) as exc:
+            all_valid = False
+            reason = str(exc) or exc.__class__.__name__
+            _err(f"evaluation suite {suite.name} failed contract checks: {reason}")
+    return all_valid
+
+
 def _reject_unsubmittable_param(key: str, value: object) -> None:
     """Reject a parsed TOML value that ``[environment.params]`` could not actually submit.
 
@@ -578,12 +672,17 @@ def cmd_env_test(args) -> int:
     # all -- a broken scorer or a missing runtime dependency (LS-005) -- and the run reaches a gpu
     # able to see only flat-zero reward. deliberately narrow: a PARTIAL zero stays the warning
     # above and still passes, because a strict reward function with some hard rows is legitimate.
-    if replayed and replayed_zero == replayed:
+    grader_recognizes_gold = not (replayed and replayed_zero == replayed)
+    if not grader_recognizes_gold:
         _err(
             f"all {replayed} replayed gold answer(s) scored zero; the reward function cannot "
             "recognize its own reference answers. check the grader and that its runtime "
             "dependencies are installed in this environment."
         )
+    # run the evaluation checks even when the grader gate already failed, so one `flash env test`
+    # reports every broken surface at once instead of hiding the sidecar's errors behind the
+    # reward function's. both gates block; neither short-circuits the other.
+    if not _check_evaluation_suites(entrypoint, env) or not grader_recognizes_gold:
         return _err("overall: FAIL")
     print(render.ok("overall: PASS") if render.styled() else "overall: PASS")
     return 0
