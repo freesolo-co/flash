@@ -1050,7 +1050,7 @@ def model_required_vram_gb(
         pull the run back onto a card that would NOT use fp8 (which would then OOM).
 
         Skipped entirely for GDN hybrids: both workers refuse fp8 KV for them (opd_train.py,
-        rl_verl.py), so their cache really is bf16 and the discount would admit a run onto a card
+        rl_train.py), so their cache really is bf16 and the discount would admit a run onto a card
         that cannot hold it."""
         from flash.providers.base import max_non_fp8_kv_vram_gb
 

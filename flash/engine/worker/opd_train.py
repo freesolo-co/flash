@@ -26,6 +26,21 @@ from flash.engine.steps import (
 )
 from flash.engine.structured_outputs import reasoning_parser_for
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.backend_common import (
+    ChildOutputTail,
+    ChildTailStaleness,
+    agent_loop_workers,
+    clamp_engine_len,
+    latest_global_step_dir,
+    model_max_position_embeddings,
+    parse_verl_metric,
+    parse_wandb_link,
+    render_wandb_link_shim,
+    resolve_verl_loggers,
+    resolve_verl_python,
+    run_verl_training,
+    stall_tail_fields,
+)
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.multiturn_glue import (
     EnvGlueTokenizer,
@@ -65,21 +80,6 @@ from flash.engine.worker.tokenizer_align import (
     TeacherToken,
     groupwise_alignment,
     groupwise_coverage,
-)
-from flash.engine.worker.verl_common import (
-    ChildOutputTail,
-    ChildTailStaleness,
-    agent_loop_workers,
-    clamp_engine_len,
-    latest_global_step_dir,
-    model_max_position_embeddings,
-    parse_verl_metric,
-    parse_wandb_link,
-    render_wandb_link_shim,
-    resolve_verl_loggers,
-    resolve_verl_python,
-    run_verl_training,
-    stall_tail_fields,
 )
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resume_state_metadata
 
@@ -1481,7 +1481,7 @@ def build_opd_overrides(config: dict) -> list[str]:
         # per-request sampling is seeded separately by the plugin's deterministic_rollout_seed.
         f"++actor_rollout_ref.rollout.engine_kwargs.vllm.seed={_hydra_val(config.get('seed', 42))}",
         # fp8 kv cache, exactly as the deleted trl colocate engine reserved it (it set
-        # kv_cache_dtype="fp8" on cc >= 8.9) and as rl_verl.py does for grpo. this is not an
+        # kv_cache_dtype="fp8" on cc >= 8.9) and as rl_train.py does for grpo. this is not an
         # optimization: flash/engine/vram.py sizes an opd run against an fp8 kv pool once the
         # requirement clears the largest non-fp8 card, so a bf16 cache here would allocate twice the
         # kv the allocator reserved and OOM at rollout init on a card sizing called sufficient.
@@ -2325,7 +2325,7 @@ def run_opd_train(spec=None) -> None:
     loggers = resolve_verl_loggers(python_bin)
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
-    # fp8 kv cache on ada/hopper+ (cc >= 8.9), matching rl_verl's grpo gate -- but NOT for hybrid
+    # fp8 kv cache on ada/hopper+ (cc >= 8.9), matching rl_train's grpo gate -- but NOT for hybrid
     # linear-attention (gdn) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a plain kv
     # tensor and crashes on the hybrid cache under verl's sleep/wake, which opd leaves enabled.
     # the vram estimator applies an fp8 discount to opd above the non-fp8 card ceiling, so this must
@@ -2712,7 +2712,7 @@ def run_opd_train(spec=None) -> None:
                 "wandb_project": project_name if "wandb" in loggers else None,
                 "wandb_run_name": experiment_name if "wandb" in loggers else None,
                 # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
-                # wandb.run, verl from the child marker (see verl_common.render_wandb_link_shim).
+                # wandb.run, verl from the child marker (see backend_common.render_wandb_link_shim).
                 "wandb_url": wandb_link.get("wandb_url"),
                 "wandb_id": wandb_link.get("wandb_id"),
             },

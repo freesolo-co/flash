@@ -695,7 +695,7 @@ def render_wandb_link_shim() -> str:
     every failure path leaves the run unlinked instead of dead.
     """
     return f'''
-# --- flash: report the w&b run link to the parent (see verl_common.render_wandb_link_shim) ---
+# --- flash: report the w&b run link to the parent (see backend_common.render_wandb_link_shim) ---
 try:
     import json as _flash_wandb_json
 
@@ -756,7 +756,7 @@ def parse_wandb_link(line: str) -> dict | None:
 # below are what flash/cli/commands.py:_FOLLOW_METRIC_FIELDS renders.
 #
 # not anchored at line start: ray tags worker stdout with a "(TaskRunner pid=123) " prefix, so an
-# anchored match would parse nothing at all in production. the existing progress regex in rl_verl
+# anchored match would parse nothing at all in production. the existing progress regex in rl_train
 # is unanchored for the same reason.
 _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+) - ")
 
