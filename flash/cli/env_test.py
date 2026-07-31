@@ -6,7 +6,7 @@ import json
 import math
 import sys
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Sequence, Sized
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,8 +18,8 @@ from .envpush import _err, _resolve_local_env_entrypoint
 
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 # the algorithms whose worker actually calls the environment's scorer. only rl.py reads a reward
-# (env.scores_breakdown / env.reward) and only multiturn_rollout.py scores a rollout; the opd and
-# opsd workers consume dataset(), prompt_messages(), and sft_completion() and never grade anything.
+# (env.scores_breakdown / env.reward) and only multiturn_rollout.py scores a rollout; the sft and
+# opd workers consume dataset(), prompt_messages(), and sft_completion() and never grade anything.
 # so a placeholder scorer is a real defect for grpo and legitimate for every other algorithm, and
 # samples_on_policy -- which is about sampling student completions, not grading them -- is the
 # wrong question to ask here (codex[bot]).
@@ -424,6 +424,24 @@ def _reference_turns(
     return [_message_text(m["content"]) for m in assistant], partial, messages
 
 
+def _strips_reasoning(env) -> bool:
+    """Whether this env removes a turn's reasoning span before its multi-turn scorer sees it.
+
+    Asked of the env rather than assumed of the run, because on this path it really is the env's
+    decision. The worker strips for the single-turn scorer itself, but a multi-turn transcript
+    reaches ``reward_from_messages`` / the rollout scorer whole; only an env that routes each
+    recorded turn through its own parser removes the markup first. ``FreesoloEnvironment`` does
+    (`flash/envs/adapter.py:427,554`), gated on the ``thinking`` attribute the worker sets
+    (`flash/engine/worker/__init__.py:253-254`) and ``cmd_env_test`` sets the same way.
+
+    A plain env exposing no such attribute is not stripped for, and deliberately: its grader really
+    does see the raw ``<think>`` text, so a gold turn carrying reasoning is unreproducible for it
+    however the run is configured. Answering otherwise would admit a mutilated transcript to the
+    control gate.
+    """
+    return hasattr(env, "thinking")
+
+
 def _resolve_policy(reference_turns: list[str]) -> str:
     return "replay" if "".join(reference_turns).strip() else "echo"
 
@@ -554,7 +572,7 @@ def _prompt_prefix_length(driven: list[dict], prompt: list[dict], *, seeded: boo
 
 
 def _env_turns_reproduce(
-    reference_messages: list[dict], state: dict, prompt: list[dict], *, seeded: bool
+    reference_messages: list[dict], driven: list[dict], prompt: list[dict]
 ) -> bool:
     """Whether the driven rollout's environment-side turns match the reference trajectory's.
 
@@ -576,20 +594,24 @@ def _env_turns_reproduce(
     env_reply after the final assistant turn, past where the gold transcript stops recording, so it
     is outside what the trajectory claims and is not evidence either way.
 
-    `prompt` is the rollout's opening messages, captured BEFORE the turn loop ran. It cannot be
-    recovered from `state` afterwards: an env that keeps its transcript under `messages` with no
-    separate `prompt` key has by then appended every driven turn to that same list, so there is
-    nothing left to distinguish the opening from the completion.
+    `driven` is the transcript `_run_rollout` built and handed to `env_reply`, threaded in rather
+    than read back out of the state. Reading `state["messages"]` asked the env to mirror the
+    conversation somewhere this command does not control, though the production driver keeps its own
+    copy for exactly that reason (`flash/engine/multiturn_rollout.py:193-221`): an env holding its
+    opening under `prompt` and its turns in custom state answered an empty list, so an exact replay
+    was marked partial, its gold was excluded from control scoring, and a flat-zero grader could
+    report PASS (codex[bot]).
+
+    `prompt` is that transcript's opening, and it is a positional prefix of `driven` by construction
+    -- `_run_rollout` opens the list with it. No `seeded` flag is needed here, unlike on the state
+    (`_prompt_prefix_length`), because provenance is not being recovered after the fact: this list
+    was built with the opening at the front and grown from there.
 
     `reference_messages` is the SAME snapshot `_reference_turns` took the replayed assistant strings
-    from, threaded in rather than re-read. `sft_completion` is not required to be pure -- one that
+    from, threaded in for the same reason. `sft_completion` is not required to be pure -- one that
     samples a stored trajectory or consumes an iterator answers differently each call -- so asking
     it again here compared the driven rollout against observations from a trajectory it never
     replayed (codex[bot]).
-
-    `seeded` says whether this env's fresh state already held the opening, observed by `_run_rollout`
-    before the loop ran. It decides whether the prompt is a positional prefix of the driven
-    transcript; see `_prompt_prefix_length` for why that cannot be recovered from content afterwards.
     """
     # the same role filter on both sides. dropping system turns from the driven side alone made an
     # env whose env_reply emits one look unreproduced on an exact replay, since the reference keeps
@@ -603,10 +625,7 @@ def _env_turns_reproduce(
     # final assistant turn, so anchoring on the tail instead would shift every observation by that
     # trailing reply -- marking a faithful replay unreproduced, and letting a coincidental trailing
     # match hide a divergence earlier in the trajectory (cursor).
-    driven = state.get("messages") or []
-    completion = _observation_blocks(
-        driven, skip_messages=_prompt_prefix_length(driven, prompt, seeded=seeded)
-    )
+    completion = _observation_blocks(driven, skip_messages=len(prompt))
     # a reference recording more turns than were driven cannot match either way.
     if len(completion) < len(reference):
         return False
@@ -754,9 +773,11 @@ def _drive_single_turn(
         )
 
 
-def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], list[dict], bool]:
-    """Drive one offline multi-turn rollout: final state, turns taken, prompt, and whether the
-    env seeded its transcript with that prompt.
+def _run_rollout(
+    env, example: dict, turn_content
+) -> tuple[dict, list[str], list[dict], bool, list[dict]]:
+    """Drive one offline multi-turn rollout: final state, turns taken, prompt, whether the env
+    seeded its transcript with that prompt, and the transcript the rollout was driven through.
 
     `turn_content(index)` supplies the model's text for each turn, so the same loop can replay a
     gold transcript or a deliberately wrong one.
@@ -832,15 +853,19 @@ def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], lis
     # every rollout (see _score_multi_turn_rollouts): the env has to be stepped while its state is
     # the one this rollout just built, not after the next rollout has moved it on.
     _final_env_step(env, messages, state, hard_cap, pending=env_step_pending)
-    return state, responses, prompt, seeded
+    return state, responses, prompt, seeded, messages
 
 
-def _drive_multi_turn(env, example: dict, record: dict) -> None:
-    # no `thinking` here, and deliberately: a multi-turn transcript is scored as a whole episode
-    # through `reward_from_messages` (flash/engine/worker/rl.py:436-438), which never strips
-    # reasoning. so gold markup really does reach this grader verbatim, and a turn carrying it is
-    # unreproducible whatever the run's thinking mode says.
-    reference_turns, record["partial_replay"], reference_messages = _reference_turns(env, example)
+def _drive_multi_turn(env, example: dict, record: dict, *, thinking: bool = False) -> None:
+    # whether markup reaches the grader verbatim is the ENV's decision on this path, not the
+    # worker's: `reward_from_messages` and the rollout scorer both hand each recorded turn to
+    # `_scored_turn_text` for a Freesolo env (flash/envs/adapter.py:427,554), which strips reasoning
+    # whenever `env.thinking` is set -- and `cmd_env_test` sets it from the run's flag, exactly as
+    # the worker does. so under --thinking such a turn IS reproducible, and calling it unreproducible
+    # set partial_replay, skipped the controls, and let a flat-zero grader report PASS (codex[bot]).
+    reference_turns, record["partial_replay"], reference_messages = _reference_turns(
+        env, example, thinking=thinking and _strips_reasoning(env)
+    )
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
 
@@ -849,7 +874,7 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
             return reference_turns[index]
         return _ECHO_RESPONSE
 
-    state, responses, prompt, seeded = _run_rollout(env, example, content)
+    state, responses, prompt, seeded, driven = _run_rollout(env, example, content)
     # the snapshot, not a re-read of the state: for an env exposing only `messages` the loop has
     # appended every driven turn to that list by now, so re-reading would record the whole
     # transcript as the prompt and report it back to the user as one.
@@ -868,9 +893,7 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     # under the same assistant strings, so a correct grader scores this "gold" rollout like the
     # controls and the gate reports a flat grader for an env that ranks fine (codex[bot]). the
     # reference records what the env replied last time, so compare against it where it does.
-    if policy == "replay" and not _env_turns_reproduce(
-        reference_messages, state, prompt, seeded=seeded
-    ):
+    if policy == "replay" and not _env_turns_reproduce(reference_messages, driven, prompt):
         record["partial_replay"] = True
 
     # the terminal rollout, kept unscored: the whole run's rollouts are scored in one batch so a
@@ -1256,7 +1279,7 @@ def _drive_multi_turn_controls(
     """
     return [
         (example, state, responses, _completion_messages(state, prompt, seeded=seeded))
-        for state, responses, prompt, seeded in (
+        for state, responses, prompt, seeded, _driven in (
             _run_rollout(env, example, lambda _index, text=control: text) for control in controls
         )
     ]
@@ -1439,6 +1462,19 @@ def _never_grades(args) -> bool:
     return normalize_algorithm(str(algorithm).strip()) not in _REWARD_CONSUMING_ALGORITHMS
 
 
+def _is_opd(args) -> bool:
+    """Whether this run's worker is opd, which refuses a tool environment before its first step.
+
+    Asked separately from grading because opd's refusal has nothing to do with the scorer: it is
+    about which rollout loop the worker drives (`flash/engine/worker/opd.py:548-555`). An unset
+    algorithm is not opd, matching every other flag here -- unknown intent is not grounds to FAIL.
+    """
+    algorithm = getattr(args, "algorithm", None)
+    if not algorithm or not str(algorithm).strip():
+        return False
+    return normalize_algorithm(str(algorithm).strip()) == "opd"
+
+
 def _reads_per_turn_rewards(args) -> bool:
     """Whether the run this environment is for credits turns individually.
 
@@ -1457,13 +1493,17 @@ def _reads_per_turn_rewards(args) -> bool:
     return str(mode).strip().lower() == PER_TURN_CREDIT_ASSIGNMENT
 
 
-def _grpo_rejection(env, *, grpo: bool, per_turn: bool) -> tuple[str | None, list]:
+def _grpo_rejection(env, *, grpo: bool, per_turn: bool, opd: bool) -> tuple[str | None, list]:
     """Why this run cannot reach its first training step, in the worker's own words, and its tools.
 
     Returns ``(reason, tools)``. ``reason`` is None when the run can start. ``tools`` is the ONE
     ``env.tools()`` snapshot this command takes, empty for every run that would not call the hook.
 
-    Two distinct refusals, both before any episode is driven.
+    Three distinct refusals, all before any episode is driven.
+
+    Ahead of the two below, and gated on the algorithm rather than on grading: opd rejects a tool
+    env outright. That refusal is not about the scorer at all, which is why it applies exactly where
+    the others do not -- to a run that never grades.
 
     First, ``env.tools()`` itself. The worker calls it unguarded for every native tool env
     (`flash/engine/worker/rl.py:816`), outside the try/except that scores a raising reward as 0.0,
@@ -1498,6 +1538,18 @@ def _grpo_rejection(env, *, grpo: bool, per_turn: bool) -> tuple[str | None, lis
     """
     if not getattr(env, "is_tool_env", False):
         return None, []
+    if opd:
+        # opd refuses a tool env outright, before any of the above applies: it drives its own vllm
+        # rollout loop and cannot execute trl's tool-call loop
+        # (`flash/engine/worker/opd.py:548-555`). the refusal comes before its first step, so
+        # reporting PASS here approved a run that always aborts during initialization (codex[bot]).
+        # quoted from the worker so the two cannot drift, and tools() is not called: opd never
+        # reaches the hook, so a raising one is not this run's problem to report.
+        return (
+            "opd does not support tool-calling environments: it cannot drive TRL's tool-call loop, "
+            "so the run aborts during initialization. Use grpo for a tool env, or a single-turn / "
+            "pure multi-turn env for opd."
+        ), []
     # only when the run really would call it. a non-grpo algorithm never reaches rl.py's tool setup,
     # so a raising tools() is not that run's problem to report.
     if not grpo:
@@ -1509,6 +1561,17 @@ def _grpo_rejection(env, *, grpo: bool, per_turn: bool) -> tuple[str | None, lis
         return (
             f"env.tools() raised ({type(exc).__name__}: {reason}); the grpo worker calls it "
             "unguarded while building the tool loop, so the run aborts during initialization"
+        ), []
+    if tools and not isinstance(tools, Sized):
+        # the worker takes `len(tools)` on any truthy return (`flash/engine/worker/rl.py:852-854`),
+        # so a truthy non-sized value -- `object()` -- is a TypeError there. accepting it here
+        # selected native message scoring and could report PASS for a run that always aborts during
+        # initialization (codex[bot]). asked as the worker asks it: only a truthy value is measured,
+        # since a falsy one never reaches the len().
+        return (
+            f"env.tools() returned {type(tools).__name__}, which has no len(); the grpo worker "
+            "measures the tool list while building the tool loop, so the run aborts during "
+            "initialization"
         ), []
     if not per_turn:
         return None, tools
@@ -1533,6 +1596,8 @@ def _grpo_rejection(env, *, grpo: bool, per_turn: bool) -> tuple[str | None, lis
     except RuntimeError as exc:
         return str(exc), tools
     return None, tools
+
+
 def _reject_unsubmittable_param(key: str, value: object) -> None:
     """Reject a parsed TOML value that ``[environment.params]`` could not actually submit.
 
@@ -1830,6 +1895,14 @@ def cmd_env_test(args) -> int:
         # relative dir like `my-env` matches the managed-slug pattern and would otherwise
         # resolve remotely, breaking the offline contract.
         env = load_freesolo_environment(str(entrypoint.resolve()), **params)
+        # exactly what the worker does after loading (flash/engine/worker/__init__.py:253-254), and
+        # it has to happen here for the same reason: a Freesolo env routes every recorded turn
+        # through `_scored_turn_text` (flash/envs/adapter.py:427,434), so with the flag unset the
+        # scorer sees raw `<think>` markup the run would have stripped. the reference was then read
+        # as unreproducible, `partial_replay` skipped the controls, and a flat-zero grader on a
+        # thinking run reported PASS (codex[bot]).
+        if hasattr(env, "thinking"):
+            env.thinking = thinking
         dataset = env.dataset()
     except (Exception, SystemExit) as exc:
         reason = str(exc) or exc.__class__.__name__
@@ -1841,7 +1914,7 @@ def cmd_env_test(args) -> int:
     # before any episode runs: this combination cannot reach a first training step, so there is no
     # reward evidence worth gathering for it, and reporting PASS would be a claim about a trainer
     # path the run never selects.
-    rejection, tools = _grpo_rejection(env, grpo=grades, per_turn=per_turn)
+    rejection, tools = _grpo_rejection(env, grpo=grades, per_turn=per_turn, opd=_is_opd(args))
     if rejection:
         return _load_failure(rejection)
     # which scorer this run uses, settled once from the one tools() snapshot and read by both the
@@ -1875,7 +1948,7 @@ def cmd_env_test(args) -> int:
             # for it. requiring them here failed a valid env -- one whose unused rollout hooks are
             # absent or raise trains fine and could not pass this command (codex[bot]).
             if env.multi_turn and not native:
-                _drive_multi_turn(env, example, record)
+                _drive_multi_turn(env, example, record, thinking=thinking)
             else:
                 _drive_single_turn(env, example, record, thinking=thinking, native=native)
             reward = record["reward"]
@@ -1897,7 +1970,7 @@ def cmd_env_test(args) -> int:
                     # a control that cannot be graded is a real defect wherever the scorer is
                     # actually called, and an unknown algorithm is not grounds to assume it is not
                     # -- so both keep failing the episode. only an algorithm whose worker provably
-                    # never grades (sft/opd/opsd) is exempt: a reference-only scorer is legitimate
+                    # never grades (sft/opd) is exempt: a reference-only scorer is legitimate
                     # there, and this is a fact about the CONTROL rather than about the episode the
                     # driver already replayed successfully (codex[bot]).
                     if not _never_grades(args):
@@ -1914,6 +1987,9 @@ def cmd_env_test(args) -> int:
     # makes exactly this one call and it would abort the run.
     graded = [record for _, record, failure, _ in episodes if not failure]
     batch_failure = None
+    # set when the never-grades exemption below leaves the gold rollouts unscored, so the reward
+    # check does not then read their absent score as a contract violation.
+    gold_unscored = False
     try:
         _score_multi_turn_rollouts(env, graded, native=native)
     except (Exception, SystemExit) as exc:
@@ -1921,14 +1997,23 @@ def cmd_env_test(args) -> int:
         # the controls are this command's own additions, not rollouts any run would submit. under
         # the never-grades exemption a scorer that only chokes on them is a fact about the CONTROL,
         # so drop them and score the gold rollouts training really does submit.
-        affected = [record for record in graded if record["control_rollouts"]]
-        if _never_grades(args) and affected:
+        if _never_grades(args):
+            affected = [record for record in graded if record["control_rollouts"]]
             for record in affected:
                 record["control_rollouts"] = None
             try:
                 _score_multi_turn_rollouts(env, graded, native=native)
             except (Exception, SystemExit):
-                pass
+                # the scorer refuses the GOLD rollouts too, so dropping the controls changed
+                # nothing. under this exemption that is not a defect either: an sft/opd worker calls
+                # no scorer at all, so a reference-only env whose rollout grader is deliberately
+                # unavailable trains fine, and failing every episode here rejected a valid
+                # configuration over a hook the run never reaches (codex[bot]). the episodes were
+                # driven and replayed successfully; only their reward is unknown, so they carry no
+                # control evidence and the gate below simply stays quiet for them.
+                control_errors.append(batch_failure)
+                batch_failure = None
+                gold_unscored = True
             else:
                 control_errors.extend(batch_failure for _ in affected)
                 batch_failure = None
@@ -1948,6 +2033,10 @@ def cmd_env_test(args) -> int:
             # the replayed episode.
             if batch_failure and reward is None:
                 failure = batch_failure
+            elif gold_unscored and reward is None:
+                # the exemption above deliberately left this unscored: the run's worker calls no
+                # scorer, so an absent reward is not a defect of the run. reported as "n/a" below.
+                pass
             elif reward is None or not reward.is_finite():
                 failure = f"reward is not finite: {reward if reward is None else reward.episode}"
         reward_text = "n/a" if reward is None else f"{reward.episode:.6f}"
