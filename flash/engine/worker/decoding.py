@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from flash.engine.worker._pkg import W as _w
 
+# the pure parsers live in flash.thinking so the multi-turn grading path (flash.envs.adapter, which
+# must stay importable without torch) reaches the same implementation. re-exported here because this
+# module is the worker's public decoding surface.
+from flash.thinking import strip_think as strip_think
+from flash.thinking import thinking_text as thinking_text
+
 
 def render_prompt(tokenizer, item) -> str:
     item = item if isinstance(item, dict) else {"question": item}
@@ -19,55 +25,6 @@ def prompt_opens_thinking(prompt: str | None) -> bool:
     if not prompt:
         return False
     return prompt.rstrip().endswith("<think>")
-
-
-def strip_think(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:
-    """Drop <think> reasoning spans before grading. Uses LAST </think> (answer extraction);
-    unclosed reasoning returns "" to score 0 (reward pressure to finish within budget)."""
-    if completion is None:
-        return None
-    if "</think>" in completion:
-        return completion.rsplit("</think>", 1)[1]
-    # No </think>: check prompt-opened before model-opened — else an echoed <think> leaks pre-think text.
-    if prompt_opened_thinking:
-        return ""
-    if "<think>" in completion:
-        return completion.split("<think>", 1)[0]
-    return completion
-
-
-def thinking_text(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:
-    """Extract reasoning text for scorers; ``None`` means no thinking span was present."""
-    if completion is None:
-        return None
-    if prompt_opened_thinking:
-        text = completion.rsplit("</think>", 1)[0] if "</think>" in completion else completion
-        open_idx = text.find("<think>")
-        if open_idx != -1 and not text[:open_idx].strip():
-            text = text[open_idx + len("<think>") :]
-        return text
-
-    segments: list[str] = []
-    pos = 0
-    while True:
-        open_idx = completion.find("<think>", pos)
-        close_idx = completion.find("</think>", pos)
-        if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
-            segments.append(completion[pos:close_idx])
-            pos = close_idx + len("</think>")
-            continue
-        if open_idx == -1:
-            break
-        start = open_idx + len("<think>")
-        close_idx = completion.find("</think>", start)
-        if close_idx == -1:
-            segments.append(completion[start:])
-            break
-        segments.append(completion[start:close_idx])
-        pos = close_idx + len("</think>")
-    if not segments:
-        return None
-    return "\n".join(segments)
 
 
 def graded_text(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:

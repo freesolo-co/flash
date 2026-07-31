@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import stat
 import tarfile
 import urllib.parse
@@ -13,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from flash._channel import CLI_NAME
+from flash.cli import envpush
 from flash.cli.envpush import cmd_env_pull
 from flash.envs import loader as adapter
 from flash.envs.pull import environment_local_dirname
@@ -80,9 +83,7 @@ def _margs(**kw) -> Namespace:
 def test_cmd_env_pull_single_file(monkeypatch, tmp_path):
     _patch_client(
         monkeypatch,
-        _package_tarball(
-            {"environment.py": b"# env\n", "datasets/train.jsonl": b"line1\nline2\n"}
-        ),
+        _package_tarball({"environment.py": b"# env\n", "datasets/train.jsonl": b"line1\nline2\n"}),
     )
     out = tmp_path / "train.jsonl"
 
@@ -149,6 +150,325 @@ def test_cmd_env_pull_single_file_refuses_real_dir(monkeypatch, tmp_path):
     rc = cmd_env_pull(_margs(path="datasets/train.jsonl", output=str(out), force=True))
 
     assert rc == 1
+
+
+def test_cmd_env_pull_positional_dir_names_the_destination_form(monkeypatch, tmp_path, capsys):
+    """`flash env pull ns/env ./dir` must say how to ask for a destination directory.
+
+    The second positional is a path inside the env, so passing a directory there reads as
+    "fetch this file" and fails on the overwrite check. The error has to name the -o form.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into-here").mkdir()
+
+    rc = cmd_env_pull(_margs(path="into-here", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--output=into-here" in err
+    assert "david-freesolo-co/stuff" in err
+
+
+def test_cmd_env_pull_explicit_output_dir_keeps_the_single_file_diagnostic(
+    monkeypatch, tmp_path, capsys
+):
+    """An explicit `-o dir` named the in-env path on purpose, so do not tell the user to drop it.
+
+    `flash env pull ns/env config.json -o existing-dir` is a single-file pull whose destination is
+    wrong. Following the mistaken-positional hint here would abandon config.json and turn the
+    command into a whole-environment download instead of fixing the destination.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "existing-dir").mkdir()
+
+    rc = cmd_env_pull(_margs(path="config.json", output="existing-dir", force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "needs -o to be a FILE path" in err
+    assert "drop the second positional" not in err
+
+
+def test_cmd_env_pull_positional_dir_hint_is_shell_quoted(monkeypatch, tmp_path, capsys):
+    """The suggested command must survive a copy-paste out of a directory name with spaces.
+
+    Unquoted, `-o into here` splits into two shell arguments and argparse rejects the very command
+    offered as the remedy.
+
+    Asserted as POSIX quoting because the platform is pinned, not assumed: `_quote_shell_token`
+    deliberately emits `"--output=into here"` via `list2cmdline` on Windows, so an unconditional
+    single-quote assertion would fail a native Windows run on correct output. The Windows shape has
+    its own test (codex).
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.setattr(envpush, "_on_windows", lambda: False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into here").mkdir()
+
+    rc = cmd_env_pull(_margs(path="into here", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "'--output=into here'" in err
+    # the property that actually matters: it parses back to the destination the user named.
+    assert _parse_as_cli(_hint_command(err)).output == "into here"
+
+
+def _hint_command(err: str) -> str:
+    """The suggested command from the hint line, as the user would copy it."""
+    for line in err.splitlines():
+        if " env pull " in line and "hint" in line:
+            return line[line.index(f"{CLI_NAME} env pull ") :]
+    raise AssertionError(f"no hint command in:\n{err}")
+
+
+def _split_as_shell(command: str) -> list[str]:
+    """Split a suggested command the way the shell it was quoted FOR would.
+
+    `_quote_shell_token` picks its quoting per platform, so the split has to match: a native
+    Windows run emits an unquoted `--output=C:\\Users\\...` whenever the path holds no space, and
+    POSIX `shlex.split` reads those backslashes as escapes and deletes them -- turning a correct
+    hint into `--output=C:Usersinto-here` and failing the assertion (codex[bot]). Non-POSIX mode
+    keeps them, but also keeps the surrounding quotes `list2cmdline` adds, so strip those back off.
+    """
+    if not envpush._on_windows():
+        return shlex.split(command)
+    return [token.strip('"') for token in shlex.split(command, posix=False)]
+
+
+def _parse_as_cli(command: str) -> Namespace:
+    """Round-trip a suggested command through a shell split and the real `env pull` parser.
+
+    A hint is only useful if pasting it back works, so assert against the parser the user would
+    actually hit rather than against the string we happened to build.
+    """
+    from flash.cli import _build_parser
+
+    argv = _split_as_shell(command)
+    assert argv[:3] == [CLI_NAME, "env", "pull"], argv
+    return _build_parser().parse_args(argv[1:])
+
+
+def test_cmd_env_pull_dash_prefixed_dir_hint_survives_the_parser(monkeypatch, tmp_path, capsys):
+    """A destination whose basename starts with `-` must not be read back as an option.
+
+    `-o -dest` makes argparse fail with "expected one argument", so the remedy would be rejected by
+    the same parser that produced the error. Quoting does not fix it -- the attached `--output=`
+    form does, because the value can no longer start its own token.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "-dest").mkdir()
+
+    rc = cmd_env_pull(_margs(path="./-dest", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    parsed = _parse_as_cli(_hint_command(err))
+    assert parsed.output == "-dest"
+    assert parsed.path is None
+
+
+def test_cmd_env_pull_positional_dir_hint_round_trips_through_the_parser(
+    monkeypatch, tmp_path, capsys
+):
+    """The suggested command must parse back to a whole-env pull aimed at that same directory."""
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into here").mkdir()
+
+    rc = cmd_env_pull(_margs(path="into here", output=None, force=False))
+
+    assert rc == 1
+    parsed = _parse_as_cli(_hint_command(capsys.readouterr().err))
+    assert parsed.output == "into here"
+    assert parsed.path is None
+
+
+def test_cmd_env_pull_absolute_positional_dir_is_diagnosed(monkeypatch, tmp_path, capsys):
+    """An absolute mistaken destination must be recognized before it is reduced to its basename.
+
+    `env pull ns/env /tmp/into-here` is the same user error as the relative form, but `out` is
+    already `Path("into-here")` by the time the check ran, so comparing against `out` could never
+    match: the command downloaded the package and failed with an unrelated invalid-path error
+    instead of the hint that explains what went wrong.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    absolute = tmp_path / "into-here"
+    absolute.mkdir()
+
+    rc = cmd_env_pull(_margs(path=str(absolute), output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "drop the second positional" in err
+    # the suggested destination must be the directory the user actually named, not its basename --
+    # a bare `into-here` would aim the whole-env download at a different path in the cwd.
+    parsed = _parse_as_cli(_hint_command(err))
+    assert parsed.output == str(absolute)
+    assert parsed.path is None
+
+
+@pytest.mark.parametrize("positional", ["../into-here", "sub/../../into-here"])
+def test_cmd_env_pull_parent_relative_dir_is_diagnosed(monkeypatch, tmp_path, capsys, positional):
+    """An upward-traversing positional cannot name anything inside the environment.
+
+    `_safe_repo_relative_path` rejects every component of `..`, so there is no in-env reading to
+    protect and no ambiguity for the multi-component gate to resolve. Suppressing the hint here
+    downloaded the package only to fail with an invalid environment path, instead of explaining
+    `--output`.
+
+    The second form matters because the rejection is on the parts, not on a leading `..`:
+    `sub/../../into-here` is equally impossible as an env path.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    work = tmp_path / "work"
+    (work / "sub").mkdir(parents=True)
+    (tmp_path / "into-here").mkdir()
+    monkeypatch.chdir(work)
+
+    rc = cmd_env_pull(_margs(path=positional, output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "drop the second positional" in err, err
+    # the destination the user named, not one resolved to somewhere else on disk.
+    parsed = _parse_as_cli(_hint_command(err))
+    assert parsed.output == positional
+    assert parsed.path is None
+
+
+@pytest.mark.parametrize(
+    "dest", [r"C:\Users\runner\into-here", r"C:\Program Files\into here", "-dest", "into-here"]
+)
+def test_windows_quoted_token_survives_the_split_used_to_check_it(monkeypatch, dest):
+    """A token quoted for Windows must come back out of `_split_as_shell` unchanged.
+
+    Asserted on the quote/split pair rather than through `cmd_env_pull`, because the command can
+    never carry a backslash on this platform: it normalizes `\\` to `/` on the way in, and a POSIX
+    `Path` renders the destination with forward slashes regardless. So a hint built from a real
+    Windows path is only reachable in the unit, and a round-trip test driven through the CLI passes
+    identically with the split fixed and broken.
+
+    `list2cmdline` quotes only when it has to, so an ordinary `C:\\Users\\...` comes back bare;
+    reading that with POSIX rules treats each backslash as an escape and deletes it, mangling a
+    correct hint into `C:Usersinto-here` (codex[bot]). The spaced form takes the other branch --
+    quoted, which POSIX mode would strip correctly but non-POSIX mode leaves in place -- so both
+    halves of the split are pinned by the same assertion.
+    """
+    monkeypatch.setattr(envpush, "_on_windows", lambda: True)
+
+    token = envpush._quote_shell_token(f"--output={dest}")
+
+    assert _split_as_shell(f"{CLI_NAME} env pull ns/env {token}")[4:] == [f"--output={dest}"]
+
+
+def test_cmd_env_pull_hint_omits_a_command_cmd_exe_would_mangle(monkeypatch, tmp_path, capsys):
+    """On Windows a destination holding cmd.exe metacharacters gets no copy-pasteable command.
+
+    `list2cmdline` implements MS C-runtime argv quoting, not cmd.exe escaping, so `foo&bar` comes
+    back unquoted and pasting the hint would run `bar` as a separate command. Emitting no command is
+    strictly better than emitting one that executes unintended text.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.setattr(envpush, "_on_windows", lambda: True)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "foo&bar").mkdir()
+
+    rc = cmd_env_pull(_margs(path="foo&bar", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "drop the second positional" in err
+    # the directory is still NAMED so the user knows which one is meant; what must not appear is a
+    # runnable command carrying the unescaped metacharacter.
+    assert "foo&bar" in err
+    assert "--output=foo&bar" not in err
+    assert "--output=DEST" in err
+
+
+def test_cmd_env_pull_hint_still_quotes_a_windows_destination_with_a_space(
+    monkeypatch, tmp_path, capsys
+):
+    """Refusing metacharacter destinations must not cost the ordinary Windows quoting case."""
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.setattr(envpush, "_on_windows", lambda: True)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into here").mkdir()
+
+    rc = cmd_env_pull(_margs(path="into here", output=None, force=False))
+
+    assert rc == 1
+    assert '"--output=into here"' in capsys.readouterr().err
+
+
+def test_cmd_env_pull_basename_collision_keeps_the_single_file_diagnostic(
+    monkeypatch, tmp_path, capsys
+):
+    """A local dir sharing the positional's BASENAME is not evidence of a mistaken destination.
+
+    `env pull ns/env assets/config` with a local ./config/ is a genuine single-file pull whose
+    output name happens to collide. Telling that user to drop the positional would abandon the file
+    they asked for, and the nonempty branch would aim --force at an unrelated directory.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "keep.txt").write_text("mine")
+
+    rc = cmd_env_pull(_margs(path="assets/config", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "needs -o to be a FILE path" in err
+    assert "drop the second positional" not in err
+    assert "--force" not in err
+
+
+def test_cmd_env_pull_cwd_destination_hint_does_not_offer_force(monkeypatch, tmp_path, capsys):
+    """`env pull ns/env .` cannot be fixed with --force, so the hint must not suggest it.
+
+    ensure_environment_pull_destination_available() refuses to replace any directory containing the
+    cwd, even with overwrite=True, so the generic nonempty remedy would fail a second time.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "existing.txt").write_text("keep me")
+
+    rc = cmd_env_pull(_margs(path=".", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "contains the current working directory" in err
+    # scoped to the SUGGESTED COMMAND, not the whole message: naming --force to say it would not
+    # help here is the point of this branch. what must not happen is offering it as the remedy.
+    command = _hint_command(err)
+    assert "--force" not in command, command
+    assert _parse_as_cli(command).path is None
+
+
+def test_cmd_env_pull_positional_nonempty_dir_hint_says_how_to_replace_it(
+    monkeypatch, tmp_path, capsys
+):
+    """A nonempty destination needs --force, so the bare command would just fail again.
+
+    The whole-environment path runs ensure_environment_pull_destination_available(overwrite=False),
+    which rejects every nonempty directory -- offering it as the remedy trades one error for the next.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "into-here").mkdir()
+    (tmp_path / "into-here" / "existing.txt").write_text("keep me")
+
+    rc = cmd_env_pull(_margs(path="into-here", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "not empty" in err
+    assert "--force" in err
 
 
 def test_cmd_env_pull_whole_env(monkeypatch, tmp_path):
@@ -569,3 +889,68 @@ def test_resolve_github_env_extracts_repo_level_siblings(monkeypatch, tmp_path):
 
     assert env_file.is_file()
     assert (env_file.parents[1] / "datasets" / "train.jsonl").is_file()
+
+
+def test_cmd_env_pull_multi_component_in_env_path_is_not_a_destination(
+    monkeypatch, tmp_path, capsys
+):
+    """`assets/config` names a path INSIDE the environment, even when it exists locally as a dir.
+
+    Testing `is_dir()` alone treated any local directory positional as a mistaken destination, so
+    this real single-file pull was refused -- and because the directory is nonempty, the hint aimed
+    a whole-environment `--force` replace at a local ./assets/config the user never named. A
+    destination is written as its own name or absolute; a multi-component relative path is not
+    (cursor).
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "assets" / "config").mkdir(parents=True)
+    (tmp_path / "assets" / "config" / "keep.txt").write_text("mine")
+
+    rc = cmd_env_pull(_margs(path="assets/config", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    # it proceeds as the single-file pull it is, and fails on the real reason: the environment has
+    # no such file. that is the diagnosis the user needs -- the local directory is irrelevant.
+    assert "assets/config" in err
+    assert "not found in package" in err
+    # not diagnosed as a mistaken destination...
+    assert "drop the second positional" not in err
+    # ...and above all, no destructive whole-env remedy aimed at the local directory.
+    assert "--force" not in err
+    # the local directory the user never named is untouched.
+    assert (tmp_path / "assets" / "config" / "keep.txt").read_text() == "mine"
+
+
+def test_cmd_env_pull_hint_omits_a_command_powershell_would_mangle(monkeypatch, tmp_path, capsys):
+    """`os.name == "nt"` does not say which shell, and powershell is the current default.
+
+    `foo;calc` passed a cmd.exe-only metacharacter set and rendered as `--output=foo;calc`.
+    Powershell splits at the semicolon and runs `calc` as its own statement, so the suggested
+    remedy executes something the user never asked for (codex).
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    monkeypatch.setattr(envpush, "_on_windows", lambda: True)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "foo;calc").mkdir()
+
+    rc = cmd_env_pull(_margs(path="foo;calc", output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "drop the second positional" in err
+    # the directory is still named so the user knows which one is meant; what must not appear is a
+    # runnable command carrying the unescaped separator.
+    assert "foo;calc" in err
+    assert "--output=foo;calc" not in err
+    assert "--output=DEST" in err
+
+
+def test_quote_shell_token_refuses_every_windows_shell_separator(monkeypatch):
+    """The refusal set must cover both shells, since we cannot know which one receives the paste."""
+    monkeypatch.setattr(envpush, "_on_windows", lambda: True)
+    for token in ("foo;calc", "foo&bar", "foo|bar", "foo$(x)", "foo`x", "foo{x}", "foo,x"):
+        assert envpush._quote_shell_token(f"--output={token}") == "", token
+    # an ordinary destination with a space is still quoted rather than refused.
+    assert envpush._quote_shell_token("--output=into here") == '"--output=into here"'

@@ -371,6 +371,12 @@ def run_rl():
     )
     if _w.THINKING:
         print(f"[rl] prompt_opens_thinking={_prompt_opens_thinking}")
+    # hand the same derived flag to the multi-turn grading path. the env cannot derive it itself --
+    # it has no tokenizer and never sees a rendered prompt -- and the template opens the block in
+    # EVERY assistant generation prompt (make_env_glue renders the next turn's header the same way),
+    # so one run-level value covers every turn, exactly as it does single-turn.
+    if hasattr(env, "prompt_opens_thinking"):
+        env.prompt_opens_thinking = _prompt_opens_thinking
 
     pending_named_breakdowns: list[dict[str, float] | None] = []
     latest_samples: list[dict] = []
