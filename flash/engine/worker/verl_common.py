@@ -493,8 +493,36 @@ def run_verl_training(
 _TEARDOWN_GRACE_S = 10.0
 
 
+def _process_is_zombie(pid: int) -> bool:
+    """true when `pid` has exited and is only awaiting a reaper.
+
+    field 3 of /proc/<pid>/stat is the state character, and it follows a comm field that may itself
+    contain spaces and parentheses -- so it is read after the LAST `)`, not by splitting the line.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
+            stat = handle.read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        # gone, or unreadable. either way there is nothing to wait for that this can prove.
+        return True
+    _, _, tail = stat.rpartition(")")
+    fields = tail.split()
+    return bool(fields) and fields[0] == "Z"
+
+
 def _process_group_alive(pgid: int) -> bool:
-    """true while the group still has a member. signal 0 checks addressability, it delivers nothing."""
+    """true while the group still has a RUNNING member.
+
+    signal 0 checks addressability and delivers nothing, so it succeeds for a group whose only
+    remaining member is a zombie. that is not a hypothetical here: `Dockerfile.worker` runs python
+    directly as pid 1 with no init, so nothing reaps an orphaned EngineCore and it can sit unreaped
+    indefinitely. driving the escalation off addressability alone therefore burned the full drain
+    deadline on every teardown -- delaying the reusable worker even though the cuda context was
+    already released -- and nothing stronger than SIGKILL exists to clear it (codex[bot]).
+
+    So the group is alive only while some member is not a zombie. Membership is read from /proc
+    rather than tracked, since the survivors are grandchildren this process never spawned.
+    """
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -503,7 +531,36 @@ def _process_group_alive(pgid: int) -> bool:
         return True  # it exists, this process just may not signal it
     except OSError:
         return False
-    return True
+    members = _process_group_members(pgid)
+    if members is None:
+        # /proc could not be enumerated, so fall back to what signal 0 already established. it
+        # over-reports rather than returning early on a live process still holding the gpu.
+        return True
+    return any(not _process_is_zombie(pid) for pid in members)
+
+
+def _process_group_members(pgid: int) -> list[int] | None:
+    """The pids currently in `pgid`, or None when /proc cannot answer.
+
+    An empty list is a real answer -- the group has no members left -- and is distinct from None.
+    """
+    try:
+        entries = os.listdir("/proc")
+    except OSError:  # pragma: no cover - /proc missing is not reachable on linux
+        return None
+    members = []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            if os.getpgid(pid) == pgid:
+                members.append(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            # exited between listdir and here, or not ours to inspect. a process this cannot see is
+            # one it also could not have signalled.
+            continue
+    return members
 
 
 def kill_process_group(proc: subprocess.Popen) -> None:

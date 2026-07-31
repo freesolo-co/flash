@@ -621,6 +621,78 @@ def test_kill_process_group_reaps_a_grandchild_that_outlives_the_leader():
             leader.stdout.close()
 
 
+def test_a_group_whose_only_member_is_a_zombie_is_not_read_as_alive():
+    # Dockerfile.worker runs python directly as pid 1 with no init, so an orphaned EngineCore is
+    # never reaped and sits as a zombie indefinitely. killpg(pgid, 0) succeeds for that group, so
+    # driving the escalation off addressability alone burned the whole drain deadline on every
+    # teardown even though the cuda context was already released -- and sigkill cannot clear a
+    # zombie, only reaping can (codex[bot]). fork rather than Popen: subprocess reaps for you, which
+    # is the very behaviour the worker image lacks.
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child never returns to pytest
+        os.setsid()
+        time.sleep(300)
+        os._exit(0)
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and os.getpgid(pid) != pid:
+            time.sleep(0.02)
+        pgid = os.getpgid(pid)
+        assert vc._process_group_alive(pgid), "a running group must read as alive"
+
+        os.kill(pid, signal.SIGKILL)
+        # deliberately unreaped: waitpid here would clear the zombie and destroy the case.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not vc._process_is_zombie(pid):
+            time.sleep(0.02)
+        assert vc._process_is_zombie(pid), "child should be an unreaped zombie"
+        assert os.killpg(pgid, 0) is None, "the zombie group is still addressable"
+
+        assert not vc._process_group_alive(pgid), (
+            "a zombie-only group must not read as alive, or teardown waits out the full deadline"
+        )
+    finally:
+        with contextlib.suppress(ProcessLookupError, ChildProcessError):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
+def test_teardown_returns_promptly_when_the_survivor_is_only_a_zombie():
+    # the cost of the bug, measured. with a zombie-only group reading as alive, kill_process_group
+    # spins out the escalation deadline AND then the drain deadline -- two full grace periods --
+    # before handing the worker back, though the cuda context went with the exit. the stub stands in
+    # for the direct child: subprocess.Popen would reap, and reaping is what the worker image's
+    # missing init never does.
+    class _ExitedChild:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def wait(self, timeout=None):
+            return 0
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child never returns to pytest
+        os.setsid()
+        os._exit(0)
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not vc._process_is_zombie(pid):
+            time.sleep(0.02)
+        assert vc._process_is_zombie(pid), "child should be an unreaped zombie"
+
+        started = time.monotonic()
+        vc.kill_process_group(_ExitedChild(pid))
+        elapsed = time.monotonic() - started
+
+        assert elapsed < vc._TEARDOWN_GRACE_S, (
+            f"teardown took {elapsed:.1f}s waiting on a zombie that no signal can clear"
+        )
+    finally:
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
 def test_grpo_teardown_uses_the_shared_escalating_kill():
     # the grpo path used to hand-roll killpg(pid, 15) and swallow the wait timeout, so a vllm
     # EngineCore that ignored the term kept its cuda context and stranded the gpu for later jobs.
