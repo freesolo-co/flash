@@ -586,33 +586,6 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "create_loraplus_optimizer" in src
 
 
-def test_trl_collator_masks_prompt_from_pretokenized_rows():
-    """The UNPACKED / TRL-bfd path (not covered by BlockDiagonalCollator tests): feed TRL's real
-    DataCollatorForLanguageModeling pre-tokenized {input_ids, completion_mask} rows with
-    completion_only_loss=True and assert it masks exactly the prompt tokens (labels -100) and keeps
-    the completion — the same representation run_sft now builds."""
-    pytest.importorskip("torch")
-    pytest.importorskip("trl")
-    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
-
-    col = DataCollatorForLanguageModeling(pad_token_id=0, completion_only_loss=True)
-    rows = [
-        {"input_ids": [10, 11, 12, 13, 14], "completion_mask": [0, 0, 0, 1, 1]},  # 3-tok prompt
-        {"input_ids": [20, 21, 22], "completion_mask": [0, 1, 1]},  # 2-tok prompt
-    ]
-    out = col(rows)
-    labels = out["labels"]
-    # row 0: first three (prompt) masked, last two kept
-    assert labels[0, :3].tolist() == [-100, -100, -100]
-    assert labels[0, 3:5].tolist() == [13, 14]
-    # row 1: first token (prompt) masked, last two kept; trailing pad masked
-    assert labels[1, 0].item() == -100
-    assert labels[1, 1:3].tolist() == [21, 22]
-    # every completion token is trained, every prompt/pad token is ignored
-    keep = labels != -100
-    assert keep.sum().item() == 4  # 2 + 2 completion tokens across the batch
-
-
 def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
     """The 'crashed before finishing' path (no /tmp/metrics.json) MUST upload the captured console
     even when the worker exited 0 — run_mode only uploads on a non-zero exit, so an OOM/segfault or

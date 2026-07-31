@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import http.client
 import io
 import ipaddress
@@ -13,7 +12,6 @@ import os
 import socket
 import ssl
 import urllib.parse
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -706,179 +704,6 @@ def resolve_image_pad_token_id(processor, tok) -> int:
                 return token_id
 
     raise ValueError("could not resolve a valid image-pad token id from the processor or tokenizer")
-
-
-def image_content_key(image) -> str:
-    """Return a stable content key for a PIL image."""
-    digest = hashlib.sha256()
-    digest.update(image.convert("RGB").tobytes())
-    digest.update(f"{image.width}x{image.height}".encode())
-    return digest.hexdigest()
-
-
-def multimodal_prompt_key(messages: list[dict]) -> str:
-    """Return a stable key for prompt messages carrying decoded PIL images."""
-    canonical = []
-    for message in messages:
-        parts = []
-        content = message.get("content")
-        if isinstance(content, str):
-            parts.append(("t", content))
-        elif isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    raise ValueError("multimodal prompt content parts must be objects")
-                part_type = part.get("type")
-                if part_type == "text":
-                    parts.append(("t", part.get("text")))
-                elif part_type in _IMAGE_BLOCK_TYPES:
-                    image = part.get("image")
-                    if not _is_pil_image(image):
-                        raise ValueError(
-                            "multimodal prompt image blocks must carry a PIL image at part['image']"
-                        )
-                    parts.append(("i", image_content_key(image)))
-                else:
-                    raise ValueError(f"unsupported multimodal prompt content type: {part_type!r}")
-        elif content is not None:
-            raise ValueError("multimodal prompt message content must be text or content parts")
-        metadata = {
-            key: value
-            for key, value in message.items()
-            if key != "content" and value is not None
-        }
-        canonical.append((metadata, parts))
-    return json.dumps(canonical, sort_keys=True, default=str)
-
-
-def _multimodal_prompt_keys(prompts: list[dict], package_root: str | Path | None) -> list[str]:
-    from trl.data_utils import prepare_multimodal_messages
-
-    keys = []
-    for item in prompts:
-        images = decode_image_descriptors(list(item.get("images") or []), package_root)
-        pil_messages = prepare_multimodal_messages(item["prompt"], images=images)
-        keys.append(multimodal_prompt_key(pil_messages))
-    return keys
-
-
-def build_multimodal_examples_index(
-    prompts: list[dict], package_root: str | Path | None
-) -> tuple[dict[str, dict], int]:
-    """Build the prompt index and collision count from one decoded key pass."""
-    keys = _multimodal_prompt_keys(prompts, package_root)
-    index = {key: item["example"] for key, item in zip(keys, prompts, strict=True)}
-    return index, len(keys) - len(index)
-
-
-def decode_arrow_examples(examples: list[dict], package_root: str | Path | None) -> list[dict]:
-    decoded = []
-    for example in examples:
-        row = dict(example)
-        row["images"] = decode_image_descriptors(list(row.get("images") or []), package_root)
-        decoded.append(row)
-    return decoded
-
-
-def filter_vlm_sft_rows(
-    rows: list[dict], collator: Callable[[list[dict]], dict], special_ids: set[int]
-) -> tuple[list[dict], int, int, int]:
-    """Filter empty or fully truncated targets using the processor-expanded labels."""
-    kept = []
-    dropped = 0
-    masked_tokens = 0
-    total_tokens = 0
-    for row in rows:
-        batch = collator([row])
-        labels = batch["labels"][0]
-        attention = batch.get("attention_mask")
-        labels_list = labels.tolist() if hasattr(labels, "tolist") else list(labels)
-        if attention is None:
-            active = [1] * len(labels_list)
-        else:
-            mask = attention[0]
-            active = mask.tolist() if hasattr(mask, "tolist") else list(mask)
-        has_target = any(
-            is_active and label != -100 and label not in special_ids
-            for label, is_active in zip(labels_list, active, strict=True)
-        )
-        if not has_target:
-            dropped += 1
-            continue
-        kept.append(row)
-        total_tokens += sum(bool(value) for value in active)
-        masked_tokens += sum(
-            bool(is_active) and label == -100
-            for label, is_active in zip(labels_list, active, strict=True)
-        )
-    return kept, dropped, masked_tokens, total_tokens
-
-
-class ArrowSafeVisionCollator:
-    """Decode Arrow-safe descriptors just before TRL vision collation."""
-
-    def __init__(
-        self,
-        processor,
-        max_length: int,
-        package_root: str | Path | None,
-        delegate: Callable[[list[dict]], dict] | None = None,
-    ):
-        if delegate is None:
-            from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
-
-            delegate = DataCollatorForVisionLanguageModeling(
-                processor=processor,
-                max_length=max_length,
-                completion_only_loss=True,
-            )
-        self._delegate = delegate
-        self._package_root = package_root
-
-    def __call__(self, examples: list[dict]) -> dict:
-        return self._delegate(decode_arrow_examples(examples, self._package_root))
-
-
-def lazy_image_dataset_transform(package_root: str | Path | None) -> Callable[[dict], dict]:
-    """Build a Hugging Face dataset transform that decodes only requested rows."""
-
-    def transform(batch: dict) -> dict:
-        image_rows = batch.get("images")
-        if image_rows is None:
-            return batch
-        batch = dict(batch)
-        batch["images"] = [decode_image_descriptors(list(row or []), package_root) for row in image_rows]
-        return batch
-
-    return transform
-
-
-def processor_prompt_token_count(
-    processor,
-    messages: list[dict],
-    descriptors: list[str],
-    package_root: str | Path | None,
-    *,
-    tools: list | None = None,
-    enable_thinking: bool = False,
-) -> int:
-    """Count the exact processor-expanded prompt tokens used by TRL GRPO."""
-    from trl.data_utils import prepare_multimodal_messages
-
-    images = decode_image_descriptors(descriptors, package_root)
-    prompt = prepare_multimodal_messages(messages, images=images)
-    result = processor.apply_chat_template(
-        conversation=[prompt],
-        tools=tools or None,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        enable_thinking=enable_thinking,
-    )
-    input_ids = result["input_ids"]
-    if input_ids and isinstance(input_ids[0], int):
-        return len(input_ids)
-    return len(input_ids[0])
 
 
 def validate_multimodal_training(model_id: str, algorithm: str, *, multi_turn: bool = False) -> None:

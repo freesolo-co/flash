@@ -587,8 +587,8 @@ def _validate_grpo(spec: JobSpec) -> None:
     """validate the grpo group-size constraint."""
     if spec.train.group_size is not None and spec.train.group_size < 2:
         raise ConfigError(
-            "train.group_size must be >= 2 for GRPO (TRL needs at least two generations "
-            "per prompt to calculate advantages)"
+            "train.group_size must be >= 2 for GRPO (advantages are group-relative, so a "
+            "prompt needs at least two generations to compare against)"
         )
 
 
