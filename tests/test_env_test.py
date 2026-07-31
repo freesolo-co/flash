@@ -602,10 +602,13 @@ def test_env_test_unknown_algorithm_warns_instead_of_failing(monkeypatch, tmp_pa
     assert "pass --algorithm to fail on this instead of warning" in captured.err
 
 
-def test_env_test_inverted_reward_direction_fails(monkeypatch, tmp_path, capsys):
-    # a grader whose sign is inverted scores wrong answers ABOVE gold. grpo maximizes the reward,
-    # so the run would train directly away from the references. differing scores are not enough:
-    # the gold answer must not rank below a deliberately wrong one.
+def test_env_test_inverted_reward_direction_is_reported_but_does_not_fail(
+    monkeypatch, tmp_path, capsys
+):
+    # a grader whose sign is inverted scores wrong answers ABOVE gold, which grpo would maximize
+    # straight away from the references. worth reporting -- but not worth failing on, because the
+    # controls are only LEXICALLY disjoint from the gold text and a healthy grader rewarding an
+    # open-ended property they share produces the identical picture (codex[bot]). so: warn, pass.
     env_dir = _environment_dir(tmp_path)
 
     class _InvertedEnv(_SingleTurnEnv):
@@ -615,11 +618,34 @@ def test_env_test_inverted_reward_direction_fails(monkeypatch, tmp_path, capsys)
 
     _patch_loader(monkeypatch, _InvertedEnv())
 
-    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     captured = capsys.readouterr()
     assert "1/1 episodes passed contract checks" in captured.out
-    assert "the reward direction is inverted" in captured.err
-    assert "overall: FAIL" in captured.err
+    assert "scored a deliberately wrong answer higher than the gold answer" in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_a_grader_rewarding_length_is_not_failed_as_inverted(
+    monkeypatch, tmp_path, capsys
+):
+    # the concrete case the verdict could not tell from an inverted sign: every fixed control runs
+    # 64-67 characters, so a correct open-ended grader paying by response length outranks a short
+    # gold reference with all of them (codex[bot]). maximizing that reward is right, and failing the
+    # run on it would block a working environment.
+    env_dir = _environment_dir(tmp_path)
+
+    class _LengthRewardEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            return float(len(completion))
+
+    _patch_loader(monkeypatch, _LengthRewardEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    # and the reader is told why the ordering is not conclusive, rather than just that it happened.
+    assert "open-ended property" in captured.err
 
 
 def test_env_test_control_rejected_on_one_row_still_counts_as_separation(
@@ -1455,11 +1481,11 @@ def test_synthetic_controls_supply_enough_alphabets_for_the_inversion_verdict():
     assert len({control[0] for control in controls}) == len(controls)
 
 
-def test_an_inverted_grader_is_caught_when_the_gold_text_disqualifies_every_fixed_control(
+def test_an_inverted_grader_is_reported_when_the_gold_text_disqualifies_every_fixed_control(
     monkeypatch, tmp_path, capsys
 ):
-    # the end of the same finding: the verdict needs unanimity across controls, so a single
-    # fallback left it unreachable and an inverted grader passed unexamined for any gold text that
+    # the end of the same finding: the report needs unanimity across controls, so a single fallback
+    # left it unreachable and an inverted grader went unmentioned for any gold text that
     # disqualified the whole fixed set -- "answer z 0" being enough to do it (codex[bot]).
     env_dir = _environment_dir(tmp_path)
 
@@ -1475,9 +1501,11 @@ def test_an_inverted_grader_is_caught_when_the_gold_text_disqualifies_every_fixe
     _patch_loader(monkeypatch, _InvertedGraderEnv())
 
     assert not any(_control_is_disjoint(c, "answer z 0") for c in _CONTROL_CANDIDATES)
-    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    # reported, not failed on: an ordering alone cannot separate an inverted sign from a correct
+    # reward for a property the controls share (see the length test above).
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     captured = capsys.readouterr()
-    assert "the reward direction is inverted" in captured.err, captured.err
+    assert "scored a deliberately wrong answer higher than the gold answer" in captured.err
 
 
 def test_synthetic_controls_are_empty_when_the_gold_text_uses_every_character():
@@ -1610,13 +1638,14 @@ def test_env_test_flat_reward_still_warns_for_a_non_reward_algorithm(monkeypatch
     assert [c for c in env.completions if c in _CONTROL_CANDIDATES]
 
 
-def test_env_test_fails_a_grader_that_credits_a_wrong_answer_at_one_turn(
+def test_env_test_reports_a_grader_that_credits_a_wrong_answer_at_one_turn(
     monkeypatch, tmp_path, capsys
 ):
     # end-to-end companion to the crossing-vector unit test. the control matches no gold turn, so
     # its (0, 1) against gold's (1, 0) is not a tie the sums obscure -- turn 1 gives the wrong text
     # a positive advantage and training reinforces it there. the equal episode scalar and equal sum
-    # are exactly why the two scalar readings both missed it (codex[bot]).
+    # are exactly why the two scalar readings both missed it (codex[bot]). the per-turn ordering has
+    # to REACH the report; whether an ordering is conclusive is settled above.
     env_dir = _environment_dir(tmp_path)
 
     class _CrossingPerTurnEnv(_MultiTurnEnv):
@@ -1641,10 +1670,9 @@ def test_env_test_fails_a_grader_that_credits_a_wrong_answer_at_one_turn(
     _patch_loader(monkeypatch, _CrossingPerTurnEnv())
 
     args = _args(env_dir, algorithm="grpo", credit_assignment="per_turn")
-    assert cmd_env_test(args) == 1
+    assert cmd_env_test(args) == 0
     captured = capsys.readouterr()
-    assert "overall: FAIL" in captured.out or "overall: FAIL" in captured.err
-    assert "reward direction looks inverted" in captured.err
+    assert "reward direction may be inverted" in captured.err
     # the warning must quote the vectors it compared: the episode scalars are equal here, so
     # printing them would read "0.500000 scored higher than 0.500000".
     assert "gold turns (1.000000, 0.000000)" in captured.err, captured.err
@@ -1894,3 +1922,240 @@ def test_an_unscorable_multi_turn_control_is_dropped_rather_than_failed(
     assert "reward is not finite" not in captured.err, captured.err
     # the surviving control still separates, so the episode is not read as flat either.
     assert "cannot rank completions" not in captured.err, captured.err
+
+
+def test_replay_fidelity_compares_the_role_of_an_observation_not_only_its_text(
+    monkeypatch, tmp_path, capsys
+):
+    # the reference records an observation as a `tool` message and the live env emits the identical
+    # string as `user`. that is a materially different transcript -- it renders differently under
+    # the chat template, and a role-aware grader scores it differently -- so reducing both sides to
+    # content alone reported a faithful replay for an episode the grader never saw (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _RoleEnv(_MultiTurnEnv):
+        """Reference records its observation as a tool message; `reply_role` is what it emits."""
+
+        reply_role = "tool"
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "tool", "content": "observation-1"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            reply = {"role": self.reply_role, "content": "observation-1"}
+            messages.append(reply)
+            return [reply]
+
+        def reward(self, completion, example, state=None):
+            # role-aware, so a `user` observation is a different episode and scores like a control.
+            observed = [
+                (message.get("role"), message.get("content"))
+                for message in state["messages"]
+                if message.get("role") != "system"
+            ]
+            gold = [(turn["role"], turn["content"]) for turn in example["output"]]
+            return 1.0 if observed[1:][: len(gold)] == gold else 0.0
+
+    class _RoleShiftedEnv(_RoleEnv):
+        # same strings, different role: the grader sees an episode the reference never recorded.
+        reply_role = "user"
+
+    _patch_loader(monkeypatch, _RoleShiftedEnv())
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    # excluded from the gate, so the flat finding is not raised against a grader that ranks fine.
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+    # the control: the same env replying with the recorded role does reproduce, so the exclusion
+    # above is about the role rather than about interleaved observations in general. it is flat by
+    # construction there -- gold and controls all miss the reference -- and saying so proves the
+    # episode reached the gate instead of being dropped.
+    _patch_loader(monkeypatch, _RoleEnv())
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_a_rollout_state_exposing_only_messages_is_accepted(monkeypatch, tmp_path, capsys):
+    # the production driver accepts `state.get("prompt") or state.get("messages")`
+    # (flash/engine/multiturn_rollout.py:171-175), so an env keeping its transcript under `messages`
+    # alone is a supported shape. requiring `prompt` afterwards failed the episode before the reward
+    # gate ever ran (codex[bot]). and the opening has to be SNAPSHOTTED: by the end of the loop that
+    # same list holds every driven turn, so a re-read would report the whole transcript as prompt.
+    env_dir = _environment_dir(tmp_path)
+
+    class _MessagesOnlyEnv(_MultiTurnEnv):
+        def new_rollout_state(self, example):
+            state = super().new_rollout_state(example)
+            del state["prompt"]
+            return state
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def reward(self, completion, example, state=None):
+            said = [
+                message["content"]
+                for message in state["messages"]
+                if message.get("role") == "assistant"
+            ]
+            return 1.0 if said == ["first", "second"] else 0.0
+
+    _patch_loader(monkeypatch, _MessagesOnlyEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "prompt is not well-formed" not in captured.err, captured.err
+    # the reported prompt is the opening alone. the driven turns were appended to that same list, so
+    # a re-read would show "first" here.
+    prompt_line = [line for line in captured.out.splitlines() if line.strip().startswith("prompt:")]
+    assert prompt_line, captured.out
+    assert "first" not in prompt_line[0], prompt_line[0]
+
+
+def test_every_rollout_of_the_run_is_scored_in_one_call(monkeypatch, tmp_path, capsys):
+    # the worker submits its whole rollout request list to score_rollouts at once
+    # (flash/engine/multiturn_rollout.py:687-695), and that list spans the generation batch rather
+    # than one example. scoring per episode handed a listwise rollout_rewards_many a shorter list
+    # than training ever gives it, which is enough to change the numbers (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    rows = [
+        {
+            "input": f"exchange {index}",
+            "output": [
+                {"role": "assistant", "content": f"first-{index}"},
+                {"role": "assistant", "content": f"second-{index}"},
+            ],
+        }
+        for index in (1, 2)
+    ]
+
+    class _BatchCountingEnv(_MultiTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.batches: list[int] = []
+
+        def dataset(self):
+            return rows
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            self.batches.append(len(items))
+            rewards = []
+            for example, state in items:
+                gold = {turn["content"] for turn in example["output"]}
+                said = [
+                    message["content"]
+                    for message in state["messages"]
+                    if message.get("role") == "assistant"
+                ]
+                rewards.append(RolloutReward(episode=1.0 if set(said) <= gold else 0.0))
+            return rewards
+
+    env = _BatchCountingEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    # one call, holding both episodes' gold rollouts and every control.
+    assert len(env.batches) == 1, env.batches
+    assert env.batches[0] == len(rows) * (1 + len(_CONTROL_CANDIDATES)), env.batches
+
+
+def test_a_reward_coordinate_for_a_text_free_turn_is_not_read_as_separation(
+    monkeypatch, tmp_path, capsys
+):
+    # build_per_turn_advantages skips any turn whose span is zero-width
+    # (flash/engine/worker/grpo_perturn_trainer.py:67-75), so a reward coordinate belonging to a
+    # turn that emitted nothing is one no advantage is computed from. counting it read separation
+    # into a group the trainer resolves to zero advantage everywhere (codex[bot]): gold replays
+    # ("", "answer") for (1, 0) against controls' (0, 0), and turn 0 -- gold's empty one -- is the
+    # only place they differ.
+    env_dir = _environment_dir(tmp_path)
+
+    class _EmptyFirstTurnEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": ""},
+                        {"role": "assistant", "content": "answer"},
+                    ],
+                }
+            ]
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            rewards = []
+            for _example, state in items:
+                said = [
+                    message["content"]
+                    for message in state["messages"]
+                    if message.get("role") == "assistant"
+                ]
+                # credit only at the turn gold left empty, and tie the episode scalar so nothing
+                # else can carry the separation.
+                gold = said[:1] == [""]
+                rewards.append(
+                    RolloutReward(episode=0.5, turns=(1.0, 0.0) if gold else (0.0, 0.0))
+                )
+            return rewards
+
+    _patch_loader(monkeypatch, _EmptyFirstTurnEnv())
+
+    args = _args(env_dir, algorithm="grpo", credit_assignment="per_turn")
+    assert cmd_env_test(args) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
+def test_a_reward_coordinate_for_a_turn_that_emitted_text_still_separates(
+    monkeypatch, tmp_path, capsys
+):
+    # the control for the exclusion above: the same shape with gold's first turn carrying text is
+    # a turn the trainer does credit, so it must still count as separation.
+    env_dir = _environment_dir(tmp_path)
+
+    class _TextFirstTurnEnv(_MultiTurnEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            rewards = []
+            for example, state in items:
+                gold = {turn["content"] for turn in example["output"]}
+                said = [
+                    message["content"]
+                    for message in state["messages"]
+                    if message.get("role") == "assistant"
+                ]
+                correct = said[:1] and said[0] in gold
+                rewards.append(
+                    RolloutReward(episode=0.5, turns=(1.0, 0.0) if correct else (0.0, 0.0))
+                )
+            return rewards
+
+    _patch_loader(monkeypatch, _TextFirstTurnEnv())
+
+    args = _args(env_dir, algorithm="grpo", credit_assignment="per_turn")
+    assert cmd_env_test(args) == 0, capsys.readouterr().err
+    assert "cannot rank completions" not in capsys.readouterr().err
