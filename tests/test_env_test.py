@@ -575,6 +575,36 @@ def test_env_test_param_keys_that_denote_toml_structure_are_rejected(
     assert "TOML key syntax" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("value", ["bad key=1", "a/b=1", "a@b=1", "k(x)=1", "café=1"])
+def test_env_test_param_keys_outside_the_toml_bare_key_grammar_are_rejected(
+    monkeypatch, tmp_path, capsys, value
+):
+    # dots and quotes are not the whole grammar. a bare TOML key is letters, digits, `_` and `-`,
+    # and there is no unquoted spelling for anything else -- so these names forwarded literally
+    # while the equivalent [environment.params] entry cannot load at all. an environment taking
+    # **kwargs swallows the call and the gate passes for a parameter the run never receives
+    # (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    assert "not a valid TOML bare key" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["max_rows=5", "MODE=fast", "n0=1", "keep-going=true"])
+def test_env_test_valid_bare_key_params_still_load(monkeypatch, tmp_path, value):
+    # the grammar check is only correct if it admits every name a config could hold: uppercase,
+    # digits, underscores and dashes are all legal bare keys, and rejecting one would remove a
+    # parameter spelling that works in [environment.params] today.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+    key = value.split("=")[0]
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 0
+    assert key in seen["kwargs"]
+
+
 def test_env_test_a_nested_param_passes_as_one_inline_table(monkeypatch, tmp_path):
     # the rejection above is only correct if the flag can still express the nested call, otherwise
     # it would be removing a capability rather than fixing a misforward. this is the spelling the

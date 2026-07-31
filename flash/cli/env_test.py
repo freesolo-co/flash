@@ -35,6 +35,10 @@ _TOML_KEY_STRUCTURAL_CHARS = frozenset(".\"'")
 # rejected depending on whether it carried a sign (cursor). it is not in _TOML_STRUCTURAL_CHARS, so
 # it reaches this test rather than being read as a delimiter.
 _TOML_SCALAR_LEADING_CHARS = frozenset("0123456789+-.")
+# the whole TOML bare-key grammar: ascii letters, digits, `_` and `-`. anything else has to be
+# written as a quoted key, which _reject_unmirrorable_param_key already turns away -- so a name
+# holding one of those characters cannot be expressed in [environment.params] at all.
+_TOML_BARE_KEY_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:
@@ -261,7 +265,10 @@ def _parse_param_value(key: str, raw: str) -> object:
 
 
 def _reject_unmirrorable_param_key(key: str) -> None:
-    """Reject a ``--param`` name whose TOML meaning this flag cannot reproduce.
+    """Reject a ``--param`` name ``[environment.params]`` could not carry with the same meaning.
+
+    Two ways that happens: a spelling that denotes structure rather than itself, and a name TOML
+    has no unquoted spelling for at all.
 
     The left side of a `[environment.params]` entry is a TOML key, not a literal name: dotted and
     quoted spellings denote structure. `difficulty.level = 3` in a config is
@@ -277,14 +284,26 @@ def _reject_unmirrorable_param_key(key: str) -> None:
     points at, so mirroring here would add a second spelling for something the flag can already
     express faithfully.
     """
-    if not (set(key) & _TOML_KEY_STRUCTURAL_CHARS):
-        return
-    outer = key.split(".", 1)[0].strip("\"'") or key
-    raise ValueError(
-        f"--param {key} uses TOML key syntax that denotes structure, which this flag cannot "
-        f"forward faithfully. pass the containing table as one value instead, for example "
-        f"--param {outer}='{{ level = 3 }}'"
-    )
+    if set(key) & _TOML_KEY_STRUCTURAL_CHARS:
+        outer = key.split(".", 1)[0].strip("\"'") or key
+        raise ValueError(
+            f"--param {key} uses TOML key syntax that denotes structure, which this flag cannot "
+            f"forward faithfully. pass the containing table as one value instead, for example "
+            f"--param {outer}='{{ level = 3 }}'"
+        )
+    # dots and quotes are the spellings that mean something OTHER than themselves, but they are not
+    # the whole grammar: `bad key`, `a/b`, `a@b` and the rest are not bare keys either, and TOML has
+    # no unquoted spelling for them. they forwarded literally, so an environment taking **kwargs
+    # swallowed the call and the gate passed for a name `[environment.params]` cannot hold
+    # (codex[bot]). no example is offered here -- unlike the nested case there is no faithful
+    # config spelling to point at.
+    illegal = sorted(set(key) - _TOML_BARE_KEY_CHARS)
+    if illegal:
+        raise ValueError(
+            f"--param {key} is not a valid TOML bare key ({''.join(illegal)!r} not allowed); "
+            f"[environment.params] could not hold this name, so the run would never receive it. "
+            f"parameter names may use letters, digits, underscores and dashes"
+        )
 
 
 def _env_params(args) -> dict:
