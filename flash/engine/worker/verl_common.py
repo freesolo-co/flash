@@ -482,7 +482,7 @@ def run_verl_training(
                     heartbeat()
                     last_hb = now
     except BaseException:
-        _kill_process_group(proc)
+        kill_process_group(proc)
         raise
     finally:
         if proc.poll() is None:
@@ -490,7 +490,7 @@ def run_verl_training(
     return int(proc.returncode)
 
 
-def _kill_process_group(proc: subprocess.Popen) -> None:
+def kill_process_group(proc: subprocess.Popen) -> None:
     """signal the child's whole process group, escalating to SIGKILL if it does not exit.
 
     signalling the group rather than the pid is what reaches vllm's EngineCore grandchild; a survivor

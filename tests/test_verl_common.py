@@ -5,10 +5,14 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import signal
+import subprocess
+import sys
 import time
 
 import pytest
 
+from flash.engine.worker import rl_verl
 from flash.engine.worker import verl_common as vc
 
 
@@ -525,3 +529,48 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
     assert len(carried) == vc.STALL_TAIL_LINES
     # the most recent lines are the ones that matter: they are what the child said last.
     assert carried[-1] == f"line{vc.STALL_TAIL_LINES + 24}"
+
+
+# ---------------------- child teardown escalates to SIGKILL ----------------------
+def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored():
+    # the whole point of this helper is the escalation, so the child has to actually ignore SIGTERM.
+    # a child that dies on the term would pass just as well against a bare killpg, which is the bug.
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(300)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        # wait until the handler is installed, otherwise the term could land before SIG_IGN and the
+        # child would die to the term -- passing without ever exercising the escalation.
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+        started = time.monotonic()
+        vc.kill_process_group(child)
+        assert child.poll() is not None, "child ignoring SIGTERM survived kill_process_group"
+        # negative-signal returncode identifies which signal actually reaped it.
+        assert child.returncode == -signal.SIGKILL
+        assert time.monotonic() - started < 60
+    finally:
+        if child.poll() is None:  # pragma: no cover - only on an unexpected failure
+            child.kill()
+            child.wait(timeout=10)
+        if child.stdout is not None:
+            child.stdout.close()
+
+
+def test_grpo_teardown_uses_the_shared_escalating_kill():
+    # the grpo path used to hand-roll killpg(pid, 15) and swallow the wait timeout, so a vllm
+    # EngineCore that ignored the term kept its cuda context and stranded the gpu for later jobs.
+    # pin the call site: a bare killpg here would reintroduce exactly that.
+    source = inspect.getsource(rl_verl)
+    assert "kill_process_group(proc)" in source
+    assert "os.killpg" not in source, "grpo teardown must not hand-roll a non-escalating killpg"
