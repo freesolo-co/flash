@@ -130,6 +130,13 @@ def _freesolo_request(
                 "(or set FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+    # a socket timeout surfaces as a bare TimeoutError rather than a URLError, so without this
+    # it escapes as an unexpected exception. callers catch ClientError to report a failure
+    # without changing their own verdict; a traceback instead would lose that.
+    except TimeoutError as exc:
+        raise RequestTimeoutError(
+            f"request to {base}{path} timed out after {timeout}s"
+        ) from exc
     except urllib.error.URLError as exc:
         raise ClientError(
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "
