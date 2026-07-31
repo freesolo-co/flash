@@ -575,7 +575,69 @@ def test_a_case_variant_of_a_non_finite_float_is_not_forwarded_as_text(
 
     assert cmd_env_test(_args(env_dir, param=[value])) == 1
     assert "kwargs" not in seen
-    assert "non-finite floats in lowercase" in capsys.readouterr().err
+    assert "lowercase inf and nan" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "threshold=Infinity",
+        "threshold=infinity",
+        "threshold=INFINITY",
+        "threshold=-Infinity",
+        "threshold=+infinity",
+    ],
+)
+def test_a_full_length_infinity_is_not_forwarded_as_text(monkeypatch, tmp_path, capsys, value):
+    # `infinity` is the same value written out, and it is not a TOML spelling in any case -- so it
+    # reaches the bare-word test rather than the parse. matching only the `inf` abbreviation let it
+    # through as the string "Infinity", which an env normalizing with float() turns straight back
+    # into inf: the value the abbreviation is rejected for, reached by a spelling
+    # [environment.params] cannot parse at all (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    assert "lowercase inf and nan" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "dataset_path=/data/\udcff/set.jsonl",
+        'dataset_path="/data/\udcff/set.jsonl"',
+    ],
+)
+def test_a_surrogate_param_value_is_rejected_like_a_surrogate_name(
+    monkeypatch, tmp_path, capsys, spelling
+):
+    # a lone surrogate reaches argv when the command line carries a byte that is not valid UTF-8. it
+    # is no more expressible on the RIGHT of an assignment than on the left, but only the name was
+    # guarded -- so the loader could open the path and the gate PASS, while no UTF-8 training TOML
+    # could submit the run that was validated (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[spelling])) == 1
+    assert "kwargs" not in seen
+    assert "not valid UTF-8" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("spelling", "expected"),
+    [("note=café", "café"), ("note=你好", "你好"), ("path=/data/ok.jsonl", "/data/ok.jsonl")],
+)
+def test_ordinary_non_ascii_values_are_unaffected_by_the_utf8_check(
+    monkeypatch, tmp_path, spelling, expected
+):
+    # the check is only correct if it admits what a UTF-8 config CAN carry. a basic string holds any
+    # encodable character, so rejecting non-ascii text would cost a spelling the config supports.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[spelling])) == 0
+    assert seen["kwargs"][spelling.partition("=")[0]] == expected
 
 
 @pytest.mark.parametrize("value", ["difficulty.level=3", "a.b.c=1"])

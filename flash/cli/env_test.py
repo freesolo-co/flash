@@ -45,7 +45,12 @@ _TOML_BOOLEAN_WORDS = frozenset({"true", "false"})
 # as the literal STRING "NaN". the offline gate then validates a str where the config would hold a
 # float -- or an environment coercing it back gets the non-finite value the lowercase spelling was
 # rejected for (codex[bot]). so a case variant is malformed, not prose, either way.
-_TOML_NON_FINITE_WORDS = frozenset({"inf", "nan"})
+#
+# `infinity` is the same value written out. it is not a TOML spelling in any case, so it reaches the
+# bare-word test rather than the parse, and matching only the abbreviation let it through as the
+# string "Infinity" -- which an env normalizing with float() turns straight back into inf, the value
+# the abbreviation is rejected for (codex[bot]).
+_TOML_NON_FINITE_WORDS = frozenset({"inf", "infinity", "nan"})
 # TOML has no null. these are the spellings people reach for anyway, borrowed from json, python, and
 # yaml -- all bare words, so they land in the same blind spot: the parse fails, the value carries no
 # structural character, and it forwards as its own literal STRING. an env testing `if value is None`
@@ -220,14 +225,25 @@ def _reject_unsubmittable_param(key: str, value: object) -> None:
     non-standard tokens ``NaN`` and ``Infinity``, which are not JSON at all. `--param
     threshold=nan` therefore passed the gate and produced a request body a strict parser rejects
     (codex[bot]). Raised as ValueError, which is a separate exception from the TypeError above.
+
+    ``ensure_ascii=False`` so the encode reaches the text itself rather than escaping it away. The
+    default renders every non-ascii character as ``\\uXXXX``, which a lone surrogate survives, and
+    the value then forwards to an env that can open the path while no UTF-8 config could carry it
+    (codex[bot]). Encoding what json produced is what makes this cover a surrogate nested inside a
+    list or table, not just a bare scalar.
     """
     try:
-        json.dumps(value, allow_nan=False)
+        encoded = json.dumps(value, allow_nan=False, ensure_ascii=False)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"--param {key} is not JSON-serializable and could not be submitted "
             f"in [environment.params]: {exc}"
         ) from exc
+    if not _is_expressible_in_toml(encoded):
+        raise ValueError(
+            f"--param {key} is not valid UTF-8, so no config file could carry it and the run "
+            f"would never receive this value"
+        )
 
 
 def _parse_param_value(key: str, raw: str) -> object:
@@ -271,8 +287,8 @@ def _parse_param_value(key: str, raw: str) -> object:
             if value.lstrip("+-").lower() in _TOML_NON_FINITE_WORDS:
                 raise ValueError(
                     f"--param {key} is not a valid TOML value: {exc}. TOML spells the non-finite "
-                    f"floats in lowercase, and [environment.params] could not submit one anyway "
-                    f"since it is not JSON; pass a finite number, or "
+                    f"floats as lowercase inf and nan, and [environment.params] could not submit "
+                    f"one anyway since it is not JSON; pass a finite number, or "
                     f"--param '{key}=\"{value}\"' to pass it as text"
                 ) from exc
             # the null spellings, the last bare-word family. unlike the others there is no lowercase
@@ -284,6 +300,10 @@ def _parse_param_value(key: str, raw: str) -> object:
                     f"leave it unset, or --param '{key}=\"{value}\"' to pass it as text"
                 ) from exc
             if value[0] not in _TOML_SCALAR_LEADING_CHARS:
+                # the bare-string path returns before the parsed-value checks below, so the one
+                # that applies to text is asked here too. this is the route a surrogate actually
+                # takes: it holds no structural character, so it is read as prose.
+                _reject_unsubmittable_param(key, value)
                 return value
             # quoting is the escape hatch, and it is the same spelling the config needs -- a
             # genuinely textual "3px" has to be written `"3px"` in `[environment.params]` too, so
@@ -308,18 +328,23 @@ def _parse_param_value(key: str, raw: str) -> object:
     return parsed
 
 
-def _key_is_expressible_in_toml(key: str) -> bool:
-    """Report whether ``[environment.params]`` can carry ``key``, unchanged.
+def _is_expressible_in_toml(text: str) -> bool:
+    """Report whether ``[environment.params]`` can carry ``text``, unchanged.
 
-    The question is not whether the name is a TOML BARE key -- quoted keys hold spaces, slashes and
-    non-ascii perfectly well -- but whether the config can express THIS name at all. A basic-string
-    key can: every character is either literal or has an escape, so the only names left out are the
-    ones the file cannot physically contain. The config is read as UTF-8
-    (``tomllib.load``, flash/schema/__init__.py), so that is exactly the un-encodable ones -- a lone
+    The question is not whether the text is a TOML BARE key -- quoted keys and basic strings hold
+    spaces, slashes and non-ascii perfectly well -- but whether the config can express THIS text at
+    all. A basic string can: every character is either literal or has an escape, so the only text
+    left out is what the file cannot physically contain. The config is read as UTF-8
+    (``tomllib.load``, flash/schema/__init__.py), so that is exactly the un-encodable text -- a lone
     surrogate, which reaches argv when a command line carries a byte that is not valid UTF-8.
+
+    Asked of both sides of an assignment. A surrogate is no more expressible on the right than on
+    the left, and guarding only the name let `--param dataset_path=<surrogate>` forward a path the
+    loader can open and the gate can PASS on, while no UTF-8 training TOML could submit the run that
+    was validated (codex[bot]).
     """
     try:
-        key.encode("utf-8")
+        text.encode("utf-8")
     except UnicodeEncodeError:
         return False
     return True
@@ -370,7 +395,7 @@ def _literal_param_key(key: str) -> str:
     # run really can receive. an earlier guard here rejected anything outside the BARE-key grammar,
     # which blocked validating a working config while claiming the config could not hold the name
     # (cursor). what is left is the names a UTF-8 config file cannot physically contain.
-    if not _key_is_expressible_in_toml(name):
+    if not _is_expressible_in_toml(name):
         raise ValueError(
             f"--param {key!r} is not valid UTF-8, so no config file could carry it and the run "
             f"would never receive this parameter"
