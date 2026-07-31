@@ -134,9 +134,7 @@ def _freesolo_request(
     # it escapes as an unexpected exception. callers catch ClientError to report a failure
     # without changing their own verdict; a traceback instead would lose that.
     except TimeoutError as exc:
-        raise RequestTimeoutError(
-            f"request to {base}{path} timed out after {timeout}s"
-        ) from exc
+        raise RequestTimeoutError(f"request to {base}{path} timed out after {timeout}s") from exc
     except urllib.error.URLError as exc:
         raise ClientError(
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "

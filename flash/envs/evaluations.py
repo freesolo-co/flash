@@ -560,8 +560,7 @@ def load_evaluation_suites(
         # bound to this package before returning: cases() and score() run after this call, when
         # nothing else would keep a sibling import resolving to the package it belongs to.
         return [
-            _ScopedSuite(suite, module_dir)
-            for suite in _validate_suites(loaded, source=source)
+            _ScopedSuite(suite, module_dir) for suite in _validate_suites(loaded, source=source)
         ]
     except Exception as exc:
         if isinstance(exc, (AttributeError, TypeError, ValueError, RuntimeError)) and str(
