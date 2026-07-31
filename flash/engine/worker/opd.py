@@ -703,9 +703,7 @@ def run_opd():
                 normalized = normalize_prompt_images(ex, messages, package_root)
                 student_messages = normalized.messages
                 descriptors = tuple(normalized.descriptors)
-                teacher_messages = image_teacher_prompt_messages(
-                    student_messages, len(descriptors)
-                )
+                teacher_messages = image_teacher_prompt_messages(student_messages, len(descriptors))
                 prompt_ids = _materialize_image_prompt(
                     processor, student_messages, descriptors, package_root
                 )[0]
@@ -959,9 +957,7 @@ def run_opd():
     no_signal_resamples = int(_resumed("no_signal_resamples", 0))
     no_signal_skipped_steps = int(_resumed("no_signal_skipped_steps", 0))
 
-    def _generate_with_rollout_seeds(
-        prompt_ids_batch, *, max_tokens, multi_modal_data_batch=None
-    ):
+    def _generate_with_rollout_seeds(prompt_ids_batch, *, max_tokens, multi_modal_data_batch=None):
         nonlocal rollout_seed_ordinal
         request_seeds = [
             rollout_request_seed(_w.SEED, rollout_seed_ordinal + offset)
@@ -1525,9 +1521,7 @@ def run_opd():
             # checkpoint on optimizer-step count, not the loop index: a `step-n` artifact must
             # contain n real updates. the final optimizer state is always a required recovery boundary,
             # even when the configured deployable schedule does not select that step.
-            checkpoint_due = save_step_due(
-                opt_steps, knobs.save_at_steps, knobs.save_every
-            )
+            checkpoint_due = save_step_due(opt_steps, knobs.save_at_steps, knobs.save_every)
             is_final_step = opt_steps == steps
             if checkpoint_due or is_final_step:
                 is_required_save = opt_steps in knobs.save_at_steps
@@ -1623,9 +1617,7 @@ def run_opd():
             # optimizer-boundary checkpoint must already be durable before this fallible sync. skip when
             # no rollout remains or the final rollout is already buffered and requires no more generation.
             if opt_steps < steps and not (
-                generate_ahead_active
-                and prefetched_rollouts is not None
-                and opt_steps == steps - 1
+                generate_ahead_active and prefetched_rollouts is not None and opt_steps == steps - 1
             ):
                 with liveness_heartbeat(
                     "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
@@ -1783,9 +1775,7 @@ def run_opd():
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,
             "opd_loss_microbatch_size": loss_microbatch_size,
-            "opd_completion_only_batches": getattr(
-                model, "_flash_opd_completion_only_batches", 0
-            ),
+            "opd_completion_only_batches": getattr(model, "_flash_opd_completion_only_batches", 0),
             # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
             # prefix, so a "sample" is a TURN, not a whole episode. Report the mode + turn ceiling and
             # the mean turns/episode so a run that collapsed to one-turn episodes (env never replied /
@@ -2122,7 +2112,9 @@ def _score_many(
     image_positions = [index for index, pending in enumerate(pendings) if pending.teacher_images]
     if image_positions:
         image_position_set = set(image_positions)
-        text_positions = [index for index in range(len(pendings)) if index not in image_position_set]
+        text_positions = [
+            index for index in range(len(pendings)) if index not in image_position_set
+        ]
         results: list[_ScoreResult | None] = [None] * len(pendings)
         if text_positions:
             text_results = _score_many(
@@ -2206,9 +2198,7 @@ def _score_many(
                 )
                 for _ in pendings
             ]
-        return [
-            _ScoreResult(teacher_toks=scored[index], status="ok") for index in scatter_indexes
-        ]
+        return [_ScoreResult(teacher_toks=scored[index], status="ok") for index in scatter_indexes]
     return [
         _ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings
     ]
@@ -2606,9 +2596,7 @@ def _resolve_samples_batched(
                 model_kwargs=model_kwargs,
             )
             rows = logits[0, prompt_len - 1 : prompt_len - 1 + comp_len]
-            loss = _gkd_loss_from_logits_rows(
-                rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
-            )
+            loss = _gkd_loss_from_logits_rows(rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef)
             if loss is None:
                 results[p.idx] = SampleResult(
                     teacher_status="ok",
@@ -2732,7 +2720,9 @@ def _save_opd_resume_checkpoint(
             raise RetriableInfraError(
                 f"required opd full-state checkpoint construction failed at step {opt_steps}"
             ) from e
-        print(f"[opd] resume checkpoint save failed at opt_steps={opt_steps}; training continues: {e}")
+        print(
+            f"[opd] resume checkpoint save failed at opt_steps={opt_steps}; training continues: {e}"
+        )
         return
 
     try:
@@ -2762,9 +2752,7 @@ def _save_opd_resume_checkpoint(
         raise RetriableInfraError(
             f"required opd full-state checkpoint upload failed at step {opt_steps}"
         )
-    print(
-        f"[opd] resume checkpoint upload failed at opt_steps={opt_steps}; training continues"
-    )
+    print(f"[opd] resume checkpoint upload failed at opt_steps={opt_steps}; training continues")
 
 
 def _restore_opd_full_state(

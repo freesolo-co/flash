@@ -83,9 +83,7 @@ def test_transient_throttling_retries_then_downloads(monkeypatch):
     calls = []
     sleeps = []
     transient = _hf_error(429)
-    monkeypatch.setattr(
-        adapter, "_warmstart_adapter_is_loadable", lambda _path: len(calls) >= 3
-    )
+    monkeypatch.setattr(adapter, "_warmstart_adapter_is_loadable", lambda _path: len(calls) >= 3)
 
     def snapshot_download(**kwargs):
         calls.append(kwargs)

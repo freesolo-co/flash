@@ -125,7 +125,11 @@ def test_scan_workers_ignores_environment(value):
     env = os.environ.copy()
     env["FLASH_GC_SCAN_WORKERS"] = value
     result = subprocess.run(
-        [sys.executable, "-c", "from flash.server.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)"],
+        [
+            sys.executable,
+            "-c",
+            "from flash.server.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)",
+        ],
         env=env,
         check=True,
         capture_output=True,
@@ -165,7 +169,9 @@ def test_scan_repo_classifies_paths():
                 _adapter("recomb/flash-2-b/adapter/w", YOUNG),
                 _adapter("code/deadbeef/flash/x.py", OLD),  # snapshot -> ignored
                 _adapter("referenced_by/flash-9-child", OLD, size=0),  # lineage marker
-                _adapter("telemetry/events.jsonl", OLD),  # unknown top-level -> reported, not reaped
+                _adapter(
+                    "telemetry/events.jsonl", OLD
+                ),  # unknown top-level -> reported, not reaped
             ]
         }
     )
@@ -383,9 +389,13 @@ def test_sweep_never_touches_non_flashrun_repos(monkeypatch):
     _wire(monkeypatch)
     api = FakeApi(
         {
-            f"{NS}/paper-gsm8k": [_adapter("sft/flash-1-old/adapter/w", OLD)],  # eval pkg, NOT a run repo
+            f"{NS}/paper-gsm8k": [
+                _adapter("sft/flash-1-old/adapter/w", OLD)
+            ],  # eval pkg, NOT a run repo
             f"{NS}/some-env": [_adapter("sft/flash-2-old/adapter/w", OLD)],  # env package
-            _managed("real"): [_adapter("sft/flash-3-old/adapter/w", OLD)],  # the only reapable repo
+            _managed("real"): [
+                _adapter("sft/flash-3-old/adapter/w", OLD)
+            ],  # the only reapable repo
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
@@ -404,7 +414,9 @@ def test_scan_failure_on_one_repo_is_not_fatal(monkeypatch):
 
     api = _FlakyApi(
         {
-            _managed("bad"): [_adapter("sft/flash-1-old/w", OLD)],  # scan raises -> skipped this cycle
+            _managed("bad"): [
+                _adapter("sft/flash-1-old/w", OLD)
+            ],  # scan raises -> skipped this cycle
             _managed("good"): [_adapter("sft/flash-2-old/w", OLD)],  # reaped
         }
     )
@@ -486,7 +498,9 @@ def test_one_delete_failure_does_not_abort_sweep(monkeypatch):
 
     api = _FlakyDeleteApi(
         {
-            _managed("e1"): [_adapter("sft/flash-1-old/w", OLD)],  # delete raises -> logged, continue
+            _managed("e1"): [
+                _adapter("sft/flash-1-old/w", OLD)
+            ],  # delete raises -> logged, continue
             _managed("e2"): [_adapter("sft/flash-2-old/w", OLD)],  # still reaped
         }
     )
@@ -500,7 +514,9 @@ def test_one_delete_failure_does_not_abort_sweep(monkeypatch):
 
 def test_restat_spares_prefix_written_since_enumeration(monkeypatch):
     _wire(monkeypatch)
-    monkeypatch.setattr(rc, "_prefix_written_within", lambda *a, **k: True)  # a fresh write appeared
+    monkeypatch.setattr(
+        rc, "_prefix_written_within", lambda *a, **k: True
+    )  # a fresh write appeared
     api = FakeApi({_managed("e"): [_adapter("sft/flash-1-old/w", OLD)]})
     assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
     assert api.deleted == []
@@ -541,7 +557,9 @@ def test_prefix_written_within_false_when_all_old_or_undated():
     )
     undated = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", None)]})
     assert (
-        rc._prefix_written_within(undated, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS)
+        rc._prefix_written_within(
+            undated, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS
+        )
         is False
     )
 

@@ -73,9 +73,13 @@ def test_big_card_batched_tokens_default_covers_engine_length():
     m = re.search(r"_mnbt = (.+?) if _card_gb >= 140 else None", src)
     assert m, "big-card _mnbt default assignment not found in run_rl"
     expr = m.group(1)
-    assert "vllm_max_len" in expr, f"big-card batched-token default must scale to the engine length, got: {expr}"
+    assert "vllm_max_len" in expr, (
+        f"big-card batched-token default must scale to the engine length, got: {expr}"
+    )
     assert "8192" in expr, f"default must keep the 8192 floor for short contexts, got: {expr}"
-    assert "max(" in expr, f"default must take the larger of 8192 and the engine length, got: {expr}"
+    assert "max(" in expr, (
+        f"default must take the larger of 8192 and the engine length, got: {expr}"
+    )
 
 
 def test_patch_is_idempotent(fake_vg):
@@ -144,12 +148,12 @@ def test_run_rl_gates_reasoning_parser_on_thinking_and_constraint():
 
     src = inspect.getsource(run_rl)
     # resolved via the shared gate, then injected only when that gate returns a parser name
-    assert re.search(
-        r"_reasoning_parser\s*=\s*reasoning_parser_for\(", src
-    ), "run_rl must resolve the parser via reasoning_parser_for"
-    assert re.search(
-        r"if _reasoning_parser:", src
-    ), "the colocate injection must be gated on a resolved parser (thinking + constraint only)"
+    assert re.search(r"_reasoning_parser\s*=\s*reasoning_parser_for\(", src), (
+        "run_rl must resolve the parser via reasoning_parser_for"
+    )
+    assert re.search(r"if _reasoning_parser:", src), (
+        "the colocate injection must be gated on a resolved parser (thinking + constraint only)"
+    )
     assert re.search(
         r"patch_trl_colocate_llm_kwargs\(\s*reasoning_parser=_reasoning_parser", src
     ), "run_rl must pass the resolved parser to the colocate-LLM patch"

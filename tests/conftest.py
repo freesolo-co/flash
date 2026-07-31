@@ -43,7 +43,7 @@ def _offline(monkeypatch):
     # so a sweep never reaches the real API; sweep tests monkeypatch it after this fixture.
     import flash.providers.runpod.api as runpod_api
 
-    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [], raising=False)
+    monkeypatch.setattr(runpod_api, "list_endpoints", list, raising=False)
 
     # Lambda and Vast are OPT-IN instance-based complements (keyed by LAMBDA_API_KEY / VAST_API_KEY).
     # On an operator box whose shell sources a .env, those keys are present in the process env — which

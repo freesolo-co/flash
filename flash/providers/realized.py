@@ -37,13 +37,13 @@ def realized_cost_for_remote(
     if provider in INSTANCE_PROVIDERS:
         # Both instance-billed providers: realized COGS == wall-clock x the instance's flat $/hr
         # (Vast's $/hr is the offer's live rate stamped on the handle as ``hourly_usd``).
-        return _instance_realized_cost(remote, start=start, end=run_end if run_end is not None else end)
+        return _instance_realized_cost(
+            remote, start=start, end=run_end if run_end is not None else end
+        )
     return None
 
 
-def _instance_realized_cost(
-    remote: dict, *, start: float, end: float
-) -> RealizedCost | None:
+def _instance_realized_cost(remote: dict, *, start: float, end: float) -> RealizedCost | None:
     """Realized COGS for an instance-billed provider: wall-clock x flat $/hr."""
     rate = remote.get("hourly_usd")
     rid = remote.get("instance_id")

@@ -17,7 +17,7 @@ _CHECKPOINT_PATH = "/api/flash/runs/checkpoints/internal"
 _EVENT_PATH = "/api/flash/events/internal"
 
 
-def _iso_from_epoch(value: float | int | None) -> str | None:
+def _iso_from_epoch(value: float | None) -> str | None:
     if value is None:
         return None
     try:
