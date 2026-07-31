@@ -985,6 +985,58 @@ def test_chat_checkpoint_ref_is_forwarded_unchanged(fake_client) -> None:
     assert fake_client.calls[-1][1] == target
 
 
+def test_chat_stream_caches_a_successful_checkpoint_capability_check(monkeypatch) -> None:
+    # env eval opens one stream per case. repeating the health preflight makes a large suite pay
+    # hundreds of extra requests and lets one transient health failure replace a model measurement.
+    from flash.client import ApiClient, ClientError
+
+    class Response:
+        def __init__(self):
+            self.headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+    client = ApiClient("https://flash.test")
+    successful_health_calls = 0
+
+    def successful_health():
+        nonlocal successful_health_calls
+        successful_health_calls += 1
+        return {"capabilities": ["chat_step_selector_v1"]}
+
+    monkeypatch.setattr(client, "health", successful_health)
+    monkeypatch.setattr(
+        "flash.client.http.urllib.request.urlopen", lambda *args, **kwargs: Response()
+    )
+
+    for _ in range(2):
+        assert list(client.chat_stream("flash-1/step-3", [])) == ["ok"]
+
+    assert successful_health_calls == 1
+
+    failing_client = ApiClient("https://flash.test")
+    failing_health_calls = 0
+
+    def failing_health():
+        nonlocal failing_health_calls
+        failing_health_calls += 1
+        return {"capabilities": []}
+
+    monkeypatch.setattr(failing_client, "health", failing_health)
+    for _ in range(2):
+        with pytest.raises(ClientError, match="chat_step_selector_v1"):
+            list(failing_client.chat_stream("flash-1/step-3", []))
+
+    assert failing_health_calls == 2
+
+
 def test_chat_accepts_full_immutable_revision(fake_client) -> None:
     revision = "flash-1@step-40." + "a" * 40
     assert _run(["models", "chat", revision, "-m", "What is 6*7?"]) == 0
@@ -1116,22 +1168,19 @@ def test_env_setup_does_not_overwrite_existing_evaluations(monkeypatch, tmp_path
     assert existing.read_text() == "# keep this evaluation sidecar\n"
 
 
-def test_env_setup_leaves_a_custom_environment_without_a_starter_suite(
-    monkeypatch, tmp_path
+def test_env_setup_does_not_add_starter_evaluations_to_a_custom_environment(
+    monkeypatch, tmp_path, capsys
 ) -> None:
-    """Rerun beside a user's own environment.py and no starter evaluations.py appears.
-
-    The starter suite grades `7 + 5`. Dropped next to an unrelated environment it publishes a
-    check that measures nothing -- and `env push` now ships evaluations.py, so it would travel."""
+    # the arithmetic starter scorer calls the neighboring environment's reward with its own
+    # example, so adding it on a rerun makes an unrelated custom environment fail or score nonsense.
     monkeypatch.chdir(tmp_path)
-    custom = tmp_path / "environment.py"
-    custom.write_text("# my own environment\n")
+    (tmp_path / "environment.py").write_text("def load_environment(): return object()\n")
 
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
-    assert custom.read_text() == "# my own environment\n"
     assert not (tmp_path / "evaluations.py").exists()
-    # the rest of the scaffold still lands: this is about the suite, not about refusing to run
+    assert "evaluations.py" not in capsys.readouterr().out
+    # the rest of the scaffold still lands: this is about the suite, not about refusing to run.
     assert (tmp_path / "configs/rl.toml").is_file()
 
 
@@ -1222,9 +1271,11 @@ def test_env_setup_multi_turn_flag_scaffolds_multiturn(monkeypatch, tmp_path) ->
 
 
 def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_path) -> None:
-    # the multi-turn scaffold ships the same evaluations.py, and its starter scorer delegates to
-    # the environment. asserting the file exists would not catch a sidecar that raises on every
-    # case, which reads as the model failing rather than as a broken template.
+    # the multi-turn scaffold ships its own evaluations.py, and `env eval` sends one prompt and
+    # grades one reply. so the starter grades the FIRST action's format rather than delegating to
+    # the environment, which with no episode state would score an empty transcript. asserting the
+    # file exists would not catch a sidecar that raises on every case, which reads as the model
+    # failing rather than as a broken template.
     monkeypatch.chdir(tmp_path)
     assert (
         _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
@@ -1239,10 +1290,16 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     suite = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0]
     case = suite.cases()[0]
 
-    scored = suite.score(case, str(case.expected))
+    # a reply `step_episode` can read: a single in-range integer scores full marks.
+    passing = suite.score(case, "50")
+    assert passing.passed is True
+    assert passing.score == 1.0
 
-    # the multi-turn starter grades numerically, so the gold answer scores full marks.
-    assert scored == 1.0
+    # and one it cannot is graded, not raised: the template reports why rather than erroring out.
+    failing = suite.score(case, "somewhere in the middle")
+    assert failing.passed is False
+    assert failing.score == 0.0
+    assert "single integer" in failing.reason
 
 
 def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp_path) -> None:
