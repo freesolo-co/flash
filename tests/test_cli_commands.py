@@ -1307,6 +1307,38 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     assert "single integer" in failing.reason
 
 
+def test_env_setup_multi_turn_eval_case_does_not_duplicate_the_episode_prompt(
+    monkeypatch, tmp_path
+) -> None:
+    # `env eval` builds the request through environment.prompt_messages(), so the scaffolded
+    # case's `input` is a dataset row, not a finished prompt. spelling the reply-instructions
+    # block into the case as well sent it twice and evaluated a prompt training never used,
+    # defeating the fix that made eval match training in the first place (cursor).
+    monkeypatch.chdir(tmp_path)
+    assert (
+        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
+        == 0
+    )
+
+    from flash.envs.evaluations import load_evaluation_suites
+    from flash.envs.loader import load_freesolo_environment
+
+    environment = load_freesolo_environment(str(tmp_path / "environment.py"))
+    case = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0].cases()[
+        0
+    ]
+    prompt = "\n".join(
+        str(message.get("content") or "")
+        for message in environment.prompt_messages({"input": case.input})
+    )
+
+    # the instructions reach the model exactly once, and they come from the environment.
+    assert prompt.count("Reply with a single integer per turn") == 1
+    assert "Reply with a single integer per turn" not in case.input
+    # and the case still carries the part of the prompt only the dataset row knows.
+    assert "secret whole number between 1 and 100" in case.input
+
+
 def test_starter_evaluator_fails_a_near_miss_the_environment_rejects(monkeypatch, tmp_path) -> None:
     """A shaped reward's partial credit is not a pass.
 
