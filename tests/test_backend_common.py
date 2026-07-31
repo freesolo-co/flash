@@ -170,7 +170,8 @@ def _record_run(calls, *, keep_check: bool = False):
     def fake_run(command, check):
         calls.append((command, check) if keep_check else command)
         if command[:2] == ["uv", "venv"]:
-            os.makedirs(os.path.join(command[2], "bin"), exist_ok=True)
+            # the venv path is `uv venv`'s trailing positional, wherever the flags before it end.
+            os.makedirs(os.path.join(command[-1], "bin"), exist_ok=True)
 
     return fake_run
 
@@ -183,7 +184,11 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     python_bin = vc.resolve_verl_python(str(tmp_path))
 
     assert python_bin.endswith("/verl-venv/bin/python")
-    assert calls[0][:2] == ["uv", "venv"]
+    # the interpreter is NAMED, not inherited: FLASH_ATTN_SPEC is a cp312-only wheel and flash
+    # supports 3.11, so a bare `uv venv` on a 3.11 host builds an interpreter that required install
+    # cannot enter -- killing the run during provisioning (codex[bot]).
+    assert calls[0][:4] == ["uv", "venv", "--python", "3.12"]
+    assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
         "verl @ git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
@@ -196,10 +201,13 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "xgrammar==0.1.25" in install
     assert "tqdm" in install
     assert "pyarrow" in install
-    assert len(calls) == 2
+    # venv, the resolve above, then the prebuilt flash_attn wheel on its own --no-build-isolation
+    # line. nothing else: a fourth call would be an unbudgeted install on a paid pod.
+    assert len(calls) == 3
+    assert calls[2][:3] == ["uv", "pip", "install"]
     # the stamp is written only after a successful install, so a crashed install is never reused.
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
-    assert stamp.read_text() == vc.VERL_REQUIREMENT
+    assert stamp.read_text() == vc.VERL_VENV_STAMP
 
 
 def test_the_fallback_install_overrides_the_three_ceilings_it_violates(monkeypatch, tmp_path):
@@ -250,26 +258,81 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
     assert "TransferQueue==0.1.7" in install
 
 
-def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_path):
-    # the stamp gates rebuilds. if it recorded the extra-bearing spec while VERL_REQUIREMENT stayed
-    # bare, every later call would see a mismatch and rebuild the venv from scratch on a paid pod.
+def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatch, tmp_path):
+    # all three backends hard-enable remove-padding (sft_train.py:164, rl_train.py:339,
+    # opd_train.py:1505) and verl's cuda remove-padding path imports flash_attn.bert_padding
+    # UNGUARDED (verl/utils/attention_utils.py:30, torch_functional.py:627). there is no sdpa
+    # fallback on that path, so a venv without the wheel dies at the first training batch on a paid
+    # gpu. Dockerfile.worker:288-297 already treats it as REQUIRED in /opt/verl-venv; this fallback
+    # provisions the same interpreter and must carry the same wheel.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
     monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
 
     vc.resolve_verl_python(str(tmp_path))
-    assert (tmp_path / "verl-venv" / "flash-verl-requirement").read_text() == vc.VERL_REQUIREMENT
+
+    flat = [arg for command in calls for arg in command]
+    assert vc.FLASH_ATTN_SPEC in flat, (
+        "verl's remove-padding path imports flash_attn unguarded; the provisioned venv must hold it"
+    )
+    # the wheel is prebuilt, so it must skip build isolation exactly as the image install does --
+    # a source build here would compile for minutes on a paid pod.
+    install = next(c for c in calls if vc.FLASH_ATTN_SPEC in c)
+    assert "--no-build-isolation" in install
+
+
+def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
+    # the fallback venv and /opt/verl-venv must resolve the same wheel: a run that lands on the
+    # no-image path otherwise trains against a different flash_attn than every baked-image run.
+    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+    assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in dockerfile.read_text(), (
+        "Dockerfile.worker's FLASH_ATTN_SPEC default drifted from backend_common.FLASH_ATTN_SPEC"
+    )
+
+
+def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_path):
+    # the stamp gates rebuilds. if it recorded the extra-bearing spec while the pin stayed bare,
+    # every later call would see a mismatch and rebuild the venv from scratch on a paid pod.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+    written = (tmp_path / "verl-venv" / "flash-verl-requirement").read_text()
+    assert written == vc.VERL_VENV_STAMP
+    assert "[vllm]" not in written
+    built = len(calls)
 
     (tmp_path / "verl-venv" / "bin" / "python").write_text("")
     vc.resolve_verl_python(str(tmp_path))
-    assert len(calls) == 2, "a venv built from the current pin must not be rebuilt"
+    assert len(calls) == built, "a venv built from the current pin must not be rebuilt"
+
+
+def test_the_stamp_identifies_flash_attn_so_a_prefix_venv_is_not_reused(monkeypatch, tmp_path):
+    """A workdir provisioned before flash-attn was installed must REBUILD, not be reused.
+
+    The stamp is the whole reuse gate, and flash-attn is installed separately from verl. A stamp
+    naming only the verl pin is byte-identical before and after this fix, so a retry landing on a
+    pod whose venv predates it would skip the install entirely and hand back an interpreter with no
+    flash-attn -- the exact failure this path exists to prevent (codex[bot]).
+    """
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    # exactly what the pre-fix release wrote: the bare verl pin, nothing about the wheel.
+    _fake_verl_venv(tmp_path, stamp=vc.VERL_REQUIREMENT)
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    assert calls, "a venv stamped before flash-attn was installed must be rebuilt"
+    assert any(vc.FLASH_ATTN_SPEC in call for call in calls)
 
 
 def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatch, tmp_path):
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
     monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
-    _fake_verl_venv(tmp_path, stamp=vc.VERL_REQUIREMENT)
+    _fake_verl_venv(tmp_path, stamp=vc.VERL_VENV_STAMP)
 
     vc.resolve_verl_python(str(tmp_path))
 
@@ -293,7 +356,7 @@ def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
 
     vc.resolve_verl_python(str(tmp_path))
 
-    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"]]
+    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"]]
     assert not (venv / "marker").exists()
 
 
@@ -311,7 +374,7 @@ def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkey
     vc.resolve_verl_python(str(tmp_path))
 
     assert not (venv / "pyvenv.cfg").exists()
-    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"]]
+    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"]]
 
 
 def test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork():
@@ -347,7 +410,9 @@ def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypat
     vc.resolve_verl_python(str(tmp_path), install_wandb=True)
 
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1][0])
-    assert calls[2] == (
+    # wandb is the LAST call: it follows the flash_attn wheel install, and unlike every install
+    # before it, it is best-effort (check=False) so a wandb outage cannot fail a training run.
+    assert calls[3] == (
         ["uv", "pip", "install", "--python", str(tmp_path / "verl-venv/bin/python"), "wandb"],
         False,
     )
@@ -1566,6 +1631,7 @@ def test_the_grpo_success_path_drains_stragglers_too():
         "the grpo teardown collects stragglers only when the run FAILS"
     )
 
+
 def _flashinfer_probe(monkeypatch, *, flashinfer_ok=True):
     """stub the one remaining subprocess probe: `import flashinfer`."""
     calls = []
@@ -1698,3 +1764,284 @@ def test_the_flashinfer_probe_runs_against_the_verl_interpreter(monkeypatch):
     vc.resolve_blackwell_attention_backends("/verl/bin/python", (12, 0))
     assert len(calls) == 1
     assert calls[0][0] == "/verl/bin/python"
+
+
+def _ray_session(root, name, *, files, mtime=None):
+    """build a ray session dir the way ray lays one out: session_<ts>_<pid>/logs/<file>."""
+    logs = root / name / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    for filename, body in files.items():
+        (logs / filename).write_text(body)
+    if mtime is not None:
+        os.utime(root / name, (mtime, mtime))
+    return root / name
+
+
+def test_ray_failure_logs_are_collected_so_a_dead_raylet_leaves_evidence(tmp_path):
+    # a raylet death prints only the driver's downstream symptom ("Failed to register worker to
+    # Raylet: ... End of file"). the reason lives in ray's own session logs, which die with the pod.
+    # without this, every raylet failure costs a paid gpu run per guess (VERL-115).
+    root = tmp_path / "ray"
+    _ray_session(
+        root,
+        "session_2026-07-31_19-19-30_1_1",
+        files={
+            "raylet.err": "worker_pool.cc:600: Some workers have not registered within the timeout",
+            "gcs_server.out": "gcs alive",
+            "dashboard_agent.log": "agent failed to start",
+        },
+    )
+
+    body = vc.collect_ray_failure_logs(root=str(root))
+
+    assert "have not registered within the timeout" in body
+    assert "agent failed to start" in body
+    # each section is labelled: six candidate files land in ONE artifact, so an unlabelled
+    # concatenation would leave a reader unable to tell which daemon produced which lines.
+    for name in ("raylet.err", "gcs_server.out", "dashboard_agent.log"):
+        assert f"===== {name}" in body
+    # absent files are simply absent -- not an empty section implying the daemon logged nothing.
+    assert "raylet.out" not in body
+
+
+def test_ray_log_collection_picks_the_newest_session_not_a_stale_one(tmp_path):
+    # a reused worker accumulates session dirs. collecting an older one would report a PREVIOUS
+    # run's raylet as this run's cause -- worse than collecting nothing, because it reads as evidence.
+    root = tmp_path / "ray"
+    _ray_session(root, "session_old", files={"raylet.err": "STALE"}, mtime=1_000_000)
+    _ray_session(root, "session_new", files={"raylet.err": "CURRENT"}, mtime=2_000_000)
+
+    body = vc.collect_ray_failure_logs(root=str(root))
+
+    assert "CURRENT" in body
+    assert "STALE" not in body
+
+
+def test_ray_log_collection_keeps_the_tail_because_the_crash_is_at_the_end(tmp_path):
+    # raylet.out on a 128-core box is large and the reason it died is the LAST thing in it. taking
+    # the head would upload megabytes of startup chatter and drop the only line that matters.
+    root = tmp_path / "ray"
+    body = ("filler\n" * 20000) + "FATAL: the actual cause\n"
+    _ray_session(root, "session_1", files={"raylet.out": body})
+
+    collected = vc.collect_ray_failure_logs(root=str(root), tail_bytes=2048)
+
+    assert "FATAL: the actual cause" in collected
+    # the per-file bound still holds after the header is added.
+    assert len(collected) <= 2048 + 100
+
+
+def test_ray_logs_are_redacted_because_they_are_third_party_text(tmp_path):
+    # ray logs a raylet's argv and flash passes credentials to the worker through the environment,
+    # so this content has never been through flash's redactor -- unlike the traceback beside it,
+    # which main() sanitizes before upload. an unsanitized path here would publish a live token to
+    # the run's HF artifacts.
+    root = tmp_path / "ray"
+    _ray_session(
+        root,
+        "session_1",
+        files={
+            "raylet.err": "started with --token=hunter2seekrit and Authorization: Bearer abc.def"
+        },
+    )
+
+    body = vc.collect_ray_failure_logs(root=str(root))
+
+    assert "hunter2seekrit" not in body
+    assert "abc.def" not in body
+    assert "<redacted>" in body
+    # redaction must not eat the diagnostic context around the secret.
+    assert "started with" in body
+
+
+def test_ray_log_collection_survives_a_tail_that_splits_a_codepoint(tmp_path):
+    # seeking to a byte offset lands wherever it lands. a strict decode would raise on a split
+    # multibyte character and lose the whole file for a cosmetic reason, on the one path whose
+    # entire purpose is preserving evidence.
+    root = tmp_path / "ray"
+    logs = root / "session_1" / "logs"
+    logs.mkdir(parents=True)
+    # the seek offset must land INSIDE the multibyte character, or this test passes under a strict
+    # decode and proves nothing. 47 bytes total with the 3-byte codepoint at [30:33), so a 16-byte
+    # tail seeks to 31 -- one byte into it.
+    raw = b"x" * 30 + "中".encode() + b"\nFATAL: cause\n"
+    (logs / "raylet.err").write_bytes(raw)
+    assert 30 < len(raw) - 16 < 33, "tail offset must split the codepoint or this test cannot fail"
+
+    body = vc.collect_ray_failure_logs(root=str(root), tail_bytes=16)
+
+    assert "FATAL: cause" in body
+
+
+def test_ray_log_collection_cannot_mask_the_real_error_it_runs_after(tmp_path):
+    # this runs on an ALREADY-failing path. if a missing/unreadable ray dir could raise here, the
+    # collector would replace the run's real traceback with its own and make things strictly worse.
+    assert vc.collect_ray_failure_logs(root=str(tmp_path / "nonexistent")) == ""
+    assert vc.latest_ray_session_dir(str(tmp_path / "nonexistent")) is None
+
+
+def test_a_session_predating_this_run_is_rejected_not_reported_as_its_evidence(tmp_path):
+    """A run that dies BEFORE ray starts must report nothing, not the previous attempt's session.
+
+    /tmp survives a retry on a reused pod, so a failure during dependency provisioning or model
+    download still finds an earlier run's session under /tmp/ray. Uploading it under this attempt's
+    artifact prefix is worse than uploading nothing: it reads as a raylet death that never happened
+    and sends the next diagnosis after a cause belonging to a different run (codex[bot], cursor).
+    """
+    root = tmp_path / "ray"
+    _ray_session(root, "session_prev", files={"raylet.err": "PREVIOUS RUN"}, mtime=1_000_000)
+    started = 1_500_000.0
+
+    assert vc.latest_ray_session_dir(str(root), started_after=started) is None
+    assert vc.collect_ray_failure_logs(root=str(root), started_after=started) == ""
+    # and the same call without a start time still sees it, so the filter is what rejected it.
+    assert "PREVIOUS RUN" in vc.collect_ray_failure_logs(root=str(root))
+
+
+def test_a_session_live_during_this_run_is_kept_even_if_it_started_earlier(tmp_path):
+    # the guard must not throw away real evidence: ray keeps writing its session dir for as long as
+    # it runs, so mtime (not the name's timestamp) is what says whether it was live during this run.
+    root = tmp_path / "ray"
+    _ray_session(root, "session_old_name", files={"raylet.err": "CURRENT CAUSE"}, mtime=2_000_000)
+
+    body = vc.collect_ray_failure_logs(root=str(root), started_after=1_500_000.0)
+
+    assert "CURRENT CAUSE" in body
+
+
+def test_a_secret_split_by_the_tail_boundary_is_not_uploaded_in_part(tmp_path):
+    """Truncating first can leave the REST of a live credential unredacted.
+
+    sanitize_diagnostic matches a secret by its ``key=`` prefix or by full value. A tail boundary
+    landing inside a token strips the prefix and the value's head, so no pattern matches and the
+    remainder uploads in clear. Dropping the partial first line makes that impossible, because a
+    secret cannot span a newline (codex[bot]).
+    """
+    root = tmp_path / "ray"
+    secret = "ghp_" + "z" * 60
+    body = f"--token={secret}\nraylet died: worker registration timeout\n"
+    _ray_session(root, "session_1", files={"raylet.err": body})
+    # land the boundary INSIDE the token, or this test passes without the fix and proves nothing.
+    tail = len("z" * 40) + len("\nraylet died: worker registration timeout\n")
+    assert body[-tail] in "z", "tail must begin inside the secret or this test cannot fail"
+
+    collected = vc.collect_ray_failure_logs(root=str(root), tail_bytes=tail)
+
+    assert "z" * 40 not in collected, "a partial credential reached the artifact"
+    assert "raylet died: worker registration timeout" in collected
+
+
+def test_a_multiline_secret_cut_by_the_boundary_is_redacted_past_the_first_line(
+    monkeypatch, tmp_path
+):
+    """Dropping the partial first line does NOT contain a multiline secret.
+
+    ``environment.secrets`` values are arbitrary strings, so a PEM key or JSON credential is legal.
+    When the tail begins inside such a value's first line, that line is dropped -- but every
+    LATER line of the same secret is whole, lands after the cut, and no longer matches the
+    whole-value replace, so it uploads verbatim. Redaction must therefore know a secret's
+    individual lines (codex[bot]).
+    """
+    root = tmp_path / "ray"
+    body_lines = ["MIIEowIBAAKCAQEAx" + "Q" * 40, "kJ9vTinRUME7Fw3n" + "R" * 40]
+    secret = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(body_lines) + "\n-----END PRIVATE KEY-----"
+    monkeypatch.setenv("CUSTOMER_API_KEY", secret)
+
+    log = f"--key={secret}\nraylet died: worker registration timeout\n"
+    _ray_session(root, "session_1", files={"raylet.err": log})
+    # begin the tail inside the FIRST line of the secret, leaving its later lines intact.
+    tail = len(log) - log.index("BEGIN") - 2
+    assert "-----BEGIN PRIVATE KEY-----" not in log[-tail:], "boundary must split the first line"
+    assert body_lines[0] in log[-tail:], (
+        "later secret lines must survive the cut, or nothing is proven"
+    )
+
+    collected = vc.collect_ray_failure_logs(root=str(root), tail_bytes=tail)
+
+    for line in body_lines:
+        assert line not in collected, "a live private key line reached the artifact"
+    assert "raylet died: worker registration timeout" in collected
+
+
+def test_redacting_secret_lines_does_not_strip_ordinary_log_punctuation(monkeypatch, tmp_path):
+    """The line-wise needles must not be short enough to gut the diagnostic.
+
+    A JSON credential ends in lines like ``}`` that every innocent log also contains. Registering
+    those as needles would redact unrelated text and destroy the evidence this collector exists to
+    produce, so short components are excluded.
+    """
+    root = tmp_path / "ray"
+    monkeypatch.setenv("CUSTOMER_API_KEY", '{\n  "private_key": "' + "k" * 40 + '"\n}')
+    _ray_session(root, "session_1", files={"raylet.err": "raylet died: cfg {\n}\nexit code 1\n"})
+
+    collected = vc.collect_ray_failure_logs(root=str(root), tail_bytes=4096)
+
+    assert "raylet died: cfg {" in collected, "an ordinary brace line was redacted as a secret"
+    assert "exit code 1" in collected
+
+
+def test_a_read_is_capped_even_when_ray_is_still_writing(monkeypatch, tmp_path):
+    # ray writes while the worker is failing. sizing the file and THEN reading to EOF consumes
+    # everything appended in between -- unbounded, on a dying pod with a bounded upload deadline.
+    root = tmp_path / "ray"
+    logs = root / "session_1" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    target = logs / "raylet.err"
+    target.write_text("x" * 4096)
+    real_open = open
+
+    read_sizes: list[int] = []
+
+    class _GrowingFile:
+        """a handle that appends 1 MiB the moment the file is OPENED, like a concurrent writer.
+
+        Growing at open (not at seek) is what makes this able to fail: a size-then-read
+        implementation calls os.path.getsize BEFORE opening, so a fixture that grows any later
+        would hand it a stale-but-consistent size and the unbounded read would never show.
+        """
+
+        def __init__(self, path):
+            with real_open(target, "ab") as sink:
+                sink.write(b"y" * (1024 * 1024))
+            self._handle = real_open(path, "rb")
+
+        def read(self, *args):
+            payload = self._handle.read(*args)
+            read_sizes.append(len(payload))
+            return payload
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._handle.close()
+            return False
+
+    # patch the name the module under test resolves, NOT builtins: a global open() replacement
+    # leaks into every later test in the session through pytest's own file handling.
+    monkeypatch.setattr(
+        vc,
+        "open",
+        lambda path, *a, **k: (
+            _GrowingFile(path) if str(path) == str(target) else real_open(path, *a, **k)
+        ),
+        raising=False,
+    )
+
+    vc.collect_ray_failure_logs(root=str(root), tail_bytes=1024)
+
+    # assert on what was READ, not on the returned string: sanitize_diagnostic(limit=tail_bytes)
+    # clamps the result either way, so the returned length hides an unbounded read entirely. the
+    # cost this fix exists to avoid is the allocation on a dying pod, which only the read shows.
+    assert read_sizes, "the log was never read"
+    assert max(read_sizes) <= 1024, f"read exceeded the declared bound: {max(read_sizes)} bytes"
+
+
+def test_a_session_without_a_logs_dir_yields_nothing_rather_than_raising(tmp_path):
+    # ray can die before it creates the logs subdir. this runs on an ALREADY-failing path, so a
+    # raise here would replace the run's real error with this collector's own.
+    (tmp_path / "ray" / "session_1").mkdir(parents=True)
+    assert vc.collect_ray_failure_logs(root=str(tmp_path / "ray")) == ""
