@@ -6,6 +6,7 @@ import ast
 import asyncio
 import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -1147,6 +1148,66 @@ def test_score_single_turn_env_error_is_zero():
         prompt_opened_thinking=False, think_penalty=0.0,
     )
     assert s == 0.0
+
+
+class _UnscorableRewardEnv:
+    def reward(self, graded, ex, state):
+        return float("nan")
+
+
+class _UnscorableBreakdownEnv:
+    def scores_breakdown(self, graded, ex, state):
+        return {"total": float("nan"), "judge": 1.0}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+@pytest.mark.parametrize(
+    "env", [_UnscorableRewardEnv(), _UnscorableBreakdownEnv()], ids=["reward", "scores_breakdown"]
+)
+def test_an_unscorable_reward_is_masked_before_it_reaches_verl(env):
+    """A non-finite reward must not be forwarded, from EITHER env hook.
+
+    verl's grpo baseline is a plain torch.mean/torch.std over the group (core_algos.py:320-326)
+    with no nan-aware variant on its path, so one nan row makes the mean, the std, and all
+    `group_size` advantages nan -- the whole group, not just the unscorable row. The retired trl
+    path could forward it because it masked nan rows out of the baseline and zeroed their
+    advantage (grpo_trainer.py:2171, :2222); nothing downstream of here does that now (codex[bot]).
+    """
+    breakdowns: list[dict[str, float] | None] = []
+    s = rl_verl.score_single_turn(
+        env, "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert s == 0.0
+    assert math.isfinite(s)
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_an_infinite_reward_is_masked_too_even_with_a_penalty_applied():
+    # inf, not just nan: nan is score_rollouts' canonical unscorable marker, but an env returning
+    # inf poisons verl's baseline exactly as thoroughly and is not covered by testing nan alone.
+    # the penalty is live here because that arithmetic runs between the env's return and the mask;
+    # inf minus a finite penalty is still inf, so the mask is what has to catch it.
+    class _InfEnv:
+        def reward(self, graded, ex, state):
+            return float("inf")
+
+    s = rl_verl.score_single_turn(
+        _InfEnv(), "x", {"gt": "1"}, tok=object(), thinking=True,
+        prompt_opened_thinking=True, think_penalty=0.1,
+    )
+    assert s == 0.0
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_an_unscorable_reward_still_re_raises_for_the_latency_profiler():
+    # same contract as a raising env: the profiler must tell a real 0.0 apart from a grader that
+    # is not returning a usable number, or it reports a broken grader as fast and confident.
+    with pytest.raises(ValueError, match="non-finite"):
+        rl_verl.score_single_turn(
+            _UnscorableRewardEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+            prompt_opened_thinking=False, think_penalty=0.0, raise_on_error=True,
+        )
 
 
 class _RaisingProbeEnv:
