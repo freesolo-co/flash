@@ -53,7 +53,9 @@ def live_candidate_rates(
         max_wall_seconds=max_wall_seconds,
         gpu_type=gpu_type,
     ):
-        rates.setdefault(offer.gpu, offer.dph_total)  # price-sorted, first seen per class is cheapest
+        rates.setdefault(
+            offer.gpu, offer.dph_total
+        )  # price-sorted, first seen per class is cheapest
     return rates
 
 

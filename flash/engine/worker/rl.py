@@ -77,6 +77,7 @@ def _patch_colocate_rollout_compilation(cc: tuple[int, int]) -> dict | None:
     _w.patch_trl_colocate_llm_kwargs(**kwargs)
     return kwargs
 
+
 def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
     totals: dict[str, float] = {}
     denominator = len(breakdowns)
@@ -476,12 +477,7 @@ def run_rl():
                 breakdowns.append(None)
                 r = 0.0
                 scoring_failed = True
-            if (
-                not scored_as_episode
-                and not scoring_failed
-                and _think_penalty > 0
-                and _w.THINKING
-            ):
+            if not scored_as_episode and not scoring_failed and _think_penalty > 0 and _w.THINKING:
                 # Gated on _prompt_opens_thinking so a template that ignores enable_thinking
                 # doesn't get its tagless answers counted as reasoning.
                 r -= _think_penalty * _w.think_token_count(
@@ -503,7 +499,11 @@ def run_rl():
 
     from flash.engine.vram import resolve_params_b
 
-    _params_b = resolve_params_b(model_id, revision=model_revision) if model_revision else resolve_params_b(model_id)
+    _params_b = (
+        resolve_params_b(model_id, revision=model_revision)
+        if model_revision
+        else resolve_params_b(model_id)
+    )
     from flash.catalog import vocab_size_for
 
     # Multi-turn accumulates a full transcript up to the engine context, so size the fp32 logits
@@ -806,9 +806,7 @@ def run_rl():
     # vLLM loads Qwen3_5ForConditionalGeneration and its own hf_to_vllm_mapper maps the trainer's
     # ``model.language_model.*`` weight-sync names, so no flash-side remap is needed.
     hb_cb = _w.make_reward_heartbeat_callback(
-        lambda: _latest_named_reward_metrics(
-            pending_named_breakdowns, latest_named_metrics
-        ),
+        lambda: _latest_named_reward_metrics(pending_named_breakdowns, latest_named_metrics),
         lambda: list(latest_samples),
     )
     trainer_callbacks = [

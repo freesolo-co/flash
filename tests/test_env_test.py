@@ -758,9 +758,7 @@ def test_a_malformed_param_key_spelling_is_rejected(monkeypatch, tmp_path, capsy
 
 
 @pytest.mark.parametrize("value", ["bad key=1", "a/b=1", "a@b=1", "k(x)=1", "café=1", "a😀b=1"])
-def test_env_test_param_keys_a_quoted_config_key_can_carry_still_load(
-    monkeypatch, tmp_path, value
-):
+def test_env_test_param_keys_a_quoted_config_key_can_carry_still_load(monkeypatch, tmp_path, value):
     # these are not BARE keys, but that is not the question -- a QUOTED key carries every one of
     # them and the schema loader reads it, so `"bad key" = 1` and `"café" = 1` are configs a run
     # really can receive. rejecting them blocked validating a working config while the error

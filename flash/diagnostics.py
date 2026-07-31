@@ -20,8 +20,7 @@ def _configured_secrets() -> tuple[str, ...]:
     for key, value in os.environ.items():
         upper = key.upper()
         if not value or not (
-            upper in {"AUTHORIZATION", "HF_TOKEN"}
-            or upper.endswith(_SECRET_ENV_SUFFIXES)
+            upper in {"AUTHORIZATION", "HF_TOKEN"} or upper.endswith(_SECRET_ENV_SUFFIXES)
         ):
             continue
         values.add(value)

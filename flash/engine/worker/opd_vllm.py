@@ -201,9 +201,7 @@ def opd_vllm_kwargs(
             )
             sizing_params_b = float(params_b or 1.0)
             resolved_lora_rank = (
-                _sizing_lora_rank(knobs)
-                if lora_rank is None
-                else max(1, int(lora_rank))
+                _sizing_lora_rank(knobs) if lora_rank is None else max(1, int(lora_rank))
             )
             resolved_prompts_per_step = (
                 getattr(knobs, "prompts_per_step", 1)
@@ -244,9 +242,7 @@ def opd_vllm_kwargs(
                     vocab=vocab_size_for(model_id),
                     active_params_b=active_b,
                 )
-                post_init_reserve_gb = opd_post_init_reserve_gb(
-                    sizing_params_b, resolved_lora_rank
-                )
+                post_init_reserve_gb = opd_post_init_reserve_gb(sizing_params_b, resolved_lora_rank)
                 allocator_margin_gb = opd_allocator_margin_gb(card_gb)
                 protected_gb = training_reserve_gb + post_init_reserve_gb + allocator_margin_gb
                 rollout_budget_gb = max(0.0, free_gb - protected_gb)
@@ -545,9 +541,7 @@ class OpdVllmRolloutEngine:
 
         adapter_dir = os.path.join(self.adapter_root, f"adapter-{next_version:06d}")
         try:
-            lora_request = self._LoRARequest(
-                f"opd-step-{next_version}", next_version, adapter_dir
-            )
+            lora_request = self._LoRARequest(f"opd-step-{next_version}", next_version, adapter_dir)
             if os.path.lexists(adapter_dir):
                 if os.path.isdir(adapter_dir) and not os.path.islink(adapter_dir):
                     shutil.rmtree(adapter_dir)
@@ -652,7 +646,10 @@ class OpdVllmRolloutEngine:
                 else None
             )
             suppressed_chunk = (
-                [int(self.image_pad_token_id) if data is not None else None for data in multimodal_chunk]
+                [
+                    int(self.image_pad_token_id) if data is not None else None
+                    for data in multimodal_chunk
+                ]
                 if multimodal_chunk is not None and self.image_pad_token_id is not None
                 else None
             )
