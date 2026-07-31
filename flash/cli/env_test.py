@@ -39,6 +39,11 @@ _SYNTHETIC_CONTROL_ALPHABET = "zqxjkvwy0123456789bcdfghlmnprstu"
 _SYNTHETIC_CONTROL_WIDTH = 64
 # enough fallbacks for the unanimity test below to be reachable; matches the fixed candidate count.
 _SYNTHETIC_CONTROL_COUNT = 3
+# the group a controlled episode presents to a listwise scorer: the gold replay plus at least one
+# and at most _SYNTHETIC_CONTROL_COUNT controls. named so the verdict can say how far it sits from
+# the run's own group_size.
+_GROUP_MIN = 2
+_GROUP_MAX = 1 + _SYNTHETIC_CONTROL_COUNT
 # the assistant fields that carry a structured call the text-only driver cannot replay. both names
 # are live in the openai schema -- `function_call` is the older shape of the same payload -- and a
 # turn holding either reaches the grader stripped of it. see _turn_is_representable.
@@ -645,7 +650,15 @@ def _drive_single_turn(
     reference_turns, record["partial_replay"], reference_messages = _reference_turns(
         env, example, thinking=thinking
     )
-    policy = _resolve_policy(reference_turns)
+    # on the native path a gold is present when it has assistant MESSAGES, not assistant text. a
+    # trajectory that is nothing but tool calls carries no text at all, so the text-only question
+    # answers "echo" for a gold that is entirely real -- and the grader would then be handed a
+    # one-line stub instead of the trajectory, scoring something the run never produces. text is
+    # still the right question everywhere else, where the replay IS text (cursor).
+    assistant_messages = [m for m in reference_messages if m["role"].strip().lower() == "assistant"]
+    policy = (
+        ("replay" if assistant_messages else "echo") if native else _resolve_policy(reference_turns)
+    )
     record["policy"] = policy
     response = (
         "\n".join(turn for turn in reference_turns if turn)
@@ -669,7 +682,10 @@ def _drive_single_turn(
     # what the single-turn scorer actually grades, which is the one text a control must be wrong
     # against. the earlier assistant turns are already excluded from the gate via partial_replay.
     record["reference_turns"] = [response] if policy == "replay" else []
-    record["turns"] = 1
+    # the assistant turns this episode actually stands for. one everywhere the scorer grades a
+    # single reply, but a native tool trajectory is graded whole, so reporting 1 for a two-call gold
+    # understated what was replayed. display only -- no gate reads this.
+    record["turns"] = len(assistant_messages) if native and policy == "replay" else 1
     if native:
         # the gold trajectory verbatim: tool calls, tool results and all, which is what trl's tool
         # loop produces and hands the grader. an echo run has no trajectory, so it is the one reply.
@@ -726,19 +742,29 @@ def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], lis
     # non-termination guard is needed.
     hard_cap = int(env.max_turns)
     responses: list[str] = []
+    # the transcript handed to env_reply is built here rather than read back out of the state, which
+    # is what the production driver does (flash/engine/multiturn_rollout.py:175-210): it opens with
+    # the same prompt and grows by one assistant message per turn and each reply. reading
+    # `state["messages"]` instead assumed the env mirrors the conversation there -- an env keeping
+    # its opening under `prompt` alone raised KeyError, and one using `messages` for completion-only
+    # state was handed a promptless transcript, so it either failed here or was graded on
+    # observations the run would never show it (codex[bot]).
+    messages = [dict(m) for m in prompt]
     while True:
         content = turn_content(len(responses))
         responses.append(content)
         env.record_model_turn(state, content)
+        messages.append({"role": "assistant", "content": content})
         if len(responses) >= hard_cap or env.rollout_done(state, max_turns=hard_cap):
             break
-        env_msgs = env.env_reply(state["messages"], state)
+        env_msgs = env.env_reply(messages, state)
         if not env_msgs:
             break
         # the env's own reply messages feed the chat template for the next turn in the real
         # rollout, so validate their envelope here too: a malformed reply that would break
         # remotely must fail the episode instead of slipping through on a finite reward.
         _check_messages(env_msgs, "env_reply")
+        messages.extend(env_msgs)
         if env.rollout_done(state, max_turns=hard_cap):
             break
     return state, responses, prompt, seeded
@@ -894,11 +920,20 @@ def _grade_single_turn(env, completion: str, example: dict, *, thinking: bool = 
     reaches trl, which aborts the run. Mirroring only the first would let an exact-match grader
     returning 1.0 for gold and an accidental string for everything else pass this command and then
     break the first sampled completion (codex[bot]).
+
+    A RAISE from either env call is scored 0.0, because ``reward_fn`` wraps both in one guard
+    (``rl.py:456-471``) and the run carries on with a real number. Letting it escape aborted the
+    episode here while production would have compared a perfectly separating group: gold raises and
+    scores 0, controls score below it, and the env is working (codex[bot]). ``SystemExit`` is not an
+    ``Exception`` and still propagates, matching that same guard.
     """
     graded, state = _scoring_inputs(completion, thinking=thinking)
-    if hasattr(env, "scores_breakdown"):
-        return float(env.scores_breakdown(graded, example, state).get("total", 0.0))
-    reward = env.reward(graded, example, state)
+    try:
+        if hasattr(env, "scores_breakdown"):
+            return float(env.scores_breakdown(graded, example, state).get("total", 0.0))
+        reward = env.reward(graded, example, state)
+    except Exception:
+        return 0.0
     try:
         # not an isinstance test: a numpy scalar or a Decimal is not a float and converts fine, and
         # trl takes it. what matters is whether the value the worker forwards IS a number.
@@ -1012,6 +1047,33 @@ def _grade_native_tool_completion(env, completion_msgs: list[dict], example: dic
             f"reward_from_messages() returned {type(reward).__name__} ({reward!r}), which is "
             "not a number; the worker forwards this value to trl uncoerced and the run aborts"
         ) from exc
+
+
+def _scores_listwise(env) -> bool:
+    """Whether this env's rollout scorer can see the other candidates in the batch.
+
+    ``score_rollouts`` calls the env's own ``rollout_rewards_many`` when it has one and falls back
+    to ``BaseEnvironment.rollout_rewards_many`` otherwise (flash/engine/multiturn_reward_scoring.py).
+    That fallback scores each item on its own -- one ``reward("", example, state)`` per rollout, in
+    input order -- so no property of the batch it sits in can reach the number, whatever its shape.
+
+    An env that REPLACES it can rank candidates against each other, and this command cannot show it
+    the batch its run would submit. Production groups ``group_size`` completions per prompt
+    (``num_generations = group_size``, default 8: flash/engine/recipe.py:133,
+    flash/engine/worker/rl.py:199,567); here each prompt carries the gold replay plus however many
+    fixed or synthetic controls were provably wrong for it, which is two to four. An env grouping by
+    example -- the only grouping its arguments expose -- therefore sees a smaller group here, and a
+    scorer computing a group-size-dependent rank can answer differently for that reason alone
+    (codex[bot]). See the verdict below for what that costs.
+    """
+    from flash.envs.base import BaseEnvironment
+
+    scorer = getattr(env, "rollout_rewards_many", None)
+    if not callable(scorer):
+        return False
+    # the resolved implementation, not merely the attribute's presence: a BaseEnvironment subclass
+    # that does not override it still answers `getattr`, and what runs is the per-item fallback.
+    return getattr(scorer, "__func__", None) is not BaseEnvironment.rollout_rewards_many
 
 
 def _grade_rollouts(env, rollouts: list[tuple[dict, dict, list[str], list[dict]]]) -> list[_Score]:
@@ -1248,7 +1310,12 @@ def _prepare_controls(
     controls = _usable_controls(record["reference_turns"] or record["responses"][:1])
     if controls is None:
         return None
-    if not env.multi_turn:
+    # the same precedence the driver uses: native scoring wins over multi_turn, because that is the
+    # worker's own (`use_rollout_func = is_multi_turn and not (is_tool_env and tools)`, rl.py:820).
+    # branching on multi_turn alone drove a native env's controls through the rollout hooks trl
+    # never calls for it, and parked them for a batch that scores nothing on this path -- so the
+    # episode carried no control evidence and the flat-reward gate went quiet for it.
+    if native or not env.multi_turn:
         # an unscorable control is dropped, exactly as on the multi-turn path: it earns no
         # advantage, so it is evidence of neither ranking nor flatness.
         scored = [
@@ -1472,7 +1539,13 @@ def cmd_env_test(args) -> int:
         failure: str | None = None
         controls: list[_Score] | None = None
         try:
-            if env.multi_turn:
+            # native wins over multi_turn, because that is the worker's own precedence:
+            # `use_rollout_func = is_multi_turn and not (is_tool_env and tools)` (rl.py:820). a
+            # multi-turn TOOL env with tools gets use_rollout_func=False and trl drives the tool
+            # loop, so new_rollout_state/record_model_turn/rollout_done/env_reply are never called
+            # for it. requiring them here failed a valid env -- one whose unused rollout hooks are
+            # absent or raise trains fine and could not pass this command (codex[bot]).
+            if env.multi_turn and not native:
                 _drive_multi_turn(env, example, record)
             else:
                 _drive_single_turn(env, example, record, thinking=thinking, native=native)
@@ -1566,12 +1639,15 @@ def cmd_env_test(args) -> int:
         # episodes it never tested.
         if controls and reward is not None:
             controlled += 1
-            # single-turn only: a multi-turn transcript is graded by `reward_from_messages`, which
-            # never strips reasoning, so no template reading enters it. counted here rather than at
-            # drive time so it speaks for exactly the episodes the gate below reads as evidence.
+            # only where a template reading actually enters the score. `reward_from_messages` is
+            # handed the messages whole and never strips reasoning, so neither a multi-turn
+            # transcript nor a NATIVE tool completion has a `<think>` span resolved for it -- the
+            # warning described a reading those paths do not perform (cursor). counted here rather
+            # than at drive time so it speaks for exactly the episodes the gate reads as evidence.
             if (
                 thinking
                 and not env.multi_turn
+                and not native
                 and any(_thinking_reading_is_ambiguous(t) for t in record["reference_turns"])
             ):
                 ambiguous_thinking += 1
@@ -1729,6 +1805,27 @@ def cmd_env_test(args) -> int:
             "grader and that its runtime dependencies are installed in this environment."
         )
     conclusive = bool(finding) and scored_zero == controlled
+    # a grader that ranks candidates against each other was not shown the group its run submits.
+    # production puts `group_size` completions behind one prompt (default 8); the group here is the
+    # gold replay plus the two or three controls provably wrong for it, and a scorer validating
+    # group boundaries or computing a group-size-dependent rank can answer differently for that
+    # alone (codex[bot]). the shape cannot be reproduced offline -- the other members are model
+    # samples this command has no model to draw -- so the finding is reported and never failed on.
+    if finding and not native and _scores_listwise(env):
+        from flash.engine.recipe import RLConfig
+
+        # reported, never used to withdraw the failure. `conclusive` is already ZERO ties only, and
+        # a grader scoring its own reference answer nothing has answered a question no group shape
+        # asks: the fallback path scores each rollout on its own, and even a listwise scorer has to
+        # rank the gold above an answer that is provably wrong for it. suppressing the failure here
+        # silenced exactly the broken-grader signature this gate exists for whenever the env merely
+        # DEFINED rollout_rewards_many, which most multi-turn envs do to batch.
+        finding += (
+            " note that this environment scores rollouts listwise, and the groups here hold "
+            f"{_GROUP_MIN}-{_GROUP_MAX} candidates against the run's group_size (default "
+            f"{RLConfig.group_size}), so a grader reading its group could answer differently for "
+            "that reason alone."
+        )
     if finding and grades and conclusive:
         _err(finding)
         return _err("overall: FAIL")
