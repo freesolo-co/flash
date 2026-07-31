@@ -530,7 +530,7 @@ def _iter_env_sidecar_files(
                     imported_modules.update(alias.name.split(".", 1)[0] for alias in node.names)
                 elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
                     imported_modules.add(node.module.split(".", 1)[0])
-            # exact-file pushes include only direct sibling modules named by the sidecar. a helper
+            # exact-file pushes include only direct siblings named by the sidecar. a helper
             # importing another helper is intentionally out of scope and requires a directory push;
             # following transitive imports here would turn the bounded single-file mode into a partial
             # python dependency resolver that still could not reproduce package imports reliably.
@@ -544,6 +544,36 @@ def _iter_env_sidecar_files(
                 ):
                     yielded.add(helper)
                     yield helper, helper.relative_to(env_root)
+                    continue
+                # `from graders.rules import score` resolves to a sibling PACKAGE, not graders.py.
+                # matching only the module spelling published an environment whose sidecar raises
+                # ModuleNotFoundError on its first case, having passed every local check.
+                package = env_root / module_name
+                if (
+                    not (package / "__init__.py").is_file()
+                    or _ignore_env_push_path(package, env_root=env_root, entrypoint=entrypoint)
+                    or package.is_symlink()
+                ):
+                    continue
+                for root, dirs, files in os.walk(
+                    package, topdown=True, followlinks=False, onerror=_raise_walk_error
+                ):
+                    root_path = Path(root)
+                    dirs[:] = sorted(
+                        name
+                        for name in dirs
+                        if not _ignore_env_push_path(
+                            root_path / name, env_root=env_root, entrypoint=entrypoint
+                        )
+                    )
+                    for name in sorted(files):
+                        child = root_path / name
+                        if child in yielded or _ignore_env_push_path(
+                            child, env_root=env_root, entrypoint=entrypoint
+                        ):
+                            continue
+                        yielded.add(child)
+                        yield child, child.relative_to(env_root)
         roots = [
             env_root / name
             for name in ("dataset", "datasets")
