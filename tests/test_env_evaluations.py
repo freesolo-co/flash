@@ -138,6 +138,48 @@ def test_lazily_imported_siblings_stay_bound_to_their_own_environment(tmp_path) 
     assert "helper" not in sys.modules
 
 
+def _package_helper_env(root: Path, label: str, *, namespace: bool) -> Path:
+    """An env whose sidecar eagerly imports a sibling PACKAGE, `from graders.rules import LABEL`."""
+    env_dir = root / label
+    (env_dir / "graders").mkdir(parents=True)
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    if not namespace:
+        (env_dir / "graders" / "__init__.py").write_text("")
+    (env_dir / "graders" / "rules.py").write_text(f"LABEL = {label!r}\n")
+    (env_dir / "evaluations.py").write_text(
+        "from graders.rules import LABEL\n"
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        f"    name = {label!r}\n"
+        "    def cases(self): return [EvalCase(id=LABEL, input='x', expected='x')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    return env_dir
+
+
+@pytest.mark.parametrize("namespace", [False, True], ids=["regular-package", "namespace-package"])
+def test_sibling_packages_do_not_leak_between_environments(tmp_path, namespace: bool) -> None:
+    """A sidecar's sibling package belongs to its own environment, not the first one loaded.
+
+    Eviction matched only modules whose parent WAS the package directory, but `graders.rules`
+    lives one level below it -- so it stayed in sys.modules and the next environment's
+    `from graders.rules import ...` silently got the first environment's grader. Both suites then
+    scored with the same code while reporting as independent environments (codex[bot]).
+
+    A namespace package (no __init__.py) has no spec origin at all, so an origin-only test cannot
+    see it either.
+    """
+    first = _package_helper_env(tmp_path, "alpha", namespace=namespace)
+    second = _package_helper_env(tmp_path, "beta", namespace=namespace)
+
+    alpha = load_evaluation_suites(first, environment=None)[0]
+    beta = load_evaluation_suites(second, environment=None)[0]
+
+    assert [case.id for case in alpha.cases()] == ["alpha"]
+    assert [case.id for case in beta.cases()] == ["beta"]
+    assert [name for name in sys.modules if name.split(".")[0] == "graders"] == []
+
+
 def test_load_evaluation_suites_supports_module_fallback(tmp_path) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
@@ -420,6 +462,56 @@ def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
     captured = capsys.readouterr().err
     assert reason in captured
     assert "overall: FAIL" in captured
+
+
+def test_env_eval_pins_the_revision_still_serving_during_a_rollout(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A queued replacement is listed with the revision it is rolling OUT to, not the live one.
+
+    Taking the busy record's adapter_revision graded a revision that was not serving yet and
+    filed the scores under it. `flash chat` reads `previous_deployment` for the same reason.
+    """
+    env_dir = _upload_env_dir(tmp_path)
+    serving = "flash-1@step-50." + "a" * 40
+    incoming = "flash-1@final." + "b" * 40
+
+    class Client:
+        def __init__(self):
+            self.targets = []
+
+        def deployments(self):
+            return [
+                {
+                    "run_id": "flash-1",
+                    "deployment": {
+                        "state": "queued",
+                        "adapter_revision": incoming,
+                        "previous_deployment": {
+                            "state": "ready",
+                            "adapter_revision": serving,
+                        },
+                    },
+                }
+            ]
+
+        def chat_stream(self, target, messages, **kwargs):
+            self.targets.append(target)
+            yield "4"
+
+    client = Client()
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 0
+    )
+    assert client.targets == [serving]
+    assert uploader.calls[0]["model"] == serving
+    assert incoming not in capsys.readouterr().out
 
 
 def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys) -> None:
@@ -778,7 +870,7 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
     # used to be marked failed, so a suite whose cases died mid-run uploaded as a completed run
     # with no error while the cli printed `overall: FAIL` (codex[bot]).
     assert uploader.calls[0]["status"] == "failed"
-    assert "1/2 case(s) failed to generate or score" == uploader.calls[0]["error"]
+    assert uploader.calls[0]["error"] == "1/2 case(s) failed to generate or score"
 
 
 def test_env_eval_upload_records_a_clean_suite_as_completed(monkeypatch, tmp_path) -> None:
