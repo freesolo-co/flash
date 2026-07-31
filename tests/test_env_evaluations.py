@@ -1426,6 +1426,52 @@ def test_a_sidecar_sibling_wins_over_an_unrelated_module_already_cached(tmp_path
         sys.modules.pop("helper", None)
 
 
+def test_a_sidecar_package_submodule_wins_over_one_already_cached(tmp_path) -> None:
+    """Displacing a package must displace its cached submodules too.
+
+    Evicting only the top-level `graders` left sys.modules["graders.rules"] in place, and
+    `from graders.rules import GOLD` reads that entry directly -- so the suite scored with the
+    other environment's rules while its own file was never read.
+    """
+    unrelated = tmp_path / "unrelated"
+    (unrelated / "graders").mkdir(parents=True)
+    (unrelated / "graders" / "__init__.py").write_text("")
+    (unrelated / "graders" / "rules.py").write_text("GOLD = 'UNRELATED'\n")
+    sys.path.insert(0, str(unrelated))
+    try:
+        import graders.rules as preexisting
+
+        assert preexisting.GOLD == "UNRELATED"
+    finally:
+        sys.path.remove(str(unrelated))
+
+    env_dir = tmp_path / "env"
+    (env_dir / "graders").mkdir(parents=True)
+    (env_dir / "environment.py").write_text("def load_environment():\n    return None\n")
+    (env_dir / "graders" / "__init__.py").write_text("")
+    (env_dir / "graders" / "rules.py").write_text("GOLD = 'OWN-SIBLING'\n")
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'submodule'\n"
+        "    def cases(self):\n"
+        "        from graders.rules import GOLD\n"
+        "        return [EvalCase(id='c', input=GOLD, expected=GOLD)]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    try:
+        suite = load_evaluation_suites(env_dir)[0]
+        # this environment's own rules, not the ones another package left cached
+        assert suite.cases()[0].input == "OWN-SIBLING"
+        # and both the package and its submodule are handed back to the process untouched
+        assert sys.modules["graders.rules"] is preexisting
+        assert sys.modules["graders.rules"].GOLD == "UNRELATED"
+    finally:
+        for name in [n for n in list(sys.modules) if n == "graders" or n.startswith("graders.")]:
+            del sys.modules[name]
+
+
 def test_a_lazily_imported_helper_keeps_its_state_across_cases(tmp_path) -> None:
     """A helper's module-level state survives from one callback to the next.
 

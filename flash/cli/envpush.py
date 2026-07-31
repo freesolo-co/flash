@@ -481,8 +481,31 @@ def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bo
     return not (path.is_dir() or path.is_file())
 
 
+def _dynamic_import_name(node) -> str | None:
+    """The module a literal `import_module("x")` or `__import__("x")` call names, if any.
+
+    A sidecar importing a sibling dynamically passes local test and eval -- the scope makes the
+    directory importable -- and then fails on its first published case, because the helper was
+    never packaged (codex[bot]). A literal argument is statically knowable, so it is followed like
+    any other import. A computed name is not, and is left to the runtime rather than guessed at."""
+    import ast
+
+    func = node.func
+    name = getattr(func, "attr", None) or getattr(func, "id", None)
+    if name not in ("import_module", "__import__"):
+        return None
+    if not node.args:
+        return None
+    first = node.args[0]
+    if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+        return None
+    # `import_module(".helper", package=...)` is relative; the sidecar directory is not a package,
+    # so only an absolute name can name a sibling this push would carry.
+    return first.value.split(".", 1)[0] or None
+
+
 def _imported_module_names(tree) -> set[str]:
-    """Top-level names a parsed module imports absolutely."""
+    """Top-level names a parsed module imports absolutely, statement or literal call."""
     import ast
 
     names: set[str] = set()
@@ -491,6 +514,10 @@ def _imported_module_names(tree) -> set[str]:
             names.update(alias.name.split(".", 1)[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             names.add(node.module.split(".", 1)[0])
+        elif isinstance(node, ast.Call):
+            dynamic = _dynamic_import_name(node)
+            if dynamic:
+                names.add(dynamic)
     return names
 
 
