@@ -610,8 +610,57 @@ class ApiClient:
     def undeploy(self, run_id: str) -> dict:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
 
-    def deployments(self) -> list[dict]:
-        return self._request("GET", "/v1/deployments")["deployments"]
+    def deployments(self, timeout: float | None = None) -> list[dict]:
+        return self._request("GET", "/v1/deployments", timeout=timeout)["deployments"]
+
+    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
+        """The current deployment record for one run, or None when it is not listed.
+
+        ``deploy`` returns as soon as the record is persisted, which is normally before the
+        requested revision is servable. This is the read side a caller needs to tell "queued"
+        from "actually ready".
+
+        ``timeout`` bounds the single request. A caller polling against its own deadline needs
+        that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
+        overshoot the bound the user asked for by an order of magnitude.
+
+        Read from the run-scoped route rather than the listing. `/v1/deployments` walks every run
+        the key owns and loads each one's status before this picks a single record out, so on an
+        account with a long run history the poll's cost grows with that history and the wait can
+        expire scanning unrelated runs while the requested revision is already ready
+        (chatgpt-codex-connector). `/v1/runs/{run_id}/deploy` resolves the one run directly.
+        """
+        base_run_id, step = _parse_adapter_target(run_id)
+        try:
+            deployment = self._request("GET", f"/v1/runs/{base_run_id}/deploy", timeout=timeout)
+        except ApiError as exc:
+            # a run the key cannot see reads the same as one that is not deployed. the listing said
+            # "absent" by omitting the row; saying it by raising would turn a vanished deployment
+            # into a failed command.
+            if exc.status == 404:
+                return None
+            raise
+        if not isinstance(deployment, dict):
+            return None
+        # the route answers for a run that was never deployed with a synthesized `undeployed`
+        # record rather than 404, and the listing omits `undeployed`/`dry_run` rows entirely. keep
+        # the listing's meaning: neither is a revision anyone can serve.
+        if str(deployment.get("state") or "") in {"undeployed", "dry_run"}:
+            return None
+        # the requested step is part of the identity, not decoration. matching on the run id
+        # alone lets `deploy RUN/step-40 --wait` settle on whichever revision happens to be
+        # deployed -- an older one still marked ready, or a replacement another shell deployed
+        # mid-wait -- and report that as this caller's own revision.
+        if "checkpoint_step" in deployment:
+            listed = deployment.get("checkpoint_step")
+            # None is the final adapter, an int is RUN/step-N (see the deployments renderer).
+            if (listed if listed is None else int(listed)) != step:
+                return None
+        if not deployment.get("run_id"):
+            # `models deploy --wait` prints this record in place of the POST body, so without the
+            # id styled output renders an empty run field and the json omits it entirely.
+            deployment = {**deployment, "run_id": base_run_id}
+        return deployment
 
     def chat(
         self,
