@@ -1544,3 +1544,125 @@ def test_env_test_fails_a_grader_that_credits_a_wrong_answer_at_one_turn(
     assert "wrong answer (0.000000, 1.000000)" in captured.err, captured.err
     # and not the flat finding: the vectors do differ.
     assert "cannot rank completions" not in captured.err
+
+
+def test_a_grader_rewarding_an_open_ended_property_is_not_called_inverted(
+    monkeypatch, tmp_path, capsys
+):
+    # a grader may reward a property of the completion rather than a match against the reference,
+    # and then a lexically disjoint control can be genuinely better: one point per "z" scores
+    # "z" * 64 above a gold "pizza", and training toward it is what the env asks for. reading that
+    # single win as an inverted sign rejected a healthy environment (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _PropertyEnv(_SingleTurnEnv):
+        def __init__(self):
+            super().__init__(rows=[{"input": "say something with a z", "output": "pizza"}])
+
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            return float(completion.casefold().count("z"))
+
+    _patch_loader(monkeypatch, _PropertyEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "reward direction" not in captured.err, captured.err
+    # and it is not read as flat either: the controls do score differently from gold.
+    assert "cannot rank completions" not in captured.err, captured.err
+
+
+def test_env_turns_that_do_not_reproduce_exclude_the_episode_from_the_gate(
+    monkeypatch, tmp_path, capsys
+):
+    # the assistant turns are only half a multi-turn transcript. an env whose own replies differ
+    # from the reference trajectory hands the grader a different episode under the same assistant
+    # strings, so a correct grader scores that supposed gold rollout like the controls and the gate
+    # reports a flat grader for an env that ranks fine (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _InterleavedEnv(_MultiTurnEnv):
+        """A multi-turn env whose reference trajectory records the observation it replied with."""
+
+        observation = "observation-A"
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "user", "content": "observation-A"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            reply = {"role": "user", "content": self.observation}
+            messages.append(reply)
+            return [reply]
+
+        def reward(self, completion, example, state=None):
+            # scores the WHOLE transcript, so a differing observation lands it with the controls.
+            said = [
+                message["content"]
+                for message in state["messages"]
+                if message.get("role") != "system"
+            ]
+            gold = [turn["content"] for turn in example["output"]]
+            # the prompt opens the transcript and env_reply appends one more observation after the
+            # final assistant turn, so the reference sits between them.
+            return 1.0 if said[1 : 1 + len(gold)] == gold else 0.0
+
+    class _DivergentEnv(_InterleavedEnv):
+        # a stochastic env: this run's observation is not the one the reference recorded.
+        observation = "observation-B"
+
+    _patch_loader(monkeypatch, _DivergentEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "cannot rank completions" not in captured.err, captured.err
+
+    # the control: an env that does reproduce its observation stays in the gate, so the exclusion
+    # above is about the divergence rather than about interleaved transcripts in general.
+    _patch_loader(monkeypatch, _InterleavedEnv())
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_an_unscorable_multi_turn_control_is_dropped_rather_than_failed(
+    monkeypatch, tmp_path, capsys
+):
+    # score_rollouts canonicalizes a non-finite multi-turn episode to NaN deliberately: it is the
+    # trainer's supported marker for a row the group baseline excludes and whose advantage is then
+    # zeroed. converting it into a contract failure rejected an env that merely marks a malformed
+    # episode unscorable, even when its other controls rank fine (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _GrammarEnv(_MultiTurnEnv):
+        def reward(self, completion, example, state=None):
+            said = [
+                message["content"]
+                for message in state["messages"]
+                if message.get("role") == "assistant"
+            ]
+            gold = {turn["content"] for turn in example["output"]}
+            if any(text in gold for text in said):
+                return 1.0
+            # outside the env's grammar: unscorable, not wrong.
+            if any(set(text) <= {"z"} or set(text) <= {"0"} for text in said):
+                return float("nan")
+            return 0.0
+
+    _patch_loader(monkeypatch, _GrammarEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "reward is not finite" not in captured.err, captured.err
+    # the surviving control still separates, so the episode is not read as flat either.
+    assert "cannot rank completions" not in captured.err, captured.err
