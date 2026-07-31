@@ -179,12 +179,8 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
 
 def test_export_adapter_normalizes_safetensors_keys_for_vanilla_peft(monkeypatch):
     uploaded: dict = {}
-    infixed_a = (
-        "base_model.model.model.language_model.layers.0.mlp.gate_proj.lora_A.default.weight"
-    )
-    infixed_b = (
-        "base_model.model.model.language_model.layers.0.mlp.gate_proj.lora_B.default.weight"
-    )
+    infixed_a = "base_model.model.model.language_model.layers.0.mlp.gate_proj.lora_A.default.weight"
+    infixed_b = "base_model.model.model.language_model.layers.0.mlp.gate_proj.lora_B.default.weight"
     plain = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
     double_infix = (
         "base_model.model.model.language_model.layers.0.language_model.mlp.up_proj."
@@ -549,9 +545,7 @@ def test_export_adapter_config_validates_and_preserves_revision(tmp_path):
         encoding="utf-8",
     )
 
-    assert export._rewrite_adapter_config_base_model(
-        tmp_path, BASE_MODEL, revision
-    ) is False
+    assert export._rewrite_adapter_config_base_model(tmp_path, BASE_MODEL, revision) is False
 
     path.write_text(
         json.dumps({"base_model_name_or_path": "other/model", "revision": revision}),

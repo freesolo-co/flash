@@ -10,9 +10,7 @@ import flash.providers.vast.preflight as vast_preflight
 
 
 @pytest.mark.parametrize("require_hf", [False, True])
-def test_lambda_preflight_ignores_hf_and_reports_only_its_api_key(
-    monkeypatch, require_hf
-) -> None:
+def test_lambda_preflight_ignores_hf_and_reports_only_its_api_key(monkeypatch, require_hf) -> None:
     """Lambda preflight must leave shared Hugging Face checks to the central preflight layer."""
     monkeypatch.setattr(lambda_preflight, "load_api_key", lambda: None)
     assert lambda_preflight.missing_credentials(require_hf=require_hf) == [
@@ -23,9 +21,7 @@ def test_lambda_preflight_ignores_hf_and_reports_only_its_api_key(
 
 
 @pytest.mark.parametrize("require_hf", [False, True])
-def test_vast_preflight_ignores_hf_and_reports_only_its_api_key(
-    monkeypatch, require_hf
-) -> None:
+def test_vast_preflight_ignores_hf_and_reports_only_its_api_key(monkeypatch, require_hf) -> None:
     """Vast preflight must leave shared Hugging Face checks to the central preflight layer."""
     monkeypatch.setattr(vast_preflight, "load_api_key", lambda: None)
     assert vast_preflight.missing_credentials(require_hf=require_hf) == [
@@ -58,4 +54,6 @@ def test_runpod_preflight_independently_checks_api_and_optional_hf_token(
 
     problems = runpod_preflight.missing_credentials(require_hf=require_hf)
 
-    assert [name for name in ("RUNPOD_API_KEY", "HF_TOKEN") if any(name in p for p in problems)] == expected_names
+    assert [
+        name for name in ("RUNPOD_API_KEY", "HF_TOKEN") if any(name in p for p in problems)
+    ] == expected_names

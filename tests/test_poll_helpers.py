@@ -49,9 +49,7 @@ def test_heartbeat_progress_pre_launch_leftover_is_not_fresh():
 def test_heartbeat_progress_rejects_unknown_launch_identity():
     now = time.time()
     for launch in (0.0, None):
-        _ts, fresh = heartbeat_progress_ts(
-            ("rl", 5, now - 30, 0), launch, current_attempt=0
-        )
+        _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 30, 0), launch, current_attempt=0)
         assert fresh is False
 
 

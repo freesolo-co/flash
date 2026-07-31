@@ -62,6 +62,7 @@ def test_gdn_forward_probe_rejects_module_without_gated_delta_net(monkeypatch) -
 @pytest.mark.parametrize("source", ["cu_seq_lens_q", "seq_idx", "neither"])
 def test_gdn_forward_probe_requires_both_reset_arguments(monkeypatch, source) -> None:
     """Packing must remain disabled unless the forward implementation threads both reset arguments."""
+
     class DemoGatedDeltaNet:
         def forward(self):
             return None
