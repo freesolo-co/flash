@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import hashlib
 import http.client
@@ -28,23 +27,23 @@ from flash.engine.steps import (
 from flash.engine.structured_outputs import reasoning_parser_for
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.multiturn_glue import (
+    EnvGlueTokenizer,
+    dedup_seam_terminator,
+    validate_glue_template,
+    validate_transcript_messages,
+)
 from flash.engine.worker.opd import (
     _drop_fully_forced_groups,
     _resolve_opd_knobs,
     _thinking_prefill_text,
 )
 from flash.engine.worker.opd_gkd import (
-    _generation_eos_ids,
     _rollout_terminated,
     _teacher_prompt_text,
     _trim_trailing_stop,
+    generation_eos_from_cached_config,
     student_tokens_with_offsets,
-)
-from flash.engine.worker.opd_multiturn import (
-    EnvGlueTokenizer,
-    _dedup_seam_terminator,
-    validate_glue_template,
-    validate_teacher_messages,
 )
 from flash.engine.worker.rng import seed_training_rngs
 from flash.engine.worker.sft_train import (
@@ -873,7 +872,7 @@ class _TeacherAlignmentBridge:
         prompt_ids = [int(token_id) for token_id in prompt_ids]
         if prompt_ids != list(prompt.prompt_ids):
             raise ValueError("multi-turn rollout prompt ids do not match the frozen flash prompt")
-        raw_prompt = validate_teacher_messages(raw_prompt, source="child initial prompt")
+        raw_prompt = validate_transcript_messages(raw_prompt, source="child initial prompt")
         if raw_prompt != prompt.student_messages:
             raise ValueError("multi-turn child prompt does not match the frozen environment prompt")
         session_id = self._validate_session_id(session_id)
@@ -896,7 +895,7 @@ class _TeacherAlignmentBridge:
             with self._env_lock:
                 state = self.active_env.new_rollout_state(prompt.example)
                 initial_messages = state.get("prompt") or state.get("messages")
-                initial_messages = validate_teacher_messages(
+                initial_messages = validate_transcript_messages(
                     initial_messages, source="environment initial prompt"
                 )
             if initial_messages != prompt.student_messages:
@@ -1033,7 +1032,7 @@ class _TeacherAlignmentBridge:
                 )
             if not terminal:
                 messages = self.active_env.env_reply(session["messages"], state)
-                messages = validate_teacher_messages(messages, source="environment reply")
+                messages = validate_transcript_messages(messages, source="environment reply")
                 session["messages"].extend(messages)
                 # the env's reply may itself end the episode (rollout_done consults the updated
                 # state); recheck before gluing a next-turn prompt no model turn will answer.
@@ -1043,7 +1042,7 @@ class _TeacherAlignmentBridge:
                 if not terminal:
                     assert self._env_glue is not None
                     next_prefix.extend(
-                        _dedup_seam_terminator(response_ids, self._env_glue(messages))
+                        dedup_seam_terminator(response_ids, self._env_glue(messages))
                     )
             step_response = {"messages": messages, "terminal": bool(terminal)}
             session["terminal"] = bool(terminal)
@@ -2052,25 +2051,6 @@ def _processed_resume_steps(
     return processed
 
 
-def _generation_eos_from_cached_config(model_id: str, model_revision: str, tokenizer) -> frozenset[int]:
-    from transformers import AutoConfig, GenerationConfig
-
-    config = AutoConfig.from_pretrained(
-        model_id, trust_remote_code=True, revision=model_revision or None, local_files_only=True
-    )
-    generation_config = None
-    with contextlib.suppress(OSError):
-        generation_config = GenerationConfig.from_pretrained(
-            model_id, revision=model_revision or None, local_files_only=True
-        )
-    model_like = type(
-        "ModelGenerationMetadata",
-        (),
-        {"config": config, "generation_config": generation_config},
-    )()
-    return _generation_eos_ids(model_like, tokenizer)
-
-
 def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
     from flash.engine.worker.teacher import TeacherClient
@@ -2204,7 +2184,7 @@ def run_opd_train(spec=None) -> None:
             _prepped[0] += 1
             messages = env.prompt_messages(example)
             if multi_turn:
-                messages = validate_teacher_messages(messages, source="environment initial prompt")
+                messages = validate_transcript_messages(messages, source="environment initial prompt")
             if record_has_images(example, messages):
                 assert processor is not None
                 normalized = normalize_prompt_images(example, messages, package_root)
@@ -2265,7 +2245,7 @@ def run_opd_train(spec=None) -> None:
     # fetch kilobytes, not weights, so they are cheap to run first.
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
     # reads the snapshot with local_files_only, so it has to follow the prefetch.
-    eos_token_ids = _generation_eos_from_cached_config(model_id, model_revision, tokenizer)
+    eos_token_ids = generation_eos_from_cached_config(model_id, model_revision, tokenizer)
     prompts_per_step = min(knobs.prompts_per_step, len(prompts))
     derived_steps = on_policy_steps(
         epochs=knobs.epochs,
@@ -2373,6 +2353,11 @@ def run_opd_train(spec=None) -> None:
     shutil.copy2(
         os.path.join(os.path.dirname(__file__), "opd_multiturn.py"),
         multiturn_helper_path,
+    )
+    glue_helper_path = os.path.join(shim_dir, "flash_multiturn_glue.py")
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), "multiturn_glue.py"),
+        glue_helper_path,
     )
     entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
     with open(entry_path, "w", encoding="utf-8") as file:
