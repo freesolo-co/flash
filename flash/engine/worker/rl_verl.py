@@ -2522,7 +2522,14 @@ def run_rl_verl():
     # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. the buffer
     # carries what trl's reward TrainerCallback carries -- recent rollouts for the per-step log dump
     # and `sampled_completions`, plus per-name components for `reward_metrics` (#607).
-    observability = RewardObservabilityBuffer()
+    # the generation size lets the buffer close each generation on the scoring thread that finishes
+    # it, rather than when the child's `step:N` line reaches this process: those are the same
+    # completions but not the same instant, and the next generation scores in between. verl is run
+    # with test_freq=-1 and val_before_train=False, so every completion reaching the bridge is a
+    # training rollout and the count is exact.
+    observability = RewardObservabilityBuffer(
+        generation_size=int(inp["prompts_per_step"]) * int(inp["group_size"]),
+    )
     # filled from the child's marker line; stays empty when wandb is off (see render_wandb_link_shim).
     wandb_link: dict[str, str | None] = {}
 

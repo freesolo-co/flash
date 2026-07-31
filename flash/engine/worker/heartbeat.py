@@ -337,23 +337,39 @@ class RewardObservabilityBuffer:
     instead would publish whichever completions happened to be graded when a 30s tick landed --
     a latency-biased subset -- and stamp samples left over from earlier generations with the
     current step (codex[bot]).
+
+    ``generation_size`` makes that boundary COUNTED rather than observed. The verl caller knows a
+    generation is exactly ``prompts_per_step * group_size`` completions, so the last one closes it
+    on the scoring thread itself. Closing on the arriving ``step:N`` stdout line instead would be a
+    race: the child's pipe is delivered asynchronously, so generation N+1 can already be scoring
+    into this buffer when the parent finally reads N's line, sealing both generations under step N
+    and leaving N+1 to republish it (codex[bot]).
     """
 
-    # how many per-completion breakdowns may queue between generations. one generation is
-    # prompts_per_step * group_size completions, so this holds several generations' worth -- a
-    # normal boundary never truncates, while a run whose steps have stopped arriving cannot grow
-    # the buffer without limit.
-    _PENDING_BREAKDOWN_LIMIT = 4096
     _SAMPLE_BUFFER_LIMIT = 64
 
-    def __init__(self) -> None:
+    def __init__(self, *, generation_size: int = 0) -> None:
         self._lock = threading.Lock()
+        # completions per generation, when the caller knows it: see the class docstring. 0 leaves
+        # the boundary entirely caller-driven.
+        self._generation_size = max(0, int(generation_size))
+        self._scored_this_generation = 0
+        # whether the count already sealed the generation this step line is about to name. it
+        # decides whether `close_generation` seals or merely relabels -- see there.
+        self._sealed_by_count = False
+        # the generation ordinal this buffer is filling, counted from the boundaries it has closed
+        # rather than from the child's stdout. `close_generation` relabels it to the step verl
+        # actually logged, which is the same number whenever the two agree.
+        self._generation = 1
         # gradings since the last boundary; they belong to the generation still being scored.
         self._samples: list[tuple[Any, Any, float]] = []
         # the last COMPLETE generation, with the step it was logged under. only these publish.
         self._published: list[tuple[Any, Any, float]] = []
         self._published_step: int | None = None
-        self._pending_breakdowns: list[dict[str, float] | None] = []
+        # running per-name sums and the completion count they are over, NOT the completions
+        # themselves: see `record`.
+        self._pending_totals: dict[str, float] = {}
+        self._pending_count = 0
         self._latest_metrics: dict[str, float] = {}
 
     def record(self, prompt: Any, completion: Any, reward: float, breakdowns=()) -> None:
@@ -361,29 +377,83 @@ class RewardObservabilityBuffer:
 
         ``breakdowns`` is the 0-or-1 element accumulator ``score_single_turn`` filled for this
         completion, empty for a multi-turn episode (the env scores a whole episode to a scalar).
+
+        The breakdown is folded into a running sum instead of being retained. A generation is
+        ``[train].batch_size * group_size`` completions, both arbitrary positive integers, so any
+        retention bound is one a valid large-batch run can exceed -- and evicting to honour it drops
+        completions out of the mean silently, biasing the published metric toward whichever ones
+        happened to be graded last (codex[bot]). Sums cost one float per NAME, which
+        ``_bounded_reward_metrics`` already caps at 12, so the generation size stops mattering.
         """
         with self._lock:
             self._samples.append((prompt, completion, float(reward)))
             del self._samples[: -self._SAMPLE_BUFFER_LIMIT]
-            self._pending_breakdowns.extend(breakdowns)
-            del self._pending_breakdowns[: -self._PENDING_BREAKDOWN_LIMIT]
+            self._scored_this_generation += 1
+            for breakdown in breakdowns:
+                # a failed grading appends None and still counts: it is a real completion that
+                # scored nothing, so it belongs in the denominator of every name (mirrors trl).
+                self._pending_count += 1
+                if not isinstance(breakdown, dict):
+                    continue
+                for name, value in breakdown.items():
+                    if name == "total":
+                        continue
+                    self._pending_totals.setdefault(name, 0.0)
+                    try:
+                        score = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(score):
+                        self._pending_totals[name] += score
+            if self._generation_size and self._scored_this_generation >= self._generation_size:
+                # the generation is complete BY COUNT, on the thread that completed it: nothing from
+                # the next one can be folded in, whenever the child's stdout happens to arrive.
+                self._seal(self._generation)
+                self._generation += 1
+                self._sealed_by_count = True
+
+    def _seal(self, step: int) -> None:
+        """Publish the open generation as ``step``'s output. Caller holds the lock."""
+        if self._pending_count:
+            metrics = {name: total / self._pending_count for name, total in self._pending_totals.items()}
+            self._pending_totals = {}
+            self._pending_count = 0
+            if metrics:
+                self._latest_metrics = metrics
+            elif self._latest_metrics:
+                # every completion failed scoring this generation: surface the known metrics as
+                # zeros instead of dropping them, so a full scoring outage shows a flat 0 rather
+                # than hiding behind missing heartbeat fields.
+                self._latest_metrics = dict.fromkeys(self._latest_metrics, 0.0)
+        if self._samples:
+            self._published = self._samples
+            self._published_step = int(step)
+            self._samples = []
+        self._scored_this_generation = 0
 
     def close_generation(self, step: int) -> None:
-        """Seal everything graded since the last boundary as generation ``step``'s output.
+        """Name the generation verl logged as ``step``, sealing it if the count has not already.
 
-        Call once per new trainer step. This is the only place the breakdown drain happens, so a
-        published mean always covers a whole generation rather than the subset that had finished
-        when a heartbeat fired.
+        Call once per new trainer step. When ``generation_size`` is known this is a RELABEL: the
+        scoring thread already sealed on the last completion, and this only corrects the ordinal to
+        the step verl printed (they agree unless verl skipped or resumed). When it is not, this is
+        the boundary itself.
 
         A boundary with no gradings leaves the previous generation published under its OWN step: a
         step that generated nothing must not relabel older samples as newly generated.
         """
         with self._lock:
-            _latest_named_reward_metrics(self._pending_breakdowns, self._latest_metrics)
-            if self._samples:
-                self._published = self._samples
+            if self._sealed_by_count:
+                # the count already sealed this step's generation, and what is open now belongs to
+                # the NEXT one -- sealing again here is exactly the leak this avoids. only the label
+                # is owed: the published rows ARE the ones this step produced.
                 self._published_step = int(step)
-                self._samples = []
+            elif self._samples or self._pending_count:
+                self._seal(step)
+            # otherwise this step generated nothing, and the published rows stay under the step that
+            # did produce them: relabelling would republish old text as freshly generated.
+            self._sealed_by_count = False
+            self._generation = int(step) + 1
 
     def latest(self) -> tuple[Any, Any, float] | None:
         """The most recently scored ``(prompt, completion, reward)``, for a per-step log preview.

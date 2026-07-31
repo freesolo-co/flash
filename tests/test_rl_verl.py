@@ -3492,14 +3492,17 @@ def test_the_reward_profiler_is_skipped_on_multi_turn():
 
 
 # ---------------- reward observability: the buffer and the heartbeat drain ----------------
-def _score_buffer(env, *, prompts=None, examples=None):
+def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
     """`_score`'s grade-then-record pair, against a real buffer and fake env.
 
     `_score` itself is a local of a body that needs a model, a dataset and a verl interpreter to
     reach, so the two calls it makes are made here directly; the wiring that they ARE what `_score`
     does is asserted separately below, on its source.
+
+    `generation_size` defaults to 0 -- the boundary stays caller-driven -- so a test that only cares
+    about grading never trips the counted seal.
     """
-    buffer = RewardObservabilityBuffer()
+    buffer = RewardObservabilityBuffer(generation_size=generation_size)
     rollout_examples = examples if examples is not None else [{"gt": "7"}]
     message_prompts = prompts if prompts is not None else ["prompt-0"]
 
@@ -3546,38 +3549,57 @@ def test_the_buffer_keeps_the_rollout_sample_and_its_named_breakdown():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_buffers_are_bounded_when_the_heartbeat_stops_draining():
-    # one generation is bounded, but nothing bounds how many generations pass between drains. an
-    # unbounded list here grows for the whole run in a process that is already memory-tight.
+def test_the_buffers_are_bounded_when_the_generation_never_closes():
+    # nothing bounds how many completions arrive before a boundary. the sample buffer evicts; the
+    # metric accumulator must not GROW instead -- this process is already memory-tight.
     score, buffer = _score_buffer(_NamedBreakdownEnv())
-    for _ in range(RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT + 50):
+    for _ in range(5000):
         score(0, "7")
 
-    assert len(buffer._pending_breakdowns) == RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT
     assert len(buffer._samples) == RewardObservabilityBuffer._SAMPLE_BUFFER_LIMIT
+    # one float per NAME, whatever the completion count: the env reports two.
+    assert set(buffer._pending_totals) == {"success", "quality"}
+    assert buffer._pending_count == 5000
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_every_completion_counts_toward_the_mean_however_large_the_generation():
+    """A generation is ``batch_size * group_size`` completions, both unbounded, so no retention cap
+    can hold one. Dropping the overflow biases the published mean toward whichever completions were
+    graded last -- here, a run that succeeded early and failed late would report a flat 0
+    (codex[bot])."""
+    score, buffer = _score_buffer(
+        _CountingBreakdownEnv(),
+        prompts=["prompt-0"],
+        examples=[{"gt": "7"}],
+    )
+    total = 5000
+    for _ in range(total):
+        score(0, "7")
+    buffer.close_generation(1)
+
+    # the env numbers each grading, so the true mean of `n` is the mean of 0..total-1.
+    assert buffer.heartbeat_fields()["reward_metrics"]["n"] == (total - 1) / 2
 
 
 @pytest.mark.usefixtures("_identity_graded")
 def test_eviction_drops_the_oldest_rollouts_and_keeps_the_newest():
-    """Over the limit, what SURVIVES has to be the recent end: both signals answer "what is the
-    model doing now", so evicting the newest would pin a stalled run's diagnostics to its oldest
+    """Over the limit, what SURVIVES has to be the recent end: samples answer "what is the model
+    doing now", so evicting the newest would pin a stalled run's diagnostics to its oldest
     gradings. A length-only assertion passes either way -- this reads the retained values."""
     score, buffer = _score_buffer(
         _CountingBreakdownEnv(),
         prompts=["prompt-0"],
         examples=[{"gt": "7"}],
     )
-    total = RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT + 50
+    total = RewardObservabilityBuffer._SAMPLE_BUFFER_LIMIT + 50
     for _ in range(total):
         score(0, "7")
 
-    # the env numbers each grading, so the retained window is identifiable by value.
     assert buffer.latest()[2] == float(total - 1)
-    assert buffer._pending_breakdowns[-1] == {"n": float(total - 1), "total": float(total - 1)}
-    assert buffer._pending_breakdowns[0] == {
-        "n": float(total - RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT),
-        "total": float(total - RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT),
-    }
+    assert [row[2] for row in buffer._samples] == [
+        float(n) for n in range(total - RewardObservabilityBuffer._SAMPLE_BUFFER_LIMIT, total)
+    ]
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -3691,6 +3713,45 @@ def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one():
 
 
 @pytest.mark.usefixtures("_identity_graded")
+def test_the_next_generation_cannot_be_sealed_into_the_step_line_that_is_still_in_flight():
+    """The child's stdout is delivered asynchronously, so `step:N` can reach the parent AFTER
+    generation N+1 has started scoring. A boundary taken at that moment seals both generations
+    under step N and leaves N+1 with nothing of its own to publish (codex[bot]).
+
+    Counting closes the generation on the scoring thread that finishes it, so the in-flight line
+    only names what was already sealed."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score(0, "7")
+    score(0, "7")  # generation 1 is complete here, whatever stdout is doing
+    score(0, "wrong")  # generation 2 begins while `step:1` is still in the pipe
+
+    buffer.close_generation(1)
+    first = buffer.heartbeat_fields()
+    assert first["reward_metrics"]["success"] == 1.0, "next generation leaked into this mean"
+    assert [s["completion"] for s in first["sampled_completions"]] == ["7", "7"]
+    assert {s["generated_at_step"] for s in first["sampled_completions"]} == {1}
+
+    score(0, "wrong")
+    buffer.close_generation(2)
+    second = buffer.heartbeat_fields()
+    assert second["reward_metrics"]["success"] == 0.0, "step 2 republished step 1"
+    assert {s["generated_at_step"] for s in second["sampled_completions"]} == {2}
+
+
+def test_the_generation_size_is_the_configured_rollout_count():
+    # the counted boundary is only correct if it counts a whole generation. verl runs with
+    # test_freq=-1 and val_before_train=False, so every completion reaching the bridge is one of
+    # these -- a validation pass would desynchronize the count from the step lines.
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    construction = src[src.index("RewardObservabilityBuffer(") :]
+    construction = construction[: construction.index("wandb_link")]
+    assert 'generation_size=int(inp["prompts_per_step"]) * int(inp["group_size"])' in construction
+    overrides = rl_verl.build_verl_overrides(_overrides_cfg())
+    assert "trainer.test_freq=-1" in overrides
+    assert "trainer.val_before_train=False" in overrides
+
+
+@pytest.mark.usefixtures("_identity_graded")
 def test_samples_carry_the_step_they_were_generated_at_not_the_current_one():
     """`generated_at_step` names the generation that PRODUCED the completion.
 
@@ -3720,7 +3781,8 @@ def test_the_drain_clears_pending_breakdowns_and_then_repeats_the_last_reading()
     buffer.close_generation(1)
 
     assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
-    assert buffer._pending_breakdowns == []
+    assert buffer._pending_totals == {}
+    assert buffer._pending_count == 0
     assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
 
     score(0, "wrong")
