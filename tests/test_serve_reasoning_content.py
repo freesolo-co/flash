@@ -412,3 +412,78 @@ def test_non_thinking_chat_returns_serving_content_unchanged(monkeypatch):
 
     result = deploy.chat("run-1", [{"role": "user", "content": "hi"}])
     assert result["choices"][0]["message"]["content"] == "foo</think>bar"
+
+
+def test_a_streamed_close_split_across_deltas_is_not_duplicated():
+    # a backend may split the retained delimiter -- "</th" then "ink>answer". requiring the whole
+    # tag at the head of one delta synthesised a second close and sent the client
+    # `<think>reasoned</think>\n</think>answer` (codex[bot], cursor).
+    lines = _sse(
+        {"reasoning_content": "reasoned"},
+        {"content": "</th"},
+        {"content": "ink>answer"},
+    )
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+        == "<think>reasoned</think>answer"
+    )
+
+
+def test_a_streamed_close_behind_whitespace_is_not_duplicated():
+    # the model samples the delimiter on its own line as often as not, which the non-streaming path
+    # already tolerates through `_is_sampled_delimiter`.
+    lines = _sse({"reasoning_content": "reasoned"}, {"content": "\n</think>answer"})
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+        == "<think>reasoned</think>answer"
+    )
+
+
+def test_an_explicitly_empty_streamed_reasoning_still_gets_a_block():
+    # `reasoning_content: ""` means the model closed its block immediately, which is a different
+    # case from an absent field -- and the non-streaming path emits `<think></think>{answer}` for
+    # it. reading falsiness made the two paths disagree on the same payload (codex[bot]).
+    lines = _sse({"reasoning_content": ""}, {"content": "answer"})
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+        == "<think></think>answer"
+    )
+
+
+def test_streamed_reasoning_is_left_alone_when_thinking_is_off():
+    # the request never asked for a reasoning phase, so wrapping the field in synthetic tags is the
+    # same defect the flag exists to prevent -- the streaming path just kept doing it (cursor).
+    lines = _sse({"reasoning_content": "reasoned"}, {"content": "answer"})
+    assert "".join(deploy._openai_stream_content(iter(lines), thinking=False)) == "answer"
+
+
+def test_an_already_balanced_legacy_stream_is_not_nested():
+    # a legacy stream that carries its own opener is already balanced, and the non-streaming path
+    # leaves it alone via `_inline_reasoning_block`. re-opening around its close nested one block
+    # inside another on the public chat_stream path (cursor).
+    lines = _sse({"content": "<think>reasoned</think>answer"})
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+        == "<think>reasoned</think>answer"
+    )
+
+
+def test_an_answer_side_pair_after_text_is_not_read_as_duplicated_reasoning():
+    # body equality alone mistook a pair inside the ANSWER for the reasoning emitted twice, so an
+    # empty-reasoning JSON answer quoting the tag came back with no reasoning block at all and the
+    # structured smoke then validated only the trailing `"}` (codex[bot]).
+    message = {"content": '{"tag":"<think></think>"}', "reasoning_content": ""}
+    assert (
+        deploy._balanced_thinking_content(message, thinking=True)
+        == '<think></think>{"tag":"<think></think>"}'
+    )
+
+
+def test_a_duplicated_inline_block_is_matched_past_its_trailing_newline():
+    # `_is_sampled_delimiter` compares the same span stripped, so an exact comparison here folded
+    # `reasoned\n` against `reasoned` into a second block and left two close tags (cursor).
+    message = {"content": "<think>reasoned\n</think>answer", "reasoning_content": "reasoned"}
+    assert (
+        deploy._balanced_thinking_content(message, thinking=True)
+        == "<think>reasoned\n</think>answer"
+    )

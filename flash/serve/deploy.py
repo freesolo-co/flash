@@ -908,6 +908,9 @@ def _retryable_smoke_unavailable(
     return RetryableServingUnavailable(str(code), retry_after_seconds)
 
 
+_TAG_CLOSE = "</think>"
+
+
 def _inline_reasoning_block(content: str) -> tuple[int, int] | None:
     """Span of a balanced ``<think>...</think>`` in ``content``, or ``None``.
 
@@ -938,6 +941,26 @@ def _is_sampled_delimiter(prefix: str, reasoning: str) -> bool:
     the smoke's answer split then read the wrong slice (cursor).
     """
     return prefix.strip() in ("", reasoning.strip())
+
+
+def _duplicates_reasoning(content: str, inline: tuple[int, int], reasoning: str) -> bool:
+    """Whether this inline pair is ``reasoning_content`` emitted a second time inline.
+
+    Two conditions, and the head one is not cosmetic. A compatibility build repeats the reasoning
+    where a reasoning phase belongs, ahead of the answer, so a pair that appears AFTER answer text
+    is the answer quoting the tag rather than a duplicate. Matching on body alone folded
+    ``{"tag":"<think></think>"}`` against empty reasoning into "already present" and returned the
+    JSON with no reasoning block at all, after which the structured smoke split at the pair inside
+    the JSON and validated only the trailing ``"}`` (codex[bot]).
+
+    Compared stripped, for the same reason `_is_sampled_delimiter` is: a build that repeats the
+    reasoning inline tends to repeat it with the newline the model sampled after it, and an exact
+    comparison folded ``reasoned\\n`` against ``reasoned`` into a second block (cursor).
+    """
+    opened, closed = inline
+    if content[:opened].strip():
+        return False
+    return content[opened + len("<think>") : closed].strip() == reasoning.strip()
 
 
 def _balanced_thinking_content(message: dict, *, thinking: bool) -> str:
@@ -979,11 +1002,18 @@ def _balanced_thinking_content(message: dict, *, thinking: bool) -> str:
         # alone rather than inventing a block around it.
         return content
     if inline is not None:
-        opened, closed = inline
-        if content[opened + len("<think>") : closed] == reasoning:
+        if _duplicates_reasoning(content, inline, reasoning):
             # the inline pair IS the block on the field, emitted twice by a compatibility build.
             # keep it once.
             return content
+        opened, _ = inline
+        close = content.find("</think>")
+        if close >= 0 and close < opened and _is_sampled_delimiter(content[:close], reasoning):
+            # the retained sampled close precedes the pair, so the pair belongs to the ANSWER and
+            # this close is the block's own. strip it and keep the answer whole; folding the raw
+            # content in wholesale left `<think>reasoned</think>...</think>` with two closes and the
+            # answer split then read the slice between them (cursor).
+            return f"<think>{reasoning}</think>{content[close + len('</think>') :]}"
         # a different pair: the answer itself is or contains a full literal block. treating any
         # pair as the reasoning returned early and DROPPED the real `reasoning_content`, after
         # which `_thinking_structured_answer` found nothing past the answer's own close tag and
@@ -1064,12 +1094,41 @@ def chat(
         return payload
 
 
+def _strip_retained_close(text: str) -> str | None:
+    """Drop a retained sampled ``</think>`` from the head of the post-reasoning content.
+
+    Returns the remaining answer, or ``None`` while the tag may still be arriving. A compatibility
+    build can emit reasoning on its own field AND keep the sampled close at the head of the first
+    content delta; synthesising another one there yields ``<think>reasoned</think></think>answer``.
+
+    The tag does not have to arrive whole or bare. The model samples it on its own line as often as
+    not, and a backend may split it across deltas -- ``"</th"`` then ``"ink>answer"``. The
+    non-streaming path already tolerates both, so requiring a complete tag at the head of one delta
+    made the two paths disagree and sent clients ``<think>reasoned</think>\n</think>answer``
+    (codex[bot], cursor).
+    """
+    close = text.find("</think>")
+    if close >= 0:
+        # whitespace before it is still the block's own close, exactly as `_is_sampled_delimiter`
+        # reads it. anything else is answer text that merely mentions the tag, so it stays put.
+        if not text[:close].strip():
+            return text[close + len("</think>") :]
+        return text
+    stripped = text.strip()
+    if stripped and _TAG_CLOSE.startswith(stripped):
+        # a strict prefix of the tag and nothing else yet: it may complete on the next delta.
+        return None
+    return text
+
+
 def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[str]:
     # reasoning arrives on its own delta field (see _balanced_thinking_content). re-open the block
     # around it and close it at the answer boundary, so the streamed text a caller prints is the
     # same balanced string the non-streaming path returns instead of silently dropping the
     # reasoning phase and then emitting a bare closing tag.
     reasoning_open = False
+    # buffered content after the block closed, while a retained delimiter may still be arriving.
+    closing: str | None = None
     # a legacy backend predating the split streams the whole block inline on `content`, with no
     # reasoning field to key off. in thinking mode the opener lives in the prompt, so such a stream
     # begins mid-block and the sampled `</think>` arrives with nothing to close -- the non-streaming
@@ -1094,8 +1153,18 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
         chunk = json.loads(data)
         for choice in chunk.get("choices") or []:
             delta = (choice.get("delta") or {}) if isinstance(choice, dict) else {}
-            reasoning = delta.get("reasoning_content") or ""
-            if reasoning:
+            raw_reasoning = delta.get("reasoning_content")
+            # `thinking` gates this exactly as it gates `_balanced_thinking_content`: outside
+            # thinking mode the request never asked for a reasoning phase, and wrapping the field in
+            # synthetic tags there rewrote an ordinary answer on the public chat route, which is the
+            # defect that flag exists to prevent -- the streaming path just kept doing it (cursor).
+            #
+            # tested by TYPE, not falsiness. a model that closed its reasoning immediately streams
+            # `reasoning_content: ""` before the answer, and reading that as absent emitted the
+            # answer with no `<think></think>` at all, so the same payload read one way streamed and
+            # another way non-streamed and a consumer splitting on the close tag saw no answer
+            # (codex[bot]).
+            if thinking and isinstance(raw_reasoning, str):
                 if held:
                     # the backend splits after all, so whatever arrived first was answer text and
                     # not an unopened block. release it untouched.
@@ -1104,21 +1173,25 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                 if not reasoning_open:
                     reasoning_open = True
                     yield "<think>"
-                yield str(reasoning)
+                if raw_reasoning:
+                    yield raw_reasoning
             content = delta.get("content") or ""
             if content:
                 content = str(content)
                 if reasoning_open:
                     reasoning_open = False
                     held = None
-                    # a compatibility build can emit reasoning on its own field AND retain the
-                    # sampled close at the head of the first content delta. synthesising another
-                    # one there yields `<think>reasoned</think></think>answer`, so let the delta's
-                    # own tag close the block when it supplies one.
-                    if content.startswith("</think>"):
-                        content = content.removeprefix("</think>")
                     yield "</think>"
-                    yield content
+                    closing = ""
+                if closing is not None:
+                    closing += content
+                    answer = _strip_retained_close(closing)
+                    if answer is None:
+                        # the tag may still be completing across deltas. keep buffering.
+                        continue
+                    closing = None
+                    if answer:
+                        yield answer
                     continue
                 if held is not None:
                     held.append(content)
@@ -1128,6 +1201,13 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                         # the delimiter may still be split across deltas, so keep holding.
                         continue
                     held = None
+                    if _inline_reasoning_block(joined) is not None:
+                        # already a balanced pair: the legacy stream carried its own opener, so this
+                        # close is not unmatched and re-opening around it nested one block inside
+                        # another. the non-streaming path leaves such a payload alone through
+                        # `_inline_reasoning_block`, and this one did not (cursor).
+                        yield joined
+                        continue
                     yield f"<think>{joined[:close]}</think>{joined[close + len('</think>') :]}"
                     continue
                 yield content
@@ -1135,6 +1215,9 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
         # generation stopped inside the reasoning block (a length cap, usually). still close it:
         # an unbalanced opener is the same defect as the unbalanced closer, mirrored.
         yield "</think>"
+    if closing:
+        # the stream ended mid-delimiter, so the buffered text was answer after all.
+        yield closing
     if held:
         # no delimiter ever arrived, so nothing marked a reasoning phase: this was a plain answer.
         # release it exactly as sent rather than wrapping it -- inventing a block here would label
