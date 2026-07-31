@@ -624,6 +624,16 @@ def recover_runs() -> None:
                 with contextlib.suppress(Exception):
                     _append_run_log(status.run_id, detail)
                 _teardown_unrecoverable_remote(status)
+                # If that teardown could not confirm deletion it records the handle for the cleanup
+                # drain -- but this run's drain was dispatched above and has already taken its
+                # snapshot, of a list that did not yet contain this record (cursor). `_drain_cleanup_
+                # remotes` returns early on an empty snapshot, so nothing would retry it before the
+                # next restart. Dispatch a second drain now that the record exists. A double teardown
+                # of one handle is safe: `_strict_teardown_handle` is idempotent and the record is
+                # removed by compare-and-remove only on a confirmed delete.
+                threading.Thread(
+                    target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
+                ).start()
                 continue
             # Only handle-backed runs are kept by the sweep; a handle-less run is being
             # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
