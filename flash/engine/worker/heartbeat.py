@@ -347,6 +347,10 @@ class RewardObservabilityBuffer:
     """
 
     _SAMPLE_BUFFER_LIMIT = 64
+    # counted generations held waiting for their step lines. the queue exists because stdout can run
+    # a generation or two behind; a child that stops printing step lines entirely would otherwise
+    # grow it without bound, at up to _SAMPLE_BUFFER_LIMIT retained completions each.
+    _SEALED_QUEUE_LIMIT = 8
 
     def __init__(self, *, generation_size: int = 0) -> None:
         self._lock = threading.Lock()
@@ -354,13 +358,13 @@ class RewardObservabilityBuffer:
         # the boundary entirely caller-driven.
         self._generation_size = max(0, int(generation_size))
         self._scored_this_generation = 0
-        # whether the count already sealed the generation this step line is about to name. it
-        # decides whether `close_generation` seals or merely relabels -- see there.
-        self._sealed_by_count = False
-        # the generation ordinal this buffer is filling, counted from the boundaries it has closed
-        # rather than from the child's stdout. `close_generation` relabels it to the step verl
-        # actually logged, which is the same number whenever the two agree.
-        self._generation = 1
+        # generations the count has already sealed, oldest first, each waiting for the step line
+        # that names it. a QUEUE rather than a flag: stdout can fall a whole generation behind, and
+        # a flag would let the second seal overwrite the first, dropping a generation and relabelling
+        # the next one under its step (cursor, codex[bot]).
+        self._sealed_by_count: list[
+            tuple[list[tuple[Any, Any, float]], dict[str, float] | None]
+        ] = []
         # gradings since the last boundary; they belong to the generation still being scored.
         self._samples: list[tuple[Any, Any, float]] = []
         # the last COMPLETE generation, with the step it was logged under. only these publish.
@@ -401,35 +405,65 @@ class RewardObservabilityBuffer:
                     self._pending_totals.setdefault(name, 0.0)
                     try:
                         score = float(value)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
+                        # OverflowError too: an int larger than a float can hold raises it rather
+                        # than ValueError. `_score` calls this OUTSIDE score_single_turn's guard, so
+                        # anything escaping here 400s the reward request and aborts the run over a
+                        # component that is only ever a diagnostic (codex[bot]).
                         continue
                     if math.isfinite(score):
                         self._pending_totals[name] += score
             if self._generation_size and self._scored_this_generation >= self._generation_size:
                 # the generation is complete BY COUNT, on the thread that completed it: nothing from
-                # the next one can be folded in, whenever the child's stdout happens to arrive.
-                self._seal(self._generation)
-                self._generation += 1
-                self._sealed_by_count = True
+                # the next one can be folded in, whenever the child's stdout happens to arrive. it is
+                # captured here and named later -- the step it belongs to is the child's to say.
+                self._sealed_by_count.append(self._close())
+                # a child that has stopped printing step lines is not going to claim these. drop the
+                # OLDEST, the same direction `_samples` evicts: what survives is what the model is
+                # doing now, rather than a window frozen at the moment stdout went quiet.
+                del self._sealed_by_count[: -self._SEALED_QUEUE_LIMIT]
 
-    def _seal(self, step: int) -> None:
-        """Publish the open generation as ``step``'s output. Caller holds the lock."""
+    def _close(self) -> tuple[list[tuple[Any, Any, float]], dict[str, float] | None]:
+        """Take the open generation's samples and mean metrics. Caller holds the lock.
+
+        The metrics are ``None`` when this generation counted no breakdowns at all -- a multi-turn
+        episode grades to a scalar and never reports named components -- which is NOT the same as
+        counting completions that all failed to report one. See ``_publish``.
+        """
+        metrics: dict[str, float] | None = None
         if self._pending_count:
-            metrics = {name: total / self._pending_count for name, total in self._pending_totals.items()}
+            metrics = {
+                name: total / self._pending_count for name, total in self._pending_totals.items()
+            }
             self._pending_totals = {}
             self._pending_count = 0
-            if metrics:
-                self._latest_metrics = metrics
-            elif self._latest_metrics:
-                # every completion failed scoring this generation: surface the known metrics as
-                # zeros instead of dropping them, so a full scoring outage shows a flat 0 rather
-                # than hiding behind missing heartbeat fields.
-                self._latest_metrics = dict.fromkeys(self._latest_metrics, 0.0)
-        if self._samples:
-            self._published = self._samples
-            self._published_step = int(step)
-            self._samples = []
+        samples = self._samples
+        self._samples = []
         self._scored_this_generation = 0
+        return samples, metrics
+
+    def _publish(
+        self,
+        samples: list[tuple[Any, Any, float]],
+        metrics: dict[str, float] | None,
+        *,
+        step: int,
+    ) -> None:
+        """Make one closed generation the published reading, under ``step``. Caller holds the lock."""
+        if metrics:
+            self._latest_metrics = metrics
+        elif metrics is not None and self._latest_metrics:
+            # every completion failed scoring this generation: surface the known metrics as
+            # zeros instead of dropping them, so a full scoring outage shows a flat 0 rather
+            # than hiding behind missing heartbeat fields.
+            self._latest_metrics = dict.fromkeys(self._latest_metrics, 0.0)
+        if samples:
+            self._published = samples
+            self._published_step = int(step)
+
+    def _seal(self, step: int) -> None:
+        """Close the open generation and publish it as ``step``. Caller holds the lock."""
+        self._publish(*self._close(), step=step)
 
     def close_generation(self, step: int) -> None:
         """Name the generation verl logged as ``step``, sealing it if the count has not already.
@@ -445,15 +479,15 @@ class RewardObservabilityBuffer:
         with self._lock:
             if self._sealed_by_count:
                 # the count already sealed this step's generation, and what is open now belongs to
-                # the NEXT one -- sealing again here is exactly the leak this avoids. only the label
-                # is owed: the published rows ARE the ones this step produced.
-                self._published_step = int(step)
+                # a LATER one -- sealing again here is exactly the leak this avoids. this line names
+                # the oldest generation still waiting for one, so a stdout delivery that falls a
+                # whole generation behind names them in the order they were produced instead of
+                # overwriting the earlier one (cursor, codex[bot]).
+                self._publish(*self._sealed_by_count.pop(0), step=step)
             elif self._samples or self._pending_count:
                 self._seal(step)
             # otherwise this step generated nothing, and the published rows stay under the step that
             # did produce them: relabelling would republish old text as freshly generated.
-            self._sealed_by_count = False
-            self._generation = int(step) + 1
 
     def latest(self) -> tuple[Any, Any, float] | None:
         """The most recently scored ``(prompt, completion, reward)``, for a per-step log preview.
@@ -507,7 +541,10 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
             continue
         try:
             score = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # an int too large for a float raises OverflowError, not ValueError. this runs on the
+            # heartbeat thread over a caller-supplied dict, so letting it out kills liveness
+            # reporting for the rest of the run.
             continue
         if not math.isfinite(score):
             continue

@@ -1037,6 +1037,17 @@ class _CountingBreakdownEnv:
         return {"n": n, "total": n}
 
 
+class _OverflowingBreakdownEnv:
+    """A named component too large to be a float, beside a usable one and a usable total.
+
+    `float()` raises OverflowError on this, NOT ValueError -- a distinction the observability pass
+    has to make because it runs outside the grading error guard."""
+
+    def scores_breakdown(self, graded, ex, state):
+        hit = 1.0 if graded.strip() == ex["gt"] else 0.0
+        return {"success": hit, "enormous": 10**400, "total": hit}
+
+
 class _BadTotalEnv:
     def scores_breakdown(self, graded, ex, state):
         return {"success": 1.0, "total": "not-a-number"}
@@ -3124,6 +3135,48 @@ def test_a_bridge_without_a_recorder_still_scores():
     assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.5}
 
 
+@pytest.mark.parametrize(
+    "abort", [{"truncated": True}, {"skip_reason": "length"}], ids=["truncated", "skipped"]
+)
+def test_a_first_turn_abort_is_still_shown_in_the_sample(abort):
+    """The turn the episode DIED on is the one worth reading, and it is trained on either way.
+
+    `step` keeps an unusable turn out of `messages` so the env never scores it. Building the sample
+    from that state alone therefore publishes an empty completion for a first-turn truncation --
+    a model that generated right up to its token limit reads as a model that generated nothing
+    (codex[bot])."""
+    recorded: list[tuple] = []
+    env = _BridgeEnv(done_after=99)
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    assert bridge.step({"session_id": "a", "completion_text": "ran out of ro", **abort}) == {
+        "terminal": True,
+        "messages": [],
+    }
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    assert env.recorded == [], "the env was shown a turn it must never score"
+    assert [m.get("content") for m in recorded[0][1]] == ["ran out of ro"]
+
+
+def test_the_env_never_scores_the_aborted_turn_it_is_shown_in_the_sample():
+    # the two sides are separate on purpose: the sample gains the turn, the scored state does not.
+    # asserting only on the sample would pass an implementation that also appended it to `messages`,
+    # which is the truncated-text-gets-graded bug the abort branch exists to prevent.
+    env = _BridgeEnv(done_after=99)
+    bridge = rl_verl.MultiTurnBridge(env, [{"index": 0}], max_turns=4)
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "good turn"})
+    bridge.step({"session_id": "a", "completion_text": "cut off", "truncated": True})
+    bridge.score({"session_id": "a", "turn_count": 2})
+
+    scored = [m.get("content") for m in env.scored[0]["messages"]]
+    assert "cut off" not in scored, "the truncated turn reached the env's scoring state"
+    assert "good turn" in scored
+
+
 def test_bridge_close_releases_the_session():
     # every in-flight episode holds env state. a leak here grows for the whole run, and the child
     # closes in a finally precisely so a failed episode still frees it -- so close must tolerate a
@@ -3736,6 +3789,65 @@ def test_the_next_generation_cannot_be_sealed_into_the_step_line_that_is_still_i
     second = buffer.heartbeat_fields()
     assert second["reward_metrics"]["success"] == 0.0, "step 2 republished step 1"
     assert {s["generated_at_step"] for s in second["sampled_completions"]} == {2}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_generation_that_completes_before_the_previous_step_line_is_not_lost():
+    """Stdout can fall a WHOLE generation behind, not just part of one.
+
+    A single "already sealed" flag only remembers one unacknowledged generation, so the second seal
+    overwrites the first: generation 1 is dropped and generation 2 publishes under step 1, leaving
+    every later step misaligned. Small generations make that window ordinary (cursor, codex[bot])."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score(0, "7")
+    score(0, "7")  # generation 1 complete: success 1.0
+    score(0, "wrong")
+    score(0, "wrong")  # generation 2 complete too, and NEITHER step line has arrived
+
+    buffer.close_generation(1)
+    first = buffer.heartbeat_fields()
+    assert first["reward_metrics"]["success"] == 1.0, "generation 1 was overwritten before it published"
+    assert [s["completion"] for s in first["sampled_completions"]] == ["7", "7"]
+    assert {s["generated_at_step"] for s in first["sampled_completions"]} == {1}
+
+    buffer.close_generation(2)
+    second = buffer.heartbeat_fields()
+    assert second["reward_metrics"]["success"] == 0.0
+    assert [s["completion"] for s in second["sampled_completions"]] == ["wrong", "wrong"]
+    assert {s["generated_at_step"] for s in second["sampled_completions"]} == {2}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_queue_of_unnamed_generations_is_bounded():
+    # the queue holds whole generations, each retaining up to _SAMPLE_BUFFER_LIMIT completions. a
+    # child that stops printing step lines never drains it, and this process is already memory-tight.
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    for _ in range(4 * RewardObservabilityBuffer._SEALED_QUEUE_LIMIT):
+        score(0, "7")
+
+    assert len(buffer._sealed_by_count) == RewardObservabilityBuffer._SEALED_QUEUE_LIMIT
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request():
+    """`record` runs OUTSIDE `score_single_turn`'s error guard, so anything it raises 400s the
+    reward request and aborts the run. An int larger than a float can hold raises OverflowError,
+    which is neither TypeError nor ValueError (codex[bot])."""
+    score, buffer = _score_buffer(_OverflowingBreakdownEnv())
+
+    assert score(0, "7") == 1.0  # the total graded fine; only the diagnostic component is unusable
+    buffer.close_generation(1)
+    metrics = buffer.heartbeat_fields()["reward_metrics"]
+    assert metrics["success"] == 1.0, "a usable component was dropped with the unusable one"
+    assert metrics["enormous"] == 0.0
+
+
+def test_the_published_metric_bound_survives_a_value_too_large_to_be_a_float():
+    # the same coercion runs again on the publish side, on the heartbeat thread, over a dict the
+    # trl callback takes from its caller. escaping there kills liveness reporting for the whole run.
+    from flash.engine.worker.heartbeat import _bounded_reward_metrics
+
+    assert _bounded_reward_metrics({"huge": 10**400, "fine": 0.25}) == {"fine": 0.25}
 
 
 def test_the_generation_size_is_the_configured_rollout_count():

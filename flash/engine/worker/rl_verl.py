@@ -1440,6 +1440,14 @@ class MultiTurnBridge:
             # append a truncated or empty assistant message to the transcript that gets scored.
             # the child stops on the same condition, so this only decides what the env sees.
             if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
+                # it is still the turn the model generated and the child trained on, so it is kept
+                # for the DIAGNOSTIC transcript. dropping it entirely would publish an empty
+                # completion for a first-turn truncation -- the one sample worth reading, since it
+                # is the failure being diagnosed (codex[bot]).
+                session["aborted_turn"] = {
+                    "role": "assistant",
+                    "content": str(payload.get("completion_text") or ""),
+                }
                 return {"terminal": True, "messages": []}
             self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
             if self._env.rollout_done(state, self._max_turns):
@@ -1478,6 +1486,11 @@ class MultiTurnBridge:
             # slice by length rather than by equality -- an env may legitimately produce a turn that
             # matches a prompt message, and dropping it would silently truncate the episode.
             transcript = list(state.get("messages") or ())[len(prompt) :]
+            # the aborted turn never entered `messages` -- the env must not score it -- but the
+            # child trained on its tokens, so the sample shows what was actually generated.
+            aborted = session.get("aborted_turn")
+            if aborted is not None:
+                transcript.append(aborted)
         # per-turn credit is a separate invariant (it needs a custom verl advantage estimator), so
         # only the episode reward crosses back. nan is score_rollouts' unscorable marker; verl has
         # no equivalent, and a nan would propagate into the group baseline and poison every other
