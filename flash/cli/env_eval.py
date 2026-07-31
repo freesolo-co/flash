@@ -122,7 +122,33 @@ def _generate_case(client, target: str, messages: list[dict], args) -> str | _Ge
         return _GenerationFailure(f"generation failed: {str(exc) or exc.__class__.__name__}")
 
 
-def _score_case(suite, case: EvalCase, case_id: str, response: str) -> EvalResult:
+def _scored_response(response: str, *, thinking: bool) -> str:
+    """The response as a scorer should see it, matching what training grades.
+
+    Training never hands a grader the raw completion: both the single-turn and multi-turn paths
+    strip the reasoning through `flash.thinking` first (flash/envs/adapter.py). Evaluating the raw
+    string instead mis-grades a thinking deployment against its own environment -- the scaffolded
+    multi-turn scorer reads the first token as an int, which is `<think>` for every reasoning run.
+
+    Gated on the run's own `thinking`, never on the text: `strip_think` also cuts at a bare
+    `<think>` mention, so applying it to a non-thinking answer that merely names the tag would
+    truncate a correct response."""
+    if not thinking:
+        return response
+    from flash.envs.adapter import _ScoredResponseText
+    from flash.thinking import strip_think, thinking_text
+
+    answer = strip_think(response)
+    return _ScoredResponseText(
+        answer if isinstance(answer, str) else response,
+        raw=response,
+        thinking=thinking_text(response),
+    )
+
+
+def _score_case(
+    suite, case: EvalCase, case_id: str, response: str, *, thinking: bool = False
+) -> EvalResult:
     """Grade one response on the caller's thread.
 
     Scoring never runs in a worker. A lock would serialize it but still execute it off the
@@ -130,7 +156,7 @@ def _score_case(suite, case: EvalCase, case_id: str, response: str) -> EvalResul
     signal-based timeout raises `signal only works in main thread`, which would be recorded
     as the model failing the case rather than as a broken harness."""
     try:
-        scored = suite.score(case, response)
+        scored = suite.score(case, _scored_response(response, thinking=thinking))
         return normalize_eval_result(case, response, scored, case_id=case_id)
     except (Exception, SystemExit) as exc:
         return EvalResult(
@@ -221,7 +247,7 @@ def _build_messages(environment, case: EvalCase) -> list[dict] | _GenerationFail
 
 
 def _run_cases(
-    client, target: str, suite, cases: list[EvalCase], args, environment=None
+    client, target: str, suite, cases: list[EvalCase], args, environment=None, thinking=False
 ) -> tuple[EvalResult, ...]:
     """Generate concurrently, score serially on this thread.
 
@@ -238,7 +264,7 @@ def _run_cases(
     return tuple(
         _generation_error(case_id, response.error)
         if isinstance(response, _GenerationFailure)
-        else _score_case(suite, case, case_id, response)
+        else _score_case(suite, case, case_id, response, thinking=thinking)
         for case, case_id, response in zip(cases, case_ids, responses, strict=True)
     )
 
@@ -520,6 +546,21 @@ def cmd_env_eval(args) -> int:
         evaluation_target = candidate.strip()
         print(f"resolved evaluation target {run_id} to {evaluation_target}")
 
+    # graders must see what training graded, so the run's own `thinking` decides whether the
+    # reasoning is stripped first (see `_scored_response`). read once here rather than per case:
+    # it is the same answer for every case, and a suite of 200 would otherwise buy 200 lookups.
+    thinking = False
+    target_run_id = (revision or parsed or (None,))[0]
+    if target_run_id:
+        try:
+            spec = client.get_run(target_run_id).get("spec")
+            thinking = bool(spec.get("thinking")) if isinstance(spec, dict) else False
+        except Exception as exc:
+            # not fatal: a run whose metadata is unreadable can still be evaluated, and the raw
+            # response is what every eval graded before this. broad, because an unreachable plane
+            # must not turn a working evaluation into a crash. say so rather than grade silently.
+            _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
+
     reports: list[EvalSuiteReport] = []
     for suite in suites:
         # each suite uploads as its own run, so each needs its own start. sharing one timestamp
@@ -577,7 +618,9 @@ def cmd_env_eval(args) -> int:
             continue
         if args.max_cases is not None:
             cases = cases[: args.max_cases]
-        results = _run_cases(client, evaluation_target, suite, cases, args, environment)
+        results = _run_cases(
+            client, evaluation_target, suite, cases, args, environment, thinking=thinking
+        )
         for result in results:
             _print_case(result)
         report = EvalSuiteReport(name=suite.name, results=results)
