@@ -48,13 +48,16 @@ from flash.engine.structured_outputs import (
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
     VERL_REQUIREMENT,
+    adopt_orphaned_descendants,
     agent_loop_workers,
     append_step_metrics,
     clamp_engine_len,
+    kill_process_group,
     model_max_position_embeddings,
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    reap_stragglers,
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
@@ -3352,6 +3355,10 @@ def run_rl_train():
             fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
             progress_step=True,
         ):
+            # claimed before the child exists, so a grandchild it orphans reparents here and can be
+            # reaped at teardown. this process is not pid 1 (the runpod handler is), so without it
+            # every wait answers ChildProcessError for a zombie nobody will collect.
+            adopt_orphaned_descendants()
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
                 stdout=subprocess.PIPE,
@@ -3438,11 +3445,11 @@ def run_rl_train():
                 rc = proc.wait()
             except BaseException:
                 # the stream loop died (upload error, cancel, oom in the parent): a still-running
-                # verl child would keep burning the gpu unattended — kill its whole process group.
-                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                    os.killpg(os.getpgid(proc.pid), 15)
-                with contextlib.suppress(Exception):
-                    proc.wait(timeout=10)
+                # verl child would keep burning the gpu unattended, so kill its whole process group.
+                # this escalates to SIGKILL after the grace period, which a bare SIGTERM does not: a
+                # vllm EngineCore that ignores the term keeps its cuda context and strands the gpu
+                # for every later job on a reusable worker.
+                kill_process_group(proc)
                 raise
         if rc != 0:
             raise RuntimeError(
@@ -3483,6 +3490,12 @@ def run_rl_train():
             with contextlib.suppress(Exception):
                 multi_turn_bridge.shutdown()
         server.shutdown()
+        # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions
+        # alone here, so a straggler an earlier teardown SIGKILLed but could not drain in time would
+        # otherwise be collected only by the next FAILING job: a reusable worker running successful
+        # grpo jobs after one late straggler keeps that zombie for life (cursor).
+        with contextlib.suppress(Exception):
+            reap_stragglers()
 
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
     out_dir = f"/tmp/rl_seed{_w.SEED}"
