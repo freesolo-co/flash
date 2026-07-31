@@ -271,10 +271,24 @@ def _call_factory(factory, kwargs: dict[str, object]) -> object:
     )
     if accepts_var_kwargs:
         return factory(**kwargs)
+    # a positional-only parameter is in signature.parameters but cannot be passed by name, so
+    # matching on membership alone would raise TypeError for `load_evaluations(environment, /)`.
+    # such a factory declared the argument, so pass it positionally rather than dropping it and
+    # handing the suite environment=None -- which downgrades a real scorer to substring matching.
+    positional: list[object] = []
+    for name, parameter in signature.parameters.items():
+        if parameter.kind != inspect.Parameter.POSITIONAL_ONLY:
+            break
+        if name not in kwargs:
+            break
+        positional.append(kwargs[name])
+    consumed = list(signature.parameters)[: len(positional)]
     filtered_kwargs = {
-        name: value for name, value in kwargs.items() if name in signature.parameters
+        name: value
+        for name, value in kwargs.items()
+        if name in signature.parameters and name not in consumed
     }
-    return factory(**filtered_kwargs)
+    return factory(*positional, **filtered_kwargs)
 
 
 def _validate_suites(value: object, *, source: Path) -> list[EvalSuite]:
