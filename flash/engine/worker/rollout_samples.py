@@ -9,6 +9,7 @@ multimodal parts are replaced with placeholders. Sizes are already bounded by th
 
 from __future__ import annotations
 
+import math
 import sys
 from collections.abc import Iterable
 from typing import Any
@@ -58,7 +59,13 @@ def _message_text(value: dict[str, Any]) -> str:
     return f"{role}: {content}" if role else content
 
 
-def _sample_text(value: Any) -> str:
+def sample_completion_text(value: Any) -> str:
+    """Flatten one prompt or completion to display text, whatever shape the backend produced.
+
+    A completion is plain text (single-turn), one message dict, or a whole message list (a
+    multi-turn transcript); non-text multimodal parts become placeholders. Public because the verl
+    path logs a per-step preview of the same value it later publishes as a sample, and the two must
+    agree on what the text of a rollout is."""
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
@@ -93,8 +100,8 @@ def build_rollout_sample(
     """Build one full, credential-safe rollout sample without retaining source example objects.
 
     Exactly one of ``reward`` (GRPO) or ``loss`` (OPD) is supplied and stored under its own key."""
-    prompt_text = _sample_text(prompt)
-    completion_text = _sample_text(completion)
+    prompt_text = sample_completion_text(prompt)
+    completion_text = sample_completion_text(completion)
     try:
         step = int(generated_at_step) if generated_at_step is not None else None
     except (TypeError, ValueError):
@@ -104,10 +111,17 @@ def build_rollout_sample(
         "completion": sanitize_rollout_text(completion_text),
         "generated_at_step": step,
     }
-    if reward is not None:
-        record["reward"] = float(reward)
-    if loss is not None:
-        record["loss"] = float(loss)
+    # this is the one place the scalar is coerced, so it is the one place a non-finite one can be
+    # created. omit rather than publish it: json.dumps writes bare NaN/Infinity, which is not json,
+    # and a strict reader rejects the whole heartbeat over it -- losing the step's other fields too.
+    # a sample without its scalar is then skipped by the reader, so a diverged step publishes fewer
+    # samples rather than a payload that will not parse.
+    for key, value in (("reward", reward), ("loss", loss)):
+        if value is None:
+            continue
+        scalar = float(value)
+        if math.isfinite(scalar):
+            record[key] = scalar
     return record
 
 
@@ -129,7 +143,7 @@ def select_rollout_samples(
     repeats: list[tuple[Any, Any, Any]] = []
     seen_prompts: set[str] = set()
     for row in rows:
-        prompt_key = _sample_text(row[0])
+        prompt_key = sample_completion_text(row[0])
         if prompt_key in seen_prompts:
             repeats.append(row)
         else:
