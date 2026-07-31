@@ -810,7 +810,7 @@ def _finalize_src(module_name: str, fn_name: str) -> str:
 
 
 def test_run_rl_publishes_final_step_as_deployable_checkpoint():
-    src = _finalize_src("flash.engine.worker.rl_verl", "run_rl_verl")
+    src = _finalize_src("flash.engine.worker.rl_train", "run_rl_train")
     # Warm-start CONTINUES the one adapter in place, so the saved adapter already carries SFT+GRPO on
     # the original catalog base and deploys as-is: the final adapter is uploaded as the default and
     # published as the deployable checkpoint directly — no recombine step.
