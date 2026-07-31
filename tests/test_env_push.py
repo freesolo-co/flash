@@ -210,6 +210,53 @@ def test_push_ships_the_package_when_a_module_of_the_same_name_shadows_it(monkey
     assert "graders/__init__.py" in files
 
 
+def test_push_ships_a_namespace_package_helper(monkeypatch, tmp_path):
+    """A PEP 420 `graders/` with no __init__.py is still importable, so it still has to ship.
+
+    Requiring the marker file sent the helper to the `graders.py` fallback, which does not exist
+    either, so the archive carried evaluations.py alone and the published environment raised
+    ModuleNotFoundError on its first case (codex[bot]).
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from graders.rules import score\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    graders = tmp_path / "graders"
+    graders.mkdir()
+    (graders / "rules.py").write_text("def score(value): return True\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "graders/rules.py" in files
+
+
+def test_push_prefers_the_module_over_a_namespace_directory(monkeypatch, tmp_path):
+    """With graders.py and a bare graders/, `import graders` binds the MODULE.
+
+    Only a regular package (one holding __init__.py) outranks a same-named module; a namespace
+    directory is merely a fallback portion. Shipping the directory here would publish the file
+    the sidecar never imports.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import graders\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    (tmp_path / "graders.py").write_text("WINS = True\n")
+    graders = tmp_path / "graders"
+    graders.mkdir()
+    (graders / "rules.py").write_text("def score(value): return True\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "graders.py" in files
+
+
 def test_push_ships_helpers_a_helper_imports(monkeypatch, tmp_path):
     """A helper's own siblings ship too, or the published sidecar fails on its first case.
 
