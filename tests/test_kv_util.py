@@ -132,8 +132,12 @@ def test_non_sleep_bigger_model_gets_a_bigger_budget():
 
 
 def test_caps_at_045_on_small_or_weight_heavy_configs():
-    assert colocate_kv_util(4.0, 2048, 32.0, sleep_mode=True, num_generations=8) == 0.45  # small card
-    assert colocate_kv_util(9.0, 2048, 80.0, sleep_mode=True, num_generations=8) == 0.45  # weight-heavy
+    assert (
+        colocate_kv_util(4.0, 2048, 32.0, sleep_mode=True, num_generations=8) == 0.45
+    )  # small card
+    assert (
+        colocate_kv_util(9.0, 2048, 80.0, sleep_mode=True, num_generations=8) == 0.45
+    )  # weight-heavy
 
 
 def test_big_card_big_weight_colocate_lifts_cap_to_055():
@@ -192,9 +196,9 @@ def test_moe_sizes_kv_on_active_backbone_not_total():
     assert u_total == max(0.10, min(0.45, (35.0 * 2.0 + kv_total) / card))
     assert u_active < u_total
     # dense (active unset/0) is unchanged: every term keys off the single params_b.
-    assert colocate_kv_util(4.0, 2048, 80.0, sleep_mode=False, active_params_b=0.0) == colocate_kv_util(
-        4.0, 2048, 80.0, sleep_mode=False
-    )
+    assert colocate_kv_util(
+        4.0, 2048, 80.0, sleep_mode=False, active_params_b=0.0
+    ) == colocate_kv_util(4.0, 2048, 80.0, sleep_mode=False)
 
 
 def test_moe_colocate_budget_kv_matches_resident_gate_kv():
@@ -204,7 +208,9 @@ def test_moe_colocate_budget_kv_matches_resident_gate_kv():
     # it equals the active-width resident KV the gate adds — so the gate can't disable sleep on a KV
     # the engine then exceeds.
     card = 320.0  # below the 0.45 cap so util*card exposes the real KV term
-    util = colocate_kv_util(35.0, 4096, card, sleep_mode=False, num_generations=8, active_params_b=3.0)
+    util = colocate_kv_util(
+        35.0, 4096, card, sleep_mode=False, num_generations=8, active_params_b=3.0
+    )
     budget_kv = util * card - 35.0 * 2.0
     gate_kv = max(_KV_CAP, _resident_kv_gb(3.0, 4096, 8))  # what the active-aware gate adds for KV
     assert round(budget_kv, 6) == round(gate_kv, 6)

@@ -142,9 +142,7 @@ class VastProvider(InstanceProvider):
             return []
         try:
             # Search once at the smallest fitting class's VRAM; the market covers every class at/above it.
-            rate_kwargs = (
-                {"gpu_type": constraints.gpu_type} if constraints.gpu_type else {}
-            )
+            rate_kwargs = {"gpu_type": constraints.gpu_type} if constraints.gpu_type else {}
             rates = live_candidate_rates(
                 min(g.vram_gb for g in fitting),
                 constraints.disk_gb,

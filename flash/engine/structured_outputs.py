@@ -56,7 +56,9 @@ def parse_structured_outputs(spec_json: str | None) -> dict | None:
     try:
         spec = json.loads(spec_json)
     except ValueError as exc:
-        raise ValueError(f"corrupt train.structured_outputs payload: {spec_json!r} ({exc})") from exc
+        raise ValueError(
+            f"corrupt train.structured_outputs payload: {spec_json!r} ({exc})"
+        ) from exc
     if not isinstance(spec, dict) or not any(spec.get(k) is not None for k in CONSTRAINT_KEYS):
         raise ValueError(f"corrupt train.structured_outputs payload (no constraint): {spec_json!r}")
     return spec

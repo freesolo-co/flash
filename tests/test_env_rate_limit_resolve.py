@@ -35,7 +35,9 @@ def test_urlopen_raises_typed_error_on_429(monkeypatch):
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
-        urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(_http_error(429, "slow down"))
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(429, "slow down")),
     )
     with pytest.raises(GitHubRateLimitError):
         _urlopen(urllib.request.Request("https://api.github.com/x"))
