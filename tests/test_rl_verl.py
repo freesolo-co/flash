@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import json
 import os
@@ -4563,3 +4564,164 @@ def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
     bridge = rl_verl.MultiTurnBridge(_Env(), [{"question": "q"}], max_turns=2, per_turn_credit=True)
     bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
     assert bridge.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0, "turns": None}
+
+
+def _drive_multi_turn_episode(
+    *, stop_reasons, env, per_turn_credit=True, max_turns=4, monkeypatch=None
+):
+    """run the real child loop end to end against a real bridge, returning its agent loop output.
+
+    the loop is the thing under test here: it is what appends turn_spans and what tells the bridge
+    how many turns to score. a hand-built bridge conversation would restate that bookkeeping
+    instead of exercising it.
+    """
+    from flash.engine.worker import grpo_multiturn
+
+    monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
+    monkeypatch.setenv("FLASH_VERL_MAX_TURNS", str(max_turns))
+    monkeypatch.setenv("FLASH_VERL_MAX_MODEL_LEN", "4096")
+
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"question": "q"}], max_turns=max_turns, per_turn_credit=per_turn_credit
+    )
+    routes = bridge.routes()
+
+    def bridge_post(url, path, payload):
+        return routes[path](payload)
+
+    class _Tokenizer:
+        """one codepoint per token, so spans are readable straight off response_ids."""
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(chr(int(i)) for i in ids)
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(c) for c in text]}
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "".join(str(m.get("content") or "") for m in messages)
+
+    class _Base:
+        def __init__(self):
+            self.tokenizer = _Tokenizer()
+            self.rollout_config = SimpleNamespace(response_length=256)
+            self.server_manager = self
+            self._sent = list(stop_reasons)
+
+        async def apply_chat_template(self, messages):
+            return [1, 2, 3]
+
+        async def generate(self, *, request_id, prompt_ids, sampling_params):
+            text, stop_reason = self._sent.pop(0)
+            return SimpleNamespace(
+                token_ids=[ord(c) for c in text],
+                log_probs=[0.0] * len(text),
+                num_preempted=0,
+                stop_reason=stop_reason,
+            )
+
+    captured = {}
+
+    def agent_loop_output(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    loop_class = grpo_multiturn.build_flash_grpo_multi_turn_agent_loop(
+        register=lambda name: lambda cls: cls,
+        agent_loop_base=_Base,
+        agent_loop_output=agent_loop_output,
+        bridge_post=bridge_post,
+    )
+
+    async def _go():
+        instance = loop_class()
+        # the loop offloads the bridge's blocking posts onto this executor, so it has to be the
+        # one actually running the coroutine.
+        instance.loop = asyncio.get_running_loop()
+        await instance.run({}, raw_prompt=[{"role": "user", "content": "go"}], index=0)
+
+    asyncio.run(_go())
+    return captured
+
+
+class _SpanEnv:
+    """an env that returns one reward per turn it was actually told about."""
+
+    max_turns = 4
+
+    def __init__(self):
+        self.recorded: list[str] = []
+
+    def new_rollout_state(self, example):
+        return {"prompt": [], "messages": []}
+
+    def record_model_turn(self, state, text):
+        self.recorded.append(text)
+        state["messages"].append({"role": "assistant", "content": text})
+
+    def rollout_done(self, state, max_turns=None):
+        return False
+
+    def env_reply(self, messages, state):
+        return [{"role": "user", "content": "next"}]
+
+    def rollout_rewards_many(self, items):
+        from flash.envs.base import RolloutReward
+
+        return [RolloutReward(episode=1.0, turns=tuple(0.5 for _ in self.recorded)) for _ in items]
+
+
+def test_a_truncated_final_turn_still_earns_per_turn_credit_for_the_turns_before_it(monkeypatch):
+    # the bridge does not record an aborted turn into env state (MultiTurnBridge.step returns before
+    # record_model_turn), so the env returns no reward for it. the loop must not span it either, or
+    # the vector is one short of the spans, score_rollouts rejects the count, and the row -- and via
+    # the shim its whole group -- silently drops to episode credit (cursor).
+    env = _SpanEnv()
+    out = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed"), ("cd", "aborted")], env=env, monkeypatch=monkeypatch
+    )
+    assert env.recorded == ["ab"], "the aborted turn was recorded into env state"
+    assert len(out["extra_fields"]["flash_turn_spans"]) == 1, "the aborted turn was spanned"
+    assert out["extra_fields"]["flash_turn_rewards"] == [0.5], (
+        "per-turn credit was dropped: the span count disagreed with the env's reward count"
+    )
+    # the truncated tokens are still trained on, they just carry no turn coordinate: the transcript
+    # is turn "ab", the env's "next" glue, then the aborted "cd".
+    assert out["num_turns"] == 2
+    assert out["response_ids"] == [ord(c) for c in "abnextcd"]
+    assert out["response_mask"] == [1, 1, 0, 0, 0, 0, 1, 1]
+
+
+def test_an_unspanned_truncated_turns_tokens_are_still_generated_and_masked_as_model_output(
+    monkeypatch,
+):
+    # the control for the fix above: dropping the SPAN must not drop the TOKENS. if the fix had
+    # skipped the turn entirely, the child would train on a transcript that never contained it.
+    env = _SpanEnv()
+    out = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed"), ("cd", "aborted")], env=env, monkeypatch=monkeypatch
+    )
+    assert out["response_ids"][-2:] == [ord("c"), ord("d")], "the truncated turn's tokens were lost"
+    assert out["response_mask"][-2:] == [1, 1], "the truncated turn's tokens were not model-masked"
+
+
+def test_every_turn_is_spanned_when_none_of_them_abort(monkeypatch):
+    # the negative control: without an abort, spans and rewards are one per turn and per-turn credit
+    # is live. an over-eager skip would show up here as a missing span.
+    env = _SpanEnv()
+    out = _drive_multi_turn_episode(
+        stop_reasons=[
+            ("ab", "completed"),
+            ("cd", "completed"),
+            ("ef", "completed"),
+            ("gh", "completed"),
+        ],
+        env=env,
+        monkeypatch=monkeypatch,
+    )
+    assert env.recorded == ["ab", "cd", "ef", "gh"]
+    assert len(out["extra_fields"]["flash_turn_spans"]) == 4
+    assert out["extra_fields"]["flash_turn_rewards"] == [0.5, 0.5, 0.5, 0.5]

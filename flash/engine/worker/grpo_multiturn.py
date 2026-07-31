@@ -194,8 +194,17 @@ def build_flash_grpo_multi_turn_agent_loop(
                     turn_ids = turn["response_ids"]
                     turn_start = len(response_ids)
                     response_ids.extend(turn_ids)
-                    turn_spans.append((turn_start, len(response_ids)))
                     response_mask.extend([1] * len(turn_ids))
+                    # a truncated or unusable turn is NOT recorded into env state by the bridge
+                    # (MultiTurnBridge.step returns before record_model_turn), so the environment
+                    # never sees it and returns no reward for it. spanning it here would leave one
+                    # more span than there are rewards, which score_rollouts rejects as a count
+                    # mismatch -- dropping the row, and with it its whole group, to episode credit.
+                    # the tokens stay in response_ids and stay trained on; they just carry no turn
+                    # coordinate. this is the same identity the trl driver scores on, where the
+                    # turn IS recorded and so IS spanned (multiturn_rollout.rollout_one).
+                    if not (turn["truncated"] or turn["skip_reason"]):
+                        turn_spans.append((turn_start, len(response_ids)))
                     if have_logprobs and generated.log_probs is not None:
                         response_logprobs.extend(list(generated.log_probs[: len(turn_ids)]))
                     else:
@@ -249,7 +258,11 @@ def build_flash_grpo_multi_turn_agent_loop(
                     lambda: bridge_post(
                         bridge_url,
                         "/multiturn/score",
-                        {"session_id": session_id, "turn_count": turn_count},
+                        # the count the ENV was told about, not `turn_count`: an aborted turn is
+                        # generated (and counted in num_turns) but never recorded into env state,
+                        # so asking for a reward per generated turn would request one the env has
+                        # no turn for. len(turn_spans) is the same quantity trl scores on.
+                        {"session_id": session_id, "turn_count": len(turn_spans)},
                     ),
                 )
                 reward_score = float(score_payload["score"])
