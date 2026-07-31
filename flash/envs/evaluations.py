@@ -275,13 +275,28 @@ def _call_factory(factory, kwargs: dict[str, object]) -> object:
     # matching on membership alone would raise TypeError for `load_evaluations(environment, /)`.
     # such a factory declared the argument, so pass it positionally rather than dropping it and
     # handing the suite environment=None -- which downgrades a real scorer to substring matching.
+    #
+    # a positional-only parameter we have no value for still has to be filled, otherwise every
+    # parameter after it shifts left. use its default; a required one cannot be satisfied at all,
+    # so stop and let the factory raise its own TypeError rather than passing a wrong argument.
     positional: list[object] = []
+    from_kwargs: list[bool] = []
     for name, parameter in signature.parameters.items():
         if parameter.kind != inspect.Parameter.POSITIONAL_ONLY:
             break
-        if name not in kwargs:
+        if name in kwargs:
+            positional.append(kwargs[name])
+            from_kwargs.append(True)
+            continue
+        if parameter.default is inspect.Parameter.empty:
             break
-        positional.append(kwargs[name])
+        positional.append(parameter.default)
+        from_kwargs.append(False)
+    # trailing arguments filled from their own defaults carry no information, so drop them and
+    # let the factory apply those defaults itself.
+    while from_kwargs and not from_kwargs[-1]:
+        positional.pop()
+        from_kwargs.pop()
     consumed = list(signature.parameters)[: len(positional)]
     filtered_kwargs = {
         name: value
