@@ -1,17 +1,22 @@
 """Serving hands reasoning back in ``reasoning_content``, split out of ``content``.
 
 A thinking chat template renders the OPENING ``<think>`` into the prompt, so the model samples only
-the closing tag. The flash side must fold the two fields back into one balanced string: reading
-``content`` alone drops the whole reasoning phase, and reading the raw text alone yields a stray
-``</think>`` with no opener.
+the closing tag. Flash folds the two fields back into one balanced string: reading ``content`` alone
+drops the whole reasoning phase, and reading the raw text alone yields a stray ``</think>`` with no
+opener.
 
 Folding is gated on the request's own ``thinking`` flag rather than inferred from the text. Without
 that gate an ordinary answer containing a literal ``</think>`` was rewritten into a synthetic
 reasoning block, on a path that also backs the public non-streaming chat route.
+
+The non-streaming result is the reference shape: it is what the public chat route serves, and what
+``_thinking_answer`` and the deployment smoke were written against. Every payload the streaming path
+can also receive is pinned in ``PARITY_CASES``, where the two must agree.
 """
 
 from __future__ import annotations
 
+import json
 from typing import ClassVar
 
 import pytest
@@ -20,244 +25,401 @@ import flash.serve.deploy as deploy
 
 
 def _sse(*deltas: dict) -> list[str]:
-    import json
-
     lines = [f"data: {json.dumps({'choices': [{'delta': d}]})}" for d in deltas]
     lines.append("data: [DONE]")
     return lines
 
 
-def test_split_reasoning_is_folded_back_into_a_balanced_block():
-    message = {"content": "the answer", "reasoning_content": "weighing it up"}
-    assert (
-        deploy._balanced_thinking_content(message, thinking=True)
-        == "<think>weighing it up</think>the answer"
-    )
+def _folded(message: dict, *, thinking: bool = True) -> str:
+    return deploy._balanced_thinking_content(message, thinking=thinking)
 
 
-def test_content_without_reasoning_is_returned_verbatim():
-    # absent and null both mean serving never split the tags out: nothing to fold back in.
-    assert (
-        deploy._balanced_thinking_content({"content": "plain answer"}, thinking=True)
-        == "plain answer"
-    )
-    assert deploy._balanced_thinking_content(
-        {"content": "plain", "reasoning_content": None}, thinking=True
-    ) == ("plain")
-    assert deploy._balanced_thinking_content({}, thinking=True) == ""
+def _streamed(*deltas: dict, thinking: bool = True) -> str:
+    return "".join(deploy._openai_stream_content(iter(_sse(*deltas)), thinking=thinking))
 
 
-def test_an_explicitly_empty_reasoning_string_still_gets_a_balanced_pair():
-    """`""` is not the same as absent: it means the model closed its block before answering.
-
-    Collapsing the two loses a real distinction. A thinking consumer splits the answer on
-    `</think>`, so returning the bare answer here makes a valid completion look like it has no
-    answer at all -- a thinking structured-output deployment then fails its smoke test despite
-    the model having answered correctly.
-    """
-    assert (
-        deploy._balanced_thinking_content(
-            {"content": "plain", "reasoning_content": ""}, thinking=True
-        )
-        == "<think></think>plain"
-    )
+def _split(message: dict) -> tuple[dict, ...]:
+    """``message`` as serving would stream it: the reasoning field, then the answer."""
+    deltas: list[dict] = []
+    if isinstance(message.get("reasoning_content"), str):
+        deltas.append({"reasoning_content": message["reasoning_content"]})
+    if message.get("content"):
+        deltas.append({"content": message["content"]})
+    return tuple(deltas)
 
 
-def test_content_that_already_closes_a_block_is_not_nested_again():
-    # a serving build that leaves the tags inline must not gain a second, outer block -- but it
-    # must still gain the OPENER, which the prompt swallowed. the old expectation returned this
-    # string verbatim, which left `reasoned</think>answer`: a close with nothing opening it, i.e.
-    # exactly the malformed completion this helper exists to repair.
-    message = {"content": "reasoned</think>answer", "reasoning_content": "reasoned"}
-    assert (
-        deploy._balanced_thinking_content(message, thinking=True) == "<think>reasoned</think>answer"
-    )
+# --------------------------------------------------------------------------------------------
+# the fold, on payloads the streaming path cannot receive in this shape.
+
+FOLD_CASES: dict[str, tuple[dict, str]] = {
+    "split-fields": (
+        {"content": "the answer", "reasoning_content": "weighing it up"},
+        "<think>weighing it up</think>the answer",
+    ),
+    # absent and null both mean serving never split the tags out: nothing to fold back in, and the
+    # skew branch must not invent a block for an answer that never had one.
+    "no-reasoning-field": ({"content": "plain answer"}, "plain answer"),
+    "null-reasoning": ({"content": "plain", "reasoning_content": None}, "plain"),
+    "empty-message": ({}, ""),
+    # `""` is not absent: the model closed its block before answering. a thinking consumer splits
+    # the answer on the close tag, so returning the bare answer makes a valid completion look like
+    # it has no answer at all, and the structured smoke then fails a checkpoint that answered.
+    "empty-reasoning": ({"content": "plain", "reasoning_content": ""}, "<think></think>plain"),
+    # a build that leaves the sampled close inline must not gain a second, outer block -- but it
+    # must still gain the OPENER, which the prompt swallowed. the model samples that close on its
+    # own line as often as not, so a whitespace prefix is still the delimiter.
+    "retained-close": (
+        {"content": "reasoned</think>answer", "reasoning_content": "reasoned"},
+        "<think>reasoned</think>answer",
+    ),
+    "bare-retained-close": (
+        {"content": "</think>answer", "reasoning_content": "reasoned"},
+        "<think>reasoned</think>answer",
+    ),
+    "retained-close-behind-newline": (
+        {"content": "\n</think>answer", "reasoning_content": "reasoned"},
+        "<think>reasoned</think>answer",
+    ),
+    "already-balanced": (
+        {"content": "<think>r</think>answer", "reasoning_content": "r"},
+        "<think>r</think>answer",
+    ),
+    # an answer may hold a full literal pair without that pair being the reasoning block. treating
+    # ANY balanced pair as proof the block was folded dropped `reasoning_content` entirely. only a
+    # pair whose body equals the field is the same block emitted twice.
+    "answer-holds-its-own-pair": (
+        {"content": "the tag is <think>like this</think> ok", "reasoning_content": "reasoned"},
+        "<think>reasoned</think>the tag is <think>like this</think> ok",
+    ),
+    "answer-is-a-whole-pair": (
+        {"content": "<think>x</think>", "reasoning_content": "the real reasoning"},
+        "<think>the real reasoning</think><think>x</think>",
+    ),
+    # balance means an opener that PRECEDES a close, not the mere presence of the substring: a
+    # `choice` constraint may be the literal open tag, and returning it unclosed fails the smoke.
+    "answer-is-the-open-tag": (
+        {"content": "<think>", "reasoning_content": "r"},
+        "<think>r</think><think>",
+    ),
+    # body equality alone mistook a pair inside the ANSWER for the reasoning emitted twice, so an
+    # empty-reasoning JSON answer quoting the tag came back with no reasoning block at all.
+    "empty-reasoning-answer-quotes-the-pair": (
+        {"content": '{"tag":"<think></think>"}', "reasoning_content": ""},
+        '<think></think>{"tag":"<think></think>"}',
+    ),
+    # the duplicate check compares the span stripped, so a trailing newline inside the repeat is
+    # the same block rather than a second one.
+    "duplicate-past-trailing-newline": (
+        {"content": "<think>reasoned\n</think>answer", "reasoning_content": "reasoned"},
+        "<think>reasoned\n</think>answer",
+    ),
+}
 
 
-def test_a_bare_inline_close_is_reopened_rather_than_treated_as_balanced():
-    """`</think>answer` has a closer and no opener, so `"</think>" in content` is not "balanced".
-
-    The opening tag came from the prompt, so a serving build that also leaves the sampled close in
-    `content` produces this shape. Treating the stray closer as proof of a balanced block hands
-    CLI and API consumers the very completion this helper repairs.
-    """
-    message = {"content": "</think>answer", "reasoning_content": "reasoned"}
-    out = deploy._balanced_thinking_content(message, thinking=True)
-    assert out == "<think>reasoned</think>answer"
-    assert out.count("<think>") == 1
-    assert out.count("</think>") == 1
+@pytest.mark.parametrize(("message", "expected"), FOLD_CASES.values(), ids=FOLD_CASES)
+def test_the_fold_rebuilds_a_balanced_block(message, expected):
+    assert _folded(message) == expected
 
 
-def test_whitespace_before_the_sampled_close_is_still_the_block_delimiter():
-    """The model samples its close on its own line as often as not.
-
-    Requiring an exactly empty prefix rejected `\\n</think>answer`, fell through to wrapping the
-    whole string, and produced `<think>reasoned</think>\\n</think>answer` -- two close tags, with
-    the real answer stranded behind the first one. `_thinking_answer` splits on that
-    first close, so the smoke then read `\\n</think>answer` as the answer (cursor).
-    """
-    message = {"content": "\n</think>answer", "reasoning_content": "reasoned"}
-    out = deploy._balanced_thinking_content(message, thinking=True)
-
-    assert out == "<think>reasoned</think>answer"
-    assert out.count("</think>") == 1
-    # the shape the smoke actually reads.
-    assert out.split("</think>", 1)[1] == "answer"
-
-
-def test_a_real_opener_is_left_alone():
-    # a genuinely balanced block must pass through untouched, with no second pair.
-    message = {"content": "<think>r</think>answer", "reasoning_content": "r"}
-    assert deploy._balanced_thinking_content(message, thinking=True) == "<think>r</think>answer"
-
-
-def test_an_inline_pair_that_is_not_the_reasoning_keeps_the_real_reasoning():
-    """An answer may contain a full literal pair without that pair being the reasoning block.
-
-    Treating ANY balanced pair as proof the block was already folded returned the answer unchanged
-    and DROPPED `reasoning_content` entirely -- the whole reasoning phase, silently. Only a pair
-    whose body equals the field is the same block emitted twice (codex[bot], cursor).
-    """
-    message = {"content": "the tag is <think>like this</think> ok", "reasoning_content": "reasoned"}
-    out = deploy._balanced_thinking_content(message, thinking=True)
-
-    assert out == "<think>reasoned</think>the tag is <think>like this</think> ok"
-    # the reasoning survives, and the answer is intact after the delimiter.
-    assert "reasoned" in out
-    assert out.split("</think>", 1)[1] == "the tag is <think>like this</think> ok"
-
-
-def test_an_answer_that_is_a_whole_literal_pair_keeps_the_real_reasoning():
-    # the degenerate case of the above: the answer is EXACTLY a pair, e.g. a `choice` constraint.
-    message = {"content": "<think>x</think>", "reasoning_content": "the real reasoning"}
-    out = deploy._balanced_thinking_content(message, thinking=True)
-
-    assert out == "<think>the real reasoning</think><think>x</think>"
-    assert "the real reasoning" in out
-
-
-def test_an_answer_mentioning_the_close_tag_keeps_its_reasoning():
-    """A close tag mid-answer is answer text, not the block delimiter.
-
-    Splitting on the first `</think>` anywhere rewrote such an answer into the reasoning slot and
-    DROPPED the real reasoning: `<think>answer about </think> tags` -- the reasoning "r" is gone and
-    the answer is now the reasoning. The streaming path already only accepts a close at the head of
-    the first content delta (`test_streamed_content_keeps_a_close_tag_that_is_not_the_block_
-    delimiter`); this is its non-streaming twin.
-    """
-    message = {"content": "answer about </think> tags", "reasoning_content": "r"}
-    out = deploy._balanced_thinking_content(message, thinking=True)
-
-    assert out == "<think>r</think>answer about </think> tags"
-    # the reasoning survives, and the answer is not promoted into the reasoning slot.
-    assert out.startswith("<think>r</think>")
-    # and both paths agree on this input.
-    streamed = "".join(
-        deploy._openai_stream_content(
-            iter(_sse({"reasoning_content": "r"}, {"content": "answer about </think> tags"})),
-            thinking=True,
-        )
-    )
-    assert out == streamed
-
-
-def test_an_answer_that_is_the_literal_open_tag_is_still_closed():
-    """A structured answer may BE `<think>` -- a `choice` constraint equal to it, or JSON quoting it.
-
-    Asking only whether the opener appears anywhere reported that answer as an already-balanced
-    block and returned it with no close tag, after which
-    `flash/server/routes/serving.py::_thinking_answer` rejects the deployment smoke.
-    Balance means an opener that precedes a close, not the mere presence of the substring.
-    """
-    message = {"content": "<think>", "reasoning_content": "r"}
-    out = deploy._balanced_thinking_content(message, thinking=True)
-
-    assert out == "<think>r</think><think>"
-    # the answer survives after the delimiter, which is what the smoke's answer split reads.
-    assert out.split("</think>", 1)[1] == "<think>"
-
-
-def test_a_legacy_inline_block_without_the_split_field_is_still_balanced():
-    """Version skew: control plane upgraded ahead of the serving backend.
-
-    A backend predating the split leaves `reasoned</think>answer` in `content` with no
-    `reasoning_content` field at all. With no field to contradict it an unbalanced close can only be
-    the sampled delimiter, so the block is re-opened around the text before it rather than handed
-    back malformed.
-    """
-    out = deploy._balanced_thinking_content({"content": "reasoned</think>answer"}, thinking=True)
-
-    assert out == "<think>reasoned</think>answer"
-    assert out.count("<think>") == 1
-    assert out.count("</think>") == 1
-
-
-def test_a_legacy_answer_without_any_block_is_still_returned_verbatim():
-    # the skew branch must not invent a block for a plain answer that never had one.
-    assert (
-        deploy._balanced_thinking_content({"content": "plain answer"}, thinking=True)
-        == "plain answer"
-    )
-
-
-def test_a_non_thinking_response_is_never_rewritten():
-    """The request's own flag decides, not the shape of the text.
-
-    Inferring reasoning-ness from content rewrote an ordinary answer that merely contains the
-    literal tag -- documentation, a structured field quoting it -- into a synthetic reasoning
-    block, and `_balance_thinking_payload` ran on EVERY `chat()` response, including the public
-    non-thinking route (codex[bot], cursor).
-    """
-    for message in (
+@pytest.mark.parametrize(
+    "message",
+    [
         {"content": "foo</think>bar"},
         {"content": "</think>answer"},
         {"content": "answer", "reasoning_content": "reasoned"},
         {"content": "<think>x</think>", "reasoning_content": "r"},
-    ):
-        assert deploy._balanced_thinking_content(message, thinking=False) == message["content"]
+    ],
+)
+def test_a_non_thinking_response_is_never_rewritten(message):
+    # the request's own flag decides, not the shape of the text. inferring reasoning-ness from
+    # content rewrote an ordinary answer that merely contains the literal tag -- documentation, a
+    # structured field quoting it -- into a synthetic reasoning block, and `_balance_thinking_
+    # payload` runs on EVERY `chat()` response, including the public non-thinking route.
+    assert _folded(message, thinking=False) == message["content"]
 
 
-def test_payload_balancing_rewrites_every_choice_in_place():
-    payload = {
-        "choices": [
-            {"message": {"content": "a", "reasoning_content": "r1"}},
-            {"message": {"content": "b", "reasoning_content": "r2"}},
-        ]
-    }
-    deploy._balance_thinking_payload(payload, thinking=True)
-    assert payload["choices"][0]["message"]["content"] == "<think>r1</think>a"
-    assert payload["choices"][1]["message"]["content"] == "<think>r2</think>b"
-    # the split fields survive for callers that want them.
-    assert payload["choices"][0]["message"]["reasoning_content"] == "r1"
+# --------------------------------------------------------------------------------------------
+# payloads both paths receive. each defect below was a disagreement between them on one payload,
+# so the assertion that matters is not what either returns alone but that they return the same.
+
+PARITY_CASES: dict[str, tuple[dict, str]] = {
+    # a close tag mid-answer is answer text, not the block delimiter. splitting on the first one
+    # anywhere promoted the answer into the reasoning slot and DROPPED the real reasoning.
+    "close-tag-mid-answer": (
+        {"content": "answer about </think> tags", "reasoning_content": "r"},
+        "<think>r</think>answer about </think> tags",
+    ),
+    # version skew, control plane ahead of serving: no `reasoning_content` field at all. with
+    # nothing to contradict it an unbalanced close can only be the sampled delimiter.
+    "legacy-inline-block": (
+        {"content": "reasoned</think>answer"},
+        "<think>reasoned</think>answer",
+    ),
+    # ... and a pair further down the answer must not disarm that re-open. asking whether the close
+    # was already matched, with any pair anywhere answering yes, switched off the whole skew fix.
+    "legacy-close-with-answer-side-pair": (
+        {"content": "reasoned</think>answer <think>x</think> more"},
+        "<think>reasoned</think>answer <think>x</think> more",
+    ),
+    # a `choice` constraint whose value is the literal close tag is byte-identical to a retained
+    # delimiter. stripping it rewrote the response to reasoning-only content and the smoke rejected
+    # a checkpoint that had answered its grammar correctly. what separates them is what follows.
+    "answer-is-the-close-tag": (
+        {"content": "</think>", "reasoning_content": "why"},
+        "<think>why</think></think>",
+    ),
+    # the reasoning repeated inline with NO answer behind it. end of stream is where this is
+    # decidable: nothing more can arrive, so a complete pair whose body is the reasoning is the
+    # repeat. the streaming path used to flush its buffer verbatim and emit both twice.
+    #
+    # an adapter whose answer happens to BE `<think>why</think>` while reasoning about "why" sends
+    # these same bytes, and nothing in the response separates the two. folding to one block is the
+    # deliberate choice: the smoke then rejects the deployment for having no answer, where keeping
+    # both would accept an adapter that answered nothing at all. it fails closed on a shape that is
+    # ambiguous at the source, which is the direction a deployment gate should fail in.
+    "terminal-duplicate": (
+        {"content": "<think>why</think>", "reasoning_content": "why"},
+        "<think>why</think>",
+    ),
+    # ... which keys on the body matching. an answer that is its own literal pair is not the
+    # repeat, so it must survive rather than be swallowed.
+    "terminal-pair-that-is-not-the-reasoning": (
+        {"content": "<think>other</think>", "reasoning_content": "why"},
+        "<think>why</think><think>other</think>",
+    ),
+    # an explicit opener says the block is present; its body must then match the reasoning to be
+    # the repeat. removing the opener left an empty prefix, read as the bare delimiter, and the
+    # streaming path deleted the answer's own pair while the fold kept it.
+    "answer-leading-empty-pair": (
+        {"content": "<think></think>answer", "reasoning_content": "why"},
+        "<think>why</think><think></think>answer",
+    ),
+    "empty-reasoning-duplicated-inline": (
+        {"content": "<think></think>answer", "reasoning_content": ""},
+        "<think></think>answer",
+    ),
+}
 
 
-def test_payload_balancing_is_a_no_op_outside_thinking_mode():
-    payload = {"choices": [{"message": {"content": "a</think>b", "reasoning_content": "r"}}]}
-    deploy._balance_thinking_payload(payload, thinking=False)
-    assert payload["choices"][0]["message"]["content"] == "a</think>b"
+@pytest.mark.parametrize(("message", "expected"), PARITY_CASES.values(), ids=PARITY_CASES)
+def test_both_paths_agree_on_the_same_payload(message, expected):
+    assert _folded(message) == expected
+    assert _streamed(*_split(message)) == expected
 
 
-def test_payload_balancing_tolerates_shapes_it_cannot_rewrite():
-    for payload in (None, [], "text", {}, {"choices": None}, {"choices": [{}, {"message": None}]}):
-        deploy._balance_thinking_payload(payload, thinking=True)  # must not raise
+# --------------------------------------------------------------------------------------------
+# the streaming path, on delta shapes the fold has no equivalent for.
+
+STREAM_CASES: dict[str, tuple[tuple[dict, ...], str]] = {
+    "reasoning-then-answer": (
+        (
+            {"reasoning_content": "weigh"},
+            {"reasoning_content": "ing"},
+            {"content": "the "},
+            {"content": "answer"},
+        ),
+        "<think>weighing</think>the answer",
+    ),
+    "block-opens-once-across-reasoning-deltas": (
+        ({"reasoning_content": "a"}, {"reasoning_content": "b"}, {"content": "z"}),
+        "<think>ab</think>z",
+    ),
+    # no delimiter ever arrives, so nothing marked a reasoning phase. wrapping here would label a
+    # whole valid answer as reasoning, and the smoke's answer split would find nothing behind the
+    # close tag and reject a working deployment.
+    "no-delimiter-is-not-wrapped": (({"content": "plain "}, {"content": "answer"}), "plain answer"),
+    # generation hit the length cap inside the block: an unbalanced OPENER is the same defect as
+    # the unbalanced closer, mirrored, so the stream must still close it.
+    "reasoning-cut-off-mid-block": (
+        ({"reasoning_content": "thinking hard"},),
+        "<think>thinking hard</think>",
+    ),
+    # `""` means the block closed immediately, which the fold emits a pair for. reading falsiness
+    # made the two paths disagree on the same payload.
+    "empty-reasoning": (
+        ({"reasoning_content": ""}, {"content": "answer"}),
+        "<think></think>answer",
+    ),
+    # a compatibility build retains the sampled close at the head of the first content delta.
+    # synthesising a second one left `<think>reasoned</think></think>answer`. the tag is tokenised,
+    # so it straddles delta boundaries routinely, and its leading newline may be a delta of its own
+    # -- an empty `strip()` failed the "could this still be the tag" test and released it as answer.
+    "retained-close": (
+        ({"reasoning_content": "reasoned"}, {"content": "</think>answer"}),
+        "<think>reasoned</think>answer",
+    ),
+    "retained-close-split": (
+        ({"reasoning_content": "reasoned"}, {"content": "</th"}, {"content": "ink>answer"}),
+        "<think>reasoned</think>answer",
+    ),
+    "retained-close-behind-newline": (
+        ({"reasoning_content": "reasoned"}, {"content": "\n</think>answer"}),
+        "<think>reasoned</think>answer",
+    ),
+    "retained-close-after-newline-delta": (
+        ({"reasoning_content": "reasoned"}, {"content": "\n"}, {"content": "</think>answer"}),
+        "<think>reasoned</think>answer",
+    ),
+    "retained-close-after-newline-delta-split": (
+        (
+            {"reasoning_content": "reasoned"},
+            {"content": "\n"},
+            {"content": "</th"},
+            {"content": "ink>answer"},
+        ),
+        "<think>reasoned</think>answer",
+    ),
+    "retained-close-after-newline-delta-split-twice": (
+        (
+            {"reasoning_content": "reasoned"},
+            {"content": "\n"},
+            {"content": "<"},
+            {"content": "/think>"},
+            {"content": "answer"},
+        ),
+        "<think>reasoned</think>answer",
+    ),
+    # holding for the answer must not turn into keeping a delimiter that really was retained.
+    "retained-close-answer-arrives-late": (
+        ({"reasoning_content": "why"}, {"content": "</think>"}, {"content": "answer"}),
+        "<think>why</think>answer",
+    ),
+    # the buffered close belongs to the block that was open when it arrived. a later non-empty
+    # reasoning delta opens a NEW block, and the stale buffer was never cleared -- so end of stream
+    # flushed it behind the new block's close, an extra tag the fold never produces.
+    "retained-close-then-later-reasoning": (
+        ({"reasoning_content": "why"}, {"content": "</think>"}, {"reasoning_content": "more"}),
+        "<think>why</think><think>more</think>",
+    ),
+    # the legacy delimiter is split across deltas too, so matching within one delta would miss it.
+    "legacy-delimiter-split": (
+        ({"content": "reasoned</th"}, {"content": "ink>answer"}),
+        "<think>reasoned</think>answer",
+    ),
+    "legacy-close-with-answer-side-pair-split": (
+        ({"content": "reasoned</think>answer <think>x"}, {"content": "</think> more"}),
+        "<think>reasoned</think>answer <think>x</think> more",
+    ),
+    # a legacy stream carrying its own opener is already balanced; re-opening around its close
+    # nested one block inside another on the public chat_stream path.
+    "legacy-stream-already-balanced": (
+        ({"content": "<think>reasoned</think>answer"},),
+        "<think>reasoned</think>answer",
+    ),
+    # the reasoning on the field AND repeated inline ahead of the retained close. the streaming
+    # helper recognised only whitespace before that close, so it returned the content whole and the
+    # caller received the reasoning twice and the close twice.
+    "duplicate-reasoning-inline": (
+        ({"reasoning_content": "reasoned"}, {"content": "reasoned</think>answer"}),
+        "<think>reasoned</think>answer",
+    ),
+    "duplicate-reasoning-split-body": (
+        (
+            {"reasoning_content": "reasoned"},
+            {"content": "reas"},
+            {"content": "oned</think>"},
+            {"content": "answer"},
+        ),
+        "<think>reasoned</think>answer",
+    ),
+    "duplicate-reasoning-sampled-newline": (
+        ({"reasoning_content": "reasoned"}, {"content": "reasoned\n</think>answer"}),
+        "<think>reasoned</think>answer",
+    ),
+    "duplicate-reasoning-split-everywhere": (
+        (
+            {"reasoning_content": "reasoned"},
+            {"content": "reasoned"},
+            {"content": "\n"},
+            {"content": "</think>"},
+            {"content": "answer"},
+        ),
+        "<think>reasoned</think>answer",
+    ),
+    # the duplicate rule keys on the reasoning being repeated BEFORE the close, so an answer that
+    # merely shares a prefix with it must arrive whole rather than be held for a delimiter that is
+    # not coming.
+    "answer-shares-a-prefix-with-the-reasoning": (
+        ({"reasoning_content": "rea"}, {"content": "reactor design"}),
+        "<think>rea</think>reactor design",
+    ),
+    # the repeat can carry its own opener, and is subject to the same delta boundaries.
+    "duplicate-block-with-opener": (
+        ({"reasoning_content": "why"}, {"content": "<think>why</think>answer"}),
+        "<think>why</think>answer",
+    ),
+    "duplicate-block-with-opener-split": (
+        ({"reasoning_content": "why"}, {"content": "<think>why<"}, {"content": "/think>a"}),
+        "<think>why</think>a",
+    ),
+    "terminal-duplicate-split": (
+        ({"reasoning_content": "why"}, {"content": "<think>why<"}, {"content": "/think>"}),
+        "<think>why</think>",
+    ),
+    # `_delimiter_may_complete` gave up on an empty body and released the head as answer, so the
+    # pair streamed twice -- while the same bytes in ONE delta folded correctly.
+    "empty-duplicate-pair-split": (
+        ({"reasoning_content": ""}, {"content": "<think></"}, {"content": "think>answer"}),
+        "<think></think>answer",
+    ),
+    # a backend whose stream schema serializes the empty field on every delta reaches the open
+    # branch again after the first answer delta closed the block. the reasoning phase happens once,
+    # so the block does too.
+    "empty-reasoning-repeated-on-every-delta": (
+        ({"reasoning_content": "", "content": "a"}, {"reasoning_content": "", "content": "b"}),
+        "<think></think>ab",
+    ),
+    # that guard is scoped to the EMPTY field on purpose: reasoning arriving after the answer began
+    # still carries text, and suppressing its tags would stream that text as answer.
+    "late-nonempty-reasoning": (
+        ({"reasoning_content": "why"}, {"content": "a"}, {"reasoning_content": "more"}),
+        "<think>why</think>a<think>more</think>",
+    ),
+    # the retained close is recognised by comparing the buffer against the reasoning it follows, so
+    # that reasoning must be the CURRENT block's. accumulating it across blocks left the second
+    # block's repeat compared against both bodies joined, which matched neither, and the delimiter
+    # streamed a second time -- two openers against three closes.
+    "second-block-keeps-its-own-retained-close": (
+        (
+            {"reasoning_content": "a"},
+            {"content": "x"},
+            {"reasoning_content": "b"},
+            {"content": "b</think>answer"},
+        ),
+        "<think>a</think>x<think>b</think>answer",
+    ),
+    "second-block-terminal-duplicate": (
+        (
+            {"reasoning_content": "a"},
+            {"content": "x"},
+            {"reasoning_content": "b"},
+            {"content": "<think>b</think>"},
+        ),
+        "<think>a</think>x<think>b</think>",
+    ),
+}
 
 
-def test_streamed_reasoning_opens_and_closes_around_the_answer():
-    lines = _sse(
-        {"reasoning_content": "weigh"},
-        {"reasoning_content": "ing"},
-        {"content": "the "},
-        {"content": "answer"},
-    )
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == (
-        "<think>weighing</think>the answer"
-    )
+@pytest.mark.parametrize(("deltas", "expected"), STREAM_CASES.values(), ids=STREAM_CASES)
+def test_the_stream_rebuilds_a_balanced_block(deltas, expected):
+    assert _streamed(*deltas) == expected
 
 
-def test_streamed_answer_without_reasoning_is_untouched():
-    lines = _sse({"content": "just "}, {"content": "text"})
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "just text"
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=False)) == "just text"
+@pytest.mark.parametrize(
+    ("deltas", "expected"),
+    [
+        (({"content": "just "}, {"content": "text"}), "just text"),
+        # wrapping the field in synthetic tags for a request that never asked for a reasoning
+        # phase is the defect the flag exists to prevent, which the streaming path kept doing.
+        (({"reasoning_content": "reasoned"}, {"content": "answer"}), "answer"),
+    ],
+)
+def test_a_non_thinking_stream_is_never_rewritten(deltas, expected):
+    assert _streamed(*deltas, thinking=False) == expected
+
+
+# --------------------------------------------------------------------------------------------
+# delivery, which the joined-string cases above cannot see.
 
 
 def test_a_non_thinking_stream_yields_each_delta_as_it_arrives():
@@ -280,484 +442,15 @@ def test_a_split_stream_releases_the_answer_incrementally():
     ]
 
 
-def test_streamed_inline_close_is_not_duplicated_by_the_synthetic_one():
-    """The streaming twin of `test_content_that_already_closes_a_block_is_not_nested_again`.
-
-    A compatibility build can emit reasoning on its own delta field AND retain the sampled close
-    at the head of the first content delta. Synthesising a second one produced
-    `<think>reasoned</think></think>answer`, which leaves `flash models chat` output and any
-    downstream parser malformed.
-    """
-    lines = _sse({"reasoning_content": "reasoned"}, {"content": "</think>answer"})
-    out = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-    assert out == "<think>reasoned</think>answer"
-    assert out.count("</think>") == 1
-
-
-def test_streamed_content_keeps_a_close_tag_that_is_not_the_block_delimiter():
-    # only a close at the HEAD of the first content delta is the sampled delimiter. one appearing
-    # later is answer text, and stripping it would corrupt the answer.
-    lines = _sse({"reasoning_content": "r"}, {"content": "answer about </think> tags"})
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == (
-        "<think>r</think>answer about </think> tags"
-    )
-
-
-def test_streamed_reasoning_cut_off_mid_block_is_still_closed():
-    # generation hit the length cap inside the reasoning block: an unbalanced OPENER is the same
-    # defect as the unbalanced closer, mirrored, so the stream must still close it.
-    lines = _sse({"reasoning_content": "thinking hard"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think>thinking hard</think>"
-    )
-
-
-def test_streamed_block_opens_once_across_many_reasoning_deltas():
-    lines = _sse(*[{"reasoning_content": c} for c in "abc"], {"content": "z"})
-    streamed = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-    assert streamed == "<think>abc</think>z"
-    assert streamed.count("<think>") == 1
-    assert streamed.count("</think>") == 1
-
-
-def test_a_legacy_inline_stream_is_reopened_like_its_non_streaming_twin():
-    """Version skew reaches the streaming path too, and it repaired nothing.
-
-    A backend predating the split streams `reasoned</think>answer` on `content` with no reasoning
-    delta at all. The non-streaming path re-opened around that delimiter and this one did not, so
-    the two disagreed on exactly one payload shape and `flash models chat` printed a close tag with
-    no opener (cursor).
-    """
-    lines = _sse({"content": "reasoned</think>answer"})
-    streamed = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-    twin = deploy._balanced_thinking_content({"content": "reasoned</think>answer"}, thinking=True)
-
-    assert streamed == "<think>reasoned</think>answer"
-    assert streamed == twin
-
-
-def test_a_legacy_inline_stream_delimiter_split_across_deltas_is_still_found():
-    # the sampled close is tokenised, so it straddles delta boundaries routinely. matching only
-    # within a single delta would miss it and leave the block unopened.
-    lines = _sse({"content": "reasoned</th"}, {"content": "ink>answer"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think>reasoned</think>answer"
-    )
-
-
-@pytest.mark.parametrize(
-    "tail",
-    [
-        ["</think>answer"],
-        ["</th", "ink>answer"],
-        ["<", "/think>", "answer"],
-    ],
-    ids=["whole", "split-once", "split-twice"],
-)
-def test_a_whitespace_delta_keeps_buffering_until_the_close_arrives(tail):
-    """Whitespace ahead of the retained close is part of the delimiter, on its own delta too.
-
-    The model samples the close on its own line, and a backend may put that newline in a delta by
-    itself. An empty `strip()` failed the "could this still be the tag" test, so the newline was
-    released as answer text and every following piece treated as answer, yielding
-    `<think>reasoned</think>\\n</think>answer` -- both previously fixed shapes combined
-    (codex[bot]).
-    """
-    lines = _sse(
-        {"reasoning_content": "reasoned"}, {"content": "\n"}, *({"content": t} for t in tail)
-    )
-    out = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-
-    assert out == "<think>reasoned</think>answer"
-    assert out.count("</think>") == 1
-
-
-@pytest.mark.parametrize(
-    "deltas",
-    [
-        ["reasoned</think>answer"],
-        ["reas", "oned</think>", "answer"],
-        ["reasoned\n</think>answer"],
-        ["reasoned", "\n", "</think>", "answer"],
-    ],
-    ids=["whole", "split-body", "sampled-newline", "split-everywhere"],
-)
-def test_streamed_reasoning_repeated_inline_is_kept_once(deltas):
-    """The duplicate-reasoning shape the non-streaming path already folds.
-
-    A compatibility build emits the reasoning on the field AND repeats it inline ahead of the
-    retained close. `_is_sampled_delimiter` recognises that prefix, but the streaming helper only
-    recognised whitespace, so it returned the content whole and the caller received the reasoning
-    twice and the close twice (codex[bot]).
-    """
-    lines = _sse({"reasoning_content": "reasoned"}, *({"content": d} for d in deltas))
-    out = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-
-    assert out == "<think>reasoned</think>answer"
-    assert out.count("reasoned") == 1
-    assert out.count("</think>") == 1
-
-
-def test_an_answer_that_merely_starts_like_the_reasoning_is_not_stripped():
-    # the duplicate rule keys on the reasoning being repeated BEFORE the close, so an answer that
-    # happens to share a prefix with it must still arrive whole -- and must not be held waiting for
-    # a delimiter that is not coming.
-    lines = _sse({"reasoning_content": "rea"}, {"content": "reactor design"})
-
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == (
-        "<think>rea</think>reactor design"
-    )
-
-
-@pytest.mark.parametrize(
-    "deltas",
-    [
-        ["reasoned</think>answer <think>x</think> more"],
-        ["reasoned</think>answer <think>x", "</think> more"],
-    ],
-)
-def test_a_legacy_close_is_reopened_even_when_the_answer_holds_its_own_pair(deltas):
-    """A pair further down the answer must not disarm the re-open.
-
-    The guard asks whether the close it found is already matched, and any pair anywhere answered
-    yes. So `reasoned</think>answer <think>x</think> more` streamed with its leading close still
-    unopened -- exactly the skew the re-open exists for, switched off by an answer-side pair
-    (cursor).
-    """
-    lines = _sse(*({"content": d} for d in deltas))
-    joined = "".join(deltas)
-    streamed = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-
-    assert streamed == "<think>reasoned</think>answer <think>x</think> more"
-    assert streamed.count("<think>") == streamed.count("</think>")
-    # the two paths must keep agreeing on this shape, which is the invariant the re-open was for.
-    assert streamed == deploy._balanced_thinking_content({"content": joined}, thinking=True)
-
-
-def test_a_thinking_stream_that_never_closes_is_not_wrapped():
-    # no delimiter ever arrives, so nothing marked a reasoning phase. wrapping here would label a
-    # whole valid answer as reasoning, and the smoke's answer split would find nothing after the
-    # close tag and reject a working deployment.
-    lines = _sse({"content": "plain "}, {"content": "answer"})
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "plain answer"
-
-
-def test_non_streaming_chat_balances_before_returning(monkeypatch):
-    captured = {}
-
-    class _Resp:
-        headers: ClassVar[dict] = {}
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "choices": [
-                    {
-                        "message": {"content": "answer", "reasoning_content": "reasoned"},
-                        "finish_reason": "stop",
-                    }
-                ]
-            }
-
-    class _Client:
-        def post(self, url, **kwargs):
-            captured["url"] = url
-            return _Resp()
-
-    monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
-    monkeypatch.setattr(deploy, "_internal_key_header", lambda: {})
-    monkeypatch.setattr(deploy, "_chat_http_client", lambda: _Client())
-
-    result = deploy.chat("run-1", [{"role": "user", "content": "hi"}], thinking=True)
-    content = result["choices"][0]["message"]["content"]
-    assert content == "<think>reasoned</think>answer"
-    # the balanced string is what the deployment smoke greps for its thinking-tag telemetry.
-    assert "<think>" in content
-    assert "</think>" in content
-
-
-def test_non_thinking_chat_returns_serving_content_unchanged(monkeypatch):
-    """`chat()` balanced every response regardless of the flag it was already given.
-
-    A non-thinking answer quoting the tag came back rewritten into a reasoning block, on the path
-    that also serves the public non-streaming chat route (codex[bot]).
-    """
-
-    class _Resp:
-        headers: ClassVar[dict] = {}
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"choices": [{"message": {"content": "foo</think>bar"}}]}
-
-    class _Client:
-        def post(self, url, **kwargs):
-            return _Resp()
-
-    monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
-    monkeypatch.setattr(deploy, "_internal_key_header", lambda: {})
-    monkeypatch.setattr(deploy, "_chat_http_client", lambda: _Client())
-
-    result = deploy.chat("run-1", [{"role": "user", "content": "hi"}])
-    assert result["choices"][0]["message"]["content"] == "foo</think>bar"
-
-
-def test_a_streamed_close_split_across_deltas_is_not_duplicated():
-    # a backend may split the retained delimiter -- "</th" then "ink>answer". requiring the whole
-    # tag at the head of one delta synthesised a second close and sent the client
-    # `<think>reasoned</think>\n</think>answer` (codex[bot], cursor).
-    lines = _sse(
-        {"reasoning_content": "reasoned"},
-        {"content": "</th"},
-        {"content": "ink>answer"},
-    )
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think>reasoned</think>answer"
-    )
-
-
-def test_a_streamed_close_behind_whitespace_is_not_duplicated():
-    # the model samples the delimiter on its own line as often as not, which the non-streaming path
-    # already tolerates through `_is_sampled_delimiter`.
-    lines = _sse({"reasoning_content": "reasoned"}, {"content": "\n</think>answer"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think>reasoned</think>answer"
-    )
-
-
-def test_an_explicitly_empty_streamed_reasoning_still_gets_a_block():
-    # `reasoning_content: ""` means the model closed its block immediately, which is a different
-    # case from an absent field -- and the non-streaming path emits `<think></think>{answer}` for
-    # it. reading falsiness made the two paths disagree on the same payload (codex[bot]).
-    lines = _sse({"reasoning_content": ""}, {"content": "answer"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think></think>answer"
-    )
-
-
-def test_streamed_reasoning_is_left_alone_when_thinking_is_off():
-    # the request never asked for a reasoning phase, so wrapping the field in synthetic tags is the
-    # same defect the flag exists to prevent -- the streaming path just kept doing it (cursor).
-    lines = _sse({"reasoning_content": "reasoned"}, {"content": "answer"})
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=False)) == "answer"
-
-
-def test_an_already_balanced_legacy_stream_is_not_nested():
-    # a legacy stream that carries its own opener is already balanced, and the non-streaming path
-    # leaves it alone via `_inline_reasoning_block`. re-opening around its close nested one block
-    # inside another on the public chat_stream path (cursor).
-    lines = _sse({"content": "<think>reasoned</think>answer"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think>reasoned</think>answer"
-    )
-
-
-def test_an_answer_side_pair_after_text_is_not_read_as_duplicated_reasoning():
-    # body equality alone mistook a pair inside the ANSWER for the reasoning emitted twice, so an
-    # empty-reasoning JSON answer quoting the tag came back with no reasoning block at all and the
-    # structured smoke then validated only the trailing `"}` (codex[bot]).
-    message = {"content": '{"tag":"<think></think>"}', "reasoning_content": ""}
-    assert (
-        deploy._balanced_thinking_content(message, thinking=True)
-        == '<think></think>{"tag":"<think></think>"}'
-    )
-
-
-def test_a_duplicated_inline_block_is_matched_past_its_trailing_newline():
-    # `_is_sampled_delimiter` compares the same span stripped, so an exact comparison here folded
-    # `reasoned\n` against `reasoned` into a second block and left two close tags (cursor).
-    message = {"content": "<think>reasoned\n</think>answer", "reasoning_content": "reasoned"}
-    assert (
-        deploy._balanced_thinking_content(message, thinking=True)
-        == "<think>reasoned\n</think>answer"
-    )
-
-
-def test_a_repeated_empty_reasoning_field_does_not_reopen_the_block():
-    # a backend whose stream schema serializes the empty field on every delta reaches the open
-    # branch again after the first answer delta closed the block. opening a second one streamed
-    # `<think></think>a<think></think>b` for what the non-streaming path folds to one pair
-    # (codex[bot]). the reasoning phase happens once, so the block does too.
-    lines = _sse(
-        {"reasoning_content": "", "content": "a"}, {"reasoning_content": "", "content": "b"}
-    )
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "<think></think>ab"
-
-
-def test_late_nonempty_reasoning_still_opens_a_block_of_its_own():
-    # the guard above is scoped to the EMPTY field on purpose. reasoning that arrives after the
-    # answer began still carries text, and suppressing its tags would stream that text as answer.
-    lines = _sse({"reasoning_content": "why"}, {"content": "a"}, {"reasoning_content": "more"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think>why</think>a<think>more</think>"
-    )
-
-
-def test_a_streamed_block_repeated_inline_is_emitted_once():
-    """The streaming twin of `test_content_that_repeats_reasoning_inline_keeps_one_block`.
-
-    A compatibility build can send the reasoning on the field AND repeat it inline WITH its opener.
-    Reading only the bare repeat left the prefix unrecognised, so the streamed text carried the
-    reasoning and its tags twice while the non-streaming path folded it to one of each (cursor).
-    """
-    lines = _sse({"reasoning_content": "why"}, {"content": "<think>why</think>answer"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think>why</think>answer"
-    )
-
-
-def test_a_repeated_inline_block_split_across_deltas_is_still_emitted_once():
-    # the repeat is subject to the same arbitrary delta boundaries as the bare tag, so the buffer
-    # has to hold across a split inside it rather than releasing the head as answer.
-    lines = _sse({"reasoning_content": "why"}, {"content": "<think>why<"}, {"content": "/think>a"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "<think>why</think>a"
-    )
-
-
-def test_an_answer_that_is_exactly_the_close_tag_survives():
-    # a `choice` constraint whose value is the literal tag arrives as `content: "</think>"`, which is
-    # byte-identical to a compatibility build's retained delimiter. stripping it rewrote the response
-    # to reasoning-only content, and the smoke then rejected a checkpoint that had answered its
-    # grammar correctly (codex[bot]). what separates them is whether anything follows.
-    message = {"content": "</think>", "reasoning_content": "why"}
-    assert deploy._balanced_thinking_content(message, thinking=True) == "<think>why</think></think>"
-
-
-def test_a_streamed_answer_that_is_exactly_the_close_tag_survives():
-    # the streaming twin, and it cannot decide on sight: the answer may still be arriving. it holds
-    # the tag and the end of stream settles it, where nothing more can arrive.
-    lines = _sse({"reasoning_content": "why"}, {"content": "</think>"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think>why</think></think>"
-    )
-
-
-def test_a_retained_delimiter_is_still_stripped_when_the_answer_follows_it_late():
-    # the shape the strip exists for, with the answer in a later delta than the tag. holding for the
-    # answer must not turn into keeping a delimiter that really was retained.
-    lines = _sse({"reasoning_content": "why"}, {"content": "</think>"}, {"content": "answer"})
-    assert (
-        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-        == "<think>why</think>answer"
-    )
-
-
-def _streamed(message: dict) -> str:
-    """The same payload through the streaming path, as one reasoning delta then one content delta.
-
-    Every defect below is a disagreement between the two paths on one payload, so the assertion that
-    matters is not what either path returns in isolation but that they return the same thing. The
-    non-streaming result is the reference: it is what the public chat route serves, and it is the
-    shape `_thinking_answer` and the deployment smoke were written against.
-    """
-    deltas: list[dict] = []
-    reasoning = message.get("reasoning_content")
-    if isinstance(reasoning, str):
-        deltas.append({"reasoning_content": reasoning})
-    content = message.get("content")
-    if content:
-        deltas.append({"content": content})
-    return "".join(deploy._openai_stream_content(iter(_sse(*deltas)), thinking=True))
-
-
-def test_a_terminal_duplicated_inline_block_is_not_emitted_twice():
-    # the duplicate shape with NO answer behind it. `_strip_retained_close` keeps buffering because
-    # nothing follows the close, and the end-of-stream branch then emits the buffer verbatim -- so
-    # the reasoning and its tags streamed twice, where the non-streaming path folds them to one
-    # (codex[bot]). end of stream is exactly where this is decidable: nothing more can arrive, so a
-    # complete inline block whose body is the reasoning can only be the repeat.
-    message = {"content": "<think>why</think>", "reasoning_content": "why"}
-
-    assert deploy._balanced_thinking_content(message, thinking=True) == "<think>why</think>"
-    assert _streamed(message) == "<think>why</think>"
-
-
-def test_a_terminal_duplicate_that_is_split_across_deltas_is_also_folded():
-    # the repeat is subject to arbitrary delta boundaries like every other shape, and the buffer is
-    # settled at end of stream either way.
-    lines = _sse({"reasoning_content": "why"}, {"content": "<think>why<"}, {"content": "/think>"})
-
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "<think>why</think>"
-
-
-def test_a_terminal_pair_that_is_not_the_reasoning_still_survives():
-    # the fold above keys on the body matching the reasoning. an answer that is its own literal pair
-    # is not the repeat, so it must arrive whole rather than being swallowed as a duplicate.
-    message = {"content": "<think>other</think>", "reasoning_content": "why"}
-
-    assert (
-        deploy._balanced_thinking_content(message, thinking=True)
-        == "<think>why</think><think>other</think>"
-    )
-    assert _streamed(message) == "<think>why</think><think>other</think>"
-
-
-def test_an_answer_leading_empty_pair_is_preserved():
-    # `<think></think>` at the head of the ANSWER, with real reasoning on the field. removing the
-    # opener leaves an empty prefix, which `_is_sampled_delimiter` accepted as the bare delimiter,
-    # so the streaming path deleted the answer's own pair while the non-streaming path kept it
-    # (codex[bot], cursor). an explicit opener says the block is present; its body must then match
-    # the reasoning to be the repeat.
-    message = {"content": "<think></think>answer", "reasoning_content": "why"}
-
-    assert (
-        deploy._balanced_thinking_content(message, thinking=True)
-        == "<think>why</think><think></think>answer"
-    )
-    assert _streamed(message) == "<think>why</think><think></think>answer"
-
-
-def test_an_empty_duplicate_pair_split_across_deltas_is_still_folded():
-    # empty reasoning repeated inline, split inside the close tag. `_delimiter_may_complete` gave up
-    # on the empty body and released the head as answer, so the pair streamed twice -- while the
-    # same bytes in ONE delta folded correctly (codex[bot], cursor).
-    lines = _sse({"reasoning_content": ""}, {"content": "<think></"}, {"content": "think>answer"})
-    whole = {"content": "<think></think>answer", "reasoning_content": ""}
-
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == (
-        "<think></think>answer"
-    )
-    # and the split stream agrees with the same payload arriving whole, and with non-streaming.
-    assert _streamed(whole) == "<think></think>answer"
-    assert deploy._balanced_thinking_content(whole, thinking=True) == "<think></think>answer"
-
-
-def test_a_retained_close_does_not_survive_a_later_reasoning_block():
-    # the buffered close belongs to the block that was open when it arrived. a later non-empty
-    # reasoning delta opens a NEW block, and the stale buffer was never cleared -- so the
-    # end-of-stream branch flushed it behind the new block's close and the stream carried an extra
-    # `</think>` the non-streaming path never produces (cursor).
-    lines = _sse({"reasoning_content": "why"}, {"content": "</think>"}, {"reasoning_content": "more"})
-    streamed = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
-
-    assert streamed == "<think>why</think><think>more</think>"
-    assert streamed.count("<think>") == streamed.count("</think>")
-
-
 def test_the_held_stream_does_not_rescan_its_whole_buffer_per_delta():
     """A legacy inline stream with no early close holds every delta, and used to rescan them all.
 
     Token-sized deltas made the search quadratic in the completion length, and the public chat route
-    caps no `max_tokens`, so a long generation burned that time before streaming a byte (codex[bot]).
+    caps no `max_tokens`, so a long generation burned that time before streaming a byte.
 
     Asserted as characters scanned rather than wall-clock, which would be a flaky way to ask the same
     question. Counting `str.find` calls alone would not fail either -- the old code called it once
-    per delta too. What changed is how much each call reads, so that is what is measured: from a
-    cursor it is the new delta, and quadratic growth in the total is what regressing reintroduces.
+    per delta too. What changed is how much each call reads, so that is what is measured.
     """
     scanned = 0
     real_find_delimiter = deploy._find_delimiter
@@ -785,3 +478,108 @@ def test_the_held_stream_does_not_rescan_its_whole_buffer_per_delta():
     # linear: twice the deltas scans about twice the characters. quadratic would be about four
     # times, so the midpoint separates them with room for the tail rescan on either side.
     assert large < small * 3, f"{small} -> {large} chars scanned looks quadratic"
+
+
+def test_the_closing_buffer_does_not_rescan_itself_per_delta():
+    """The post-reasoning buffer grows the same way the held one does, and rescanned itself too.
+
+    A compatibility build repeats a long `reasoning_content` inline over token-sized deltas before
+    sending the retained close, so the buffer the delimiter search runs on grows a token at a time
+    with no answer released until the tag lands. Measured as the held twin is, and for the same
+    reason.
+    """
+    scanned = 0
+    real_find_delimiter = deploy._find_delimiter
+
+    def _counting_find(buffer: str, start: int) -> int:
+        nonlocal scanned
+        scanned += max(0, len(buffer) - start)
+        return real_find_delimiter(buffer, start)
+
+    def _scan_for(deltas: int) -> int:
+        nonlocal scanned
+        scanned = 0
+        reasoning = "tok " * deltas
+        stream = [{"reasoning_content": reasoning}]
+        stream += [{"content": "tok "} for _ in range(deltas)]
+        stream += [{"content": "</think>"}, {"content": "answer"}]
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(deploy, "_find_delimiter", _counting_find)
+            out = "".join(deploy._openai_stream_content(iter(_sse(*stream)), thinking=True))
+        assert out == f"<think>{reasoning}</think>answer"
+        return scanned
+
+    small = _scan_for(500)
+    large = _scan_for(1000)
+    # the count must come from the buffer this test is about. without this the ratio below would
+    # read an uninstrumented path as zero and zero, which no growth assertion can tell from linear.
+    assert small > 0, "the closing buffer was never searched through the measured seam"
+    assert large < small * 3, f"{small} -> {large} chars scanned looks quadratic"
+
+
+# --------------------------------------------------------------------------------------------
+# the payload rewrite, and the public chat route it runs on.
+
+
+def test_payload_balancing_rewrites_every_choice_in_place():
+    payload = {
+        "choices": [
+            {"message": {"content": "a", "reasoning_content": "r1"}},
+            {"message": {"content": "b", "reasoning_content": "r2"}},
+        ]
+    }
+    deploy._balance_thinking_payload(payload, thinking=True)
+    assert payload["choices"][0]["message"]["content"] == "<think>r1</think>a"
+    assert payload["choices"][1]["message"]["content"] == "<think>r2</think>b"
+    # the split fields survive for callers that want them.
+    assert payload["choices"][0]["message"]["reasoning_content"] == "r1"
+
+
+def test_payload_balancing_is_a_no_op_outside_thinking_mode():
+    payload = {"choices": [{"message": {"content": "a</think>b", "reasoning_content": "r"}}]}
+    deploy._balance_thinking_payload(payload, thinking=False)
+    assert payload["choices"][0]["message"]["content"] == "a</think>b"
+
+
+def test_payload_balancing_tolerates_shapes_it_cannot_rewrite():
+    for payload in (None, [], "text", {}, {"choices": None}, {"choices": [{}, {"message": None}]}):
+        deploy._balance_thinking_payload(payload, thinking=True)  # must not raise
+
+
+def _stub_serving(monkeypatch, message: dict) -> None:
+    class _Resp:
+        headers: ClassVar[dict] = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": message, "finish_reason": "stop"}]}
+
+    class _Client:
+        def post(self, url, **kwargs):
+            return _Resp()
+
+    monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(deploy, "_internal_key_header", lambda: {})
+    monkeypatch.setattr(deploy, "_chat_http_client", lambda: _Client())
+
+
+def test_non_streaming_chat_balances_before_returning(monkeypatch):
+    _stub_serving(monkeypatch, {"content": "answer", "reasoning_content": "reasoned"})
+
+    result = deploy.chat("run-1", [{"role": "user", "content": "hi"}], thinking=True)
+
+    # the balanced string is what the deployment smoke greps for its thinking-tag telemetry.
+    assert result["choices"][0]["message"]["content"] == "<think>reasoned</think>answer"
+
+
+def test_non_thinking_chat_returns_serving_content_unchanged(monkeypatch):
+    # `chat()` balanced every response regardless of the flag it was already given, so a
+    # non-thinking answer quoting the tag came back rewritten into a reasoning block -- on the path
+    # that also serves the public non-streaming chat route.
+    _stub_serving(monkeypatch, {"content": "foo</think>bar"})
+
+    result = deploy.chat("run-1", [{"role": "user", "content": "hi"}])
+
+    assert result["choices"][0]["message"]["content"] == "foo</think>bar"
