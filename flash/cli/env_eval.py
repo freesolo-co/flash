@@ -177,7 +177,11 @@ def _upload_report(
 
     # a case that failed before it was graded is still uploaded verbatim; the server
     # excludes it from the aggregate so a transport failure never reads as a zero score.
-    by_id = {case.id or str(index): case for index, case in enumerate(cases, start=1)}
+    #
+    # key on the same resolved ids the results carry, not on the raw `case.id`: a sidecar
+    # that reuses one id across cases resolves the second to `id#2`, so a raw-id map both
+    # misses it and hands the first result the *second* case's input and expected value.
+    by_id = dict(zip(_case_ids(cases), cases, strict=True))
     payload = [_case_payload(by_id.get(result.case_id), result) for result in report.results]
     try:
         upload_eval_run(
