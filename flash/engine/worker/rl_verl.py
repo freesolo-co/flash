@@ -1485,7 +1485,24 @@ def score_single_turn(
         r -= think_penalty * _w.think_token_count(
             solution_str, tok, prompt_opened_thinking=prompt_opened_thinking
         )
-    return float(r)
+    r = float(r)
+    # an unscorable completion scores 0.0, the same as a failed grading. it CANNOT be forwarded:
+    # verl's grpo baseline is a plain torch.mean/torch.std over the group (core_algos.py:320-326),
+    # with no nan-aware variant anywhere on its path -- one nan row therefore makes the mean, the
+    # std, and every one of the group's `group_size` advantages nan, not just its own. the retired
+    # trl path could forward it because it masked nan rows out of the baseline and zeroed their
+    # advantage (grpo_trainer.py:2171, :2222); nothing downstream of here does that now.
+    # 0.0 rather than a mask because that is what this backend already does with an unscorable
+    # multi-turn episode (see FlashMultiTurnBridge.score) and with a grading that raised, above.
+    # last, so it covers the penalty arithmetic as well as the env's return. the penalty cannot
+    # itself introduce a non-finite value -- the schema bounds its coefficient to [0.0, 1.0] -- but
+    # a mask this cheap has no reason to sit anywhere a future term could slip past it.
+    if not math.isfinite(r):
+        if raise_on_error:
+            raise ValueError(f"env scoring returned a non-finite reward: {r}")
+        print(f"[rl-verl] env scored {r}; unscorable, scoring 0.0", flush=True)
+        return 0.0
+    return r
 
 
 # the total startup delay this hook is allowed to add, covering reference extraction AND timing.
