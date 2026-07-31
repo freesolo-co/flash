@@ -274,8 +274,15 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
     return module
 
 
-def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> None:
-    """Drop modules this sidecar load imported from its own package directory.
+# Each sidecar directory's own modules, parked here while it is out of scope. They are removed
+# from sys.modules so the next environment's `helper` resolves to its own file, and put back on
+# re-entry so a helper's module-level state -- a counter, a client, a loaded judge model --
+# survives from one case to the next instead of re-executing for every callback (cursor[bot]).
+_PARKED_SIDECAR_MODULES: dict[str, dict[str, ModuleType]] = {}
+
+
+def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> dict[str, ModuleType]:
+    """Take this sidecar's own modules out of sys.modules, and return them.
 
     Only modules that (a) were absent before the load and (b) resolve to a file anywhere under
     this package directory. A stdlib or third-party module the sidecar imported first stays
@@ -287,12 +294,13 @@ def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> None:
     first one's -- scoring every later suite with another environment's grader, silently
     (codex[bot])."""
     directory = Path(module_dir).resolve()
+    taken: dict[str, ModuleType] = {}
     for name in set(sys.modules) - before:
         module = sys.modules[name]
         origin = getattr(getattr(module, "__spec__", None), "origin", None)
         if origin:
             if _is_under(origin, directory):
-                sys.modules.pop(name, None)
+                taken[name] = sys.modules.pop(name)
             continue
         # a namespace package (a sibling dir with no __init__.py) has no origin at all, so an
         # origin-only test leaves it cached. its __path__ recomputes from sys.path, so imports
@@ -300,7 +308,8 @@ def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> None:
         # load that created it.
         search = getattr(module, "__path__", None)
         if search is not None and any(_is_under(entry, directory) for entry in search):
-            sys.modules.pop(name, None)
+            taken[name] = sys.modules.pop(name)
+    return taken
 
 
 def _is_under(path: str, directory: Path) -> bool:
@@ -364,18 +373,25 @@ def _sidecar_scope(module_dir: str) -> Iterator[None]:
     error to reveal it. Wrong results that read as legitimate are the one failure this module
     exists to prevent, so the binding has to cover the calls, not just the load.
 
-    Modules imported from this directory are dropped on exit for the same reason they are
-    dropped after loading: the plain name belongs to whichever package is currently in scope,
-    so leaving it cached would hand it to the next one."""
+    Modules imported from this directory are PARKED on exit rather than discarded: the plain
+    name belongs to whichever package is currently in scope, so leaving it cached would hand it
+    to the next one -- but throwing it away re-executed the helper on every callback, resetting a
+    counter, reloading a judge model, and reopening a connection between one case and the next
+    (cursor[bot]). Parking keeps both: the name is free while another sidecar runs, and this
+    sidecar sees the same module objects it had last time."""
     resolved = Path(module_dir).resolve()
     directory = str(resolved)
     before = set(sys.modules)
-    # evict first, so `before` records the name as absent and the exit path drops whatever the
+    # evict first, so `before` records the name as absent and the exit path parks whatever the
     # sidecar imported in its place before the original is restored.
     shadowed = _shadowed_cached_modules(resolved)
     for name in shadowed:
         del sys.modules[name]
     before -= set(shadowed)
+    # this directory's own modules from a previous scope, resuming with the state they built up.
+    # they were absent from sys.modules until now, so `before` correctly excludes them and the
+    # exit path parks them again.
+    sys.modules.update(_PARKED_SIDECAR_MODULES.pop(directory, {}))
     sys.path.insert(0, directory)
     try:
         yield
@@ -383,7 +399,9 @@ def _sidecar_scope(module_dir: str) -> Iterator[None]:
         # a sidecar that rewrote sys.path itself may already have removed it; nothing to undo.
         with suppress(ValueError):
             sys.path.remove(directory)
-        _forget_sidecar_siblings(directory, before)
+        parked = _forget_sidecar_siblings(directory, before)
+        if parked:
+            _PARKED_SIDECAR_MODULES[directory] = parked
         # restore unconditionally: the displaced module belongs to the rest of the process, and
         # a sidecar that never imported the name must not leave it evicted either.
         sys.modules.update(shadowed)

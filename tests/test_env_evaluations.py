@@ -514,6 +514,51 @@ def test_env_eval_pins_the_revision_still_serving_during_a_rollout(
     assert incoming not in capsys.readouterr().out
 
 
+def test_env_eval_refuses_a_first_rollout_that_is_not_serving_yet(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A busy record with no servable predecessor means nothing is answering requests.
+
+    Falling through to the busy record graded the revision the rollout is heading TO, which is
+    not loaded anywhere, and filed the scores under it as if the model had produced them.
+    """
+    env_dir = _upload_env_dir(tmp_path)
+    incoming = "flash-1@final." + "b" * 40
+
+    class Client:
+        def __init__(self):
+            self.targets = []
+
+        def deployments(self):
+            return [
+                {
+                    "run_id": "flash-1",
+                    "deployment": {"state": "queued", "adapter_revision": incoming},
+                }
+            ]
+
+        def chat_stream(self, target, messages, **kwargs):
+            self.targets.append(target)
+            yield "4"
+
+    client = Client()
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 1
+    )
+    # no generation was attempted and no scores were filed against an unloaded revision
+    assert client.targets == []
+    assert uploader.calls == []
+    captured = capsys.readouterr()
+    assert "is not deployed" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
@@ -1374,6 +1419,44 @@ def test_a_sidecar_sibling_wins_over_an_unrelated_module_already_cached(tmp_path
         assert sys.modules["helper"].GOLD == "UNRELATED"
     finally:
         sys.modules.pop("helper", None)
+
+
+def test_a_lazily_imported_helper_keeps_its_state_across_cases(tmp_path) -> None:
+    """A helper's module-level state survives from one callback to the next.
+
+    Discarding this sidecar's modules on scope exit re-executed the helper for every callback, so
+    a counter restarted at 1 for every case and an expensive judge model or connection was rebuilt
+    each time. Parking keeps the name free for other sidecars without resetting the module.
+    """
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment():\n    return None\n")
+    (env_dir / "counter.py").write_text("LOADS = []\nLOADS.append(1)\nCALLS = 0\n")
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'stateful'\n"
+        "    def cases(self):\n"
+        "        return [EvalCase(id='a', input='x', expected='x'),\n"
+        "                EvalCase(id='b', input='y', expected='y')]\n"
+        "    def score(self, case, response):\n"
+        "        import counter\n"
+        "        counter.CALLS += 1\n"
+        "        return EvalResult(case_id=case.id, passed=True, score=float(counter.CALLS),\n"
+        "                          response=response, reason=str(len(counter.LOADS)))\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    suite = load_evaluation_suites(env_dir)[0]
+    cases = suite.cases()
+    first = suite.score(cases[0], "x")
+    second = suite.score(cases[1], "y")
+
+    # the counter advances rather than restarting, and the module executed exactly once
+    assert (first.score, second.score) == (1.0, 2.0)
+    assert (first.reason, second.reason) == ("1", "1")
+    # parking, not leaking: the name is still free for the next environment's own `counter`
+    assert "counter" not in sys.modules
 
 
 def test_a_sidecar_load_leaves_unrelated_cached_modules_alone(tmp_path) -> None:
