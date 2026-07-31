@@ -564,8 +564,8 @@ def cmd_env_eval(args) -> int:
 
     client = client_from_config()
     evaluation_target = args.target
-    if revision is None and parsed is not None and parsed[1] is None:
-        run_id = parsed[0]
+    if revision is None and parsed is not None:
+        run_id, want_step = parsed
         try:
             deployment = _live_deployment(client, run_id)
         except (ApiError, ClientError) as exc:
@@ -574,7 +574,7 @@ def cmd_env_eval(args) -> int:
             _err(f"env eval failed: could not resolve deployed revision for {run_id}: {exc}")
             return _err("overall: FAIL")
         if deployment is None:
-            _err(f"env eval failed: run {run_id} is not deployed")
+            _err(f"env eval failed: run {args.target} is not deployed")
             return _err("overall: FAIL")
         candidate = deployment.get("adapter_revision")
         resolved = parse_adapter_revision(candidate) if isinstance(candidate, str) else None
@@ -583,8 +583,24 @@ def cmd_env_eval(args) -> int:
                 f"env eval failed: deployment for {run_id} has no valid immutable adapter revision"
             )
             return _err("overall: FAIL")
+        # `RUN/step-N` is a shorthand, not an identity: the chat route resolves it against the
+        # run's whole verified ledger, which can hold several revisions at one step, and picks the
+        # deployed one. Forwarding the shorthand therefore graded weights the report could not
+        # name, and a later rebuild of the same step would read as the same measurement
+        # (codex[bot]). Pin here so generation and the uploaded report carry the immutable value.
+        if want_step is not None and resolved[1] != want_step:
+            # the requested step may still be verified and servable, but nothing the CLI can read
+            # says WHICH revision at that step would answer -- `deployments` reports the live
+            # record only. Grading under a name that cannot be resolved is the defect itself, so
+            # refuse and point at the one surface that gives an unambiguous target.
+            serving = f"step {resolved[1]}" if resolved[1] is not None else "its final adapter"
+            _err(
+                f"env eval failed: run {run_id} is deployed at {serving}, not step {want_step}; "
+                "pass the full immutable adapter revision from `flash models deployments`"
+            )
+            return _err("overall: FAIL")
         evaluation_target = candidate.strip()
-        print(f"resolved evaluation target {run_id} to {evaluation_target}")
+        print(f"resolved evaluation target {args.target} to {evaluation_target}")
 
     # graders must see what training graded, so the run's own `thinking` decides whether the
     # reasoning is stripped first (see `_scored_response`). read once here rather than per case:
