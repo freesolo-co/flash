@@ -7,9 +7,10 @@ as a subprocess against a separate interpreter (FLASH_VERL_PYTHON, or a venv pro
 pod). reward parity with the trl path is provided by a localhost rpc bridge that scores each
 completion against flash's live env, so verl and trl compute identical rewards.
 
-scope: single-turn, non-tool grpo, text or multimodal. multi-turn / tool / rollout_func rewards
-stay on the trl path (run_rl). anything outside this scope raises rather than silently training
-on a different contract.
+scope: non-tool grpo, single- or multi-turn, text or multimodal. a multi-turn env is driven by
+flash's own verl agent loop (grpo_multiturn.py), which runs in the verl interpreter and calls back
+into this process for every environment reply. openai function-calling tool envs are still out of
+scope and raise rather than silently training on a different contract.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from functools import reduce
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import gcd
 
+from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import (
     final_save_due,
@@ -50,6 +52,8 @@ from flash.engine.worker.heartbeat import (
     liveness_heartbeat,
 )
 from flash.engine.worker.hf import _deployable_adapter_on_hf
+from flash.engine.worker.multiturn_glue import validate_glue_template
+from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import sanitize_rollout_text
@@ -263,7 +267,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"data.val_files={cfg['val_files']}",
         f"data.train_batch_size={cfg['prompts_per_step']}",
         f"data.max_prompt_length={cfg['max_prompt_len']}",
-        f"data.max_response_length={cfg['max_completion']}",
+        # rollout.response_length interpolates from this key, and it is BOTH the response tensor's
+        # width and the default per-request generation cap. on multi-turn it is the episode budget,
+        # not the per-turn cap -- the agent loop passes an explicit per-turn max_tokens, so the
+        # wider default is never used as a single turn's limit.
+        f"data.max_response_length={cfg['max_response_len']}",
         "data.prompt_key=prompt",
         # rollout prompt parity: verl renders raw messages with the tokenizer's chat template;
         # thread flash's thinking mode so the rollout sees the same prompt as the trl path.
@@ -356,6 +364,14 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # pool to the batch instead: the largest divisor of the rollout batch that is <= 8, which is
         # always valid and still parallelizes whenever the batch allows it.
         f"actor_rollout_ref.rollout.agent.num_workers={agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']))}",
+        # multi-turn runs flash's own agent loop, registered in the child by flash_grpo_plugin. the
+        # stock single_turn_agent generates once and returns; it has no notion of an environment
+        # reply, so a multi-turn env on the default loop would train on first turns only.
+        *(
+            ["actor_rollout_ref.rollout.agent.default_agent_loop=flash_grpo_multi_turn"]
+            if cfg["multi_turn"]
+            else []
+        ),
         # fork-only rollout field, so `++` (append-or-override): it exists in the fork's rollout.yaml
         # but not in stock verl 0.8.0's, where a bare key or `+` would break. omitted entirely when
         # false, since not masking is already stock behavior and stock verl rejects the unknown key.
@@ -486,6 +502,8 @@ def _build_verl_training_cfg(
         "max_token_len_per_gpu": engine_len,
         "max_prompt_len": inp["max_prompt_len"],
         "max_completion": inp["max_completion"],
+        "max_response_len": inp["max_response_len"],
+        "multi_turn": bool(inp["multi_turn"]),
         "temperature": inp["temperature"],
         "top_p": inp["top_p"],
         "kl_coef": inp["kl_coef"],
@@ -1030,7 +1048,9 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         "        raise RuntimeError('flash reward bridge received an invalid example index: %r' % idx)\n"
         "    idx = exact_idx\n"
         "    body = json.dumps({'index': idx, 'solution_str': solution_str or ''}).encode()\n"
-        "    req = urllib.request.Request(_URL, data=body, headers={'Content-Type': 'application/json'})\n"
+        "    req = urllib.request.Request(\n"
+        "        _URL.rstrip('/') + '/score', data=body, headers={'Content-Type': 'application/json'}\n"
+        "    )\n"
         "    try:\n"
         "        with urllib.request.urlopen(req, timeout=120) as r:\n"
         "            payload = json.loads(r.read().decode())\n"
@@ -1206,40 +1226,201 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
 # --------------------------------------------------------------------------------------------
 # reward rpc bridge: verl subprocess -> flash live env.
 # --------------------------------------------------------------------------------------------
-def start_reward_server(score_by_index, *, example_count: int):
+class MultiTurnBridge:
+    """parent-side episode state for the child's multi-turn agent loop.
+
+    the child owns tokens and the engine; this owns the flash env. one session per in-flight
+    episode, keyed by the id the child mints. the env's own rollout state is the source of truth
+    for turn budget, doneness, and the terminal episode that gets scored -- exactly the state the
+    trl driver accumulates, so both backends score the same object.
+    """
+
+    def __init__(self, env, examples: list[dict], *, max_turns: int) -> None:
+        self._env = env
+        self._examples = examples
+        self._max_turns = int(max_turns)
+        # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
+        # every env touch below happens under this lock, matching the single-turn path's contract.
+        self._lock = threading.Lock()
+        self._sessions: dict[str, dict] = {}
+
+    def routes(self) -> dict:
+        return {
+            "/multiturn/start": self.start,
+            "/multiturn/step": self.step,
+            "/multiturn/score": self.score,
+            "/multiturn/close": self.close,
+        }
+
+    def _session(self, payload: dict) -> dict:
+        session_id = str(payload["session_id"])
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"unknown multi-turn session {session_id}")
+        return session
+
+    def start(self, payload: dict) -> dict:
+        index = int(payload["index"])
+        if index < 0 or index >= len(self._examples):
+            raise IndexError(
+                f"multi-turn example index {index} is outside [0, {len(self._examples)})"
+            )
+        session_id = str(payload["session_id"])
+        example = self._examples[index]
+        with self._lock:
+            if session_id in self._sessions:
+                raise KeyError(f"duplicate multi-turn session {session_id}")
+            state = self._env.new_rollout_state(example)
+            self._sessions[session_id] = {"example": example, "state": state}
+        # the per-example budget wins over the batch-wide cap, same precedence as rollout_done.
+        episode_turns = state.get("max_episode_turns")
+        turns = self._max_turns if episode_turns is None else int(episode_turns)
+        return {"max_turns": max(1, min(self._max_turns, turns))}
+
+    def step(self, payload: dict) -> dict:
+        with self._lock:
+            session = self._session(payload)
+            state = session["state"]
+            # an unusable turn is terminal and must NOT be shown to the env: recording it would
+            # append a truncated or empty assistant message to the transcript that gets scored.
+            # the child stops on the same condition, so this only decides what the env sees.
+            if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
+                return {"terminal": True, "messages": []}
+            self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
+            if self._env.rollout_done(state, self._max_turns):
+                return {"terminal": True, "messages": []}
+            replies = self._env.env_reply(list(state.get("messages") or ()), state)
+            terminal = bool(self._env.rollout_done(state, self._max_turns))
+        return {
+            "terminal": terminal,
+            "messages": [
+                {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
+                for message in replies
+            ],
+        }
+
+    def score(self, payload: dict) -> dict:
+        turn_count = int(payload["turn_count"])
+        with self._lock:
+            session = self._session(payload)
+            reward = score_rollouts(
+                self._env,
+                [
+                    RolloutScoreRequest(
+                        example=session["example"],
+                        state=session["state"],
+                        turn_count=turn_count,
+                    )
+                ],
+            )[0]
+        # per-turn credit is a separate invariant (it needs a custom verl advantage estimator), so
+        # only the episode reward crosses back. nan is score_rollouts' unscorable marker; verl has
+        # no equivalent, and a nan would propagate into the group baseline and poison every other
+        # rollout in the group, so an unscorable episode scores 0.0 the way a failed single-turn
+        # grading does.
+        episode = float(reward.episode)
+        if not math.isfinite(episode):
+            print("[rl-verl] multi-turn episode unscorable; scoring 0.0", flush=True)
+            episode = 0.0
+        return {"score": episode}
+
+    def close(self, payload: dict) -> dict:
+        with self._lock:
+            self._sessions.pop(str(payload["session_id"]), None)
+        return {"closed": True}
+
+    def open_sessions(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+
+# the three stdlib-only modules the child needs beside its shim, mapped to the flat names it
+# imports them under. flat and `flash_`-prefixed because the child imports them as top-level
+# modules, not as a package: flash itself is NOT importable in the verl interpreter (incompatible
+# torch/vllm pins), which is why they are copied rather than imported. same mechanism the opd verl
+# path uses for its own loop.
+MULTI_TURN_CHILD_MODULES = (
+    ("multiturn_glue.py", "flash_multiturn_glue.py"),
+    ("grpo_multiturn.py", "flash_grpo_multiturn.py"),
+    ("grpo_plugin.py", "flash_grpo_plugin.py"),
+)
+
+
+def copy_multi_turn_child_modules(shim_dir: str) -> tuple[str, ...]:
+    """copy the child-side agent loop next to the shim; returns the paths written."""
+    written = []
+    for source_name, child_name in MULTI_TURN_CHILD_MODULES:
+        target = os.path.join(shim_dir, child_name)
+        shutil.copy2(os.path.join(os.path.dirname(__file__), source_name), target)
+        written.append(target)
+    return tuple(written)
+
+
+def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[str, str]:
+    """the child env vars the multi-turn agent loop reads, and nothing else.
+
+    the loop runs in the verl interpreter and cannot import flash, so every decision it makes about
+    turn budget, halting and glue rendering has to arrive as a string here. the parent is the only
+    process that can resolve them: the eos set needs the model's generation_config and the turn
+    limit needs the live env.
+    """
+    return {
+        # verl imports this at the end of `verl/__init__` (import_external_libs), which is what
+        # registers the loop under the name the agent-loop override selects. without it the
+        # override names a loop that was never registered and the child dies at rollout build.
+        "VERL_USE_EXTERNAL_MODULES": "flash_grpo_plugin",
+        "FLASH_VERL_MULTITURN_URL": reward_url,
+        "FLASH_VERL_MAX_TURNS": str(int(inp["max_turns"])),
+        "FLASH_VERL_MAX_MODEL_LEN": str(int(inp["engine_len"])),
+        "FLASH_VERL_STOP_SEQUENCES": json.dumps(list(inp["stop_sequences"])),
+        # sorted so the child sees a stable set regardless of frozenset iteration order.
+        "FLASH_VERL_EOS_TOKEN_IDS": json.dumps(sorted(inp["eos_token_ids"])),
+        "FLASH_VERL_THINKING": "1" if thinking else "0",
+    }
+
+
+def start_reward_server(score_by_index, *, example_count: int, multi_turn_bridge=None):
     """start a localhost http reward server. score_by_index(index, solution_str) -> float.
 
-    returns (server, url). the server runs in a daemon thread; call server.shutdown() when done.
+    returns (server, base_url). the server runs in a daemon thread; call server.shutdown() when
+    done. single-turn scoring lives at ``<base_url>/score``; when ``multi_turn_bridge`` is given,
+    its four episode routes are served alongside it from the same thread pool.
     """
     # serialize scoring so the flash env sees sequential calls, matching the trl reward path's
     # contract; verl's reward manager may otherwise call the reward with several workers at once.
     score_lock = threading.Lock()
+
+    def _score_route(payload: dict) -> dict:
+        index = int(payload["index"])
+        if index < 0 or index >= example_count:
+            raise IndexError(f"reward example index {index} is outside [0, {example_count})")
+        with score_lock:
+            return {"score": float(score_by_index(index, payload.get("solution_str", "")))}
+
+    routes = {"/score": _score_route}
+    if multi_turn_bridge is not None:
+        routes.update(multi_turn_bridge.routes())
 
     class _Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def do_POST(self):
-            if self.path != "/score":
+            route = routes.get(self.path)
+            if route is None:
                 self.send_response(404)
                 self.end_headers()
                 return
             try:
                 n = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
-                index = int(payload["index"])
-                if index < 0 or index >= example_count:
-                    raise IndexError(
-                        f"reward example index {index} is outside [0, {example_count})"
-                    )
-                with score_lock:
-                    score = float(score_by_index(index, payload.get("solution_str", "")))
+                result = route(payload)
             except Exception as exc:
                 print(f"[rl-verl] reward server request failed: {exc}", flush=True)
                 body = json.dumps({"error": str(exc)}).encode()
                 self.send_response(400)
             else:
-                body = json.dumps({"score": score}).encode()
+                body = json.dumps(result).encode()
                 self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1249,7 +1430,7 @@ def start_reward_server(score_by_index, *, example_count: int):
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
-    return server, f"http://127.0.0.1:{port}/score"
+    return server, f"http://127.0.0.1:{port}"
 
 
 # --------------------------------------------------------------------------------------------
@@ -1676,14 +1857,29 @@ def _stamp_adapter_dir_provenance(
 # --------------------------------------------------------------------------------------------
 # orchestration.
 # --------------------------------------------------------------------------------------------
-def _resolve_single_turn_inputs():
-    """reproduce run_rl's front-half config + dataset prep, fenced to single-turn text grpo."""
+def _resolve_grpo_inputs():
+    """reproduce run_rl's front-half config + dataset prep for text, multimodal, and multi-turn."""
     env = _w.require_active_env()
-    if getattr(env, "multi_turn", False) or getattr(env, "is_tool_env", False):
+    if getattr(env, "is_tool_env", False):
         raise RuntimeError(
-            "FLASH_RL_BACKEND=verl supports single-turn, non-tool grpo only; this env is "
-            "multi-turn/tool. use the trl backend (unset FLASH_RL_BACKEND) for it."
+            "verl grpo does not support openai function-calling tool environments; this env "
+            "reports is_tool_env"
         )
+    multi_turn = bool(getattr(env, "multi_turn", False))
+    if multi_turn:
+        # the bridge drives the env through exactly these four calls, so a missing one would only
+        # surface mid-rollout on the first episode. same gate the opd verl path applies.
+        missing = [
+            name
+            for name in ("new_rollout_state", "record_model_turn", "env_reply", "rollout_done")
+            if not callable(getattr(env, name, None))
+        ]
+        if missing:
+            raise RuntimeError(
+                f"multi-turn grpo environment is missing required rollout methods: {missing}"
+            )
+        if int(getattr(env, "max_turns", 0) or 0) <= 0:
+            raise RuntimeError("multi-turn grpo environment requires a positive bounded turn limit")
     seed_training_rngs(_w.SEED)
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
@@ -1716,12 +1912,22 @@ def _resolve_single_turn_inputs():
     entropy_quantile = float(_eq) if _eq is not None and float(_eq) < 1.0 else None
     # credit_assignment: per_turn only changes the objective when there is more than one assistant
     # turn to credit -- trl reaches GRPOPerTurnTrainer solely via use_rollout_func, which requires
-    # is_multi_turn (rl.py select_grpo_trainer). the multi-turn/tool guard above already rejects every
-    # env that could get there, so anything still running here is single-turn, where the two modes are
-    # the same objective. trl says so itself and accepts the key ("per-turn is equivalent to
-    # per-episode for single-turn environments", rl.py). match that: log it, do not reject.
+    # is_multi_turn (rl.py select_grpo_trainer). single-turn envs cannot get there, and trl says so
+    # itself while accepting the key ("per-turn is equivalent to per-episode for single-turn
+    # environments", rl.py). match that: log it, do not reject.
+    #
+    # multi-turn is different. verl credits the episode: the agent loop returns one sequence with
+    # one reward on its last token. per-turn credit needs a custom advantage estimator AND turn
+    # spans plumbed into it (verl's generic estimator branch does not forward non_tensor_batch), so
+    # it is a separate change. reject rather than downgrade -- silently training per-episode when
+    # the config asks for per-turn is the worse failure.
     credit_assignment = getattr(_t, "credit_assignment", DEFAULT_CREDIT_ASSIGNMENT) if _t else None
     if credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
+        if multi_turn:
+            raise RuntimeError(
+                f"verl grpo credits the whole episode; credit_assignment={credit_assignment} is "
+                "not supported for multi-turn environments"
+            )
         print(
             f"[rl-verl] credit assignment: {credit_assignment} is equivalent to "
             f"{DEFAULT_CREDIT_ASSIGNMENT} for single-turn environments",
@@ -1817,7 +2023,7 @@ def _resolve_single_turn_inputs():
     if multimodal:
         # the model must actually support image training; this raises for a text-only checkpoint
         # rather than letting the processor silently drop the pixels.
-        validate_multimodal_training(model_id, "grpo", multi_turn=False)
+        validate_multimodal_training(model_id, "grpo", multi_turn=multi_turn)
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(
@@ -1853,6 +2059,11 @@ def _resolve_single_turn_inputs():
         raise ValueError(
             "engine length leaves no room for the completion; raise max_context_tokens"
         )
+    if multi_turn:
+        # the child derives inter-turn glue by probing this template. a template that cannot
+        # round-trip assistant content would fail on the first environment reply, after the rollout
+        # has already burned gpu time -- fail here instead, before anything is launched.
+        validate_glue_template(tok, thinking=bool(_w.THINKING))
 
     prompts = []
     if multimodal:
@@ -1882,6 +2093,7 @@ def _resolve_single_turn_inputs():
                         "images": list(normalized.descriptors),
                         "rendered": rendered,
                         "example": ex,
+                        "prompt_len": len(expanded),
                     }
                 )
     else:
@@ -1889,8 +2101,16 @@ def _resolve_single_turn_inputs():
             rendered = tok.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
             )
-            if 0 < len(tok(rendered, add_special_tokens=False).input_ids) <= prompt_budget:
-                prompts.append({"prompt": messages, "rendered": rendered, "example": ex})
+            prompt_len = len(tok(rendered, add_special_tokens=False).input_ids)
+            if 0 < prompt_len <= prompt_budget:
+                prompts.append(
+                    {
+                        "prompt": messages,
+                        "rendered": rendered,
+                        "example": ex,
+                        "prompt_len": prompt_len,
+                    }
+                )
     if len(prompts) < len(train):
         print(
             f"[rl-verl] dropped {len(train) - len(prompts)} prompts over the "
@@ -1899,6 +2119,23 @@ def _resolve_single_turn_inputs():
         )
     if not prompts:
         raise ValueError(f"every training prompt exceeds the {prompt_budget}-token prompt budget")
+
+    # single-turn: one completion IS the response, so the response tensor is max_completion wide and
+    # prompt + response exactly fills the engine.
+    #
+    # multi-turn: the whole EPISODE is the response -- every assistant turn plus every environment
+    # glue span concatenated. verl right-pads response_ids to data.max_response_length and drops
+    # whatever is longer (_pad_token_ids), so a max_completion-wide tensor would silently cut a
+    # transcript mid-turn and train on the fragment. the tightest width that can hold any episode
+    # this dataset can produce is the engine budget minus the SHORTEST admitted prompt: the child
+    # stops generating once the prefix reaches max_model_len, so no episode can exceed that.
+    # max_completion stays the PER-TURN cap, which is exactly what the trl driver does
+    # (per_turn_max_tokens=max_completion, episode budget=engine_len-prompt_len-slack).
+    max_response_len = (
+        max(max_completion, vllm_max_len - min(int(p["prompt_len"]) for p in prompts))
+        if multi_turn
+        else max_completion
+    )
 
     prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
     prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
@@ -1939,6 +2176,17 @@ def _resolve_single_turn_inputs():
         "tok": tok,
         "processor": processor,
         "multimodal": multimodal,
+        "multi_turn": multi_turn,
+        "max_turns": int(getattr(env, "max_turns", 0) or 0) if multi_turn else 0,
+        # the child decides whether an assistant turn ended naturally or was cut off, and it has no
+        # access to the model config -- so the full halting set is resolved here and handed over.
+        # the union of the tokenizer's eos and the model's generation_config eos, because a model can
+        # stop on a secondary id its tokenizer never exposes.
+        "eos_token_ids": (
+            generation_eos_from_cached_config(model_id, model_revision, tok)
+            if multi_turn
+            else frozenset()
+        ),
         "package_root": package_root,
         "image_pad_token_id": image_pad_token_id,
         "model_id": model_id,
@@ -1955,6 +2203,9 @@ def _resolve_single_turn_inputs():
         "stop_sequences": stop_sequences,
         "structured_outputs": structured_outputs,
         "max_completion": max_completion,
+        # the response TENSOR's width. equals max_completion on a single-turn job; on multi-turn it
+        # holds the whole episode (see the derivation above).
+        "max_response_len": max_response_len,
         "max_prompt_len": prompt_budget,
         # the engine's full sequence length (prompt + completion), already clamped to the model's
         # own limit. sizes vllm's kv cache and the training token budget, and prompt_budget above is
@@ -1988,7 +2239,7 @@ def run_rl_verl():
     )
     setup_perf_backends()
 
-    inp = _resolve_single_turn_inputs()
+    inp = _resolve_grpo_inputs()
     env, tok = inp["env"], inp["tok"]
     # what gets saved next to a published adapter. a multimodal adapter is unservable without its
     # image preprocessor, so save the whole processor there; a text run saves the tokenizer alone.
@@ -2097,6 +2348,11 @@ def run_rl_verl():
     elif os.path.exists(shim_py):
         os.remove(shim_py)
 
+    # multi-turn: copy the child-side agent loop next to the shim so the verl interpreter can
+    # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
+    if inp["multi_turn"]:
+        copy_multi_turn_child_modules(shim_dir)
+
     # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. also keep a
     # rolling buffer of recent (completion, score) so the training loop can dump one sample per step
     # to the flash log, matching the trl path's #607 per-step completion dump.
@@ -2140,14 +2396,30 @@ def run_rl_verl():
             raise_on_error=True,
         )
 
-    reward_profile = _log_reward_profile(
-        env,
-        _score_for_profile,
-        rollout_examples,
-        int(inp["prompts_per_step"]) * int(inp["group_size"]),
+    # the profiler times the single-turn grading path (env.reward / env.scores_breakdown on one
+    # completion). a multi-turn env scores a terminal episode instead, so that timing would neither
+    # describe nor even validly reach its reward path.
+    reward_profile = (
+        None
+        if inp["multi_turn"]
+        else _log_reward_profile(
+            env,
+            _score_for_profile,
+            rollout_examples,
+            int(inp["prompts_per_step"]) * int(inp["group_size"]),
+        )
     )
 
-    server, reward_url = start_reward_server(_score, example_count=len(rollout_examples))
+    multi_turn_bridge = (
+        MultiTurnBridge(env, rollout_examples, max_turns=int(inp["max_turns"]))
+        if inp["multi_turn"]
+        else None
+    )
+    server, reward_url = start_reward_server(
+        _score,
+        example_count=len(rollout_examples),
+        multi_turn_bridge=multi_turn_bridge,
+    )
     # bound before the try so the finally can always ask whether it was started.
     resume_uploader: _VerlResumeUploader | None = None
     # verl trains out-of-process, so torch's in-process allocator counter never sees the trainer.
@@ -2249,10 +2521,17 @@ def run_rl_verl():
         env_for_verl["HF_HUB_OFFLINE"] = "1"
         env_for_verl["TRANSFORMERS_OFFLINE"] = "1"
         env_for_verl["HF_HUB_DISABLE_XET"] = "1"
-        if shim_source:
+        if inp["multi_turn"]:
+            # the plugin named here and the loop it builds live in shim_dir, so PYTHONPATH must
+            # carry it -- see below.
+            env_for_verl.update(
+                multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
+            )
+        if shim_source or inp["multi_turn"]:
             # python imports sitecustomize automatically at startup, so the shim patches verl before
             # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
             # install itself, and ray workers inherit this env so every actor gets the same patch.
+            # multi-turn needs the same entry for its copied-in agent loop modules.
             env_for_verl["PYTHONPATH"] = os.pathsep.join(
                 item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
             )

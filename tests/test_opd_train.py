@@ -5148,7 +5148,7 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
     reach a verdict the tokenizer already had. The deleted trl trainer filtered first; this pins the
     verl path to the same order.
 
-    `_generation_eos_from_cached_config` reads the snapshot with local_files_only, so it is allowed
+    `generation_eos_from_cached_config` reads the snapshot with local_files_only, so it is allowed
     to sit after the prefetch -- but the budget check must not.
     """
     import inspect
@@ -5160,7 +5160,7 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
     prefetch = source.index("_w.prefetch_model(")
     assert budget_raise < prefetch
     # and the eos read, which needs the downloaded snapshot, must follow the prefetch.
-    assert prefetch < source.index("_generation_eos_from_cached_config(")
+    assert prefetch < source.index("generation_eos_from_cached_config(")
 
 
 def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
