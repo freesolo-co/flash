@@ -104,4 +104,7 @@ def test_every_shipped_worker_actually_reaches_wandb():
         if "wandb_report_to" not in source and "wandb_run_info" not in source:
             without_wandb.add(algorithm)
 
+    # an empty catalog would satisfy the assertion below without having checked anything, so the
+    # test would keep passing while proving nothing about the remedy it exists to protect.
+    assert ALGORITHMS, "the catalog must ship at least one algorithm for this to prove anything"
     assert without_wandb == set()
