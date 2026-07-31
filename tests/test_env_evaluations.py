@@ -1426,16 +1426,26 @@ def test_a_sidecar_sibling_wins_over_an_unrelated_module_already_cached(tmp_path
         sys.modules.pop("helper", None)
 
 
-def test_a_sidecar_package_submodule_wins_over_one_already_cached(tmp_path) -> None:
+@pytest.mark.parametrize("namespace", [False, True], ids=["regular-package", "namespace-package"])
+def test_a_sidecar_package_submodule_wins_over_one_already_cached(
+    tmp_path, namespace: bool
+) -> None:
     """Displacing a package must displace its cached submodules too.
 
     Evicting only the top-level `graders` left sys.modules["graders.rules"] in place, and
     `from graders.rules import GOLD` reads that entry directly -- so the suite scored with the
     other environment's rules while its own file was never read.
+
+    The namespace case is the same defect reached a different way: under PEP 420 a `graders/` with
+    no `__init__.py` is importable all the same, but the owned-name scan required the marker file,
+    so such a directory was never claimed and nothing was displaced at all. This is the
+    already-cached path specifically -- two sidecars in sequence are covered by parking, and only
+    a module the process held BEFORE any sidecar ran survives to be handed to the wrong one.
     """
     unrelated = tmp_path / "unrelated"
     (unrelated / "graders").mkdir(parents=True)
-    (unrelated / "graders" / "__init__.py").write_text("")
+    if not namespace:
+        (unrelated / "graders" / "__init__.py").write_text("")
     (unrelated / "graders" / "rules.py").write_text("GOLD = 'UNRELATED'\n")
     sys.path.insert(0, str(unrelated))
     try:
@@ -1448,7 +1458,8 @@ def test_a_sidecar_package_submodule_wins_over_one_already_cached(tmp_path) -> N
     env_dir = tmp_path / "env"
     (env_dir / "graders").mkdir(parents=True)
     (env_dir / "environment.py").write_text("def load_environment():\n    return None\n")
-    (env_dir / "graders" / "__init__.py").write_text("")
+    if not namespace:
+        (env_dir / "graders" / "__init__.py").write_text("")
     (env_dir / "graders" / "rules.py").write_text("GOLD = 'OWN-SIBLING'\n")
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"

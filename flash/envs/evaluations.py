@@ -322,7 +322,18 @@ def _is_under(path: str, directory: Path) -> bool:
 
 
 def _sidecar_module_names(directory: Path) -> set[str]:
-    """Top-level import names this package directory can supply."""
+    """Top-level import names this package directory can supply.
+
+    A subdirectory counts whether or not it has `__init__.py`: since PEP 420 any directory on the
+    path is a namespace package, so `graders/rules.py` with no `__init__.py` is importable as
+    `graders.rules`. Requiring the marker file left such a directory out of the owned set, so
+    another environment's cached `graders.rules` was never displaced and the suite silently graded
+    with its scoring code (codex[bot]). Verified by probe: the second import returned the first
+    package's value.
+
+    `isidentifier` is the real condition -- a directory named `my-env` or `.git` cannot be spelled
+    in an import statement, so claiming it would evict cached modules this directory can never
+    supply. `__pycache__` is a valid identifier but is build output, never a sidecar's helper."""
     names: set[str] = set()
     try:
         entries = list(directory.iterdir())
@@ -333,7 +344,7 @@ def _sidecar_module_names(directory: Path) -> set[str]:
             continue
         if entry.is_file() and entry.suffix == ".py":
             names.add(entry.stem)
-        elif entry.is_dir() and (entry / "__init__.py").is_file():
+        elif entry.is_dir() and entry.name.isidentifier() and entry.name != "__pycache__":
             names.add(entry.name)
     return names
 

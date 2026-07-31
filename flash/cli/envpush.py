@@ -604,9 +604,14 @@ def _iter_env_sidecar_files(
                 # same-named modules: when both exist, `import graders` is the package. shipping the
                 # .py and skipping the package published the file the sidecar never imports while
                 # dropping the one it does (cursor[bot]).
+                #
+                # `__init__.py` is not required: under PEP 420 any directory is importable as a
+                # namespace package, so a `graders/` with no marker file imports fine locally and
+                # was then dropped from the archive -- publishing an `evaluations.py` that raises
+                # ModuleNotFoundError on its first case after upload (codex[bot]).
                 package = env_root / module_name
                 if (
-                    (package / "__init__.py").is_file()
+                    package.is_dir()
                     and not package.is_symlink()
                     and not _ignore_env_push_path(package, env_root=env_root, entrypoint=entrypoint)
                 ):
