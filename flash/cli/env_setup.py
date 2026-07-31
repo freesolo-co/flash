@@ -394,7 +394,8 @@ def cmd_env_setup(args) -> int:
     # dataset (or vice versa); the flag/answer only decides the mode when starting fresh.
     existing_multi: bool | None = None
     anchor = "environment.py"
-    if starter_env.exists():
+    starter_env_exists = starter_env.exists()
+    if starter_env_exists:
         existing_multi = "EnvironmentMultiTurn" in starter_env.read_text(encoding="utf-8")
     elif dataset.exists():
         # No env.py to anchor on, but the starter multi-turn dataset carries a
@@ -472,10 +473,14 @@ def cmd_env_setup(args) -> int:
         f"{'exported from your traces' if traces_jsonl else 'the starter dataset has 2'}"
         f"{'' if traces_jsonl else ' (raise as your dataset grows)'}\n"
     )
-    if not starter_env.exists():
+    if not starter_env_exists:
         starter_env.write_text(env_py)
-    if not starter_evaluations.exists():
-        starter_evaluations.write_text(_STARTER_EVALUATIONS_PY.replace("PROJECT_UUID", project_id))
+        # the arithmetic sidecar only matches the starter environment created in this run.
+        # adding it beside an existing custom environment would grade unrelated examples.
+        if not starter_evaluations.exists():
+            starter_evaluations.write_text(
+                _STARTER_EVALUATIONS_PY.replace("PROJECT_UUID", project_id)
+            )
     project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
         "# Environment: upload this project folder with\n"
@@ -575,7 +580,7 @@ def cmd_env_setup(args) -> int:
         )
     scaffolded = [
         "environment.py",
-        _DEFAULT_EVALUATIONS_PATH,
+        *([_DEFAULT_EVALUATIONS_PATH] if starter_evaluations.exists() else []),
         "dataset/train.jsonl",
         "configs/sft.toml",
         "configs/rl.toml",
