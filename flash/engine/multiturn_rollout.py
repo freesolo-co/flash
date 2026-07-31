@@ -664,7 +664,14 @@ def rollout_async(
                             max_turns,
                             pending=r.env_step_pending,
                         )
-                except Exception as exc:
+                # SystemExit derives from BaseException, so user env code that calls sys.exit() --
+                # a one-turn environment running a CLI-style parser is the realistic one -- unwound
+                # this thread without reporting anything (codex[bot]). The receive loop below ends
+                # on a dead worker rather than hanging, so the cost is not a stall: it is silence.
+                # The final env step never ran, and the episode was scored on that partial state as
+                # if the close-out had succeeded. Report it like any other close-out failure; the
+                # CLI-side user-code paths catch it the same way (flash/cli/env_test.py).
+                except (Exception, SystemExit) as exc:
                     to_submit.put(("error", exc))
                     return
                 to_submit.put(("closed",))
