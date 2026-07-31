@@ -153,14 +153,14 @@ class StarterFirstActionSuite(BaseEvalSuite):
         self.environment = environment
 
     def cases(self):
+        # `input` is a dataset row's input, not a finished prompt. `env eval` builds the
+        # request through `environment.prompt_messages()`, which runs `start_episode` and
+        # appends the reply instructions -- exactly as training does. Spelling that block
+        # out here too would send it twice and evaluate a prompt training never used.
         return [
             EvalCase(
                 id="opening-guess",
-                input=(
-                    f"I picked a secret whole number between {LOW} and {HIGH}.\\n"
-                    "Reply with a single integer per turn. I will say 'higher', "
-                    "'lower', or 'correct'. You have 5 guesses."
-                ),
+                input=f"I picked a secret whole number between {LOW} and {HIGH}.",
             )
         ]
 
