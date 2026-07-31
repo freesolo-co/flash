@@ -296,7 +296,15 @@ def _call_factory(factory, kwargs: dict[str, object]) -> object:
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
     )
-    if accepts_var_kwargs:
+    has_positional_only = any(
+        parameter.kind == inspect.Parameter.POSITIONAL_ONLY
+        for parameter in signature.parameters.values()
+    )
+    # **kwargs alone means every name is accepted, so pass them through. but `**kwargs` does not
+    # make a positional-only parameter keyword-passable: `load_evaluations(environment, /, **opts)`
+    # put environment into opts and then raised for the missing positional, so a valid factory
+    # failed to load at all. fall through to the positional handling below when both are present.
+    if accepts_var_kwargs and not has_positional_only:
         return factory(**kwargs)
     # a positional-only parameter is in signature.parameters but cannot be passed by name, so
     # matching on membership alone would raise TypeError for `load_evaluations(environment, /)`.
@@ -328,7 +336,8 @@ def _call_factory(factory, kwargs: dict[str, object]) -> object:
     filtered_kwargs = {
         name: value
         for name, value in kwargs.items()
-        if name in signature.parameters and name not in consumed
+        # a factory with **kwargs accepts any name, so only drop what a positional slot already got.
+        if (accepts_var_kwargs or name in signature.parameters) and name not in consumed
     }
     return factory(*positional, **filtered_kwargs)
 

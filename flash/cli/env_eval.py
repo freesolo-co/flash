@@ -301,6 +301,10 @@ def _upload_report(
 ) -> int:
     """Record one suite's results against a project, reporting failures without hiding them.
 
+    `environment_reference` is the resolved entrypoint, not its directory: a package may hold
+    several environment modules, and evaluating `/env/easy.py` then `/env/hard.py` recorded the
+    same provenance for two runs graded by different environments.
+
     Upload failure is reported but does not change the eval's own exit status: the suite
     already ran and its verdict is printed above. Returning FAIL here would relabel a
     passing suite as failing because a network call did not land."""
@@ -479,7 +483,7 @@ def cmd_env_eval(args) -> int:
                     report,
                     [],
                     project_id=project_id,
-                    environment_reference=str(entrypoint.parent),
+                    environment_reference=str(entrypoint),
                     target=evaluation_target,
                     started_at=started_at,
                     status="failed",
@@ -501,7 +505,7 @@ def cmd_env_eval(args) -> int:
                     report,
                     cases,
                     project_id=project_id,
-                    environment_reference=str(entrypoint.parent),
+                    environment_reference=str(entrypoint),
                     target=evaluation_target,
                     started_at=started_at,
                     status="failed",
@@ -526,7 +530,7 @@ def cmd_env_eval(args) -> int:
                 report,
                 cases,
                 project_id=project_id,
-                environment_reference=str(entrypoint.parent),
+                environment_reference=str(entrypoint),
                 target=evaluation_target,
                 started_at=started_at,
             )
