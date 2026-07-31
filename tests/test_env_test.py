@@ -2005,6 +2005,81 @@ def test_an_extra_environment_turn_is_not_a_faithful_replay(monkeypatch, tmp_pat
     assert "cannot rank completions" not in capsys.readouterr().err
 
 
+def test_a_prompt_ending_in_an_assistant_turn_still_replays_faithfully(
+    monkeypatch, tmp_path, capsys
+):
+    # a prefill prompt -- one ending in an assistant turn -- is copied through unfiltered by
+    # flash/engine/multiturn_rollout.py, and the rollout state's transcript starts as a copy of the
+    # prompt. skipping the prompt's NON-ASSISTANT messages by count therefore left that trailing
+    # turn to open a block, shifting every reference block by one. an exact replay was marked
+    # partial_replay, excluded from the control gate, and an all-zero grader could pass unreported
+    # (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _PrefillEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    # the gold transcript must RECORD an observation. a completion of pure
+                    # assistant turns makes every reference block empty, `any(reference)` false,
+                    # and _env_turns_reproduce returns True before it aligns anything -- so the
+                    # defect is unreachable and a test built on it cannot fail either way.
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def new_rollout_state(self, example):
+            prompt = [
+                {"role": "user", "content": example["input"]},
+                # the prefill: part of the PROMPT, not of the completion.
+                {"role": "assistant", "content": "let me start"},
+            ]
+            return {"prompt": prompt, "messages": list(prompt), "done": False, "turn": 0}
+
+        def reward(self, completion, example, state=None):
+            # flat at zero, which is the conclusive signature. it can only be reported if the
+            # episode reached the gate, so a shifted alignment silently passes instead.
+            return 0.0
+
+    _patch_loader(monkeypatch, _PrefillEnv())
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
+def test_a_mixed_tie_sample_is_not_described_as_entirely_non_zero(monkeypatch, tmp_path, capsys):
+    # `not conclusive` is `scored_zero != controlled`, which a MIXED sample satisfies too. claiming
+    # every score was non-zero was then false, and pointed at the wrong episodes (cursor).
+    env_dir = _environment_dir(tmp_path)
+
+    class _MixedTieEnv(_MultiTurnEnv):
+        """Ties every control with gold, at zero on the first episode and above it on the rest."""
+
+        def __init__(self):
+            super().__init__()
+            self.episodes = 0
+
+        def dataset(self):
+            return [
+                dict(row, input=f"{row['input']} {i}")
+                for i, row in enumerate([_MultiTurnEnv.dataset(self)[0]] * 2)
+            ]
+
+        def reward(self, completion, example, state=None):
+            # constant within an episode (so it ties) and different across them.
+            return 0.0 if str(example["input"]).endswith("0") else 0.5
+
+    _patch_loader(monkeypatch, _MixedTieEnv())
+    cmd_env_test(_args(env_dir, algorithm="grpo"))
+    err = capsys.readouterr().err
+    assert "every score was the same non-zero value" not in err, err
+    assert "tied above zero" in err, err
+
+
 def test_an_unscorable_multi_turn_control_is_dropped_rather_than_failed(
     monkeypatch, tmp_path, capsys
 ):
@@ -2232,9 +2307,7 @@ def test_a_reward_coordinate_for_a_text_free_turn_is_not_read_as_separation(
                 # credit only at the turn gold left empty, and tie the episode scalar so nothing
                 # else can carry the separation.
                 gold = said[:1] == [""]
-                rewards.append(
-                    RolloutReward(episode=0.5, turns=(1.0, 0.0) if gold else (0.0, 0.0))
-                )
+                rewards.append(RolloutReward(episode=0.5, turns=(1.0, 0.0) if gold else (0.0, 0.0)))
             return rewards
 
     _patch_loader(monkeypatch, _EmptyFirstTurnEnv())
