@@ -628,9 +628,7 @@ def _drive_single_turn(env, example: dict, record: dict, *, thinking: bool = Fal
     record["prompt"] = prompt
     # single-turn drives one assistant reply and never checks observations, so the snapshot the
     # multi-turn path threads through has no second reader here.
-    reference_turns, record["partial_replay"], _ = _reference_turns(
-        env, example, thinking=thinking
-    )
+    reference_turns, record["partial_replay"], _ = _reference_turns(env, example, thinking=thinking)
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
     response = (
@@ -653,9 +651,7 @@ def _drive_single_turn(env, example: dict, record: dict, *, thinking: bool = Fal
     # against. the earlier assistant turns are already excluded from the gate via partial_replay.
     record["reference_turns"] = [response] if policy == "replay" else []
     record["turns"] = 1
-    record["reward"] = _Score(
-        episode=_grade_single_turn(env, response, example, thinking=thinking)
-    )
+    record["reward"] = _Score(episode=_grade_single_turn(env, response, example, thinking=thinking))
 
 
 def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], list[dict], bool]:
@@ -750,7 +746,16 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     # the terminal rollout, kept unscored: the whole run's rollouts are scored in one batch so a
     # listwise grader ranks them together, exactly as the worker submits them (codex[bot]). see
     # _score_multi_turn_rollouts.
-    record["rollout"] = (example, state, responses)
+    #
+    # the completion messages ride along because which SCORER sees this rollout is not decided here:
+    # a native tool env is graded by reward_from_messages, which takes the messages rather than the
+    # state (see _uses_native_tool_scoring).
+    record["rollout"] = (
+        example,
+        state,
+        responses,
+        _completion_messages(state, prompt, seeded=seeded),
+    )
 
 
 def _control_is_disjoint(control: str, reference: str) -> bool:
@@ -866,6 +871,45 @@ def _grade_single_turn(env, completion: str, example: dict, *, thinking: bool = 
         ) from exc
 
 
+def _completion_messages(state: dict, prompt: list[dict], *, seeded: bool) -> list[dict]:
+    """The messages a native tool loop would hand ``reward_from_messages`` as the completion.
+
+    trl passes the generated messages only -- the prompt is not part of the completion -- so the
+    opening is dropped as a positional prefix, by the same provenance rule the observation
+    comparison uses (see ``_prompt_prefix_length``: whether the state was seeded with the prompt is
+    observed on the fresh state, never inferred from content).
+    """
+    driven = state.get("messages") or []
+    return [dict(m) for m in driven[_prompt_prefix_length(driven, prompt, seeded=seeded) :]]
+
+
+def _uses_native_tool_scoring(env, *, grpo: bool) -> bool:
+    """Whether this env's run is scored by ``reward_from_messages`` rather than the rollout path.
+
+    The GRPO worker drives a multi-turn env through a ``rollout_func`` -- and therefore through
+    ``score_rollouts``/``rollout_rewards_many`` -- only when it is not a tool env exposing tools:
+    ``use_rollout_func = is_multi_turn and not (is_tool_env and tools)`` (`flash/engine/worker/
+    rl.py:820`). A native tool env with a nonempty ``tools()`` instead hands trl the tool callables,
+    and trl's message completion is scored by ``env.reward_from_messages`` (`rl.py:433-438`).
+
+    Both scorers are optional and independent, so testing the wrong one is not a near-miss: a
+    placeholder ``rollout_rewards_many`` passes an env whose real ``reward_from_messages`` is flat or
+    raises, and a healthy native scorer is rejected because an unused rollout scorer fails
+    (codex[bot]). The condition is read from the worker's own inputs so the two cannot drift.
+
+    ``grpo`` is part of that condition, not a shortcut: only rl.py builds a tool loop. Answering from
+    the env's flags alone would also call ``tools()`` for an sft/opd/opsd run, and those workers
+    never call it -- ``_grpo_rejection`` therefore leaves it unvalidated for them, so a raising hook
+    that is legitimately not their problem would abort this command instead.
+
+    For a GRPO run a raising ``tools()`` is not caught here: ``_grpo_rejection`` already refuses that
+    run before any episode is driven, so by this point the call is known to return.
+    """
+    if not grpo or not getattr(env, "is_tool_env", False):
+        return False
+    return bool(env.tools())
+
+
 def _emitted_turns(responses: list[str]) -> tuple[bool, ...]:
     """Which assistant turns put tokens on the wire, positionally.
 
@@ -877,7 +921,43 @@ def _emitted_turns(responses: list[str]) -> tuple[bool, ...]:
     return tuple(bool(response) for response in responses)
 
 
-def _grade_rollouts(env, rollouts: list[tuple[dict, dict, list[str]]]) -> list[_Score]:
+def _grade_native_tool_rollouts(
+    env, rollouts: list[tuple[dict, dict, list[str], list[dict]]]
+) -> list[_Score]:
+    """Score terminal rollouts the way a native tool run scores them: one call per completion.
+
+    ``reward_from_messages`` takes one message list, and the worker calls it once per completion
+    inside ``reward_fn``'s try/except (`flash/engine/worker/rl.py:433-438`) -- there is no batch to
+    preserve here, and no per-turn vector: that scorer returns a scalar, so nothing downstream can
+    read turn coordinates for this path.
+
+    A raise is scored 0.0 rather than failing the episode, because that guard is what production
+    does with it (`rl.py:462-471`): the run sees a real number and carries on. Failing here would
+    report a run-surviving grader as a run-aborting defect. ``SystemExit`` is not an ``Exception``
+    and still propagates, matching the same guard. A non-numeric RETURN is not caught either -- the
+    value is forwarded to trl uncoerced, so it aborts the run and is reported as the contract
+    violation it is, exactly as on the single-turn path (see ``_grade_single_turn``).
+    """
+    scores: list[_Score] = []
+    for example, _state, responses, completion_msgs in rollouts:
+        try:
+            reward = env.reward_from_messages(completion_msgs, example)
+        except Exception:
+            # mirrors reward_fn's own except branch: the run would score this 0.0 and carry on.
+            scores.append(_Score(episode=0.0, emitted=_emitted_turns(responses)))
+            continue
+        try:
+            episode = float(reward)
+        except (TypeError, ValueError) as exc:
+            raise _InvalidReward(
+                f"reward_from_messages() returned {type(reward).__name__} ({reward!r}), which is "
+                "not a number; the worker forwards this value to trl uncoerced and the run aborts"
+            ) from exc
+        scores.append(_Score(episode=episode, emitted=_emitted_turns(responses)))
+    return scores
+
+
+def _grade_rollouts(env, rollouts: list[tuple[dict, dict, list[str], list[dict]]]) -> list[_Score]:
     """Score terminal rollouts through the multi-turn worker's own path, in one batched call.
 
     The multi-turn trainer never calls ``env.reward`` itself: it calls ``score_rollouts``
@@ -905,12 +985,12 @@ def _grade_rollouts(env, rollouts: list[tuple[dict, dict, list[str]]]) -> list[_
 
     requests = [
         RolloutScoreRequest(example=example, state=state, turn_count=len(responses))
-        for example, state, responses in rollouts
+        for example, state, responses, _completion_msgs in rollouts
     ]
     rewards = score_rollouts(env, requests)
     return [
         _Score(episode=float(reward.episode), turns=reward.turns, emitted=_emitted_turns(responses))
-        for reward, (_example, _state, responses) in zip(rewards, rollouts, strict=True)
+        for reward, (_example, _state, responses, _msgs) in zip(rewards, rollouts, strict=True)
     ]
 
 
@@ -955,7 +1035,7 @@ def _score_single_turn_control(
 
 def _drive_multi_turn_controls(
     env, example: dict, controls: list[str]
-) -> list[tuple[dict, dict, list[str]]]:
+) -> list[tuple[dict, dict, list[str], list[dict]]]:
     """Drive one wrong episode per control, leaving them unscored for the caller's batch.
 
     A multi-turn reward reads the accumulated rollout state, so a comparable wrong episode has to be
@@ -964,8 +1044,8 @@ def _drive_multi_turn_controls(
     ``_score_multi_turn_rollouts``).
     """
     return [
-        (example, state, responses)
-        for state, responses, _prompt, _seeded in (
+        (example, state, responses, _completion_messages(state, prompt, seeded=seeded))
+        for state, responses, prompt, seeded in (
             _run_rollout(env, example, lambda _index, text=control: text) for control in controls
         )
     ]
@@ -1008,7 +1088,7 @@ def _usable_controls(references: list[str]) -> list[str] | None:
     return usable or None
 
 
-def _score_multi_turn_rollouts(env, records: list[dict]) -> None:
+def _score_multi_turn_rollouts(env, records: list[dict], *, grpo: bool) -> None:
     """Score every multi-turn rollout of the whole run -- gold and controls -- in ONE call.
 
     The worker submits its entire rollout request list to ``score_rollouts`` at once
@@ -1031,7 +1111,7 @@ def _score_multi_turn_rollouts(env, records: list[dict]) -> None:
     it rejected such an env for the single reason that a fixed control is not valid input for it
     (codex[bot]).
     """
-    batch: list[tuple[dict, dict, list[str]]] = []
+    batch: list[tuple[dict, dict, list[str], list[dict]]] = []
     # (record, slice of `batch` holding its controls) so each result returns to its own episode.
     layout: list[tuple[dict, slice]] = []
     for record in records:
@@ -1044,7 +1124,15 @@ def _score_multi_turn_rollouts(env, records: list[dict]) -> None:
         layout.append((record, slice(start, start + len(controls))))
     if not batch:
         return
-    scores = _grade_rollouts(env, batch)
+    # the scoring contract is the run's, not this command's: a native tool env exposing tools is
+    # driven through trl's tool loop and graded per completion by reward_from_messages, and only
+    # everything else reaches score_rollouts (codex[bot]). routing unconditionally through the
+    # rollout path let a placeholder rollout scorer pass an env whose real grader is flat, and
+    # rejected a healthy native grader over an unused one.
+    if _uses_native_tool_scoring(env, grpo=grpo):
+        scores = _grade_native_tool_rollouts(env, batch)
+    else:
+        scores = _grade_rollouts(env, batch)
     gold_index = 0
     for record, control_slice in layout:
         record["reward"] = scores[gold_index]
@@ -1169,8 +1257,14 @@ def _grpo_rejection(env, *, grpo: bool, per_turn: bool) -> str | None:
 
     Ordered as the worker orders them: tools() is called before the trainer is selected, so a env
     that both raises and asks for per-turn credit reports the failure that actually comes first.
+
+    Each refusal is gated on the condition the WORKER gates it on, and those differ. `rl.py:816`
+    calls tools() for every `is_tool_env`, with no multi_turn in the condition, so requiring
+    multi_turn here left a single-turn tool env with a raising tools() reporting PASS for a run that
+    aborts during initialization (codex[bot]). multi_turn belongs only to the second refusal, which
+    is about the trainer the tool loop selects.
     """
-    if not (getattr(env, "is_tool_env", False) and getattr(env, "multi_turn", False)):
+    if not getattr(env, "is_tool_env", False):
         return None
     # only when the run really would call it. a non-grpo algorithm never reaches rl.py's tool setup,
     # so a raising tools() is not that run's problem to report.
@@ -1185,6 +1279,11 @@ def _grpo_rejection(env, *, grpo: bool, per_turn: bool) -> str | None:
             "unguarded while building the tool loop, so the run aborts during initialization"
         )
     if not per_turn:
+        return None
+    # the trainer refusal, unlike tools(), is specific to the multi-turn tool loop: `select_grpo_
+    # trainer` is only asked for per-turn credit when is_multi_turn, so a single-turn tool env has
+    # nothing to refuse here.
+    if not getattr(env, "multi_turn", False):
         return None
     # a tool env exposing no tools degrades to the rollout_func path, which supports per-turn credit
     # -- the same condition the worker checks, not merely the is_tool_env flag.
@@ -1309,7 +1408,7 @@ def cmd_env_test(args) -> int:
     graded = [record for _, record, failure, _ in episodes if not failure]
     batch_failure = None
     try:
-        _score_multi_turn_rollouts(env, graded)
+        _score_multi_turn_rollouts(env, graded, grpo=grades)
     except (Exception, SystemExit) as exc:
         batch_failure = str(exc) or exc.__class__.__name__
         # the controls are this command's own additions, not rollouts any run would submit. under
@@ -1320,7 +1419,7 @@ def cmd_env_test(args) -> int:
             for record in affected:
                 record["control_rollouts"] = None
             try:
-                _score_multi_turn_rollouts(env, graded)
+                _score_multi_turn_rollouts(env, graded, grpo=grades)
             except (Exception, SystemExit):
                 pass
             else:
