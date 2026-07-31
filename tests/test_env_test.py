@@ -609,6 +609,69 @@ def test_env_test_bare_unquoted_param_still_falls_back_to_a_string(monkeypatch, 
     assert seen["kwargs"] == {"name": "hard mode"}
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "cutoff=2026-13-01",  # month 13
+        "when=2026-01-32T00:00:00",  # day 32
+        "at=12:99:00",  # minute 99
+        "scale=1e",  # exponent with no digits
+        "mask=0x",  # radix prefix with no digits
+        "code=007",  # leading zeros are not a TOML integer
+        "size=1_",  # trailing underscore separator
+        "version=1.2.3",  # two dots is not a float
+        "width=3px",  # number with a unit suffix
+        "share=10%",
+    ],
+)
+def test_env_test_malformed_param_without_a_delimiter_is_rejected(
+    monkeypatch, tmp_path, capsys, value
+):
+    # carrying no structural character does not make a token prose. these hold none, so they
+    # forwarded as literal strings ("2026-13-01", "1e", ...) while the equivalent
+    # [environment.params] entry fails to load -- the gate approving a config that cannot be
+    # written. the tell is a leading digit or sign: every TOML scalar except the bare
+    # true/false/inf/nan words starts with one, so a token that starts that way and does not parse
+    # is a malformed number or date rather than text (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    err = capsys.readouterr().err
+    assert "is not a valid TOML value" in err, err
+    # the remedy has to be named, because "3px" really is text to the user who typed it.
+    assert "quote it" in err, err
+
+
+@pytest.mark.parametrize(
+    "value", ["name=v1.0", "path=/tmp/data", "tag=a-b", "when=x2026-01-01", "name=hard mode"]
+)
+def test_env_test_text_that_merely_contains_digits_still_falls_back(monkeypatch, tmp_path, value):
+    # the rejection is on how the token STARTS, not on whether digits appear in it. these are
+    # ordinary prose values and must keep working unquoted, or the check would cost the convenience
+    # the fallback exists for.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 0
+    key, _, raw = value.partition("=")
+    assert seen["kwargs"] == {key: raw}
+
+
+@pytest.mark.parametrize("value", ['width="3px"', 'cutoff="2026-13-01"'])
+def test_env_test_quoting_passes_a_scalar_looking_value_as_text(monkeypatch, tmp_path, value):
+    # the escape hatch, and deliberately the same spelling [environment.params] needs: a genuinely
+    # textual "3px" has to be quoted in the config too, so the flag and the config stay in step
+    # rather than the flag accepting a spelling the config would reject.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 0
+    key, _, raw = value.partition("=")
+    assert seen["kwargs"] == {key: raw.strip('"')}
+
+
 def test_env_test_well_formed_structured_params_still_load(monkeypatch, tmp_path):
     # the rejections above must not cost the valid structured forms [environment.params] supports,
     # or tightening the gate would just move the false failures to the other side.

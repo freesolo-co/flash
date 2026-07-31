@@ -24,6 +24,12 @@ _TOML_STRUCTURAL_CHARS = frozenset("\"'[]{}=,\n")
 # _TOML_STRUCTURAL_CHARS, which describes values -- a key is checked before the `=` split, so the
 # structural characters of a value are not applicable to it.
 _TOML_KEY_STRUCTURAL_CHARS = frozenset(".\"'")
+# every TOML scalar that is not a bare `true`/`false`/`inf`/`nan` word starts here: integers,
+# floats, and the whole date/time family all begin with a digit, and a signed number with `+`/`-`.
+# so a token starting with one of these was reaching for a TOML scalar, and failing to parse means
+# it is malformed rather than prose -- the same reasoning _TOML_STRUCTURAL_CHARS applies to
+# delimiters, applied to the tokens that carry no delimiter at all.
+_TOML_SCALAR_LEADING_CHARS = frozenset("0123456789+-")
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:
@@ -216,8 +222,25 @@ def _parse_param_value(key: str, raw: str) -> object:
         # the fallback is an allowlist, not a blocklist of opening delimiters: `filters=]` opens
         # nothing yet is still malformed TOML, and blocklisting only the openers let it through as
         # the literal string "]". a bare string is text with no TOML structural character in it.
+        #
+        # ...and no delimiter is needed to be reaching for TOML syntax. `cutoff=2026-13-01` holds
+        # none of those characters, so it forwarded as the string "2026-13-01" while the equivalent
+        # `[environment.params]` entry fails to load -- the gate passing on a config that cannot be
+        # written. same for `1e`, `0x`, `007`, `1_`, `12:99:00` (codex[bot]). a leading digit or
+        # sign is the tell: every TOML scalar except the bare `true`/`false`/`inf`/`nan` words
+        # starts with one, so such a token is a malformed number or date, not prose.
         if value and not (set(value) & _TOML_STRUCTURAL_CHARS):
-            return value
+            if value[0] not in _TOML_SCALAR_LEADING_CHARS:
+                return value
+            # quoting is the escape hatch, and it is the same spelling the config needs -- a
+            # genuinely textual "3px" has to be written `"3px"` in `[environment.params]` too, so
+            # pointing at it keeps the flag and the config in step rather than adding a second
+            # spelling that only the flag accepts.
+            raise ValueError(
+                f"--param {key} is not a valid TOML value: {exc}. it starts like a number or "
+                f'date, so [environment.params] would reject it too; quote it (--param {key}="'
+                f'{value}") to pass it as text'
+            ) from exc
         raise ValueError(f"--param {key} is not a valid TOML value: {exc}") from exc
     # a value containing a newline makes `v = <value>` a multi-line document, so tomllib accepts
     # `max_rows=5\nstrict=true` as two assignments and taking only "v" drops the second silently.
