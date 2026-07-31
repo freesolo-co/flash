@@ -10,6 +10,7 @@ on top.
 
 from __future__ import annotations
 
+import atexit
 import collections
 import contextlib
 import ctypes
@@ -655,12 +656,46 @@ def reap_stragglers() -> None:
     """take the statuses still owed by processes an earlier teardown could not drain.
 
     this is the future wait that the final in-loop reap cannot schedule for itself: a member still
-    running when its own teardown gave up is cleared by the next one instead. teardowns are frequent
-    on a reused worker -- one per run -- so the entry is transient rather than permanent.
+    running when its own teardown gave up is cleared by the next one instead.
     """
     for pid in tuple(_UNREAPED_STRAGGLERS):
         if _reap(pid):
             _UNREAPED_STRAGGLERS.discard(pid)
+
+
+# how long the last drain waits for a straggler that was still running when its teardown gave up.
+# it has already been SIGKILLed, so this is the delivery and exit latency of a process leaving
+# uninterruptible sleep, not a grace period.
+_EXIT_DRAIN_S = 5.0
+
+
+def _drain_stragglers_before_exit() -> None:
+    """block briefly for the statuses this process still owes, because no later teardown will.
+
+    a straggler is remembered so a FUTURE wait can collect it, and on a long-lived process the next
+    teardown is that wait. this process is not long-lived: `flash/providers/runpod/train/
+    endpoints.py:538-552` spawns a fresh `flash.engine.worker_entrypoint` per phase and waits for it
+    to exit, so the set dies with the phase. the straggler then reparents to the persistent runpod
+    handler, which waits only on the worker it spawned, and becomes a zombie for the container's
+    whole life (codex[bot]).
+
+    so the last wait happens here rather than at a job boundary that never comes. registered at
+    import because the leak is not specific to one entry point: whichever of them ran, the pids are
+    recorded in this process and only this process is their reaper.
+
+    bounded and non-fatal. these are pids already SIGKILLed by an earlier teardown, so the wait is
+    for a process finishing its exit, not for work; and an interpreter already on its way out must
+    not be held up or failed by a reap that costs a pid at worst.
+    """
+    deadline = time.monotonic() + _EXIT_DRAIN_S
+    while _UNREAPED_STRAGGLERS:
+        reap_stragglers()
+        if not _UNREAPED_STRAGGLERS or time.monotonic() >= deadline:
+            return
+        time.sleep(0.05)
+
+
+atexit.register(_drain_stragglers_before_exit)
 
 
 def _process_group_alive(pgid: int) -> bool:

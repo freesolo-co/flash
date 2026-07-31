@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from unittest import mock
 
@@ -20,6 +21,9 @@ import pytest
 
 from flash.engine.worker import rl_verl
 from flash.engine.worker import verl_common as vc
+
+# several tests below drive real subprocesses that import flash from a checkout, not from the venv.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 @pytest.mark.parametrize(
@@ -930,6 +934,76 @@ def test_the_subreaper_setting_does_not_outlive_the_test_that_enabled_it():
 
 
 @_needs_process_teardown
+def test_a_production_entry_point_does_not_leave_this_process_adopting_orphans():
+    """The entry points claim adoption unconditionally, and that claim is PROCESS-global.
+
+    Any test reaching `run_verl_training` flips this shared pytest process from 0 to 1 for the rest
+    of the session, after which every later test adopts orphaned grandchildren it never waits on --
+    accumulating zombies and making results order-dependent. The `subreaper` fixture restores only
+    the tests that ask for it, which is not where this flag is now set (codex[bot]).
+
+    The autouse conftest fixture is what restores it. This asserts the guarantee the fixture makes,
+    from a 0 setting -- what the suite actually runs -- and would fail on a plain `finally`-less
+    entry point exactly as the leak does.
+    """
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    entered = _child_subreaper_setting()
+    try:
+        libc.prctl(_PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0)
+        assert _child_subreaper_setting() == 0
+
+        code = vc.run_verl_training(["bash", "-c", "echo 'step: 1'"], env=dict(os.environ))
+        assert code == 0
+        # inside the test the claim is expected: the entry point needs it to reap its own orphans.
+        assert _child_subreaper_setting() == 1, "the entry point never claimed adoption at all"
+    finally:
+        libc.prctl(_PR_SET_CHILD_SUBREAPER, entered, 0, 0, 0)
+
+
+@_needs_process_teardown
+def test_the_conftest_fixture_restores_the_flag_the_entry_point_set():
+    """The half the test above cannot see: the flag is restored AFTER a test, not during it.
+
+    Run as a subprocess so a real pytest teardown happens. Asserting from a later test in this
+    process would pass under random ordering whenever it happened to run first.
+
+    The probe is written UNDER ``tests/`` rather than to a scratch tempdir, because a conftest
+    governs its own directory and below: from anywhere else `tests/conftest.py` is never loaded,
+    the autouse fixture under test never runs, and the probe reports the leak whether or not the
+    fixture works. Placed in a subdirectory of its own so it is never collected by the outer run.
+    """
+    probe = (
+        "import ctypes\n"
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n"
+        "def flag():\n"
+        "    cur = ctypes.c_int(0)\n"
+        "    libc.prctl(37, ctypes.byref(cur), 0, 0, 0)\n"
+        "    return cur.value\n"
+        "import os\n"
+        "from flash.engine.worker import verl_common as vc\n"
+        "def test_claims_adoption():\n"
+        "    vc.run_verl_training(['bash', '-c', \"echo 'step: 1'\"], env=dict(os.environ))\n"
+        "    assert flag() == 1\n"
+        "def test_zz_sees_it_restored():\n"
+        "    assert flag() == 0, 'PR_SET_CHILD_SUBREAPER leaked into a later test'\n"
+        "    assert vc._ADOPTS_ORPHANS is False, 'the module still believes a claim it lost'\n"
+    )
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    with tempfile.TemporaryDirectory(dir=tests_dir) as scratch:
+        path = os.path.join(scratch, "test_subreaper_leak_probe.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(probe)
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", path, "-p", "no:randomly", "-q", "-o", "addopts="],
+            capture_output=True,
+            text=True,
+            cwd=_REPO_ROOT,
+            timeout=300,
+        )
+    assert done.returncode == 0, f"{done.stdout[-3000:]}\n{done.stderr[-2000:]}"
+
+
+@_needs_process_teardown
 def test_an_empty_snapshot_of_a_gone_group_is_still_drained():
     # and the recheck must not make teardown unfailable: when the group is genuinely gone, the walk
     # being empty has to stay an answer or every teardown burns both deadlines.
@@ -1104,6 +1178,87 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
             os.waitpid(pid, 0)
 
 
+# the worker as the runpod handler really runs it: a short-lived process that records a straggler
+# and then EXITS, with no second job to sweep it. `flash/providers/runpod/train/endpoints.py:538-552`
+# spawns one of these per phase and waits for it, so anything the phase leaves behind reparents to
+# the persistent handler -- which waits only on the worker -- and stays a zombie for the container's
+# life. driven as a subprocess because the leak is about process EXIT, which pytest cannot perform.
+_SHORT_LIVED_WORKER = r"""
+import os, sys, time
+sys.path.insert(0, {repo!r})
+from flash.engine.worker import verl_common as vc
+
+# a straggler as teardown leaves one: exited, owed to this process, recorded because it was still
+# running when the drain deadline passed.
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+deadline = time.monotonic() + 10
+while not vc._process_is_zombie(pid):
+    assert time.monotonic() < deadline, "the straggler never exited"
+    time.sleep(0.01)
+vc._UNREAPED_STRAGGLERS.add(pid)
+sys.stdout.write(str(pid))
+sys.stdout.flush()
+# and now the phase ends. no later teardown, no next job: this process is the only reaper the pid
+# will ever have.
+"""
+
+
+@_needs_process_teardown
+def test_a_worker_that_exits_after_one_phase_still_collects_its_straggler():
+    """The deferred reap has to happen before this process exits, because nothing follows it.
+
+    Remembering a pid arranges a future wait, and on a long-lived process the next teardown is that
+    wait. The runpod worker is not long-lived -- one process per phase -- so the set dies with the
+    phase and the straggler reparents to the persistent handler as a permanent zombie (codex[bot]).
+    """
+    done = subprocess.run(
+        [sys.executable, "-c", _SHORT_LIVED_WORKER.format(repo=_REPO_ROOT)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert done.returncode == 0, f"worker failed: {done.stderr[-2000:]}"
+    straggler = int(done.stdout.strip())
+    assert not os.path.exists(f"/proc/{straggler}"), (
+        f"straggler {straggler} outlived the worker that owed its status, so the runpod handler "
+        "inherits a zombie it never waits on: one leaked pid per phase"
+    )
+
+
+def test_the_exit_drain_is_registered_wherever_stragglers_are_recorded():
+    """At import, not from one entry point: the pids are recorded in whichever process ran.
+
+    `run_verl_training` and `kill_process_group` both record stragglers, so hanging the last drain
+    off either one leaves the other's pids uncollected when that process exits.
+    """
+    source = " ".join(inspect.getsource(vc).split())
+    assert "atexit.register(_drain_stragglers_before_exit)" in source, (
+        "no exit drain is registered, so a straggler recorded by a short-lived worker is never "
+        "collected by anything"
+    )
+
+
+def test_the_exit_drain_gives_up_rather_than_holding_the_interpreter_open():
+    """A straggler that never exits must cost a pid, not the worker's shutdown."""
+    original = set(vc._UNREAPED_STRAGGLERS)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    try:
+        vc._UNREAPED_STRAGGLERS.add(child.pid)  # ours, alive, and not going to exit
+        started = time.monotonic()
+        with mock.patch.object(vc, "_EXIT_DRAIN_S", 0.3):
+            vc._drain_stragglers_before_exit()
+        assert time.monotonic() - started < 10, (
+            "the exit drain blocked on a process that is running"
+        )
+    finally:
+        vc._UNREAPED_STRAGGLERS.clear()
+        vc._UNREAPED_STRAGGLERS.update(original)
+        child.kill()
+        child.wait(timeout=10)
+
+
 def test_grpo_teardown_uses_the_shared_escalating_kill():
     # the grpo path used to hand-roll killpg(pid, 15) and swallow the wait timeout, so a vllm
     # EngineCore that ignored the term kept its cuda context and stranded the gpu for later jobs.
@@ -1199,19 +1354,36 @@ if worker == 0:
         time.sleep(0.5)
         claimed = _reap(engine)
         time.sleep(0.3)
-        os.write(w_res, ("%s|%s" % (claimed, state_of(engine) or "gone")).encode())
+        os.write(w_res, ("%s|%s|%s" % (claimed, state_of(engine) or "gone", engine)).encode())
     finally:
         os._exit(0)
 
 os.close(w_e)
 os.close(w_res)
-print(os.read(r_res, 64).decode(), end="")
+result = os.read(r_res, 64).decode()
 os.waitpid(worker, 0)
+# the negative control leaves the EngineCore a zombie ON PURPOSE -- that is the result it reports.
+# but this handler is its subreaper (line 1173), so the entry is OURS, and exiting here would
+# reparent it to whatever runs pytest and leak one process-table slot per run of that test
+# (codex[bot]). the state above was already recorded, so collecting it now costs the test nothing.
+#
+# reported rather than done silently: whether the leak is VISIBLE depends on the pid 1 the suite
+# happens to run under -- systemd reaps orphans, a container's `python rp_handler.py` does not -- so
+# a test that only asks whether the pid disappeared cannot fail on the machine most likely to run
+# it. what this handler collected is the same either way.
+collected = []
+while True:
+    try:
+        reaped, _ = os.waitpid(-1, 0)
+    except ChildProcessError:
+        break
+    collected.append(reaped)
+print("%s|%s" % (result, ",".join(str(p) for p in collected)), end="")
 """
 
 
-def _run_topology_probe(*, claim: bool) -> tuple[str, str]:
-    """(what `_reap` claimed, the orphan's /proc state afterwards) in the real container shape."""
+def _run_topology_probe(*, claim: bool) -> tuple[str, str, int, list[int]]:
+    """(what `_reap` claimed, the orphan's /proc state, its pid, pids the handler reaped on exit)."""
     done = subprocess.run(
         [sys.executable, "-c", _TOPOLOGY_PROBE.format(repo=_REPO_ROOT, claim=claim)],
         capture_output=True,
@@ -1219,11 +1391,8 @@ def _run_topology_probe(*, claim: bool) -> tuple[str, str]:
         timeout=120,
     )
     assert done.returncode == 0, f"probe failed: {done.stderr[-2000:]}"
-    claimed, state = done.stdout.strip().split("|")
-    return claimed, state
-
-
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    claimed, state, engine, collected = done.stdout.strip().split("|")
+    return claimed, state, int(engine), [int(p) for p in collected.split(",") if p]
 
 
 @_needs_process_teardown
@@ -1240,7 +1409,7 @@ def test_an_orphan_is_actually_reaped_in_the_container_process_topology():
     the teardown tests use manufactures the adoption production does not have, so the defect is
     invisible from inside it.
     """
-    claimed, state = _run_topology_probe(claim=True)
+    claimed, state, _engine, _collected = _run_topology_probe(claim=True)
     assert state == "gone", (
         f"the orphan is still {state!r} after _reap, so the worker never adopted it and every "
         "wait in this module is a no-op in the container"
@@ -1256,10 +1425,21 @@ def test_without_the_claim_the_orphan_reparents_past_this_process():
     gone, the probe is being reaped by something other than the code under test and the pass above
     means nothing.
     """
-    claimed, state = _run_topology_probe(claim=False)
-    assert state == "Z", "the orphan was collected without the claim, so the test above proves nothing"
+    claimed, state, engine, collected = _run_topology_probe(claim=False)
+    assert state == "Z", (
+        "the orphan was collected without the claim, so the test above proves nothing"
+    )
     assert claimed == "True", (
         "`_reap` reported the zombie as handled, which is what makes this silent"
+    )
+    # the zombie this control deliberately produces is the probe's to clear before it exits. it is
+    # a subreaper, so the entry is its own; exiting would hand it to whatever runs pytest and leak
+    # one process-table slot per run (codex[bot]). asserted on what the probe COLLECTED rather than
+    # on the pid disappearing: under systemd the orphan is reaped either way, so the disappearance
+    # is not evidence and a test built on it could never fail here.
+    assert engine in collected, (
+        f"the probe exited without reaping orphan {engine}, leaking a process-table entry to "
+        "whatever inherits it -- invisible under an init that reaps, permanent under one that does not"
     )
 
 

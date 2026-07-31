@@ -92,6 +92,48 @@ def _offline(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _child_subreaper_does_not_leak_between_tests():
+    """Restore PR_SET_CHILD_SUBREAPER after every test, not just the ones that opt in.
+
+    ``adopt_orphaned_descendants`` sets a PROCESS-global flag, and the production entry points call
+    it unconditionally: any test reaching ``run_verl_training`` or ``kill_process_group`` flips this
+    pytest process from 0 to 1 for the rest of the session. From then on every later test adopts
+    orphaned grandchildren it never waits on, so it accumulates zombies and its result depends on
+    what ran before it. The ``subreaper`` fixture in ``test_verl_common`` restores only the tests
+    that ask for it, which is not where the flag is now set (codex[bot]).
+
+    Autouse and here rather than in that module: five test files reach those entry points, and the
+    tests harmed are any that follow -- so the guarantee has to cover the whole suite. The module's
+    own ``_child_subreaper_enabled`` still nests inside this untouched.
+
+    ``_ADOPTS_ORPHANS`` is reset alongside the kernel flag. It is the module's memory of having
+    claimed adoption; leaving it True while clearing the flag would leave the module believing a
+    claim the kernel no longer holds, and the next call would skip the prctl it needs to make.
+    """
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        current = ctypes.c_int(0)
+        # PR_GET_CHILD_SUBREAPER / PR_SET_CHILD_SUBREAPER, from linux/prctl.h.
+        if libc.prctl(37, ctypes.byref(current), 0, 0, 0) != 0:
+            yield  # pragma: no cover - linux 3.4+
+            return
+    except (OSError, AttributeError, ValueError):  # pragma: no cover - not reachable on linux
+        yield  # no libc: nothing can set the flag either, so there is nothing to restore
+        return
+
+    previous = current.value
+    try:
+        yield
+    finally:
+        libc.prctl(36, previous, 0, 0, 0)
+        import flash.engine.worker.verl_common as _vc
+
+        _vc._ADOPTS_ORPHANS = bool(previous)
+
+
+@pytest.fixture(autouse=True)
 def _fast_serving_readback(monkeypatch):
     """Zero the deploy read-back backoff so verification polls don't slow the suite."""
     import flash.serve.deploy as _deploy
