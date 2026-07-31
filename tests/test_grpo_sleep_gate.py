@@ -21,7 +21,13 @@ def test_fp8_kv_unlocks_longer_resident_context():
 
     def f(ctx, fp8):
         return grpo_fits_resident(
-            mid, seq_len=ctx, max_tokens=384, lora_rank=16, group_size=8, card_vram_gb=179.06, fp8_kv=fp8
+            mid,
+            seq_len=ctx,
+            max_tokens=384,
+            lora_rank=16,
+            group_size=8,
+            card_vram_gb=179.06,
+            fp8_kv=fp8,
         )
 
     assert f(2048, False)  # short ctx fits either way
@@ -41,12 +47,28 @@ def test_sleep_unsupported_model_rejects_instead_of_sleeping():
     mid = "Qwen/Qwen3.6-35B-A3B"
     # Fits resident (group 8, ctx 4096 with fp8 KV) -> resident, no raise.
     assert (
-        grpo_sleep_mode(mid, max_length=4096, group_size=8, max_tokens=384, lora_rank=16, card_vram_gb=179.06, fp8_kv=True)
+        grpo_sleep_mode(
+            mid,
+            max_length=4096,
+            group_size=8,
+            max_tokens=384,
+            lora_rank=16,
+            card_vram_gb=179.06,
+            fp8_kv=True,
+        )
         is False
     )
     # Too long to fit resident -> hard reject (NOT True / sleep).
     with pytest.raises(ValueError, match="sleep mode HANGS"):
-        grpo_sleep_mode(mid, max_length=8192, group_size=8, max_tokens=384, lora_rank=16, card_vram_gb=179.06, fp8_kv=True)
+        grpo_sleep_mode(
+            mid,
+            max_length=8192,
+            group_size=8,
+            max_tokens=384,
+            lora_rank=16,
+            card_vram_gb=179.06,
+            fp8_kv=True,
+        )
 
 
 def test_sleep_unsupported_model_rejected_at_parse_time_for_long_context():
@@ -55,8 +77,18 @@ def test_sleep_unsupported_model_rejected_at_parse_time_for_long_context():
     from flash.engine.vram import model_required_vram_gb
 
     mid = "Qwen/Qwen3.6-35B-A3B"
-    fits = {"max_context_tokens": 4096, "group_size": 8, "max_completion_tokens": 384, "lora_rank": 16}
-    over = {"max_context_tokens": 8192, "group_size": 8, "max_completion_tokens": 384, "lora_rank": 16}
+    fits = {
+        "max_context_tokens": 4096,
+        "group_size": 8,
+        "max_completion_tokens": 384,
+        "lora_rank": 16,
+    }
+    over = {
+        "max_context_tokens": 8192,
+        "group_size": 8,
+        "max_completion_tokens": 384,
+        "lora_rank": 16,
+    }
     assert model_required_vram_gb(mid, "grpo", train=fits) <= 180  # admitted on the B200
     assert model_required_vram_gb(mid, "grpo", train=over) > 180  # past every GPU -> rejected
 
@@ -192,15 +224,27 @@ def test_moe_grpo_fits_resident_sizes_compute_on_active_params():
     # exceed 180 and the B200 case above would be False. Prove the active-aware estimate is materially
     # leaner than the (buggy) total-based one — that gap is what flips the B200 verdict.
     active_aware = estimate_vram_gb(
-        info.params_b, "grpo", "bf16", sleep_offload=False,
-        active_params_b=info.active_params_b, vocab=vocab_size_for(moe), **kw,
+        info.params_b,
+        "grpo",
+        "bf16",
+        sleep_offload=False,
+        active_params_b=info.active_params_b,
+        vocab=vocab_size_for(moe),
+        **kw,
     )
     total_based = estimate_vram_gb(
-        info.params_b, "grpo", "bf16", sleep_offload=False,
-        active_params_b=None, vocab=vocab_size_for(moe), **kw,
+        info.params_b,
+        "grpo",
+        "bf16",
+        sleep_offload=False,
+        active_params_b=None,
+        vocab=vocab_size_for(moe),
+        **kw,
     )
     assert active_aware < total_based
-    assert active_aware * 1.15 <= 180 < total_based * 1.15  # only the active-aware fit clears the B200
+    assert (
+        active_aware * 1.15 <= 180 < total_based * 1.15
+    )  # only the active-aware fit clears the B200
 
 
 def test_sleep_gate_resolves_unset_max_length_against_real_rollout_length():
@@ -235,7 +279,13 @@ def test_boot_alloc_conf_and_run_rl_share_sleep_resolver():
             if not isinstance(node, ast.Call):
                 continue
             f = node.func
-            name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+            name = (
+                f.id
+                if isinstance(f, ast.Name)
+                else f.attr
+                if isinstance(f, ast.Attribute)
+                else None
+            )
             if name == call_name:
                 return {kw.arg for kw in node.keywords}
         return None
@@ -244,4 +294,7 @@ def test_boot_alloc_conf_and_run_rl_share_sleep_resolver():
     assert resolver_kws is not None, "shared GRPO sleep resolver no longer calls grpo_sleep_mode"
     assert "fp8_kv" in resolver_kws, "shared GRPO sleep resolver must pass fp8_kv"
     assert _call_keywords(w.run_rl, "resolve_grpo_sleep_mode") is not None
-    assert _call_keywords(gpu_setup.finalize_alloc_conf_for_sleep, "resolve_grpo_sleep_mode") is not None
+    assert (
+        _call_keywords(gpu_setup.finalize_alloc_conf_for_sleep, "resolve_grpo_sleep_mode")
+        is not None
+    )

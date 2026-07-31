@@ -104,12 +104,16 @@ def _validate_remote_url(url: str) -> tuple[urllib.parse.SplitResult, str, int, 
     addresses = []
     for family, _socktype, _proto, _canonname, sockaddr in resolved:
         if family not in {socket.AF_INET, socket.AF_INET6}:
-            raise ValueError(f"remote image host resolved to an unsupported address family: {hostname}")
+            raise ValueError(
+                f"remote image host resolved to an unsupported address family: {hostname}"
+            )
         address = str(sockaddr[0]).split("%", 1)[0]
         try:
             globally_routable = ipaddress.ip_address(address).is_global
         except ValueError as exc:
-            raise ValueError(f"remote image host resolved to an invalid address: {hostname}") from exc
+            raise ValueError(
+                f"remote image host resolved to an invalid address: {hostname}"
+            ) from exc
         if not globally_routable:
             raise ValueError(
                 f"remote image host must resolve only to globally routable addresses: {hostname}"
@@ -264,7 +268,9 @@ def _image_source_from_block(block: dict) -> object | None:
     if isinstance(value, dict):
         extra = set(value) - {"url", "detail"}
         if extra or "url" not in value:
-            raise ValueError(f"malformed {block_type} block: expected image URL object with a url field")
+            raise ValueError(
+                f"malformed {block_type} block: expected image URL object with a url field"
+            )
         value = value["url"]
     if value is None and block_type != "image":
         raise ValueError(f"malformed {block_type} block: missing image source")
@@ -295,8 +301,7 @@ def record_has_images(record: dict, messages: list[dict] | None = None) -> bool:
     for message in messages or []:
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list) and any(
-            isinstance(block, dict) and block.get("type") in _IMAGE_BLOCK_TYPES
-            for block in content
+            isinstance(block, dict) and block.get("type") in _IMAGE_BLOCK_TYPES for block in content
         ):
             return True
     return False
@@ -475,7 +480,9 @@ def descriptor_source_size(descriptor: str, package_root: str | Path | None) -> 
     if kind == "data_uri":
         return len(_data_uri_bytes(value))
     if kind == "path":
-        return _package_image_path(value, Path(package_root) if package_root else None).stat().st_size
+        return (
+            _package_image_path(value, Path(package_root) if package_root else None).stat().st_size
+        )
     raise ValueError("invalid internal image descriptor kind")
 
 
@@ -743,9 +750,7 @@ def multimodal_prompt_key(messages: list[dict]) -> str:
         elif content is not None:
             raise ValueError("multimodal prompt message content must be text or content parts")
         metadata = {
-            key: value
-            for key, value in message.items()
-            if key != "content" and value is not None
+            key: value for key, value in message.items() if key != "content" and value is not None
         }
         canonical.append((metadata, parts))
     return json.dumps(canonical, sort_keys=True, default=str)
@@ -847,7 +852,9 @@ def lazy_image_dataset_transform(package_root: str | Path | None) -> Callable[[d
         if image_rows is None:
             return batch
         batch = dict(batch)
-        batch["images"] = [decode_image_descriptors(list(row or []), package_root) for row in image_rows]
+        batch["images"] = [
+            decode_image_descriptors(list(row or []), package_root) for row in image_rows
+        ]
         return batch
 
     return transform
@@ -881,7 +888,9 @@ def processor_prompt_token_count(
     return len(input_ids[0])
 
 
-def validate_multimodal_training(model_id: str, algorithm: str, *, multi_turn: bool = False) -> None:
+def validate_multimodal_training(
+    model_id: str, algorithm: str, *, multi_turn: bool = False
+) -> None:
     from flash.catalog import supports_image_training
 
     if not supports_image_training(model_id):

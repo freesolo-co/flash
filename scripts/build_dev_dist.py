@@ -82,8 +82,7 @@ def rewrite_channel(text: str) -> str:
     )
     if count != 1:
         raise SystemExit(
-            'expected exactly one `CHANNEL = "prod"` line in flash/_channel.py; '
-            f"found {count}."
+            f'expected exactly one `CHANNEL = "prod"` line in flash/_channel.py; found {count}.'
         )
     return new_text
 

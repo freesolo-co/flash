@@ -111,9 +111,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
         if o < 0 or o > full_len:
             _bad(f"teacher echo response text_offset {o!r} is outside [0, {full_len}]")
         if prev_off is not None and o < prev_off:
-            _bad(
-                f"teacher echo response text_offset is not non-decreasing: {prev_off!r} -> {o!r}"
-            )
+            _bad(f"teacher echo response text_offset is not non-decreasing: {prev_off!r} -> {o!r}")
         prev_off = o
     # Tiling from offsets[0] only proves coverage of full[offsets[0]:], so the echo must START at 0.
     # A malformed 200 that DROPS a prompt prefix and echoes a clean-tiling SUFFIX (offsets[0] > 0)
@@ -314,7 +312,9 @@ def _validate_multimodal_echo(
     previous_offset = None
     for offset in offsets:
         if isinstance(offset, bool) or not isinstance(offset, (int, float)):
-            _bad(f"teacher multimodal echo response text_offset has a non-numeric value: {offset!r}")
+            _bad(
+                f"teacher multimodal echo response text_offset has a non-numeric value: {offset!r}"
+            )
         if not math.isfinite(offset):
             _bad(f"teacher multimodal echo response text_offset is not finite: {offset!r}")
         if offset != int(offset):

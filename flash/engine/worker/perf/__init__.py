@@ -143,7 +143,7 @@ def _find_real_libcudart() -> str | None:
     candidates: list[str] = []
     # 1. nvidia cuda-runtime PyPI wheel (any CUDA major — cu12/cu13 layouts differ)
     try:
-        import nvidia  # type: ignore  # namespace package; subpkg import may fail, this won't
+        import nvidia  # type: ignore[import-untyped]  # namespace pkg; subpkg import may fail, this won't
 
         for base in sorted(map(str, getattr(nvidia, "__path__", []) or [])):
             candidates += sorted(glob.glob(os.path.join(base, "*", "lib", "libcudart.so.*")))
