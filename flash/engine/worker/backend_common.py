@@ -11,8 +11,10 @@ on top.
 from __future__ import annotations
 
 import ast
+import atexit
 import collections
 import contextlib
+import ctypes
 import json
 import math
 import os
@@ -435,9 +437,20 @@ def export_peft_adapter(
     merge_env["TRANSFORMERS_OFFLINE"] = "1"
     merge_env["HF_HUB_DISABLE_XET"] = "1"
     subprocess.run(
-        [python_bin, "-m", "verl.model_merger", "merge", "--backend", "fsdp",
-         "--local_dir", ckpt_actor_dir, "--target_dir", merge_out],
-        check=True, env=merge_env,
+        [
+            python_bin,
+            "-m",
+            "verl.model_merger",
+            "merge",
+            "--backend",
+            "fsdp",
+            "--local_dir",
+            ckpt_actor_dir,
+            "--target_dir",
+            merge_out,
+        ],
+        check=True,
+        env=merge_env,
     )
     lora_dir = os.path.join(merge_out, "lora_adapter")
     if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
@@ -620,6 +633,10 @@ def run_verl_training(
     device memory that nothing will release.
     """
     step_re = re.compile(step_pattern)
+    # before the child exists, so any grandchild it orphans reparents here and can actually be
+    # reaped. this process is not pid 1 -- the runpod handler is -- so without it every wait below
+    # answers ChildProcessError for a zombie nobody will collect.
+    adopt_orphaned_descendants()
     proc = subprocess.Popen(
         cmd,
         env=env,
@@ -647,31 +664,328 @@ def run_verl_training(
                     heartbeat()
                     last_hb = now
     except BaseException:
-        _kill_process_group(proc)
+        kill_process_group(proc)
         raise
     finally:
         if proc.poll() is None:
             proc.wait()
+        # every job boundary, not just the failing ones. a straggler an earlier teardown SIGKILLed
+        # but could not drain in time exits shortly after, and `kill_process_group` -- the only other
+        # caller of this -- runs on exceptions alone: a worker whose later jobs all succeed would
+        # hold that zombie for its whole life, as pid 1 with nothing else to reap it (codex[bot]).
+        reap_stragglers()
     return int(proc.returncode)
 
 
-def _kill_process_group(proc: subprocess.Popen) -> None:
-    """signal the child's whole process group, escalating to SIGKILL if it does not exit.
+_TEARDOWN_GRACE_S = 10.0
+
+
+def _process_is_zombie(pid: int) -> bool:
+    """true when `pid` has exited and is only awaiting a reaper.
+
+    field 3 of /proc/<pid>/stat is the state character, and it follows a comm field that may itself
+    contain spaces and parentheses -- so it is read after the LAST `)`, not by splitting the line.
+
+    only DISAPPEARANCE proves an exit. every other error says this process could not look, not that
+    there is nothing there, and the two must not collapse: teardown can run with the worker out of
+    file descriptors, where opening /proc/<pid>/stat raises EMFILE for every live member at once.
+    reading that as a zombie made the whole group report drained, so SIGKILL was never sent and an
+    EngineCore kept its cuda context precisely on a resource-failure path (codex[bot]). so an
+    unreadable status counts as alive -- over-reporting costs a signal to a group that ignores it,
+    under-reporting strands the gpu.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
+            stat = handle.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return True  # gone, so there is nothing left to wait for
+    except OSError:
+        return False  # unreadable, which is not evidence of an exit
+    _, _, tail = stat.rpartition(")")
+    fields = tail.split()
+    return bool(fields) and fields[0] == "Z"
+
+
+def _process_group_addressable(pgid: int) -> bool:
+    """true while the kernel still knows `pgid`, whether or not its members are running."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, this process just may not signal it
+    except OSError:
+        return False
+    return True
+
+
+# pids this process adopted and killed but could not reap before a teardown deadline expired. each
+# is confirmed ours -- `waitpid` answered for it rather than raising -- and was still running at
+# that point, so it still owes a status. a zombie holds its pid until it is reaped, so nothing
+# recorded here can be recycled behind our back and a later sweep can only ever find the same
+# process it recorded.
+_UNREAPED_STRAGGLERS: set[int] = set()
+
+# PR_SET_CHILD_SUBREAPER, from linux/prctl.h.
+_PR_SET_CHILD_SUBREAPER = 36
+
+
+def adopt_orphaned_descendants() -> bool:
+    """become the reaper for descendants orphaned below this process. true if the kernel agreed.
+
+    without this every reap below is a no-op, because this process is NOT pid 1. `Dockerfile.worker`
+    runs `/rp_handler.py` as pid 1 and that handler spawns the flash worker as a subprocess
+    (`flash/providers/runpod/train/endpoints.py:539`), so an EngineCore orphaned when the trainer
+    exits reparents past us to the HANDLER. `waitpid` then raises `ChildProcessError` here and the
+    zombie is recorded as handled while it keeps its pid for the worker's whole life -- and the
+    handler only ever waits on the worker itself, so nothing else ever collects it either.
+
+    marking this process a subreaper makes the kernel reparent such orphans HERE instead, which is
+    the condition the rest of this module already assumes. set once at teardown-path entry rather
+    than at import, so merely importing this module cannot change an unrelated process's semantics.
+    """
+    global _ADOPTS_ORPHANS
+    if _ADOPTS_ORPHANS:
+        return True
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            return False
+    except (OSError, AttributeError, ValueError):
+        # no libc, or a kernel without the option (linux < 3.4). the reaps below degrade to what
+        # they did before rather than failing the run: a leaked zombie costs a pid, not the job.
+        return False
+    _ADOPTS_ORPHANS = True
+    return True
+
+
+# whether this process has already claimed orphaned descendants; the prctl is idempotent but the
+# call is not free, and teardown runs once per job on a reused worker.
+_ADOPTS_ORPHANS = False
+
+
+def _reap(pid: int) -> bool:
+    """wait on `pid` without blocking. true once nothing is owed, false while it still owes a status.
+
+    the return value is what distinguishes "reaped" from "ours and still running": `waitpid` answers
+    `(0, 0)` for a live child of ours, which is the one case worth remembering. `ChildProcessError`
+    means the pid is not ours to wait on, so there is no status left for this process to take.
+
+    that answer is only safe because `adopt_orphaned_descendants` runs first: it makes an orphaned
+    grandchild reparent to US, so `ChildProcessError` really does mean someone else owns the pid.
+    Without it the same error is returned for a zombie nobody will ever reap (codex[bot]).
+    """
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return True  # not ours, so no status is owed to this process
+    except (PermissionError, OSError):
+        # cannot wait on it, and retrying later would not change that. dropped rather than tracked
+        # so the straggler set cannot grow without bound on a path that can never clear it.
+        return True
+    return reaped != 0
+
+
+def _reap_group_zombies(pgid: int, skip: int) -> None:
+    """wait on any group member this process has adopted, clearing its process-table entry.
+
+    an EngineCore orphaned when the trainer exits is reparented HERE, because
+    `adopt_orphaned_descendants` claimed it. once SIGKILL turns it into a zombie no signal can clear
+    it -- only a wait can -- and leaving it costs the reusable worker one permanent pid per failed or
+    cancelled run, walking it toward the pid limit (codex[bot]).
+
+    `skip` is the direct child, which `subprocess.Popen` reaps itself. waiting on it here would take
+    the exit status Popen is owed, leaving `returncode` unset for a caller that asks which signal
+    reaped it. everything else in the group is a grandchild this process never spawned, so nothing
+    else has a reaper to conflict with.
+
+    scoped to the group so it can only ever touch descendants of this teardown, and non-blocking so
+    a member that is merely still running costs nothing.
+
+    a member that is ours and STILL RUNNING here is remembered rather than forgotten. SIGKILL cannot
+    be refused but it also cannot be delivered while a process sits in uninterruptible sleep, so one
+    can outlast the drain deadline and only then become a zombie -- after the last wait this
+    teardown performs. without a record no future wait is ever scheduled for it and the entry is
+    permanent on a pid-1 worker (codex[bot]).
+    """
+    for pid in _process_group_members(pgid) or ():
+        if pid == skip:
+            continue
+        if _reap(pid):
+            _UNREAPED_STRAGGLERS.discard(pid)
+        else:
+            _UNREAPED_STRAGGLERS.add(pid)
+
+
+def reap_stragglers() -> None:
+    """take the statuses still owed by processes an earlier teardown could not drain.
+
+    this is the future wait that the final in-loop reap cannot schedule for itself: a member still
+    running when its own teardown gave up is cleared by the next one instead.
+    """
+    for pid in tuple(_UNREAPED_STRAGGLERS):
+        if _reap(pid):
+            _UNREAPED_STRAGGLERS.discard(pid)
+
+
+# how long the last drain waits for a straggler that was still running when its teardown gave up.
+# it has already been SIGKILLed, so this is the delivery and exit latency of a process leaving
+# uninterruptible sleep, not a grace period.
+_EXIT_DRAIN_S = 5.0
+
+
+def _drain_stragglers_before_exit() -> None:
+    """block briefly for the statuses this process still owes, because no later teardown will.
+
+    a straggler is remembered so a FUTURE wait can collect it, and on a long-lived process the next
+    teardown is that wait. this process is not long-lived: `flash/providers/runpod/train/
+    endpoints.py:538-552` spawns a fresh `flash.engine.worker_entrypoint` per phase and waits for it
+    to exit, so the set dies with the phase. the straggler then reparents to the persistent runpod
+    handler, which waits only on the worker it spawned, and becomes a zombie for the container's
+    whole life (codex[bot]).
+
+    so the last wait happens here rather than at a job boundary that never comes. registered at
+    import because the leak is not specific to one entry point: whichever of them ran, the pids are
+    recorded in this process and only this process is their reaper.
+
+    bounded and non-fatal. these are pids already SIGKILLed by an earlier teardown, so the wait is
+    for a process finishing its exit, not for work; and an interpreter already on its way out must
+    not be held up or failed by a reap that costs a pid at worst.
+    """
+    deadline = time.monotonic() + _EXIT_DRAIN_S
+    while _UNREAPED_STRAGGLERS:
+        reap_stragglers()
+        if not _UNREAPED_STRAGGLERS or time.monotonic() >= deadline:
+            return
+        time.sleep(0.05)
+
+
+atexit.register(_drain_stragglers_before_exit)
+
+
+def _process_group_alive(pgid: int) -> bool:
+    """true while the group still has a RUNNING member.
+
+    signal 0 checks addressability and delivers nothing, so it succeeds for a group whose only
+    remaining member is a zombie. that is not a hypothetical here: the container runs python
+    directly with no init, so an orphaned EngineCore is reaped only by this module's own waits and
+    can otherwise sit unreaped indefinitely. driving the escalation off addressability alone
+    therefore burned the full drain
+    deadline on every teardown -- delaying the reusable worker even though the cuda context was
+    already released -- and nothing stronger than SIGKILL exists to clear it (codex[bot]).
+
+    So the group is alive only while some member is not a zombie. Membership is read from /proc
+    rather than tracked, since the survivors are grandchildren this process never spawned.
+
+    A drained verdict is only returned when TWO consecutive walks agree on it, because a single walk
+    cannot distinguish a drained group from one it read too early. /proc can be listed while the
+    leader is still present, and the leader can then fork and exit before its status is inspected:
+    the snapshot is nonempty and zombie-only, yet the child that inherited the group is alive,
+    unlisted, and never received the earlier signal -- so teardown returns without SIGKILL and it
+    keeps its cuda context (codex[bot]). Rechecking addressability cannot settle it either, since a
+    zombie holds the group id: that answers True for a group that really has drained, which is the
+    burn-both-deadlines failure this function exists to avoid. A second walk can, because the fork
+    it missed is published by then.
+    """
+    if not _process_group_addressable(pgid):
+        return False
+    for scan in range(2):
+        members = _process_group_members(pgid)
+        if members is None:
+            # /proc could not be enumerated, so fall back to what signal 0 already established. it
+            # over-reports rather than returning early on a live process still holding the gpu.
+            return True
+        if any(not _process_is_zombie(pid) for pid in members):
+            return True
+        if scan == 0:
+            # this walk says drained. it is only believed if a second one, taken after any fork it
+            # could have raced, still says so.
+            continue
+        if not members:
+            # the kernel says this group exists and two walks found nobody in it. that contradiction
+            # outlives the fork window, so it is the /proc walk that is wrong rather than late: fall
+            # back to what signal 0 established rather than reporting a drain the kernel denies.
+            return _process_group_addressable(pgid)
+    return False
+
+
+def _process_group_members(pgid: int) -> list[int] | None:
+    """The pids currently in `pgid`, or None when /proc cannot answer.
+
+    An empty list is a real answer -- the group has no members left -- and is distinct from None.
+    """
+    try:
+        entries = os.listdir("/proc")
+    except OSError:  # pragma: no cover - /proc missing is not reachable on linux
+        return None
+    members = []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            if os.getpgid(pid) == pgid:
+                members.append(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            # exited between listdir and here, or not ours to inspect. a process this cannot see is
+            # one it also could not have signalled.
+            continue
+    return members
+
+
+def kill_process_group(proc: subprocess.Popen) -> None:
+    """signal the child's whole process group, escalating to SIGKILL if anything survives.
 
     signalling the group rather than the pid is what reaches vllm's EngineCore grandchild; a survivor
-    holds its cuda context and strands the gpu for every later run.
+    holds its cuda context and strands the gpu for every later run. the escalation is driven off the
+    group, not off the direct child: the usual shape of this failure is the trainer dying on the term
+    while the EngineCore ignores it, so waiting only on the child returns before the survivor is gone.
     """
-    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    # grpo drives its own subprocess and calls this directly, never through `run_verl_training`, so
+    # the adoption is claimed here too rather than only at the other entry point. idempotent.
+    adopt_orphaned_descendants()
+    # collect anything a previous teardown killed but could not drain before its deadline. done on
+    # entry rather than on exit because that is when such a process has had the longest to die, and
+    # it runs before the early returns below so no path through this function skips it.
+    reap_stragglers()
     try:
-        proc.wait(timeout=10)
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        # already reaped, so there is no group id left to address the survivors by.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_TEARDOWN_GRACE_S)
         return
-    except subprocess.TimeoutExpired:
-        pass
+
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(pgid, signal.SIGTERM)
+
+    deadline = time.monotonic() + _TEARDOWN_GRACE_S
+    # reap the direct child before probing: an unwaited zombie leader is still a group member, so the
+    # liveness check below cannot otherwise tell an empty group from one that is merely unreaped.
     with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=10)
+        proc.wait(timeout=_TEARDOWN_GRACE_S)
+    while _process_group_alive(pgid) and time.monotonic() < deadline:
+        _reap_group_zombies(pgid, skip=proc.pid)
+        time.sleep(0.1)
+    _reap_group_zombies(pgid, skip=proc.pid)
+    if not _process_group_alive(pgid):
+        return
+
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(pgid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=_TEARDOWN_GRACE_S)
+    # sigkill cannot be refused, but delivery and reaping are asynchronous and the caller's next job
+    # wants the gpu already free. wait for the group to drain -- bounded, since a zombie awaiting a
+    # reaper that is not coming stays addressable and there is nothing stronger left to send.
+    drain_deadline = time.monotonic() + _TEARDOWN_GRACE_S
+    while _process_group_alive(pgid) and time.monotonic() < drain_deadline:
+        _reap_group_zombies(pgid, skip=proc.pid)
+        time.sleep(0.1)
+    # last pass after the loop: a member killed on the final iteration becomes a zombie only once the
+    # kernel has posted its status, which can land after the check that ended the loop. without this
+    # the group drains but its process-table entry stays behind for the worker's whole lifetime.
+    _reap_group_zombies(pgid, skip=proc.pid)
 
 
 # --------------------------- w&b run link (all three verl backends) ---------------------------
