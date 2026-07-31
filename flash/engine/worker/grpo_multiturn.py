@@ -106,7 +106,22 @@ def build_flash_grpo_multi_turn_agent_loop(
             raw_prompt = validate_transcript_messages(
                 [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
             )
-            prompt_ids = await self.apply_chat_template(raw_prompt)
+            # an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. both
+            # apply_chat_template and every generate call need the decoded media alongside the ids,
+            # or the engine sees placeholders it cannot expand and the rollout either dies on a
+            # feature/placeholder mismatch or conditions on nothing. text-only prompts yield {}.
+            multi_modal_data = await self.process_multi_modal_info(raw_prompt)
+            images = multi_modal_data.get("images")
+            videos = multi_modal_data.get("videos")
+            audios = multi_modal_data.get("audios")
+            mm_processor_kwargs = self._get_mm_processor_kwargs(audios)
+            prompt_ids = await self.apply_chat_template(
+                raw_prompt,
+                images=images,
+                videos=videos,
+                audios=audios,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
             bridge_url = os.environ["FLASH_VERL_MULTITURN_URL"]
             example_index = int(kwargs["index"])
             max_turns = int(os.environ["FLASH_VERL_MAX_TURNS"])
@@ -176,10 +191,16 @@ def build_flash_grpo_multi_turn_agent_loop(
                     if eos_token_ids:
                         params["stop_token_ids"] = sorted(eos_token_ids)
                     request_started = time.perf_counter()
+                    # the media rides along on EVERY turn, not just the first: each turn re-sends the
+                    # whole prefix, whose placeholder tokens still need their pixels to expand.
                     generated = await self.server_manager.generate(
                         request_id=uuid4().hex,
                         prompt_ids=prefix_ids,
                         sampling_params=params,
+                        image_data=images,
+                        video_data=videos,
+                        audio_data=audios,
+                        mm_processor_kwargs=mm_processor_kwargs,
                     )
                     generated_seconds += time.perf_counter() - request_started
                     num_preempted = sum_preemptions(num_preempted, generated.num_preempted)
@@ -299,6 +320,11 @@ def build_flash_grpo_multi_turn_agent_loop(
                 response_ids=response_ids,
                 response_mask=response_mask,
                 response_logprobs=response_logprobs if have_logprobs else None,
+                # the training pass re-tokenizes this episode through the processor, so it needs the
+                # same media the rollout conditioned on; without it the actor's forward would see
+                # placeholders with no pixels behind them.
+                multi_modal_data=multi_modal_data or None,
+                mm_processor_kwargs=mm_processor_kwargs,
                 num_turns=turn_count,
                 # verl reads reward_score BEFORE its reward manager runs: _compute_score skips any
                 # output that already carries one, _postprocess writes it into rm_scores on the
