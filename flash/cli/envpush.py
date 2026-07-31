@@ -546,10 +546,14 @@ def _iter_env_sidecar_files(
     import os
 
     roots = [env_root]
+    # shared with the dataset walk below: the import closure can reach a helper package that IS
+    # `dataset/` (or lives under it), and yielding it twice makes `_check_env_push_limits` charge
+    # those bytes and members twice -- rejecting a tree that is actually under the limit
+    # (codex[bot]). the copy pass is idempotent, so only the limit check ever saw the double.
+    yielded: set[Path] = set()
     if not include_full_tree:
         import ast
 
-        yielded: set[Path] = set()
         # a single-file push carries only the entrypoint, its dataset sidecars, and its own
         # docs. ship user-authored docs so the synthesized stub readme does not stand in for
         # real training guidance the user shipped next to the module.
@@ -666,8 +670,11 @@ def _iter_env_sidecar_files(
             )
             for name in sorted(files):
                 child = root_path / name
-                if _ignore_env_push_path(child, env_root=env_root, entrypoint=entrypoint):
+                if child in yielded or _ignore_env_push_path(
+                    child, env_root=env_root, entrypoint=entrypoint
+                ):
                     continue
+                yielded.add(child)
                 yield child, child.relative_to(env_root)
 
 

@@ -923,6 +923,37 @@ def test_push_rejects_when_member_count_exceeds_limit_including_dirs(monkeypatch
     assert "(limit 4)" in error
 
 
+def test_push_counts_an_imported_dataset_package_once(monkeypatch, tmp_path):
+    """A helper package reachable BOTH ways must not be charged twice against the limit.
+
+    The single-file walk yields imported helper packages, then falls through to the `dataset/`
+    walk. A helper package that IS `dataset/` is reached by both, and the second pass did not
+    consult the first's `yielded` set -- so the limit check counted those files and bytes twice and
+    rejected a tree that actually fits. The archive was always correct (the copy just overwrites),
+    which is why only the limit saw it (codex[bot]).
+    """
+    # a SINGLE-FILE push: only that path builds the import closure whose `yielded` set the dataset
+    # walk has to honour. pushing the directory takes the full-tree branch and never reaches it.
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text("import dataset\n\n\ndef cases():\n    return []\n")
+    pkg = tmp_path / "dataset"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("ROWS = []\n")
+    (pkg / "rows.jsonl").write_text('{"a": 1}\n')
+
+    # environment.py + evaluations.py + the two dataset files + the synthesized readme = 5 members,
+    # plus the `dataset` directory = 6. counting the package twice charges 8 and trips this cap.
+    monkeypatch.setattr("flash.cli.envpush._ENV_PUSH_MAX_FILES", 6)
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert "dataset/__init__.py" in names
+    assert "dataset/rows.jsonl" in names
+
+
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses dir perms")
 def test_push_fails_fast_on_unreadable_directory(monkeypatch, tmp_path, capsys):
     import os as _os
