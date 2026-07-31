@@ -656,6 +656,98 @@ def test_a_retained_delimiter_is_still_stripped_when_the_answer_follows_it_late(
     )
 
 
+def _streamed(message: dict) -> str:
+    """The same payload through the streaming path, as one reasoning delta then one content delta.
+
+    Every defect below is a disagreement between the two paths on one payload, so the assertion that
+    matters is not what either path returns in isolation but that they return the same thing. The
+    non-streaming result is the reference: it is what the public chat route serves, and it is the
+    shape `_thinking_answer` and the deployment smoke were written against.
+    """
+    deltas: list[dict] = []
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str):
+        deltas.append({"reasoning_content": reasoning})
+    content = message.get("content")
+    if content:
+        deltas.append({"content": content})
+    return "".join(deploy._openai_stream_content(iter(_sse(*deltas)), thinking=True))
+
+
+def test_a_terminal_duplicated_inline_block_is_not_emitted_twice():
+    # the duplicate shape with NO answer behind it. `_strip_retained_close` keeps buffering because
+    # nothing follows the close, and the end-of-stream branch then emits the buffer verbatim -- so
+    # the reasoning and its tags streamed twice, where the non-streaming path folds them to one
+    # (codex[bot]). end of stream is exactly where this is decidable: nothing more can arrive, so a
+    # complete inline block whose body is the reasoning can only be the repeat.
+    message = {"content": "<think>why</think>", "reasoning_content": "why"}
+
+    assert deploy._balanced_thinking_content(message, thinking=True) == "<think>why</think>"
+    assert _streamed(message) == "<think>why</think>"
+
+
+def test_a_terminal_duplicate_that_is_split_across_deltas_is_also_folded():
+    # the repeat is subject to arbitrary delta boundaries like every other shape, and the buffer is
+    # settled at end of stream either way.
+    lines = _sse({"reasoning_content": "why"}, {"content": "<think>why<"}, {"content": "/think>"})
+
+    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "<think>why</think>"
+
+
+def test_a_terminal_pair_that_is_not_the_reasoning_still_survives():
+    # the fold above keys on the body matching the reasoning. an answer that is its own literal pair
+    # is not the repeat, so it must arrive whole rather than being swallowed as a duplicate.
+    message = {"content": "<think>other</think>", "reasoning_content": "why"}
+
+    assert (
+        deploy._balanced_thinking_content(message, thinking=True)
+        == "<think>why</think><think>other</think>"
+    )
+    assert _streamed(message) == "<think>why</think><think>other</think>"
+
+
+def test_an_answer_leading_empty_pair_is_preserved():
+    # `<think></think>` at the head of the ANSWER, with real reasoning on the field. removing the
+    # opener leaves an empty prefix, which `_is_sampled_delimiter` accepted as the bare delimiter,
+    # so the streaming path deleted the answer's own pair while the non-streaming path kept it
+    # (codex[bot], cursor). an explicit opener says the block is present; its body must then match
+    # the reasoning to be the repeat.
+    message = {"content": "<think></think>answer", "reasoning_content": "why"}
+
+    assert (
+        deploy._balanced_thinking_content(message, thinking=True)
+        == "<think>why</think><think></think>answer"
+    )
+    assert _streamed(message) == "<think>why</think><think></think>answer"
+
+
+def test_an_empty_duplicate_pair_split_across_deltas_is_still_folded():
+    # empty reasoning repeated inline, split inside the close tag. `_delimiter_may_complete` gave up
+    # on the empty body and released the head as answer, so the pair streamed twice -- while the
+    # same bytes in ONE delta folded correctly (codex[bot], cursor).
+    lines = _sse({"reasoning_content": ""}, {"content": "<think></"}, {"content": "think>answer"})
+    whole = {"content": "<think></think>answer", "reasoning_content": ""}
+
+    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == (
+        "<think></think>answer"
+    )
+    # and the split stream agrees with the same payload arriving whole, and with non-streaming.
+    assert _streamed(whole) == "<think></think>answer"
+    assert deploy._balanced_thinking_content(whole, thinking=True) == "<think></think>answer"
+
+
+def test_a_retained_close_does_not_survive_a_later_reasoning_block():
+    # the buffered close belongs to the block that was open when it arrived. a later non-empty
+    # reasoning delta opens a NEW block, and the stale buffer was never cleared -- so the
+    # end-of-stream branch flushed it behind the new block's close and the stream carried an extra
+    # `</think>` the non-streaming path never produces (cursor).
+    lines = _sse({"reasoning_content": "why"}, {"content": "</think>"}, {"reasoning_content": "more"})
+    streamed = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+
+    assert streamed == "<think>why</think><think>more</think>"
+    assert streamed.count("<think>") == streamed.count("</think>")
+
+
 def test_the_held_stream_does_not_rescan_its_whole_buffer_per_delta():
     """A legacy inline stream with no early close holds every delta, and used to rescan them all.
 
