@@ -226,11 +226,12 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # live there), so verl gets its own venv and flash launches it out-of-process via FLASH_VERL_PYTHON.
 # The venv deliberately re-resolves its own numpy independent of the base interpreter's.
 #
-# Without this venv the runtime falls back to resolve_verl_python(), which builds a venv from the
-# verl requirement ALONE. verl's install_requires omits vllm/uvicorn/fastapi/cachetools, so that
-# fallback yields an interpreter where `verl.trainer.main_ppo` dies on ModuleNotFoundError:
-# cachetools and `main_ppo_sync` dies on uvicorn. Baking the full set here is what makes the verl
-# backends actually runnable.
+# Without this venv the runtime falls back to resolve_verl_python(), which provisions the same set on
+# the pod. Keep the two in lockstep: verl's install_requires omits vllm/uvicorn/fastapi/cachetools
+# while importing them at module level on the launch path, so any dependency dropped from ONE of
+# these two lists yields an interpreter where `verl.trainer.main_ppo` dies on ModuleNotFoundError:
+# cachetools and `main_ppo_sync` dies on uvicorn. Baking them here keeps the image from paying the
+# fallback's install cost on every run; it is not what makes the backends runnable.
 #
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
 # That deliberately exceeds verl's declared vllm<=0.12.0 ceiling. The metadata-clean alternative
