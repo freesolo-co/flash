@@ -511,7 +511,25 @@ def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> t
     return content, finish
 
 
-def _thinking_answer(content: str) -> str:
+def _thinking_tag_is_guaranteed(spec) -> bool:
+    """Whether the catalog vouches that this model's chat template opens a thinking block.
+
+    Only the open-model policy yields "unknown", and `flash.schema` already warns and proceeds for
+    it. Anything that fails to resolve keeps the strict requirement, so a lookup failure cannot
+    quietly weaken the guard into admitting an adapter that answered nothing.
+    """
+    from flash.catalog import resolve_model
+
+    try:
+        info = resolve_model(
+            spec.model, spec.algorithm, policy=getattr(spec, "model_policy", "catalog")
+        )
+    except Exception:
+        return True
+    return info.thinking != "unknown"
+
+
+def _thinking_answer(content: str, *, require_tag: bool = True) -> str:
     """Return the answer a thinking adapter emitted after its reasoning, or reject the smoke.
 
     Applies to every thinking smoke, not only grammar-constrained ones. A run trained with
@@ -520,9 +538,17 @@ def _thinking_answer(content: str) -> str:
     empty-content check and activates a checkpoint that answers nothing on real requests. The stop
     also makes ``finish_reason`` ``"stop"`` rather than ``"length"``, so the truncation guard above
     cannot see it.
+
+    ``require_tag`` is False only when the catalog cannot confirm the model's chat template honors
+    ``enable_thinking``. Such a run is admitted with a warning and may answer with no block at all,
+    so demanding the tag would reject a correct answer and leave the adapter undeployable. An
+    answerless generation is still caught: `_smoke_provenance` has already rejected blank content,
+    so reaching here without a tag means real answer text.
     """
     closed = content.find("</think>")
     if closed < 0:
+        if not require_tag:
+            return content.strip()
         raise ServingError(
             "smoke generation for a thinking adapter never closed its reasoning with </think>"
         )
@@ -637,7 +663,11 @@ def _run_deployment_smoke(
     # balanced <think>...</think> and passes the empty-content check carrying a non-answer.
     if spec.thinking and finish == "length":
         raise ServingError("smoke generation was truncated at the maximum token length")
-    answer = _thinking_answer(content) if spec.thinking else content.strip()
+    answer = (
+        _thinking_answer(content, require_tag=_thinking_tag_is_guaranteed(spec))
+        if spec.thinking
+        else content.strip()
+    )
     if constraint:
         _validate_structured_smoke(answer, constraint, deadline=deadline, budget_s=budget_s)
     if time.monotonic() > deadline:
