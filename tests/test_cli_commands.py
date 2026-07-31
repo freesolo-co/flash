@@ -1393,6 +1393,52 @@ def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
     assert "attempt=2" in progress
 
 
+@pytest.mark.parametrize("heartbeat_attempt", [0, 1])
+def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
+    heartbeat_attempt: int,
+) -> None:
+    """A supervised retry publishes `remote: null` for its whole allocation window.
+
+    `flash/runner/lifecycle.py` clears `remote` before reserving the replacement attempt and does
+    not persist the new one until the provider handle lands, so throughout that window flash serves
+    a running record whose only attempt identity is the superseded worker's ping. Falling back to it
+    there reintroduced exactly what preferring `remote` was meant to fix: the first retry unlabelled
+    (its stale attempt is 0), later ones naming the *previous* attempt (codex[bot]).
+
+    Both parametrizations are the same window one retry apart, and both must refuse the ping.
+
+    Keyed on an explicit null rather than a missing key, which is what makes it decidable:
+    `on_handle` persists `remote` in the same `_update` that sets `running`, so a running flash
+    record with a heartbeat and no remote is a worker already torn down. An ABSENT `remote` still
+    falls back -- that is a plane which never surfaces the field, covered above.
+    """
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    _, progress = _log_follow_progress(
+        {
+            "state": "running",
+            "remote": None,
+            "last_heartbeat": {
+                "stage": "sft_step",
+                "step": 455,
+                "ts": _time.time(),
+                "attempt": heartbeat_attempt,
+            },
+        },
+        "unknown",
+    )
+    # no identity is claimed: the replacement is not reserved yet, and a wrong number is worse than
+    # none for the one field that exists to explain the rewind.
+    assert "attempt=" not in progress, progress
+    # ...and the ping it did print belongs to the torn-down worker, so it must not read as the
+    # replacement's progress.
+    assert "step=455" in progress, progress
+    assert "(prev attempt)" in progress, progress
+    assert progress.index("step=455") < progress.index("(prev attempt)"), progress
+
+
 def test_log_follow_progress_names_the_attempt_before_the_first_heartbeat() -> None:
     """The relaunch has to be named while the replacement worker is still cold.
 

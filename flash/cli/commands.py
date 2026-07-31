@@ -437,11 +437,26 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     # ping, so reading the heartbeat leaves the first preemption unlabelled (stale attempt 0) and
     # names the *previous* attempt on later ones. `remote` is absent on planes that do not surface
     # it, hence the heartbeat fallback.
+    #
+    # ...but the fallback is only for an ABSENT `remote`, not a null one. a supervised retry clears
+    # `remote` before reserving the replacement attempt and does not persist the new one until the
+    # provider handle lands, so for that whole allocation window flash publishes `remote: null` with
+    # the superseded worker's ping still attached. falling back there reintroduced exactly what
+    # preferring `remote` was meant to fix: the first retry unlabelled, later ones naming the
+    # previous attempt (codex[bot]).
+    #
+    # an explicit null is unambiguous, which is why this can key on it: `on_handle` persists
+    # `remote` in the same `_update` that sets `running`, so a running flash record with a heartbeat
+    # and no remote can only be a worker that has been torn down -- there is no ordinary window
+    # where a live worker is pinging without one. drop the identity rather than guess: the attempt
+    # is genuinely unknown until the replacement is reserved, and a wrong number is worse than none
+    # for a field whose entire job is to explain a step rewind.
     from flash.providers._poll import _attempt_int
 
     remote = status.get("remote")
+    remote_cleared = "remote" in status and remote is None
     attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
-    if attempt is None and isinstance(heartbeat, dict):
+    if attempt is None and not remote_cleared and isinstance(heartbeat, dict):
         attempt = _attempt_int(heartbeat.get("attempt"))
     if isinstance(heartbeat, dict):
         heartbeat_age_seconds = render._heartbeat_age_seconds(heartbeat.get("ts"))
@@ -452,7 +467,13 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         # rewind the attempt counter was added to explain. mark the heartbeat-sourced fields as
         # the previous attempt's instead of dropping them: the run really did reach that step, and
         # suppressing it entirely would read as no progress at all (codex[bot]).
-        stale_heartbeat = not render.heartbeat_is_current_attempt(status, heartbeat)
+        # a cleared `remote` is the same relaunch window, and the ping is just as superseded there:
+        # the worker that produced it has already been torn down. `heartbeat_is_current_attempt`
+        # answers True because it cannot prove otherwise from the identity alone, so the qualifier
+        # has to come from the clear itself or `step=455` reads as the replacement's progress.
+        stale_heartbeat = remote_cleared or not render.heartbeat_is_current_attempt(
+            status, heartbeat
+        )
         stage = heartbeat.get("stage")
         if stage:
             parts.append(f"stage={stage}")
