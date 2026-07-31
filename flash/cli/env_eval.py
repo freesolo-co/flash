@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
 from pathlib import Path
 
 from flash._channel import CLI_NAME
@@ -107,6 +108,70 @@ def _run_cases(client, target: str, suite, cases: list[EvalCase], args) -> tuple
     return tuple(result for result in results if result is not None)
 
 
+def _case_payload(case: EvalCase | None, result: EvalResult) -> dict:
+    """One graded case in the shape `POST /api/evals/runs` accepts."""
+    expected = None
+    if case is not None and case.expected is not None:
+        expected = str(case.expected)
+    return {
+        "case_id": result.case_id,
+        "input": case.input if case is not None else None,
+        "expected": expected,
+        "actual": result.response,
+        "score": result.score,
+        "success": result.passed,
+        "reason": result.reason,
+        "error": result.error,
+    }
+
+
+def _upload_report(
+    report: EvalSuiteReport,
+    cases: list[EvalCase],
+    *,
+    project_id: str,
+    environment_reference: str,
+    target: str,
+    started_at: str,
+) -> int:
+    """Record one suite's results against a project, reporting failures without hiding them.
+
+    Upload failure is reported but does not change the eval's own exit status: the suite
+    already ran and its verdict is printed above. Returning FAIL here would relabel a
+    passing suite as failing because a network call did not land."""
+    from flash.client import ClientError, upload_eval_run
+    from flash.client.config import load_credentials
+
+    _, api_key = load_credentials()
+    if not api_key:
+        return _err(
+            "cannot upload results: not logged in — run `flash login` with your freesolo "
+            "API key (or set FREESOLO_API_KEY)"
+        )
+
+    # a case that failed before it was graded is still uploaded verbatim; the server
+    # excludes it from the aggregate so a transport failure never reads as a zero score.
+    by_id = {case.id or str(index): case for index, case in enumerate(cases, start=1)}
+    payload = [_case_payload(by_id.get(result.case_id), result) for result in report.results]
+    try:
+        upload_eval_run(
+            project_id=project_id,
+            suite_name=report.name,
+            environment_reference=environment_reference,
+            model=target,
+            status="completed",
+            error=None,
+            started_at=started_at,
+            cases=payload,
+            api_key=api_key,
+        )
+    except ClientError as exc:
+        return _err(f"suite {report.name}: upload failed: {exc}")
+    detail = f"suite {report.name}: uploaded {len(payload)} case(s)"
+    print(render.ok(detail) if render.styled() else detail)
+    return 0
+
+
 def _print_case(result: EvalResult) -> None:
     state = "PASS" if result.passed else "FAIL"
     detail = f"case {result.case_id}: {state} score={result.score:.6f}"
@@ -139,6 +204,13 @@ def cmd_env_eval(args) -> int:
     from flash.envs.loader import load_freesolo_environment
     from flash.schema import parse_adapter_revision, parse_checkpoint_ref
 
+    # checked before the suites run so a missing project id fails in a second rather than
+    # after a long paid evaluation whose results would then have nowhere to go.
+    if args.upload and not (args.project or "").strip():
+        return _err("--upload requires --project PROJECT_ID")
+    if args.project and not args.upload:
+        return _err("--project only applies with --upload")
+
     revision = parse_adapter_revision(args.target)
     parsed = parse_checkpoint_ref(args.target) if revision is None else None
     if revision is None and parsed is None:
@@ -165,6 +237,7 @@ def cmd_env_eval(args) -> int:
             return _err("overall: FAIL")
 
     client = client_from_config()
+    started_at = datetime.now(UTC).isoformat()
     reports: list[EvalSuiteReport] = []
     for suite in suites:
         try:
@@ -189,6 +262,15 @@ def cmd_env_eval(args) -> int:
         report = EvalSuiteReport(name=suite.name, results=results)
         _print_report(report)
         reports.append(report)
+        if args.upload:
+            _upload_report(
+                report,
+                cases,
+                project_id=args.project,
+                environment_reference=str(entrypoint.parent),
+                target=args.target,
+                started_at=started_at,
+            )
 
     failed = any(
         report.passed != report.total or any(result.error for result in report.results)
