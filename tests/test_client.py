@@ -754,3 +754,138 @@ def test_export_rejects_malformed_checkpoint_ref():
     for bad in ("r1/step-", "r1/checkpoints/step-4", "r1/step-4/adapter"):
         with pytest.raises(ClientError, match="invalid adapter id"):
             client.export(bad, repository="me/a", hf_token="hf")
+
+
+def _deployment_reader(monkeypatch, client, record, *, status=None):
+    """Patch the run-scoped deployment read; record the calls it receives."""
+    calls: list[tuple] = []
+
+    def request(method, path, body=None, timeout=None, progress=None):
+        calls.append((method, path, timeout))
+        if status is not None:
+            raise ApiError(status, "boom")
+        return record
+
+    monkeypatch.setattr(client, "_request", request)
+    return calls
+
+
+def test_deployment_for_reads_the_run_scoped_route_not_the_listing(monkeypatch):
+    """`/v1/deployments` walks every run the key owns before one record is picked out.
+
+    That makes each poll cost grow with the account's run history, so a long-lived account can
+    spend its whole `--wait` budget loading unrelated runs and time out against a revision that is
+    already ready. The run-scoped route resolves exactly the run being polled.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    calls = _deployment_reader(monkeypatch, client, {"state": "queued"})
+
+    # the id is carried onto the returned record: `models deploy --wait` prints this in place of
+    # the POST body, so dropping it renders an empty run field and omits it from the json.
+    assert client.deployment_for("flash-1") == {"state": "queued", "run_id": "flash-1"}
+    assert calls == [("GET", "/v1/runs/flash-1/deploy", None)]
+
+
+def test_deployment_for_keeps_a_run_id_already_on_the_record(monkeypatch):
+    """The record's own id wins; the requested id must not overwrite it."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    _deployment_reader(monkeypatch, client, {"state": "ready", "run_id": "flash-1"})
+
+    assert client.deployment_for("flash-1") == {"state": "ready", "run_id": "flash-1"}
+
+
+def test_deployment_for_asks_about_the_base_run_not_the_checkpoint_ref(monkeypatch):
+    """`RUN/step-N` is not a path segment; the route is keyed by the run alone."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    calls = _deployment_reader(
+        monkeypatch, client, {"state": "ready", "checkpoint_step": 40, "run_id": "flash-1"}
+    )
+
+    assert client.deployment_for("flash-1/step-40") == {
+        "state": "ready",
+        "checkpoint_step": 40,
+        "run_id": "flash-1",
+    }
+    assert calls == [("GET", "/v1/runs/flash-1/deploy", None)]
+
+
+def test_deployment_for_requires_the_requested_checkpoint_step(monkeypatch):
+    """The requested step is part of the identity, not decoration.
+
+    Matching on the run id alone let `deploy RUN/step-40 --wait` settle on whichever revision was
+    deployed -- an older one still marked ready, or a replacement another shell deployed mid-wait
+    -- and report it as the caller's own.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    _deployment_reader(monkeypatch, client, {"state": "ready", "checkpoint_step": 20})
+
+    assert client.deployment_for("flash-1/step-40") is None
+    assert client.deployment_for("flash-1/step-20") == {
+        "state": "ready",
+        "checkpoint_step": 20,
+        "run_id": "flash-1",
+    }
+    # the bare run id is the FINAL adapter, which the plane reports as a null step -- a checkpoint
+    # revision must not answer for it either.
+    assert client.deployment_for("flash-1") is None
+
+
+def test_deployment_for_matches_the_final_adapters_null_step(monkeypatch):
+    """`checkpoint_step` is None for the final adapter; the bare run id must still match it."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    _deployment_reader(monkeypatch, client, {"state": "ready", "checkpoint_step": None})
+
+    assert client.deployment_for("flash-1") == {
+        "state": "ready",
+        "checkpoint_step": None,
+        "run_id": "flash-1",
+    }
+    assert client.deployment_for("flash-1/step-40") is None
+
+
+@pytest.mark.parametrize("state", ["undeployed", "dry_run"])
+def test_deployment_for_reports_a_never_deployed_run_as_absent(monkeypatch, state):
+    """The route answers for an undeployed run with a synthesized record instead of 404.
+
+    The listing this replaced omitted `undeployed` and `dry_run` rows outright, so returning them
+    here would make `--wait` treat "nothing is deployed" as a live revision and, since neither is
+    a busy state, exit 0 against nothing serving.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    _deployment_reader(monkeypatch, client, {"state": state, "run_id": "flash-1"})
+
+    assert client.deployment_for("flash-1") is None
+
+
+def test_deployment_for_reports_an_unknown_run_as_absent(monkeypatch):
+    """A run this key cannot see reads the same as one that is not deployed.
+
+    The listing said "absent" by omitting the row. Letting the 404 out instead would turn a
+    vanished deployment into a failed command rather than the reported end of the wait.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    _deployment_reader(monkeypatch, client, None, status=404)
+
+    assert client.deployment_for("flash-1") is None
+
+
+def test_deployment_for_still_raises_a_rejected_key(monkeypatch):
+    """Only 404 means absent. A rejected key must stay an error the caller can act on."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    _deployment_reader(monkeypatch, client, None, status=401)
+
+    with pytest.raises(ApiError):
+        client.deployment_for("flash-1")
+
+
+def test_deployment_for_bounds_the_read(monkeypatch):
+    """A caller polling against its own deadline has to be able to bound the read.
+
+    The client default is 60s, so an unbounded read inside a short --wait overshoots the timeout
+    the user asked for.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    calls = _deployment_reader(monkeypatch, client, {"state": "undeployed"})
+
+    assert client.deployment_for("flash-1", timeout=3.0) is None
+    assert calls == [("GET", "/v1/runs/flash-1/deploy", 3.0)]

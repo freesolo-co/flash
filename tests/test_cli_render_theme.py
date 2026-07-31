@@ -178,6 +178,25 @@ def test_train_submitted_note(monkeypatch) -> None:
     assert "--follow" in out  # tells the user how to re-attach after Ctrl-C
 
 
+def test_train_submitted_note_names_this_channel_executable(monkeypatch) -> None:
+    """The hand-off must name the executable the user actually has installed.
+
+    On the dev channel the console script is `flash-dev` and CLI_NAME is rewritten to match, so a
+    hardcoded `flash runs cancel ...` hands out a command that does not exist on that install --
+    and the command it hands out is the one that stops the billing.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    # stand in for the dev channel. asserting against the real CLI_NAME would pass on the release
+    # channel even if the name were hardcoded, since there it is literally "flash".
+    monkeypatch.setattr(render, "CLI_NAME", "flash-dev")
+
+    out = render.submitted("flash-xyz")
+
+    assert "`flash-dev runs log flash-xyz --follow`" in out
+    assert "`flash-dev runs cancel flash-xyz`" in out
+
+
 def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
     # On an ASCII / non-UTF-8 stdout, the themed renderers (which use em dashes, bullets, etc.)
     # must degrade rather than raise UnicodeEncodeError once styling is forced on.
@@ -640,3 +659,102 @@ def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
     # canonical int identities: exact match shows, mismatch suppresses
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 2}) is True
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 1}) is False
+
+
+def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
+    """A frozen step on a throttled worker must not read as a stalled trainer (AS-018/AS-019).
+
+    The pre-existing quiet hint points at `flash runs log`, which reads the same uploaded
+    heartbeats -- so when the step counter is what went stale, that advice is a dead end.
+    """
+    import time as _time
+
+    from flash.cli import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+    }
+
+    stale = dict(
+        base, last_heartbeat={"stage": "rl_step", "step": 1, "ts": _time.time() - 1200}
+    )
+    out = render.run_status(stale)
+    assert "last one UPLOADED" in out
+    assert "before treating this as a stall" in out
+
+    # the hint must not send the user to `runs log` for worker output: cmd_log prints the worker
+    # console only after the run reaches a terminal state, and the console artifact itself uploads
+    # hourly, so neither can answer "is it still training?" at the 300s the hint fires.
+    assert "runs log" not in out
+    assert "worker output" not in out
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    # the reported incident ages sit inside the 900s throttle window; a gate at 900s would stay
+    # silent on exactly the runs that prompted the fix.
+    for incident_age in (559, 687):
+        seen = dict(
+            base,
+            last_heartbeat={"stage": "rl_step", "step": 1, "ts": _time.time() - incident_age},
+        )
+        assert "last one UPLOADED" in render.run_status(seen), incident_age
+
+    # a recently uploaded step is live enough to trust as-is.
+    fresh = dict(base, last_heartbeat={"stage": "rl_step", "step": 73, "ts": _time.time() - 100})
+    assert "last one UPLOADED" not in render.run_status(fresh)
+
+    # one explanation for one silence: the quiet hint points at `runs log`, which reads the same
+    # frozen heartbeats, so it must not ride along with the progress row.
+    assert render._QUIET_HEARTBEAT_HINT not in out
+
+    # a SETUP stage has no step to be stale about -- it gets the warmup/quiet hints instead.
+    setup = dict(
+        base, last_heartbeat={"stage": "sft_initializing", "ts": _time.time() - 1200}
+    )
+    assert "last one UPLOADED" not in render.run_status(setup)
+
+    # a training stage with no step reported yet has nothing to qualify.
+    stepless = dict(base, last_heartbeat={"stage": "rl_step", "ts": _time.time() - 1200})
+    assert "last one UPLOADED" not in render.run_status(stepless)
+
+    # terminal runs are not progressing, so the reassurance would be wrong.
+    done = dict(stale, state="done")
+    assert "last one UPLOADED" not in render.run_status(done)
+
+    # step 0 is the cold first step: no optimizer update landed, so there is no hidden later step.
+    step_zero = dict(
+        base, last_heartbeat={"stage": "rl_step", "step": 0, "ts": _time.time() - 1200}
+    )
+    assert "last one UPLOADED" not in render.run_status(step_zero)
+
+    # opd_step force-commits at the 60s floor, so an old one is a real stall, not reporting lag.
+    opd = dict(base, last_heartbeat={"stage": "opd_step", "step": 4, "ts": _time.time() - 1200})
+    assert "last one UPLOADED" not in render.run_status(opd)
+
+    # a heartbeat from a superseded attempt describes a dead worker, not throttled progress.
+    superseded = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "rl_step", "step": 1, "attempt": 1, "ts": _time.time() - 1200},
+    )
+    assert "last one UPLOADED" not in render.run_status(superseded)
+
+    # ...but the live attempt still gets the reassurance.
+    live = dict(
+        base,
+        remote={"attempt": 2},
+        last_heartbeat={"stage": "rl_step", "step": 1, "attempt": 2, "ts": _time.time() - 1200},
+    )
+    assert "last one UPLOADED" in render.run_status(live)
+
+    # w&b is optional, so the advice must name a signal that always exists. `runs log` was that
+    # signal until it turned out it cannot answer the question while the run is live (see the
+    # `runs log` assertion above); the heartbeat age row can, is rendered from the same payload,
+    # and so is never absent.
+    assert "the age above" in out
+    assert "if configured" in out
