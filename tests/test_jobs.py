@@ -3786,6 +3786,65 @@ def test_attach_requires_handle(monkeypatch):
             orch.attach_run("nh")
 
 
+def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
+    """A spec that stops parsing must terminate the run, not silently strand a billing worker.
+
+    `attach_run` parses the persisted spec ABOVE its try, so a raise there escapes every handler.
+    It is dispatched on a daemon thread by `recover_runs`, so nothing surfaces the exception: the
+    run stays nonterminal holding a live handle and its worker bills until someone notices. A spec
+    stops parsing when the plane drops a surface a still-in-flight run was accepted under -- here a
+    local `environment.path`, which `JobSpec.from_dict` rejects (codex[bot]).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import json
+
+        import flash.providers.runpod.train as flash_train
+        import flash.runner.lifecycle as lifecycle
+
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "epBad",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "jBad",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+        from dataclasses import replace
+
+        spec = _spec("bad")
+        spec = replace(spec, gpu=replace(spec.gpu, type="RTX 5090"))
+        orch._save_status(
+            orch.RunStatus(run_id="bad", state="running", spec=spec.to_dict(), remote=remote)
+        )
+        # Rewrite the spec on disk: the plane can no longer WRITE this record, so go around the
+        # writer the same way an older plane's leftover file would have arrived.
+        raw = orch._load_status_json("bad")
+        raw["spec"] = {**raw["spec"], "environment": {"path": "/legacy/local/env"}}
+        with open(orch.runs_file_path("bad", ".json"), "w") as file:
+            json.dump(raw, file)
+
+        torn_down = []
+        terminated = []
+        monkeypatch.setattr(
+            lifecycle,
+            "_strict_teardown_handle",
+            lambda handle, rid: torn_down.append((handle.data.get("endpoint_id"), rid)) or True,
+        )
+        monkeypatch.setattr(
+            flash_train, "terminate_endpoint", lambda gpu, rid: terminated.append((gpu, rid))
+        )
+
+        status = orch.attach_run("bad", log_stream=sys.stderr)
+
+        assert status.state == "failed"
+        assert "spec is malformed" in (status.error or "")
+        # the exact endpoint the handle names, plus the rN retry endpoints it cannot name.
+        assert torn_down == [("epBad", "bad")]
+        assert terminated == [("RTX 5090", "bad")]
+
+
 def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
     # A recovered run whose remote job ended not-ok (it died while the control plane was down for
     # the redeploy) must NOT be failed — reattach resumes training on a fresh host (worker resumes
