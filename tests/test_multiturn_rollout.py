@@ -1168,6 +1168,48 @@ def test_close_out_does_not_hang_when_the_env_worker_dies_unreported():
     assert done.wait(timeout=20.0), "close-out wait never returned after the env worker died"
 
 
+def test_close_out_reports_a_sys_exit_from_user_env_code():
+    """`sys.exit()` in an env must fail the step, not silently truncate the episode.
+
+    SystemExit derives from BaseException, so `except Exception` let it unwind the worker having
+    reported nothing. The liveness check ends the wait rather than hanging, so the cost is not a
+    stall: the close-out env step never ran and the episode was scored on that partial state as if
+    it had succeeded -- here `applied` stays 2 of 3, a silently wrong reward feeding the gradient.
+    A one-turn env running a CLI-style parser is the realistic way to reach this.
+    """
+
+    class _ExitOnCloseOutEnv(_StatefulBoardEnv):
+        def __init__(self):
+            super().__init__()
+            self.entered = 0
+
+        def env_reply(self, messages, state):
+            self.entered += 1
+            # the close-out is the 3rd and last call for this episode
+            if self.entered >= 3:
+                sys.exit("environment called sys.exit() during its final step")
+            return super().env_reply(messages, state)
+
+    env = _ExitOnCloseOutEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    with pytest.raises(SystemExit):
+        rollout_async(
+            examples=[{}],
+            active_env=env,
+            render=render,
+            submit=submit,
+            poll=poll,
+            busy=busy,
+            abort=lambda ids: None,
+            env_glue=env_glue,
+            max_turns=3,
+            per_turn_max_tokens=8,
+        )
+    # the close-out really was the step that died: it was entered, and the two turns before it had
+    # completed. without the report this run returns a reward of 2 for a 3-move episode.
+    assert (env.entered, env.env_reply_calls) == (3, 2)
+
+
 def test_token_budget_exhaustion_also_steps_the_env():
     """The token budget is the other driver-side exit that skipped the env step."""
     env = _StatefulBoardEnv()
