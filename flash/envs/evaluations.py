@@ -252,6 +252,12 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
         sys.path.insert(0, module_dir)
     previous_module = sys.modules.get(module_name)
     sys.modules[module_name] = module
+    # a sibling a sidecar imports is cached under its plain name, so a second package importing
+    # its own `helper` found the FIRST package's module already in sys.modules and reused it --
+    # silently running the wrong cases and the wrong scoring logic, with no import error to see
+    # (codex[bot]). dropping the siblings this load introduced makes the next package import its
+    # own; anything already imported before this call is left alone, since it is not ours to evict.
+    before = set(sys.modules)
     try:
         spec.loader.exec_module(module)
     except Exception:
@@ -259,8 +265,29 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
             sys.modules.pop(module_name, None)
         else:
             sys.modules[module_name] = previous_module
+        _forget_sidecar_siblings(module_dir, before)
         raise
+    _forget_sidecar_siblings(module_dir, before)
     return module
+
+
+def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> None:
+    """Drop modules this sidecar load imported from its own package directory.
+
+    Only modules that (a) were absent before the load and (b) resolve to a file inside this
+    package directory. A stdlib or third-party module the sidecar imported first stays cached:
+    evicting it would re-execute unrelated code for every later load."""
+    directory = Path(module_dir).resolve()
+    for name in set(sys.modules) - before:
+        origin = getattr(getattr(sys.modules[name], "__spec__", None), "origin", None)
+        if not origin:
+            continue
+        try:
+            resolved = Path(origin).resolve()
+        except OSError:
+            continue
+        if resolved.parent == directory:
+            sys.modules.pop(name, None)
 
 
 def _call_factory(factory, kwargs: dict[str, object]) -> object:
