@@ -514,19 +514,21 @@ def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> t
 def _thinking_tag_is_guaranteed(spec) -> bool:
     """Whether the catalog vouches that this model's chat template opens a thinking block.
 
-    Only the open-model policy yields "unknown", and `flash.schema` already warns and proceeds for
-    it. Anything that fails to resolve keeps the strict requirement, so a lookup failure cannot
-    quietly weaken the guard into admitting an adapter that answered nothing.
-    """
-    from flash.catalog import resolve_model
+    A curated entry states its `thinking` capability, so the tag is required. Everything else is
+    the open-model policy's "unknown", which `flash.schema` already warns and proceeds for.
 
-    try:
-        info = resolve_model(
-            spec.model, spec.algorithm, policy=getattr(spec, "model_policy", "catalog")
-        )
-    except Exception:
-        return True
-    return info.thinking != "unknown"
+    Asks the catalog directly rather than through `resolve_model`: for an uncataloged model that
+    call also runs a VRAM fit against the DEFAULT gpu and raises on `too_big`, which has nothing to
+    do with the chat template. Treating that as "guaranteed" would demand the tag from the very
+    models that cannot promise it, failing a valid tagless smoke over an unrelated sizing check on
+    a gpu the run may not even use (cursor[bot]). A missing entry is the open-model case by
+    definition, so no exception path is needed to reach the answer.
+    """
+    from flash.catalog import MODELS
+
+    model = getattr(spec, "model", None)
+    info = MODELS.get(model.strip()) if isinstance(model, str) else None
+    return info is not None and info.thinking != "unknown"
 
 
 def _thinking_answer(content: str, *, require_tag: bool = True) -> str:

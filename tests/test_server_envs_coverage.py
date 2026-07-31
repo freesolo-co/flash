@@ -1029,6 +1029,35 @@ def test_thinking_smoke_accepts_a_tagless_answer_only_under_the_open_model_polic
         _run_smoke(unknown)
 
 
+def test_tagless_open_model_smoke_does_not_depend_on_a_vram_fit(monkeypatch):
+    """Whether the tag is guaranteed is a chat-template question, not a sizing one.
+
+    Resolving the capability through `resolve_model` also ran an open-model VRAM fit against the
+    DEFAULT gpu, which raises for a model too big for it. That exception read as "tag guaranteed",
+    so the model least able to promise a `<think>` block was the one the strict requirement was
+    applied to, and a valid tagless smoke failed over the size of a gpu the run need not be using
+    (cursor[bot]).
+
+    The model below really does exceed the default: it is served on multi-gpu hardware the smoke
+    never consults. A pass here means the decision no longer reaches the estimator at all.
+    """
+    from flash.catalog import DEFAULT_GPU
+    from flash.engine.vram import check_fit
+
+    spec = _smoke_spec(thinking=True)
+    spec.model = "some-org/huge-open-model"
+    spec.model_policy = "allow"
+
+    # the premise: this is a genuine `too_big` for the gpu the resolver would have assumed.
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda *a, **k: 400.0)
+    assert check_fit(spec.model, spec.algorithm, DEFAULT_GPU).verdict == "too_big"
+
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
+    out = _run_smoke(spec)
+    assert out["verify_sample"] == "4"
+    assert out["thinking_tag"] is False
+
+
 def test_unconstrained_thinking_smoke_accepts_an_answer_after_the_block(monkeypatch):
     # the companion direction: a reconstructed block WITH an answer after it still passes, so the
     # check above rejects answerlessness rather than reconstruction.
