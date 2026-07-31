@@ -2432,3 +2432,73 @@ def test_log_follow_progress_explains_warmup_when_heartbeat_matches_attempt(stag
 
     assert f"warming up (stage={stage})" in progress
     assert "do not cancel" in progress
+
+
+# --------------------------------------------------------------------------- live-run cost (MP-022/LS-016)
+
+
+def test_runs_listing_flags_a_live_cost_as_an_estimate(fake_client, monkeypatch, capsys) -> None:
+    """A queued/running run reports cost_usd 0.0 until it settles; showing that bare reads as free."""
+    monkeypatch.setattr(cli.render, "styled", lambda: False)
+    monkeypatch.setattr(
+        fake_client,
+        "list_runs",
+        lambda: [
+            {
+                "run_id": "flash-live",
+                "state": "running",
+                "cost_usd": 0.0,
+                "estimated_cost_usd": 2.5,
+                "updated_at": 1700000000.0,
+                "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+            }
+        ],
+    )
+    assert _run(["runs", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "~2.5000" in out
+    assert "0.0000" not in out
+
+
+def test_runs_listing_shows_the_settled_charge_unflagged(fake_client, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli.render, "styled", lambda: False)
+    assert _run(["runs", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "0.2500" in out  # the fixture run is `done`
+    assert "~" not in out
+
+
+def test_log_follow_progress_reports_the_quote_while_live() -> None:
+    _state, progress = cli.commands._log_follow_progress(
+        {"state": "running", "cost_usd": 0.0, "estimated_cost_usd": 2.5}, "running"
+    )
+    assert "cost=~$2.5000" in progress
+
+
+def test_log_follow_progress_reports_the_settled_charge_when_done() -> None:
+    _state, progress = cli.commands._log_follow_progress(
+        {"state": "done", "cost_usd": 1.25, "estimated_cost_usd": 2.5}, "done"
+    )
+    assert "cost=$1.2500" in progress
+    assert "~" not in progress
+
+
+def test_log_follow_progress_omits_cost_when_there_is_nothing_to_show() -> None:
+    # no quote and no measured spend: don't print a misleading "cost=$0.0000".
+    _state, progress = cli.commands._log_follow_progress({"state": "queued"}, "queued")
+    assert "cost=" not in progress
+
+
+def test_log_follow_progress_shows_a_settled_zero_like_the_other_surfaces() -> None:
+    """A terminal $0.0000 is an answer, and the three surfaces have to give the same one.
+
+    `runs list` and `runs status` both print $0.0000 for a settled zero because run_cost returns
+    (0.0, False) there. Suppressing it only in follow made the same finished run read as costed in
+    one place and uncosted in another, which is the inconsistency, not the zero (cursor).
+    """
+    for state in sorted(cli.render.SETTLED_COST_STATES):
+        _state, progress = cli.commands._log_follow_progress(
+            {"state": state, "cost_usd": 0.0}, state
+        )
+        assert "cost=$0.0000" in progress, state
+        assert "~" not in progress, state
