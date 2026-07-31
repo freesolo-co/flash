@@ -55,7 +55,6 @@ from flash.engine.worker.heartbeat import (
     _STEP_GPU_DIAG_INTERVAL_S,
     LATEST_GRPO_METRICS_LAST,
     heartbeat,
-    make_reward_heartbeat_callback,
     make_sft_heartbeat_callback,
 )
 from flash.engine.worker.hf import (
@@ -509,7 +508,6 @@ __all__ = [
     "main",
     "make_checkpoint_upload_callback",
     "make_lora",
-    "make_reward_heartbeat_callback",
     "make_sft_heartbeat_callback",
     "model_revision_kwargs",
     "optimal_attn_impl",

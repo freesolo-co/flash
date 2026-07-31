@@ -1,8 +1,8 @@
-"""verl GRPO per-step metrics parity with the trl callback.
+"""verl GRPO per-step metrics reconstructed from the trainer's stdout.
 
-trl feeds `flash runs log -f` from a TrainerCallback (heartbeat.make_reward_heartbeat_callback).
-verl's trainer runs out of process and cannot host one, so rl_verl reconstructs the same
-`metrics_last` backlog from verl's own per-step stdout line. these tests pin the parse against the
+an in-process trainer would feed `flash runs log -f` from a TrainerCallback. verl's trainer runs
+out of process and cannot host one, so rl_verl reconstructs the same `metrics_last` backlog from
+verl's own per-step stdout line. these tests pin the parse against the
 line format verl actually prints (LocalLogger.concat_dict_to_str) under the interpreter flash
 actually ships (Dockerfile.worker installs numpy 2.2.6 into /opt/verl-venv), plus the lifecycle
 sites that carry the backlog to the console.
