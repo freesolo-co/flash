@@ -412,7 +412,11 @@ def test_env_test_fails_when_every_replayed_gold_answer_scores_zero(monkeypatch,
     captured = capsys.readouterr()
     # the episodes themselves are contract-clean; it is the run-wide signature that fails.
     assert "2/2 episodes passed contract checks" in captured.out
-    assert "all 2 replayed gold answer(s) scored zero" in captured.err
+    # this grader returns 0.0 for anything, so the wrong answer it is checked against scores 0.0
+    # too: the zero really is flat, not the low end of a scale.
+    assert "all 2 replayed gold answer(s) scored zero, no better than a deliberately wrong" in (
+        captured.err
+    )
     assert "overall: FAIL" in captured.err
     assert "overall: PASS" not in captured.out
 
@@ -435,6 +439,55 @@ def test_env_test_partial_zero_gold_answers_warn_but_pass(monkeypatch, tmp_path,
     assert "overall: PASS" in captured.out
 
 
+def test_env_test_does_not_blame_the_grader_for_a_reference_it_cannot_replay(
+    monkeypatch, tmp_path, capsys
+):
+    # a gold answer written in reasoning markup is graded on what survives the `<think>` strip in a
+    # thinking run, but this command has no run config to read `thinking` from and replays the
+    # tagged reference verbatim. against a strict answer-only grader every reference then scores
+    # zero, and the gate reported a working environment as unable to recognize its own gold answers
+    # (codex[bot]). the evidence for that conclusion cannot be produced from here.
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[
+            {"input": "what is 2 + 2?", "output": "<think>2 plus 2</think>4"},
+            {"input": "2 + 3?", "output": "<think>2 plus 3</think>5"},
+        ],
+        reward=0.0,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "2/2 episodes passed contract checks" in captured.out
+    # the zero is still surfaced -- it is worth seeing -- it just cannot be the reason to fail.
+    assert "replay gold answer scored low" in captured.err
+    assert "cannot recognize its own reference answers" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_still_blames_the_grader_for_plain_gold_answers(monkeypatch, tmp_path, capsys):
+    # the exclusion above is scoped to the markup it cannot reproduce: a plain reference alongside a
+    # tagged one is replayed faithfully, so its zero is real evidence and must still block.
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[
+            {"input": "what is 2 + 2?", "output": "<think>2 plus 2</think>4"},
+            {"input": "2 + 3?", "output": "5"},
+        ],
+        reward=0.0,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    # 1, not 2: only the replayable reference is counted, and it is enough to fail the run.
+    assert "all 1 replayed gold answer(s) scored zero, no better than a deliberately wrong" in (
+        captured.err
+    )
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_test_negative_reward_scale_is_not_a_zero_reward_grader(monkeypatch, tmp_path, capsys):
     # a grader scaled -1 for a correct reference and -2 for an incorrect completion still separates
     # them, which is all GRPO's relative advantage needs. counting every non-positive reward as a
@@ -452,6 +505,37 @@ def test_env_test_negative_reward_scale_is_not_a_zero_reward_grader(monkeypatch,
     assert "replay gold answer scored low (reward=-1.000000)" in captured.err
     assert "scored zero" not in captured.err
     assert "overall: PASS" in captured.out
+
+
+def test_env_test_centered_reward_scale_passes_on_what_the_grader_pays_junk(
+    monkeypatch, tmp_path, capsys
+):
+    """A grader paying 0 for correct and negative for wrong separates them, so it must pass.
+
+    The scale above is cleared by its sign; this one is not. Zero is exactly the value the gate
+    reads as "recognized nothing", so the only thing that distinguishes a centered scale from a
+    broken grader is what the reward pays a wrong answer -- and the gate has to go and ask.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[{"input": "what is 2 + 2?", "output": "4"}, {"input": "2 + 3?", "output": "5"}]
+    )
+    scored = []
+
+    def _centered(completion, example, state=None):
+        scored.append(completion)
+        return 0.0 if completion == example["output"] else -1.0
+
+    monkeypatch.setattr(env, "reward", _centered)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "cannot recognize its own reference answers" not in captured.err
+    assert "overall: PASS" in captured.out
+    # both gold answers scored 0.0 and the run still passed, so the verdict came from the extra
+    # wrong-answer call -- and it took exactly one, after the two episodes, not one per episode.
+    assert scored == ["4", "5", "test"]
 
 
 def test_env_test_non_text_sft_completion_uses_echo(monkeypatch, tmp_path, capsys):
