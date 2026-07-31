@@ -2887,12 +2887,16 @@ def test_the_graded_text_of_a_thinking_run_has_its_reasoning_removed(monkeypatch
     env_dir = _environment_dir(tmp_path)
 
     class _ThinkingGoldEnv(_SingleTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.states: dict[str, dict | None] = {}
+
         def sft_completion(self, example):
             return [{"role": "assistant", "content": "<think>weighing it up</think>4"}]
 
         def reward(self, completion, example, state=None):
             self.completions.append(completion)
-            self.last_state = state
+            self.states[completion] = state
             return 1.0 if completion == "4" else 0.0
 
     env = _ThinkingGoldEnv()
@@ -2900,8 +2904,11 @@ def test_the_graded_text_of_a_thinking_run_has_its_reasoning_removed(monkeypatch
 
     assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 0
     assert env.replayed[0] == "4"
-    assert env.last_state["raw"] == "<think>weighing it up</think>4"
-    assert env.last_state["thinking"] == "weighing it up"
+    # the gold answer's own state, keyed rather than taken from the last call: under --thinking the
+    # gold reaches the ranking gate, so its negative controls are graded after it.
+    gold_state = env.states["4"]
+    assert gold_state["raw"] == "<think>weighing it up</think>4"
+    assert gold_state["thinking"] == "weighing it up"
 
 
 def test_a_run_without_thinking_still_grades_the_raw_text_with_no_state(
@@ -2922,6 +2929,209 @@ def test_a_run_without_thinking_still_grades_the_raw_text_with_no_state(
 
     assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     assert env.last_state is None
+
+
+def test_a_thinking_run_gates_a_gold_answer_carrying_reasoning(monkeypatch, tmp_path, capsys):
+    # under --thinking the run grades strip_think(gold), and so does this command, so a gold answer
+    # carrying a <think> span replays faithfully and belongs in the ranking gate. excluding it there
+    # set partial_replay and skipped control scoring, which is how a flat-zero grader on a thinking
+    # run still reported overall: PASS -- the miss this gate exists to catch (cursor).
+    env_dir = _environment_dir(tmp_path)
+
+    class _FlatThinkingGoldEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [{"role": "assistant", "content": "<think>work</think>4"}]
+
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            return 0.0  # flat at zero: only REPORTED if the replay reached the gate
+
+    _patch_loader(monkeypatch, _FlatThinkingGoldEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 1
+    captured = capsys.readouterr()
+    assert "cannot rank completions" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_a_run_without_thinking_still_excludes_a_gold_answer_carrying_reasoning(
+    monkeypatch, tmp_path, capsys
+):
+    # the control for the above, and the case the exclusion was written for. without thinking the run
+    # grades the raw text, so the reasoning markup really does reach an exact-answer grader, which
+    # scores it and every control zero. that is a property of the replay, not of the reward function.
+    env_dir = _environment_dir(tmp_path)
+
+    class _FlatThinkingGoldEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [{"role": "assistant", "content": "<think>work</think>4"}]
+
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            return 0.0
+
+    _patch_loader(monkeypatch, _FlatThinkingGoldEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_a_multi_turn_gold_carrying_reasoning_is_excluded_even_under_thinking(
+    monkeypatch, tmp_path, capsys
+):
+    # the second control, pinning where the thinking allowance stops. a multi-turn transcript is
+    # scored as a whole episode through reward_from_messages (flash/engine/worker/rl.py:436-438),
+    # which never strips reasoning -- so gold markup reaches that grader verbatim whatever the run's
+    # thinking mode says, and the turn stays unreproducible.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ThinkingMultiTurnEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "<think>work</think>first"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def reward(self, completion, example, state=None):
+            return 0.0  # flat at zero, so an admitted replay would be reported
+
+    _patch_loader(monkeypatch, _ThinkingMultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 0
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_a_tagless_thinking_gold_answer_reports_which_reading_was_assumed(
+    monkeypatch, tmp_path, capsys
+):
+    # strip_think reads a completion with no closing </think> differently depending on whether the
+    # RENDERED prompt already opened the span (rl.py:367-371 derives that from the chat template).
+    # this command grades it as its own text; under a prompt-opening template the run grades "".
+    # named rather than excluded: a plain gold answer is exactly this shape, so excluding it would
+    # empty the gate for every thinking env (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 0
+    captured = capsys.readouterr()
+    assert "no closing </think>" in captured.err
+    # reported, never failed on, and the gate still ran on the episode.
+    assert "overall: PASS" in captured.out
+
+
+def test_a_closed_thinking_span_reads_the_same_either_way_and_is_not_reported(
+    monkeypatch, tmp_path, capsys
+):
+    # the control: a gold answer carrying </think> resolves to the same graded text under both
+    # readings, so there is no ambiguity to report and the warning must stay silent.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ClosedThinkingGoldEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [{"role": "assistant", "content": "<think>work</think>4"}]
+
+    _patch_loader(monkeypatch, _ClosedThinkingGoldEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 0
+    assert "no closing </think>" not in capsys.readouterr().err
+
+
+def test_a_run_without_thinking_never_reports_the_template_reading(monkeypatch, tmp_path, capsys):
+    # the second control: without thinking the worker grades the raw text and strip_think is not
+    # called at all, so no template reading enters the verdict and there is nothing to warn about.
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert "no closing </think>" not in capsys.readouterr().err
+
+
+def test_a_raising_tools_hook_fails_a_grpo_run_on_per_episode_credit(
+    monkeypatch, tmp_path, capsys
+):
+    # the grpo worker calls env.tools() unguarded while building the tool loop (rl.py:816), outside
+    # the try/except that scores a raising reward as 0.0, so the run aborts during initialization.
+    # checking it only on the per-turn path surfaced it nowhere for a default run, and env test
+    # reported PASS for a configuration that dies before its first step (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _RaisingToolsEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            raise RuntimeError("tool schema failed to load")
+
+    _patch_loader(monkeypatch, _RaisingToolsEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", credit_assignment="per_episode")) == 1
+    captured = capsys.readouterr()
+    assert "env.tools() raised (RuntimeError: tool schema failed to load)" in captured.err
+    assert "overall: FAIL" in captured.err
+    # refused before any episode runs, like the credit-assignment refusal beside it.
+    assert "episode 1:" not in captured.out
+
+
+def test_a_raising_tools_hook_is_not_a_finding_for_a_run_that_never_builds_the_tool_loop(
+    monkeypatch, tmp_path, capsys
+):
+    # the control: only the grpo worker reaches rl.py's tool setup. an sft run never calls tools(),
+    # so a raising hook is not that run's problem and must not fail it.
+    env_dir = _environment_dir(tmp_path)
+
+    class _RaisingToolsEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            raise RuntimeError("tool schema failed to load")
+
+    _patch_loader(monkeypatch, _RaisingToolsEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    assert "env.tools() raised" not in capsys.readouterr().err
+
+
+def test_a_completion_only_transcript_repeating_the_prompt_keeps_its_first_turn(
+    monkeypatch, tmp_path, capsys
+):
+    # provenance is observed, not inferred. a prompt ending in an assistant prefill whose text the
+    # first replayed turn repeats makes a completion-only transcript OPEN with the same observations
+    # as the prompt, so a content test answers len(prompt) and drops a real completion message --
+    # shifting every block, marking an exact replay partial_replay, and letting a flat-zero grader
+    # pass unreported (codex[bot]). _run_rollout reads `messages` on the FRESH state instead.
+    env_dir = _environment_dir(tmp_path)
+
+    class _PrefillEchoEnv(_MultiTurnEnv):
+        def new_rollout_state(self, example):
+            # the opening is an assistant prefill the model continues from, and the gold's first
+            # turn happens to repeat it -- so the completion transcript OPENS with a message the
+            # prompt also holds. `prompt` carries the opening; `messages` records driven turns only.
+            prompt = [{"role": "assistant", "content": "first"}]
+            return {"prompt": prompt, "messages": [], "done": False, "turn": 0}
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def reward(self, completion, example, state=None):
+            return 0.0  # flat at zero, so an admitted replay is REPORTED
+
+    _patch_loader(monkeypatch, _PrefillEchoEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
 
 
 def test_per_turn_credit_is_refused_for_a_native_tool_environment(monkeypatch, tmp_path, capsys):

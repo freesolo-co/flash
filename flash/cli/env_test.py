@@ -267,7 +267,46 @@ def _message_text(content: object) -> str:
     return ""
 
 
-def _turn_is_representable(message: dict) -> bool:
+def _reasoning_is_representable(text: str, *, thinking: bool) -> bool:
+    """Whether replaying ``text`` reaches the grader as the run's own graded answer.
+
+    Without thinking the run grades the completion verbatim, so reasoning markup in a gold answer
+    is text an exact-answer grader scores zero -- indistinguishable from the controls, and read as
+    a flat grader.
+
+    With thinking the run grades ``strip_think(...)`` and so does this command, so the same markup
+    replays faithfully. The remaining difference -- whether the rendered prompt already opened the
+    reasoning span -- is reported by ``_thinking_reading_is_ambiguous`` rather than handled here;
+    see ``cmd_env_test``.
+    """
+    if thinking:
+        return True
+    return "<think>" not in text and "</think>" not in text
+
+
+def _thinking_reading_is_ambiguous(text: str) -> bool:
+    """Whether grading ``text`` depends on a chat template this command cannot see.
+
+    ``strip_think`` reads a completion differently depending on whether the RENDERED PROMPT already
+    opened the reasoning span (`flash/engine/worker/rl.py:367-371` derives that from the template).
+    A gold answer carrying ``</think>`` reads the same either way. A tagless one does not: under a
+    prompt-opening template the run treats it as unterminated reasoning and grades the empty answer,
+    while this command grades its raw text -- so env test can report separation the real scorer,
+    seeing every completion collapse to "", never sees (codex[bot]).
+
+    Reported, not silently excluded. Excluding these would drop the ordinary case -- a plain gold
+    answer with no reasoning markup is exactly this shape -- from the ranking gate for every
+    thinking env, which is the same way a flat grader slips through that finding 1 above describes.
+    Naming it as inconclusive keeps the gate running and tells the user which reading was assumed.
+    """
+    from flash.engine.worker.decoding import strip_think
+
+    return strip_think(text, prompt_opened_thinking=False) != strip_think(
+        text, prompt_opened_thinking=True
+    )
+
+
+def _turn_is_representable(message: dict, *, thinking: bool = False) -> bool:
     """Whether replaying this assistant turn as plain text reproduces the reference faithfully.
 
     The driver replays each assistant turn as a text-only message. A native tool call
@@ -281,25 +320,26 @@ def _turn_is_representable(message: dict) -> bool:
     the newer name marked such a turn representable, replayed it as its (usually empty) content
     string, and admitted the mutilated rollout to the gate -- where a payload-aware grader scoring
     it like the controls reads as a flat reward function (codex[bot]).
+
+    ``thinking`` says whether the run strips reasoning before grading. Reasoning markup is only
+    unreproducible when it does NOT: the raw ``<think>`` text then reaches an exact-answer grader
+    that scores it and every control zero, and a working env reads as unable to rank. Under
+    ``--thinking`` the command grades the same ``strip_think`` answer the run does, so the turn is
+    reproducible and belongs in the gate. Excluding it there set `partial_replay` and skipped
+    control scoring, which is exactly how a flat-zero grader on a thinking run still reported
+    `overall: PASS` -- the miss this gate exists to catch (cursor).
     """
     if any(message.get(field) for field in _ASSISTANT_CALL_FIELDS):
         return False
     content = message.get("content")
     if isinstance(content, str):
-        # a gold answer carrying reasoning markup is graded by the run as `graded_text` leaves it,
-        # which strips the <think> span under a thinking config (flash/engine/worker/rl.py). this
-        # command has no run config to tell it whether thinking is on, so it can neither reproduce
-        # that text nor rule it out: an exact-answer grader would score both this raw reference and
-        # every control zero and report a working env as unable to rank. treat it as a replay the
-        # driver cannot reproduce faithfully, which is what the flag already means (codex[bot]).
-        return "<think>" not in content and "</think>" not in content
+        return _reasoning_is_representable(content, thinking=thinking)
     if isinstance(content, list):
         # text blocks survive extraction verbatim; anything else (an image block) is dropped.
         return all(
             isinstance(block, dict)
             and block.get("type") == "text"
-            and "<think>" not in str(block.get("text") or "")
-            and "</think>" not in str(block.get("text") or "")
+            and _reasoning_is_representable(str(block.get("text") or ""), thinking=thinking)
             for block in content
         )
     # bare null content with no structured call carries no payload at all, so replaying it as the
@@ -307,7 +347,9 @@ def _turn_is_representable(message: dict) -> bool:
     return content is None
 
 
-def _reference_turns(env, example: dict) -> tuple[list[str], bool, list[dict]]:
+def _reference_turns(
+    env, example: dict, *, thinking: bool = False
+) -> tuple[list[str], bool, list[dict]]:
     # the sft_completion gold answer stands in for the missing policy model. validate its
     # envelope like the prompt so a malformed completion (scalar content, missing role)
     # fails the episode instead of silently falling back to echo. text is extracted the
@@ -322,7 +364,7 @@ def _reference_turns(env, example: dict) -> tuple[list[str], bool, list[dict]]:
     # assistant turns only (a gold with no assistant message must echo, not replay user/system);
     # keep text-free turns positionally (empty string) so multi-turn replay stays aligned. the second
     # element reports whether any turn lost content in that flattening; see _turn_is_representable.
-    partial = any(not _turn_is_representable(m) for m in assistant)
+    partial = any(not _turn_is_representable(m, thinking=thinking) for m in assistant)
     # the messages are returned alongside the replay text so the observation check can reuse THIS
     # snapshot. calling sft_completion again for the same episode asks a second time for something
     # an env is free to answer differently -- one that samples a stored trajectory or consumes an
@@ -433,7 +475,7 @@ def _observation_blocks(
     return tuple(blocks)
 
 
-def _prompt_prefix_length(driven: list[dict], prompt: list[dict]) -> int:
+def _prompt_prefix_length(driven: list[dict], prompt: list[dict], *, seeded: bool) -> int:
     """How many leading messages of ``driven`` are the prompt: ``len(prompt)`` or 0.
 
     The adapter seeds its transcript from the prompt (flash/envs/adapter.py:392), so for that shape
@@ -444,17 +486,26 @@ def _prompt_prefix_length(driven: list[dict], prompt: list[dict]) -> int:
     `partial_replay` -- which drops it from the control gate and lets a flat-zero grader pass
     unreported (codex[bot]).
 
-    So the prefix is verified rather than assumed, and only by what ``_observation`` compares: role,
-    text, and block shape. Comparing whole dicts would fail on any per-call key the env is free to
-    regenerate, reintroducing the same false exclusion one level down.
+    ``seeded`` is that distinction, observed rather than inferred: `_run_rollout` records whether
+    this env's fresh state already contained the opening, BEFORE any turn was driven into it. That
+    is the only moment the two shapes are actually distinguishable.
+
+    Content equality cannot stand in for it. A prompt ending in an assistant prefill whose text the
+    first replayed turn repeats makes a completion-only transcript open with the same observations
+    as the prompt, so a content test answers ``len(prompt)`` and drops a real completion message --
+    the exact replay is then marked `partial_replay`, excluded from the control gate, and a flat
+    grader passes unreported (codex[bot]). The same coincidence in reverse is why the check is not
+    merely tightened: no comparison of the driven transcript against the prompt can recover
+    provenance the state never encoded.
     """
-    if len(driven) < len(prompt):
+    if not seeded or len(driven) < len(prompt):
         return 0
-    opening = [_observation(m) for m in driven[: len(prompt)]]
-    return len(prompt) if opening == [_observation(m) for m in prompt] else 0
+    return len(prompt)
 
 
-def _env_turns_reproduce(reference_messages: list[dict], state: dict, prompt: list[dict]) -> bool:
+def _env_turns_reproduce(
+    reference_messages: list[dict], state: dict, prompt: list[dict], *, seeded: bool
+) -> bool:
     """Whether the driven rollout's environment-side turns match the reference trajectory's.
 
     Only meaningful when the reference records them: a gold completion of assistant turns alone
@@ -485,6 +536,10 @@ def _env_turns_reproduce(reference_messages: list[dict], state: dict, prompt: li
     samples a stored trajectory or consumes an iterator answers differently each call -- so asking
     it again here compared the driven rollout against observations from a trajectory it never
     replayed (codex[bot]).
+
+    `seeded` says whether this env's fresh state already held the opening, observed by `_run_rollout`
+    before the loop ran. It decides whether the prompt is a positional prefix of the driven
+    transcript; see `_prompt_prefix_length` for why that cannot be recovered from content afterwards.
     """
     # the same role filter on both sides. dropping system turns from the driven side alone made an
     # env whose env_reply emits one look unreproduced on an exact replay, since the reference keeps
@@ -499,7 +554,9 @@ def _env_turns_reproduce(reference_messages: list[dict], state: dict, prompt: li
     # trailing reply -- marking a faithful replay unreproduced, and letting a coincidental trailing
     # match hide a divergence earlier in the trajectory (cursor).
     driven = state.get("messages") or []
-    completion = _observation_blocks(driven, skip_messages=_prompt_prefix_length(driven, prompt))
+    completion = _observation_blocks(
+        driven, skip_messages=_prompt_prefix_length(driven, prompt, seeded=seeded)
+    )
     # a reference recording more turns than were driven cannot match either way.
     if len(completion) < len(reference):
         return False
@@ -571,7 +628,9 @@ def _drive_single_turn(env, example: dict, record: dict, *, thinking: bool = Fal
     record["prompt"] = prompt
     # single-turn drives one assistant reply and never checks observations, so the snapshot the
     # multi-turn path threads through has no second reader here.
-    reference_turns, record["partial_replay"], _ = _reference_turns(env, example)
+    reference_turns, record["partial_replay"], _ = _reference_turns(
+        env, example, thinking=thinking
+    )
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
     response = (
@@ -599,8 +658,9 @@ def _drive_single_turn(env, example: dict, record: dict, *, thinking: bool = Fal
     )
 
 
-def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], list[dict]]:
-    """Drive one offline multi-turn rollout, returning the final state, turns taken, and prompt.
+def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], list[dict], bool]:
+    """Drive one offline multi-turn rollout: final state, turns taken, prompt, and whether the
+    env seeded its transcript with that prompt.
 
     `turn_content(index)` supplies the model's text for each turn, so the same loop can replay a
     gold transcript or a deliberately wrong one.
@@ -617,6 +677,12 @@ def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], lis
     prompt = [
         dict(m) for m in _check_messages(state.get("prompt") or state.get("messages"), "prompt")
     ]
+    # whether this env seeds its transcript with the opening, read from the FRESH state -- the only
+    # point where the two supported shapes differ observably. once the loop below has appended a
+    # turn, a completion-only transcript that happens to begin like the prompt is indistinguishable
+    # from a seeded one, and guessing from content drops real completion messages (see
+    # _prompt_prefix_length).
+    seeded = bool(state.get("messages"))
     # mirror the worker turn loop (flash/engine/multiturn_rollout.py): drive one model
     # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
     # env yields no reply. the hard cap is fixed at what the trainer passes (env.max_turns)
@@ -640,10 +706,14 @@ def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], lis
         _check_messages(env_msgs, "env_reply")
         if env.rollout_done(state, max_turns=hard_cap):
             break
-    return state, responses, prompt
+    return state, responses, prompt, seeded
 
 
 def _drive_multi_turn(env, example: dict, record: dict) -> None:
+    # no `thinking` here, and deliberately: a multi-turn transcript is scored as a whole episode
+    # through `reward_from_messages` (flash/engine/worker/rl.py:436-438), which never strips
+    # reasoning. so gold markup really does reach this grader verbatim, and a turn carrying it is
+    # unreproducible whatever the run's thinking mode says.
     reference_turns, record["partial_replay"], reference_messages = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
@@ -653,7 +723,7 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
             return reference_turns[index]
         return _ECHO_RESPONSE
 
-    state, responses, prompt = _run_rollout(env, example, content)
+    state, responses, prompt, seeded = _run_rollout(env, example, content)
     # the snapshot, not a re-read of the state: for an env exposing only `messages` the loop has
     # appended every driven turn to that list by now, so re-reading would record the whole
     # transcript as the prompt and report it back to the user as one.
@@ -672,7 +742,9 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     # under the same assistant strings, so a correct grader scores this "gold" rollout like the
     # controls and the gate reports a flat grader for an env that ranks fine (codex[bot]). the
     # reference records what the env replied last time, so compare against it where it does.
-    if policy == "replay" and not _env_turns_reproduce(reference_messages, state, prompt):
+    if policy == "replay" and not _env_turns_reproduce(
+        reference_messages, state, prompt, seeded=seeded
+    ):
         record["partial_replay"] = True
 
     # the terminal rollout, kept unscored: the whole run's rollouts are scored in one batch so a
@@ -743,9 +815,12 @@ def _scoring_inputs(completion: str, *, thinking: bool) -> tuple[str, dict | Non
     look flat here -- either way the verdict was about a scorer the run never calls (codex[bot]).
 
     ``prompt_opened_thinking`` is False because it is a property of the rendered prompt, which needs
-    the model's tokenizer and chat template: not available offline, and not meaningful for text this
-    command replays from the dataset rather than generates. It only changes the reading of a
-    completion carrying <think> tags, which a gold reference and a synthetic control do not.
+    the model's tokenizer and chat template: not available offline. The False reading is the one
+    that keeps the text intact, so a gold answer is graded as itself rather than as the empty string
+    a prompt-opening template would grade it as. Where the two readings disagree the run is told
+    which one was assumed -- ``cmd_env_test`` counts those episodes via
+    ``_thinking_reading_is_ambiguous`` and warns (codex[bot]). Excluding them instead would drop the
+    ordinary gold answer, which carries no reasoning markup and is exactly that shape, from the gate.
     """
     if not thinking:
         return completion, None
@@ -890,7 +965,7 @@ def _drive_multi_turn_controls(
     """
     return [
         (example, state, responses)
-        for state, responses, _prompt in (
+        for state, responses, _prompt, _seeded in (
             _run_rollout(env, example, lambda _index, text=control: text) for control in controls
         )
     ]
@@ -1071,30 +1146,48 @@ def _reads_per_turn_rewards(args) -> bool:
     return str(mode).strip().lower() == PER_TURN_CREDIT_ASSIGNMENT
 
 
-def _per_turn_rejection(env, *, per_turn: bool) -> str | None:
-    """Why this run's credit assignment cannot start, in the worker's own words, or None.
+def _grpo_rejection(env, *, grpo: bool, per_turn: bool) -> str | None:
+    """Why this run cannot reach its first training step, in the worker's own words, or None.
 
-    A native tool env exposing tools is driven through trl's tool loop rather than a rollout_func
-    (`flash/engine/worker/rl.py:814-827`), and `select_grpo_trainer` refuses per-turn credit on that
-    path. Reporting the per-turn reward vectors as evidence would pass an environment for a run that
-    raises before its first step (codex[bot]).
+    Two distinct refusals, both before any episode is driven.
 
-    The worker's own selector answers this, so the two cannot drift: the refusal it raises IS the
-    finding. Its supported per-turn branch imports the trainer (and torch with it), but that branch
-    is unreachable here -- this asks only about the combination that raises.
+    First, ``env.tools()`` itself. The worker calls it unguarded for every native tool env
+    (`flash/engine/worker/rl.py:816`), outside the try/except that scores a raising reward as 0.0,
+    so a tools() that raises aborts during initialization. Nothing else in this command calls it --
+    the offline driver replays text and never builds a tool loop -- so leaving it to "the episode
+    driver to surface" surfaced it nowhere, and `flash env test --algorithm grpo` reported PASS for
+    a run that dies before its first step (codex[bot]). Exercise it here, for every native-tool GRPO
+    run rather than only the per-turn ones.
+
+    Second, per-turn credit on that same tool-loop path: a tool env exposing tools is driven through
+    trl's tool loop rather than a rollout_func (`rl.py:814-827`), and `select_grpo_trainer` refuses
+    per-turn credit there. Reporting per-turn reward vectors as evidence would pass an environment
+    for a run that cannot start. The worker's own selector answers this, so the two cannot drift:
+    the refusal it raises IS the finding. Its supported per-turn branch imports the trainer (and
+    torch with it), but that branch is unreachable here -- this asks only about the combination that
+    raises.
+
+    Ordered as the worker orders them: tools() is called before the trainer is selected, so a env
+    that both raises and asks for per-turn credit reports the failure that actually comes first.
     """
-    if not per_turn:
-        return None
     if not (getattr(env, "is_tool_env", False) and getattr(env, "multi_turn", False)):
+        return None
+    # only when the run really would call it. a non-grpo algorithm never reaches rl.py's tool setup,
+    # so a raising tools() is not that run's problem to report.
+    if not grpo:
+        return None
+    try:
+        tools = env.tools()
+    except (Exception, SystemExit) as exc:
+        reason = str(exc) or exc.__class__.__name__
+        return (
+            f"env.tools() raised ({type(exc).__name__}: {reason}); the grpo worker calls it "
+            "unguarded while building the tool loop, so the run aborts during initialization"
+        )
+    if not per_turn:
         return None
     # a tool env exposing no tools degrades to the rollout_func path, which supports per-turn credit
     # -- the same condition the worker checks, not merely the is_tool_env flag.
-    try:
-        tools = env.tools()
-    except Exception:
-        # the worker calls this unguarded, so a raise here is a load failure of its own rather than
-        # a credit-assignment verdict. leave it to the episode driver to surface.
-        return None
     if not tools:
         return None
     from flash.engine.worker.rl import select_grpo_trainer
@@ -1153,13 +1246,16 @@ def cmd_env_test(args) -> int:
     # before any episode runs: this combination cannot reach a first training step, so there is no
     # reward evidence worth gathering for it, and reporting PASS would be a claim about a trainer
     # path the run never selects.
-    rejection = _per_turn_rejection(env, per_turn=per_turn)
+    rejection = _grpo_rejection(env, grpo=grades, per_turn=per_turn)
     if rejection:
         return _load_failure(rejection)
 
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0
     controlled = 0
+    # gold answers whose graded text depends on whether the run's chat template opens the reasoning
+    # span. counted, not excluded: see _thinking_reading_is_ambiguous.
+    ambiguous_thinking = 0
     scored_flat = 0
     scored_zero = 0
     inverted = 0
@@ -1266,6 +1362,15 @@ def cmd_env_test(args) -> int:
         # episodes it never tested.
         if controls and reward is not None:
             controlled += 1
+            # single-turn only: a multi-turn transcript is graded by `reward_from_messages`, which
+            # never strips reasoning, so no template reading enters it. counted here rather than at
+            # drive time so it speaks for exactly the episodes the gate below reads as evidence.
+            if (
+                thinking
+                and not env.multi_turn
+                and any(_thinking_reading_is_ambiguous(t) for t in record["reference_turns"])
+            ):
+                ambiguous_thinking += 1
             # the group is the gold rollout plus its controls, and `build_per_turn_advantages`
             # falls back to episode advantages for the WHOLE group as soon as one member lacks a
             # vector. so the vectors decide only when every member has one; otherwise the episode
@@ -1356,6 +1461,23 @@ def cmd_env_test(args) -> int:
             f"{len(control_errors)} episode(s) could not score a deliberately wrong answer "
             f"({control_errors[0]}), so the reward check skipped them. this scorer would fail "
             "under --algorithm grpo, which does grade arbitrary completions."
+        )
+        print(
+            render.warn(message) if render.styled() else f"warning: {message}",
+            file=sys.stderr,
+        )
+    if ambiguous_thinking:
+        # which reading of the gold answer this run assumed. `strip_think` grades a tagless
+        # completion as the answer itself or as unterminated reasoning depending on whether the
+        # RENDERED prompt already opened the span, and rendering it needs the model's chat template
+        # -- offline, this command cannot know which (codex[bot]). named rather than excluded: the
+        # ordinary gold answer has exactly this shape, so excluding it would empty the gate for
+        # every thinking env, which is how a flat grader passes unnoticed.
+        message = (
+            f"{ambiguous_thinking} replayed episode(s) carry a gold answer with no closing "
+            "</think>, graded here as its own text. under a chat template that opens the reasoning "
+            "span in the prompt the run grades the empty answer instead, so the reward check above "
+            "describes a completion that run would not see."
         )
         print(
             render.warn(message) if render.styled() else f"warning: {message}",
