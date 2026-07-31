@@ -10,6 +10,7 @@ on top.
 
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
 import json
@@ -192,6 +193,57 @@ def resolve_verl_loggers(python_bin: str) -> list[str]:
         )
         return ["console"]
     return ["console", "wandb"]
+
+
+def resolve_rollout_enforce_eager(python_bin: str) -> bool:
+    """whether this GPU must run the rollout eagerly instead of capturing cuda graphs.
+
+    vllm 0.19.1 is pinned on BOTH the baked verl venv and the fallback interpreter, so its
+    graph-capture defects are the same ones the retired trl driver worked around: aot_compile on
+    Ampere sm86 and a triton slot-mapping illegal-memory-access during capture. That driver only
+    trusted graphs on the architectures it had validated -- ``{(8, 0), (9, 0)}`` plus Blackwell --
+    and forced eager everywhere else. Nothing about that is trl-specific: it is a property of the
+    vllm build and the card, and verl drives the same engine.
+
+    verl is strictly MORE aggressive than the default that crashed: ``rollout.enforce_eager``
+    defaults False (``workers/config/rollout.py:195``) and its async server hardcodes
+    ``cudagraph_mode=FULL_AND_PIECEWISE`` (``vllm_async_server.py:237-241``) where trl asked only for
+    ``FULL_DECODE_ONLY``. So an unvalidated card now captures MORE graphs than the configuration
+    already known to fail on it. RTX 4090 (sm89) is the catalog's ``recommended_gpu`` for the small
+    models, so this is the default GRPO route, not an exotic one.
+
+    One knob is enough and cannot fight verl's: vllm 0.19.1 resolves ``enforce_eager`` LAST, forcing
+    ``compilation_config.mode=NONE`` and ``cudagraph_mode=NONE`` regardless of what was requested
+    (``config/vllm.py:847-853`` and ``:1024-1029``). Overriding ``cudagraph_mode`` instead would
+    leave torch.compile on, which is the other half of what sm86 dies in.
+
+    B200 (sm100) is deliberately NOT eager -- the trl path returned early there and kept vllm's own
+    default, and the b200 rollout work depends on graphs.
+
+    Probed in the VERL interpreter for the same reason the Blackwell probe is: verl owns the rollout
+    engine and pins its own stack. A probe that cannot answer returns False, leaving verl's default
+    in place rather than guessing eager onto an unknown card.
+    """
+    probe = (
+        "import torch;"
+        "print(tuple(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else ())"
+    )
+    try:
+        out = subprocess.run(
+            [python_bin, "-c", probe], capture_output=True, text=True, timeout=120
+        )
+        cc = ast.literal_eval((out.stdout or "").strip().splitlines()[-1])
+        major, minor = int(cc[0]), int(cc[1])
+    except Exception as e:  # no cuda / probe failure -> leave verl's default alone
+        print(f"[verl] rollout graph-capture probe skipped: {e}")
+        return False
+    if (major, minor) in {(8, 0), (9, 0)} or major in (10, 12):
+        return False
+    print(
+        f"[verl] sm{major}{minor}: enforce_eager=True for the rollout (vllm 0.19.1 graph capture is "
+        "unvalidated on this arch: aot_compile / triton slot-mapping failures)"
+    )
+    return True
 
 
 def resolve_blackwell_attention_backends(python_bin: str) -> tuple[str | None, str | None]:
