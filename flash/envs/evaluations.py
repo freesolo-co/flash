@@ -312,6 +312,46 @@ def _is_under(path: str, directory: Path) -> bool:
     return directory in resolved.parents
 
 
+def _sidecar_module_names(directory: Path) -> set[str]:
+    """Top-level import names this package directory can supply."""
+    names: set[str] = set()
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return names
+    for entry in entries:
+        if entry.is_symlink():
+            continue
+        if entry.is_file() and entry.suffix == ".py":
+            names.add(entry.stem)
+        elif entry.is_dir() and (entry / "__init__.py").is_file():
+            names.add(entry.name)
+    return names
+
+
+def _shadowed_cached_modules(directory: Path) -> dict[str, ModuleType]:
+    """Cached modules whose plain name this directory owns while its sidecar runs.
+
+    sys.modules is consulted BEFORE sys.path, so prepending the package directory does nothing
+    when the name is already cached: a process holding an unrelated top-level `helper` handed it
+    to a sidecar importing its own sibling `helper`, and the suite silently graded with another
+    module's cases and scoring constants. `_forget_sidecar_siblings` cannot correct it either --
+    it only examines names absent before the scope, and this one was present (cursor[bot]).
+
+    Only names this directory can actually supply are displaced, and only ones resolving
+    elsewhere: a module already loaded FROM this directory is the right one to keep."""
+    shadowed: dict[str, ModuleType] = {}
+    for name in _sidecar_module_names(directory):
+        cached = sys.modules.get(name)
+        if cached is None:
+            continue
+        origin = getattr(getattr(cached, "__spec__", None), "origin", None)
+        if origin and _is_under(origin, directory):
+            continue
+        shadowed[name] = cached
+    return shadowed
+
+
 @contextmanager
 def _sidecar_scope(module_dir: str) -> Iterator[None]:
     """Make `module_dir` the first place a bare import resolves, then undo it.
@@ -327,8 +367,15 @@ def _sidecar_scope(module_dir: str) -> Iterator[None]:
     Modules imported from this directory are dropped on exit for the same reason they are
     dropped after loading: the plain name belongs to whichever package is currently in scope,
     so leaving it cached would hand it to the next one."""
-    directory = str(Path(module_dir).resolve())
+    resolved = Path(module_dir).resolve()
+    directory = str(resolved)
     before = set(sys.modules)
+    # evict first, so `before` records the name as absent and the exit path drops whatever the
+    # sidecar imported in its place before the original is restored.
+    shadowed = _shadowed_cached_modules(resolved)
+    for name in shadowed:
+        del sys.modules[name]
+    before -= set(shadowed)
     sys.path.insert(0, directory)
     try:
         yield
@@ -337,6 +384,9 @@ def _sidecar_scope(module_dir: str) -> Iterator[None]:
         with suppress(ValueError):
             sys.path.remove(directory)
         _forget_sidecar_siblings(directory, before)
+        # restore unconditionally: the displaced module belongs to the rest of the process, and
+        # a sidecar that never imported the name must not leave it evicted either.
+        sys.modules.update(shadowed)
 
 
 class _ScopedSuite:

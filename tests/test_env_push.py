@@ -6,6 +6,7 @@ import argparse
 import base64
 import io
 import os
+import subprocess
 import sys
 import tarfile
 
@@ -200,6 +201,74 @@ def test_push_ships_the_package_when_a_module_of_the_same_name_shadows_it(monkey
     assert "graders/__init__.py" in files
 
 
+def test_push_ships_helpers_a_helper_imports(monkeypatch, tmp_path):
+    """A helper's own siblings ship too, or the published sidecar fails on its first case.
+
+    An exact-file push that packaged `scorer.py` but not the `thresholds` it imports passed
+    every local check -- the source directory is importable -- and raised ModuleNotFoundError
+    once published.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import scorer\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    (tmp_path / "scorer.py").write_text("from thresholds import CUTOFF\n")
+    (tmp_path / "thresholds.py").write_text("CUTOFF = 0.5\n")
+    # reached only through thresholds.py, so it proves the walk keeps following, not just one hop
+    (tmp_path / "units.py").write_text("SCALE = 2\n")
+    (tmp_path / "thresholds.py").write_text("import units\n\nCUTOFF = 0.5\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "scorer.py" in files
+    assert "thresholds.py" in files
+    assert "units.py" in files
+
+
+def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monkeypatch, tmp_path):
+    """`from custom import SCORER` must keep resolving after custom.py is published as environment.py.
+
+    Packaging renames the entrypoint, so a sidecar importing it by its local name resolved
+    locally and raised ModuleNotFoundError once published. The alias rebinds sys.modules so both
+    names give one module object rather than two copies of its state.
+    """
+    env_dir = tmp_path / "legacy-env"
+    env_dir.mkdir()
+    (env_dir / "custom.py").write_text("SCORER = 'gold'\n\ndef load_environment(**k):\n    return None\n")
+    (env_dir / "evaluations.py").write_text(
+        "from custom import SCORER\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir, name="legacy-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "custom.py" in files
+    # the published tree must import cleanly, with both names bound to ONE module object
+    (tmp_path / "published").mkdir()
+    for name, body in files.items():
+        target = tmp_path / "published" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import custom, environment; "
+            "assert custom is environment, (custom, environment); "
+            "print(custom.SCORER)",
+        ],
+        cwd=tmp_path / "published",
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "gold"
+
+
 def test_push_dir_infers_entrypoint_ignoring_the_evaluations_sidecar(monkeypatch, tmp_path):
     # a legacy package whose sole module is custom.py resolved fine before evaluations.py
     # existed. counting the sidecar as a candidate entrypoint makes adding one turn that
@@ -392,7 +461,11 @@ def test_push_alternate_py_keeps_packaged_entrypoint(monkeypatch, tmp_path):
     files = _members(cap["package_b64"])
     assert "return 'custom'" in files["environment.py"]
     assert "return 'sibling'" not in files["environment.py"]
-    assert "custom_env.py" not in files
+    # the entrypoint's SOURCE is published once, under the canonical name. custom_env.py exists
+    # only as an import alias so a sidecar's `import custom_env` still resolves, and it must not
+    # carry a second copy of the module body.
+    assert "return 'custom'" not in files["custom_env.py"]
+    assert "sys.modules[__name__] = _environment" in files["custom_env.py"]
 
 
 def test_push_requires_explicit_name(tmp_path, capsys):
