@@ -656,8 +656,8 @@ def parse_wandb_link(line: str) -> dict | None:
 
 
 # --------------------------- per-step grpo metrics (verl -> `flash runs log -f`) ---------------------------
-# trl feeds `metrics_last` from a TrainerCallback (heartbeat.make_reward_heartbeat_callback), which
-# verl cannot use: its trainer runs out of process. verl's LocalLogger prints exactly one line per
+# an in-process trainer would feed `metrics_last` from a TrainerCallback, which verl cannot host:
+# its trainer runs out of process. verl's LocalLogger prints exactly one line per
 # optimizer update -- "step:N - key:value - key:value" over every scalar metric -- so the parent
 # reconstructs the same backlog from that line. the payload schema is the CLI's, not verl's: keys
 # below are what flash/cli/commands.py:_FOLLOW_METRIC_FIELDS renders.

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import sys
-import types
 
 import pytest
 
@@ -167,98 +165,6 @@ def test_select_rollout_samples_loss_scalar_for_opd() -> None:
 def test_select_rollout_samples_rejects_unknown_scalar() -> None:
     with pytest.raises(ValueError, match="scalar"):
         select_rollout_samples([("p", "c", 1.0)], generated_at_step=1, scalar="entropy")
-
-
-def test_reward_heartbeat_carries_bounded_samples_and_forces_only_the_first(
-    monkeypatch,
-) -> None:
-    import flash.engine.worker as worker
-
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
-    emitted: list[tuple[str, dict]] = []
-
-    def committed_heartbeat(stage, **payload):
-        emitted.append((stage, payload))
-        return True
-
-    monkeypatch.setattr(worker, "heartbeat", committed_heartbeat)
-    monkeypatch.setattr(
-        heartbeat_module,
-        "_maybe_attach_gpu_diag",
-        lambda payload, last, now: last,
-    )
-    transformers = types.ModuleType("transformers")
-    transformers.TrainerCallback = type("TrainerCallback", (), {})
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-
-    samples = [
-        {
-            "prompt_tail": f"prompt-{index}",
-            "completion": f"completion-{index}",
-            "reward": index / 10,
-            "generated_at_step": 1,
-        }
-        for index in range(6)
-    ]
-    callback = heartbeat_module.make_reward_heartbeat_callback(
-        lambda: {"success": 0.8}, lambda: samples
-    )
-    state = types.SimpleNamespace(global_step=1)
-
-    callback.on_log(None, state, None, logs={"reward": 0.65})
-    callback.on_log(None, state, None, logs={"reward": 0.70})
-
-    first_payload = emitted[0][1]
-    assert emitted[0][0] == "rl_step"
-    assert first_payload["reward"] == 0.65
-    assert first_payload["reward_metrics"] == {"success": 0.8}
-    assert len(first_payload["sampled_completions"]) == 3
-    assert first_payload["force"] is True
-    assert "force" not in emitted[1][1]
-
-
-def test_reward_heartbeat_retries_force_until_sample_payload_commits(monkeypatch) -> None:
-    import flash.engine.worker as worker
-
-    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
-    emitted: list[tuple[str, dict]] = []
-    outcomes = iter([False, True, True])
-
-    def heartbeat(stage, **payload):
-        emitted.append((stage, payload))
-        return next(outcomes)
-
-    monkeypatch.setattr(worker, "heartbeat", heartbeat)
-    monkeypatch.setattr(
-        heartbeat_module,
-        "_maybe_attach_gpu_diag",
-        lambda payload, last, now: last,
-    )
-    transformers = types.ModuleType("transformers")
-    transformers.TrainerCallback = type("TrainerCallback", (), {})
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-    callback = heartbeat_module.make_reward_heartbeat_callback(
-        samples=lambda: [
-            {
-                "prompt_tail": "prompt",
-                "completion": "completion",
-                "reward": 1.0,
-                "generated_at_step": 1,
-            }
-        ]
-    )
-
-    for step in (1, 2, 3):
-        callback.on_log(
-            None,
-            types.SimpleNamespace(global_step=step),
-            None,
-            logs={"reward": 1.0},
-        )
-
-    assert emitted[0][1]["force"] is True
-    assert emitted[1][1]["force"] is True
-    assert "force" not in emitted[2][1]
 
 
 def test_heartbeat_reports_failed_then_successful_forced_delivery(monkeypatch) -> None:
