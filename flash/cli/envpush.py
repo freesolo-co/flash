@@ -486,6 +486,9 @@ def _iter_env_sidecar_files(
 
     roots = [env_root]
     if not include_full_tree:
+        import ast
+
+        yielded: set[Path] = set()
         # a single-file push carries only the entrypoint, its dataset sidecars, and its own
         # docs. ship user-authored docs so the synthesized stub readme does not stand in for
         # real training guidance the user shipped next to the module.
@@ -494,6 +497,7 @@ def _iter_env_sidecar_files(
             if doc.is_file() and not _ignore_env_push_path(
                 doc, env_root=env_root, entrypoint=entrypoint
             ):
+                yielded.add(doc)
                 yield doc, doc.relative_to(env_root)
         # the eval sidecar ships with its entrypoint. `env eval` loads evaluations.py next to an
         # exact .py target, so omitting it here would publish an environment whose suite passed
@@ -504,7 +508,34 @@ def _iter_env_sidecar_files(
             and sidecar != entrypoint
             and not _ignore_env_push_path(sidecar, env_root=env_root, entrypoint=entrypoint)
         ):
+            yielded.add(sidecar)
             yield sidecar, sidecar.relative_to(env_root)
+            try:
+                tree = ast.parse(sidecar.read_text(encoding="utf-8"), filename=str(sidecar))
+            except SyntaxError as exc:
+                raise ValueError(
+                    f"{sidecar}: invalid evaluation sidecar syntax: {exc.msg}"
+                ) from exc
+            imported_modules: set[str] = set()
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    imported_modules.update(alias.name.split(".", 1)[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    imported_modules.add(node.module.split(".", 1)[0])
+            # exact-file pushes include only direct sibling modules named by the sidecar. a helper
+            # importing another helper is intentionally out of scope and requires a directory push;
+            # following transitive imports here would turn the bounded single-file mode into a partial
+            # python dependency resolver that still could not reproduce package imports reliably.
+            for module_name in sorted(imported_modules):
+                helper = env_root / f"{module_name}.py"
+                if (
+                    helper.is_file()
+                    and helper != entrypoint
+                    and helper not in yielded
+                    and not _ignore_env_push_path(helper, env_root=env_root, entrypoint=entrypoint)
+                ):
+                    yielded.add(helper)
+                    yield helper, helper.relative_to(env_root)
         roots = [
             env_root / name
             for name in ("dataset", "datasets")
