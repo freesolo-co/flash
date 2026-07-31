@@ -1223,9 +1223,37 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
         return None
 
 
+def _episode_opening(messages) -> tuple[tuple[str, str], ...]:
+    """the (role, text) opening of a transcript, for comparing two independent initializations."""
+    return tuple(
+        (str(message.get("role", "")), str(message.get("content", "")))
+        for message in (messages or ())
+        if isinstance(message, dict)
+    )
+
+
+def _require_episode_matches_prompt(state: dict, prompt_messages, index: int) -> None:
+    """raise unless a fresh episode state opens on the prompt the child generated against."""
+    opening = _episode_opening(state.get("prompt") or state.get("messages"))
+    expected = _episode_opening(prompt_messages)
+    if opening != expected:
+        raise RuntimeError(
+            f"multi-turn example {index} initialized a different episode than the prompt the "
+            "model generated against; this environment's episode setup is not reproducible, so "
+            "its rollouts would be scored against state the model never saw"
+        )
+
+
 # --------------------------------------------------------------------------------------------
 # reward rpc bridge: verl subprocess -> flash live env.
 # --------------------------------------------------------------------------------------------
+# how long a terminal episode waits for the rest of its group before scoring without them. only a
+# liveness backstop for a peer that dies before reaching score -- the normal path is quiescence,
+# which fires as soon as the last episode arrives. well under the child's 600s bridge timeout so a
+# stuck group still returns a reward instead of failing the whole rollout on transport.
+_MULTI_TURN_SCORE_BATCH_SECONDS = 120.0
+
+
 class MultiTurnBridge:
     """parent-side episode state for the child's multi-turn agent loop.
 
@@ -1235,14 +1263,27 @@ class MultiTurnBridge:
     trl driver accumulates, so both backends score the same object.
     """
 
-    def __init__(self, env, examples: list[dict], *, max_turns: int) -> None:
+    def __init__(self, env, examples: list[dict], prompts: list, *, max_turns: int) -> None:
         self._env = env
         self._examples = examples
+        # the prompt messages the dataset was built from, parallel to examples. the child generated
+        # against exactly these, so they are what a freshly created episode state has to agree with.
+        self._prompts = prompts
         self._max_turns = int(max_turns)
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every env touch below happens under this lock, matching the single-turn path's contract.
-        self._lock = threading.Lock()
+        # a Condition rather than a plain Lock so terminal scoring can park here and coalesce (see
+        # score); it is still exactly one lock, so there is no new acquisition order to get wrong.
+        self._lock = threading.Condition()
         self._sessions: dict[str, dict] = {}
+        # episodes that have reached terminal state and are waiting to be scored as one batch.
+        self._pending_scores: list[dict] = []
+        self._score_leader = False
+        # a drain releases the lock across the env call, so this -- not the lock -- is what keeps
+        # env scoring single-flight. without it a later arrival could time out and start a second
+        # batch while the first is still in the env, which is exactly the concurrency the
+        # single-turn path's score_lock exists to prevent.
+        self._scoring = False
 
     def routes(self) -> dict:
         return {
@@ -1271,11 +1312,25 @@ class MultiTurnBridge:
             if session_id in self._sessions:
                 raise KeyError(f"duplicate multi-turn session {session_id}")
             state = self._env.new_rollout_state(example)
-            self._sessions[session_id] = {"example": example, "state": state}
-        # the per-example budget wins over the batch-wide cap, same precedence as rollout_done.
-        episode_turns = state.get("max_episode_turns")
-        turns = self._max_turns if episode_turns is None else int(episode_turns)
-        return {"max_turns": max(1, min(self._max_turns, turns))}
+            # the dataset prompt came from an EARLIER env.prompt_messages call; this is a second,
+            # independent episode initialization. an env that randomizes its opening would hand the
+            # model one episode and score it against another, so require the two to agree rather
+            # than train on a mismatched signal (codex[bot]).
+            _require_episode_matches_prompt(state, self._prompts[index], index)
+            # the per-example budget wins over the batch-wide cap, same precedence as rollout_done.
+            episode_turns = state.get("max_episode_turns")
+            turns = self._max_turns if episode_turns is None else int(episode_turns)
+            turn_limit = max(1, min(self._max_turns, turns))
+            # the same limit the child loops to. every later rollout_done check has to use it, not
+            # the batch-wide cap: an env whose per-example budget is the smaller of the two would
+            # otherwise be asked for a reply after its last allowed turn, appending an unanswered
+            # user message to the transcript that then gets scored (cursor).
+            self._sessions[session_id] = {
+                "example": example,
+                "state": state,
+                "turn_limit": turn_limit,
+            }
+        return {"max_turns": turn_limit}
 
     def step(self, payload: dict) -> dict:
         with self._lock:
@@ -1286,11 +1341,18 @@ class MultiTurnBridge:
             # the child stops on the same condition, so this only decides what the env sees.
             if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
                 return {"terminal": True, "messages": []}
+            turn_limit = int(session["turn_limit"])
             self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
-            if self._env.rollout_done(state, self._max_turns):
+            # the turn just recorded is the (turn_ordinal + 1)-th. once that reaches the limit the
+            # child will not generate again, so asking the env for a reply would only append a
+            # message no assistant turn can answer -- and it would still be scored. trl breaks on
+            # the same `turns >= max_turns` before calling env_reply (multiturn_rollout).
+            if int(payload["turn_ordinal"]) + 1 >= turn_limit:
+                return {"terminal": True, "messages": []}
+            if self._env.rollout_done(state, turn_limit):
                 return {"terminal": True, "messages": []}
             replies = self._env.env_reply(list(state.get("messages") or ()), state)
-            terminal = bool(self._env.rollout_done(state, self._max_turns))
+            terminal = bool(self._env.rollout_done(state, turn_limit))
         return {
             "terminal": terminal,
             "messages": [
@@ -1299,20 +1361,92 @@ class MultiTurnBridge:
             ],
         }
 
+    def _batch_is_ready(self) -> bool:
+        """true once every episode still open has parked in score, so nothing more can join."""
+        return len(self._pending_scores) >= len(self._sessions)
+
+    def _drain_pending_scores(self) -> None:
+        """score every parked episode in ONE env call and hand each waiter its own reward.
+
+        runs with self._lock held and releases it across the env call, the same way the rest of the
+        bridge serializes env access -- one scorer runs at a time, and no other env touch can
+        interleave with it because start/step/close all take this lock too.
+        """
+        batch = self._pending_scores
+        self._pending_scores = []
+        requests = [
+            RolloutScoreRequest(
+                example=entry["session"]["example"],
+                state=entry["session"]["state"],
+                turn_count=entry["turn_count"],
+            )
+            for entry in batch
+        ]
+        rewards: list | None = None
+        failure: Exception | None = None
+        self._scoring = True
+        self._lock.release()
+        try:
+            rewards = score_rollouts(self._env, requests)
+        except Exception as error:
+            failure = error
+        finally:
+            self._lock.acquire()
+            self._scoring = False
+        for index, entry in enumerate(batch):
+            # every waiter leaves with a reward or an error, never with neither: a batch that
+            # produced too few rewards would otherwise wake its tail with reward None.
+            if rewards is not None and index < len(rewards):
+                entry["reward"] = rewards[index]
+            else:
+                entry["error"] = failure or RuntimeError(
+                    "multi-turn batch scoring returned no reward for this episode"
+                )
+            entry["done"] = True
+        self._lock.notify_all()
+        if failure is not None:
+            raise failure
+
     def score(self, payload: dict) -> dict:
         turn_count = int(payload["turn_count"])
+        # terminal scoring is batched across the rollout group. an env that implements
+        # rollout_rewards_many uses it to grade remotely in one call, and scoring each episode on
+        # its own would turn a group into that many serialized round trips -- enough for the slowest
+        # to exceed the child's 600s bridge timeout. the trl driver has the whole group in hand and
+        # calls score_rollouts once (multiturn_rollout.rollout_many); here the episodes finish
+        # independently, so they park until the group is quiescent and then one of them scores all
+        # of it. the wait is free: verl cannot advance the step until the last episode lands anyway.
+        entry = {"session": None, "turn_count": turn_count, "done": False, "reward": None}
         with self._lock:
-            session = self._session(payload)
-            reward = score_rollouts(
-                self._env,
-                [
-                    RolloutScoreRequest(
-                        example=session["example"],
-                        state=session["state"],
-                        turn_count=turn_count,
-                    )
-                ],
-            )[0]
+            entry["session"] = self._session(payload)
+            self._pending_scores.append(entry)
+            # this arrival may be the one that completes the group; wake the leader to re-check.
+            self._lock.notify_all()
+            # a peer that dies without reaching score would leave the group one arrival short
+            # forever, so quiescence is a fast path, not the only way out.
+            deadline = time.monotonic() + _MULTI_TURN_SCORE_BATCH_SECONDS
+            while not entry["done"]:
+                if self._score_leader or self._scoring:
+                    # someone else is already scoring or waiting to; just wait for our result. this
+                    # also covers the case where our own deadline expires mid-drain: starting a
+                    # second batch then would run the env concurrently with the first.
+                    self._lock.wait(timeout=_MULTI_TURN_SCORE_BATCH_SECONDS)
+                    continue
+                if not self._batch_is_ready() and time.monotonic() < deadline:
+                    self._score_leader = True
+                    try:
+                        # released inside wait, so later arrivals can join the batch we lead.
+                        self._lock.wait(timeout=max(0.0, deadline - time.monotonic()))
+                    finally:
+                        self._score_leader = False
+                    continue
+                if entry["done"]:
+                    break
+                self._drain_pending_scores()
+            error = entry.get("error")
+            if error is not None:
+                raise error
+            reward = entry["reward"]
         # per-turn credit is a separate invariant (it needs a custom verl advantage estimator), so
         # only the episode reward crosses back. nan is score_rollouts' unscorable marker; verl has
         # no equivalent, and a nan would propagate into the group baseline and poison every other
@@ -1327,6 +1461,10 @@ class MultiTurnBridge:
     def close(self, payload: dict) -> dict:
         with self._lock:
             self._sessions.pop(str(payload["session_id"]), None)
+            # one fewer open session can be what makes the batch quiescent -- notably when an
+            # episode fails before scoring, so it never arrives and the group would otherwise wait
+            # out the full deadline for an arrival that is never coming.
+            self._lock.notify_all()
         return {"closed": True}
 
     def open_sessions(self) -> int:
@@ -1372,6 +1510,12 @@ def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[
         "FLASH_VERL_MULTITURN_URL": reward_url,
         "FLASH_VERL_MAX_TURNS": str(int(inp["max_turns"])),
         "FLASH_VERL_MAX_MODEL_LEN": str(int(inp["engine_len"])),
+        # the PER-TURN generation cap. the response tensor is widened to hold the whole episode on
+        # a multi-turn job, so without this the child would read that episode width as one turn's
+        # budget and let the first turn consume the entire transcript -- no room for an environment
+        # reply, and a rollout distribution that does not match the trl driver's
+        # per_turn_max_tokens=max_completion (codex[bot], cursor).
+        "FLASH_VERL_MAX_COMPLETION": str(int(inp["max_completion"])),
         "FLASH_VERL_STOP_SEQUENCES": json.dumps(list(inp["stop_sequences"])),
         # sorted so the child sees a stable set regardless of frozenset iteration order.
         "FLASH_VERL_EOS_TOKEN_IDS": json.dumps(sorted(inp["eos_token_ids"])),
@@ -2024,6 +2168,18 @@ def _resolve_grpo_inputs():
         # the model must actually support image training; this raises for a text-only checkpoint
         # rather than letting the processor silently drop the pixels.
         validate_multimodal_training(model_id, "grpo", multi_turn=multi_turn)
+        if multi_turn:
+            # the multi-turn child conditions the engine on prompt_ids alone -- server_manager
+            # .generate takes no image payload -- so the pixels cannot reach the rollout at all,
+            # and the transcript validator (role/content text) rejects the block-list prompt verl
+            # rebuilds. it is not merely an image row that breaks: normalize_prompt_images turns
+            # EVERY row of a multimodal job into content blocks, so the pure-text rows fail too.
+            # fail here rather than at the first rollout, which is the same contract the tool-env
+            # and opd multi-turn gates apply (codex[bot]).
+            raise RuntimeError(
+                "verl grpo supports image-bearing records only for single-turn environments; "
+                "run this multi-turn multimodal job on the trl backend"
+            )
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(
@@ -2178,15 +2334,11 @@ def _resolve_grpo_inputs():
         "multimodal": multimodal,
         "multi_turn": multi_turn,
         "max_turns": int(getattr(env, "max_turns", 0) or 0) if multi_turn else 0,
-        # the child decides whether an assistant turn ended naturally or was cut off, and it has no
-        # access to the model config -- so the full halting set is resolved here and handed over.
-        # the union of the tokenizer's eos and the model's generation_config eos, because a model can
-        # stop on a secondary id its tokenizer never exposes.
-        "eos_token_ids": (
-            generation_eos_from_cached_config(model_id, model_revision, tok)
-            if multi_turn
-            else frozenset()
-        ),
+        # the halting set the child needs is NOT resolved here: it reads the model's
+        # generation_config off local disk, and on a cold worker the snapshot does not exist until
+        # run_rl_verl prefetches it. run_rl_verl fills this in after that download, the way the opd
+        # path already orders the two (codex[bot]).
+        "eos_token_ids": frozenset(),
         "package_root": package_root,
         "image_pad_token_id": image_pad_token_id,
         "model_id": model_id,
@@ -2274,6 +2426,18 @@ def run_rl_verl():
             )
     else:
         download_seconds = _w.prefetch_model(inp["model_id"])
+
+    if inp["multi_turn"]:
+        # only now is the snapshot on disk. the child classifies each assistant turn as naturally
+        # ended or truncated and cannot read the model config itself, so the full halting set --
+        # the tokenizer's eos unioned with the model's generation_config eos, since a model can stop
+        # on a secondary id its tokenizer never exposes -- is resolved here and handed over.
+        # generation_eos_from_cached_config reads local_files_only and SUPPRESSES a missing
+        # generation_config.json, so running it before the prefetch above would silently yield the
+        # tokenizer's ids alone and make naturally ended turns look truncated (codex[bot]).
+        inp["eos_token_ids"] = generation_eos_from_cached_config(
+            inp["model_id"], inp["model_revision"], tok
+        )
 
     # stable int index -> rollout example, exactly as the trl path (reward maps back via this).
     ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
@@ -2411,7 +2575,7 @@ def run_rl_verl():
     )
 
     multi_turn_bridge = (
-        MultiTurnBridge(env, rollout_examples, max_turns=int(inp["max_turns"]))
+        MultiTurnBridge(env, rollout_examples, message_prompts, max_turns=int(inp["max_turns"]))
         if inp["multi_turn"]
         else None
     )

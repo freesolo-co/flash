@@ -2397,6 +2397,9 @@ def _multi_turn_inp(**over):
     return {
         "max_turns": 4,
         "engine_len": 8192,
+        # the per-turn generation cap, distinct from engine_len on purpose: the child must not be
+        # able to recover one from the other, or a test would pass on the wrong value.
+        "max_completion": 512,
         "stop_sequences": ("</answer>",),
         "eos_token_ids": frozenset({151645, 151643}),
         **over,
@@ -2545,9 +2548,15 @@ class _BridgeEnv:
         return [RolloutReward(episode=self.episode, turns=None) for _ in items]
 
 
-def _bridge(env, *, max_turns=4, examples=None):
+def _bridge(env, *, max_turns=4, examples=None, prompts=None):
+    rows = examples if examples is not None else [{"index": 0}, {"index": 1}]
+    # by default the prompts agree with what new_rollout_state builds (an empty transcript), so the
+    # reproducibility gate passes and these tests exercise the behavior they are actually about.
     return rl_verl.MultiTurnBridge(
-        env, examples if examples is not None else [{"index": 0}, {"index": 1}], max_turns=max_turns
+        env,
+        rows,
+        prompts if prompts is not None else [[] for _ in rows],
+        max_turns=max_turns,
     )
 
 
@@ -2609,7 +2618,7 @@ def test_bridge_step_records_the_turn_and_returns_the_env_reply():
     env = _BridgeEnv(done_after=2, replies=[{"role": "user", "content": "again"}])
     bridge = _bridge(env)
     bridge.start({"index": 0, "session_id": "a"})
-    out = bridge.step({"session_id": "a", "completion_text": "first"})
+    out = bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "first"})
     assert env.recorded == ["first"]
     assert out == {"terminal": False, "messages": [{"role": "user", "content": "again"}]}
 
@@ -2618,8 +2627,8 @@ def test_bridge_step_does_not_show_the_env_an_unusable_turn():
     # a truncated or skipped turn is terminal on the child side too. recording it would append a
     # cut-off assistant message to the transcript that then gets SCORED as if the model produced it.
     for payload in (
-        {"session_id": "a", "completion_text": "cut", "truncated": True},
-        {"session_id": "a", "completion_text": "cut", "skip_reason": "no room for a turn"},
+        {"session_id": "a", "turn_ordinal": 0, "completion_text": "cut", "truncated": True},
+        {"session_id": "a", "turn_ordinal": 0, "completion_text": "cut", "skip_reason": "no room for a turn"},
     ):
         env = _BridgeEnv()
         bridge = _bridge(env)
@@ -2634,7 +2643,7 @@ def test_bridge_step_stops_before_asking_a_finished_env_for_a_reply():
     env = _BridgeEnv(done_after=1)
     bridge = _bridge(env)
     bridge.start({"index": 0, "session_id": "a"})
-    assert bridge.step({"session_id": "a", "completion_text": "done"}) == {
+    assert bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "done"}) == {
         "terminal": True,
         "messages": [],
     }
@@ -2642,14 +2651,14 @@ def test_bridge_step_stops_before_asking_a_finished_env_for_a_reply():
 
 def test_bridge_step_on_an_unknown_session_raises_rather_than_scoring_a_blank_episode():
     with pytest.raises(KeyError, match="unknown multi-turn session"):
-        _bridge(_BridgeEnv()).step({"session_id": "ghost", "completion_text": "x"})
+        _bridge(_BridgeEnv()).step({"session_id": "ghost", "turn_ordinal": 0, "completion_text": "x"})
 
 
 def test_bridge_score_returns_the_episode_reward_for_that_session():
     env = _BridgeEnv(episode=0.75)
     bridge = _bridge(env)
     bridge.start({"index": 1, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "answer"})
     assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.75}
     # scored against the state the turns accumulated into, not a fresh one.
     assert env.scored[0]["messages"][0]["content"] == "answer"
@@ -2662,7 +2671,7 @@ def test_bridge_score_converts_an_unscorable_episode_to_zero(capsys):
     env = _BridgeEnv(episode=float("nan"))
     bridge = _bridge(env)
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "answer"})
     assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
     assert "unscorable" in capsys.readouterr().out
 
@@ -2673,7 +2682,7 @@ def test_bridge_score_converts_a_non_finite_episode_to_zero():
         env = _BridgeEnv(episode=episode)
         bridge = _bridge(env)
         bridge.start({"index": 0, "session_id": "a"})
-        bridge.step({"session_id": "a", "completion_text": "answer"})
+        bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "answer"})
         assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
 
 
@@ -2709,7 +2718,10 @@ def test_bridge_routes_are_served_alongside_single_turn_scoring():
 
         assert _post("/score", {"index": 0, "solution_str": "x"}) == {"score": 1.0}
         assert _post("/multiturn/start", {"index": 0, "session_id": "a"}) == {"max_turns": 4}
-        _post("/multiturn/step", {"session_id": "a", "completion_text": "answer"})
+        _post(
+            "/multiturn/step",
+            {"session_id": "a", "turn_ordinal": 0, "completion_text": "answer"},
+        )
         assert _post("/multiturn/score", {"session_id": "a", "turn_count": 1}) == {"score": 1.0}
         assert _post("/multiturn/close", {"session_id": "a"}) == {"closed": True}
     finally:
@@ -2720,8 +2732,229 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
     # a bridge on a single-turn job would expose episode routes with no episode state behind them,
     # and mounting it costs a lock the single-turn scoring path already has.
     src = inspect.getsource(rl_verl.run_rl_verl)
-    assert 'MultiTurnBridge(env, rollout_examples, max_turns=int(inp["max_turns"]))' in src
+    assert (
+        "MultiTurnBridge(env, rollout_examples, message_prompts, "
+        'max_turns=int(inp["max_turns"]))' in src
+    )
     assert 'if inp["multi_turn"]\n        else None' in src
+
+
+# ---------------------- multi-turn review fixes ----------------------
+def test_the_child_is_told_the_per_turn_cap_not_just_the_episode_width(monkeypatch):
+    # the response tensor is widened to hold a whole EPISODE on multi-turn, so the child cannot
+    # derive one turn's budget from it. without an explicit per-turn cap the first turn is free to
+    # consume the entire transcript, leaving no room for an environment reply -- a single-turn
+    # rollout wearing a multi-turn config, and not the distribution trl produces.
+    inp = _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+    child = rl_verl.multi_turn_child_env(inp, reward_url="http://127.0.0.1:1", thinking=False)
+    assert child["FLASH_VERL_MAX_COMPLETION"] == str(int(inp["max_completion"]))
+    # the point of the export: it is STRICTLY tighter than the episode width, so reading the width
+    # instead is an observable difference rather than a rename.
+    assert int(child["FLASH_VERL_MAX_COMPLETION"]) < int(inp["max_response_len"])
+
+
+def test_the_child_caps_each_turn_by_the_per_turn_budget_it_was_given():
+    # pinned on the child's source: the turn budget is the MINIMUM of three ceilings, and dropping
+    # max_completion from that min is the exact regression above. the child runs in the verl
+    # interpreter, so a behavioral test would need verl importable here.
+    from flash.engine.worker import grpo_multiturn
+
+    src = inspect.getsource(grpo_multiturn)
+    assert 'max_completion = int(os.environ["FLASH_VERL_MAX_COMPLETION"])' in src
+    assert (
+        "max_tokens = min(\n"
+        "                        max_completion,\n"
+        "                        max_model_len - len(prefix_ids),\n"
+        "                        response_capacity - len(response_ids),\n"
+        "                    )" in src
+    ), "the per-turn cap is not one of the ceilings the turn budget takes the min of"
+
+
+def test_bridge_does_not_ask_the_env_for_a_reply_after_the_last_allowed_turn():
+    # the child stops generating once turn_ordinal + 1 reaches the limit. asking the env for a reply
+    # then appends a user message no assistant turn can ever answer -- and that dangling message is
+    # still part of the transcript that gets scored. trl breaks on the same condition BEFORE
+    # env_reply (multiturn_rollout.rollout_one).
+    env = _BridgeEnv(done_after=99, replies=[{"role": "user", "content": "dangling"}])
+    bridge = _bridge(env, max_turns=2)
+    bridge.start({"index": 0, "session_id": "a"})
+    assert bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "t1"})["messages"]
+    last = bridge.step({"session_id": "a", "turn_ordinal": 1, "completion_text": "t2"})
+    assert last == {"terminal": True, "messages": []}
+    # the env was never asked to reply after the final turn, so no unanswerable message was glued.
+    transcript = [m["content"] for m in bridge._sessions["a"]["state"]["messages"]]
+    assert transcript == ["t1", "dangling", "t2"], (
+        f"a message was appended after the last allowed turn: {transcript}"
+    )
+
+
+def test_bridge_uses_the_per_example_turn_limit_for_doneness_not_the_batch_cap():
+    # an env whose per-example budget is SMALLER than the batch cap must be judged against its own
+    # budget. passing the batch cap to rollout_done asks the env whether it is done under a horizon
+    # it never agreed to.
+    seen: list[int] = []
+
+    class _Env(_BridgeEnv):
+        def rollout_done(self, state, max_turns):
+            seen.append(int(max_turns))
+            return False
+
+    bridge = _bridge(_Env(max_episode_turns=2), max_turns=7)
+    assert bridge.start({"index": 0, "session_id": "a"}) == {"max_turns": 2}
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "t1"})
+    assert seen, "rollout_done was never consulted"
+    assert set(seen) == {2}, f"rollout_done saw the batch cap, not the example's: {seen}"
+
+
+def test_the_eos_set_is_resolved_only_after_the_model_snapshot_is_on_disk():
+    # generation_eos_from_cached_config reads generation_config.json with local_files_only and
+    # SUPPRESSES a miss. resolving it before the prefetch on a cold worker therefore yields the
+    # tokenizer's ids alone -- silently, and every naturally-ended turn then reads as truncated.
+    # source-level because the ordering lives inside run_rl_verl, past the subprocess launch.
+    resolver = inspect.getsource(rl_verl._resolve_grpo_inputs)
+    assert '"eos_token_ids": frozenset(),' in resolver, (
+        "the resolver eagerly computes the eos set again, before any prefetch"
+    )
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    fill = src.index('inp["eos_token_ids"] = generation_eos_from_cached_config')
+    prefetch = src.index("prefetch_model(")
+    assert prefetch < fill, "the eos set is resolved before the model snapshot is fetched"
+
+
+def test_multi_turn_multimodal_fails_at_resolve_rather_than_dropping_the_pixels(monkeypatch):
+    # the child conditions the engine on prompt_ids alone -- server_manager.generate takes no image
+    # payload -- so pixels cannot reach a multi-turn rollout at all. training on the text while
+    # silently discarding the image is the worst outcome; fail closed, as the tool-env gate does.
+    with pytest.raises(RuntimeError, match="image-bearing records only for single-turn"):
+        _capability_resolve(
+            monkeypatch,
+            _capability_env(
+                multi_turn=True,
+                image_uri="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+            ),
+        )
+
+
+def test_single_turn_multimodal_still_resolves(monkeypatch):
+    # the control for the gate above: it must reject multi-turn multimodal specifically, not
+    # multimodal grpo in general, which the verl path does support.
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(
+            image_uri="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+        ),
+    )
+    assert inp["multi_turn"] is False
+
+
+def test_bridge_scores_the_whole_rollout_group_in_one_env_call():
+    # an env that batches remote grading gets ONE call for the group, the way the trl driver does
+    # (multiturn_rollout.rollout_many). scoring each episode alone turns a group into that many
+    # serialized round trips, and the accumulated wait can exceed the child's bridge timeout.
+    calls: list[int] = []
+
+    class _Env(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            calls.append(len(items))
+            # a distinct reward per episode, so a batch that mixed up the mapping is visible.
+            return [
+                RolloutReward(episode=float(len(state["messages"])), turns=None)
+                for _, state in items
+            ]
+
+    env = _Env(done_after=1)
+    bridge = _bridge(env, examples=[{"index": 0}, {"index": 1}, {"index": 2}], max_turns=1)
+    for index, session in enumerate(("a", "b", "c")):
+        bridge.start({"index": index, "session_id": session})
+        # a longer transcript per episode, so each carries a different reward.
+        for _turn in range(index + 1):
+            bridge._sessions[session]["state"]["messages"].append(
+                {"role": "assistant", "content": "x"}
+            )
+
+    results: dict[str, float] = {}
+    errors: list[BaseException] = []
+
+    def _score(session):
+        try:
+            results[session] = bridge.score({"session_id": session, "turn_count": 1})["score"]
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=_score, args=(s,)) for s in ("a", "b", "c")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not [t for t in threads if t.is_alive()], "a scorer never returned; the batch deadlocked"
+    assert not errors, f"scoring raised: {errors}"
+    assert calls == [3], f"the group was not scored in one env call: {calls}"
+    # each waiter got ITS OWN reward, not the leader's.
+    assert results == {"a": 1.0, "b": 2.0, "c": 3.0}
+
+
+def test_a_batch_scoring_failure_reaches_every_waiter_rather_than_hanging_them():
+    # the leader raises for its own request; the peers parked in the same batch must not wait out
+    # the deadline and must not return a None reward.
+    class _Env(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            raise RuntimeError("grader unreachable")
+
+    bridge = _bridge(_Env(), examples=[{"index": 0}, {"index": 1}], max_turns=1)
+    for index, session in enumerate(("a", "b")):
+        bridge.start({"index": index, "session_id": session})
+
+    errors: dict[str, BaseException] = {}
+
+    def _score(session):
+        try:
+            bridge.score({"session_id": session, "turn_count": 1})
+        except BaseException as error:
+            errors[session] = error
+
+    threads = [threading.Thread(target=_score, args=(s,)) for s in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not [t for t in threads if t.is_alive()], "a waiter hung on a failed batch"
+    assert set(errors) == {"a", "b"}, f"not every waiter was told the batch failed: {errors}"
+
+
+def test_a_lone_episode_still_scores_without_waiting_out_the_batch_deadline():
+    # the group is quiescent as soon as every OPEN session has parked, so a single episode scores
+    # immediately. if this ever blocks on the deadline, every small group pays 120s per step.
+    env = _BridgeEnv(episode=0.5)
+    bridge = _bridge(env, examples=[{"index": 0}], max_turns=1)
+    bridge.start({"index": 0, "session_id": "a"})
+    started = time.monotonic()
+    assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.5}
+    assert time.monotonic() - started < 10.0, "a lone episode waited for peers that cannot exist"
+
+
+def test_a_peer_that_dies_before_scoring_does_not_hold_the_batch(monkeypatch):
+    # an episode that fails mid-turn closes without ever reaching score. the survivors must still
+    # get scored: close notifies, so the group becomes quiescent without waiting out the deadline.
+    monkeypatch.setattr(rl_verl, "_MULTI_TURN_SCORE_BATCH_SECONDS", 30.0)
+    env = _BridgeEnv(episode=0.25)
+    bridge = _bridge(env, examples=[{"index": 0}, {"index": 1}], max_turns=1)
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.start({"index": 1, "session_id": "b"})
+
+    scored: dict[str, float] = {}
+
+    def _score():
+        scored["a"] = bridge.score({"session_id": "a", "turn_count": 1})["score"]
+
+    thread = threading.Thread(target=_score)
+    thread.start()
+    # b never scores; it dies and closes, which is what makes the group quiescent.
+    bridge.close({"session_id": "b"})
+    thread.join(timeout=25)
+    assert not thread.is_alive(), "the survivor waited on an episode that had already closed"
+    assert scored == {"a": 0.25}
 
 
 # ---------------------- multi-turn response tensor width ----------------------

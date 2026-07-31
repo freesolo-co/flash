@@ -111,6 +111,7 @@ def build_flash_grpo_multi_turn_agent_loop(
             example_index = int(kwargs["index"])
             max_turns = int(os.environ["FLASH_VERL_MAX_TURNS"])
             max_model_len = int(os.environ["FLASH_VERL_MAX_MODEL_LEN"])
+            max_completion = int(os.environ["FLASH_VERL_MAX_COMPLETION"])
             stop_sequences = tuple(
                 str(value) for value in json.loads(os.environ.get("FLASH_VERL_STOP_SEQUENCES", "[]"))
             )
@@ -158,7 +159,12 @@ def build_flash_grpo_multi_turn_agent_loop(
                         "flash multi-turn bridge returned an invalid per-example turn limit"
                     )
                 for turn_ordinal in range(turn_limit):
+                    # three ceilings, and the turn gets the tightest. the first two are the episode's
+                    # remaining room; max_completion is what ONE turn is allowed regardless of how
+                    # much episode is left, which is the cap the trl driver applies
+                    # (per_turn_max_tokens) and the one the response tensor's width does not carry.
                     max_tokens = min(
+                        max_completion,
                         max_model_len - len(prefix_ids),
                         response_capacity - len(response_ids),
                     )
