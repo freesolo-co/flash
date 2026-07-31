@@ -316,6 +316,8 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
             reason = str(exc) or exc.__class__.__name__
             _err(f"evaluation suite {suite.name} failed contract checks: {reason}")
     return all_valid
+
+
 def _reject_unsubmittable_param(key: str, value: object) -> None:
     """Reject a parsed TOML value that ``[environment.params]`` could not actually submit.
 
