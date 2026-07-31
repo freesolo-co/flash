@@ -604,20 +604,24 @@ def _iter_env_sidecar_files(
                 # matching only the module spelling published an environment whose sidecar raises
                 # ModuleNotFoundError on its first case, having passed every local check.
                 #
-                # the package is tried FIRST because python's path finder checks directories before
-                # same-named modules: when both exist, `import graders` is the package. shipping the
-                # .py and skipping the package published the file the sidecar never imports while
-                # dropping the one it does (cursor[bot]).
-                #
-                # `__init__.py` is not required: under PEP 420 any directory is importable as a
-                # namespace package, so a `graders/` with no marker file imports fine locally and
-                # was then dropped from the archive -- publishing an `evaluations.py` that raises
-                # ModuleNotFoundError on its first case after upload (codex[bot]).
+                # resolution follows python's own order, which is NOT simply "directories first".
+                # a directory holding __init__.py is a regular package and outranks a same-named
+                # module, so shipping the .py and skipping the package published the file the
+                # sidecar never imports while dropping the one it does (cursor[bot]). but a PEP 420
+                # namespace directory (no __init__.py) is only a fallback portion: `graders.py`
+                # wins over a bare `graders/`. requiring the marker unconditionally sent a
+                # namespace helper to the .py fallback, which did not exist either, and published
+                # an archive missing the helper entirely (codex[bot]). verified by probe: with both
+                # present, `import graders` binds graders.py.
                 package = env_root / module_name
-                if (
+                helper = env_root / f"{module_name}.py"
+                ships_package = (
                     package.is_dir()
                     and not package.is_symlink()
-                    and not _ignore_env_push_path(package, env_root=env_root, entrypoint=entrypoint)
+                    and ((package / "__init__.py").is_file() or not helper.is_file())
+                )
+                if ships_package and not _ignore_env_push_path(
+                    package, env_root=env_root, entrypoint=entrypoint
                 ):
                     for root, dirs, files in os.walk(
                         package, topdown=True, followlinks=False, onerror=_raise_walk_error
@@ -640,7 +644,6 @@ def _iter_env_sidecar_files(
                             pending.extend(_helper_imports(child))
                             yield child, child.relative_to(env_root)
                     continue
-                helper = env_root / f"{module_name}.py"
                 if (
                     helper.is_file()
                     and helper != entrypoint
