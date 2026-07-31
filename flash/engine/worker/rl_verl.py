@@ -79,6 +79,7 @@ from flash.engine.worker.verl_common import (
     parse_wandb_link,
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
+    resolve_rollout_enforce_eager,
     resolve_verl_loggers,
     resolve_verl_python,
     verl_supports_rollout_field,
@@ -470,6 +471,10 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
         # engine_kwargs.vllm struct (it is not a default field).
         o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
+    if cfg.get("enforce_eager"):
+        # this card's vllm 0.19.1 graph capture is unvalidated (see resolve_rollout_enforce_eager).
+        # rollout.enforce_eager is a real verl field, so this is a plain override, not a '+' append.
+        o.append("actor_rollout_ref.rollout.enforce_eager=True")
     # blackwell attention pins (see resolve_blackwell_attention_backends for why each default is
     # wrong). both are real AsyncEngineArgs fields in the pinned vllm 0.19.1, and verl spreads
     # engine_kwargs.vllm straight into them, so a plain override reaches the engine. '+' appends
@@ -523,6 +528,7 @@ def _build_verl_training_cfg(
     thinking: bool,
     loggers: str,
     fp8_kv: bool,
+    enforce_eager: bool,
     attention_backend: str | None,
     mm_encoder_attn_backend: str | None,
     reward_path: str,
@@ -571,6 +577,7 @@ def _build_verl_training_cfg(
         "n_gpus": n_gpus,
         "loggers": loggers,
         "fp8_kv": fp8_kv,
+        "enforce_eager": enforce_eager,
         "attention_backend": attention_backend,
         "mm_encoder_attn_backend": mm_encoder_attn_backend,
         "sleep_unsupported": _sleep_unsupported(inp["model_id"]),
@@ -2914,6 +2921,10 @@ def run_rl_verl():
         attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(
             python_bin
         )
+        # vllm 0.19.1 graph capture is only validated on a100/h100/blackwell; elsewhere it dies in
+        # aot_compile or triton slot-mapping, so the rollout runs eagerly. see
+        # resolve_rollout_enforce_eager for why one knob is enough.
+        enforce_eager = resolve_rollout_enforce_eager(python_bin)
         cfg = _build_verl_training_cfg(
             inp,
             train_files=train_pq,
@@ -2922,6 +2933,7 @@ def run_rl_verl():
             thinking=bool(_w.THINKING),
             loggers=loggers,
             fp8_kv=fp8_kv,
+            enforce_eager=enforce_eager,
             attention_backend=attention_backend,
             mm_encoder_attn_backend=mm_encoder_attn_backend,
             reward_path=reward_py,

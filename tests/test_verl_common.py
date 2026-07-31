@@ -542,6 +542,63 @@ def _blackwell_probe(monkeypatch, *, major, flashinfer_ok=True):
     return calls
 
 
+def _cc_probe(monkeypatch, cc):
+    """stub the capability probe; `cc` is what torch reports, or () for no cuda."""
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=f"{cc}\n", stderr="")
+
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+
+
+@pytest.mark.parametrize("cc", [(8, 6), (8, 9), (7, 5), (11, 0)])
+def test_unvalidated_arches_force_the_rollout_eager(monkeypatch, cc):
+    # vllm 0.19.1's graph capture dies in aot_compile (sm86) / triton slot-mapping on the arches the
+    # retired trl driver never validated. verl defaults enforce_eager False AND asks for
+    # FULL_AND_PIECEWISE, so without this an sm89 rtx 4090 -- the catalog's recommended_gpu for the
+    # small models, i.e. the DEFAULT grpo route -- captures more graphs than the config known to fail.
+    _cc_probe(monkeypatch, cc)
+    assert vc.resolve_rollout_enforce_eager("/verl/bin/python") is True
+
+
+@pytest.mark.parametrize("cc", [(8, 0), (9, 0), (10, 0), (12, 0)])
+def test_validated_arches_keep_verl_graph_capture(monkeypatch, cc):
+    # a100/h100 were validated with graphs, and blackwell (incl. the b200 rollout work) depends on
+    # them. forcing eager here would be a silent throughput regression, not a safety net.
+    _cc_probe(monkeypatch, cc)
+    assert vc.resolve_rollout_enforce_eager("/verl/bin/python") is False
+
+
+def test_capability_probe_failure_leaves_verl_default_alone(monkeypatch):
+    # a probe that cannot answer must not guess eager onto an unknown card.
+    def boom(*a, **k):
+        raise OSError("no interpreter")
+
+    monkeypatch.setattr(vc.subprocess, "run", boom)
+    assert vc.resolve_rollout_enforce_eager("/verl/bin/python") is False
+
+
+def test_no_cuda_leaves_verl_default_alone(monkeypatch):
+    # torch reports () with no visible card; literal_eval yields an empty tuple, not a crash.
+    _cc_probe(monkeypatch, ())
+    assert vc.resolve_rollout_enforce_eager("/verl/bin/python") is False
+
+
+def test_capability_probe_runs_against_the_verl_interpreter(monkeypatch):
+    # verl owns the rollout engine and pins its own vllm, so flash's own torch would answer for the
+    # wrong environment -- and on a heterogeneous host, potentially the wrong card.
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="(8, 9)\n", stderr="")
+
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    vc.resolve_rollout_enforce_eager("/verl/bin/python")
+    assert calls
+    assert all(cmd[0] == "/verl/bin/python" for cmd in calls)
+
+
 @pytest.mark.parametrize("major", [10, 12])
 def test_blackwell_pins_flashinfer_and_sdpa_vit(monkeypatch, major):
     _blackwell_probe(monkeypatch, major=major)
