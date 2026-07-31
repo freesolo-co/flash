@@ -807,6 +807,235 @@ def cmd_checkpoints(args) -> int:
     return 0
 
 
+# the states a deployment sits in before the requested revision is actually servable, mirroring
+# the set the control plane transitions through. anything else ends the wait: ready, failed, or a
+# state this client does not know, which must not spin until the timeout.
+_DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
+# the only states in which the control plane will actually serve the revision, mirroring
+# flash/server/routes/serving.py. leaving the busy set is NOT the same as arriving here:
+# `revocation_failed` (a concurrent undeploy whose backend cleanup failed) and any state a newer
+# plane introduces are both non-busy and non-servable, so `--wait` must fail closed on them
+# rather than let `deploy --wait && evaluate` proceed against nothing.
+_DEPLOYMENT_READY_STATES = frozenset({"ready", "deployed"})
+_DEPLOY_POLL_SECONDS = 5.0
+# `--wait 0` still owes the caller its one read, and a read needs a positive timeout. keep that
+# bound short enough that "check once, do not block" stays true against a stalled plane: a longer
+# fixed budget just moves the overshoot the per-poll bound exists to prevent.
+_DEPLOY_ZERO_WAIT_READ_SECONDS = 1.0
+# withheld from each sleep so the read that follows it starts inside the deadline. without this the
+# sleep spends the whole remainder and the wait ends on the deadline check having never looked
+# again, so a revision that went ready early in a short window reads as queued.
+_DEPLOY_FINAL_READ_SECONDS = 1.0
+# an auth or authorization rejection answers the same way every time; polling through it just
+# spends the whole timeout to arrive at the identical error.
+_PERMANENT_POLL_STATUSES = frozenset({401, 403})
+
+
+def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> dict:
+    """Poll until the requested revision leaves the busy states, or the timeout expires.
+
+    POST deploy returns as soon as the record is persisted, normally in ``queued`` while the
+    previous revision is still the ready one. A caller that starts evaluating on that return
+    talks to a reconciling endpoint and mostly gets errors. Polling here makes the returned
+    record mean what it appears to mean.
+    """
+    if str(deployment.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
+        return deployment
+    waiting = (
+        f"waiting up to {timeout:g}s for {run_id} to become servable; "
+        "ctrl-c stops waiting, not the deployment"
+    )
+    print(render.note(waiting) if render.styled() else f"note: {waiting}", file=sys.stderr)
+    deadline = time.monotonic() + timeout
+    latest = deployment
+    first = True
+    # set once the wait enters its final window, so the read funded by that window's split is the
+    # last one. see the sleep below: without a stop the split repeats down to clock granularity.
+    final_read = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if not first and (remaining <= 0 or final_read):
+            break
+        if not first:
+            # hold back a slice of the budget for the read this sleep precedes, so a revision that
+            # becomes ready early in a window no longer than one poll interval is still observed
+            # rather than reported as queued. reserving a fixed slice (rather than sleeping a
+            # fraction of the remainder) is what makes this terminate: a fraction leaves a positive
+            # remainder forever, while this drives the remainder to the slice and then to zero.
+            #
+            # the reservation has to apply to the final window too. subtracting only when the slice
+            # EXCEEDS the reserve meant a remainder at or under it was slept in full and the
+            # post-sleep deadline check ended the wait with no further read: `--wait 1` reported a
+            # revision that went ready mid-window as still queued and exited 1, and every longer
+            # wait carried the same blind spot through its last second (cursor, codex[bot]). split
+            # that window instead, and take the split as the wait's last sleep -- repeating it would
+            # be the fraction this comment already rejects, terminating only on the clock's
+            # granularity while issuing an unbounded number of reads inside one second.
+            slice_seconds = min(_DEPLOY_POLL_SECONDS, remaining)
+            if slice_seconds > _DEPLOY_FINAL_READ_SECONDS:
+                slice_seconds -= _DEPLOY_FINAL_READ_SECONDS
+            else:
+                slice_seconds /= 2
+                final_read = True
+            time.sleep(slice_seconds)
+            remaining = deadline - time.monotonic()
+            # the sleep can consume the whole budget. issuing the read anyway, with the fallback
+            # bound below, is how `--wait 0.1` came to block for over a second: check after waking.
+            if remaining <= 0:
+                break
+        # `--wait 0` is documented as "check once, do not block", so the first read happens before
+        # the deadline applies. without it zero never calls deployment_for at all and the command
+        # judges readiness from the POST body, which is queued on every normal async deploy.
+        first = False
+        try:
+            # bound the read by what is left of the wait. the client's default timeout is 60s, so
+            # an unbounded poll inside `--wait 5` blocks far past the deadline the user set. a
+            # blanket 1s floor would do the same to shorter waits, so only the expired-budget read
+            # -- which is just the zero-wait one-shot -- takes the fixed bound; every other read
+            # honours the remainder exactly.
+            budget = remaining if remaining > 0 else _DEPLOY_ZERO_WAIT_READ_SECONDS
+            current = client.deployment_for(run_id, timeout=budget)
+        except ApiError as exc:
+            if exc.status in _PERMANENT_POLL_STATUSES:
+                # retrying will not fix a rejected key or a run this key cannot see. without this
+                # the loop burns the full timeout (30 minutes by default) on a request that
+                # answers identically every time, and then reports it as "still queued".
+                print(f"warning: cannot check {run_id}: {exc}", file=sys.stderr)
+                return latest
+        except ClientError:
+            # a transient control-plane blip must not fail a deploy that is otherwise progressing;
+            # keep polling to the deadline and report whatever we last saw.
+            pass
+        else:
+            if current is None:
+                # the listing drops a run once its deployment is gone, so vanishing mid-wait is
+                # terminal, not slow; continuing here would just burn the whole timeout.
+                #
+                # "absent" and "gone", though, are not the same thing. deployment_for matches on
+                # the checkpoint step too, so a redeploy that FAILED and rolled the run back to a
+                # different revision also reads as absent: `mark_deployment_failed` restores the
+                # predecessor verbatim, and the restored record carries the predecessor's step.
+                # reporting that as "no longer an active deployment" names the wrong event and
+                # drops `last_deploy_error`, the only record of why the requested revision did not
+                # make it (codex[bot]). look for the run's other revision before saying it vanished.
+                # recomputed, not `budget`: that was the remainder BEFORE the read that just
+                # returned, and a poll which consumed nearly all of it would hand this lookup a
+                # second full-length bound -- so `--wait 5` could block for close to ten seconds,
+                # and the pinned one-shot of `--wait 0` for twice its fixed bound (codex[bot],
+                # cursor). the expired case still gets the zero-wait bound rather than being
+                # skipped: classifying rollback against vanished is the difference between
+                # reporting the real failure and naming the wrong event, and it is one read.
+                #
+                # a floor, not just an expired-case fallback: a poll that answered a hair inside the
+                # deadline leaves a remainder that is positive and far too small to read in, so
+                # forwarding it verbatim timed the listing out, `_rollback_record` swallowed the
+                # error, and the run was reported vanished with `last_deploy_error` never printed
+                # (cursor). the same one-read reasoning covers it -- a bound too small to answer in
+                # buys nothing over no lookup at all, and overshoots the deadline by at most the
+                # bound the zero-wait one-shot already spends.
+                left = deadline - time.monotonic()
+                other = _rollback_record(client, run_id, max(left, _DEPLOY_ZERO_WAIT_READ_SECONDS))
+                if other is not None:
+                    return other
+                print(
+                    f"warning: {run_id} is no longer an active deployment; "
+                    f"run `{CLI_NAME} models deployments` to check what happened",
+                    file=sys.stderr,
+                )
+                return latest
+            latest = current
+            if str(current.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
+                return current
+    print(
+        f"warning: still {str(latest.get('state') or 'unknown')!r} after {timeout:g}s; "
+        f"run `{CLI_NAME} models deployments` to keep checking {run_id}",
+        file=sys.stderr,
+    )
+    return latest
+
+
+def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
+    """The run's currently-listed revision when it is NOT the one that was requested.
+
+    Only meaningful once the requested revision is absent from the listing. A failed cross-step
+    redeploy leaves exactly this shape: the run is still deployed, on its previous checkpoint,
+    with `last_deploy_error` explaining why the new one did not take.
+
+    Returned as-is rather than reshaped to look like the requested revision. The caller compares
+    attempt identity (`_deployment_attempt_failed`) and prints the record, so handing back the
+    predecessor's real step and stamp is what makes both report the rollback instead of claiming
+    the requested checkpoint is live.
+    """
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(run_id)
+    if parsed is None:
+        return None
+    base_run_id, _ = parsed
+    # the requested step is not read here, and there is no early return for the final adapter.
+    # a run serving a checkpoint whose FINAL-adapter
+    # redeploy fails is rolled back to that checkpoint by `mark_deployment_failed`, and
+    # `deployment_for` rejects the restored record because its non-null `checkpoint_step` does not
+    # match the requested final adapter. exempting `step is None` therefore hit exactly the case
+    # this lookup exists for: the CLI reported the run as vanished and printed the stale queued
+    # record instead of the persisted error and the still-serving checkpoint (codex[bot], cursor).
+    # the rollback is always to a DIFFERENT revision, so the direction of the step change is not
+    # what makes it one -- `last_deploy_error` below is.
+    try:
+        entries = client.deployments(timeout=timeout)
+    except (ApiError, ClientError):
+        # this runs on the way out of a wait that has already ended; a failed lookup just means we
+        # fall back to the original "no longer active" message rather than failing the command.
+        return None
+    # deployment_for is no help here: it resolves an exact revision, so asking it for the bare run
+    # id means "the final adapter" (step None) and it rejects the rolled-back step just as it
+    # rejected the requested one. match on the run id alone and let the caller judge identity.
+    for entry in entries or ():
+        listed = entry.get("deployment") or {}
+        if base_run_id not in (listed.get("run_id"), entry.get("run_id")):
+            continue
+        if not listed.get("last_deploy_error"):
+            # without a recorded error there is nothing tying this revision to the requested one's
+            # disappearance, and reporting an unrelated deployment as this command's rollback would
+            # be the "settle on whichever revision is listed" defect the step filter exists to stop.
+            continue
+        if not listed.get("run_id") and entry.get("run_id"):
+            listed = {**listed, "run_id": entry["run_id"]}
+        return listed
+    return None
+
+
+def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
+    """True when the revision we asked for is not the one now being served.
+
+    A failed redeploy does not leave a `failed` record. `mark_deployment_failed` restores the
+    previous deployment verbatim and records the failure only in `last_deploy_error`, so the run
+    ends up `ready` on the OLD adapter. Treating that as success is how
+    `deploy --wait && evaluate` silently evaluates the previous checkpoint. Compare the attempt
+    identity instead of trusting the state word.
+    """
+    if str(final.get("state") or "") == "failed":
+        return True
+    asked = requested.get("requested_at")
+    got = final.get("requested_at")
+    # a POST that already answered with a settled record ran the deployment synchronously
+    # (FLASH_DEPLOY_SYNC, flash/server/routes/serving.py), so it returned the FINISHED row and never
+    # exposed the queued attempt. `requested` and `final` are then the same row and their stamps
+    # match by construction -- a restored previous revision compares equal to itself and reads as
+    # success. the recorded error is the only evidence left, and a deploy that really succeeded
+    # writes a fresh record that carries none, so this cannot fire on one.
+    if str(requested.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
+        return bool(final.get("last_deploy_error"))
+    # a differing stamp means the record on the plane belongs to some other deploy request. that
+    # happens without any error at all: a concurrent `deploy` for the same run supersedes this one
+    # and reaches ready on ITS checkpoint, and reading only last_deploy_error would call that this
+    # command's success. compare the stamps whenever both sides carry one.
+    if asked is not None and got is not None:
+        return asked != got
+    # no attempt stamp to compare: a recorded error is the only signal left.
+    return bool(final.get("last_deploy_error"))
+
+
 def cmd_deploy(args) -> int:
     from flash.schema import parse_checkpoint_ref
 
@@ -822,6 +1051,20 @@ def cmd_deploy(args) -> int:
     base_run_id, _step = parsed
     client = client_from_config()
     dep = client.deploy(args.run_id, dry_run=args.dry_run)
+    wait_seconds = getattr(args, "wait", None)
+    # a dry run creates no deployment to poll for, so --wait has nothing to observe. test against
+    # None, not truthiness: `--wait 0` is an explicit "poll once, do not block" and 0.0 is falsy.
+    waited_but_unservable = False
+    if wait_seconds is not None and dep.get("state") != "dry_run":
+        requested = dep
+        dep = _await_deployment(client, args.run_id, dep, wait_seconds)
+        # --wait promises the revision is servable on return, so require the plane to SAY it is
+        # servable. "not busy" is a weaker claim that also covers a timeout, a vanished listing, an
+        # unpollable plane, `revocation_failed`, and any state a newer plane adds; a restored
+        # previous revision means the requested one never made it. exiting 0 on any of those lets
+        # `deploy --wait && evaluate` run against the wrong adapter, or against none.
+        not_ready = str(dep.get("state") or "") not in _DEPLOYMENT_READY_STATES
+        waited_but_unservable = not_ready or _deployment_attempt_failed(requested, dep)
     if render.styled():
         print(render.deployed(dep))
     else:
@@ -830,7 +1073,7 @@ def cmd_deploy(args) -> int:
     if dep.get("state") != "dry_run":
         openai_base = str(dep.get("openai_base_url") or "")
         note = (
-            f"serving is billed per token only; use `flash models undeploy {base_run_id}` "
+            f"serving is billed per token only; use `{CLI_NAME} models undeploy {base_run_id}` "
             "to deregister the adapter."
         )
         print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
@@ -846,19 +1089,36 @@ def cmd_deploy(args) -> int:
         if state == "failed":
             detail = str(dep.get("error") or dep.get("detail") or "unknown error")
             status_note = (
-                f"deployment failed: {detail}; run `flash models deployments` for details and "
-                f"retry `flash models deploy {args.run_id}` after fixing the error."
+                f"deployment failed: {detail}; run `{CLI_NAME} models deployments` for details "
+                f"and retry `{CLI_NAME} models deploy {args.run_id}` after fixing the error."
+            )
+        elif waited_but_unservable and dep.get("last_deploy_error"):
+            # state reads `ready`, but it is the PREVIOUS revision: say so, or the reader trusts
+            # the word and never learns the requested checkpoint is not the one being served.
+            detail = str(dep.get("last_deploy_error"))
+            status_note = (
+                f"the requested revision did not become servable ({detail}); the previously "
+                f"deployed revision is still serving. retry "
+                f"`{CLI_NAME} models deploy {args.run_id}` after fixing the error."
+            )
+        elif waited_but_unservable:
+            # the wait ended without the plane calling this revision servable, and there is no
+            # recorded error to explain it: a timeout, or a terminal state that is not ready. the
+            # generic "use chat once it is ready" below would read as success next to the exit 1.
+            status_note = (
+                f"deployment state is {state!r} after waiting; the requested revision is not "
+                f"servable yet. run `{CLI_NAME} models deployments` to keep checking it."
             )
         else:
             status_note = (
-                f"deployment state is {state!r}; run `flash models deployments` to check progress "
-                "and use `flash models chat` once it is ready."
+                f"deployment state is {state!r}; run `{CLI_NAME} models deployments` to check "
+                f"progress and use `{CLI_NAME} models chat` once it is ready."
             )
         print(
             render.arrow(status_note) if render.styled() else f"note: {status_note}",
             file=sys.stderr,
         )
-    return 1 if dep.get("state") == "failed" else 0
+    return 1 if dep.get("state") == "failed" or waited_but_unservable else 0
 
 
 def cmd_export(args) -> int:
