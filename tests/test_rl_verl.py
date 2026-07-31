@@ -256,6 +256,7 @@ def _overrides_cfg(**over):
         "structured_outputs": None, "thinking": False,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
         "steps": 60, "gpu_mem_util": 0.5, "n_gpus": 1, "loggers": "console", "fp8_kv": False,
+        "enforce_eager": False,
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
         "mask_truncated_completions": True,
         "total_epochs": 1, "save_freq": 20, "ckpt_to_keep": 1, "local_dir": "/w/ckpt",
@@ -528,7 +529,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
         # go through the real builder so the flag cannot drift out of the cfg it emits.
         cfg = rl_verl._build_verl_training_cfg(
             inp, train_files="/w/t.parquet", val_files="/w/v.parquet", model_id="/w/model",
-            thinking=False, loggers="console", fp8_kv=False,
+            thinking=False, loggers="console", fp8_kv=False, enforce_eager=False,
             attention_backend=None, mm_encoder_attn_backend=None, reward_path="/w/r.py",
             local_dir="/w/ckpt", project_name="flash", experiment_name="flash-rl-run123",
         )
@@ -554,6 +555,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
     common = {
         "train_files": "/w/t.parquet", "val_files": "/w/v.parquet", "model_id": "Qwen/Qwen3-4B",
         "thinking": False, "loggers": "console", "fp8_kv": False,
+        "enforce_eager": False,
         "attention_backend": None, "mm_encoder_attn_backend": None,
         "reward_path": "/w/r.py", "local_dir": "/w/ckpt",
         "project_name": "flash", "experiment_name": "flash-rl-run123",
@@ -645,6 +647,7 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        enforce_eager=False,
         attention_backend=None,
         mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
@@ -848,6 +851,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        enforce_eager=False,
         attention_backend=None,
         mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
@@ -892,6 +896,25 @@ def test_build_verl_overrides_fp8_kv_gated_on_hardware():
     assert not any("kv_cache_dtype" in x for x in off)
     on = rl_verl.build_verl_overrides(_overrides_cfg(fp8_kv=True))
     assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8" in on
+
+
+def test_build_verl_overrides_enforce_eager_gated_on_hardware():
+    off = rl_verl.build_verl_overrides(_overrides_cfg(enforce_eager=False))
+    assert not any("enforce_eager" in x for x in off)
+    on = rl_verl.build_verl_overrides(_overrides_cfg(enforce_eager=True))
+    # plain override, not '+': enforce_eager is a declared verl RolloutConfig field
+    # (workers/config/rollout.py:195), so appending it would be a duplicate-key error.
+    assert "actor_rollout_ref.rollout.enforce_eager=True" in on
+
+
+def test_the_resolved_eager_flag_reaches_the_verl_config():
+    # the string assertions above pass against a resolver whose answer is never carried into the
+    # config, which is exactly how the retired trl workaround got dropped. pin the wiring.
+    built = inspect.getsource(rl_verl.run_rl_verl)
+    assert "enforce_eager = resolve_rollout_enforce_eager(python_bin)" in built
+    assert "enforce_eager=enforce_eager," in built
+    cfg = inspect.getsource(rl_verl._build_verl_training_cfg)
+    assert '"enforce_eager": enforce_eager,' in cfg
 
 
 def test_build_verl_overrides_kl_off_by_default():
@@ -2767,6 +2790,7 @@ def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        enforce_eager=False,
         attention_backend=None,
         mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
@@ -3485,6 +3509,7 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        enforce_eager=False,
         attention_backend=None,
         mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
