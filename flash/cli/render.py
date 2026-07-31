@@ -440,7 +440,14 @@ def version(value: str) -> str:
 def submitted(run_id: str) -> str:
     """The `flash train` hand-off note (printed to stderr before logs start streaming)."""
     head = ok(f"run {_paint(run_id, _ACCENT2)} submitted")
-    hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash runs log {run_id} --follow`")
+    # "detaches" alone reads as "stops it" to anyone who has not been bitten by it yet, and the
+    # next move after that misreading is a second `flash train` and a second bill. Say it keeps
+    # running, and name the command that actually stops it.
+    hint = _dim(
+        f"following logs: Ctrl-C detaches (the run keeps going and keeps billing); "
+        f"resume with `{CLI_NAME} runs log {run_id} --follow`, "
+        f"stop with `{CLI_NAME} runs cancel {run_id}`"
+    )
     return _safe(f"{head}\n{hint}")
 
 
