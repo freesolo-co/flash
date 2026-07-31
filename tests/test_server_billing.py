@@ -707,3 +707,46 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
     status = runner.get_status("run-1")
     assert status.billing_state == "failed"
     assert "FREESOLO_INTERNAL_KEY" in (status.billing_error or "")
+
+
+# --------------------------------------------------------- warm-start error attribution
+
+
+def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
+    # a genuine adapter-resolution failure keeps the actionable 400 that names the source.
+    import flash.runner as runner_mod
+    import flash.server.app as app_mod
+
+    # raise the class off the reloaded module: the api fixture reloads flash.runner, so a symbol
+    # imported at module scope here would be a different object than the route's.
+    def _prepare(*args, **kwargs):
+        raise runner_mod.WarmStartPreparationError("private-owner/private-repo:sft/step-20")
+
+    monkeypatch.setattr(app_mod, "prepare_job", _prepare)
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
+
+    assert res.status_code == 400, res.text
+    assert "train.init_from_adapter source" in res.text
+    # the reason stays server-side: it can name internal storage paths. see
+    # test_server_api.py::test_create_run_redacts_internal_warmstart_preparation_error.
+    assert "private-owner" not in res.text
+
+
+def test_route_does_not_blame_the_adapter_for_unrelated_failures(api, monkeypatch):
+    # the regression this guards: gpu sizing, budget, and environment resolution also run inside
+    # prepare_job, for every submit. those failures must reach the user as themselves instead of
+    # sending them to re-check an adapter that is fine.
+    #
+    # the spec MUST set train.init_from_adapter: the old bug only rewrote failures when that field
+    # was populated, so a submit without it cannot distinguish the fix from the bug.
+    import flash.server.app as app_mod
+
+    def _prepare(*args, **kwargs):
+        raise ValueError("no gpu class satisfies the requested memory")
+
+    monkeypatch.setattr(app_mod, "prepare_job", _prepare)
+    warm_start_spec = {**SPEC, "train": {**SPEC["train"], "init_from_adapter": "source-run"}}
+    res = api.post("/v1/runs", json={"spec": warm_start_spec}, headers=_bearer("fslo-user-1"))
+
+    assert "no gpu class satisfies" in res.text
+    assert "init_from_adapter" not in res.text
