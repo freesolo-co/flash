@@ -2218,14 +2218,16 @@ def test_env_eval_pins_a_step_shorthand_to_its_immutable_revision(
     assert f"resolved evaluation target {shorthand} to {revision}" in capsys.readouterr().out
 
 
-def test_env_eval_refuses_a_step_shorthand_the_run_is_not_serving(
-    monkeypatch, tmp_path, capsys
+def test_env_eval_keeps_a_step_shorthand_the_live_deployment_has_moved_past(
+    monkeypatch, tmp_path
 ) -> None:
-    """A step the live deployment is not on cannot be named, so it must not be graded.
+    """A step the deployment has moved past is still servable, so it must still be evaluated.
 
-    The step may still be verified and servable, but nothing the CLI can read says WHICH revision
-    at that step would answer -- `deployments` reports the live record only. Grading under a name
-    that cannot be resolved is the defect itself.
+    A run keeps its earlier verified revisions after a newer step is deployed, and the chat route
+    serves them: asked for step-3 while step-40 is live, the server resolves the ledger's single
+    step-3 entry and answers 200 (tests/test_server_api.py). Only the live revision is visible from
+    here, so anything else stays the shorthand for the server to resolve -- refusing would fail an
+    evaluation that runs correctly, and the server answers a genuinely ambiguous step with a 409.
     """
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
@@ -2237,6 +2239,9 @@ def test_env_eval_refuses_a_step_shorthand_the_run_is_not_serving(
     )
 
     class Client:
+        def __init__(self):
+            self.targets = []
+
         def deployments(self):
             return [
                 {
@@ -2250,16 +2255,17 @@ def test_env_eval_refuses_a_step_shorthand_the_run_is_not_serving(
             ]
 
         def chat_stream(self, target, messages, **kwargs):
-            raise AssertionError(f"an unresolvable step must not be graded, got {target!r}")
+            self.targets.append(target)
+            yield "4"
 
+    client = Client()
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", Client)
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
-    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir)]) == 1
+    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir)]) == 0
 
-    err = capsys.readouterr().err
-    assert "is deployed at step 40, not step 3" in err
-    assert "flash models deployments" in err
+    # the shorthand is forwarded untouched: the step-40 revision must never be substituted for it.
+    assert client.targets == ["flash-1/step-3"]
 
 
 def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> None:
@@ -2422,6 +2428,96 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
         url = images[0]["image_url"]["url"]
         # a data URI, not "dataset/cat.png": the backend has no access to this filesystem
         assert url.startswith("data:image/png;base64,"), url
+
+
+def _stub_pil(monkeypatch, mime: str = "image/png") -> None:
+    """Stand in for Pillow at the one boundary multimodal.py uses it.
+
+    Pillow is not installed by the test extras (`uv sync --extra server --dev`), so the real-image
+    test above skips in CI and pins nothing there. Only image *inspection* needs PIL -- the
+    normalization, descriptor, and data-URI code under test is ours -- so faking that boundary keeps
+    the assertion about our own path rather than about Pillow being present.
+    """
+    from types import ModuleType
+
+    class _Image:
+        def __init__(self, data: bytes) -> None:
+            self.width, self.height, self.format = 2, 2, "PNG"
+            self._data = data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    module = ModuleType("PIL")
+    image_module = ModuleType("PIL.Image")
+    image_module.Image = _Image
+    image_module.MIME = {"PNG": mime}
+    image_module.open = lambda stream: _Image(stream.getvalue())
+    image_module.new = lambda *_a, **_k: _Image(b"")
+    module.Image = image_module
+    monkeypatch.setitem(sys.modules, "PIL", module)
+    monkeypatch.setitem(sys.modules, "PIL.Image", image_module)
+    monkeypatch.setattr("flash.multimodal._is_pil_image", lambda _value: False)
+
+
+def test_env_eval_sends_a_top_level_image_the_prompt_never_mentions(monkeypatch, tmp_path) -> None:
+    """The same defect as above, pinned where CI can actually see it.
+
+    The real-image test skips without Pillow, which the test extras do not install -- so on CI
+    nothing catches a regression here. Stubbing only the PIL boundary runs the normalization and
+    data-URI code for real: an `image` field with no placeholder block is appended to the first user
+    message, which is how training sees it, and sending prompt_messages() unchanged would lose it
+    with no error at all.
+    """
+    from flash.cli.env_eval import _case_messages
+
+    _stub_pil(monkeypatch)
+
+    class Environment:
+        package_root = None
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": example["input"]}]
+
+    case = EvalCase(
+        id="row",
+        input="describe it",
+        expected="a cat",
+        metadata={"image": "data:image/png;base64,ZmFrZQ=="},
+    )
+    messages = _case_messages(Environment(), case)
+
+    assert len(messages) == 1
+    text, image = messages[0]["content"]
+    assert text == {"type": "text", "text": "describe it"}
+    assert image == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,ZmFrZQ=="},
+    }
+
+
+def test_env_eval_leaves_a_text_only_prompt_exactly_as_the_environment_built_it() -> None:
+    # the common path must stay byte-identical: no content-block rewrapping for a text suite, or
+    # every existing non-multimodal environment would be graded on a prompt shape it never trained
+    # on. this is the half that must NOT change, so it needs no PIL at all.
+    from flash.cli.env_eval import _case_messages
+
+    class Environment:
+        def prompt_messages(self, example):
+            return [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": example["input"]},
+            ]
+
+    messages = _case_messages(Environment(), EvalCase(id="t", input="2+2", expected="4"))
+
+    assert messages == [
+        {"role": "system", "content": "be terse"},
+        {"role": "user", "content": "2+2"},
+    ]
 
 
 def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path, capsys) -> None:
