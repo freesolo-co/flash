@@ -1172,43 +1172,44 @@ def test_env_test_thinking_reference_is_excluded_from_the_reward_gate(
     assert "cannot rank completions" not in captured.err
 
 
-def test_per_turn_vectors_with_equal_sums_are_not_reported_as_flat():
-    # build_per_turn_advantages centres each turn index against its own group mean, so (1, 0)
-    # against (0, 1) produces nonzero opposing advantages at BOTH turns. reducing the vectors to
-    # one scalar made the sums tie and reported usable per-turn credit as a grader that cannot rank.
+def test_a_control_credited_above_gold_at_one_shared_turn_is_inverted():
+    # a crossing pair. the control is admitted only when it is disjoint from EVERY gold turn, so
+    # there is no turn at which it legitimately scores higher -- and build_per_turn_advantages
+    # centres each index separately, so turn 1 hands the deliberately wrong text a positive
+    # advantage and training reinforces it there. requiring dominance called this "neither is worse"
+    # and let it pass (codex[bot]).
     gold = _Score(episode=1.0, turns=(1.0, 0.0))
     control = _Score(episode=1.0, turns=(0.0, 1.0))
 
+    assert control.outranks(gold, per_turn=True)
+    # separation is a different question and still true: both turns carry nonzero advantage.
     assert gold.separates_from(control, per_turn=True)
     assert control.separates_from(gold, per_turn=True)
-    # neither DOMINATES: worse at one turn and better at another is not "worse" in any direction
-    # the trainer reads, so the inverted finding must not fire either.
-    assert not gold.ranks_below(control, per_turn=True)
-    assert not control.ranks_below(gold, per_turn=True)
 
 
-def test_per_turn_vector_that_dominates_still_ranks():
-    # the ranking direction still has to work: no better anywhere and worse somewhere IS worse.
+def test_a_control_no_better_at_any_shared_turn_is_not_inverted():
+    # the complement: worse at turn 0, tied at turn 1. no turn credits it above gold, so the sign is
+    # right and only the flat gate is left to ask anything.
     gold = _Score(episode=1.0, turns=(1.0, 1.0))
     control = _Score(episode=1.0, turns=(0.0, 1.0))
 
-    assert control.ranks_below(gold, per_turn=True)
-    assert gold.outranks(control, per_turn=True)
+    assert not control.outranks(gold, per_turn=True)
     assert control.separates_from(gold, per_turn=True)
 
 
-def test_a_larger_sum_is_not_a_ranking():
-    # the companion to the equal-sum case, and the one a sum rule gets WRONG rather than ties on:
-    # the control's sum is the larger, but it is worse at turn 0 and better at turn 1, so the group
-    # centring gives it advantages in both directions and it outranks the gold answer at neither.
-    # reading the sums here reports a working grader as inverted.
+def test_the_sum_does_not_decide_either_direction():
+    # a sum rule gets this one wrong in the opposite direction from the crossing case: the control's
+    # sum is far larger, but what makes it inverted is turn 1 specifically, not the total. the
+    # verdict must come from the per-index comparison the trainer performs.
     gold = _Score(episode=1.0, turns=(1.0, 0.0))
     control = _Score(episode=1.0, turns=(0.0, 5.0))
 
     assert sum(control.turns or ()) > sum(gold.turns or ())
-    assert not gold.ranks_below(control, per_turn=True)
-    assert not control.ranks_below(gold, per_turn=True)
-    assert gold.separates_from(control, per_turn=True)
+    assert control.outranks(gold, per_turn=True)
+    # ...and a larger sum built ONLY from turns gold also wins is not inverted at all.
+    tied_high = _Score(episode=1.0, turns=(0.5, 0.0))
+    assert sum(tied_high.turns or ()) < sum(gold.turns or ())
+    assert not tied_high.outranks(gold, per_turn=True)
 
 
 def test_identical_per_turn_vectors_are_still_flat():
@@ -1217,8 +1218,21 @@ def test_identical_per_turn_vectors_are_still_flat():
     control = _Score(episode=1.0, turns=(1.0, 0.0))
 
     assert not gold.separates_from(control, per_turn=True)
-    assert not gold.ranks_below(control, per_turn=True)
-    assert not control.ranks_below(gold, per_turn=True)
+    assert not control.outranks(gold, per_turn=True)
+    assert not gold.outranks(control, per_turn=True)
+
+
+def test_identical_vectors_are_flat_however_far_apart_the_episode_scores_are():
+    # build_per_turn_advantages REPLACES the episode advantages with centred turn rewards, so an
+    # env whose episode scalars differ but whose vectors match trains on exactly zero advantage.
+    # consulting the scalar first reported that as separation (codex[bot]).
+    gold = _Score(episode=1.0, turns=(1.0, 0.0))
+    control = _Score(episode=0.0, turns=(1.0, 0.0))
+
+    assert not gold.separates_from(control, per_turn=True)
+    assert not control.outranks(gold, per_turn=True)
+    # ...and the same pair IS separable in the default mode, where the scalar is what trains.
+    assert gold.separates_from(control, per_turn=False)
 
 
 @pytest.mark.parametrize(
@@ -1241,25 +1255,26 @@ def test_unequal_turn_vectors_are_compared_over_their_overlap(gold, control, sep
     assert gold.separates_from(control, per_turn=True) is separates
 
 
-def test_a_shorter_control_that_is_worse_over_the_overlap_still_ranks_below():
-    # the ranking direction reads the same overlap, so an early-terminating wrong answer that is
-    # worse everywhere it reached is worse -- not incomparable.
+def test_a_shorter_control_that_is_worse_over_the_overlap_is_not_inverted():
+    # the overlap is what the trainer centres, so an early-terminating wrong answer that is worse
+    # everywhere it reached credits itself nowhere -- the sign is right, not incomparable.
     gold = _Score(episode=1.0, turns=(1.0, 1.0))
     control = _Score(episode=1.0, turns=(0.0,))
 
-    assert control.ranks_below(gold, per_turn=True)
-    assert gold.outranks(control, per_turn=True)
+    assert not control.outranks(gold, per_turn=True)
+    assert control.separates_from(gold, per_turn=True)
 
 
-def test_differing_episode_scores_rank_whatever_the_turn_shapes():
-    # the episode scalar alone settles it, so turn shape is irrelevant -- and it settles it in
-    # either credit mode, since the scalar is what per_episode training reads.
+def test_a_missing_vector_falls_back_to_the_episode_scalar():
+    # `_overlap` returns None when either side has no vector, which is also the case where
+    # build_per_turn_advantages falls the whole group back to episode advantages -- so the scalar
+    # is exactly the right thing to read there.
     gold = _Score(episode=1.0, turns=(1.0, 0.0))
-    control = _Score(episode=0.0, turns=None)
+    control = _Score(episode=2.0, turns=None)
 
-    assert control.ranks_below(gold, per_turn=True)
-    assert control.ranks_below(gold, per_turn=False)
-    assert control.separates_from(gold, per_turn=False)
+    assert control.outranks(gold, per_turn=True)
+    assert control.outranks(gold, per_turn=False)
+    assert control.separates_from(gold, per_turn=True)
 
 
 @pytest.mark.parametrize(
@@ -1276,8 +1291,8 @@ def test_per_turn_vectors_are_not_evidence_under_default_credit_assignment(contr
     gold = _Score(episode=1.0, turns=(1.0, 0.0))
 
     assert not control.separates_from(gold, per_turn=False)
-    assert not control.ranks_below(gold, per_turn=False)
-    assert not gold.ranks_below(control, per_turn=False)
+    assert not control.outranks(gold, per_turn=False)
+    assert not gold.outranks(control, per_turn=False)
 
 
 def test_env_test_control_with_a_shorter_turn_vector_is_compared_over_the_overlap(
@@ -1416,6 +1431,51 @@ def test_env_test_control_that_cannot_be_graded_still_fails_grpo(monkeypatch, tm
     assert "overall: FAIL" in captured.err
 
 
+def test_env_test_one_control_without_a_vector_falls_the_group_back_to_the_scalar(
+    monkeypatch, tmp_path, capsys
+):
+    # `build_per_turn_advantages` checks `any(row.turns is None for row in group)` and falls the
+    # WHOLE group back to episode advantages, so a single control with no vector means no member
+    # trains on turn credit. the gate must follow the trainer: read the episode scalars for every
+    # comparison in the group, not just for the pair that is missing a vector.
+    #
+    # here the vectors alone would report an inversion -- gold (1, 0) against a crossing control
+    # (0, 1) -- while the episode scalars agree gold is ahead of both. what actually trains is the
+    # scalar, which ranks correctly, so failing this env would be a false positive built on numbers
+    # the run never reads.
+    env_dir = _environment_dir(tmp_path)
+
+    class _MixedVectorEnv(_MultiTurnEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            rewards = []
+            for index, (example, state) in enumerate(items):
+                gold_turns = {turn["content"] for turn in example["output"]}
+                said = [
+                    message["content"]
+                    for message in state["messages"]
+                    if message.get("role") == "assistant"
+                ]
+                if any(text in gold_turns for text in said):
+                    rewards.append(RolloutReward(episode=1.0, turns=(1.0, 0.0)))
+                elif index % 2:
+                    # one control emits no vector at all, which is what collapses the group.
+                    rewards.append(RolloutReward(episode=0.0, turns=None))
+                else:
+                    rewards.append(RolloutReward(episode=0.0, turns=(0.0, 1.0)))
+            return rewards
+
+    _patch_loader(monkeypatch, _MixedVectorEnv())
+
+    args = _args(env_dir, algorithm="grpo", credit_assignment="per_turn")
+    assert cmd_env_test(args) == 0, capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "reward direction looks inverted" not in captured.err, captured.err
+    # and the scalars do separate, so this is not the flat finding either.
+    assert "cannot rank completions" not in captured.err, captured.err
+
+
 def test_env_test_control_that_cannot_be_graded_still_fails_when_the_algorithm_is_unset(
     monkeypatch, tmp_path, capsys
 ):
@@ -1443,14 +1503,16 @@ def test_env_test_flat_reward_still_warns_for_a_non_reward_algorithm(monkeypatch
     assert [c for c in env.completions if c in _CONTROL_CANDIDATES]
 
 
-def test_env_test_equal_sum_per_turn_vectors_are_not_failed_as_flat(monkeypatch, tmp_path, capsys):
-    # end-to-end companion to the _Score unit tests: a grader whose gold and control vectors have
-    # the same sum but differ positionally ((1, 0) against (0, 1)) does rank under the per-turn
-    # trainer, since each turn index is centred against its own group mean. reducing the vectors to
-    # one scalar made the sums tie and failed a working environment.
+def test_env_test_fails_a_grader_that_credits_a_wrong_answer_at_one_turn(
+    monkeypatch, tmp_path, capsys
+):
+    # end-to-end companion to the crossing-vector unit test. the control matches no gold turn, so
+    # its (0, 1) against gold's (1, 0) is not a tie the sums obscure -- turn 1 gives the wrong text
+    # a positive advantage and training reinforces it there. the equal episode scalar and equal sum
+    # are exactly why the two scalar readings both missed it (codex[bot]).
     env_dir = _environment_dir(tmp_path)
 
-    class _EqualSumPerTurnEnv(_MultiTurnEnv):
+    class _CrossingPerTurnEnv(_MultiTurnEnv):
         def rollout_rewards_many(self, items):
             from flash.envs.base import RolloutReward
 
@@ -1469,12 +1531,16 @@ def test_env_test_equal_sum_per_turn_vectors_are_not_failed_as_flat(monkeypatch,
                 rewards.append(RolloutReward(episode=0.5, turns=turns))
             return rewards
 
-    _patch_loader(monkeypatch, _EqualSumPerTurnEnv())
+    _patch_loader(monkeypatch, _CrossingPerTurnEnv())
 
     args = _args(env_dir, algorithm="grpo", credit_assignment="per_turn")
-    assert cmd_env_test(args) == 0
+    assert cmd_env_test(args) == 1
     captured = capsys.readouterr()
-    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" in captured.out or "overall: FAIL" in captured.err
+    assert "reward direction looks inverted" in captured.err
+    # the warning must quote the vectors it compared: the episode scalars are equal here, so
+    # printing them would read "0.500000 scored higher than 0.500000".
+    assert "gold turns (1.000000, 0.000000)" in captured.err, captured.err
+    assert "wrong answer (0.000000, 1.000000)" in captured.err, captured.err
+    # and not the flat finding: the vectors do differ.
     assert "cannot rank completions" not in captured.err
-    # and not misread as inverted either: neither vector dominates the other.
-    assert "reward direction" not in captured.err
