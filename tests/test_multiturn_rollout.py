@@ -1119,6 +1119,55 @@ def test_rollout_async_runs_every_env_step_on_one_thread():
     assert env.owner != threading.current_thread().name
 
 
+def test_close_out_does_not_hang_when_the_env_worker_dies_unreported():
+    """A worker that dies without answering must end the wait, not stall the training step.
+
+    The close-out is a handshake: the driver queues the request and waits for "closed". The worker
+    reports failures through the same queue, but only for exceptions it CATCHES -- a BaseException
+    unwinds the thread having put nothing. `KeyboardInterrupt` landing in a close-out `env_reply`
+    is the realistic one, and it is exactly the moment a user is trying to stop the run. Waiting on
+    the answer alone then blocks forever on a queue no live thread can fill, so the interrupt never
+    reaches the CLI and the step hangs instead of exiting.
+
+    The timeout is the assertion: without the liveness check this test does not fail, it hangs, so
+    it is run on a separate thread and the wait is bounded here.
+    """
+
+    class _InterruptOnCloseOutEnv(_StatefulBoardEnv):
+        def env_reply(self, messages, state):
+            # the close-out is the 3rd and last call for this episode
+            if self.env_reply_calls >= 2:
+                raise KeyboardInterrupt("interrupted during the close-out step")
+            return super().env_reply(messages, state)
+
+    env = _InterruptOnCloseOutEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    done = threading.Event()
+
+    def _drive() -> None:
+        try:
+            rollout_async(
+                examples=[{}],
+                active_env=env,
+                render=render,
+                submit=submit,
+                poll=poll,
+                busy=busy,
+                abort=lambda ids: None,
+                env_glue=env_glue,
+                max_turns=3,
+                per_turn_max_tokens=8,
+            )
+        except BaseException:
+            pass
+        finally:
+            done.set()
+
+    driver = threading.Thread(target=_drive, daemon=True)
+    driver.start()
+    assert done.wait(timeout=20.0), "close-out wait never returned after the env worker died"
+
+
 def test_token_budget_exhaustion_also_steps_the_env():
     """The token budget is the other driver-side exit that skipped the env step."""
     env = _StatefulBoardEnv()
