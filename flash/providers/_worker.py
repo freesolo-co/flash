@@ -262,7 +262,7 @@ def build_worker_env(
         env.update(weight_cache_env())
     for k in (
         "FLASH_CHALK_SPEC",
-    ):  # install-source override; kernel selection is fixed in chalk_kernels
+    ):  # install-source override only; the kernels themselves are warmed by kernel_warmup
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
