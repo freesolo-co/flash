@@ -41,8 +41,7 @@ def test_sanitizer_recurses_through_lists_and_tuples() -> None:
 def test_sanitizer_redacts_direct_adapter_ref_strings() -> None:
     """Direct strings that parse as storage refs must not escape outside named adapter fields."""
     assert (
-        accounting.sanitize_worker_metrics("owner/repo:rl/run")
-        == accounting._PRIVATE_SOURCE_MARKER
+        accounting.sanitize_worker_metrics("owner/repo:rl/run") == accounting._PRIVATE_SOURCE_MARKER
     )
 
 

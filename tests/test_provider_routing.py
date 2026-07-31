@@ -654,9 +654,7 @@ def test_pinned_gpu_retry_says_there_is_no_untried_class_left(orch, monkeypatch)
     candidates = (Candidate("runpod", "H200", 4.0, 141),)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
-    monkeypatch.setattr(
-        runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True
-    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
 
     submitted_gpus = []
 
