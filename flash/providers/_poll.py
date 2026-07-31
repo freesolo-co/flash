@@ -212,7 +212,7 @@ def _format_child_tail(tail: object, silent_ticks: object = None) -> str:
     """Render a stalled worker's retained child output, or "" when there is none.
 
     ``_format_heartbeat`` renders a fixed whitelist of scalar keys, so ``child_tail`` -- the verl
-    child's last words before it wedged (see ``verl_common.ChildOutputTail``) -- would otherwise be
+    child's last words before it wedged (see ``backend_common.ChildOutputTail``) -- would otherwise be
     carried all the way to the control plane and then dropped one step short of the log a human
     reads. It survives in ``heartbeat.json`` and in the run's ``last_heartbeat``, but a stall is
     diagnosed from the streamed log, so a tail nobody sees costs another paid attempt to learn
