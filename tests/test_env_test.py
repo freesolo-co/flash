@@ -1256,6 +1256,52 @@ def test_env_test_multi_turn_scorer_error_fails_instead_of_scoring_zero(
     assert "overall: FAIL" in captured.err
 
 
+def test_a_never_grading_run_is_not_failed_by_a_scorer_that_refuses_the_gold_rollout(
+    monkeypatch, tmp_path, capsys
+):
+    # the existing exemption dropped the synthetic controls and retried, which only helps a scorer
+    # that chokes on THOSE. one deliberately unavailable for every rollout raised again, the retry
+    # swallowed it, and the original batch failure then failed every episode -- rejecting a valid
+    # sft/opd configuration over a hook that worker never calls (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _NoRolloutScorerEnv(_MultiTurnEnv):
+        """Its rollout scorer is deliberately unavailable: this env is for sft/opd training."""
+
+        def reward(self, completion, example, state=None):
+            raise NotImplementedError("this environment has no rollout reward function")
+
+    _patch_loader(monkeypatch, _NoRolloutScorerEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" not in captured.err
+    # unscored rather than scored zero: no reward was obtained, and none was needed.
+    assert "reward=n/a" in captured.out
+
+
+def test_a_grpo_run_is_still_failed_by_a_scorer_that_refuses_the_gold_rollout(
+    monkeypatch, tmp_path, capsys
+):
+    # the exemption above is scoped to workers that provably never grade. under grpo the same env
+    # aborts on its first rollout, so it must keep failing -- otherwise the fix above would pass an
+    # environment that cannot survive training.
+    env_dir = _environment_dir(tmp_path)
+
+    class _NoRolloutScorerEnv(_MultiTurnEnv):
+        def reward(self, completion, example, state=None):
+            raise NotImplementedError("this environment has no rollout reward function")
+
+    _patch_loader(monkeypatch, _NoRolloutScorerEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "0/1 episodes passed contract checks" in captured.out
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_test_text_free_gold_turn_still_reaches_the_reward_gate(monkeypatch, tmp_path, capsys):
     # a text-free gold turn (a native tool call) carries no text a control could collide with, so it
     # cannot make a control unusable. keeping it in control selection would trip the empty-gold
@@ -2359,6 +2405,58 @@ def test_a_completion_only_message_list_is_aligned_without_skipping_real_turns(
     assert "cannot rank completions" in capsys.readouterr().err
 
 
+def test_an_env_that_keeps_its_turns_outside_messages_still_replays(monkeypatch, tmp_path, capsys):
+    # the observation comparison read `state["messages"]`, which asked the env to mirror the
+    # conversation somewhere this command does not control. an env holding its opening under `prompt`
+    # and its turns in custom state answered an empty list, so an exact replay was marked
+    # partial_replay, its gold was dropped from the control gate, and a flat-zero grader passed
+    # unreported. the driven transcript the loop built is the one production keeps (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _CustomTranscriptEnv(_MultiTurnEnv):
+        """Records its transcript under a key of its own; `messages` stays empty throughout."""
+
+        def new_rollout_state(self, example):
+            prompt = [{"role": "user", "content": example["input"]}]
+            # `prompt` carries the opening and `transcript` records the turns. `messages` is present
+            # and empty, which is what the old comparison read.
+            return {"prompt": prompt, "messages": [], "transcript": [], "done": False, "turn": 0}
+
+        def record_model_turn(self, state, content):
+            message = {"role": "assistant", "content": content}
+            state["transcript"].append(message)
+            return message
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            reply = {"role": "user", "content": "continue"}
+            state["transcript"].append(reply)
+            return [reply]
+
+        def dataset(self):
+            # the reference records the interleaved observation, so there IS something to compare.
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def reward(self, completion, example, state=None):
+            # flat: conclusive, but only reportable once the exact replay is admitted to the gate.
+            return 0.0
+
+    _patch_loader(monkeypatch, _CustomTranscriptEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
 def test_the_prompt_prefix_is_recognized_through_a_regenerated_per_call_key(
     monkeypatch, tmp_path, capsys
 ):
@@ -2961,6 +3059,91 @@ def test_the_graded_text_of_a_thinking_run_has_its_reasoning_removed(monkeypatch
     assert gold_state["thinking"] == "weighing it up"
 
 
+def test_a_thinking_run_gates_a_multi_turn_gold_carrying_reasoning(monkeypatch, tmp_path, capsys):
+    # a multi-turn transcript reaches its scorer whole, so whether markup survives is the ENV's
+    # decision. a Freesolo env routes each recorded turn through `_scored_turn_text`
+    # (flash/envs/adapter.py:427,554), which strips reasoning once `env.thinking` is set -- and the
+    # worker sets it (flash/engine/worker/__init__.py:253-254). this command did not, so the
+    # reference was read as unreproducible, partial_replay skipped the controls, and a flat-zero
+    # grader reported PASS on a thinking run (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _ThinkingMultiTurnEnv(_MultiTurnEnv):
+        """Strips reasoning before scoring, as the Freesolo adapter does, once told the run thinks."""
+
+        def __init__(self):
+            super().__init__()
+            # present and False: what the worker flips, and what this command must flip too.
+            self.thinking = False
+            self.graded: list[str] = []
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "<think>first pass</think>first"},
+                        {"role": "assistant", "content": "<think>second pass</think>second"},
+                    ],
+                }
+            ]
+
+        def record_model_turn(self, state, content):
+            message = {"role": "assistant", "content": content}
+            state["messages"].append(message)
+            if self.thinking:
+                from flash.thinking import strip_think
+
+                state["response_text"] = strip_think(content, prompt_opened_thinking=False)
+            else:
+                state["response_text"] = content
+            return message
+
+        def reward(self, completion, example, state=None):
+            self.graded.append(str(state.get("response_text", "")))
+            return 0.0  # flat at zero: only REPORTED if the replay reached the gate
+
+    env = _ThinkingMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 1
+    captured = capsys.readouterr()
+    assert "cannot rank completions" in captured.err
+    assert "overall: FAIL" in captured.err
+    # the env was told, so it graded the answer alone rather than the raw markup.
+    assert "<think>" not in "".join(env.graded), env.graded
+
+
+def test_a_multi_turn_env_that_cannot_strip_still_excludes_a_reasoning_gold(
+    monkeypatch, tmp_path, capsys
+):
+    # the control for the scope of the fix. a plain env exposes no `thinking` attribute, so nothing
+    # strips the markup and its grader really does see the raw `<think>` text. such a gold turn stays
+    # unreproducible, and admitting it would send a mutilated transcript to the control gate.
+    env_dir = _environment_dir(tmp_path)
+
+    class _PlainThinkingGoldEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "<think>first pass</think>first"},
+                        {"role": "assistant", "content": "<think>second pass</think>second"},
+                    ],
+                }
+            ]
+
+        def reward(self, completion, example, state=None):
+            return 0.0
+
+    _patch_loader(monkeypatch, _PlainThinkingGoldEnv())
+
+    # flat at zero, but excluded from the gate: the replay is not faithful for this env.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 0
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
 def test_a_run_without_thinking_still_grades_the_raw_text_with_no_state(
     monkeypatch, tmp_path, capsys
 ):
@@ -3141,6 +3324,81 @@ def test_a_raising_tools_hook_is_not_a_finding_for_a_run_that_never_builds_the_t
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     assert "env.tools() raised" not in capsys.readouterr().err
+
+
+def test_an_opd_run_is_rejected_for_a_tool_environment(monkeypatch, tmp_path, capsys):
+    # the opd worker refuses a tool env outright before training begins: it drives its own vllm
+    # rollout loop and cannot execute trl's tool-call loop (opd.py:548-555). that refusal has
+    # nothing to do with grading, so the grpo-gated checks beside it all returned early and env test
+    # reported PASS for a run that always aborts during initialization (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _ToolEnv(_SingleTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            return [{"name": "search"}]
+
+    _patch_loader(monkeypatch, _ToolEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="opd")) == 1
+    captured = capsys.readouterr()
+    assert "opd does not support tool-calling environments" in captured.err
+    assert "overall: FAIL" in captured.err
+    # refused before any episode runs, like every other pre-flight refusal here.
+    assert "episode 1:" not in captured.out
+
+
+def test_an_opd_run_is_not_rejected_for_a_non_tool_environment(monkeypatch, tmp_path, capsys):
+    # the control, and the reason the refusal reads is_tool_env rather than the algorithm alone:
+    # opd supports single-turn and pure multi-turn envs, and rejecting those would refuse a
+    # configuration that trains.
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _MultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="opd")) == 0
+    assert "does not support tool-calling" not in capsys.readouterr().err
+
+
+def test_a_tools_hook_returning_an_unsized_value_fails_a_grpo_run(monkeypatch, tmp_path, capsys):
+    # the grpo worker measures the tool list while building the loop -- `len(tools)` at
+    # rl.py:852-854 -- so a truthy value with no len() is a TypeError there. accepting it here
+    # selected native message scoring and could report PASS for a run that always aborts during
+    # initialization (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _UnsizedToolsEnv(_SingleTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            return object()
+
+    _patch_loader(monkeypatch, _UnsizedToolsEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "env.tools() returned object, which has no len()" in captured.err
+    assert "overall: FAIL" in captured.err
+    assert "episode 1:" not in captured.out
+
+
+def test_a_tools_hook_returning_nothing_is_not_measured(monkeypatch, tmp_path, capsys):
+    # the control, asked as the worker asks it: `if is_tool_env and tools` guards the len(), so a
+    # falsy return never reaches it. an env exposing no tools degrades to the rollout_func path and
+    # trains, and failing it on a shape the worker never measures would refuse a working
+    # configuration.
+    env_dir = _environment_dir(tmp_path)
+
+    class _NoToolsEnv(_SingleTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            return []
+
+    _patch_loader(monkeypatch, _NoToolsEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert "has no len()" not in capsys.readouterr().err
 
 
 def test_a_completion_only_transcript_repeating_the_prompt_keeps_its_first_turn(
@@ -3647,6 +3905,8 @@ def test_the_thinking_ambiguity_warning_is_not_raised_for_a_native_tool_run(
 
     assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 0
     assert "no closing </think>" not in capsys.readouterr().err
+
+
 def test_env_test_split_flag_reaches_loader(monkeypatch, tmp_path):
     # the gate must validate the split a run actually trains on; without --split it always
     # loaded the environment's default split and could pass while the configured one was
@@ -3903,9 +4163,7 @@ def test_a_malformed_param_key_spelling_is_rejected(monkeypatch, tmp_path, capsy
 
 
 @pytest.mark.parametrize("value", ["bad key=1", "a/b=1", "a@b=1", "k(x)=1", "café=1", "a😀b=1"])
-def test_env_test_param_keys_a_quoted_config_key_can_carry_still_load(
-    monkeypatch, tmp_path, value
-):
+def test_env_test_param_keys_a_quoted_config_key_can_carry_still_load(monkeypatch, tmp_path, value):
     # these are not BARE keys, but that is not the question -- a QUOTED key carries every one of
     # them and the schema loader reads it, so `"bad key" = 1` and `"café" = 1` are configs a run
     # really can receive. rejecting them blocked validating a working config while the error
