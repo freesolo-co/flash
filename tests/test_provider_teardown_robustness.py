@@ -26,17 +26,24 @@ def test_is_not_found_keys_off_status_code_not_bare_404():
     from flash.providers._http import is_not_found
 
     # genuine 404 (chained HTTPError) -> gone
-    assert is_not_found(_chained(404, "GET /core/virtual-machines/7 -> HTTP 404: Not Found")) is True
+    assert (
+        is_not_found(_chained(404, "GET /core/virtual-machines/7 -> HTTP 404: Not Found")) is True
+    )
     # a 5xx on a VM whose id CONTAINS 404 -> NOT gone (the old bare-substring bug)
     assert is_not_found(_chained(500, "GET /core/virtual-machines/1404 failed: HTTP 500")) is False
     assert is_not_found(_chained(403, "GET /x/404 -> HTTP 403: Forbidden")) is False
     # no chained cause: only an unambiguous "HTTP 404" token counts, never a bare "404"
     assert is_not_found(RuntimeError("GET /x -> HTTP 404: Not Found")) is True
-    assert is_not_found(RuntimeError("GET /core/virtual-machines/1404 failed after 5 attempts")) is False
+    assert (
+        is_not_found(RuntimeError("GET /core/virtual-machines/1404 failed after 5 attempts"))
+        is False
+    )
     # a STATUS-like number that merely begins 404 must NOT match (trailing-\b rejects HTTP 4040/4041)
     assert is_not_found(RuntimeError("GET /x -> HTTP 4040: weird")) is False
     assert is_not_found(RuntimeError("GET /x -> HTTP 4041")) is False
-    assert is_not_found(RuntimeError("GET /x -> HTTP 404")) is True  # trailing token at end-of-string
+    assert (
+        is_not_found(RuntimeError("GET /x -> HTTP 404")) is True
+    )  # trailing token at end-of-string
 
 
 def test_lambda_terminate_is_per_id_isolated(monkeypatch):
@@ -111,8 +118,15 @@ def test_user_data_fails_fast_and_throttles_bootlog():
     from flash.providers._instance import build_user_data
 
     payload = {
-        "hf_repo": "org/repo", "hf_prefix": "sft/x/seed0", "flash_arm": "lambda", "attempt": 0,
-        "job_spec_json": "{}", "phase": "sft", "seed": 0, "max_wall_s": 60, "extra_pip": [],
+        "hf_repo": "org/repo",
+        "hf_prefix": "sft/x/seed0",
+        "flash_arm": "lambda",
+        "attempt": 0,
+        "job_spec_json": "{}",
+        "phase": "sft",
+        "seed": 0,
+        "max_wall_s": 60,
+        "extra_pip": [],
         "env": {"HF_TOKEN": "t"},
     }
     s = build_user_data(payload, image="img:tag")
@@ -141,5 +155,10 @@ def test_instance_realized_cost_is_wall_times_rate():
     assert rc.wall_seconds == 3600.0
     assert rc.by_resource == {"gpu": 1.20}
     # no rate, or no auditable resource id -> unattributable (stays unreconciled, never books cost)
-    assert realized_cost_for_remote({"provider": "lambda", "instance_id": "i-9"}, start=0, end=10) is None
-    assert realized_cost_for_remote({"provider": "lambda", "hourly_usd": 1.0}, start=0, end=10) is None
+    assert (
+        realized_cost_for_remote({"provider": "lambda", "instance_id": "i-9"}, start=0, end=10)
+        is None
+    )
+    assert (
+        realized_cost_for_remote({"provider": "lambda", "hourly_usd": 1.0}, start=0, end=10) is None
+    )

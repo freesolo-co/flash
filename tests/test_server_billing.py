@@ -287,7 +287,7 @@ def api(tmp_path, monkeypatch):
     import flash.server.projects as projects_mod
     import flash.server.run_registry as run_registry
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(
         projects_mod,
         "require_project_access",

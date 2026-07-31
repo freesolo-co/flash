@@ -123,7 +123,9 @@ def test_inspect_adapter_config_rejects_non_mapping_config() -> None:
 
 
 @pytest.mark.parametrize("mode", ["download", "invalid-json", "non-object"])
-def test_load_hf_adapter_config_reports_remote_and_json_failures(tmp_path, monkeypatch, mode) -> None:
+def test_load_hf_adapter_config_reports_remote_and_json_failures(
+    tmp_path, monkeypatch, mode
+) -> None:
     """Adapter config loading must classify download, parse, and top-level shape failures."""
     import huggingface_hub
 

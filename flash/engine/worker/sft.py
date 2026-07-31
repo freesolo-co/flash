@@ -891,7 +891,9 @@ def run_sft():
                 )
             elif _fa_ok:
                 _attn = "flash_attention_2"
-                print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+                print(
+                    "[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)"
+                )
             else:
                 cfg_kwargs["packing"] = False
                 print(
@@ -943,7 +945,9 @@ def run_sft():
             _cmask = [r["completion_mask"] for r in _pretok]
             _packed_rows = pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)
             ds = Dataset.from_list(_packed_rows)
-            _collator = _SFTTokenCountingCollator(BlockDiagonalCollator(pad_token_id=tok.pad_token_id))
+            _collator = _SFTTokenCountingCollator(
+                BlockDiagonalCollator(pad_token_id=tok.pad_token_id)
+            )
             _packed_examples_per_block = len(_ids) / max(1, len(_packed_rows))
             _packing_kind = "sdpa"
         elif (
@@ -1199,7 +1203,9 @@ def run_sft():
                             self._flash_qm_correct_tokens = correct_tokens_mb
                         else:
                             self._flash_qm_entropy_sum = self._flash_qm_entropy_sum + entropy_sum_mb
-                            self._flash_qm_total_tokens = self._flash_qm_total_tokens + total_tokens_mb
+                            self._flash_qm_total_tokens = (
+                                self._flash_qm_total_tokens + total_tokens_mb
+                            )
                             self._flash_qm_correct_tokens = (
                                 self._flash_qm_correct_tokens + correct_tokens_mb
                             )
@@ -1222,7 +1228,9 @@ def run_sft():
                             correct_tokens = self.accelerator.gather_for_metrics(
                                 self._flash_qm_correct_tokens
                             ).sum()
-                            entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
+                            entropy = (
+                                (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
+                            )
                             accuracy = (
                                 (correct_tokens / total_tokens).item() if total_tokens > 0 else 0.0
                             )

@@ -966,7 +966,7 @@ def test_deployments_json_passes_server_rows_through(fake_client, capsys) -> Non
 
 
 def test_deployments_json_empty_list(fake_client, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(fake_client, "deployments", lambda: [])
+    monkeypatch.setattr(fake_client, "deployments", list)
     assert _run(["models", "deployments", "--json"]) == 0
     assert capsys.readouterr().out.strip() == "[]"
 
