@@ -27,6 +27,7 @@ from flash.engine.worker.adapter import (
     require_vllm_for_rollout_func,
     stamp_adapter_provenance,
 )
+from flash.engine.worker.backend_common import collect_ray_failure_logs
 from flash.engine.worker.decoding import (
     graded_text,
     prompt_opens_thinking,
@@ -73,6 +74,7 @@ from flash.engine.worker.hf import (
     prefetch_model,
     publish_deployable_checkpoint,
     publish_opd_optimizer_start_marker,
+    ray_log_artifact_name,
     upload_debug_jsonl,
     upload_resume_checkpoint,
     write_base_model_provenance,
@@ -155,6 +157,10 @@ HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 ATTEMPT = _parse_attempt_env()
+# captured at import, which is before this attempt can have started ray. any ray session older than
+# this belongs to a PREVIOUS attempt on the same reused pod (/tmp survives a retry), and reporting
+# one as this attempt's evidence would send the next diagnosis after a failure that never happened.
+WORKER_START_TIME = time.time()
 JOB_SPEC = load_job_spec_from_env()
 SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
 PHASE = os.environ.get(
@@ -389,6 +395,24 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", sanitize_diagnostic(up_err, limit=500))
+        try:
+            # when a raylet dies, the traceback uploaded above records only the downstream symptom
+            # ("Failed to register worker to Raylet: ... End of file"); the reason is in ray's
+            # session logs, which live on the pod and vanish with it. that makes a raylet failure
+            # undiagnosable from artifacts and costs a paid gpu run per guess (VERL-115). runs for
+            # every mode: all three backends start ray, and this is empty when the failure had
+            # nothing to do with it.
+            ray_logs = collect_ray_failure_logs(started_after=WORKER_START_TIME)
+            if ray_logs:
+                ray_name = ray_log_artifact_name(RUN_MODE, ATTEMPT)
+                ray_path = f"/tmp/{ray_name}"
+                with open(ray_path, "w") as f:
+                    f.write(ray_logs)
+                hf_upload_file(ray_path, ray_name)
+        except Exception as ray_err:
+            # this is the failure path already. a collector that could raise here would replace the
+            # run's real error with its own.
+            print("ray-log-collect warn:", sanitize_diagnostic(ray_err, limit=500))
         # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Infra failures
         # keep same-size retry semantics and must never be reclassified as OOM.
         hb_flags = _worker_failure_flags(e)
@@ -517,6 +541,7 @@ __all__ = [
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
     "publish_opd_optimizer_start_marker",
+    "ray_log_artifact_name",
     "render_prompt",
     "require_active_env",
     "require_vllm_for_rollout_func",
