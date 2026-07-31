@@ -64,7 +64,7 @@ def _status(**kw) -> runner.RunStatus:
 
 def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
     now = 1_000_000.0
-    settled = now - 7200  # 2h ago (past the 1h settle delay, within the 7d window)
+    settled = now - 7200  # 2h ago (past the 1h RunPod settle delay)
     handle = {"provider": "runpod", "endpoint_id": "ep-1"}
 
     assert reconcile._due(_status(state="done", updated_at=settled, remote=handle), now)
@@ -74,42 +74,75 @@ def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
     assert not reconcile._due(_status(state="running", updated_at=settled, remote=handle), now)
     # dry_run spent no GPU
     assert not reconcile._due(_status(state="dry_run", updated_at=settled, remote=handle), now)
-    # too fresh (billing hasn't settled)
+    # too fresh (RunPod billing hasn't settled)
     assert not reconcile._due(_status(state="done", updated_at=now - 60, remote=handle), now)
-    # too old (aged out of the window)
-    assert not reconcile._due(_status(state="done", updated_at=now - 8 * 86400, remote=handle), now)
+    # OLD runs stay due: there is no time window. A run missed while the control plane was down
+    # must still reconcile whenever a plane next comes up, not age out and lose the data point.
+    assert reconcile._due(_status(state="done", updated_at=now - 8 * 86400, remote=handle), now)
+    assert reconcile._due(_status(state="done", updated_at=now - 90 * 86400, remote=handle), now)
     # already reconciled
     assert not reconcile._due(
         _status(state="done", updated_at=settled, remote=handle, reconciled_at=now - 1), now
+    )
+    # explicitly given up on -> terminal for reconciliation, never retried again
+    assert not reconcile._due(
+        _status(state="done", updated_at=settled, remote=handle, reconcile_state="unattributable"),
+        now,
+    )
+    # attempt budget exhausted -> stops being swept even if not yet marked
+    assert not reconcile._due(
+        _status(
+            state="done",
+            updated_at=settled,
+            remote=handle,
+            reconcile_attempts=reconcile._MAX_RECONCILE_ATTEMPTS,
+        ),
+        now,
     )
     # no provider handle to attribute cost
     assert not reconcile._due(_status(state="done", updated_at=settled, remote=None), now)
 
 
-def test_due_anchors_settle_and_window_to_finished_at_not_bumped_updated_at():
-    """_due bases the settle delay and the 7-day window on the frozen finished_at (teardown), not
-    the mutable updated_at that deploy / late heartbeat move past teardown. So a run finished long
-    enough ago is due even if updated_at was just bumped, and one finished outside the window is
-    NOT resurrected by a recent bump."""
+def test_due_anchors_settle_to_finished_at_not_bumped_updated_at():
+    """_due bases the settle delay on the frozen finished_at (teardown), not the mutable updated_at
+    that deploy / late heartbeat move past teardown."""
     now = 1_000_000.0
-    handle = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29}
+    # RunPod: the only provider with a settle delay (its invoice lags teardown).
+    handle = {"provider": "runpod", "endpoint_id": "ep-1"}
 
-    # deployed run: updated_at bumped to the deploy time 1 min ago (would look "too fresh" under
-    # the old rule), but it finished training 2h ago -> past the settle delay -> DUE.
+    # deployed run: updated_at bumped to the deploy time 1 min ago (would look "too fresh" if we
+    # anchored on updated_at), but it finished training 2h ago -> past the settle delay -> DUE.
     assert reconcile._due(
         _status(state="deployed", updated_at=now - 60, finished_at=now - 7200, remote=handle), now
-    )
-    # finished 8 days ago but bumped 1 day ago: old rule (updated_at) would reconcile it; the
-    # window must bound by finish time -> NOT due.
-    assert not reconcile._due(
-        _status(state="done", updated_at=now - 86400, finished_at=now - 8 * 86400, remote=handle),
-        now,
     )
     # finished only 1 min ago -> still within the settle delay -> NOT due (even if updated_at is
     # older from some earlier write).
     assert not reconcile._due(
         _status(state="done", updated_at=now - 7200, finished_at=now - 60, remote=handle), now
     )
+
+
+def test_instance_providers_settle_instantly_runpod_waits():
+    """Lambda/Vast bill a flat $/hr against a lease whose rate and launch are already on the handle,
+    so realized cost is exact at teardown -- no settle delay. That is what lets the completion path
+    report them inline. RunPod's invoice lags, so it keeps the 1h delay."""
+    now = 1_000_000.0
+    just_finished = now - 5  # 5s ago
+
+    for provider, handle in (
+        ("vast", {"provider": "vast", "instance_id": 1, "hourly_usd": 0.6}),
+        ("lambda", {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29}),
+    ):
+        assert reconcile._settle_seconds(_status(remote=handle)) == 0.0, provider
+        assert reconcile._due(
+            _status(state="done", updated_at=just_finished, remote=handle), now
+        ), provider
+
+    runpod = {"provider": "runpod", "endpoint_id": "ep-1"}
+    assert reconcile._settle_seconds(_status(remote=runpod)) == reconcile._RUNPOD_SETTLE_SECONDS
+    assert not reconcile._due(_status(state="done", updated_at=just_finished, remote=runpod), now)
+    # unknown/missing provider falls back to the conservative RunPod delay
+    assert reconcile._settle_seconds(_status(remote={})) == reconcile._RUNPOD_SETTLE_SECONDS
 
 
 def test_reconcile_run_reports_and_persists(monkeypatch):
@@ -154,7 +187,10 @@ def test_instance_realized_cost_bills_launch_to_run_end_not_padded_end():
     (used only for RunPod's invoice query) must NOT inflate their wall."""
     remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 2.0, "started_ts": 1000.0}
     rc = realized.realized_cost_for_remote(
-        remote, start=1000.0, end=1_000_000.0, run_end=4600.0  # 1h of wall, end padded way past
+        remote,
+        start=1000.0,
+        end=1_000_000.0,
+        run_end=4600.0,  # 1h of wall, end padded way past
     )
     assert rc is not None
     assert rc.provider == "lambda"
@@ -183,7 +219,10 @@ def test_reconcile_run_falls_back_to_created_at_when_started_ts_missing_or_zero(
         if started is not None:
             remote["started_ts"] = started
         status = _status(
-            run_id="r-leg", created_at=created, updated_at=now - 7200, finished_at=now - 7200,
+            run_id="r-leg",
+            created_at=created,
+            updated_at=now - 7200,
+            finished_at=now - 7200,
             remote=remote,
         )
         assert reconcile.reconcile_run(status, now=now) is True
@@ -240,7 +279,12 @@ def test_reconcile_falls_back_to_updated_at_when_no_finished_at(monkeypatch):
         state="done",
         updated_at=now - 7200.0,
         finished_at=None,
-        remote={"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29, "started_ts": now - 9000},
+        remote={
+            "provider": "lambda",
+            "instance_id": "i-1",
+            "hourly_usd": 1.29,
+            "started_ts": now - 9000,
+        },
     )
     assert reconcile.reconcile_run(status, now=now) is True
     assert captured["run_end"] == now - 7200.0
@@ -267,6 +311,55 @@ def test_reconcile_run_skips_zero_and_unreported(monkeypatch):
     )
     monkeypatch.setattr(reconcile, "_report", lambda body: False)
     assert reconcile.reconcile_run(status, now=now) is False
+
+
+def test_failed_attempts_are_recorded_and_eventually_marked_unattributable(monkeypatch):
+    """A failed pull must be RECORDED, not silently skipped -- that record is what keeps the run in
+    the queue -- and after _MAX_RECONCILE_ATTEMPTS it is marked `unattributable` so the sweep stops
+    retrying forever and the gap becomes visible."""
+    now = 1_000_000.0
+    status = _status(updated_at=now - 7200, remote={"provider": "runpod", "endpoint_id": "e"})
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        runner,
+        "record_reconcile_attempt",
+        lambda run_id, *, error, unattributable: calls.append(
+            {"run_id": run_id, "error": error, "unattributable": unattributable}
+        ),
+    )
+    monkeypatch.setattr(reconcile, "_report", lambda body: True)
+
+    # provider returned no cost yet -> recorded as a retryable attempt, NOT given up on
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda remote, **kw: realized.RealizedCost(provider="runpod", realized_usd=0.0),
+    )
+    assert reconcile.reconcile_run(status, now=now) is False
+    assert calls[-1]["unattributable"] is False
+    assert "unsettled" in calls[-1]["error"]
+
+    # the provider billing API itself raised -> still recorded (never escapes as an exception)
+    def boom(remote, **kw):
+        raise RuntimeError("billing api down")
+
+    monkeypatch.setattr(reconcile, "realized_cost_for_remote", boom)
+    assert reconcile.reconcile_run(status, now=now) is False
+    assert "RuntimeError" in calls[-1]["error"]
+
+    # on the LAST allowed attempt the run is marked unattributable so it stops being retried
+    last = _status(
+        updated_at=now - 7200,
+        remote={"provider": "runpod", "endpoint_id": "e"},
+        reconcile_attempts=reconcile._MAX_RECONCILE_ATTEMPTS - 1,
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda remote, **kw: realized.RealizedCost(provider="runpod", realized_usd=0.0),
+    )
+    assert reconcile.reconcile_run(last, now=now) is False
+    assert calls[-1]["unattributable"] is True
 
 
 def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, monkeypatch):
@@ -354,7 +447,9 @@ def test_reconcile_once_sweeps_due_runs(monkeypatch):
     not_due = _status(
         run_id="fresh", updated_at=now - 60, remote={"provider": "runpod", "endpoint_id": "e"}
     )
-    monkeypatch.setattr(runner, "list_runs", lambda: [due, not_due])
+    by_id = {"due": due, "fresh": not_due}
+    monkeypatch.setattr(runner, "list_run_ids", lambda: ["due", "fresh"])
+    monkeypatch.setattr(runner, "get_status", lambda run_id: by_id[run_id])
     seen: list[str] = []
 
     def fake_reconcile_run(status, *, now):
@@ -364,6 +459,51 @@ def test_reconcile_once_sweeps_due_runs(monkeypatch):
     monkeypatch.setattr(reconcile, "reconcile_run", fake_reconcile_run)
     assert reconcile.reconcile_once(now=now) == 1
     assert seen == ["due"]
+
+
+def test_reconcile_once_skips_one_corrupt_record_and_keeps_sweeping(monkeypatch):
+    """One unreadable/legacy status file must not abort the sweep for every OTHER run. The old
+    list_runs() parsed every record up front, so a single bad file blocked reconciliation entirely."""
+    now = 1_000_000.0
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "k")
+    good = _status(
+        run_id="good", updated_at=now - 7200, remote={"provider": "runpod", "endpoint_id": "e"}
+    )
+
+    def fake_get_status(run_id):
+        if run_id == "corrupt":
+            raise TypeError("unreadable legacy status record")
+        return good
+
+    monkeypatch.setattr(runner, "list_run_ids", lambda: ["corrupt", "good"])
+    monkeypatch.setattr(runner, "get_status", fake_get_status)
+    monkeypatch.setattr(reconcile, "reconcile_run", lambda status, *, now: True)
+    assert reconcile.reconcile_once(now=now) == 1
+
+
+def test_reconcile_once_stops_between_runs_when_asked(monkeypatch):
+    """Cooperative cancel: the sweep runs in a thread task.cancel() cannot interrupt, so at shutdown
+    a stop flag must halt it BETWEEN runs rather than working through the whole backlog."""
+    now = 1_000_000.0
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "k")
+    seen: list[str] = []
+    monkeypatch.setattr(runner, "list_run_ids", lambda: ["a", "b", "c"])
+    monkeypatch.setattr(
+        runner,
+        "get_status",
+        lambda run_id: _status(
+            run_id=run_id, updated_at=now - 7200, remote={"provider": "runpod", "endpoint_id": "e"}
+        ),
+    )
+
+    def fake_reconcile_run(status, *, now):
+        seen.append(status.run_id)
+        return True
+
+    monkeypatch.setattr(reconcile, "reconcile_run", fake_reconcile_run)
+    # stop after the first run has been processed
+    assert reconcile.reconcile_once(now=now, should_stop=lambda: len(seen) >= 1) == 1
+    assert seen == ["a"]
 
 
 # ----------------------------------------------------------- _reconcile_cost_loop cancel/error

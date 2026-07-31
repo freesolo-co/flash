@@ -24,11 +24,43 @@ _log = logging.getLogger("flash.server")
 _RECOVERABLE = {"queued", "provisioning", "running"}
 
 
+async def _reconcile_cost_startup() -> None:
+    """Run ONE realized-cost sweep off the startup critical path.
+
+    This is what makes reconciliation survive restarts. The periodic loop sleeps a full interval
+    before its first sweep, so a control plane that restarts more often than the interval -- or that
+    is only up briefly after a run finishes -- used to sweep NOTHING, ever, and the run then aged out
+    of the old 7-day window and lost its estimate/actual pair permanently. Sweeping at startup means
+    every queued run gets picked up as soon as a plane is running, however briefly.
+
+    Scheduled as a background task (not awaited before `yield`) for the same reason as
+    _charge_retry_startup: with a backlog of queued runs and a slow provider billing API, each pull
+    can wait the full timeout, so awaiting it inline would delay accepting traffic."""
+    from flash.server.reconcile import reconcile_once
+
+    stop = threading.Event()
+    try:
+        reported = await asyncio.to_thread(reconcile_once, should_stop=stop.is_set)
+        if reported:
+            _log.info("reconciled realized cost for %d run(s) at startup", reported)
+    except asyncio.CancelledError:
+        # task.cancel() only cancels the await, not the worker thread; signal it to stop between
+        # runs so a backlog of slow provider pulls can't keep the thread alive past shutdown.
+        stop.set()
+        raise  # shutdown during the startup sweep: let the lifespan's task.cancel() propagate
+    except Exception:
+        _log.debug("startup realized-cost sweep failed; periodic loop will retry", exc_info=True)
+
+
 async def _reconcile_cost_loop() -> None:
     """Background loop: periodically pull realized provider cost (COGS) for finished runs and
     report it to the freesolo backend for estimator accuracy. The provider billing calls are
     blocking urllib, so each sweep is offloaded to a thread; failures are swallowed and retried
-    next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled)."""
+    next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled).
+
+    The interval IS the bounded backoff for a run whose provider invoice has not settled yet; the
+    prompt first pass is _reconcile_cost_startup, so this loop's leading sleep no longer delays the
+    first sweep of a freshly started plane."""
     from flash.server.reconcile import reconcile_once
 
     interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
@@ -40,11 +72,13 @@ async def _reconcile_cost_loop() -> None:
         # already derives from BaseException, so the old `contextlib.suppress(Exception)` did not
         # swallow a shutdown cancel arriving during the blocking sweep — but being explicit makes the
         # cancel path obvious and uniform, and logs a failed sweep instead of silently dropping it.
+        stop = threading.Event()
         try:
-            reported = await asyncio.to_thread(reconcile_once)
+            reported = await asyncio.to_thread(reconcile_once, should_stop=stop.is_set)
             if reported:
                 _log.info("reconciled realized cost for %d run(s)", reported)
         except asyncio.CancelledError:
+            stop.set()  # signal the worker thread to stop between runs (see _reconcile_cost_startup)
             raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
         except Exception:
             _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)

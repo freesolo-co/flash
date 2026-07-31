@@ -402,6 +402,19 @@ class RunStatus:
     # isn't re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
+    # Reconciliation state machine, mirroring ``billing_state``. A realized pull is OWED for every
+    # billable terminal run, so "not yet reconciled" must be a durable, inspectable state rather than
+    # the absence of one -- the old time-window sweep silently turned "owed" into "never" once a run
+    # aged out, losing the estimate/actual pair for good.
+    #   None/"pending"    -- still owed a realized pull (the work queue)
+    #   "reconciled"      -- a positive provider cost was recorded (``reconciled_at`` is stamped)
+    #   "unattributable"  -- gave up after _MAX_RECONCILE_ATTEMPTS; the provider never returned a
+    #                        cost for this run (endpoint purged, invoice never settled). Terminal:
+    #                        the sweep stops retrying, and the run is counted as a known gap rather
+    #                        than an invisible one.
+    reconcile_state: str | None = None
+    reconcile_attempts: int = 0
+    reconcile_error: str | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deploy/reconcile.
     finished_at: float | None = None
     billing_context: dict | None = None
@@ -1870,6 +1883,30 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
             return
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
+        status.reconcile_state = "reconciled"
+        status.reconcile_error = None
+        status.updated_at = time.time()
+        _save_status_unlocked(status)
+    _report_status(status)
+
+
+def record_reconcile_attempt(run_id: str, *, error: str | None, unattributable: bool) -> None:
+    """Persist a FAILED realized-cost attempt: bump the attempt counter and record why.
+
+    Same COST-FIELDS-ONLY discipline as ``record_realized_cost`` -- re-reads under the guard and never
+    writes ``state``, so a run that advanced since the sweep's snapshot (e.g. to ``deployed``) is not
+    reverted. ``unattributable`` marks the run TERMINAL for reconciliation so the sweep stops retrying
+    it forever; the run then surfaces as a KNOWN gap instead of silently pending."""
+    with _status_guard(run_id):
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        if status.reconcile_state == "reconciled":
+            return  # a concurrent success won; never downgrade it
+        status.reconcile_attempts = int(status.reconcile_attempts or 0) + 1
+        status.reconcile_error = error
+        status.reconcile_state = "unattributable" if unattributable else "pending"
         status.updated_at = time.time()
         _save_status_unlocked(status)
     _report_status(status)
