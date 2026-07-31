@@ -635,19 +635,16 @@ def cmd_env_eval(args) -> int:
         # deployed one. Forwarding the shorthand therefore graded weights the report could not
         # name, and a later rebuild of the same step would read as the same measurement
         # (codex[bot]). Pin here so generation and the uploaded report carry the immutable value.
-        if want_step is not None and resolved[1] != want_step:
-            # the requested step may still be verified and servable, but nothing the CLI can read
-            # says WHICH revision at that step would answer -- `deployments` reports the live
-            # record only. Grading under a name that cannot be resolved is the defect itself, so
-            # refuse and point at the one surface that gives an unambiguous target.
-            serving = f"step {resolved[1]}" if resolved[1] is not None else "its final adapter"
-            _err(
-                f"env eval failed: run {run_id} is deployed at {serving}, not step {want_step}; "
-                "pass the full immutable adapter revision from `flash models deployments`"
-            )
-            return _err("overall: FAIL")
-        evaluation_target = candidate.strip()
-        print(f"resolved evaluation target {args.target} to {evaluation_target}")
+        # Only when the live deployment IS the requested step can the CLI name the revision that
+        # will answer. Otherwise the shorthand stays: a run keeps its earlier verified revisions
+        # after a newer step is deployed, and the chat route serves them -- asked for step-3 while
+        # step-20 is live, the server resolves the ledger's single step-3 entry and answers 200.
+        # Refusing would fail an evaluation the server runs correctly, so let the server resolve it;
+        # it reads the verified ledger this CLI cannot see, and answers a genuinely ambiguous step
+        # with a 409 naming the surface to use instead.
+        if want_step is None or resolved[1] == want_step:
+            evaluation_target = candidate.strip()
+            print(f"resolved evaluation target {args.target} to {evaluation_target}")
 
     # graders must see what training graded, so the run's own `thinking` decides whether the
     # reasoning is stripped first (see `_scored_response`). read once here rather than per case:
