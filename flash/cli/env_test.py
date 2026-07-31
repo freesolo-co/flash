@@ -566,7 +566,7 @@ def _new_record() -> dict:
     }
 
 
-def _drive_single_turn(env, example: dict, record: dict) -> None:
+def _drive_single_turn(env, example: dict, record: dict, *, thinking: bool = False) -> None:
     prompt = _check_messages(env.prompt_messages(example), "prompt")
     record["prompt"] = prompt
     # single-turn drives one assistant reply and never checks observations, so the snapshot the
@@ -594,7 +594,9 @@ def _drive_single_turn(env, example: dict, record: dict) -> None:
     # against. the earlier assistant turns are already excluded from the gate via partial_replay.
     record["reference_turns"] = [response] if policy == "replay" else []
     record["turns"] = 1
-    record["reward"] = _Score(episode=_grade_single_turn(env, response, example))
+    record["reward"] = _Score(
+        episode=_grade_single_turn(env, response, example, thinking=thinking)
+    )
 
 
 def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], list[dict]]:
@@ -726,17 +728,67 @@ def _synthetic_controls(references: list[str]) -> list[str]:
     return controls
 
 
-def _grade_single_turn(env, completion: str, example: dict) -> float:
+class _InvalidReward(Exception):
+    """A scorer returned something the worker would hand to trl as-is, aborting the run."""
+
+
+def _scoring_inputs(completion: str, *, thinking: bool) -> tuple[str, dict | None]:
+    """The graded text and reward ``state`` the single-turn worker would build for this completion.
+
+    With thinking enabled the worker grades the answer with its reasoning span removed and passes a
+    dict of ``raw``/``completion``/``thinking`` alongside it (`flash/engine/worker/rl.py:444-461`);
+    with it disabled the raw text is graded and the state is None. Passing None either way graded the
+    unprocessed text through a contract the run does not use, so a scorer reading its state could
+    separate answers here and return a constant in production, or rank correctly in production and
+    look flat here -- either way the verdict was about a scorer the run never calls (codex[bot]).
+
+    ``prompt_opened_thinking`` is False because it is a property of the rendered prompt, which needs
+    the model's tokenizer and chat template: not available offline, and not meaningful for text this
+    command replays from the dataset rather than generates. It only changes the reading of a
+    completion carrying <think> tags, which a gold reference and a synthetic control do not.
+    """
+    if not thinking:
+        return completion, None
+    from flash.engine.worker.decoding import strip_think, thinking_text
+
+    return (
+        strip_think(completion, prompt_opened_thinking=False),
+        {
+            "raw": completion,
+            "completion": strip_think(completion, prompt_opened_thinking=False),
+            "thinking": thinking_text(completion, prompt_opened_thinking=False),
+        },
+    )
+
+
+def _grade_single_turn(env, completion: str, example: dict, *, thinking: bool = False) -> float:
     """Score one single-turn completion through the same dispatch the GRPO worker uses.
 
     ``flash/engine/worker/rl.py`` prefers ``scores_breakdown(...)["total"]`` and only falls back to
     ``reward()``. An environment whose real composite grader lives in ``scores_breakdown`` while
     ``reward`` is inherited or a placeholder would otherwise be judged here on a scorer training
     never calls -- failing a working environment, or passing a broken one (codex[bot]).
+
+    The two branches treat a non-numeric return differently because the worker does. It coerces the
+    breakdown total inside its own guard, so a bad total there really is scored 0.0 and carries on;
+    it does NOT coerce ``reward()``, so that value is appended to the reward list as returned and
+    reaches trl, which aborts the run. Mirroring only the first would let an exact-match grader
+    returning 1.0 for gold and an accidental string for everything else pass this command and then
+    break the first sampled completion (codex[bot]).
     """
+    graded, state = _scoring_inputs(completion, thinking=thinking)
     if hasattr(env, "scores_breakdown"):
-        return float(env.scores_breakdown(completion, example, None).get("total", 0.0))
-    return float(env.reward(completion, example, None))
+        return float(env.scores_breakdown(graded, example, state).get("total", 0.0))
+    reward = env.reward(graded, example, state)
+    try:
+        # not an isinstance test: a numpy scalar or a Decimal is not a float and converts fine, and
+        # trl takes it. what matters is whether the value the worker forwards IS a number.
+        return float(reward)
+    except (TypeError, ValueError) as exc:
+        raise _InvalidReward(
+            f"reward() returned {type(reward).__name__} ({reward!r}), which is not a number; "
+            "the worker forwards this value to trl uncoerced and the run aborts"
+        ) from exc
 
 
 def _emitted_turns(responses: list[str]) -> tuple[bool, ...]:
@@ -787,13 +839,19 @@ def _grade_rollouts(env, rollouts: list[tuple[dict, dict, list[str]]]) -> list[_
     ]
 
 
-def _score_single_turn_control(env, example: dict, control: str) -> _Score | None:
+def _score_single_turn_control(
+    env, example: dict, control: str, *, thinking: bool = False
+) -> _Score | None:
     """Score one deliberately wrong single-turn answer the way training would score it.
 
     For single-turn GRPO a grader that raises is not inconclusive: ``reward_fn`` catches exactly
     that and scores the completion 0.0 (flash/engine/worker/rl.py), so training would see a real
     number. Record that same 0.0, otherwise a row that genuinely separates gold from wrong is
     dropped and a later tied row can fail the whole sample alone.
+
+    A non-numeric RETURN is not that case and is not caught here. The worker's guard covers the env
+    CALL raising; the value it returns is forwarded to trl without coercion, so scoring it 0.0 here
+    would report a run-aborting contract violation as a well-behaved control (codex[bot]).
 
     ``SystemExit`` still propagates. ``reward_fn`` catches only ``Exception``, so a grader that
     exits on an unexpected completion kills training rather than scoring it zero -- and the gold
@@ -807,7 +865,9 @@ def _score_single_turn_control(env, example: dict, control: str) -> _Score | Non
     (codex[bot]).
     """
     try:
-        score = _Score(episode=_grade_single_turn(env, control, example))
+        score = _Score(episode=_grade_single_turn(env, control, example, thinking=thinking))
+    except _InvalidReward:
+        raise
     except Exception:
         # mirrors reward_fn's own except branch: the run would score this 0.0 and carry on.
         score = _Score(episode=0.0)
@@ -927,7 +987,9 @@ def _score_multi_turn_rollouts(env, records: list[dict]) -> None:
         record["unscorable_controls"] = [score for score in graded if not score.is_finite()]
 
 
-def _prepare_controls(env, example: dict, record: dict) -> list[_Score] | None:
+def _prepare_controls(
+    env, example: dict, record: dict, *, thinking: bool = False
+) -> list[_Score] | None:
     """Prepare this episode's deliberately wrong answers, or None when none is provably wrong.
 
     Single-turn scores them here and returns the scores. Multi-turn only DRIVES them, parking the
@@ -945,7 +1007,10 @@ def _prepare_controls(env, example: dict, record: dict) -> list[_Score] | None:
     if not env.multi_turn:
         # an unscorable control is dropped, exactly as on the multi-turn path: it earns no
         # advantage, so it is evidence of neither ranking nor flatness.
-        scored = [_score_single_turn_control(env, example, control) for control in controls]
+        scored = [
+            _score_single_turn_control(env, example, control, thinking=thinking)
+            for control in controls
+        ]
         return [score for score in scored if score is not None]
     record["control_rollouts"] = _drive_multi_turn_controls(env, example, controls)
     return None
@@ -1006,6 +1071,46 @@ def _reads_per_turn_rewards(args) -> bool:
     return str(mode).strip().lower() == PER_TURN_CREDIT_ASSIGNMENT
 
 
+def _per_turn_rejection(env, *, per_turn: bool) -> str | None:
+    """Why this run's credit assignment cannot start, in the worker's own words, or None.
+
+    A native tool env exposing tools is driven through trl's tool loop rather than a rollout_func
+    (`flash/engine/worker/rl.py:814-827`), and `select_grpo_trainer` refuses per-turn credit on that
+    path. Reporting the per-turn reward vectors as evidence would pass an environment for a run that
+    raises before its first step (codex[bot]).
+
+    The worker's own selector answers this, so the two cannot drift: the refusal it raises IS the
+    finding. Its supported per-turn branch imports the trainer (and torch with it), but that branch
+    is unreachable here -- this asks only about the combination that raises.
+    """
+    if not per_turn:
+        return None
+    if not (getattr(env, "is_tool_env", False) and getattr(env, "multi_turn", False)):
+        return None
+    # a tool env exposing no tools degrades to the rollout_func path, which supports per-turn credit
+    # -- the same condition the worker checks, not merely the is_tool_env flag.
+    try:
+        tools = env.tools()
+    except Exception:
+        # the worker calls this unguarded, so a raise here is a load failure of its own rather than
+        # a credit-assignment verdict. leave it to the episode driver to surface.
+        return None
+    if not tools:
+        return None
+    from flash.engine.worker.rl import select_grpo_trainer
+
+    try:
+        select_grpo_trainer(
+            object,
+            credit_assignment=PER_TURN_CREDIT_ASSIGNMENT,
+            is_multi_turn=True,
+            use_rollout_func=False,
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    return None
+
+
 def cmd_env_test(args) -> int:
     """Load a local environment and drive deterministic offline contract checks.
 
@@ -1020,6 +1125,9 @@ def cmd_env_test(args) -> int:
     # ValueError, which main() renders as an ordinary `error:` line.
     grades = _grades_completions(args)
     per_turn = _reads_per_turn_rewards(args)
+    # the run's thinking mode decides what the scorer is handed, so it has to be settled before any
+    # grading happens (see _scoring_inputs).
+    thinking = bool(getattr(args, "thinking", False))
 
     try:
         _, _, entrypoint, _ = _resolve_local_env_entrypoint(Path(args.path))
@@ -1042,6 +1150,13 @@ def cmd_env_test(args) -> int:
     if not dataset:
         return _load_failure("dataset is empty")
 
+    # before any episode runs: this combination cannot reach a first training step, so there is no
+    # reward evidence worth gathering for it, and reporting PASS would be a claim about a trainer
+    # path the run never selects.
+    rejection = _per_turn_rejection(env, per_turn=per_turn)
+    if rejection:
+        return _load_failure(rejection)
+
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0
     controlled = 0
@@ -1062,7 +1177,7 @@ def cmd_env_test(args) -> int:
             if env.multi_turn:
                 _drive_multi_turn(env, example, record)
             else:
-                _drive_single_turn(env, example, record)
+                _drive_single_turn(env, example, record, thinking=thinking)
             reward = record["reward"]
             # multi-turn gold is graded below, batched with its controls, so there is nothing to
             # check yet there. single-turn gold already has its score, and failing it here keeps a
@@ -1075,7 +1190,7 @@ def cmd_env_test(args) -> int:
                 # completions below it. what makes a grader unusable for RL is that it cannot
                 # SEPARATE a good completion from a bad one, so score wrong answers and compare.
                 try:
-                    controls = _prepare_controls(env, example, record)
+                    controls = _prepare_controls(env, example, record, thinking=thinking)
                 except (Exception, SystemExit) as exc:
                     # a control that cannot be graded is a real defect wherever the scorer is
                     # actually called, and an unknown algorithm is not grounds to assume it is not
