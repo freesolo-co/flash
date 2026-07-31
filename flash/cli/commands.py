@@ -420,8 +420,60 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     state = str(status.get("state") or fallback_state or "unknown")
     parts = [state]
     heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
+    # a preemption relaunches the run on fresh hardware from step 0 while `state` stays "running",
+    # so the step counter silently rewinds and the earlier progress is gone. the attempt counter is
+    # the one field that distinguishes that from normal progress, so show it once the run is past
+    # its first attempt rather than leaving a rewind unexplained. attempts are 0-based
+    # (flash/providers/runpod/jobs.py stamps no retry suffix on attempt 0), so any nonzero value is
+    # already a relaunch.
+    #
+    # resolved OUTSIDE the heartbeat block. an attempt preempted before it published its first ping
+    # leaves `last_heartbeat` None while `remote.attempt` has already advanced, and nesting this
+    # under the heartbeat printed a bare `running` for the whole cold start -- silent through
+    # exactly the relaunch this line exists to explain (codex[bot]).
+    #
+    # prefer the live attempt from `remote` over the heartbeat's: during the relaunch window
+    # `remote.attempt` has already advanced while `last_heartbeat` is still the superseded worker's
+    # ping, so reading the heartbeat leaves the first preemption unlabelled (stale attempt 0) and
+    # names the *previous* attempt on later ones. `remote` is absent on planes that do not surface
+    # it, hence the heartbeat fallback.
+    #
+    # ...but the fallback is only for an ABSENT `remote`, not a null one. a supervised retry clears
+    # `remote` before reserving the replacement attempt and does not persist the new one until the
+    # provider handle lands, so for that whole allocation window flash publishes `remote: null` with
+    # the superseded worker's ping still attached. falling back there reintroduced exactly what
+    # preferring `remote` was meant to fix: the first retry unlabelled, later ones naming the
+    # previous attempt (codex[bot]).
+    #
+    # an explicit null is unambiguous, which is why this can key on it: `on_handle` persists
+    # `remote` in the same `_update` that sets `running`, so a running flash record with a heartbeat
+    # and no remote can only be a worker that has been torn down -- there is no ordinary window
+    # where a live worker is pinging without one. drop the identity rather than guess: the attempt
+    # is genuinely unknown until the replacement is reserved, and a wrong number is worse than none
+    # for a field whose entire job is to explain a step rewind.
+    from flash.providers._poll import _attempt_int
+
+    remote = status.get("remote")
+    remote_cleared = "remote" in status and remote is None
+    attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
+    if attempt is None and not remote_cleared and isinstance(heartbeat, dict):
+        attempt = _attempt_int(heartbeat.get("attempt"))
     if isinstance(heartbeat, dict):
         heartbeat_age_seconds = render._heartbeat_age_seconds(heartbeat.get("ts"))
+        # stage and step come from the heartbeat, attempt from `remote` below. during the relaunch
+        # window those are two different attempts, so printing them side by side reads as progress
+        # the replacement worker has not made: `stage=sft_step step=455 attempt=1` attributes the
+        # superseded worker's 455 steps to an attempt that just started from zero -- the exact
+        # rewind the attempt counter was added to explain. mark the heartbeat-sourced fields as
+        # the previous attempt's instead of dropping them: the run really did reach that step, and
+        # suppressing it entirely would read as no progress at all (codex[bot]).
+        # a cleared `remote` is the same relaunch window, and the ping is just as superseded there:
+        # the worker that produced it has already been torn down. `heartbeat_is_current_attempt`
+        # answers True because it cannot prove otherwise from the identity alone, so the qualifier
+        # has to come from the clear itself or `step=455` reads as the replacement's progress.
+        stale_heartbeat = remote_cleared or not render.heartbeat_is_current_attempt(
+            status, heartbeat
+        )
         stage = heartbeat.get("stage")
         if stage:
             parts.append(f"stage={stage}")
@@ -429,7 +481,7 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
                 warmup = render.warmup_message(
                     stage,
                     heartbeat_age_seconds,
-                    render.heartbeat_is_current_attempt(status, heartbeat),
+                    not stale_heartbeat,
                 )
                 if warmup:
                     parts.append(warmup)
@@ -442,6 +494,19 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         if heartbeat_age_seconds is not None:
             mins = int(heartbeat_age_seconds // 60)
             parts.append(f"hb={mins}m" if mins else "hb=<1m")
+        if stale_heartbeat and (stage or step is not None or heartbeat_age_seconds is not None):
+            # one marker for the whole heartbeat-sourced group rather than a suffix on each field:
+            # the staleness is a property of the ping, not of any one value it carried.
+            #
+            # it TRAILS the group, and `attempt=` is appended after it, so the split is positional:
+            # everything before the marker came from the superseded ping, everything after is live.
+            # covering `hb=` matters as much as covering the step -- that age is the old worker's
+            # ping too, so a fresh `hb=<1m` printed outside the marker read as the replacement
+            # worker being alive when nothing had been heard from it at all, the opposite of what
+            # the age is there to say (cursor).
+            parts.append("(prev attempt)")
+    if attempt:
+        parts.append(f"attempt={attempt}")
     realized = status.get("realized_cost_usd")
     if realized is not None:
         if isinstance(realized, (int, float)):
