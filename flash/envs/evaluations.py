@@ -12,6 +12,8 @@ import importlib.util
 import inspect
 import math
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
@@ -243,31 +245,23 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"could not import evaluation module from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    # the package dir stays on sys.path after this returns: a sidecar may import its local
-    # helpers lazily inside cases() or score(), which run long after the module is loaded.
-    # removing it here would break those sidecars. the membership check keeps repeated loads
-    # from growing sys.path without bound.
-    module_dir = str(module_path.parent)
-    if module_dir not in sys.path:
-        sys.path.insert(0, module_dir)
-    previous_module = sys.modules.get(module_name)
-    sys.modules[module_name] = module
     # a sibling a sidecar imports is cached under its plain name, so a second package importing
     # its own `helper` found the FIRST package's module already in sys.modules and reused it --
     # silently running the wrong cases and the wrong scoring logic, with no import error to see
-    # (codex[bot]). dropping the siblings this load introduced makes the next package import its
-    # own; anything already imported before this call is left alone, since it is not ours to evict.
-    before = set(sys.modules)
+    # (codex[bot]). the scope drops the siblings this load introduced, so the next package imports
+    # its own; anything imported before is left alone, since it is not ours to evict. the same
+    # scope is re-entered around cases() and score(), which is where lazy sibling imports land.
+    previous_module = sys.modules.get(module_name)
+    sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
-    except Exception:
+        with _sidecar_scope(str(module_path.parent)):
+            spec.loader.exec_module(module)
+    except BaseException:
         if previous_module is None:
             sys.modules.pop(module_name, None)
         else:
             sys.modules[module_name] = previous_module
-        _forget_sidecar_siblings(module_dir, before)
         raise
-    _forget_sidecar_siblings(module_dir, before)
     return module
 
 
@@ -288,6 +282,67 @@ def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> None:
             continue
         if resolved.parent == directory:
             sys.modules.pop(name, None)
+
+
+@contextmanager
+def _sidecar_scope(module_dir: str) -> Iterator[None]:
+    """Make `module_dir` the first place a bare import resolves, then undo it.
+
+    A sidecar may import its local helpers lazily inside cases() or score(), which run long
+    after the module finished executing. Those imports resolve against whatever sys.path and
+    sys.modules look like at call time, so without this scope the FIRST package's `helper`
+    stayed cached under its plain name and every later package silently reused it -- grading
+    with another environment's cases and another environment's scoring logic, with no import
+    error to reveal it. Wrong results that read as legitimate are the one failure this module
+    exists to prevent, so the binding has to cover the calls, not just the load.
+
+    Modules imported from this directory are dropped on exit for the same reason they are
+    dropped after loading: the plain name belongs to whichever package is currently in scope,
+    so leaving it cached would hand it to the next one."""
+    directory = str(Path(module_dir).resolve())
+    before = set(sys.modules)
+    sys.path.insert(0, directory)
+    try:
+        yield
+    finally:
+        # a sidecar that rewrote sys.path itself may already have removed it; nothing to undo.
+        with suppress(ValueError):
+            sys.path.remove(directory)
+        _forget_sidecar_siblings(directory, before)
+
+
+class _ScopedSuite:
+    """One suite bound to the package directory its sidecar was loaded from.
+
+    Delegates rather than subclasses: a suite is any object with `name`, `cases()`, and
+    `score()`, so there is no base class to extend and user state must stay on the user's
+    own object."""
+
+    __slots__ = ("_module_dir", "_suite")
+
+    def __init__(self, suite: EvalSuite, module_dir: str) -> None:
+        self._suite = suite
+        self._module_dir = module_dir
+
+    @property
+    def name(self) -> str:
+        return self._suite.name
+
+    def cases(self) -> list[EvalCase]:
+        with _sidecar_scope(self._module_dir):
+            return self._suite.cases()
+
+    def score(self, case: EvalCase, response: str) -> EvalResult | float | bool:
+        with _sidecar_scope(self._module_dir):
+            return self._suite.score(case, response)
+
+    def __getattr__(self, name: str):
+        # tests and callers reach through to suite attributes (`suite.environment`), and an
+        # unknown name must raise the suite's own AttributeError, not this wrapper's.
+        return getattr(self._suite, name)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self._suite!r})"
 
 
 def _call_factory(factory, kwargs: dict[str, object]) -> object:
@@ -391,18 +446,27 @@ def load_evaluation_suites(
         ) from exc
 
     factory = getattr(module, _DEFAULT_EVALUATIONS_FACTORY, None)
+    module_dir = str(source.parent)
     try:
         if factory is not None:
             if not callable(factory):
                 raise TypeError(f"{source}: {_DEFAULT_EVALUATIONS_FACTORY} must be callable")
-            loaded = _call_factory(factory, {"environment": environment})
+            # the factory is user code that may import its own helpers too, so it runs in the
+            # same scope its cases() and score() will later run in.
+            with _sidecar_scope(module_dir):
+                loaded = _call_factory(factory, {"environment": environment})
         elif hasattr(module, "EVALUATIONS"):
             loaded = module.EVALUATIONS
         else:
             raise AttributeError(
                 f"{source}: define {_DEFAULT_EVALUATIONS_FACTORY}() or a module-level EVALUATIONS list/tuple"
             )
-        return _validate_suites(loaded, source=source)
+        # bound to this package before returning: cases() and score() run after this call, when
+        # nothing else would keep a sibling import resolving to the package it belongs to.
+        return [
+            _ScopedSuite(suite, module_dir)
+            for suite in _validate_suites(loaded, source=source)
+        ]
     except Exception as exc:
         if isinstance(exc, (AttributeError, TypeError, ValueError, RuntimeError)) and str(
             exc
