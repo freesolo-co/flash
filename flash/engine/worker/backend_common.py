@@ -47,6 +47,18 @@ FLASH_ATTN_SPEC = (
     "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/"
     "v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl"
 )
+# the wheel above is cp312-ONLY, and flash itself supports 3.11 (pyproject requires-python >=3.11),
+# so a bare `uv venv` on a 3.11 host builds an interpreter the wheel cannot install into -- and that
+# install is required, so the run dies during provisioning instead of training. name the interpreter
+# rather than inheriting the host's.
+VERL_VENV_PYTHON = "3.12"
+
+# what a provisioned venv HOLDS, which is the only thing the stamp may identify. flash-attn belongs
+# in it because it is installed separately from verl and pinned separately: a workdir provisioned by
+# a release that installed verl but not flash-attn records the same VERL_REQUIREMENT, so a
+# verl-only stamp would let a retry reuse that venv, skip the install, and return an interpreter
+# missing exactly the package this path exists to guarantee.
+VERL_VENV_STAMP = f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}"
 
 
 def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
@@ -151,7 +163,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     if os.path.exists(stamp):
         with open(stamp) as f:
             installed = f.read().strip()
-    if installed != VERL_REQUIREMENT or not os.path.exists(py):
+    if installed != VERL_VENV_STAMP or not os.path.exists(py):
         # a retry reuses the pod workdir, so this venv can be from an earlier attempt, from an earlier
         # flash release pinning a different verl, or from an install that died partway. remove it and
         # start clean: reusing it would train on the wrong verl, and `uv venv` refuses to write into a
@@ -159,7 +171,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         shutil.rmtree(venv, ignore_errors=True)
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
         # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
-        subprocess.run(["uv", "venv", venv], check=True)
+        subprocess.run(["uv", "venv", "--python", VERL_VENV_PYTHON, venv], check=True)
         # the SAME three overrides Dockerfile.worker writes, for the same reason: this pin set
         # deliberately violates three declared ceilings, and a bare pin cannot break any of them --
         # a pin is a constraint the resolver must satisfy alongside the declaration, so the pair is
@@ -225,8 +237,10 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
             ],
             check=True,
         )
+        # written only after BOTH installs succeed, so a venv that died between them is unstamped
+        # and the next attempt rebuilds it rather than reusing a half-provisioned interpreter.
         with open(stamp, "w") as f:
-            f.write(VERL_REQUIREMENT)
+            f.write(VERL_VENV_STAMP)
         if install_wandb:
             # verl does not pull wandb; install it best-effort so logger setup can fall back to console.
             subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
@@ -650,28 +664,53 @@ RAY_FAILURE_LOGS = (
 RAY_LOG_TAIL_BYTES = 64 * 1024
 
 
-def latest_ray_session_dir(root: str = "/tmp/ray") -> str | None:
-    """the most recent ray session directory, or None if ray never started one.
+def latest_ray_session_dir(
+    root: str = "/tmp/ray", *, started_after: float | None = None
+) -> str | None:
+    """the most recent ray session directory, or None if THIS run never started one.
 
     ray names these ``session_<timestamp>_<pid>`` and also maintains a ``session_latest`` symlink,
     but the symlink is removed on a clean shutdown, so pick the newest real directory instead: the
     case this exists for is the one where ray did NOT shut down cleanly.
+
+    ``started_after`` rejects sessions older than the caller's start. a retry reuses the pod workdir
+    and /tmp survives it, so a run that fails BEFORE ray starts -- during dependency provisioning or
+    model download -- still finds a previous run's session here. uploading that as the current
+    attempt's evidence is worse than uploading nothing: it reads as a raylet failure that never
+    happened, and sends the next diagnosis after a cause belonging to a different run.
     """
     try:
-        sessions = [
-            os.path.join(root, name)
-            for name in os.listdir(root)
-            if name.startswith("session_") and os.path.isdir(os.path.join(root, name))
-        ]
+        names = os.listdir(root)
     except OSError:
         return None
-    if not sessions:
+    # stat once, here: a session directory can vanish between listing and stat, and doing it in a
+    # `max(key=...)` would let that raise on an already-failing path.
+    dated: list[tuple[float, str]] = []
+    for name in names:
+        if not name.startswith("session_"):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if not os.path.isdir(path):
+                continue
+            # mtime, not the name's timestamp: the directory keeps being written while ray runs, so
+            # a session that STARTED before this run but was still live during it is still ours.
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if started_after is not None and mtime < started_after:
+            continue
+        dated.append((mtime, path))
+    if not dated:
         return None
-    return max(sessions, key=lambda path: os.path.getmtime(path))
+    return max(dated)[1]
 
 
 def collect_ray_failure_logs(
-    *, root: str = "/tmp/ray", tail_bytes: int = RAY_LOG_TAIL_BYTES
+    *,
+    root: str = "/tmp/ray",
+    tail_bytes: int = RAY_LOG_TAIL_BYTES,
+    started_after: float | None = None,
 ) -> str:
     """ray's own logs about why a raylet died, as one credential-safe artifact body ("" if none).
 
@@ -683,11 +722,14 @@ def collect_ray_failure_logs(
     artifact beside it, so a dying pod does one upload instead of six against the same bounded hf
     deadline allowance, and there is no staging directory whose only purpose is to be uploaded.
 
+    ``started_after`` is passed through so a run that failed before ray ever started reports nothing
+    rather than a previous run's session.
+
     best-effort by construction: this runs on a path that is ALREADY failing, so it must not be able
     to replace the real error with its own. every read is guarded and a file that cannot be read is
     simply absent from the result.
     """
-    session = latest_ray_session_dir(root)
+    session = latest_ray_session_dir(root, started_after=started_after)
     if session is None:
         return ""
     logs_dir = os.path.join(session, "logs")
@@ -695,20 +737,34 @@ def collect_ray_failure_logs(
     for name in RAY_FAILURE_LOGS:
         src = os.path.join(logs_dir, name)
         try:
-            size = os.path.getsize(src)
             with open(src, "rb") as handle:
+                # seek relative to the file's OWN end and cap the read: ray may still be writing
+                # while this runs, and a getsize()-then-read() would consume from the old offset
+                # through the new EOF -- unbounded, on a dying pod with a bounded upload deadline.
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
                 # the tail, not the head: a crash reason is at the end of the file.
-                if size > tail_bytes:
-                    handle.seek(size - tail_bytes)
-                payload = handle.read()
+                handle.seek(max(0, size - tail_bytes))
+                payload = handle.read(tail_bytes)
         except OSError:
             continue
         # seeking to a byte offset can land mid-codepoint, and a decode error here would lose the
         # whole file for a cosmetic reason on the one path that exists to preserve evidence.
         text = payload.decode("utf-8", errors="replace")
-        # ray logs a raylet's argv, and flash passes credentials to the worker through the
-        # environment -- so these are third-party text that has never been through flash's redactor.
-        # limit is tail_bytes so sanitizing cannot cut below the tail already bounded at read time.
+        if size > tail_bytes:
+            # never begin mid-line. ray logs a raylet's argv and flash passes credentials to the
+            # worker through the environment, so this is third-party text carrying live tokens.
+            # sanitize_diagnostic matches a secret by its `key=` prefix or by its full value, and a
+            # tail boundary landing inside either leaves the REST of a real credential unmatched and
+            # uploaded. a secret cannot span a newline (env values hold none, and the key=value
+            # regex stops at whitespace), so dropping the partial first line makes a partial secret
+            # impossible -- at the cost of at most one line we could not have redacted anyway.
+            newline = text.find("\n")
+            text = text[newline + 1 :] if newline != -1 else ""
+            if not text:
+                # a single line longer than the whole tail. dropping it is the only safe option, but
+                # say so: an empty section would otherwise read as "ray logged nothing here".
+                text = f"<omitted: final {tail_bytes} bytes are one unterminated line>"
         sections.append(
             f"===== {name} (last {tail_bytes} bytes) =====\n"
             f"{sanitize_diagnostic(text, limit=tail_bytes)}"

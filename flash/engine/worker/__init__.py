@@ -157,6 +157,10 @@ HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 ATTEMPT = _parse_attempt_env()
+# captured at import, which is before this attempt can have started ray. any ray session older than
+# this belongs to a PREVIOUS attempt on the same reused pod (/tmp survives a retry), and reporting
+# one as this attempt's evidence would send the next diagnosis after a failure that never happened.
+WORKER_START_TIME = time.time()
 JOB_SPEC = load_job_spec_from_env()
 SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
 PHASE = os.environ.get(
@@ -398,7 +402,7 @@ def main():
             # undiagnosable from artifacts and costs a paid gpu run per guess (VERL-115). runs for
             # every mode: all three backends start ray, and this is empty when the failure had
             # nothing to do with it.
-            ray_logs = collect_ray_failure_logs()
+            ray_logs = collect_ray_failure_logs(started_after=WORKER_START_TIME)
             if ray_logs:
                 ray_name = ray_log_artifact_name(RUN_MODE, ATTEMPT)
                 ray_path = f"/tmp/{ray_name}"
