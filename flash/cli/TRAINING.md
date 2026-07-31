@@ -161,12 +161,31 @@ flash env pull your-org/my-env -o ./pulled   # -o must be a FILE for a single fi
                                              # existing non-empty dir is refused
 ```
 
-`flash env test` loads the environment with **no `[environment.params]`**, so an env whose
-split (or any other kwarg) is selected through `params` is validated at its _defaults_ —
-i.e. potentially a different dataset file than the one your run will train on. If your SFT
-and RL configs point at different splits, the local gate can pass while the real training
-path is broken, or fail while the real path is fine. Make the default the split you
-actually train on, or exercise `load_environment(**params)` directly in your own test.
+**Validate the parameters your run actually trains on.** Left alone, `flash env test` calls
+`load_environment()` at its _defaults_ — potentially a different dataset file than your run
+uses, so the gate can pass while the real training path is broken, or fail while the real
+path is fine. Pass the run's own `[environment.params]` instead: `--split` sets the split,
+and `--param KEY=VALUE` (repeatable, values parsed as TOML scalars) sets every other kwarg.
+For a run configured as
+
+```toml
+[environment.params]
+split = "train_sft"
+difficulty = "hard"
+max_turns = 4
+```
+
+validate it with the matching invocation:
+
+```bash
+flash env test . --split train_sft --param difficulty=hard --param max_turns=4
+```
+
+Values keep the types `[environment.params]` would give them — `max_turns=4` arrives as an
+int, `strict=true` as a bool, and anything that does not parse as a TOML scalar as text.
+
+`flash env eval` takes the same two flags, for the same reason: a held-out suite scored
+against a differently-configured environment is not measuring your run.
 
 **It is also a three-example smoke test, not a dataset audit.** `flash env test` runs the
 contract checks against the **first 3 rows only** (`_DEFAULT_EPISODES = 3`, and it iterates
