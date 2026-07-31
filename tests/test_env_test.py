@@ -13,7 +13,7 @@ from flash.cli.env_test import (
     _SYNTHETIC_CONTROL_ALPHABET,
     _control_is_disjoint,
     _Score,
-    _synthetic_control,
+    _synthetic_controls,
     cmd_env_test,
 )
 
@@ -522,27 +522,57 @@ def test_env_test_substring_grader_gold_inside_a_control_still_passes(
                 assert gold not in control, (gold, control)
 
 
-def test_env_test_non_finite_control_reward_fails_the_episode(monkeypatch, tmp_path, capsys):
-    # a scorer that returns NaN for an unexpected completion breaks the same reward contract the
-    # gold answer is already failed for: the policy reaches this scorer with completions no more
-    # expected than the controls, and non-finite rewards there yield unusable samples. excluding
-    # the episode as merely inconclusive would let `overall: PASS` hide that.
+def test_env_test_infinite_control_reward_fails_the_episode(monkeypatch, tmp_path, capsys):
+    # infinity is NOT trl's unscorable marker -- isnan(inf) is false -- so it reaches the group as a
+    # real number and contaminates every advantage in it. that is the same reward contract the gold
+    # answer is already failed for, and excluding the episode as merely inconclusive would let
+    # `overall: PASS` hide it.
     env_dir = _environment_dir(tmp_path)
 
-    class _NanControlEnv(_SingleTurnEnv):
+    class _InfiniteControlEnv(_SingleTurnEnv):
         def reward(self, completion, example, state=None):
             self.completions.append(completion)
             if completion != example.get("output", ""):
-                return float("nan")
+                return float("inf")
             return 1.0
 
-    _patch_loader(monkeypatch, _NanControlEnv())
+    _patch_loader(monkeypatch, _InfiniteControlEnv())
 
     assert cmd_env_test(_args(env_dir)) == 1
     captured = capsys.readouterr()
     assert "0/1 episodes passed contract checks" in captured.out
     assert "reward is not finite for a non-reference completion" in captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_env_test_nan_single_turn_control_is_dropped_rather_than_failed(
+    monkeypatch, tmp_path, capsys
+):
+    # NaN is the trainer's supported unscorable marker: trl excludes such a row from the group
+    # baseline and zeroes its advantage. a grammar-constrained scorer marking a synthetic control
+    # unscorable is behaving as designed, so failing the episode rejected a working scorer for the
+    # single reason that a fixed control is not valid input for it (codex[bot]). the multi-turn path
+    # already dropped these; this is the same rule on the single-turn path.
+    env_dir = _environment_dir(tmp_path)
+
+    class _GrammarEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            if completion == example.get("output", ""):
+                return 1.0
+            # a control inside the grammar still ranks; one outside it is unscorable.
+            if set(completion) <= {"z"} or set(completion) <= {"0"}:
+                return float("nan")
+            return 0.0
+
+    _patch_loader(monkeypatch, _GrammarEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "reward is not finite" not in captured.err, captured.err
+    # the surviving control still separates, so the episode is not read as flat either.
+    assert "cannot rank completions" not in captured.err, captured.err
 
 
 def test_env_test_sft_placeholder_reward_warns_instead_of_failing(monkeypatch, tmp_path, capsys):
@@ -919,6 +949,45 @@ def test_env_test_multi_turn_rollouts_are_scored_in_one_listwise_call(
     # the gold rollout is scored WITH its controls and only once: grading it alone as well would
     # show a stateful or listwise grader a request list the real run never submits.
     assert env.batch_sizes == [1 + len(_CONTROL_CANDIDATES)]
+
+
+def test_gold_rollouts_no_control_batch_reached_are_graded_in_one_call(
+    monkeypatch, tmp_path, capsys
+):
+    # the other end of the same listwise contract. episodes that never reach a control batch -- an
+    # echo policy here -- still need a gold reward, and grading them one call each hands a listwise
+    # rollout_rewards_many a request list the real run never submits: the worker submits its whole
+    # rollout list to score_rollouts at once (flash/engine/multiturn_rollout.py), so a grader that
+    # cannot score a singleton works under GRPO and fails its contract check here (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _BatchOnlyEnv(_MultiTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.batch_sizes = []
+
+        def dataset(self):
+            # three episodes, so a per-episode call and a single batched call differ observably.
+            return [{"input": f"prompt {index}", "output": []} for index in range(3)]
+
+        def sft_completion(self, example):
+            # no assistant turn to replay, so the policy is echo and no control batch runs.
+            return [{"role": "user", "content": "no gold answer here"}]
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            self.batch_sizes.append(len(items))
+            if len(items) < 2:
+                raise ValueError("this grader normalizes across the batch and cannot score one")
+            return [RolloutReward(episode=0.5) for _ in items]
+
+    env = _BatchOnlyEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    # one call carrying all three, not three calls carrying one.
+    assert env.batch_sizes == [3]
 
 
 def test_env_test_sft_only_environment_is_not_failed_by_the_reward_gate(
@@ -1368,34 +1437,72 @@ def test_env_test_gold_answer_colliding_with_every_fixed_control_is_still_contro
     assert "cannot rank completions" in captured.err
 
 
-def test_synthetic_control_is_disjoint_from_the_gold_answer():
-    control = _synthetic_control(["answer z 0"])
+def test_synthetic_controls_are_disjoint_from_the_gold_answer():
+    controls = _synthetic_controls(["answer z 0"])
 
-    assert control is not None
-    assert _control_is_disjoint(control, "answer z 0")
+    assert controls
+    for control in controls:
+        assert _control_is_disjoint(control, "answer z 0")
 
 
-def test_synthetic_control_is_none_when_the_gold_text_uses_every_character():
+def test_synthetic_controls_supply_enough_alphabets_for_the_inversion_verdict():
+    # the inversion verdict reads unanimity across controls on mutually exclusive alphabets, so a
+    # lone fallback could never reach it and an inverted grader passed unexamined for any gold text
+    # that disqualified the whole fixed set (codex[bot]).
+    controls = _synthetic_controls(["answer z 0"])
+
+    assert len(controls) > 1
+    assert len({control[0] for control in controls}) == len(controls)
+
+
+def test_an_inverted_grader_is_caught_when_the_gold_text_disqualifies_every_fixed_control(
+    monkeypatch, tmp_path, capsys
+):
+    # the end of the same finding: the verdict needs unanimity across controls, so a single
+    # fallback left it unreachable and an inverted grader passed unexamined for any gold text that
+    # disqualified the whole fixed set -- "answer z 0" being enough to do it (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _InvertedGraderEnv(_SingleTurnEnv):
+        def dataset(self):
+            return [{"input": "q", "output": "answer z 0"}]
+
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            # the sign is backwards: the gold answer scores lowest, every wrong answer above it.
+            return 0.0 if completion == "answer z 0" else 1.0
+
+    _patch_loader(monkeypatch, _InvertedGraderEnv())
+
+    assert not any(_control_is_disjoint(c, "answer z 0") for c in _CONTROL_CANDIDATES)
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "the reward direction is inverted" in captured.err, captured.err
+
+
+def test_synthetic_controls_are_empty_when_the_gold_text_uses_every_character():
     # no character is left to build a provably-wrong control from, so the episode must still be
     # excluded rather than controlled against text that might be correct.
     exhaustive = _SYNTHETIC_CONTROL_ALPHABET
 
-    assert _synthetic_control([exhaustive]) is None
+    assert _synthetic_controls([exhaustive]) == []
 
 
 class _NonFiniteControlScorerEnv(_SingleTurnEnv):
-    """A grader that scores its own reference finitely and anything else NaN.
+    """A grader that scores its own reference finitely and anything else infinite.
 
     `_score_control` maps a raised exception to 0.0 for single-turn (mirroring reward_fn), so a
-    non-finite score is the shape that actually reaches the caller. Legitimate for sft/opd/opsd,
-    whose workers never call the scorer at all; a real defect for grpo, whose reward_fn grades
-    arbitrary policy completions.
+    non-finite score is the shape that actually reaches the caller. Infinity rather than NaN,
+    because NaN is the trainer's supported unscorable marker and is dropped as inconclusive, while
+    infinity reaches the group as a real number. Legitimate for sft/opd/opsd, whose workers never
+    call the scorer at all; a real defect for grpo, whose reward_fn grades arbitrary policy
+    completions.
     """
 
     def reward(self, completion, example, state=None):
         self.completions.append(completion)
         if completion != example.get("output", ""):
-            return float("nan")
+            return float("inf")
         return 1.0
 
 
@@ -1613,9 +1720,9 @@ def test_env_turns_that_do_not_reproduce_exclude_the_episode_from_the_gate(
                 if message.get("role") != "system"
             ]
             gold = [turn["content"] for turn in example["output"]]
-            # the prompt opens the transcript and env_reply appends one more observation after the
-            # final assistant turn, so the reference sits between them.
-            return 1.0 if said[1 : 1 + len(gold)] == gold else 0.0
+            # the prompt opens the transcript, so the completion starts after it; env_reply appends
+            # one more observation past the final assistant turn, so compare gold as a prefix.
+            return 1.0 if said[1:][: len(gold)] == gold else 0.0
 
     class _DivergentEnv(_InterleavedEnv):
         # a stochastic env: this run's observation is not the one the reference recorded.
@@ -1632,6 +1739,127 @@ def test_env_turns_that_do_not_reproduce_exclude_the_episode_from_the_gate(
     _patch_loader(monkeypatch, _InterleavedEnv())
     assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
     assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_env_turn_reproduction_is_judged_by_position_not_by_the_transcript_tail(
+    monkeypatch, tmp_path, capsys
+):
+    # the turn loop appends one more env_reply after the final assistant turn, so the reference's
+    # observations do not sit at the end of the driven transcript. comparing against the tail
+    # shifted every one of them by that trailing reply, which broke the exclusion in both
+    # directions: a faithful replay was dropped from the gate, and a divergence earlier in the
+    # trajectory was hidden whenever the trailing reply happened to match (cursor).
+    env_dir = _environment_dir(tmp_path)
+
+    class _RecordedObservationEnv(_MultiTurnEnv):
+        """Reference trajectory records the observation replied at that point in the exchange."""
+
+        replies = ("observation-1", "observation-2")
+
+        def __init__(self):
+            super().__init__()
+            self.replied = 0
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "user", "content": "observation-1"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def new_rollout_state(self, example):
+            # the gold and control rollouts share this instance, and each drives the reply
+            # sequence from its start.
+            self.replied = 0
+            return super().new_rollout_state(example)
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            reply = {"role": "user", "content": self.replies[self.replied]}
+            self.replied += 1
+            messages.append(reply)
+            return [reply]
+
+        def reward(self, completion, example, state=None):
+            # flat on purpose: this env really cannot rank, and the gate has to be able to say so.
+            return 0.5
+
+    # a faithful replay: "observation-1" comes back where the reference recorded it, and the
+    # trailing "observation-2" is past everything the reference claims. the episode belongs in the
+    # gate, so the flat grader above must still be reported.
+    _patch_loader(monkeypatch, _RecordedObservationEnv())
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+    class _LateMatchEnv(_RecordedObservationEnv):
+        # diverges at the turn the reference recorded, then replies with the recorded text one turn
+        # too late. the tail comparison read that coincidence as a faithful replay.
+        replies = ("observation-X", "observation-1")
+
+        def reward(self, completion, example, state=None):
+            # scores the whole transcript, so the differing observation lands gold with the
+            # controls -- a flat-grader report this env has not earned.
+            said = [
+                message["content"]
+                for message in state["messages"]
+                if message.get("role") != "system"
+            ]
+            gold = [turn["content"] for turn in example["output"]]
+            return 1.0 if said[1:][: len(gold)] == gold else 0.0
+
+    _patch_loader(monkeypatch, _LateMatchEnv())
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_a_system_turn_in_the_reference_is_compared_on_both_sides(monkeypatch, tmp_path, capsys):
+    # the reference and the driven transcript must be filtered by the same rule. dropping system
+    # turns from the driven side alone left the reference's system turn with nothing to line up
+    # against, shifting every later observation by one and marking an exact replay unreproduced --
+    # excluding a healthy env from the gate for having a system turn at all (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _SystemObservationEnv(_MultiTurnEnv):
+        """Replies with a system turn ahead of the observation, and records both in the reference."""
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "system", "content": "tool budget exceeded"},
+                        {"role": "user", "content": "observation-1"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            replies = [
+                {"role": "system", "content": "tool budget exceeded"},
+                {"role": "user", "content": "observation-1"},
+            ]
+            messages.extend(replies)
+            return replies
+
+        def reward(self, completion, example, state=None):
+            # flat on purpose: the env genuinely cannot rank, so the gate has to still say so. that
+            # report is the evidence the episode was not silently dropped -- an excluded episode and
+            # a healthy one are otherwise indistinguishable from the outside, both being silent.
+            return 0.5
+
+    _patch_loader(monkeypatch, _SystemObservationEnv())
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
 
 
 def test_an_unscorable_multi_turn_control_is_dropped_rather_than_failed(
