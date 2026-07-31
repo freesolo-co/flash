@@ -575,21 +575,33 @@ def test_env_test_param_keys_that_denote_toml_structure_are_rejected(
     assert "TOML key syntax" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("value", ["bad key=1", "a/b=1", "a@b=1", "k(x)=1", "café=1"])
-def test_env_test_param_keys_outside_the_toml_bare_key_grammar_are_rejected(
-    monkeypatch, tmp_path, capsys, value
+@pytest.mark.parametrize("value", ["bad key=1", "a/b=1", "a@b=1", "k(x)=1", "café=1", "a😀b=1"])
+def test_env_test_param_keys_a_quoted_config_key_can_carry_still_load(
+    monkeypatch, tmp_path, value
 ):
-    # dots and quotes are not the whole grammar. a bare TOML key is letters, digits, `_` and `-`,
-    # and there is no unquoted spelling for anything else -- so these names forwarded literally
-    # while the equivalent [environment.params] entry cannot load at all. an environment taking
-    # **kwargs swallows the call and the gate passes for a parameter the run never receives
-    # (codex[bot]).
+    # these are not BARE keys, but that is not the question -- a QUOTED key carries every one of
+    # them and the schema loader reads it, so `"bad key" = 1` and `"café" = 1` are configs a run
+    # really can receive. rejecting them blocked validating a working config while the error
+    # claimed [environment.params] could not hold the name (cursor).
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+    key = value.split("=")[0]
 
-    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert cmd_env_test(_args(env_dir, param=[value])) == 0
+    assert key in seen["kwargs"]
+
+
+def test_env_test_a_param_key_no_config_file_could_hold_is_rejected(monkeypatch, tmp_path, capsys):
+    # what IS unexpressible is a name the UTF-8 config file cannot contain. a command line carrying
+    # a byte that is not valid UTF-8 reaches argv as a lone surrogate, and no [environment.params]
+    # entry could ever spell it -- so the run would never receive the parameter.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+    key = b"a\xffb".decode("utf-8", "surrogateescape")
+
+    assert cmd_env_test(_args(env_dir, param=[f"{key}=1"])) == 1
     assert "kwargs" not in seen
-    assert "not a valid TOML bare key" in capsys.readouterr().err
+    assert "not valid UTF-8" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("value", ["max_rows=5", "MODE=fast", "n0=1", "keep-going=true"])
@@ -678,6 +690,49 @@ def test_env_test_malformed_param_without_a_delimiter_is_rejected(
     assert "is not a valid TOML value" in err, err
     # the remedy has to be named, because "3px" really is text to the user who typed it.
     assert "quote it" in err, err
+    # and it has to survive a shell. suggesting `--param k="v"` is a remedy that fails when pasted:
+    # the shell strips those quotes, argv sees `k=v` again, and the user hits the same error. the
+    # quoting has to be spelled so the quotes reach argv (cursor).
+    key = value.partition("=")[0]
+    assert f"--param '{key}=" in err, err
+
+
+@pytest.mark.parametrize("value", ["strict=False", "strict=True", "strict=TRUE", "flag=fAlse"])
+def test_env_test_a_python_spelled_boolean_is_rejected_rather_than_sent_as_text(
+    monkeypatch, tmp_path, capsys, value
+):
+    # the booleans are the TOML scalars that do not start with a digit or sign, so the
+    # leading-character test cannot see them. TOML spells them lowercase only, which makes a
+    # python-style `strict=False` parse-fail and fall through as the STRING "False" -- and a
+    # non-empty string is truthy, so an env branching on `if strict` reads it as ENABLED while the
+    # config spelling `false` disables it. the gate would pass on the opposite of what the run
+    # trains with (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    err = capsys.readouterr().err
+    assert "in lowercase" in err, err
+    # both remedies must be spelled out: the literal the user probably meant, and the shell-safe
+    # quoting if they really did want the text.
+    assert value.partition("=")[2].lower() in err, err
+    assert f"--param '{value.partition('=')[0]}=" in err, err
+
+
+@pytest.mark.parametrize("value", ["strict=false", "strict=true", "note=truthy", "note=False Ok"])
+def test_env_test_real_booleans_and_prose_are_unaffected_by_the_case_check(
+    monkeypatch, tmp_path, value
+):
+    # the check is only correct if it admits the lowercase literals TOML does accept, and leaves
+    # ordinary prose alone -- rejecting either would cost a spelling [environment.params] supports.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+    key, _, raw = value.partition("=")
+    expected = {"false": False, "true": True}.get(raw, raw)
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 0
+    assert seen["kwargs"][key] == expected
 
 
 @pytest.mark.parametrize(

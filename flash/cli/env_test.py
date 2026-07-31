@@ -35,10 +35,14 @@ _TOML_KEY_STRUCTURAL_CHARS = frozenset(".\"'")
 # rejected depending on whether it carried a sign (cursor). it is not in _TOML_STRUCTURAL_CHARS, so
 # it reaches this test rather than being read as a delimiter.
 _TOML_SCALAR_LEADING_CHARS = frozenset("0123456789+-.")
-# the whole TOML bare-key grammar: ascii letters, digits, `_` and `-`. anything else has to be
-# written as a quoted key, which _reject_unmirrorable_param_key already turns away -- so a name
-# holding one of those characters cannot be expressed in [environment.params] at all.
-_TOML_BARE_KEY_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+# the TOML booleans, which are written as bare words rather than starting with a digit or sign and
+# are therefore the blind spot of _TOML_SCALAR_LEADING_CHARS. TOML spells them in lowercase only, so
+# a case variant is a malformed literal rather than prose and must not forward as a string.
+#
+# only the booleans: `inf`/`nan` are the other bare-word scalars, but they are not JSON-serializable
+# and _reject_unsubmittable_param turns the lowercase spelling away regardless -- so pointing a user
+# at `nan` would be handing them a remedy that fails one step later.
+_TOML_BOOLEAN_WORDS = frozenset({"true", "false"})
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:
@@ -236,9 +240,21 @@ def _parse_param_value(key: str, raw: str) -> object:
         # none of those characters, so it forwarded as the string "2026-13-01" while the equivalent
         # `[environment.params]` entry fails to load -- the gate passing on a config that cannot be
         # written. same for `1e`, `0x`, `007`, `1_`, `12:99:00` (codex[bot]). a leading digit or
-        # sign is the tell: every TOML scalar except the bare `true`/`false`/`inf`/`nan` words
-        # starts with one, so such a token is a malformed number or date, not prose.
+        # sign is the tell: every TOML scalar except the bare-word `true`/`false`/`inf`/`nan`
+        # spellings starts with one, so such a token is a malformed number or date, not prose.
         if value and not (set(value) & _TOML_STRUCTURAL_CHARS):
+            # the booleans are the family of TOML scalars that does NOT start with a digit or sign,
+            # so the leading-character test below cannot see them. TOML spells them lowercase only,
+            # which makes a python-style `strict=False` parse-fail and fall through here as the
+            # STRING "False" -- and a non-empty string is truthy, so an env branching on `if strict`
+            # reads it as enabled while the config spelling `false` disables it. the offline gate
+            # would pass on the opposite of what the run trains with (codex[bot]).
+            if value.lower() in _TOML_BOOLEAN_WORDS:
+                raise ValueError(
+                    f"--param {key} is not a valid TOML value: {exc}. TOML spells "
+                    f"{value.lower()} in lowercase; write --param {key}={value.lower()} for the "
+                    f"boolean, or --param '{key}=\"{value}\"' to pass it as text"
+                ) from exc
             if value[0] not in _TOML_SCALAR_LEADING_CHARS:
                 return value
             # quoting is the escape hatch, and it is the same spelling the config needs -- a
@@ -247,8 +263,8 @@ def _parse_param_value(key: str, raw: str) -> object:
             # spelling that only the flag accepts.
             raise ValueError(
                 f"--param {key} is not a valid TOML value: {exc}. it starts like a number or "
-                f'date, so [environment.params] would reject it too; quote it (--param {key}="'
-                f'{value}") to pass it as text'
+                f"date, so [environment.params] would reject it too; quote it "
+                f"(--param '{key}=\"{value}\"') to pass it as text"
             ) from exc
         raise ValueError(f"--param {key} is not a valid TOML value: {exc}") from exc
     # a value containing a newline makes `v = <value>` a multi-line document, so tomllib accepts
@@ -262,6 +278,23 @@ def _parse_param_value(key: str, raw: str) -> object:
     parsed = document["v"]
     _reject_unsubmittable_param(key, parsed)
     return parsed
+
+
+def _key_is_expressible_in_toml(key: str) -> bool:
+    """Report whether ``[environment.params]`` can carry ``key``, unchanged.
+
+    The question is not whether the name is a TOML BARE key -- quoted keys hold spaces, slashes and
+    non-ascii perfectly well -- but whether the config can express THIS name at all. A basic-string
+    key can: every character is either literal or has an escape, so the only names left out are the
+    ones the file cannot physically contain. The config is read as UTF-8
+    (``tomllib.load``, flash/schema/__init__.py), so that is exactly the un-encodable ones -- a lone
+    surrogate, which reaches argv when a command line carries a byte that is not valid UTF-8.
+    """
+    try:
+        key.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _reject_unmirrorable_param_key(key: str) -> None:
@@ -291,18 +324,18 @@ def _reject_unmirrorable_param_key(key: str) -> None:
             f"forward faithfully. pass the containing table as one value instead, for example "
             f"--param {outer}='{{ level = 3 }}'"
         )
-    # dots and quotes are the spellings that mean something OTHER than themselves, but they are not
-    # the whole grammar: `bad key`, `a/b`, `a@b` and the rest are not bare keys either, and TOML has
-    # no unquoted spelling for them. they forwarded literally, so an environment taking **kwargs
-    # swallowed the call and the gate passed for a name `[environment.params]` cannot hold
-    # (codex[bot]). no example is offered here -- unlike the nested case there is no faithful
-    # config spelling to point at.
-    illegal = sorted(set(key) - _TOML_BARE_KEY_CHARS)
-    if illegal:
+    # dots and quotes are the spellings that mean something OTHER than themselves. everything else
+    # is a question of whether the config can hold the name at all, and the answer is almost always
+    # yes: a QUOTED key carries `bad key`, `a/b`, `café` and the rest, and the schema loader takes
+    # it, so those are configs a run really can receive. an earlier guard here rejected anything
+    # outside the BARE-key grammar, which blocked validating a working config while claiming the
+    # config could not hold the name (cursor).
+    #
+    # what is left is the names a UTF-8 config file cannot physically contain.
+    if not _key_is_expressible_in_toml(key):
         raise ValueError(
-            f"--param {key} is not a valid TOML bare key ({''.join(illegal)!r} not allowed); "
-            f"[environment.params] could not hold this name, so the run would never receive it. "
-            f"parameter names may use letters, digits, underscores and dashes"
+            f"--param {key!r} is not valid UTF-8, so no config file could carry it and the run "
+            f"would never receive this parameter"
         )
 
 
