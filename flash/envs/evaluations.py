@@ -133,7 +133,10 @@ class BaseEvalSuite:
         raise NotImplementedError
 
     def score(self, case: EvalCase, response: str) -> EvalResult:
-        gold = str(case.expected or "").strip()
+        # `case.expected or ""` would erase a falsy-but-real gold answer: expected=0 and
+        # expected=False are legitimate answers no response could ever match. Only an
+        # absent expected means "no gold to compare against".
+        gold = "" if case.expected is None else str(case.expected).strip()
         # `"" in x` is always true, so missing gold must not grade every response correct.
         passed = bool(gold) and gold in (response or "")
         return EvalResult(
@@ -240,6 +243,10 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"could not import evaluation module from {module_path}")
     module = importlib.util.module_from_spec(spec)
+    # the package dir stays on sys.path after this returns: a sidecar may import its local
+    # helpers lazily inside cases() or score(), which run long after the module is loaded.
+    # removing it here would break those sidecars. the membership check keeps repeated loads
+    # from growing sys.path without bound.
     module_dir = str(module_path.parent)
     if module_dir not in sys.path:
         sys.path.insert(0, module_dir)

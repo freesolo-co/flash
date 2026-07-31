@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from pathlib import Path
 
@@ -487,3 +488,205 @@ def test_env_eval_blank_stream_errors_without_scoring(monkeypatch, tmp_path, cap
     assert "generation failed: no response text from flash-1" in captured.out
     assert "score must not run" not in captured.out + captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_base_eval_suite_can_match_a_falsy_expected_answer() -> None:
+    # `expected or ""` would erase these: 0 and False are real gold answers, and treating
+    # them as "no gold" makes every such case permanently unpassable.
+    suite = BaseEvalSuite()
+
+    assert suite.score(EvalCase(input="how many?", expected=0), "the answer is 0").passed is True
+    assert suite.score(EvalCase(input="true?", expected=False), "False").passed is True
+    assert suite.score(EvalCase(input="how many?", expected=0), "the answer is 5").passed is False
+    # an absent expected still has nothing to compare against.
+    assert suite.score(EvalCase(input="anything", expected=None), "whatever").passed is False
+
+
+def test_env_eval_scoring_that_exits_fails_only_its_own_case(monkeypatch, tmp_path, capsys) -> None:
+    # sys.exit() inside score() raises SystemExit, which is not an Exception. Catching only
+    # Exception would abort the run and discard every case already graded.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "import sys\n"
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'exiting'\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id='ok', input='ok', expected='ok'),\n"
+        "        EvalCase(id='exits', input='exits', expected='exits'),\n"
+        "    ]\n"
+        "    def score(self, case, response):\n"
+        "        if case.id == 'exits': sys.exit('scorer bailed')\n"
+        "        return super().score(case, response)\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield messages[0]["content"]
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir)]) == 1
+
+    captured = capsys.readouterr()
+    # the case that exited is recorded as a scoring error...
+    assert "case exits: FAIL" in captured.out
+    assert "scoring failed: scorer bailed" in captured.out
+    # ...and the case graded before it survives rather than being lost with the process.
+    assert "case ok: PASS score=1.000000" in captured.out
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_eval_serializes_scoring_across_worker_threads(monkeypatch, tmp_path, capsys) -> None:
+    # a suite is one user object shared by every worker. a scorer holding mutable state that
+    # is raced produces silently wrong scores, which is worse than scoring serially.
+    env_dir = _environment_dir(tmp_path)
+    witness = tmp_path / "max_inside.txt"
+    # the sidecar records the peak overlap to a file: the suite object that actually ran
+    # lives inside the command, and reloading the module would build a fresh one.
+    (env_dir / "evaluations.py").write_text(
+        "import time\n"
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        f"WITNESS = {str(witness)!r}\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'racy'\n"
+        "    def __init__(self):\n"
+        "        self.inside = 0\n"
+        "        self.max_inside = 0\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id=f'c{i}', input=f'c{i}', expected=f'c{i}') for i in range(6)\n"
+        "    ]\n"
+        "    def score(self, case, response):\n"
+        "        self.inside += 1\n"
+        "        self.max_inside = max(self.max_inside, self.inside)\n"
+        "        time.sleep(0.02)\n"
+        "        self.inside -= 1\n"
+        "        open(WITNESS, 'w').write(str(self.max_inside))\n"
+        "        return super().score(case, response)\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    generating = threading.Barrier(6, timeout=5)
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            # force all six generations to be genuinely in flight together, so any
+            # unserialized scoring really would overlap.
+            generating.wait()
+            yield messages[0]["content"]
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--concurrency", "6"]) == 0
+
+    # never more than one scorer in flight, despite six concurrent generations.
+    assert witness.read_text() == "1"
+    assert "overall: PASS" in capsys.readouterr().out
+
+
+def test_env_eval_empty_suite_is_not_a_pass(monkeypatch, tmp_path, capsys) -> None:
+    # 0/0 graded is not a green suite. reporting PASS here hides a sidecar whose cases()
+    # silently returned nothing.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'empty'\n"
+        "    def cases(self): return []\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            raise AssertionError("no cases means no generation")
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir)]) == 1
+
+    captured = capsys.readouterr()
+    assert "suite empty has no cases to run" in captured.err
+    assert "overall: FAIL" in captured.err
+    assert "overall: PASS" not in captured.out
+
+
+def test_env_eval_disambiguates_duplicate_case_ids(monkeypatch, tmp_path, capsys) -> None:
+    # two cases sharing an id would collide in the report and in the uploaded payload,
+    # showing one graded case where two ran.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'dupes'\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id='same', input='a', expected='a'),\n"
+        "        EvalCase(id='same', input='b', expected='b'),\n"
+        "    ]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield messages[0]["content"]
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir)]) == 0
+
+    output = capsys.readouterr().out
+    assert "case same: PASS" in output
+    assert "case same#2: PASS" in output
+    assert "suite dupes: 2/2 passed" in output
+
+
+def test_env_eval_debug_surfaces_the_load_traceback(monkeypatch, tmp_path) -> None:
+    # a broken sidecar is a bug, and --debug asked for its traceback. swallowing it into a
+    # one-line message leaves nothing to debug with.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text("raise RuntimeError('sidecar exploded')\n")
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+
+    with pytest.raises(RuntimeError, match="sidecar exploded"):
+        cli.main(["--debug", "env", "eval", "flash-1", str(env_dir)])
+
+
+def test_evaluation_sidecar_can_import_helpers_lazily(tmp_path) -> None:
+    # the package dir must stay importable after load: sidecars import local helpers inside
+    # cases()/score(), which run long after the module is executed.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "lazy_helper.py").write_text("GOLD = 'deferred'\n")
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'lazy'\n"
+        "    def cases(self):\n"
+        "        from lazy_helper import GOLD\n"
+        "        return [EvalCase(id='one', input=GOLD, expected=GOLD)]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    suites = load_evaluation_suites(env_dir)
+
+    assert suites[0].cases() == [EvalCase(id="one", input="deferred", expected="deferred")]
+
+
+def test_evaluation_sidecar_load_does_not_grow_sys_path(tmp_path) -> None:
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'repeat'\n"
+        "    def cases(self): return []\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    load_evaluation_suites(env_dir)
+    after_first = list(sys.path)
+    load_evaluation_suites(env_dir)
+
+    assert sys.path == after_first

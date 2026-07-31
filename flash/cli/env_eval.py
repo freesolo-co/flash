@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 
 from flash._channel import CLI_NAME
 from flash.envs.evaluations import (
@@ -69,17 +70,26 @@ def _generate_response(client, target: str, case: EvalCase, args) -> str:
     return response
 
 
-def _run_case(client, target: str, suite, case: EvalCase, case_id: str, args) -> EvalResult:
+def _run_case(
+    client, target: str, suite, case: EvalCase, case_id: str, args, score_lock: Lock
+) -> EvalResult:
+    # SystemExit and KeyboardInterrupt derive from BaseException, so a sidecar that calls
+    # sys.exit() inside score() would tear down the whole suite mid-run and lose every case
+    # already graded. A sidecar that exits is a broken scorer, which is this case's error.
     try:
         response = _generate_response(client, target, case, args)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         return _generation_error(
             case_id, f"generation failed: {str(exc) or exc.__class__.__name__}"
         )
     try:
-        scored = suite.score(case, response)
+        # suites are user objects shared across worker threads. a scorer holding mutable state
+        # (a tokenizer, a counter, a cached client) would be raced under --concurrency and
+        # produce silently wrong scores, which is worse than scoring serially.
+        with score_lock:
+            scored = suite.score(case, response)
         return normalize_eval_result(case, response, scored, case_id=case_id)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         return EvalResult(
             case_id=case_id,
             passed=False,
@@ -89,18 +99,34 @@ def _run_case(client, target: str, suite, case: EvalCase, case_id: str, args) ->
         )
 
 
+def _case_ids(cases: list[EvalCase]) -> list[str]:
+    """Stable per-case ids, disambiguating sidecars that reuse one id across cases.
+
+    Two cases sharing an id would collide in the uploaded payload and in the printed
+    report, silently reporting one graded case where two ran."""
+    ids: list[str] = []
+    seen: dict[str, int] = {}
+    for index, case in enumerate(cases, start=1):
+        case_id = case.id or str(index)
+        count = seen.get(case_id, 0)
+        seen[case_id] = count + 1
+        ids.append(case_id if count == 0 else f"{case_id}#{count + 1}")
+    return ids
+
+
 def _run_cases(client, target: str, suite, cases: list[EvalCase], args) -> tuple[EvalResult, ...]:
-    case_ids = [case.id or str(index) for index, case in enumerate(cases, start=1)]
+    case_ids = _case_ids(cases)
+    score_lock = Lock()
     if args.concurrency == 1 or len(cases) <= 1:
         return tuple(
-            _run_case(client, target, suite, case, case_id, args)
+            _run_case(client, target, suite, case, case_id, args, score_lock)
             for case, case_id in zip(cases, case_ids, strict=True)
         )
 
     results: list[EvalResult | None] = [None] * len(cases)
     with ThreadPoolExecutor(max_workers=min(args.concurrency, len(cases))) as pool:
         futures = {
-            pool.submit(_run_case, client, target, suite, case, case_id, args): index
+            pool.submit(_run_case, client, target, suite, case, case_id, args, score_lock): index
             for index, (case, case_id) in enumerate(zip(cases, case_ids, strict=True))
         }
         for future in as_completed(futures):
@@ -225,6 +251,10 @@ def cmd_env_eval(args) -> int:
         environment = load_freesolo_environment(str(entrypoint))
         suites = load_evaluation_suites(entrypoint, environment=environment)
     except (Exception, SystemExit) as exc:
+        # a load failure is a bug in the sidecar or the package layout, not a measurement.
+        # --debug asked for the traceback, so let the root handler print it.
+        if getattr(args, "debug", False):
+            raise
         reason = str(exc) or exc.__class__.__name__
         _err(f"env eval failed: {reason.replace('cannot publish', 'cannot evaluate')}")
         return _err("overall: FAIL")
@@ -245,11 +275,24 @@ def cmd_env_eval(args) -> int:
                 suite, source=entrypoint.parent / _DEFAULT_EVALUATIONS_PATH
             )
         except (Exception, SystemExit) as exc:
+            if getattr(args, "debug", False):
+                raise
             reason = str(exc) or exc.__class__.__name__
             _err(f"suite {suite.name} failed to load cases: {reason}")
             report = EvalSuiteReport(
                 name=suite.name,
                 results=(_generation_error("load", f"case loading failed: {reason}"),),
+            )
+            _print_report(report)
+            reports.append(report)
+            continue
+        if not cases:
+            # a suite that graded nothing measured nothing. reporting 0/0 as a pass would
+            # turn an empty or over-filtered suite into a green check nobody looks at again.
+            _err(f"suite {suite.name} has no cases to run")
+            report = EvalSuiteReport(
+                name=suite.name,
+                results=(_generation_error("load", "suite produced no cases"),),
             )
             _print_report(report)
             reports.append(report)
