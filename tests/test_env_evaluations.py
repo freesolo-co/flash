@@ -2121,3 +2121,99 @@ def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, 
     assert "prompt construction failed: no template for this row" in output
     # the broken case is an error, not a zero the model earned.
     assert "errors=1 (excluded from pass_rate and mean_score)" in output
+
+
+def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path, capsys) -> None:
+    """Graders must see what training graded, and only when the run actually reasons.
+
+    Training never hands a scorer the raw completion: both rollout paths run it through
+    `flash.thinking` first (`flash/envs/adapter.py`). Evaluating the raw string mis-graded a
+    thinking deployment against its own environment -- the scaffolded scorer in `env setup` reads
+    the first token as an int, which is `<think>` for every reasoning run, so every case errored.
+
+    Stripping unconditionally is the opposite defect, and just as real: `strip_think` also cuts at
+    a bare `<think>` mention, so a non-thinking answer that merely names the tag would be truncated
+    to nothing. The run's own `thinking` decides, never the text, and the two halves below fail in
+    opposite directions to pin that.
+    """
+
+    def _suite(name: str, expected: str) -> Path:
+        root = tmp_path / name
+        root.mkdir()
+        env_dir = _environment_dir(root)
+        (env_dir / "evaluations.py").write_text(
+            "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
+            f"EXPECTED = {expected!r}\n"
+            "class Suite(BaseEvalSuite):\n"
+            "    name = 'reasoning'\n"
+            "    def cases(self): return [EvalCase(id='sum', input='2+2', expected=EXPECTED)]\n"
+            "    def score(self, case, response):\n"
+            # exact match, not the base class substring test: the whole question is which
+            # string reaches the scorer, and a substring check passes on either one.
+            "        ok = str(response) == EXPECTED\n"
+            "        return EvalResult(case_id='sum', passed=ok, score=float(ok),\n"
+            "                          response=str(response))\n"
+            "def load_evaluations(environment=None): return [Suite()]\n"
+        )
+        return env_dir
+
+    class Client:
+        def __init__(self, thinking, response):
+            self._thinking = thinking
+            self._response = response
+
+        def get_run(self, run_id):
+            return {"spec": {"thinking": self._thinking}}
+
+        def chat_stream(self, target, messages, **kwargs):
+            yield self._response
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+
+    # a thinking run: the reasoning is cut, so the grader sees the answer it was trained against.
+    # before the fix the scorer saw the whole `<think>...` string and the case failed.
+    monkeypatch.setattr(
+        "flash.client.client_from_config", lambda: Client(True, "<think>2+2 is 4</think>4")
+    )
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(_suite("thinking", "4"))]) == 0
+
+    # a non-thinking run answering *about* the tag: `strip_think` would cut at the bare mention and
+    # leave "answer: ", so stripping here would fail a correct response.
+    mention = "answer: <think> is a reasoning tag"
+    monkeypatch.setattr("flash.client.client_from_config", lambda: Client(False, mention))
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(_suite("plain", mention))]) == 0
+
+    assert capsys.readouterr().out.count("case sum: PASS") == 2
+
+
+def test_env_eval_grades_raw_when_the_run_spec_is_unreadable(monkeypatch, tmp_path, capsys) -> None:
+    """An unreadable run must not turn a working evaluation into a crash.
+
+    The lookup is a convenience over the plane, and every eval before it graded the raw response.
+    A client that cannot answer -- an old plane with no such route, a network fault -- keeps that
+    behavior and says so, rather than failing the command the user asked for.
+    """
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'reasoning'\n"
+        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def get_run(self, run_id):
+            raise RuntimeError("run metadata is unavailable")
+
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 0
+
+    captured = capsys.readouterr()
+    assert "could not read thinking mode for flash-1" in captured.err
+    assert "case sum: PASS" in captured.out
