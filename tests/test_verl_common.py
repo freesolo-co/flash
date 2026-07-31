@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import os
@@ -565,6 +566,59 @@ def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored():
             child.wait(timeout=10)
         if child.stdout is not None:
             child.stdout.close()
+
+
+def test_kill_process_group_reaps_a_grandchild_that_outlives_the_leader():
+    # the real shape of this failure: the verl trainer dies on the term but its vllm EngineCore
+    # grandchild ignores it. escalating off proc.wait() alone returns the instant the leader is
+    # reaped, leaving the grandchild holding the cuda context -- so drive the escalation off the
+    # group, and prove it by having the leader exit cleanly on SIGTERM.
+    leader_src = (
+        "import subprocess, sys, time\n"
+        "g = subprocess.Popen([sys.executable, '-c',\n"
+        "    \"import signal,time\\n\"\n"
+        "    \"signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n\"\n"
+        "    \"print('gready', flush=True)\\n\"\n"
+        "    \"time.sleep(300)\\n\"], stdout=subprocess.PIPE, text=True)\n"
+        "assert g.stdout.readline().strip() == 'gready'\n"
+        "print(g.pid, flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    leader = subprocess.Popen(
+        [sys.executable, "-c", leader_src],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    grandchild_pid = None
+    try:
+        assert leader.stdout is not None
+        grandchild_pid = int(leader.stdout.readline().strip())
+        started = time.monotonic()
+        vc.kill_process_group(leader)
+        assert leader.poll() is not None
+        # the leader dying is not the property under test -- the grandchild being gone is. poll
+        # rather than assert instantly: sigkill delivery and reaping are asynchronous, so a bare
+        # check here races the kernel and flakes.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:  # pragma: no cover - only when the escalation genuinely fails
+            pytest.fail("grandchild ignoring SIGTERM survived kill_process_group")
+        assert time.monotonic() - started < 60
+    finally:
+        if grandchild_pid is not None:  # pragma: no cover - only on an unexpected failure
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(grandchild_pid, signal.SIGKILL)
+        if leader.poll() is None:  # pragma: no cover - only on an unexpected failure
+            leader.kill()
+            leader.wait(timeout=10)
+        if leader.stdout is not None:
+            leader.stdout.close()
 
 
 def test_grpo_teardown_uses_the_shared_escalating_kill():

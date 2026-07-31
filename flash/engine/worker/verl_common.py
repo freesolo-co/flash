@@ -490,23 +490,61 @@ def run_verl_training(
     return int(proc.returncode)
 
 
+_TEARDOWN_GRACE_S = 10.0
+
+
+def _process_group_alive(pgid: int) -> bool:
+    """true while the group still has a member. signal 0 checks addressability, it delivers nothing."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, this process just may not signal it
+    except OSError:
+        return False
+    return True
+
+
 def kill_process_group(proc: subprocess.Popen) -> None:
-    """signal the child's whole process group, escalating to SIGKILL if it does not exit.
+    """signal the child's whole process group, escalating to SIGKILL if anything survives.
 
     signalling the group rather than the pid is what reaches vllm's EngineCore grandchild; a survivor
-    holds its cuda context and strands the gpu for every later run.
+    holds its cuda context and strands the gpu for every later run. the escalation is driven off the
+    group, not off the direct child: the usual shape of this failure is the trainer dying on the term
+    while the EngineCore ignores it, so waiting only on the child returns before the survivor is gone.
     """
-    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
     try:
-        proc.wait(timeout=10)
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        # already reaped, so there is no group id left to address the survivors by.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_TEARDOWN_GRACE_S)
         return
-    except subprocess.TimeoutExpired:
-        pass
+
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(pgid, signal.SIGTERM)
+
+    deadline = time.monotonic() + _TEARDOWN_GRACE_S
+    # reap the direct child before probing: an unwaited zombie leader is still a group member, so the
+    # liveness check below cannot otherwise tell an empty group from one that is merely unreaped.
     with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=10)
+        proc.wait(timeout=_TEARDOWN_GRACE_S)
+    while _process_group_alive(pgid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if not _process_group_alive(pgid):
+        return
+
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(pgid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=_TEARDOWN_GRACE_S)
+    # sigkill cannot be refused, but delivery and reaping are asynchronous and the caller's next job
+    # wants the gpu already free. wait for the group to drain -- bounded, since a zombie awaiting a
+    # reaper that is not coming stays addressable and there is nothing stronger left to send.
+    drain_deadline = time.monotonic() + _TEARDOWN_GRACE_S
+    while _process_group_alive(pgid) and time.monotonic() < drain_deadline:
+        time.sleep(0.1)
 
 
 # --------------------------- w&b run link (all three verl backends) ---------------------------
