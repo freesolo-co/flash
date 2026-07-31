@@ -98,18 +98,24 @@ def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypa
     keys.advance_key()
     assert keys.active_key() == "secretB"
 
-    assert api.submit_job(
-        "ep-1",
-        {"x": 1},
-        key_fingerprint=owner,
-        deadline_at=4_000_000_000.0,
-    ) == "job-1"
-    assert api.job_status(
-        "ep-1",
-        "job-1",
-        key_fingerprint=owner,
-        deadline_at=4_000_000_000.0,
-    )["status"] == "IN_PROGRESS"
+    assert (
+        api.submit_job(
+            "ep-1",
+            {"x": 1},
+            key_fingerprint=owner,
+            deadline_at=4_000_000_000.0,
+        )
+        == "job-1"
+    )
+    assert (
+        api.job_status(
+            "ep-1",
+            "job-1",
+            key_fingerprint=owner,
+            deadline_at=4_000_000_000.0,
+        )["status"]
+        == "IN_PROGRESS"
+    )
     assert api.cancel_job("ep-1", "job-1", key_fingerprint=owner)["status"] == "CANCELLED"
     assert api.delete_endpoint_for_fingerprint("ep-1", owner) is True
 

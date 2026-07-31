@@ -109,6 +109,7 @@ def _throttle_tree_list() -> None:
             time.sleep(wait)
         _tree_list_last_call = time.monotonic()
 
+
 # Only these top-level dirs are deletable model-artifact phases (``JobSpec.phase``: grpo -> "rl",
 # plus the VL warm-start ``recomb`` recombined adapter). Anything else — ``code/`` snapshots,
 # ``referenced_by/`` lineage markers, telemetry, or an unrecognized future phase — is NEVER a delete
@@ -209,9 +210,7 @@ def _scan_repo(api, repo_id: str) -> tuple[dict[str, list], float | None, set[st
     only, ``ref_recent_ts`` is the newest commit among ``referenced_by/`` markers (warm-start-source
     signal), and ``unknown_tops`` are unrecognized top-level dirs (reported, never deleted)."""
     _throttle_tree_list()
-    entries = api.list_repo_tree(
-        repo_id=repo_id, repo_type="dataset", recursive=True, expand=True
-    )
+    entries = api.list_repo_tree(repo_id=repo_id, repo_type="dataset", recursive=True, expand=True)
     prefixes: dict[str, list] = {}
     ref_recent_ts: float | None = None
     unknown: set[str] = set()
@@ -290,7 +289,9 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
     """Enumerate every ``flashrun-*`` repo and return the aged, undeployed, non-warm-start-source run
     prefixes to delete. Per-repo scan failures (HF rate-limit / transient) are skipped and logged, not
     fatal — the sweep reaps what it could read and tries the rest next cycle."""
-    repos = [d.id for d in api.list_datasets(author=_ARTIFACT_NAMESPACE) if _is_managed_env_repo(d.id)]
+    repos = [
+        d.id for d in api.list_datasets(author=_ARTIFACT_NAMESPACE) if _is_managed_env_repo(d.id)
+    ]
     targets: list[_RunTarget] = []
     unknown_tops: set[str] = set()
     scanned = errored = 0
@@ -328,10 +329,16 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
                     _RunTarget(repo_id=repo, prefix=pfx, run_id=pfx.split("/", 1)[1], age_ts=ts)
                 )
     if unknown_tops:
-        logger.info("repo GC: skipped unrecognized non-artifact dirs (never deleted): %s", sorted(unknown_tops))
+        logger.info(
+            "repo GC: skipped unrecognized non-artifact dirs (never deleted): %s",
+            sorted(unknown_tops),
+        )
     logger.info(
         "repo GC: scanned %d/%d repos (%d unreadable), %d aged undeployed prefix(es) to reap",
-        scanned - errored, len(repos), errored, len(targets),
+        scanned - errored,
+        len(repos),
+        errored,
+        len(targets),
     )
     return targets
 
@@ -410,7 +417,9 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
             # right ahead of delete_folder, so a deploy can't register this run in the confirm->delete
             # gap. If it can't be confirmed now, abort the WHOLE sweep (re-raise) rather than press on
             # deleting other prefixes while an unidentified live adapter may be backed by one of them.
-            fresh, fresh_whole = _confirm_live_set()  # raises -> finally releases, sweep fails closed
+            fresh, fresh_whole = (
+                _confirm_live_set()
+            )  # raises -> finally releases, sweep fails closed
             if (target.repo_id, target.prefix) in fresh or target.repo_id in fresh_whole:
                 logger.warning("repo GC: %s became deployed mid-sweep; skipping", target.prefix)
                 continue

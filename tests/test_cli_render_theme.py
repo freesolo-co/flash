@@ -680,9 +680,7 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
         "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
     }
 
-    stale = dict(
-        base, last_heartbeat={"stage": "rl_step", "step": 1, "ts": _time.time() - 1200}
-    )
+    stale = dict(base, last_heartbeat={"stage": "rl_step", "step": 1, "ts": _time.time() - 1200})
     out = render.run_status(stale)
     assert "last one UPLOADED" in out
     assert "before treating this as a stall" in out
@@ -713,9 +711,7 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     assert render._QUIET_HEARTBEAT_HINT not in out
 
     # a SETUP stage has no step to be stale about -- it gets the warmup/quiet hints instead.
-    setup = dict(
-        base, last_heartbeat={"stage": "sft_initializing", "ts": _time.time() - 1200}
-    )
+    setup = dict(base, last_heartbeat={"stage": "sft_initializing", "ts": _time.time() - 1200})
     assert "last one UPLOADED" not in render.run_status(setup)
 
     # a training stage with no step reported yet has nothing to qualify.

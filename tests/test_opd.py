@@ -807,8 +807,8 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
         write_train_meta=lambda **k: None,
-        wandb_report_to=lambda: [],  # W&B off by default in unit tests
-        wandb_run_info=lambda: {},
+        wandb_report_to=list,  # W&B off by default in unit tests
+        wandb_run_info=dict,
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     # Deterministic knobs: 1 step / 1 prompt / group 1 -> a single sample, forced to skip.
@@ -935,8 +935,8 @@ def _opd_harness(
         write_train_meta=(
             (lambda **k: metas.append(k)) if metas is not None else (lambda **k: None)
         ),
-        wandb_report_to=lambda: [],  # W&B off by default in unit tests
-        wandb_run_info=lambda: {},
+        wandb_report_to=list,  # W&B off by default in unit tests
+        wandb_run_info=dict,
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     monkeypatch.setattr(
@@ -1028,9 +1028,7 @@ def test_opd_train_meta_reports_truncated_rollouts_without_special_diagnostics(m
 def test_opd_truncated_rollouts_bypass_teacher_and_gkd(monkeypatch, capsys):
     from flash.engine.worker import opd as opd_mod
 
-    outputs = [
-        opd_mod.OpdVllmOutput([3], "x", finish_reason="length") for _ in range(13)
-    ]
+    outputs = [opd_mod.OpdVllmOutput([3], "x", finish_reason="length") for _ in range(13)]
     opd_mod = _opd_harness(
         monkeypatch,
         sample_result=None,
@@ -1119,18 +1117,19 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
         is_tool_env=False,
         multi_turn=False,
         package_root=None,
-        dataset=lambda: events.append("dataset")
-        or [{"input": "describe", "image": image}],
-        prompt_messages=lambda _record: events.append("prompt_messages")
-        or [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "describe"},
-                    {"type": "image"},
-                ],
-            }
-        ],
+        dataset=lambda: events.append("dataset") or [{"input": "describe", "image": image}],
+        prompt_messages=lambda _record: (
+            events.append("prompt_messages")
+            or [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image"},
+                    ],
+                }
+            ]
+        ),
     )
     fake_w = SimpleNamespace(
         require_active_env=lambda: events.append("require_active_env") or env,
@@ -1146,9 +1145,7 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
         prefetch_model=lambda *args, **kwargs: events.append("prefetch_model") or 0.0,
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
-    monkeypatch.setattr(
-        opd_mod, "seed_training_rngs", lambda seed: events.append(f"seed:{seed}")
-    )
+    monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: events.append(f"seed:{seed}"))
     monkeypatch.setattr(
         opd_mod,
         "_resolve_opd_knobs",
@@ -1167,7 +1164,7 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
     monkeypatch.setattr(teacher_mod, "TeacherClient", lambda *args, **kwargs: object())
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *args, **kwargs: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda: None)
-    monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(opd_mod, "gpu_diagnostics", dict)
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda: None)
     monkeypatch.setattr(
         transformers.AutoProcessor,
@@ -1218,9 +1215,7 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
         "accounts/fireworks/models/deepseek-v4-pro",
     ],
 )
-def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(
-    monkeypatch, teacher_model
-):
+def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(monkeypatch, teacher_model):
     fake_torch = types.ModuleType("torch")
     fake_torch.manual_seed = lambda _seed: None
     fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
@@ -1232,9 +1227,7 @@ def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(
         is_tool_env=False,
         multi_turn=False,
         dataset=lambda: [{"image": "dataset/red.png"}],
-        prompt_messages=lambda _record: [
-            {"role": "user", "content": [{"type": "image"}]}
-        ],
+        prompt_messages=lambda _record: [{"role": "user", "content": [{"type": "image"}]}],
     )
     train = SimpleNamespace(
         init_from_adapter="",
@@ -1422,9 +1415,7 @@ def test_opd_image_prompt_fingerprint_uses_descriptors_and_teacher_messages():
     }
     first = opd_mod._PromptRecord(**base)
     same_content = opd_mod._PromptRecord(**base)
-    changed_descriptor = opd_mod._PromptRecord(
-        **{**base, "descriptors": ("descriptor-b",)}
-    )
+    changed_descriptor = opd_mod._PromptRecord(**{**base, "descriptors": ("descriptor-b",)})
     changed_teacher = opd_mod._PromptRecord(
         **{
             **base,
@@ -1592,7 +1583,14 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         model, tok_, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = real_resolve_samples_batched(
-            model, tok_, device, samples, knobs, microbatch, backward_scale=backward_scale, **_kwargs
+            model,
+            tok_,
+            device,
+            samples,
+            knobs,
+            microbatch,
+            backward_scale=backward_scale,
+            **_kwargs,
         )
         for (gen, _score, prompt_ids), r in zip(samples, out, strict=True):
             loss_calls.append((len(prompt_ids), gen.completion_text, r.loss is not None))
@@ -1618,8 +1616,8 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
         write_train_meta=lambda **k: meta.update(k),
-        wandb_report_to=lambda: [],
-        wandb_run_info=lambda: {},
+        wandb_report_to=list,
+        wandb_run_info=dict,
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     monkeypatch.setattr(opd_mod, "_opd_teacher_batch_size", lambda _total: 2)
@@ -1980,7 +1978,9 @@ def test_opd_due_checkpoint_is_complete_before_nonfinal_sync(monkeypatch):
 
     monkeypatch.setattr(engine_type, "sync_from_model", _sync)
     monkeypatch.setattr(engine_type, "generate", _generate)
-    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *args, **kwargs: events.append("save_adapter"))
+    monkeypatch.setattr(
+        opd_mod, "_save_adapter", lambda *args, **kwargs: events.append("save_adapter")
+    )
     monkeypatch.setattr(opd_mod, "_save_opd_resume_checkpoint", _save_checkpoint)
     monkeypatch.setattr(
         opd_mod,
@@ -2160,7 +2160,10 @@ def test_opd_final_nondue_step_saves_required_full_state_before_default(monkeypa
 
     opd_mod.run_opd()
 
-    assert events == ["full_state", ("deployable", {"as_default": True, "publish_checkpoint": True})]
+    assert events == [
+        "full_state",
+        ("deployable", {"as_default": True, "publish_checkpoint": True}),
+    ]
     assert len(checkpoints) == 1
     assert checkpoints[0]["opt_steps"] == 1
     assert checkpoints[0]["required"] is True
@@ -3260,8 +3263,8 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
         write_train_meta=lambda **k: None,
-        wandb_report_to=lambda: [],  # W&B off by default in unit tests
-        wandb_run_info=lambda: {},
+        wandb_report_to=list,  # W&B off by default in unit tests
+        wandb_run_info=dict,
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     monkeypatch.setattr(
@@ -3372,8 +3375,8 @@ def test_run_opd_releases_torch_cache_before_vllm_sizing(monkeypatch):
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
         write_train_meta=lambda **k: None,
-        wandb_report_to=lambda: [],
-        wandb_run_info=lambda: {},
+        wandb_report_to=list,
+        wandb_run_info=dict,
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     monkeypatch.setattr(
@@ -3552,7 +3555,9 @@ def test_student_model_continues_warmstart_adapter_in_place(monkeypatch):
     out, rollout_model_source = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
     assert out is live  # the same live adapter, moved to device
     assert moved == ["cpu"]
-    assert rollout_model_source == "Qwen/Qwen3.5-4B"  # continued adapter deploys on the catalog base
+    assert (
+        rollout_model_source == "Qwen/Qwen3.5-4B"
+    )  # continued adapter deploys on the catalog base
     assert calls == []  # no base reload: neither causal nor VL loader is used
 
 
@@ -3720,7 +3725,9 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
     need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
     assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
-    assert not supports_fp8_kv(cheapest_gpu(need))  # ...on the A100 (sm80), which does NOT use fp8 KV
+    assert not supports_fp8_kv(
+        cheapest_gpu(need)
+    )  # ...on the A100 (sm80), which does NOT use fp8 KV
 
 
 def test_opd_oversized_reject_names_the_knobs_to_shrink():
@@ -4324,9 +4331,7 @@ def test_teacher_http_error_diagnostic_omits_opaque_response_body(monkeypatch):
         client.score("P", "hi")
 
     detail = str(exc_info.value)
-    formatted = "".join(
-        traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb)
-    )
+    formatted = "".join(traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb))
     assert exc_info.value.permanent is True
     assert "teacher HTTP 403" in detail
     assert "/completions" in detail
@@ -4917,9 +4922,7 @@ def test_opd_loss_skips_empty_student_group_without_crashing():
     torch = pytest.importorskip("torch")
 
     rows = torch.zeros(1, 8, requires_grad=True)
-    loss = _dense_gkd_loss_from_logits_rows(
-        rows, [2], [([], -1.0), ([0], -2.0)], kl_coef=1.0
-    )
+    loss = _dense_gkd_loss_from_logits_rows(rows, [2], [([], -1.0), ([0], -2.0)], kl_coef=1.0)
     assert loss is not None  # the empty group is ignored; the real group still trains
     loss.backward()
     assert rows.grad is not None
@@ -4952,8 +4955,7 @@ def test_live_kimi_multimodal_teacher_conditions_red_completion_on_image():
         return f"data:image/png;base64,{encoded}"
 
     prompt = (
-        "User: <|media_pad|>\nWhat color is this image? Reply with one lowercase word.\n"
-        "Assistant: "
+        "User: <|media_pad|>\nWhat color is this image? Reply with one lowercase word.\nAssistant: "
     )
     client = TeacherClient(
         os.environ["FIREWORKS_API_KEY"],
@@ -4966,9 +4968,7 @@ def test_live_kimi_multimodal_teacher_conditions_red_completion_on_image():
             (prompt, "red", [data_uri((20, 20, 220))]),
         ]
     )
-    delta = sum(token.logprob for token in red_tokens) - sum(
-        token.logprob for token in blue_tokens
-    )
+    delta = sum(token.logprob for token in red_tokens) - sum(token.logprob for token in blue_tokens)
 
     assert delta > 0.05
 
@@ -5398,9 +5398,7 @@ def test_resolve_samples_batched_truncated_sample_has_no_forward_or_gradients():
         def __call__(self, input_ids, **kwargs):
             self.calls += 1
             return SimpleNamespace(
-                logits=self.w[: input_ids.shape[1]]
-                .unsqueeze(0)
-                .expand(input_ids.shape[0], -1, -1)
+                logits=self.w[: input_ids.shape[1]].unsqueeze(0).expand(input_ids.shape[0], -1, -1)
             )
 
     model = _NoForwardLM()
@@ -5542,9 +5540,7 @@ def test_resolve_image_sample_lazily_processes_vision_inputs_and_extends_token_t
     model = _VisionLM()
     sample = opd_mod._ImageLossSample(
         gen=opd_mod._GenResult(completion_ids=[3], completion_text="a", gen_tokens=1),
-        score=opd_mod._ScoreResult(
-            teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"
-        ),
+        score=opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
         prompt_ids=[1, 99, 99, 2],
         student_messages=[{"role": "user", "content": [{"type": "image"}]}],
         descriptors=(descriptor,),
@@ -5591,9 +5587,7 @@ def test_resolve_image_sample_rejects_rematerialized_prompt_id_mismatch(monkeypa
     model = _TinyLM(torch, T=3, V=8)
     sample = opd_mod._ImageLossSample(
         gen=opd_mod._GenResult(completion_ids=[3], completion_text="a", gen_tokens=1),
-        score=opd_mod._ScoreResult(
-            teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"
-        ),
+        score=opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
         prompt_ids=[1, 99, 2],
         student_messages=[{"role": "user", "content": [{"type": "image"}]}],
         descriptors=("descriptor",),
@@ -5631,12 +5625,14 @@ def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
     groups = [([0, 1], -0.75), ([2], -0.25)]
 
     loss = _dense_gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=0.5)
-    manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(1) - torch.logsumexp(
-        rows, dim=-1
-    )
+    manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(
+        1
+    ) - torch.logsumexp(rows, dim=-1)
     coeff0 = 0.5 * (manual_logps[:2].detach().sum() - groups[0][1]) / 2
     coeff1 = 0.5 * (manual_logps[2:].detach().sum() - groups[1][1])
-    expected = torch.stack([coeff0 * manual_logps[0], coeff0 * manual_logps[1], coeff1 * manual_logps[2]]).mean()
+    expected = torch.stack(
+        [coeff0 * manual_logps[0], coeff0 * manual_logps[1], coeff1 * manual_logps[2]]
+    ).mean()
 
     assert loss is not None
     torch.testing.assert_close(loss, expected)
@@ -5668,12 +5664,8 @@ def test_opd_loss_coefficient_tracks_student_minus_teacher_logprob():
     student_ids = [2]
     rows_hi = torch.zeros(1, V, requires_grad=True)  # uniform logits -> student logprob = -log V
     rows_lo = torch.zeros(1, V, requires_grad=True)
-    hi = _dense_gkd_loss_from_logits_rows(
-        rows_hi, student_ids, [([0], -5.0)], kl_coef=1.0
-    )
-    lo = _dense_gkd_loss_from_logits_rows(
-        rows_lo, student_ids, [([0], -0.5)], kl_coef=1.0
-    )
+    hi = _dense_gkd_loss_from_logits_rows(rows_hi, student_ids, [([0], -5.0)], kl_coef=1.0)
+    lo = _dense_gkd_loss_from_logits_rows(rows_lo, student_ids, [([0], -0.5)], kl_coef=1.0)
     # loss = coeff * student_logprob, student_logprob < 0, and coeff = (s_det - teacher)/1.
     # teacher=-5.0 -> larger coeff -> more-negative loss than teacher=-0.5.
     assert hi is not None
@@ -5702,7 +5694,9 @@ def test_opd_generate_ahead_on_by_default_for_single_turn_text(monkeypatch):
     metas = []
     opd_mod = _opd_harness(monkeypatch, sample_result=_trained, epochs=3, metas=metas)
     monkeypatch.setattr(
-        opd_mod, "_score_many", lambda _t, pendings, **_k: _generate_ahead_ok_score_many(pendings, opd_mod)
+        opd_mod,
+        "_score_many",
+        lambda _t, pendings, **_k: _generate_ahead_ok_score_many(pendings, opd_mod),
     )
     gen_calls = []
     orig = opd_mod._generate_many_vllm
@@ -5742,7 +5736,9 @@ def test_opd_generate_ahead_prefetches_and_generates_each_slice_once(monkeypatch
     metas = []
     opd_mod = _opd_harness(monkeypatch, sample_result=_trained, epochs=3, metas=metas)
     monkeypatch.setattr(
-        opd_mod, "_score_many", lambda _t, pendings, **_k: _generate_ahead_ok_score_many(pendings, opd_mod)
+        opd_mod,
+        "_score_many",
+        lambda _t, pendings, **_k: _generate_ahead_ok_score_many(pendings, opd_mod),
     )
     gen_calls = []
     orig = opd_mod._generate_many_vllm
@@ -5782,11 +5778,11 @@ def test_opd_generate_ahead_skips_prefetch_at_checkpoint_boundary(monkeypatch):
         )
 
     metas = []
-    opd_mod = _opd_harness(
-        monkeypatch, sample_result=_trained, epochs=3, metas=metas, save_every=1
-    )
+    opd_mod = _opd_harness(monkeypatch, sample_result=_trained, epochs=3, metas=metas, save_every=1)
     monkeypatch.setattr(
-        opd_mod, "_score_many", lambda _t, pendings, **_k: _generate_ahead_ok_score_many(pendings, opd_mod)
+        opd_mod,
+        "_score_many",
+        lambda _t, pendings, **_k: _generate_ahead_ok_score_many(pendings, opd_mod),
     )
 
     opd_mod.run_opd()

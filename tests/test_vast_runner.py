@@ -109,7 +109,7 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
     monkeypatch.setenv("VAST_API_KEY", "vk-supersecret")
     monkeypatch.setenv("HF_TOKEN", "hf-worker-token")
     deadline_at = time.time() + 3600
-    payload = _build_payload(builders,_spec(), seed=0, attempt=1, deadline_at=deadline_at)
+    payload = _build_payload(builders, _spec(), seed=0, attempt=1, deadline_at=deadline_at)
     assert payload["phase"] == "sft"
     assert payload["attempt"] == 1
     assert payload["hf_prefix"] == "sft/flash-1700000000-abcd1234"
@@ -156,7 +156,7 @@ def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch
 
     monkeypatch.setenv("VAST_API_KEY", "vk")
     monkeypatch.setenv("HF_TOKEN", "hf")
-    script = builders.build_onstart(_build_payload(builders,_spec(), seed=0, attempt=1))
+    script = builders.build_onstart(_build_payload(builders, _spec(), seed=0, attempt=1))
     # Each closing terminator is preceded by a newline (own line), regardless of payload/src content.
     for term in ("FLASH_PAYLOAD_EOF", "FLASH_BOOTSTRAP_EOF"):
         assert f"\n{term}\n" in script, f"{term} terminator must be on its own line"
@@ -245,7 +245,7 @@ def test_deploy_walks_taken_offers(monkeypatch):
 
     monkeypatch.setattr(vast_api, "create_instance", fake_create)
     offers = [_offer(offer_id=i, machine_id=i, dph_total=0.20 + i * 0.01) for i in (1, 2, 3)]
-    h = _deploy(vast,_spec(), seed=0, offers=offers, attempt=2)
+    h = _deploy(vast, _spec(), seed=0, offers=offers, attempt=2)
     assert rented == [3]
     assert h.instance_id == 4242
     assert h.offer_id == 3
@@ -278,7 +278,7 @@ def test_deploy_walks_documented_non_2xx_rejection(monkeypatch):
     monkeypatch.setattr(vast_api, "request_with_retries", request)
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
 
-    handle = _deploy(vast,_spec(), seed=0, offers=offers, attempt=0)
+    handle = _deploy(vast, _spec(), seed=0, offers=offers, attempt=0)
 
     assert handle.instance_id == 4242
     assert handle.offer_id == 2
@@ -300,7 +300,7 @@ def test_deploy_stops_on_contradictory_create_response(monkeypatch, destroy_conf
         raise err
 
     monkeypatch.setattr(vast_api, "create_instance", create)
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [])
+    monkeypatch.setattr(vast_api, "list_instances", list)
     destroyed_exact = []
     monkeypatch.setattr(
         vast_api,
@@ -314,7 +314,7 @@ def test_deploy_stops_on_contradictory_create_response(monkeypatch, destroy_conf
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
 
     with pytest.raises(UnreconciledCreateError, match="aborting the offer walk"):
-        _deploy(vast,_spec(), seed=0, offers=offers, attempt=0)
+        _deploy(vast, _spec(), seed=0, offers=offers, attempt=0)
 
     assert created == [1]
     # the contradictory response's known contract id is destroyed directly, even when the
@@ -337,9 +337,7 @@ def test_deploy_refuses_primary_creation_below_minimum_deadline_allowance(monkey
     )
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        _deploy(vast,
-            _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0, deadline_at=159.0
-        )
+        _deploy(vast, _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0, deadline_at=159.0)
 
     assert created == []
 
@@ -358,7 +356,7 @@ def test_deploy_success_log_failure_does_not_leak_handle(monkeypatch):
         return _say
 
     monkeypatch.setattr(vast, "make_say", raising_say)
-    h = _deploy(vast,_spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
+    h = _deploy(vast, _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
     assert h.instance_id == 4242
 
 
@@ -385,7 +383,7 @@ def test_deploy_argument_failure_precedes_create_and_cleanup(monkeypatch, argume
     )
 
     with pytest.raises(RuntimeError) as exc_info:
-        _deploy(vast,_spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
+        _deploy(vast, _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
 
     assert exc_info.value is original
     assert create_requests == []
@@ -410,6 +408,7 @@ def test_post_create_baseexception_cleans_and_never_walks_offers(
 
     monkeypatch.setattr(vast_api, "create_instance", create)
     monkeypatch.setattr(vast, "usable_offers", lambda *args, **kwargs: offers)
+
     def time_after_create():
         if created:
             raise interrupt_type("stop")
@@ -428,7 +427,7 @@ def test_post_create_baseexception_cleans_and_never_walks_offers(
     )
 
     with pytest.raises(interrupt_type):
-        _submit(vast,spec, seed=0, deadline_at=20_000.0)
+        _submit(vast, spec, seed=0, deadline_at=20_000.0)
 
     assert created == [1]
     assert destroyed_ids == [4242]
@@ -473,6 +472,7 @@ def test_post_create_preserves_original_baseexception_when_cleanup_raises(
 
     monkeypatch.setattr(vast_api, "create_instance", create)
     monkeypatch.setattr(vast, "usable_offers", lambda *args, **kwargs: offers)
+
     def time_after_create():
         if created:
             raise original
@@ -483,7 +483,7 @@ def test_post_create_preserves_original_baseexception_when_cleanup_raises(
     monkeypatch.setattr(vast, "destroy_run_instances", destroy_label)
 
     with pytest.raises(interrupt_type) as exc_info:
-        _submit(vast,spec, seed=0, deadline_at=20_000.0)
+        _submit(vast, spec, seed=0, deadline_at=20_000.0)
 
     assert exc_info.value is original
     assert created == [1]
@@ -505,7 +505,7 @@ def test_deploy_refreshes_once_when_all_taken(monkeypatch):
     monkeypatch.setattr(
         vast, "usable_offers", lambda *a, **k: [_offer(offer_id=99, machine_id=99, gpu="RTX 4090")]
     )
-    h = _deploy(vast,_spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
+    h = _deploy(vast, _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
     assert h.instance_id == 7
     assert h.offer_id == 99
 
@@ -551,9 +551,7 @@ def test_deploy_rechecks_deadline_before_refreshed_offer_creation(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        _deploy(vast,
-            _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0, deadline_at=200.0
-        )
+        _deploy(vast, _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0, deadline_at=200.0)
 
     assert created == [1]
 
@@ -585,7 +583,7 @@ def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
         lambda: [{"id": 555, "label": label, "start_date": 1699999000.0}],
     )
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
-    h = _deploy(vast,_spec(), seed=0, offers=offers, attempt=2)
+    h = _deploy(vast, _spec(), seed=0, offers=offers, attempt=2)
     assert h.instance_id == 555  # adopted the existing contract, not a fresh rent
     assert h.offer_id == 1
     assert h.started_ts == 1699999000.0  # Codex Mr72L / Cursor MsA6d: real launch time, not now
@@ -614,14 +612,14 @@ def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
         raise e
 
     monkeypatch.setattr(vast_api, "create_instance", fake_create)
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [])  # nothing under our label
+    monkeypatch.setattr(vast_api, "list_instances", list)  # nothing under our label
     # Cursor MsECQ: the abort must proactively destroy this run's instances (kill any phantom)
     destroyed_for = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: destroyed_for.append(rid) or [])
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
     log = io.StringIO()
     with pytest.raises(UnreconciledCreateError, match="aborting the offer walk") as exc_info:
-        _deploy(vast,_spec(), seed=0, offers=offers, attempt=2, log=log)
+        _deploy(vast, _spec(), seed=0, offers=offers, attempt=2, log=log)
     assert rented == [1]  # aborted after the FIRST offer — never rented offer 2
     assert destroyed_for  # destroy_run_instances was called to reap any phantom contract
     assert "provider body secret" not in str(exc_info.value)
@@ -636,9 +634,7 @@ def test_vast_failure_detail_is_bounded_and_redacts_credentials(monkeypatch):
     monkeypatch.setattr(
         vast,
         "_make_hf_file_reader",
-        lambda *_args, **_kwargs: lambda force=False: (
-            "worker failed with token=hf-private-token"
-        ),
+        lambda *_args, **_kwargs: lambda force=False: "worker failed with token=hf-private-token",
     )
     monkeypatch.setattr(
         vast_api,
@@ -691,7 +687,7 @@ def test_deploy_aborts_when_adopted_row_has_unparseable_id(monkeypatch):
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: destroyed_for.append(rid) or [])
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
     with pytest.raises(UnreconciledCreateError, match="aborting the offer walk"):
-        _deploy(vast,_spec(), seed=0, offers=offers, attempt=2)
+        _deploy(vast, _spec(), seed=0, offers=offers, attempt=2)
     assert rented == [1]  # never walked on to offer 2 (no duplicate create)
     assert destroyed_for  # fail-closed: destroy-by-label was attempted before the terminal raise
 
@@ -726,7 +722,7 @@ def test_deploy_adopts_only_exact_label_among_decoys(monkeypatch):
         ],
     )
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
-    h = _deploy(vast,_spec(), seed=0, offers=offers, attempt=2)
+    h = _deploy(vast, _spec(), seed=0, offers=offers, attempt=2)
     assert h.instance_id == 555  # only the exact label is adopted
     assert rented == [1]  # no duplicate create
 
@@ -760,7 +756,7 @@ def test_deploy_decoys_without_exact_match_abort_with_no_second_create(monkeypat
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: destroyed_for.append(rid) or [])
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
     with pytest.raises(UnreconciledCreateError, match="aborting the offer walk"):
-        _deploy(vast,_spec(), seed=0, offers=offers, attempt=2)
+        _deploy(vast, _spec(), seed=0, offers=offers, attempt=2)
     assert rented == [1]  # decoys must not satisfy the reconcile: no second create
     assert destroyed_for
 
@@ -787,9 +783,9 @@ def test_deploy_raises_when_pool_exhausted(monkeypatch):
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [])
     with pytest.raises(vast_api.VastApiError, match="rejected the job"):
-        _deploy(vast,_spec(), seed=0, offers=[_offer()], attempt=0)
+        _deploy(vast, _spec(), seed=0, offers=[_offer()], attempt=0)
     with pytest.raises(vast_api.VastApiError, match="no usable vast offers"):
-        _deploy(vast,_spec(), seed=0, offers=[], attempt=0)
+        _deploy(vast, _spec(), seed=0, offers=[], attempt=0)
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +811,7 @@ def _wire_poll(
         if done is None:
             marker = None
         else:
+
             def auto_marker():
                 done_value = done() if callable(done) else done
                 if done_value is None:
@@ -1912,7 +1909,7 @@ def _wire_submit(monkeypatch, poll_result=None, poll_raises=None):
 
 def test_runner_destroys_on_success(monkeypatch):
     vast, destroyed = _wire_submit(monkeypatch)
-    res = _submit(vast,_spec(), seed=0)
+    res = _submit(vast, _spec(), seed=0)
     assert res.ok
     assert destroyed == [9999]  # the rented instance is torn down
 
@@ -1920,7 +1917,7 @@ def test_runner_destroys_on_success(monkeypatch):
 def test_runner_destroys_on_exception(monkeypatch):
     vast, destroyed = _wire_submit(monkeypatch, poll_raises=KeyboardInterrupt())
     with pytest.raises(KeyboardInterrupt):
-        _submit(vast,_spec(), seed=0)
+        _submit(vast, _spec(), seed=0)
     assert destroyed == [9999]  # destroyed even on interrupt
 
 
@@ -1932,7 +1929,7 @@ def test_runner_destroys_when_handle_persist_fails(monkeypatch):
         raise RuntimeError("db down")
 
     with pytest.raises(RuntimeError, match="db down"):
-        _submit(vast,_spec(), seed=0, on_handle=boom)
+        _submit(vast, _spec(), seed=0, on_handle=boom)
     assert destroyed == [9999]
 
 
@@ -1958,7 +1955,7 @@ def test_submit_teardown_warns_on_unconfirmed_destroy_without_raising(monkeypatc
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
 
     with caplog.at_level(logging.WARNING):
-        res = _submit(vast,_spec(), seed=0)  # the finally must not raise on False
+        res = _submit(vast, _spec(), seed=0)  # the finally must not raise on False
     assert res.ok
     assert any("teardown unconfirmed" in r.message for r in caplog.records), (
         "an unconfirmed teardown in the primary path must emit an operator-visible warning"
@@ -1990,7 +1987,7 @@ def test_submit_unconfirmed_teardown_escalates_to_run_scoped_reap(monkeypatch):
     reaped = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
 
-    res = _submit(vast,_spec(), seed=0)
+    res = _submit(vast, _spec(), seed=0)
     assert res.ok  # the successful seed still returns
     assert reaped == [_spec().run_id], (
         "an unconfirmed teardown must escalate to a run-scoped label reap"
@@ -2017,7 +2014,7 @@ def test_submit_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
     reaped = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
 
-    assert _submit(vast,_spec(), seed=0).ok
+    assert _submit(vast, _spec(), seed=0).ok
     assert reaped == [], "a confirmed teardown must NOT trigger the run-scoped reap"
 
 
@@ -2047,7 +2044,7 @@ def test_submit_no_reap_when_rejection_log_raises_baseexception(monkeypatch):
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
 
     with pytest.raises(KeyboardInterrupt) as exc_info:
-        _submit(vast,_spec(), seed=0)
+        _submit(vast, _spec(), seed=0)
     assert exc_info.value is original
     assert reaped == []  # definitive rejection rented nothing: no run-label reap
 
@@ -2063,7 +2060,7 @@ def test_submit_no_reap_when_failure_precedes_any_create(monkeypatch):
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
 
     with pytest.raises(vast_api.VastApiError, match="no usable vast offers"):
-        _submit(vast,_spec(), seed=0)
+        _submit(vast, _spec(), seed=0)
     assert reaped == []
 
 
@@ -2097,7 +2094,7 @@ def test_submit_teardown_cleanup_baseexception_preserves_original_and_still_reap
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
 
     with pytest.raises(KeyboardInterrupt) as exc_info:
-        _submit(vast,_spec(), seed=0)
+        _submit(vast, _spec(), seed=0)
     assert exc_info.value is original
     assert reaped == [_spec().run_id]
 
@@ -2128,7 +2125,7 @@ def test_submit_teardown_cleanup_baseexception_reraised_when_no_original(monkeyp
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
 
     with pytest.raises(KeyboardInterrupt) as exc_info:
-        _submit(vast,_spec(), seed=0)
+        _submit(vast, _spec(), seed=0)
     assert exc_info.value is cleanup
     assert reaped == [_spec().run_id]
 
@@ -2167,7 +2164,7 @@ def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
         spec.gpu, "type", "cheapest"
     )  # a policy word that never reached the allocator
     with pytest.raises(vast_api.VastApiError, match="concrete gpu class"):
-        _submit(vast,spec, seed=0)
+        _submit(vast, spec, seed=0)
 
 
 def test_submit_uses_transient_concrete_gpu_type_for_exact_search(monkeypatch):
