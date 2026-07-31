@@ -306,6 +306,25 @@ def test_env_test_partial_zero_gold_answers_warn_but_pass(monkeypatch, tmp_path,
     assert "overall: PASS" in captured.out
 
 
+def test_env_test_negative_reward_scale_is_not_a_zero_reward_grader(monkeypatch, tmp_path, capsys):
+    # a grader scaled -1 for a correct reference and -2 for an incorrect completion still separates
+    # them, which is all GRPO's relative advantage needs. counting every non-positive reward as a
+    # zero made the gate reject those environments outright (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[{"input": "what is 2 + 2?", "output": "4"}, {"input": "2 + 3?", "output": "5"}],
+        reward=-1.0,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    # the advisory warning still fires -- it only advises -- but the run-wide gate does not.
+    assert "replay gold answer scored low (reward=-1.000000)" in captured.err
+    assert "scored zero" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
 def test_env_test_non_text_sft_completion_uses_echo(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     env = _NonTextSftEnv()
