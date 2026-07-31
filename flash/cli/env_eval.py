@@ -166,8 +166,15 @@ def _live_deployment(client, run_id: str) -> dict | None:
         # predecessor for exactly this reason (`_previous_ready_deployment`).
         if listed.get("state") not in _READY_DEPLOYMENT_STATES:
             previous = listed.get("previous_deployment")
-            if isinstance(previous, dict) and previous.get("state") in _READY_DEPLOYMENT_STATES:
-                listed = previous
+            if not isinstance(previous, dict) or previous.get("state") not in (
+                _READY_DEPLOYMENT_STATES
+            ):
+                # a first rollout has no predecessor to fall back to, so nothing is serving yet.
+                # returning the busy record anyway handed back the INCOMING revision and graded
+                # weights that were not answering requests (cursor[bot]). the caller reports the
+                # run as undeployed, which is what "still coming up" means to an evaluation.
+                return None
+            listed = previous
         # the listing omits undeployed/dry_run rows, so anything here is servable.
         if not listed.get("run_id") and entry.get("run_id"):
             listed = {**listed, "run_id": entry["run_id"]}
