@@ -1332,6 +1332,50 @@ def test_evaluation_sidecars_do_not_share_a_sibling_module_name(tmp_path) -> Non
     assert beta.cases()[0].input == "BETA"
 
 
+def test_a_sidecar_sibling_wins_over_an_unrelated_module_already_cached(tmp_path) -> None:
+    """sys.modules is consulted before sys.path, so a cached `helper` must be displaced.
+
+    A process holding an unrelated top-level `helper` handed it to a sidecar importing its own
+    sibling of that name: the suite graded with another module's constants, and no import error
+    ever surfaced. `_forget_sidecar_siblings` could not correct it -- the name was present before
+    the scope, so the loop never examined it.
+    """
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "helper.py").write_text("GOLD = 'UNRELATED'\n")
+    sys.path.insert(0, str(unrelated))
+    try:
+        import helper as preexisting
+
+        assert preexisting.GOLD == "UNRELATED"
+    finally:
+        sys.path.remove(str(unrelated))
+
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment():\n    return None\n")
+    (env_dir / "helper.py").write_text("GOLD = 'OWN-SIBLING'\n")
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'shadowed'\n"
+        "    def cases(self):\n"
+        "        from helper import GOLD\n"
+        "        return [EvalCase(id='c', input=GOLD, expected=GOLD)]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    try:
+        suite = load_evaluation_suites(env_dir)[0]
+        # the sidecar's own sibling, not the module the process already had cached
+        assert suite.cases()[0].input == "OWN-SIBLING"
+        # and the displaced module is handed back to the rest of the process untouched
+        assert sys.modules["helper"] is preexisting
+        assert sys.modules["helper"].GOLD == "UNRELATED"
+    finally:
+        sys.modules.pop("helper", None)
+
+
 def test_a_sidecar_load_leaves_unrelated_cached_modules_alone(tmp_path) -> None:
     # the control for the scope of the isolation. only modules resolving to the package directory
     # are dropped: evicting a stdlib or third-party module the sidecar happened to import first
