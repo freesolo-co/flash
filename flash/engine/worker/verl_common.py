@@ -10,6 +10,7 @@ on top.
 
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
 import json
@@ -26,9 +27,14 @@ from collections.abc import Callable
 # base: the opd plugin patches 0.8.0 internals and imports verl.trainer.main_ppo_sync, which verl
 # deleted after 0.8.0, and opd's exact-version gate reads the version file this branch pins to the
 # release value.
-VERL_REQUIREMENT = (
-    "verl @ git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
+VERL_REQUIREMENT_NAME = "verl"
+VERL_REQUIREMENT_URL = (
+    "git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
 )
+# the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
+# same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
+# installed.
+VERL_REQUIREMENT = f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}"
 
 
 def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
@@ -142,6 +148,17 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
         # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
         subprocess.run(["uv", "venv", venv], check=True)
+        # the SAME three overrides Dockerfile.worker writes, for the same reason: this pin set
+        # deliberately violates three declared ceilings, and a bare pin cannot break any of them --
+        # a pin is a constraint the resolver must satisfy alongside the declaration, so the pair is
+        # simply unsatisfiable and the install fails outright. only --override makes uv IGNORE the
+        # declaration. all three lines are required; dropping any one leaves the set unsatisfiable:
+        #   verl + transferqueue declare numpy<2.0.0  -> vllm 0.19.1 needs numpy>=2
+        #   verl[vllm] declares vllm>=0.8.5,<=0.12.0  -> flash needs 0.19.1 for the Qwen3.5 archs
+        #   vllm declares xgrammar>=0.1.32            -> structured opd gates on EXACTLY 0.1.25
+        overrides = os.path.join(workdir, "verl-overrides.txt")
+        with open(overrides, "w") as f:
+            f.write("numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n")
         subprocess.run(
             [
                 "uv",
@@ -149,7 +166,26 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "install",
                 "--python",
                 py,
-                VERL_REQUIREMENT,
+                "--override",
+                overrides,
+                # the [vllm] extra, matching Dockerfile.worker's VERL_SPEC. verl's bare
+                # install_requires omits vllm, and every entrypoint flash launches needs it:
+                # main_ppo/main_ppo_sync set rollout.name=vllm.
+                f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
+                "vllm==0.19.1",
+                "numpy==2.2.6",
+                # NOT transitively guaranteed: verl imports these at MODULE level on the launch path
+                # (main_ppo -> ppo.ray_trainer -> rollout.llm_server imports cachetools, and
+                # rollout.utils imports uvicorn + fastapi), yet declares none of them. vllm happens
+                # to pull cachetools and fastapi today, but that is vllm's dependency choice, not a
+                # contract verl states -- name them so a vllm respin cannot silently break launch.
+                "cachetools",
+                "uvicorn",
+                "fastapi",
+                # opd's entrypoint calls tq.init()/tq.close(); absent from verl's setup.py.
+                "TransferQueue==0.1.7",
+                # older raises AttributeError on PyArrow PyExtensionType.
+                "datasets>=4.7,<6",
                 "liger-kernel",
                 "bitsandbytes>=0.49",
                 "qwen-vl-utils",
@@ -192,6 +228,135 @@ def resolve_verl_loggers(python_bin: str) -> list[str]:
         )
         return ["console"]
     return ["console", "wandb"]
+
+
+def resolve_verl_device_capability(python_bin: str) -> tuple[int, int] | None:
+    """device 0's ``(major, minor)`` cuda capability as the VERL interpreter sees it, or None.
+
+    probed in verl's interpreter rather than flash's because verl owns the rollout engine and pins
+    its own torch/vllm stack, and both callers below are deciding what that stack can do. None means
+    the probe could not answer -- no cuda, no torch, a hung import -- and every caller must read it
+    as "leave the default alone" rather than guessing a workaround onto an unknown card.
+    """
+    probe = (
+        "import torch;"
+        "print(tuple(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else ())"
+    )
+    try:
+        out = subprocess.run(
+            [python_bin, "-c", probe], capture_output=True, text=True, timeout=120
+        )
+        cc = ast.literal_eval((out.stdout or "").strip().splitlines()[-1])
+        return (int(cc[0]), int(cc[1]))
+    except Exception as e:
+        print(f"[verl] device capability probe skipped: {e}")
+        return None
+
+
+def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
+    """whether this GPU must run the rollout eagerly instead of capturing cuda graphs.
+
+    vllm 0.19.1 is pinned on BOTH the baked verl venv and the fallback interpreter, so its
+    graph-capture defects are the same ones the retired trl driver worked around: aot_compile on
+    Ampere sm86 and a triton slot-mapping illegal-memory-access during capture. That driver only
+    trusted graphs on the architectures it had validated -- ``{(8, 0), (9, 0)}`` plus Blackwell --
+    and forced eager everywhere else. Nothing about that is trl-specific: it is a property of the
+    vllm build and the card, and verl drives the same engine.
+
+    verl is strictly MORE aggressive than the default that crashed: ``rollout.enforce_eager``
+    defaults False (``workers/config/rollout.py:195``) and its async server hardcodes
+    ``cudagraph_mode=FULL_AND_PIECEWISE`` (``vllm_async_server.py:237-241``) where trl asked only for
+    ``FULL_DECODE_ONLY``. So an unvalidated card now captures MORE graphs than the configuration
+    already known to fail on it. RTX 4090 (sm89) is the catalog's ``recommended_gpu`` for the small
+    models, so this is the default GRPO route, not an exotic one.
+
+    One knob is enough and cannot fight verl's: vllm 0.19.1 resolves ``enforce_eager`` LAST, forcing
+    ``compilation_config.mode=NONE`` and ``cudagraph_mode=NONE`` regardless of what was requested
+    (``config/vllm.py:847-853`` and ``:1024-1029``). Overriding ``cudagraph_mode`` instead would
+    leave torch.compile on, which is the other half of what sm86 dies in.
+
+    B200 (sm100) is deliberately NOT eager -- the trl path returned early there and kept vllm's own
+    default, and the b200 rollout work depends on graphs.
+
+    An unanswerable probe (``cc is None``) leaves verl's default in place rather than guessing eager
+    onto an unknown card.
+    """
+    if cc is None:
+        return False
+    major, minor = cc
+    if (major, minor) in {(8, 0), (9, 0)} or major in (10, 12):
+        return False
+    print(
+        f"[verl] sm{major}{minor}: enforce_eager=True for the rollout (vllm 0.19.1 graph capture is "
+        "unvalidated on this arch: aot_compile / triton slot-mapping failures)"
+    )
+    return True
+
+
+def resolve_blackwell_attention_backends(
+    python_bin: str, cc: tuple[int, int] | None
+) -> tuple[str | None, str | None]:
+    """the rollout ``(attention_backend, mm_encoder_attn_backend)`` this GPU needs, or ``(None, None)``.
+
+    vLLM 0.19.1 picks both by capability, and on Blackwell both defaults are wrong:
+
+    * **decoder.** ``_get_backend_priorities`` (vllm/platforms/cuda.py:99-111) heads its non-MLA list
+      with FLASH_ATTN for every arch except cc-major 10, and FlashAttention validates at
+      ``>= (8, 0)`` -- so sm120 (RTX 5090 / RTX Pro 6000) selects it, and its prebuilt PTX is
+      unreliable on consumer Blackwell hosts, which surfaces as SILENT EMPTY ROLLOUTS rather than a
+      crash. Pin FLASHINFER, which the same table already prefers on B200. flashinfer can install yet
+      be ABI-broken against this torch, so gate on the import and fall back to TRITON_ATTN: a
+      registered, PTX-independent decoder backend that trains on the 5090. NOT TORCH_SDPA -- that tag
+      is ``""`` in the 0.19.1 registry (ViT-only) and raises at decoder backend validation.
+    * **ViT.** ``get_supported_vit_attn_backends`` (cuda.py:344-351) heads its list with FLASH_ATTN on
+      every cc>=8.0 card, and on Blackwell that routes to vLLM's CUTE flash-attn, which is
+      unimportable against every published ``nvidia-cutlass-dsl``: the vendored cute needs
+      ``cutlass.cute.core.ThrMma`` (<=4.5.x) while ``vit_attn_wrappers`` needs
+      ``cutlass._mlir_helpers`` (>=4.6.0) -- the two never coexist, so the first ViT attention aborts
+      and takes the rollout with it (a version pin cannot fix it; measured 2026-07-07). A VL model
+      builds its vision tower even for a text-only rollout, so this reaches text-only GRPO too.
+      ``get_vit_attn_backend`` honors an explicit backend unconditionally (cuda.py:367-373), and
+      TORCH_SDPA is a supported ViT backend on cc>=8.0, so pinning it sidesteps the CUTE import. The
+      decoder attention is unaffected -- that is chosen separately, above.
+
+    The flashinfer probe runs in the VERL interpreter, not flash's: verl owns the rollout engine and
+    pins its own vllm stack, so flash's ``import flashinfer`` would answer for the wrong
+    environment. A failed flashinfer probe degrades to TRITON_ATTN rather than leaving the fragile
+    default in place; an unanswerable capability probe (``cc is None``) leaves vllm's defaults alone.
+
+    Returns ``(None, None)`` off Blackwell, where vLLM's own defaults are correct.
+    """
+    if cc is None:
+        return (None, None)
+    major = cc[0]
+    if major not in (10, 12):
+        return (None, None)
+    try:
+        has_flashinfer = (
+            subprocess.run(
+                [python_bin, "-c", "import flashinfer"], capture_output=True, timeout=120
+            ).returncode
+            == 0
+        )
+    except Exception as e:  # a hung/failed import must not wedge the launch -> treat as unavailable
+        print(f"[verl] flashinfer probe failed ({e}); treating it as unavailable")
+        has_flashinfer = False
+    decoder = "FLASHINFER" if has_flashinfer else "TRITON_ATTN"
+    if not has_flashinfer:
+        print(
+            f"[verl] sm{major}0 (Blackwell): flashinfer is not importable in the verl interpreter "
+            "-> attention_backend=TRITON_ATTN (PTX-independent registered decoder backend)"
+        )
+    else:
+        print(
+            f"[verl] sm{major}0 (Blackwell): attention_backend=FLASHINFER "
+            "(flash-attn PTX is unreliable on consumer Blackwell -> empty-rollout failures)"
+        )
+    print(
+        f"[verl] sm{major}0 (Blackwell): mm_encoder_attn_backend=TORCH_SDPA "
+        "(vllm 0.19.1 ViT CUTE flash-attn is unimportable vs every nvidia-cutlass-dsl)"
+    )
+    return (decoder, "TORCH_SDPA")
 
 
 def resolve_checkpoint_actor_dir(step_dir: str) -> str:
@@ -584,8 +749,8 @@ def parse_wandb_link(line: str) -> dict | None:
 
 
 # --------------------------- per-step grpo metrics (verl -> `flash runs log -f`) ---------------------------
-# trl feeds `metrics_last` from a TrainerCallback (heartbeat.make_reward_heartbeat_callback), which
-# verl cannot use: its trainer runs out of process. verl's LocalLogger prints exactly one line per
+# an in-process trainer would feed `metrics_last` from a TrainerCallback, which verl cannot host:
+# its trainer runs out of process. verl's LocalLogger prints exactly one line per
 # optimizer update -- "step:N - key:value - key:value" over every scalar metric -- so the parent
 # reconstructs the same backlog from that line. the payload schema is the CLI's, not verl's: keys
 # below are what flash/cli/commands.py:_FOLLOW_METRIC_FIELDS renders.

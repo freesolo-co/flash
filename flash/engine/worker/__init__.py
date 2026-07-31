@@ -36,21 +36,11 @@ from flash.engine.worker.decoding import (
     thinking_text,
 )
 from flash.engine.worker.finalize import write_train_meta
-from flash.engine.worker.gpu_setup import (
-    finalize_alloc_conf_for_sleep,
-    force_vit_sdpa_on_blackwell,
-    force_vllm_backend_for_sm120,
-    patch_trl_colocate_llm_kwargs,
-)
 from flash.engine.worker.grpo import (
-    _grpo_is_no_op_failure,
-    _grpo_resume_already_complete,
     build_grpo_prompt_dataset,
-    compute_grpo_batching,
     grpo_mask_truncated_completions,
     grpo_overrides,
     resolve_grpo_prompts_per_step,
-    rl_per_device_comps,
 )
 from flash.engine.worker.heartbeat import (
     _HB_LOCK,
@@ -65,7 +55,6 @@ from flash.engine.worker.heartbeat import (
     _STEP_GPU_DIAG_INTERVAL_S,
     LATEST_GRPO_METRICS_LAST,
     heartbeat,
-    make_reward_heartbeat_callback,
     make_sft_heartbeat_callback,
 )
 from flash.engine.worker.hf import (
@@ -120,7 +109,6 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
-    grpo_sleep_mode,
     grpo_use_reentrant,
     is_cuda_oom,
     liger_on,
@@ -382,7 +370,6 @@ def main():
         # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
         _restrict_fla_gdn_autotune_on_blackwell()
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
-        finalize_alloc_conf_for_sleep()
         load_mega_cache()
         handler()
         # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
@@ -476,8 +463,6 @@ __all__ = [
     "_flash_attn_3_available",
     "_flash_attn_available",
     "_force_fla_triton_gdn_on_sm100",
-    "_grpo_is_no_op_failure",
-    "_grpo_resume_already_complete",
     "_hf_upload",
     "_init_adapter_model",
     "_latest_checkpoint_dir",
@@ -497,14 +482,10 @@ __all__ = [
     "assert_lora_applied",
     "backend_seed",
     "build_grpo_prompt_dataset",
-    "compute_grpo_batching",
     # gpu/backend setup
     "disable_liger_grpo_torch_compile",
     "error_artifact_name",
-    "finalize_alloc_conf_for_sleep",
     "flush_optional_uploads",
-    "force_vit_sdpa_on_blackwell",
-    "force_vllm_backend_for_sm120",
     "free_gpu",
     "fused_optim_name",
     "gpu_diagnostics",
@@ -512,7 +493,6 @@ __all__ = [
     "graded_text",
     "grpo_mask_truncated_completions",
     "grpo_overrides",
-    "grpo_sleep_mode",
     "grpo_use_reentrant",
     "heartbeat",
     "hf_api",
@@ -528,12 +508,10 @@ __all__ = [
     "main",
     "make_checkpoint_upload_callback",
     "make_lora",
-    "make_reward_heartbeat_callback",
     "make_sft_heartbeat_callback",
     "model_revision_kwargs",
     "optimal_attn_impl",
     "patch_grpo_mask_aware_lm_head",
-    "patch_trl_colocate_llm_kwargs",
     "prefetch_model",
     "prepare_fresh_lora_base",
     "prompt_opens_thinking",
@@ -543,7 +521,6 @@ __all__ = [
     "require_active_env",
     "require_vllm_for_rollout_func",
     "resolve_grpo_prompts_per_step",
-    "rl_per_device_comps",
     "run_opd",
     "run_rl",
     "run_sft",

@@ -39,7 +39,6 @@ updates:
       - dependency-name: torch
       - dependency-name: vllm
       - dependency-name: transformers
-      - dependency-name: trl
       - dependency-name: peft
       - dependency-name: bitsandbytes
       - dependency-name: accelerate
