@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import math
 import re
 import shlex
 import sys
@@ -115,6 +116,30 @@ _HELP_OPTIONS: list[tuple[str, str]] = [
     ("--debug", "show full tracebacks on error"),
     ("-v, --verbose", "increase log verbosity (-v info, -vv debug)"),
 ]
+
+
+def _wait_seconds(value: str) -> float:
+    """Parse a --wait timeout, rejecting the values that would never time out.
+
+    bare `float` accepts `nan` and `inf`. a nan deadline makes every `remaining <= 0` comparison
+    false, so the poll loop runs forever while the user believes they set a bound. reject both, and
+    reject negatives, at parse time rather than letting the wait path inherit an unusable deadline.
+    """
+    try:
+        seconds = float(value)
+    except ValueError:
+        # `--wait` takes an OPTIONAL value, so `deploy --wait RUN_ID` hands the run id here rather
+        # than leaving it for the positional. argparse cannot give the token back, so name the real
+        # cause: "invalid float value: 'flash-1'" reads like the run id was mistyped.
+        raise argparse.ArgumentTypeError(
+            f"expected a number of seconds, got {value!r}. if {value!r} is the run id, put it "
+            f"before the flag (`deploy {value} --wait`) or give --wait an explicit timeout"
+        ) from None
+    if not math.isfinite(seconds):
+        raise argparse.ArgumentTypeError(f"--wait needs a finite number of seconds, got {value!r}")
+    if seconds < 0:
+        raise argparse.ArgumentTypeError(f"--wait cannot be negative, got {value!r}")
+    return seconds
 
 
 def _friendly_message(message: str) -> str:
@@ -504,6 +529,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
     )
     deploy.add_argument("--dry-run", action="store_true")
+    deploy.add_argument(
+        "--wait",
+        nargs="?",
+        type=_wait_seconds,
+        const=1800.0,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "block until the requested revision is ready or failed (default timeout 1800s). "
+            "without it, deploy returns while the revision is still queued"
+        ),
+    )
     deploy.set_defaults(func=cmd_deploy)
 
     undeploy = models_sub.add_parser("undeploy", help="tear down a run's serving endpoint")
