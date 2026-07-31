@@ -517,7 +517,12 @@ def _iter_env_sidecar_files(
                     f"{sidecar}: invalid evaluation sidecar syntax: {exc.msg}"
                 ) from exc
             imported_modules: set[str] = set()
-            for node in tree.body:
+            # walk the whole tree, not just tree.body: the loader deliberately keeps the package
+            # dir on sys.path so a sidecar can import its helpers lazily inside cases() or score()
+            # (flash/envs/evaluations.py). scanning only top-level nodes skips exactly that
+            # pattern, so `env test` passes locally and the pushed environment is missing the
+            # helper the sidecar imports the moment it grades a case.
+            for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     imported_modules.update(alias.name.split(".", 1)[0] for alias in node.names)
                 elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
