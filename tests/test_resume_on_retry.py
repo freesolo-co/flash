@@ -688,7 +688,7 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
         lambda run_id: gc_calls.append(run_id) or [],
     )
 
-    spec = _spec(**{"type": "A10"})
+    spec = _spec(type="A10")
     _seed_status(orch, spec)
     log = io.StringIO()
 

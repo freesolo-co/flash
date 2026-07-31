@@ -325,13 +325,9 @@ def test_malformed_blocks_fail_clearly(tmp_path):
     with pytest.raises(ValueError, match="expected an object"):
         mm.normalize_prompt_images({}, [{"role": "user", "content": ["bad"]}], root)
     with pytest.raises(ValueError, match="missing text"):
-        mm.normalize_prompt_images(
-            {}, [{"role": "user", "content": [{"type": "text"}]}], root
-        )
+        mm.normalize_prompt_images({}, [{"role": "user", "content": [{"type": "text"}]}], root)
     with pytest.raises(ValueError, match="missing image source"):
-        mm.normalize_prompt_images(
-            {}, [{"role": "user", "content": [{"type": "image_url"}]}], root
-        )
+        mm.normalize_prompt_images({}, [{"role": "user", "content": [{"type": "image_url"}]}], root)
     with pytest.raises(ValueError, match="unsupported content block"):
         mm.normalize_prompt_images(
             {}, [{"role": "user", "content": [{"type": "audio", "audio": "x"}]}], root
@@ -378,9 +374,7 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
         mm.decode_image_descriptors([descriptor], root)
 
 
-def test_total_decoded_budget_is_checked_before_any_image_load_or_conversion(
-    monkeypatch, tmp_path
-):
+def test_total_decoded_budget_is_checked_before_any_image_load_or_conversion(monkeypatch, tmp_path):
     root, _image = _package(tmp_path)
     data = _png_bytes()
     descriptors = [mm.normalize_image_source(data, root), mm.normalize_image_source(data, root)]
@@ -491,9 +485,7 @@ def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
     image_example = {"input": "color?", "metadata": {"mixed": 7}}
     prompts = [
         {
-            "prompt": [
-                {"role": "user", "content": [{"type": "text", "text": "text?"}]}
-            ],
+            "prompt": [{"role": "user", "content": [{"type": "text", "text": "text?"}]}],
             "images": [],
             "example": text_example,
         },
@@ -513,9 +505,7 @@ def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
 
 
 def test_single_turn_conversational_completion_keeps_text_reward_semantics():
-    completion = [
-        {"role": "assistant", "content": [{"type": "text", "text": "red"}]}
-    ]
+    completion = [{"role": "assistant", "content": [{"type": "text", "text": "red"}]}]
     assert mm.assistant_completion_text(completion) == "red"
 
 
@@ -636,9 +626,7 @@ def test_multimodal_prompt_key_preserves_message_metadata_in_index():
     first_example = {"answer": "first"}
     second_example = {"answer": "second"}
     first_prompt = [{"role": "user", "name": "first-viewer", "content": [{"type": "image"}]}]
-    second_prompt = [
-        {"role": "user", "name": "second-viewer", "content": [{"type": "image"}]}
-    ]
+    second_prompt = [{"role": "user", "name": "second-viewer", "content": [{"type": "image"}]}]
     prompts = [
         {"prompt": first_prompt, "images": [descriptor], "example": first_example},
         {"prompt": second_prompt, "images": [descriptor], "example": second_example},
@@ -752,10 +740,7 @@ def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
 
     source = inspect.getsource(rl.run_rl)
     guard = "if multimodal and not is_multi_turn:"
-    suppression = (
-        '_gen_kwargs["logit_bias"] = '
-        "{resolve_image_pad_token_id(processor, tok): -100.0}"
-    )
+    suppression = '_gen_kwargs["logit_bias"] = {resolve_image_pad_token_id(processor, tok): -100.0}'
 
     assert guard in source
     assert suppression in source
@@ -817,9 +802,7 @@ def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
     multi_turn = SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
-        environment=SimpleNamespace(
-            id=str(env_file), resolved_sha="", params={}, multi_turn=True
-        ),
+        environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}, multi_turn=True),
         train=SimpleNamespace(teacher_model="kimi-k2.6"),
     )
 
@@ -884,9 +867,7 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
             "environment": {
                 "id": "local",
                 "params": {
-                    "records": [
-                        {"input": "color?", "output": "red", "image": "dataset/red.png"}
-                    ]
+                    "records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]
                 },
             },
             "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},

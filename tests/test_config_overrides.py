@@ -11,7 +11,7 @@ BASE = (
     'model = "Qwen/Qwen3.5-4B"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-    '[train]\nepochs = 1\nmax_examples = 100\n'
+    "[train]\nepochs = 1\nmax_examples = 100\n"
     '[gpu]\ntype = "B200"\n'
 )
 

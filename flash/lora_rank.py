@@ -18,6 +18,7 @@ class ServingPreflightError(ValueError):
     """Serving-path preflight rejection. Homed here (dependency-light) so unstructured
     preparation can raise/catch it without importing the heavy flash.serve.preflight module."""
 
+
 if TYPE_CHECKING:
     from flash.spec import JobSpec
 

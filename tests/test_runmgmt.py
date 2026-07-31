@@ -370,9 +370,7 @@ def test_status_sanitizer_preserves_metric_backlog_and_bounds_other_lists():
     import flash.runner as runner
 
     metrics = [{"step": step, "reward": step / 1025} for step in range(1025)]
-    sanitized = runner._sanitize_status_value(
-        {"metrics_last": metrics, "other": list(range(32))}
-    )
+    sanitized = runner._sanitize_status_value({"metrics_last": metrics, "other": list(range(32))})
 
     assert len(sanitized["metrics_last"]) == 1024
     assert sanitized["metrics_last"][0]["step"] == 1
@@ -1984,7 +1982,7 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(runner, "_mark_warmstart_source", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner, "effective_spec_from_status", lambda _status, **_kwargs: spec)
-    monkeypatch.setattr(providers, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers, "configured_providers", list)
     monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
     resubmit_attempted = {"value": False}
@@ -2019,7 +2017,9 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     # recover_runs) so a slow/outage-hit provider teardown can't block the startup path; check
     # for the resubmit-loop thread specifically rather than asserting the full thread list.
     assert (runtime._deferred_resubmit_loop, (spec,), True) in started
-    drain_calls = [args for target, args, _daemon in started if target.__name__ == "_drain_cleanup_remotes_bg"]
+    drain_calls = [
+        args for target, args, _daemon in started if target.__name__ == "_drain_cleanup_remotes_bg"
+    ]
     assert drain_calls == [(spec.run_id,)]
 
 
@@ -2221,6 +2221,7 @@ def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypat
         return read
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+
     def call():
         return lifecycle._completed_attempt_metrics(
             spec,
@@ -2229,6 +2230,7 @@ def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypat
             launch_floor=100.0,
             deadline_at=200.0,
         )
+
     if pending:
         with pytest.raises(lifecycle._CompletedAttemptPending, match=r"metrics\.json"):
             call()

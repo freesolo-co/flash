@@ -151,8 +151,12 @@ def test_huggingface_hub_floor_is_in_lockstep():
     docker_hf = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "huggingface_hub"]
     worker_hf = [d for d in WORKER_DEPS if kf._pkg_name(d) == "huggingface_hub"]
     # Exactly one pin per source, else a duplicate/drifted entry could hide behind the first match.
-    assert len(docker_hf) == 1, f"expected one huggingface_hub pin in Dockerfile.worker, found {docker_hf}"
-    assert len(worker_hf) == 1, f"expected one huggingface_hub pin in WORKER_DEPS, found {worker_hf}"
+    assert len(docker_hf) == 1, (
+        f"expected one huggingface_hub pin in Dockerfile.worker, found {docker_hf}"
+    )
+    assert len(worker_hf) == 1, (
+        f"expected one huggingface_hub pin in WORKER_DEPS, found {worker_hf}"
+    )
     assert docker_hf[0] == worker_hf[0], (
         f"huggingface_hub floor drift: Dockerfile.worker={docker_hf[0]!r} vs WORKER_DEPS={worker_hf[0]!r}; "
         "bump both together so the baked image and the live-function path share the 429 retry floor"
@@ -224,11 +228,7 @@ def test_baked_arch_workflows_match_canonical_source():
     (fallback,) = [
         match.group(1)
         for line in bake_lines
-        if (
-            match := re.fullmatch(
-                r'\s*req="\$\{\{ inputs\.sms \|\| \'([^\']+)\' \}\}"\s*', line
-            )
-        )
+        if (match := re.fullmatch(r'\s*req="\$\{\{ inputs\.sms \|\| \'([^\']+)\' \}\}"\s*', line))
     ]
     fallback_arches = {arch.strip() for arch in fallback.split(",") if arch.strip()}
 

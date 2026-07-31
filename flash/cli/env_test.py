@@ -613,6 +613,10 @@ def cmd_env_test(args) -> int:
 
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0
+    # only replay episodes carry a gold answer to score. an echo episode has none, so a zero there
+    # says nothing about the grader and is counted in neither total.
+    replayed = 0
+    replayed_zero = 0
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
         failure: str | None = None
@@ -640,19 +644,43 @@ def cmd_env_test(args) -> int:
             continue
 
         passed += 1
-        if record["policy"] == "replay" and reward is not None and reward <= 0.0:
-            message = (
-                f"replay gold answer scored low (reward={reward:.6f}); check the reward function"
-            )
-            print(
-                render.warn(message) if render.styled() else f"warning: {message}",
-                file=sys.stderr,
-            )
+        if record["policy"] == "replay" and reward is not None:
+            replayed += 1
+            # only an exact zero counts toward the blocking gate below. a negative scale is a
+            # legitimate grader -- -1 for a correct reference and -2 for an incorrect completion
+            # still separates them, which is all GRPO's relative advantage needs -- so counting
+            # every non-positive reward as a zero rejected those environments outright
+            # (codex[bot]). the warning stays wider, since it only advises.
+            if reward == 0.0:
+                replayed_zero += 1
+            if reward <= 0.0:
+                message = (
+                    f"replay gold answer scored low (reward={reward:.6f}); "
+                    "check the reward function"
+                )
+                print(
+                    render.warn(message) if render.styled() else f"warning: {message}",
+                    file=sys.stderr,
+                )
 
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
         return _err("overall: FAIL")
-    if not _check_evaluation_suites(entrypoint, env):
+    # a grader that scores zero for every one of its own reference answers cannot recognize them at
+    # all -- a broken scorer or a missing runtime dependency (LS-005) -- and the run reaches a gpu
+    # able to see only flat-zero reward. deliberately narrow: a PARTIAL zero stays the warning
+    # above and still passes, because a strict reward function with some hard rows is legitimate.
+    grader_recognizes_gold = not (replayed and replayed_zero == replayed)
+    if not grader_recognizes_gold:
+        _err(
+            f"all {replayed} replayed gold answer(s) scored zero; the reward function cannot "
+            "recognize its own reference answers. check the grader and that its runtime "
+            "dependencies are installed in this environment."
+        )
+    # run the evaluation checks even when the grader gate already failed, so one `flash env test`
+    # reports every broken surface at once instead of hiding the sidecar's errors behind the
+    # reward function's. both gates block; neither short-circuits the other.
+    if not _check_evaluation_suites(entrypoint, env) or not grader_recognizes_gold:
         return _err("overall: FAIL")
     print(render.ok("overall: PASS") if render.styled() else "overall: PASS")
     return 0
