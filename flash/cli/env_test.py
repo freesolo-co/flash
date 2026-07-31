@@ -29,7 +29,12 @@ _TOML_KEY_STRUCTURAL_CHARS = frozenset(".\"'")
 # so a token starting with one of these was reaching for a TOML scalar, and failing to parse means
 # it is malformed rather than prose -- the same reasoning _TOML_STRUCTURAL_CHARS applies to
 # delimiters, applied to the tokens that carry no delimiter at all.
-_TOML_SCALAR_LEADING_CHARS = frozenset("0123456789+-")
+#
+# `.` is here for the leading-dot float. TOML requires a digit before the point, so `.5` is exactly
+# as malformed as `+.5` -- which the signs already caught, leaving the same spelling accepted or
+# rejected depending on whether it carried a sign (cursor). it is not in _TOML_STRUCTURAL_CHARS, so
+# it reaches this test rather than being read as a delimiter.
+_TOML_SCALAR_LEADING_CHARS = frozenset("0123456789+-.")
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:

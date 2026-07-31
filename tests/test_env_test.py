@@ -622,6 +622,8 @@ def test_env_test_bare_unquoted_param_still_falls_back_to_a_string(monkeypatch, 
         "version=1.2.3",  # two dots is not a float
         "width=3px",  # number with a unit suffix
         "share=10%",
+        "rate=.5",  # toml floats require a digit before the point
+        "rate=.5e3",
     ],
 )
 def test_env_test_malformed_param_without_a_delimiter_is_rejected(
@@ -633,6 +635,10 @@ def test_env_test_malformed_param_without_a_delimiter_is_rejected(
     # written. the tell is a leading digit or sign: every TOML scalar except the bare
     # true/false/inf/nan words starts with one, so a token that starts that way and does not parse
     # is a malformed number or date rather than text (codex[bot]).
+    #
+    # a leading `.` is the same tell: TOML requires a digit before the point, so `.5` is exactly as
+    # malformed as the `+.5` the signs already caught -- accepting one and rejecting the other left
+    # the same number admitted or refused on whether it carried a sign (cursor).
     env_dir = _environment_dir(tmp_path)
     seen = _patch_loader(monkeypatch, _SingleTurnEnv())
 
@@ -645,7 +651,16 @@ def test_env_test_malformed_param_without_a_delimiter_is_rejected(
 
 
 @pytest.mark.parametrize(
-    "value", ["name=v1.0", "path=/tmp/data", "tag=a-b", "when=x2026-01-01", "name=hard mode"]
+    "value",
+    [
+        "name=v1.0",
+        "path=/tmp/data",
+        "tag=a-b",
+        "when=x2026-01-01",
+        "name=hard mode",
+        "version=v1.2.3",  # dotted, but the leading char is prose
+        "attr=a.b",
+    ],
 )
 def test_env_test_text_that_merely_contains_digits_still_falls_back(monkeypatch, tmp_path, value):
     # the rejection is on how the token STARTS, not on whether digits appear in it. these are
