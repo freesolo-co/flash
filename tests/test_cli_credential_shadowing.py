@@ -16,6 +16,7 @@ import pytest
 import flash.cli as cli
 import flash.client.config as client_config
 from flash.cli.commands import cmd_train, cmd_whoami
+from flash.cli.env_eval import cmd_env_eval
 from flash.cli.env_setup import cmd_env_setup
 from flash.cli.traces import cmd_traces_export
 
@@ -111,7 +112,21 @@ def test_every_org_binding_command_is_registered():
         "cmd_env_delete",
         "cmd_traces_export",
         "cmd_env_setup",
+        "cmd_env_eval",
     }
+
+
+def test_env_eval_warns_only_when_uploading(monkeypatch, capsys):
+    # a plain `env eval` runs locally and never picks an org, so naming one would describe a
+    # request it does not make. `--upload` does bind an org, and the warning has to land before
+    # the run: by the time the upload is rejected, every paid request is already spent.
+    monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
+
+    cli._warn_if_login_shadowed(argparse.Namespace(func=cmd_env_eval, upload=False))
+    assert capsys.readouterr().err == ""
+
+    cli._warn_if_login_shadowed(argparse.Namespace(func=cmd_env_eval, upload=True))
+    assert "shadowed!" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("handler", [cmd_traces_export, cmd_env_setup])
