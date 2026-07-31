@@ -409,7 +409,7 @@ def colocate_kv_util(
         # long-context run (vLLM's blocks must span vllm_max_model_length), so scale it with the
         # context + group (floored at _KV_CAP for the validated short-context lean point, bounded by
         # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
-        # =False) so grpo_sleep_mode's gate and this budget size the SAME KV.
+        # =False) so the resident-fit gate and this budget size the SAME KV.
         kv_gb = max(
             _KV_CAP,
             _resident_kv_gb(
@@ -1050,7 +1050,7 @@ def model_required_vram_gb(
         pull the run back onto a card that would NOT use fp8 (which would then OOM).
 
         Skipped entirely for GDN hybrids: both workers refuse fp8 KV for them (opd_train.py,
-        rl_verl.py), so their cache really is bf16 and the discount would admit a run onto a card
+        rl_train.py), so their cache really is bf16 and the discount would admit a run onto a card
         that cannot hold it."""
         from flash.providers.base import max_non_fp8_kv_vram_gb
 

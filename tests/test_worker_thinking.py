@@ -85,7 +85,10 @@ def test_thinking_text_unit():
 
 def test_thinking_budget_selection(monkeypatch):
     # A JobSpec with an env id makes the worker resolve ACTIVE_ENV at import; stub the loader so
-    # this CPU dry-run doesn't load the Freesolo env. We only exercise THINKING / micro-batch here.
+    # this CPU dry-run doesn't load the Freesolo env. We only exercise THINKING resolution here.
+    # (the per-device micro-batch half of this test went with trl: verl bounds the backward pass by
+    # TOKENS via use_dynamic_bsz + ppo_max_token_len_per_gpu, so there is no per-device sequence
+    # count to select. see test_rl_train's batch-shape and token-budget coverage.)
     monkeypatch.setattr("flash.envs.registry.load_environment", lambda *a, **k: object())
     saved = _set_thinking_worker_env()
     import flash.engine.worker as ne
@@ -93,16 +96,6 @@ def test_thinking_budget_selection(monkeypatch):
     try:
         importlib.reload(ne)
         assert ne.THINKING is True
-        # Thinking default micro-batch is 2 (vs 8); effective batch is preserved through grad-accum.
-        # use_vllm=False asserts the offline default deterministically (no dependence on a host GPU,
-        # which would engage the colocate VRAM-growth path).
-        assert ne.rl_per_device_comps(use_vllm=False) == 2
-        b = ne.compute_grpo_batching(64, 8, ne.rl_per_device_comps(use_vllm=False))
-        assert b["unique_prompts_per_step"] == 64
-        assert b["divisible_by_group"]
-        # RL_PER_DEVICE_PROMPTS is no longer an override — the default + auto-caps stand.
-        os.environ["RL_PER_DEVICE_PROMPTS"] = "4"
-        assert ne.rl_per_device_comps(use_vllm=False) == 2
     finally:
         _restore_env(saved)
     # thinking off: a JobSpec with thinking=false -> original (larger) micro-batch
@@ -117,47 +110,9 @@ def test_thinking_budget_selection(monkeypatch):
     try:
         importlib.reload(ne)
         assert ne.THINKING is False
-        assert ne.rl_per_device_comps(use_vllm=False) == 8
     finally:
         os.environ.pop("FLASH_JOB_SPEC_JSON", None)
         importlib.reload(ne)
-
-
-def test_grpo_batching_rounds_up_to_divisible():
-    # A small/non-divisible override (prompts=5, group=3, per_device=8) used to leave
-    # the global completion batch (8) indivisible by num_generations (3); TRL rejects
-    # that only AFTER the paid worker is provisioned. compute_grpo_batching now rounds
-    # grad_accum up so the batch is always divisible by group_size.
-    import flash.engine.worker as ne
-
-    importlib.reload(ne)
-    for prompts, group, per_device in [(5, 3, 8), (64, 8, 2), (64, 8, 8), (7, 5, 4), (1, 6, 8)]:
-        b = ne.compute_grpo_batching(prompts, group, per_device)
-        assert b["divisible_by_group"], (prompts, group, per_device)
-        assert b["generations_per_step"] % group == 0
-        assert b["unique_prompts_per_step"] >= 1
-        # never shrinks below the requested prompts/step (rounding only goes up)
-        assert (
-            b["unique_prompts_per_step"] >= prompts or b["generations_per_step"] >= prompts * group
-        )
-
-
-def test_grpo_batching_caps_per_device_at_target():
-    # A small prompts_per_step must not be overshot by an oversized per-device completion
-    # micro-batch: the global completion batch is capped at prompts_per_step * group_size,
-    # so the per-device micro-batch is clamped down to the target (mirrors run_sft).
-    import flash.engine.worker as ne
-
-    importlib.reload(ne)
-    # per_device (8) far exceeds target completions (1 * 2 = 2): must clamp, not overshoot.
-    b = ne.compute_grpo_batching(prompts_per_step=1, group_size=2, per_device_comps=8)
-    assert b["per_device_train_batch_size"] <= 2
-    assert b["generations_per_step"] <= 2
-    assert b["unique_prompts_per_step"] == 1
-    # The common default stays a no-op: per_device passes through unchanged.
-    b = ne.compute_grpo_batching(prompts_per_step=64, group_size=8, per_device_comps=2)
-    assert b["per_device_train_batch_size"] == 2
-    assert b["unique_prompts_per_step"] == 64
 
 
 def test_grpo_prompts_per_step_caps_to_available_dataset():

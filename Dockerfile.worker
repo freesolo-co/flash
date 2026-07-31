@@ -49,7 +49,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 # The pinned worker stack (torch already in the base image, version-matched so pip skips it).
 RUN pip install --no-cache-dir \
     "transformers>=5.6,<5.13" \
-    "trl>=1.6,<1.7" \
     "peft>=0.19" \
     "vllm==0.19.1" \
     "flashinfer-python==0.6.6" \
@@ -201,7 +200,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # is imported optionally here: a missing FA must NOT abort the build, or the SDPA-fallback image
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
-import torch, transformers, trl, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
+import torch, transformers, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
 fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
 import importlib; \
 fa_ok = False; \
@@ -213,7 +212,7 @@ exec('try:\n import flashinfer\n fi_ok = True\nexcept Exception:\n fi_ok = False
 cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into torch'; \
 ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)', '| flashinfer', 'present (B200 MoE/attn)' if fi_ok else 'ABSENT (Triton fused-MoE fallback)'); \
-[print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
+[print('  ', d, ver(d)) for d in ['transformers','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
 'accelerate','wandb','flash-linear-attention','bitsandbytes', \
 'hf-transfer','freesolo','runpod']]"
 
@@ -223,15 +222,16 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # verl's dependency set CONFLICTS with the worker stack above. verl and TransferQueue declare
 # numpy<2.0.0 while this image's stack resolves numpy>=2, and verl's structured-OPD gate pins
 # xgrammar to exactly 0.1.25 against vLLM's declared >=0.1.32 floor. Resolving verl into the main
-# interpreter would move shared pins under every other worker path (trl/peft/transformers/vllm all
+# interpreter would move shared pins under every other worker path (peft/transformers/vllm all
 # live there), so verl gets its own venv and flash launches it out-of-process via FLASH_VERL_PYTHON.
 # The venv deliberately re-resolves its own numpy independent of the base interpreter's.
 #
-# Without this venv the runtime falls back to resolve_verl_python(), which builds a venv from the
-# verl requirement ALONE. verl's install_requires omits vllm/uvicorn/fastapi/cachetools, so that
-# fallback yields an interpreter where `verl.trainer.main_ppo` dies on ModuleNotFoundError:
-# cachetools and `main_ppo_sync` dies on uvicorn. Baking the full set here is what makes the verl
-# backends actually runnable.
+# Without this venv the runtime falls back to resolve_verl_python(), which provisions the same set on
+# the pod. Keep the two in lockstep: verl's install_requires omits vllm/uvicorn/fastapi/cachetools
+# while importing them at module level on the launch path, so any dependency dropped from ONE of
+# these two lists yields an interpreter where `verl.trainer.main_ppo` dies on ModuleNotFoundError:
+# cachetools and `main_ppo_sync` dies on uvicorn. Baking them here keeps the image from paying the
+# fallback's install cost on every run; it is not what makes the backends runnable.
 #
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
 # That deliberately exceeds verl's declared vllm<=0.12.0 ceiling. The metadata-clean alternative
@@ -262,8 +262,12 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # ensurepip is not available"). --seed puts pip in the venv anyway. uv itself is already in the base
 # image at /usr/local/bin/uv.
 #
-# Two pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
-# PyExtensionType) and TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()).
+# Three pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
+# PyExtensionType), TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()),
+# and wandb (also absent from verl's setup.py). verl calls wandb.init from THIS interpreter, not
+# flash's, so a job that sets WANDB_API_KEY loses its curves and run link unless wandb is importable
+# in here; resolve_verl_loggers() degrades to console when it is not, which is the right behaviour
+# for a foreign FLASH_VERL_PYTHON but silently drops W&B on the default image (codex[bot]).
 ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-overrides.txt \
@@ -277,11 +281,12 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-o
         "datasets>=4.7,<6" \
         "TransferQueue==0.1.7" \
         liger-kernel "bitsandbytes>=0.49" qwen-vl-utils \
+        "wandb>=0.17" \
     && rm -f /tmp/verl-overrides.txt \
     && uv cache clean
 
 # flash-attn is REQUIRED in here, not best-effort like it is in the main interpreter above. All three
-# backends hard-enable remove-padding (rl_verl.py:138, sft_train.py:145, opd_train.py:1458), and verl's
+# backends hard-enable remove-padding (rl_train.py:336, sft_train.py:164, opd_train.py:1505), and verl's
 # CUDA remove-padding path imports flash_attn.bert_padding UNGUARDED
 # (verl/utils/attention_utils.py:30, torch_functional.py:627,657). There is no SDPA fallback on that
 # path: without the module the run dies at the first training batch, which the import-only assert
@@ -293,7 +298,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
-# (rl_verl -> main_ppo, opd_plugin -> main_ppo_sync, sft_train -> sft_trainer; note it is
+# (rl_train -> main_ppo, opd_plugin -> main_ppo_sync, sft_train -> sft_trainer; note it is
 # sft_trainer, NOT fsdp_sft_trainer, which does not exist in this pin), the vLLM rollout modules
 # where a version mismatch would surface, and the fork-only rollout field the GRPO path emits as a
 # hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this

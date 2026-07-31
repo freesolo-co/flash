@@ -99,7 +99,7 @@ def _child_subreaper_does_not_leak_between_tests():
     it unconditionally: any test reaching ``run_verl_training`` or ``kill_process_group`` flips this
     pytest process from 0 to 1 for the rest of the session. From then on every later test adopts
     orphaned grandchildren it never waits on, so it accumulates zombies and its result depends on
-    what ran before it. The ``subreaper`` fixture in ``test_verl_common`` restores only the tests
+    what ran before it. The ``subreaper`` fixture in ``test_backend_common`` restores only the tests
     that ask for it, which is not where the flag is now set (codex[bot]).
 
     Autouse and here rather than in that module: five test files reach those entry points, and the
@@ -128,7 +128,7 @@ def _child_subreaper_does_not_leak_between_tests():
         yield
     finally:
         libc.prctl(36, previous, 0, 0, 0)
-        import flash.engine.worker.verl_common as _vc
+        import flash.engine.worker.backend_common as _vc
 
         _vc._ADOPTS_ORPHANS = bool(previous)
 

@@ -1,8 +1,8 @@
-"""verl GRPO per-step metrics parity with the trl callback.
+"""verl GRPO per-step metrics reconstructed from the trainer's stdout.
 
-trl feeds `flash runs log -f` from a TrainerCallback (heartbeat.make_reward_heartbeat_callback).
-verl's trainer runs out of process and cannot host one, so rl_verl reconstructs the same
-`metrics_last` backlog from verl's own per-step stdout line. these tests pin the parse against the
+an in-process trainer would feed `flash runs log -f` from a TrainerCallback. verl's trainer runs
+out of process and cannot host one, so rl_train reconstructs the same `metrics_last` backlog from
+verl's own per-step stdout line. these tests pin the parse against the
 line format verl actually prints (LocalLogger.concat_dict_to_str) under the interpreter flash
 actually ships (Dockerfile.worker installs numpy 2.2.6 into /opt/verl-venv), plus the lifecycle
 sites that carry the backlog to the console.
@@ -12,7 +12,7 @@ import ast
 import inspect
 import textwrap
 
-from flash.engine.worker.verl_common import (
+from flash.engine.worker.backend_common import (
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
@@ -144,9 +144,9 @@ def test_backlog_is_mutated_in_place_for_the_heartbeat_reader():
 
 
 def _verl_rl_tree() -> ast.Module:
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
-    return ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
+    return ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
 
 
 def test_verl_rl_lifecycle_heartbeats_carry_latest_metrics():
@@ -272,7 +272,7 @@ def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
     # the payload schema belongs to the cli, not verl: a key the renderer does not know is dead
     # weight, so keep the mapping's flash-side names inside the rendered set.
     from flash.cli.commands import _FOLLOW_METRIC_FIELDS
-    from flash.engine.worker.verl_common import _VERL_METRIC_FIELDS
+    from flash.engine.worker.backend_common import _VERL_METRIC_FIELDS
 
     rendered = {name for name, *_ in _FOLLOW_METRIC_FIELDS}
     emitted = {flash_key for _, flash_key in _VERL_METRIC_FIELDS}

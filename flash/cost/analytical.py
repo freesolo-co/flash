@@ -57,11 +57,10 @@ COMPILE_MOE_SFT_S = 35.0
 COMPILE_MOE_ROLLOUT_S = 48.0  # GRPO / OPD (adds vLLM cudagraph capture)
 
 # Single-turn grpo scores a step's completions SERIALLY, so the reward wall is the full
-# completions x latency sum. this is not an accident of either backend, it is a deliberate contract:
-# the trl reward_fn walks its completions in one loop (worker/rl.py), and the verl reward bridge
-# takes a global lock around the env call precisely so "the flash env sees sequential calls,
-# matching the trl reward path" (worker/rl_verl.py). the serialization protects envs whose scorers
-# are not thread-safe, so it cannot be removed to match a faster model.
+# completions x latency sum. this is not an accident, it is a deliberate contract: the verl reward
+# bridge takes a global lock around the env call so the flash env sees sequential calls
+# (worker/rl_train.py). the serialization protects envs whose scorers are not thread-safe, so it
+# cannot be removed to match a faster model.
 #
 # a concurrency divisor here was a flat 16x understatement of the reward term, and reward time lands
 # in the FIXED half of a step -- the half no gpu choice can shorten. under-counting it makes a

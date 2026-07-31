@@ -165,60 +165,6 @@ def make_multimodal_input_require_grads_callback():
     return _MultimodalInputRequireGrads()
 
 
-def grpo_sleep_mode(
-    model_id: str,
-    *,
-    max_length: int = 0,
-    group_size: int = 8,
-    max_tokens: int | None = None,
-    lora_rank: int = 32,
-    thinking: bool = False,
-    card_vram_gb: float = 0.0,
-    fp8_kv: bool = False,
-    revision: str = "",
-) -> bool:
-    """Whether colocated-vLLM GRPO should offload the rollout engine between steps."""
-    from flash.catalog import MODELS
-    from flash.engine.vram import grpo_fits_resident, grpo_rollout_seq_len
-
-    _info = MODELS.get(model_id)
-    _sleep_broken = bool(_info is not None and getattr(_info, "sleep_unsupported", False))
-    seq_len = grpo_rollout_seq_len(max_length, max_tokens, thinking)
-    if not _memory_mode(model_id, seq_len, revision=revision) and not _sleep_broken:
-        return False
-    _fits = None
-    if card_vram_gb and card_vram_gb > 0:
-        try:
-            _fits = grpo_fits_resident(
-                model_id,
-                seq_len=seq_len,
-                max_tokens=max_tokens,
-                lora_rank=lora_rank,
-                group_size=group_size,
-                thinking=thinking,
-                card_vram_gb=card_vram_gb,
-                fp8_kv=fp8_kv,
-                revision=revision,
-            )
-        except Exception as e:
-            print("[rl] grpo sleep-mode resident check skipped:", e)
-    if _fits:
-        return False  # fits resident -> skip the (buggy, slow) sleep/wake cycle
-    if _sleep_broken:
-        # vLLM sleep is NON-FUNCTIONAL for this model (the wake/reload HANGS -- see ModelInfo
-        # .sleep_unsupported). NEVER return True (that would route to the hang). If we positively know
-        # it doesn't fit resident, REJECT with a clear error; if we couldn't check (no card info),
-        # attempt RESIDENT anyway -- a possible OOM beats a guaranteed wake-hang.
-        if _fits is False:
-            raise ValueError(
-                f"{model_id}: GRPO config (engine context ~{seq_len} tok, group={group_size}) does NOT "
-                f"fit RESIDENT on {card_vram_gb:.0f} GB and vLLM sleep mode HANGS this model "
-                f"(resident-only). Reduce [train].max_context_tokens and/or group_size to fit resident."
-            )
-        return False
-    return True
-
-
 def fused_optim_name() -> str:
     """8-bit paged AdamW: optimizer state paged to host RAM, fits smaller GPUs."""
     return "paged_adamw_8bit"

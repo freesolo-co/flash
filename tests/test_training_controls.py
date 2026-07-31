@@ -609,11 +609,28 @@ def test_sft_under_ran_only_fails_a_genuine_under_run():
 
 
 def test_grpo_under_ran_only_fails_a_genuine_under_run():
-    from flash.engine.worker.rl import grpo_under_ran
+    # verl has no grpo_under_ran helper: run_rl_train compares the checkpoint dir's step count to
+    # expected_steps inline. same invariant, so assert on the comparison rather than a symbol --
+    # STRICTLY less-than, so a resume that overshoots a lowered horizon (12 >= 10) still finalizes
+    # instead of failing a fully-trained policy.
+    import ast
+    import inspect
+    import textwrap
 
-    assert grpo_under_ran(9, 10)
-    assert not grpo_under_ran(10, 10)
-    assert not grpo_under_ran(12, 10)
+    from flash.engine.worker import rl_train
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+    compares = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "steps_run"
+        and isinstance(node.comparators[0], ast.Name)
+        and node.comparators[0].id == "expected_steps"
+    ]
+    assert len(compares) == 1
+    assert isinstance(compares[0].ops[0], ast.Lt)
 
 
 @pytest.mark.parametrize("bad", [[], False, "", 0])
