@@ -924,9 +924,20 @@ def _submit_seed_supervised(
             )
         if projected is not None:
             same = (projected.provider, projected.gpu) == (chosen.provider, chosen.gpu)
-            no_escalation = (
-                ", no untried GPU class fits this run" if current_on_last_gpu["value"] else ""
+            # derived from the sets AFTER this failure's bookkeeping, not from the flag. a
+            # cache-drop retry deliberately leaves tried_classes untouched and reuses this class
+            # cold, so the projected class is still untried and reading current_on_last_gpu there
+            # printed "retry on H100 again, no untried GPU class fits" -- naming the untried class
+            # in the same clause that denies one exists. on_last_gpu is also true when the infra
+            # retry budget runs out with classes still untried, which is not exhaustion either
+            # (codex[bot]).
+            retry_tried = (
+                tried_classes
+                if first_cache_drop
+                else tried_classes | {(chosen.provider, chosen.gpu)}
             )
+            exhausted = all((c.provider, c.gpu) in retry_tried for c in cands)
+            no_escalation = ", no untried GPU class fits this run" if exhausted else ""
             retry_target = (
                 f"expecting to retry on {projected.gpu} @ {projected.provider}"
                 f"{' again' if same else ''}{no_escalation} (resume from last checkpoint; "

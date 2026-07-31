@@ -1417,3 +1417,85 @@ def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, mon
     assert "retrying on H200" not in action, (
         "stated a projected class as the confirmed retry target"
     )
+
+
+def test_sole_class_cache_drop_does_not_claim_the_class_is_exhausted(orch, monkeypatch):
+    """on_last_gpu is not an exhaustion signal, so the escalation clause cannot be read off it.
+
+    With one fitting class, ``len(untried) <= 1`` sets the flag on the FIRST attempt -- before that
+    class has been tried at all. A cache-drop retry then deliberately leaves tried_classes untouched
+    and reselects the same class cold, so the line read "expecting to retry on H100 @ runpod again,
+    no untried GPU class fits this run": naming the untried class in the same clause that denies one
+    exists. Derive the clause from the sets the retry will actually see instead (codex[bot])."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    # exactly one fitting class -> untried is a single entry -> on_last_gpu true from attempt 0.
+    candidates = (Candidate("runpod", "H100", 0.49, 80),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    seen_flags = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **kw):
+        seen_flags.append(on_last_gpu)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        if getattr(run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME:
+            return PollResult(False, failure="no_capacity", detail="IN_QUEUE (no capacity)")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    # the flag really is set here -- otherwise this test would pass for the wrong reason.
+    assert seen_flags[0] is True, seen_flags
+    action = _retry_action_line(log.getvalue(), 0)
+    assert "expecting to retry on H100 @ runpod again" in action, action
+    # the class the very next attempt reuses is still untried, so nothing may claim otherwise.
+    assert "no untried GPU class fits this run" not in action, action
+
+
+def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
+    """The complement of the cache-drop case: a plain infra retry DOES mark the class tried, so with
+    one fitting class the clause is accurate and must survive. Guards against fixing the false
+    positive by deleting the clause outright."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (Candidate("runpod", "H100", 0.49, 80),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        if attempt == 0:
+            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=2)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    action = _retry_action_line(log.getvalue(), 0)
+    assert "expecting to retry on H100 @ runpod again" in action, action
+    assert "no untried GPU class fits this run" in action, action

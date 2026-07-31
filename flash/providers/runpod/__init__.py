@@ -135,11 +135,15 @@ class RunpodProvider:
             failure_detail_reader=failure_reader,
             current_attempt=rh.attempt,
             **deadline_kwargs(poll_job, _deadline_at),
-            # the recovery path must word its capacity failures exactly as the direct submit does:
-            # the flag was persisted onto the handle for precisely this, and feeding it only to
-            # stall_kwargs left poll_job at its False default -- so a reattached last-GPU job still
-            # claimed escalation may follow when the picker has nowhere to walk to.
-            on_last_gpu=on_last_gpu,
+            # the persisted flag drives the stall grace only, NOT the capacity wording. it is a
+            # snapshot of the supervisor loop that submitted this attempt, and that loop is gone:
+            # recovery calls reallocation_spec_from_status, which restores the run's original
+            # unpinned gpu type, and re-enters _run_training with empty failed_providers and
+            # tried_classes -- so the replacement really can pick another class or provider.
+            # forwarding the snapshot here would state "no further GPU-class escalation follows"
+            # about a picker that has its whole candidate list back (codex[bot]). the grace is a
+            # different question: how long to wait on hardware that was scarce, which the snapshot
+            # still answers correctly.
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 

@@ -5594,10 +5594,17 @@ def test_capacity_detail_claims_neither_a_retry_nor_class_exhaustion(monkeypatch
     assert "untried" not in res.detail, res.detail
 
 
-def test_reattached_last_gpu_job_words_capacity_like_the_direct_submit(monkeypatch):
-    """The flag is persisted onto the handle for recovery, but poll() fed it only to stall_kwargs, so
-    poll_job stayed at its False default and a reattached last-GPU job still promised the next-best
-    GPU. Recovery must word capacity failures exactly as the submit path does."""
+def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch):
+    """The persisted flag answers one of the two questions it is read for, and only one.
+
+    It is a snapshot of a supervisor loop that no longer exists. Recovery calls
+    reallocation_spec_from_status -- restoring the run's original unpinned gpu type -- and re-enters
+    _run_training with empty failed_providers and tried_classes, so the replacement really can pick
+    another class or provider. Forwarding the snapshot to poll_job would state "no further GPU-class
+    escalation follows" about a picker that has its whole candidate list back (codex[bot]).
+
+    The stall grace is a different question -- how long to wait on hardware that was scarce -- which
+    the snapshot still answers correctly, so it must keep flowing through."""
     from flash.providers.base import JobHandle
     from flash.providers.runpod import PROVIDER
     from flash.providers.runpod import jobs as jobs
@@ -5628,11 +5635,17 @@ def test_reattached_last_gpu_job_words_capacity_like_the_direct_submit(monkeypat
     }
 
     PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True}), spec, spec.seed)
-    assert captured["on_last_gpu"] is True
+    # the capacity wording is left at poll_job's neutral default: escalation may follow, because
+    # after recovery it genuinely can.
+    assert "on_last_gpu" not in captured, captured
+    # the scarcity grace still honours the snapshot: 900s, not the 300s of a normal attempt.
+    assert captured["queue_grace_s"] == 900.0, captured
+    assert captured["throttled_grace_s"] == 900.0, captured
 
     captured.clear()
     PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False}), spec, spec.seed)
-    assert captured["on_last_gpu"] is False
+    assert "on_last_gpu" not in captured, captured
+    assert captured["queue_grace_s"] == 300.0, captured
 
 
 def test_capacity_detail_promises_no_retry_when_a_next_class_exists(monkeypatch):
