@@ -673,16 +673,16 @@ def _build_verl_train_notes(
         "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
         # verl trains out-of-process, so torch's in-process allocator counter would read ~0 here and
         # miss the trainer entirely. nvidia-smi is the only reading that sees the child, so both keys
-        # carry the same device-level figure -- unlike the trl path, where peak_gpu_gb is the
-        # torch-allocated subset of device_peak_gpu_gb.
+        # carry the same device-level figure. (on the retired in-process trl path peak_gpu_gb was the
+        # torch-allocated subset of device_peak_gpu_gb; consumers must not assume that split here.)
         "peak_gpu_gb": device_peak_gpu_gb,
         "device_peak_gpu_gb": device_peak_gpu_gb,
         # chalk installs against an in-process trainer.model; verl's model lives in the subprocess, so
         # no kernel can engage on this path. None (not an empty list) matches the sft verl backend.
         "chalk_kernels": None,
-        # trl counts generated tokens from a padded upper bound; verl derives them from the response
-        # lengths it actually observed. without this flag the two backends' token counts read as
-        # comparable when they are not.
+        # verl derives generated tokens from the response lengths it actually observed, not from a
+        # padded upper bound. the flag is published so a consumer comparing against historical runs
+        # (which counted the padded bound) does not read the two as equivalent.
         "gen_tokens_is_upper_bound": False,
         "thinking": _w.THINKING,
         # the console is uploaded only on failure, so a SUCCESSFUL run has no other record that fp8 kv
