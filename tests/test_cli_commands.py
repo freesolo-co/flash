@@ -985,6 +985,58 @@ def test_chat_checkpoint_ref_is_forwarded_unchanged(fake_client) -> None:
     assert fake_client.calls[-1][1] == target
 
 
+def test_chat_stream_caches_a_successful_checkpoint_capability_check(monkeypatch) -> None:
+    # env eval opens one stream per case. repeating the health preflight makes a large suite pay
+    # hundreds of extra requests and lets one transient health failure replace a model measurement.
+    from flash.client import ApiClient, ClientError
+
+    class Response:
+        def __init__(self):
+            self.headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+    client = ApiClient("https://flash.test")
+    successful_health_calls = 0
+
+    def successful_health():
+        nonlocal successful_health_calls
+        successful_health_calls += 1
+        return {"capabilities": ["chat_step_selector_v1"]}
+
+    monkeypatch.setattr(client, "health", successful_health)
+    monkeypatch.setattr(
+        "flash.client.http.urllib.request.urlopen", lambda *args, **kwargs: Response()
+    )
+
+    for _ in range(2):
+        assert list(client.chat_stream("flash-1/step-3", [])) == ["ok"]
+
+    assert successful_health_calls == 1
+
+    failing_client = ApiClient("https://flash.test")
+    failing_health_calls = 0
+
+    def failing_health():
+        nonlocal failing_health_calls
+        failing_health_calls += 1
+        return {"capabilities": []}
+
+    monkeypatch.setattr(failing_client, "health", failing_health)
+    for _ in range(2):
+        with pytest.raises(ClientError, match="chat_step_selector_v1"):
+            list(failing_client.chat_stream("flash-1/step-3", []))
+
+    assert failing_health_calls == 2
+
+
 def test_chat_accepts_full_immutable_revision(fake_client) -> None:
     revision = "flash-1@step-40." + "a" * 40
     assert _run(["models", "chat", revision, "-m", "What is 6*7?"]) == 0
@@ -1114,6 +1166,20 @@ def test_env_setup_does_not_overwrite_existing_evaluations(monkeypatch, tmp_path
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     assert existing.read_text() == "# keep this evaluation sidecar\n"
+
+
+def test_env_setup_does_not_add_starter_evaluations_to_a_custom_environment(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    # the arithmetic starter scorer calls the neighboring environment's reward with its own
+    # example, so adding it on a rerun makes an unrelated custom environment fail or score nonsense.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "environment.py").write_text("def load_environment(): return object()\n")
+
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+
+    assert not (tmp_path / "evaluations.py").exists()
+    assert "evaluations.py" not in capsys.readouterr().out
 
 
 def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path, capsys) -> None:

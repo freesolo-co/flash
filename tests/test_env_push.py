@@ -84,6 +84,29 @@ def test_push_single_py_module_carries_its_evaluations_sidecar(monkeypatch, tmp_
     assert "evaluations.py" in files
 
 
+def test_push_single_py_module_carries_direct_evaluation_helper_imports(monkeypatch, tmp_path):
+    # evaluations.py can import sibling helpers locally, so dropping those direct imports from an
+    # exact-file push publishes a suite that passed env test but cannot load from the package.
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import eval_constants\n"
+        "from eval_scorer import score\n"
+        "def load_evaluations(environment=None): return []\n"
+    )
+    (tmp_path / "eval_constants.py").write_text("EXPECTED = '4'\n")
+    (tmp_path / "eval_scorer.py").write_text("def score(value): return value == '4'\n")
+    (tmp_path / "unrelated.py").write_text("VALUE = 'do not publish'\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "eval_constants.py" in files
+    assert "eval_scorer.py" in files
+    assert "unrelated.py" not in files
+
+
 def test_push_dir_infers_entrypoint_ignoring_the_evaluations_sidecar(monkeypatch, tmp_path):
     # a legacy package whose sole module is custom.py resolved fine before evaluations.py
     # existed. counting the sidecar as a candidate entrypoint makes adding one turn that
