@@ -137,6 +137,31 @@ class _PerExampleCapMultiTurnEnv(_MultiTurnEnv):
         return state.get("done") or (cap is not None and state["turn"] >= cap)
 
 
+class _StatefulBoardMultiTurnEnv(_MultiTurnEnv):
+    # a stateful env that only counts a model turn once env_reply applies it, and whose reward is
+    # that count. it never declares itself done, so the driver's own turn cap ends the episode --
+    # which is exactly the exit that skipped the last env step.
+    max_turns = 3
+
+    def new_rollout_state(self, example):
+        prompt = [{"role": "user", "content": example["input"]}]
+        return {"prompt": prompt, "messages": list(prompt), "done": False, "turn": 0, "applied": 0}
+
+    def env_reply(self, messages, state):
+        state["turn"] += 1
+        state["applied"] += 1
+        reply = {"role": "user", "content": "continue"}
+        messages.append(reply)
+        return [reply]
+
+    def rollout_done(self, state, max_turns=None):
+        return False
+
+    def reward(self, completion, example, state=None):
+        self.scored_state = state
+        return float((state or {}).get("applied", 0))
+
+
 class _BadPromptEnv(_SingleTurnEnv):
     def prompt_messages(self, example):
         # content must be a string, content-block list, or null; an int is malformed
@@ -333,6 +358,20 @@ def test_env_test_multi_turn_replays_text_free_turn_positionally(
     assert env.recorded == ["first", "", "third"]
     out = capsys.readouterr().out
     assert "overall: PASS" in out
+
+
+def test_env_test_steps_the_env_on_the_final_turn_before_scoring(monkeypatch, tmp_path, capsys):
+    # the worker now applies the last assistant turn before scoring (_final_env_step in
+    # flash/engine/multiturn_rollout.py). without the same close-out here the command scores a
+    # board missing the model's last move, so it disagrees with the paid run it exists to predict:
+    # a passing env can look unrankable, and a final step that raises goes unseen until training.
+    env_dir = _environment_dir(tmp_path)
+    env = _StatefulBoardMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    assert env.scored_state["applied"] == 3, "the final model turn was scored without being applied"
+    assert "reward=3.000000" in capsys.readouterr().out
 
 
 def test_env_test_multi_turn_bounds_turns_to_hard_cap(monkeypatch, tmp_path, capsys):
