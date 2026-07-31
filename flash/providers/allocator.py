@@ -17,6 +17,7 @@ from flash.providers.base import (
 
 logger = get_logger(__name__)
 
+
 def vram_headroom() -> float:
     """Sizing headroom multiplier; shared by submit-time allocator and parse-time provisional_gpu."""
     return 1.1
@@ -79,9 +80,7 @@ def allocate(
         exact = canonical_gpu(gpu_type)
         exact_info = GPU_INFO.get(exact)
         if exact_info is None or not exact_info.validated:
-            raise UnsupportedGpuError(
-                f"exact GPU {exact!r} is not an active validated GPU class"
-            )
+            raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
         if exact_info.vram_gb < need:
             raise UnsupportedGpuError(
                 f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
@@ -89,9 +88,7 @@ def allocate(
             )
         exact_providers = providers_for(exact)
         if provider and provider not in exact_providers:
-            raise UnsupportedGpuError(
-                f"provider {provider!r} cannot provision exact GPU {exact!r}"
-            )
+            raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
         available = tuple(name for name in available if name in exact_providers)
 
     constraints = AllocationConstraints(
@@ -115,7 +112,9 @@ def allocate(
             ]
         except CapacityLookupError as exc:
             lookup_failed = True
-            logger.warning("%s capacity lookup failed (%s); allocating without it", name, exc.__cause__)
+            logger.warning(
+                "%s capacity lookup failed (%s); allocating without it", name, exc.__cause__
+            )
     if not candidates:
         if lookup_failed:
             # No candidate fit, but a live capacity lookup blipped and was the only possible source of one

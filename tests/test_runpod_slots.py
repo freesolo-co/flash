@@ -76,7 +76,7 @@ def test_acquire_shared_records_shared_mode(monkeypatch):
     monkeypatch.setattr(slots, "internal_key", lambda: "k")
     seen = []
     monkeypatch.setattr(
-        slots, "claim", lambda name, *, cap, claimed_by=None: (seen.append((name, cap)) or (True, 1))
+        slots, "claim", lambda name, *, cap, claimed_by=None: seen.append((name, cap)) or (True, 1)
     )
     ep._acquire_endpoint_slot("flash-5090-abc")
     assert ep._ACQUIRED["flash-5090-abc"] == "shared"
@@ -135,7 +135,7 @@ def test_release_shared_calls_store_and_is_idempotent(monkeypatch):
     # No internal key: the second (untracked) call is a no-op rather than a cross-replica release.
     monkeypatch.setattr(slots, "internal_key", lambda: None)
     released = []
-    monkeypatch.setattr(slots, "release", lambda name: (released.append(name) or True))
+    monkeypatch.setattr(slots, "release", lambda name: released.append(name) or True)
     assert ep._release_endpoint_slot("flash-x") is True
     assert released == ["flash-x"]
     assert "flash-x" not in ep._ACQUIRED
@@ -150,7 +150,7 @@ def test_release_cross_replica_releases_shared_row(monkeypatch):
     monkeypatch.setattr(ep, "_ACQUIRED", {})
     monkeypatch.setattr(slots, "internal_key", lambda: "k")
     released = []
-    monkeypatch.setattr(slots, "release", lambda name: (released.append(name) or True))
+    monkeypatch.setattr(slots, "release", lambda name: released.append(name) or True)
     assert ep._release_endpoint_slot("flash-x") is True
     assert released == ["flash-x"]
 

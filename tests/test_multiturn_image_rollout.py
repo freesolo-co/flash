@@ -288,4 +288,6 @@ def test_text_only_multiturn_rollout_payload_is_unchanged():
     assert len(engine.requests) == 2
     assert all(set(request) == {"prompt_token_ids"} for request in engine.requests)
     # no pad-suppression bias leaks into text-only turns
-    assert all(getattr(sampling_params, "logit_bias", None) is None for sampling_params in engine.sampling)
+    assert all(
+        getattr(sampling_params, "logit_bias", None) is None for sampling_params in engine.sampling
+    )

@@ -504,6 +504,13 @@ def _status_storage_dict(status: RunStatus) -> dict:
     return data
 
 
+class WarmStartPreparationError(ValueError):
+    """A submit failed while preparing ``train.init_from_adapter``'s source adapter.
+
+    Lets the submit route blame the adapter only for failures that really came from resolving it.
+    """
+
+
 class _RunCancelled(RuntimeError):
     """User cancellation observed mid-run; terminal, never retried/overwritten."""
 
@@ -809,7 +816,30 @@ def _prepare_init_from_adapter(
     owner_key_id: int | None = None,
     token: str | None = None,
 ) -> tuple[JobSpec, JobSpec, dict | None]:
-    """prepare public and worker specs with source-authoritative adapter metadata."""
+    """prepare public and worker specs with source-authoritative adapter metadata.
+
+    Failures here are genuinely about the warm-start source, so they are tagged
+    ``WarmStartPreparationError`` for the submit route. Everything else in ``prepare_job`` (gpu
+    sizing, budget, environment resolution) must keep its own message rather than be reported as a
+    bad adapter, since those run for non-warm-start runs too and have nothing to do with the adapter.
+    """
+    try:
+        return _prepare_init_from_adapter_inner(
+            spec, owner_org_id=owner_org_id, owner_key_id=owner_key_id, token=token
+        )
+    except WarmStartPreparationError:
+        raise
+    except Exception as exc:
+        raise WarmStartPreparationError(str(exc)) from exc
+
+
+def _prepare_init_from_adapter_inner(
+    spec: JobSpec,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+    token: str | None = None,
+) -> tuple[JobSpec, JobSpec, dict | None]:
     _require_supported_adapter_continuation(spec)
     ref = spec.train.init_from_adapter
     if not ref:

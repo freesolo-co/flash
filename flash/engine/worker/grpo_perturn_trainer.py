@@ -15,6 +15,31 @@ class TurnCreditRow:
     turns: tuple[float, ...] | None
 
 
+# one line per run, not one per group per step: the condition is a property of the environment, so it
+# is either true for most groups or none of them, and a per-group warning would bury the training log.
+_WARNED_EPISODE_FALLBACK = False
+
+
+def _warn_episode_fallback() -> None:
+    """Say that the requested per-turn credit is not actually being applied.
+
+    ``credit_assignment = "per_turn"`` is accepted by the spec and echoed back in run status, so a
+    user who sets it believes it took effect. When the environment returns no ``per_turn_rewards``
+    this silently trains on episode credit instead -- the configured setting is inert, the run looks
+    healthy, and nothing distinguishes it from a run that never asked for per-turn credit.
+    """
+    global _WARNED_EPISODE_FALLBACK
+    if _WARNED_EPISODE_FALLBACK:
+        return
+    _WARNED_EPISODE_FALLBACK = True
+    print(
+        '[grpo][warn] credit_assignment="per_turn" was requested, but the environment returned no '
+        "per_turn_rewards for at least one group; those groups train on episode credit. have "
+        "score_episodes() put a per-turn reward list in result.metadata['per_turn_rewards'] to "
+        "apply per-turn credit."
+    )
+
+
 def build_per_turn_advantages(
     turn_spans_per_completion: list[list[tuple[int, int]]],
     turn_rewards_per_completion: list[list[float] | None],
@@ -57,6 +82,7 @@ def build_per_turn_advantages(
         group_end = group_start + num_generations
         group = rows[group_start:group_end]
         if any(row.turns is None for row in group):
+            _warn_episode_fallback()
             for row_index in range(group_start, group_end):
                 completion_end = rows[row_index].spans[-1][1] if rows[row_index].spans else 0
                 advantages[row_index, :completion_end] = episode_advantages[row_index]
@@ -75,12 +101,12 @@ def build_per_turn_advantages(
                 # empty turn contributes no advantage and must not skew the group baseline.
                 continue
             mean_reward = sum(
-                cast(tuple[float, ...], rows[row_index].turns)[turn_index]
+                cast("tuple[float, ...]", rows[row_index].turns)[turn_index]
                 for row_index in member_indexes
             ) / len(member_indexes)
             for row_index in member_indexes:
                 row = rows[row_index]
-                reward = cast(tuple[float, ...], row.turns)[turn_index]
+                reward = cast("tuple[float, ...]", row.turns)[turn_index]
                 start, end = row.spans[turn_index]
                 advantages[row_index, start:end] = reward - mean_reward
 
@@ -93,12 +119,16 @@ class GRPOPerTurnTrainer(GRPOTrainer):
     """Replace scalar GRPO advantages with aligned per-turn advantages when supplied."""
 
     def _generate_and_score_completions(self, inputs: list[dict[str, object]]) -> dict[str, object]:
-        output = cast(dict[str, object], super()._generate_and_score_completions(inputs))
+        output = cast("dict[str, object]", super()._generate_and_score_completions(inputs))
         turn_rewards = cast(
-            list[list[float] | None],
+            "list[list[float] | None]",
             [item.get("turn_rewards") for item in inputs],
         )
         if not any(rewards is not None for rewards in turn_rewards):
+            # the whole-batch miss is the common case: the environment never emits per_turn_rewards
+            # at all. it returns before build_per_turn_advantages(), so warn here too or the very
+            # configuration this warning exists for is the one that stays silent.
+            _warn_episode_fallback()
             return output
         if self.accelerator.num_processes > 1:
             raise NotImplementedError(
@@ -107,16 +137,16 @@ class GRPOPerTurnTrainer(GRPOTrainer):
             )
 
         turn_spans = cast(
-            list[list[tuple[int, int]] | None],
+            "list[list[tuple[int, int]] | None]",
             [item.get("turn_spans") for item in inputs],
         )
         if any(spans is None for spans in turn_spans):
             raise ValueError("per-turn rollout rows must all include turn_spans")
-        aligned_turn_spans = cast(list[list[tuple[int, int]]], turn_spans)
-        scalar_advantages = cast(torch.Tensor, output["advantages"])
+        aligned_turn_spans = cast("list[list[tuple[int, int]]]", turn_spans)
+        scalar_advantages = cast("torch.Tensor", output["advantages"])
         if scalar_advantages.dim() != 1:
             raise ValueError("expected TRL scalar advantages with shape [B]")
-        completion_ids = cast(torch.Tensor, output["completion_ids"])
+        completion_ids = cast("torch.Tensor", output["completion_ids"])
         batch_size, completion_len = completion_ids.shape
         if len(inputs) != batch_size:
             raise ValueError(

@@ -107,6 +107,60 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+def _spec_with_resolved_env_sha(spec: JobSpec, sha: str) -> JobSpec:
+    """The spec carrying an already-resolved environment SHA, or the spec unchanged."""
+    if not sha or spec.environment.resolved_sha == sha:
+        return spec
+    d = spec.to_internal_dict()
+    d["environment"] = {**d["environment"], "resolved_sha": sha}
+    return JobSpec.from_dict(d)
+
+
+def _pin_environment_for_run(spec: JobSpec, log, *, attempt_started: bool) -> JobSpec:
+    """Resolve the environment ref to a SHA once, before any attempt runs, and keep that pin.
+
+    Submit already tries this, but best-effort: a GitHub outage or rate limit there returns the spec
+    unpinned, and the failure is only visible in a server-side log the user never sees. Retrying then
+    re-resolves the ref, and for a managed slug that ref is ``environment-hub@main`` -- so a push
+    landing between attempt 1 and attempt 2 trains the retry on different environment code, with no
+    error and nothing in the run record distinguishing it.
+
+    ``attempt_started`` is the fail-closed half. Once an attempt has run unpinned it already resolved
+    the symbolic ref on its worker, and that commit is unknowable here. Resolving now would pin a ref
+    that may have advanced since, which reintroduces the same split -- and a retry resumes from the
+    unpinned attempt's checkpoint, so the run would carry both commits. Leave it symbolic instead:
+    unpinned-throughout is one consistent story, and the warning below is what tells the user.
+    """
+    if spec.environment.resolved_sha:
+        return spec
+    if attempt_started:
+        # no pin is recoverable from here; see the docstring. warn once more so the condition is
+        # visible in the log at the point the retry is launched, not only at the start of the run.
+        print(
+            f"warning: environment {spec.environment.id!r} ran unpinned on an earlier attempt; "
+            "leaving it unpinned so this retry cannot resolve a different commit",
+            file=log,
+            flush=True,
+        )
+        return spec
+    from flash.runner import _assign_resolved_env_sha
+
+    pinned = _assign_resolved_env_sha(spec)
+    sha = pinned.environment.resolved_sha
+    if not sha:
+        # still unpinned: the ref stays symbolic and every attempt resolves it on its own worker. say
+        # so in the run log, which is the one place the user actually reads.
+        print(
+            f"warning: could not pin environment {spec.environment.id!r} to a commit; "
+            "a retry may resolve it to a newer push",
+            file=log,
+            flush=True,
+        )
+        return spec
+    print(f"environment {spec.environment.id!r} pinned to {sha}", file=log, flush=True)
+    return pinned
+
+
 def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     """Spec with the SHARED weight-cache volume removed for an unrestricted cross-region retry.
 
@@ -422,6 +476,30 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
     )
 
 
+def _projected_retry_class(
+    candidates, failed_providers, tried_classes, chosen, *, cache_drop: bool
+):
+    """The class the NEXT attempt is expected to select, given the failure this one records.
+
+    Mirrors the bookkeeping at the bottom of the retry loop: a cache-drop retry leaves both sets
+    untouched (same class, cold), any other retry marks this class tried and its provider failed.
+    Only valid off the OOM path, where the escalation floor rewrites the candidate list first.
+
+    Expected, not guaranteed: the next attempt calls ``allocate()`` again, and providers that build
+    candidates from live capacity can drop this class or surface a cheaper one. Callers must word it
+    as a projection.
+    """
+    if not candidates:
+        return None
+    if cache_drop:
+        return _select_candidate(candidates, failed_providers, tried_classes)
+    return _select_candidate(
+        candidates,
+        failed_providers | {chosen.provider},
+        tried_classes | {(chosen.provider, chosen.gpu)},
+    )
+
+
 def _oom_escalated(candidates, oom_vram_floor: int):
     """Candidates strictly LARGER than the VRAM that just OOM'd. ``oom_vram_floor == 0`` (no prior OOM)
     leaves the list unchanged; otherwise an 80GB OOM leaves only the >80GB classes (a same-size retry
@@ -604,6 +682,12 @@ def _submit_seed_supervised(
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str]] = set()
     oom_vram_floor = 0
+    # Pin the environment ref ONCE, here, before any attempt runs -- not per attempt. Submit's pin
+    # is best-effort, so a GitHub blip there leaves resolved_sha empty, and a managed slug points at
+    # environment-hub@main, which moves. attempt_start > 0 means a previous invocation already ran an
+    # attempt (post-restart recovery), so resolving now could pin a commit different from the one
+    # that attempt used; _pin_environment_for_run fails closed on that.
+    spec = _pin_environment_for_run(spec, log, attempt_started=attempt_start > 0)
     for local_attempt in range(retry_budget.max_attempts):
         attempt = attempt_start + local_attempt
         try:
@@ -770,9 +854,28 @@ def _submit_seed_supervised(
                     file=log,
                     flush=True,
                 )
+            elif attempt and not untried:
+                # every fitting class has been tried, so the picker re-selects the one that just
+                # failed -- correct (never strand a run with no candidates), but silent: a
+                # no_capacity retry then spends another full LAST_GPU_CAPACITY_GRACE_S waiting on
+                # the same unavailable class. say so, because the operator's fix is to unpin
+                # gpu.type rather than to keep waiting.
+                print(
+                    f"retry {attempt}: no untried class left; re-selecting {chosen.gpu} "
+                    f"@ {chosen.provider}"
+                    + (" (gpu.type is pinned)" if getattr(spec.gpu, "type", None) else ""),
+                    file=log,
+                    flush=True,
+                )
             effective_spec = _spec_with_gpu(spec, chosen.gpu)
             if drop_weight_cache:
                 effective_spec = _drop_weight_cache(effective_spec)
+            # carry the run's one pin (resolved above the loop) onto this attempt's spec. _spec_with_gpu
+            # and _drop_weight_cache rebuild the spec, so the pin has to be re-applied, but it is never
+            # re-resolved: every attempt is handed the same commit.
+            effective_spec = _spec_with_resolved_env_sha(
+                effective_spec, spec.environment.resolved_sha
+            )
             try:
                 run_spec = _spec_with_remaining_wall(
                     effective_spec,
@@ -883,10 +986,48 @@ def _submit_seed_supervised(
             res.failure,
             cache_drop=first_cache_drop,
         )
+        # name the class the retry will ACTUALLY land on. on_last_gpu only says no further class
+        # escalation follows -- it does NOT mean this class is reused: with several fitting classes
+        # the picker clamps back to the cheapest already-tried one (A100 PCIe, A100 SXM, then A100
+        # PCIe again). so re-run the picker against the sets this failure is about to update.
+        #
+        # projected off the CURRENT candidate list, which the next attempt rebuilds by calling
+        # allocate() again. lambda/vast rebuild from live capacity and pricing, so the named class
+        # can disappear or lose to a newly available one -- word it as the expected target, not a
+        # guarantee. a cache-drop retry projects too: it leaves both sets untouched and so reuses
+        # this class cold, which is exactly the escalation the generic line failed to describe.
+        projected = None
+        if will_retry and not oom_mode and chosen is not None:
+            projected = _projected_retry_class(
+                cands, failed_providers, tried_classes, chosen, cache_drop=first_cache_drop
+            )
+        if projected is not None:
+            same = (projected.provider, projected.gpu) == (chosen.provider, chosen.gpu)
+            # derived from the sets AFTER this failure's bookkeeping, not from the flag. a
+            # cache-drop retry deliberately leaves tried_classes untouched and reuses this class
+            # cold, so the projected class is still untried and reading current_on_last_gpu there
+            # printed "retry on H100 again, no untried GPU class fits" -- naming the untried class
+            # in the same clause that denies one exists. on_last_gpu is also true when the infra
+            # retry budget runs out with classes still untried, which is not exhaustion either
+            # (codex[bot]).
+            retry_tried = (
+                tried_classes
+                if first_cache_drop
+                else tried_classes | {(chosen.provider, chosen.gpu)}
+            )
+            exhausted = all((c.provider, c.gpu) in retry_tried for c in cands)
+            no_escalation = ", no untried GPU class fits this run" if exhausted else ""
+            retry_target = (
+                f"expecting to retry on {projected.gpu} @ {projected.provider}"
+                f"{' again' if same else ''}{no_escalation} (resume from last checkpoint; "
+                "reallocated against live capacity, so the class may change)"
+            )
+        else:
+            retry_target = "retrying (resume from last checkpoint)"
         action = (
             f"retrying on a larger GPU (> {oom_vram_floor} GB)"
             if (will_retry and oom_mode)
-            else "retrying (resume from last checkpoint)"
+            else retry_target
             if will_retry
             else "not retrying"
         )

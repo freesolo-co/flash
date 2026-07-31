@@ -994,3 +994,141 @@ def test_rollout_func_unconstrained_without_structured_outputs():
     rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
     assert captured
     assert all(not hasattr(sp, "structured_outputs") for sp in captured)
+
+
+# ============================================================================================
+# LO-004 — the driver must not end an episode without giving the env the final assistant turn
+# ============================================================================================
+class _StatefulBoardEnv:
+    """Env whose reward is the state it has actually STEPPED, not the raw transcript.
+
+    Models a board/game env: every model turn is a move the env must apply through ``env_reply``
+    before the position means anything. ``rollout_done`` is driven only by the env's own state, so
+    the DRIVER's turn cap is what cuts these episodes short.
+    """
+
+    multi_turn = True
+    rollout_rewards_many = BaseEnvironment.rollout_rewards_many
+
+    def __init__(self):
+        self.env_reply_calls = 0
+
+    def new_rollout_state(self, example):
+        return {"prompt": [{"role": "user", "content": "u1"}], "pending": None, "applied": 0}
+
+    def record_model_turn(self, state, content):
+        state["pending"] = content
+
+    def rollout_done(self, state, max_turns):
+        return False  # only the driver's cap ends these episodes
+
+    def env_reply(self, messages, state):
+        self.env_reply_calls += 1
+        if state["pending"] is not None:
+            state["applied"] += 1  # the move is only on the board once the env has stepped it
+            state["pending"] = None
+        return [{"role": "user", "content": "u2"}]
+
+    def reward(self, completion, example, state=None):
+        return float((state or {}).get("applied", 0))
+
+
+def test_rollout_one_steps_the_env_on_the_final_turn_before_scoring():
+    """LO-004: the loop broke at the turn cap BEFORE env_reply, so the last model turn was never
+    applied and a stateful env scored a stale board."""
+    env = _StatefulBoardEnv()
+    out = rollout_one(
+        example={},
+        active_env=env,
+        render=render,
+        generate=_det_generate,
+        env_glue=env_glue,
+        max_turns=3,
+        per_turn_max_tokens=8,
+    )
+    assert out["reward"] == 3.0, "the final model turn was scored without being applied by the env"
+    assert env.env_reply_calls == 3
+
+
+def test_rollout_async_steps_the_env_on_the_final_turn_before_scoring():
+    """Same close-out in the continuously-batched driver."""
+    env = _StatefulBoardEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    out = rollout_async(
+        examples=[{}],
+        active_env=env,
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=busy,
+        abort=lambda ids: None,
+        env_glue=env_glue,
+        max_turns=3,
+        per_turn_max_tokens=8,
+    )
+    assert out[0]["reward"] == 3.0
+    assert env.env_reply_calls == 3
+
+
+def test_token_budget_exhaustion_also_steps_the_env():
+    """The token budget is the other driver-side exit that skipped the env step."""
+    env = _StatefulBoardEnv()
+    # engine_max_len leaves room for ~2 turns; the cap is never reached.
+    out = rollout_one(
+        example={},
+        active_env=env,
+        render=render,
+        generate=_det_generate,
+        env_glue=env_glue,
+        max_turns=99,
+        per_turn_max_tokens=8,
+        engine_max_len=len(render([{"role": "user", "content": "u1"}], True)) + 8 + 6,
+    )
+    assert out["reward"] == float(env.env_reply_calls)
+    assert env.env_reply_calls >= 1
+
+
+class _FinishingEnv(_StatefulBoardEnv):
+    """Env that declares the episode over itself after the first env step."""
+
+    def rollout_done(self, state, max_turns):
+        return state["applied"] >= 1
+
+
+def test_env_that_finishes_itself_is_not_stepped_twice():
+    """The close-out must fire only when the DRIVER ended the episode. An env that already stepped
+    the last turn (or declared itself done) would otherwise get a spurious extra move."""
+    env = _FinishingEnv()
+    out = rollout_one(
+        example={},
+        active_env=env,
+        render=render,
+        generate=_det_generate,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
+    )
+    assert env.env_reply_calls == 1
+    assert out["reward"] == 1.0
+
+
+class _SilentEnv(_StatefulBoardEnv):
+    """Env that ends the episode by replying with nothing."""
+
+    def env_reply(self, messages, state):
+        super().env_reply(messages, state)
+        return []
+
+
+def test_env_ending_with_an_empty_reply_is_not_stepped_twice():
+    env = _SilentEnv()
+    rollout_one(
+        example={},
+        active_env=env,
+        render=render,
+        generate=_det_generate,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
+    )
+    assert env.env_reply_calls == 1
