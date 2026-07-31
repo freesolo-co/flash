@@ -80,6 +80,7 @@ from flash.engine.worker.verl_common import (
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
+    resolve_verl_device_capability,
     resolve_verl_loggers,
     resolve_verl_python,
     verl_supports_rollout_field,
@@ -1225,6 +1226,15 @@ def render_reentrant_checkpointing_shim(reentrant: bool) -> str:
     out, so verl's own call still runs and only the flag differs. the same hook the SFT verl path
     uses (``sft_train.py``), against the same class: GRPO's actor is ``FSDPEngineWithLMHead``, which
     inherits ``_build_module`` from ``FSDPEngine``.
+
+    deliberately NOT unified with SFT's version, which instead tells verl
+    ``enable_gradient_checkpointing=False`` and enables checkpointing itself. GRPO cannot do that:
+    verl reads the same flag a SECOND time, to decide activation offloading
+    (``transformer_impl.py:433-434``), so clearing it would silently change the memory profile as
+    well as the recompute flag. leaving it True and correcting only the kwarg keeps this a
+    flag-level change. the guard below exists for the same reason -- ``_build_module`` also builds
+    engines whose config may legitimately have checkpointing off, and enabling it there would turn
+    on a feature verl chose to leave off.
     """
     if not reentrant:
         return ""
@@ -2944,16 +2954,19 @@ def run_rl_verl():
             )
         except Exception:  # no cuda / probe failure -> conservative bf16 kv
             fp8_kv = False
+        # one capability probe, both rollout decisions below. asked of the verl interpreter, whose
+        # torch/vllm stack is the one that has to run the rollout.
+        verl_cc = resolve_verl_device_capability(python_bin)
         # blackwell needs both rollout attention backends pinned; vllm 0.19.1's own defaults pick
         # flash-attn, which is PTX-unreliable on sm120 (silent empty rollouts) and routes the ViT
         # into an unimportable CUTE kernel on sm100/sm120. no-op off blackwell.
         attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(
-            python_bin
+            python_bin, verl_cc
         )
         # vllm 0.19.1 graph capture is only validated on a100/h100/blackwell; elsewhere it dies in
         # aot_compile or triton slot-mapping, so the rollout runs eagerly. see
         # resolve_rollout_enforce_eager for why one knob is enough.
-        enforce_eager = resolve_rollout_enforce_eager(python_bin)
+        enforce_eager = resolve_rollout_enforce_eager(verl_cc)
         cfg = _build_verl_training_cfg(
             inp,
             train_files=train_pq,

@@ -912,8 +912,11 @@ def test_the_resolved_eager_flag_reaches_the_verl_config():
     # the string assertions above pass against a resolver whose answer is never carried into the
     # config, which is exactly how the retired trl workaround got dropped. pin the wiring.
     built = inspect.getsource(rl_verl.run_rl_verl)
-    assert "enforce_eager = resolve_rollout_enforce_eager(python_bin)" in built
+    assert "enforce_eager = resolve_rollout_enforce_eager(verl_cc)" in built
     assert "enforce_eager=enforce_eager," in built
+    # and the capability it decides from is the one probe both rollout decisions share.
+    assert "verl_cc = resolve_verl_device_capability(python_bin)" in built
+    assert "resolve_blackwell_attention_backends(\n            python_bin, verl_cc\n        )" in built
     cfg = inspect.getsource(rl_verl._build_verl_training_cfg)
     assert '"enforce_eager": enforce_eager,' in cfg
 
