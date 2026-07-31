@@ -472,63 +472,16 @@ def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
     assert "overall: FAIL" in captured
 
 
-def test_env_eval_pins_the_revision_still_serving_during_a_rollout(
+def test_env_eval_never_pins_the_revision_a_rollout_is_heading_to(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    """A queued replacement is listed with the revision it is rolling OUT to, not the live one.
+    """A busy record is listed with the revision it is rolling OUT to, not the one serving.
 
-    Taking the busy record's adapter_revision graded a revision that was not serving yet and
-    filed the scores under it. `flash chat` reads `previous_deployment` for the same reason.
-    """
-    env_dir = _upload_env_dir(tmp_path)
-    serving = "flash-1@step-50." + "a" * 40
-    incoming = "flash-1@final." + "b" * 40
-
-    class Client:
-        def __init__(self):
-            self.targets = []
-
-        def deployments(self):
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "queued",
-                        "adapter_revision": incoming,
-                        "previous_deployment": {
-                            "state": "ready",
-                            "adapter_revision": serving,
-                        },
-                    },
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield "4"
-
-    client = Client()
-    uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-    _patch_upload(monkeypatch, uploader)
-
-    assert (
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
-        == 0
-    )
-    assert client.targets == [serving]
-    assert uploader.calls[0]["model"] == serving
-    assert incoming not in capsys.readouterr().out
-
-
-def test_env_eval_refuses_a_first_rollout_that_is_not_serving_yet(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """A busy record with no servable predecessor means nothing is answering requests.
-
-    Falling through to the busy record graded the revision the rollout is heading TO, which is
-    not loaded anywhere, and filed the scores under it as if the model had produced them.
+    Pinning it graded a revision that was not answering requests and filed the scores under it.
+    The predecessor still serving underneath cannot be read from here -- `/v1/deployments` strips
+    `previous_deployment` as private rollback state (tests/test_server_api.py asserts the public
+    body omits it) -- so the run id is forwarded and the chat route resolves it, exactly as
+    `flash chat RUN` does through the same predecessor.
     """
     env_dir = _upload_env_dir(tmp_path)
     incoming = "flash-1@final." + "b" * 40
@@ -538,6 +491,8 @@ def test_env_eval_refuses_a_first_rollout_that_is_not_serving_yet(
             self.targets = []
 
         def deployments(self):
+            # the public listing shape: no `previous_deployment`, so a redeploy over a live
+            # revision and a first rollout are indistinguishable from this side.
             return [
                 {
                     "run_id": "flash-1",
@@ -557,14 +512,13 @@ def test_env_eval_refuses_a_first_rollout_that_is_not_serving_yet(
 
     assert (
         cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
-        == 1
+        == 0
     )
-    # no generation was attempted and no scores were filed against an unloaded revision
-    assert client.targets == []
-    assert uploader.calls == []
-    captured = capsys.readouterr()
-    assert "is not deployed" in captured.err
-    assert "overall: FAIL" in captured.err
+    # the run id is forwarded untouched: the incoming revision must never be substituted for it,
+    # in generation or in the uploaded report.
+    assert client.targets == ["flash-1"]
+    assert uploader.calls[0]["model"] == "flash-1"
+    assert incoming not in capsys.readouterr().out
 
 
 def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys) -> None:
@@ -1943,6 +1897,29 @@ def test_env_eval_rejects_a_non_finite_temperature_before_paying(monkeypatch, tm
     assert excinfo.value.code == 2
 
 
+@pytest.mark.parametrize("bad", ["-1", "-0.5", "-1e-9"])
+def test_env_eval_rejects_a_negative_temperature_before_paying(monkeypatch, tmp_path, bad):
+    # a negative value is finite, so it passed the non-finite guard above and every case then
+    # spent a request the OpenAI sampling contract rejects -- one bad flag recorded as one
+    # generation failure per case rather than one usage error (codex[bot]). training already
+    # enforces this floor on its own temperature (`flash/schema/__init__.py`, `minimum=0.0`).
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            raise AssertionError(f"paid request issued with temperature={kwargs['temperature']}")
+            yield ""  # pragma: no cover - generator protocol only
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--temperature", bad])
+
+    # argparse's own usage error, which is exit 2 rather than the CLI's 1
+    assert excinfo.value.code == 2
+
+
 def test_env_eval_still_accepts_an_ordinary_temperature(monkeypatch, tmp_path) -> None:
     # the control: rejecting non-finite values must not narrow the flag's real range.
     env_dir = _upload_env_dir(tmp_path)
@@ -2581,6 +2558,57 @@ def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(_suite("plain", mention))]) == 0
 
     assert capsys.readouterr().out.count("case sum: PASS") == 2
+
+
+def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """An unreachable plane is retryable, so it must not be graded through.
+
+    The chat requests can succeed while this one lookup fails, and then `thinking` stays false and
+    every `<think>...</think>answer` reaches the scorer raw -- a whole paid suite uploaded as false
+    failures. Distinct from an ApiError, where the plane answered and there is nothing to retry.
+    """
+    from flash.client import ClientError
+
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'reasoning'\n"
+        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def __init__(self):
+            self.generated = 0
+
+        def get_run(self, run_id):
+            raise ClientError("cannot reach the Flash service at https://api.example")
+
+        def chat_stream(self, target, messages, **kwargs):
+            self.generated += 1
+            yield "<think>2 plus 2</think>4"
+
+    client = Client()
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(
+            ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--upload", "--project", _PROJECT_ID]
+        )
+        == 1
+    )
+    # it stops BEFORE generation: nothing is bought, and no false failure is filed.
+    assert client.generated == 0
+    assert uploader.calls == []
+    captured = capsys.readouterr()
+    assert "could not reach the control plane" in captured.err
+    assert "overall: FAIL" in captured.err
 
 
 def test_env_eval_grades_raw_when_the_run_spec_is_unreadable(monkeypatch, tmp_path, capsys) -> None:
