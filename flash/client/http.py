@@ -372,6 +372,7 @@ class ApiClient:
         self.api_key = api_key
         self.timeout = timeout
         self.key_source = key_source
+        self._chat_step_selector_ok = False
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key:
@@ -472,6 +473,13 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     def _require_chat_step_selector(self) -> None:
+        # cached after it first succeeds: this is a property of the control plane, not of the
+        # request. `env eval` sends one chat per case, so re-checking each time doubled the
+        # request count and let a single transient /v1/health blip fail an arbitrary case while
+        # the chat endpoint was healthy (codex[bot]). only a positive result is cached -- a plane
+        # that genuinely lacks the capability keeps failing every call.
+        if self._chat_step_selector_ok:
+            return
         capabilities = self.health().get("capabilities")
         if not isinstance(capabilities, list) or _CHAT_STEP_SELECTOR_CAPABILITY not in capabilities:
             raise ClientError(
@@ -479,6 +487,7 @@ class ApiClient:
                 f"{_CHAT_STEP_SELECTOR_CAPABILITY}; use a full immutable adapter revision or "
                 "upgrade the control plane"
             )
+        self._chat_step_selector_ok = True
 
     def publish_env(
         self,

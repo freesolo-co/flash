@@ -252,6 +252,12 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
         sys.path.insert(0, module_dir)
     previous_module = sys.modules.get(module_name)
     sys.modules[module_name] = module
+    # a sibling a sidecar imports is cached under its plain name, so a second package importing
+    # its own `helper` found the FIRST package's module already in sys.modules and reused it --
+    # silently running the wrong cases and the wrong scoring logic, with no import error to see
+    # (codex[bot]). dropping the siblings this load introduced makes the next package import its
+    # own; anything already imported before this call is left alone, since it is not ours to evict.
+    before = set(sys.modules)
     try:
         spec.loader.exec_module(module)
     except Exception:
@@ -259,8 +265,29 @@ def _import_evaluations_module(module_path: Path) -> ModuleType:
             sys.modules.pop(module_name, None)
         else:
             sys.modules[module_name] = previous_module
+        _forget_sidecar_siblings(module_dir, before)
         raise
+    _forget_sidecar_siblings(module_dir, before)
     return module
+
+
+def _forget_sidecar_siblings(module_dir: str, before: set[str]) -> None:
+    """Drop modules this sidecar load imported from its own package directory.
+
+    Only modules that (a) were absent before the load and (b) resolve to a file inside this
+    package directory. A stdlib or third-party module the sidecar imported first stays cached:
+    evicting it would re-execute unrelated code for every later load."""
+    directory = Path(module_dir).resolve()
+    for name in set(sys.modules) - before:
+        origin = getattr(getattr(sys.modules[name], "__spec__", None), "origin", None)
+        if not origin:
+            continue
+        try:
+            resolved = Path(origin).resolve()
+        except OSError:
+            continue
+        if resolved.parent == directory:
+            sys.modules.pop(name, None)
 
 
 def _call_factory(factory, kwargs: dict[str, object]) -> object:
@@ -271,23 +298,28 @@ def _call_factory(factory, kwargs: dict[str, object]) -> object:
     )
     if accepts_var_kwargs:
         return factory(**kwargs)
-    # a positional-only parameter is in signature.parameters but cannot be passed by name, so
-    # matching on membership alone would raise TypeError for `load_evaluations(environment, /)`.
-    # such a factory declared the argument, so pass it positionally rather than dropping it and
-    # handing the suite environment=None -- which downgrades a real scorer to substring matching.
+    # a positional-only parameter is recognized by name but cannot be passed by one, so
+    # `load_evaluations(environment, /)` was accepted by the filter and then rejected by
+    # python itself -- a sidecar the documented contract says is supported (codex[bot]).
+    #
+    # position is the only thing that binds these, so a parameter we have no value for cannot
+    # be skipped: `load_evaluations(options=None, environment=None, /)` would otherwise pass
+    # the environment as `options` and leave `environment` at its default -- the wrong argument
+    # silently accepted, which is worse than the TypeError it replaced (codex[bot]). fill an
+    # unsupplied one from its default and stop at the first that has none, leaving the rest to
+    # python's own signature error.
     positional: list[object] = []
+    filtered_kwargs: dict[str, object] = {}
     for name, parameter in signature.parameters.items():
-        if parameter.kind != inspect.Parameter.POSITIONAL_ONLY:
-            break
-        if name not in kwargs:
-            break
-        positional.append(kwargs[name])
-    consumed = list(signature.parameters)[: len(positional)]
-    filtered_kwargs = {
-        name: value
-        for name, value in kwargs.items()
-        if name in signature.parameters and name not in consumed
-    }
+        if parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+            if name in kwargs:
+                positional.append(kwargs[name])
+            elif parameter.default is not inspect.Parameter.empty:
+                positional.append(parameter.default)
+            else:
+                break
+        elif name in kwargs:
+            filtered_kwargs[name] = kwargs[name]
     return factory(*positional, **filtered_kwargs)
 
 

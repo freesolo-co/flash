@@ -766,3 +766,66 @@ def test_push_drops_underscore_secret_files_but_keeps_secretish_packages(monkeyp
     assert "id_rsa_backup" not in names
     assert "credentials_store/__init__.py" in names
     assert "credentials_store/load.py" in names
+
+
+def test_push_single_py_ships_its_evaluations_sidecar(monkeypatch, tmp_path):
+    # `env eval TARGET ./environment.py` loads the sibling evaluations.py, so a single-file push
+    # that dropped it published a package whose suite passed locally and was simply gone once
+    # uploaded -- while a directory push of the same files kept it (codex[bot]).
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'held-out'\n"
+        "    def cases(self): return [EvalCase(id='c', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    (tmp_path / "helper.py").write_text("VALUE = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+
+    files = _members(cap["package_b64"])
+    assert "held-out" in files["evaluations.py"]
+    # the sidecar is a known filename, not a blanket "ship every sibling module" change.
+    assert "helper.py" not in files
+
+
+def test_push_directory_infers_its_entrypoint_past_an_evaluations_sidecar(monkeypatch, tmp_path):
+    # a directory whose only module is `custom.py` is a supported layout. counting evaluations.py
+    # as a second top-level module made adding one reject the directory outright, so the very
+    # sidecar that enables evaluation disabled the push and the eval alike (codex[bot]).
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'held-out'\n"
+        "    def cases(self): return []\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+
+    files = _members(cap["package_b64"])
+    # custom.py was resolved as the entrypoint and published under the canonical name...
+    assert "load_environment" in files["environment.py"]
+    # ...and the sidecar rode along rather than being mistaken for a rival entrypoint.
+    assert "held-out" in files["evaluations.py"]
+
+
+def test_push_directory_still_rejects_two_real_candidate_modules(monkeypatch, tmp_path):
+    # the control for the scope of that exclusion: only the known sidecar filename is skipped,
+    # so a genuinely ambiguous directory is still refused rather than silently picking one.
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "other.py").write_text("def load_environment(**k):\n    return None\n")
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
