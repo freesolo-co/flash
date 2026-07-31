@@ -6,11 +6,11 @@ import math
 from dataclasses import asdict, dataclass, replace
 from typing import Any
 
-ALGORITHMS = ("sft", "grpo", "opd", "opsd")
+ALGORITHMS = ("sft", "grpo", "opd")
 
 # algorithms whose training step samples on-policy student completions, unlike fixed-dataset sft.
 # import ``samples_on_policy`` instead of hand-rolling algorithm tuples at each call site.
-_ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd", "opsd"})
+_ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
 _IMAGE_TRAINING_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-0.8B",
@@ -419,7 +419,7 @@ MODELS: dict[str, ModelInfo] = {
             (6144, 5120, 64),
             (17408, 5120, 64),
         ),
-        algos=("sft", "grpo", "opd", "opsd"),
+        algos=("sft", "grpo", "opd"),
         min_vram_gb=80,
         grpo_min_vram_gb=142,  # colocated GRPO (two ~54GB copies) needs B200; triggers resident-peak sizing ~150GB
         sft_min_vram_gb=80,
