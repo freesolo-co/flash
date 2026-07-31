@@ -228,6 +228,36 @@ def test_push_ships_helpers_a_helper_imports(monkeypatch, tmp_path):
     assert "units.py" in files
 
 
+def test_push_ships_helpers_named_by_a_literal_dynamic_import(monkeypatch, tmp_path):
+    """`import_module("judge")` names a sibling as surely as an import statement does.
+
+    Scanning only Import/ImportFrom omitted the helper from the package, and the suite passed
+    every local check -- the sidecar scope makes the directory importable -- then failed on its
+    first published case.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import importlib\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    importlib.import_module('judge')\n"
+        "    __import__('rubric')\n"
+        "    return []\n"
+    )
+    # reached only through judge.py, so a dynamically named helper is followed like any other
+    (tmp_path / "judge.py").write_text("import weights\n")
+    (tmp_path / "weights.py").write_text("W = 1\n")
+    (tmp_path / "rubric.py").write_text("RULES = ()\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "judge.py" in files
+    assert "rubric.py" in files
+    assert "weights.py" in files
+
+
 def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monkeypatch, tmp_path):
     """`from custom import SCORER` must keep resolving after custom.py is published as environment.py.
 
