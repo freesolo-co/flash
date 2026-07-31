@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import urllib.error
@@ -766,10 +767,17 @@ def _import_freesolo_environment_tools():
             "task_example_from_record": task_example_from_record,
         }
     except ImportError as exc:
+        # report what actually failed and where. a fixed "install freesolo" message is wrong
+        # whenever the SDK IS installed and something underneath it raised -- a missing
+        # transitive dep, a version conflict, a partially removed package after a tool upgrade.
+        # the interpreter matters too: `flash` runs from its own uv-tool environment, so the
+        # freesolo the user sees on their PATH is not necessarily the one that failed here.
         raise ImportError(
-            "the 'freesolo' package is required to run Freesolo environments; "
-            "install it (for example `uv pip install freesolo`) or use a worker image "
-            "that includes the Freesolo SDK"
+            f"could not import the Freesolo environment tools: {exc.__class__.__name__}: {exc}. "
+            f"The interpreter that failed is {sys.executable}. "
+            "If the 'freesolo' package is genuinely missing, install it (for example "
+            "`uv pip install freesolo`) or use a worker image that includes the Freesolo SDK; "
+            "if it is already installed, the error above is the real failure."
         ) from exc
 
 

@@ -8,6 +8,7 @@ extraction, and the pure ref-parsing / dataset-probing helpers in the loader.
 from __future__ import annotations
 
 import io
+import sys
 import tarfile
 from pathlib import Path
 
@@ -274,3 +275,33 @@ def test_github_response_message_and_safe_contents_path():
         loader._safe_contents_path("../escape.py", ["pkg"])
     with pytest.raises(RuntimeError, match="unexpected path in environment contents"):
         loader._safe_contents_path("other/environment.py", ["pkg"])
+
+
+def test_freesolo_import_error_reports_the_real_failure(monkeypatch):
+    """The wrapper must surface the underlying ImportError, not a fixed "install it" message.
+
+    A fixed message is actively misleading when the SDK IS installed and something beneath it
+    failed (missing transitive dep, version conflict, half-removed package after a tool upgrade):
+    it sends the user to reinstall a package that is already there.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def explode(name, *args, **kwargs):
+        if name.startswith("freesolo"):
+            raise ImportError("No module named 'pyarrow'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", explode)
+
+    with pytest.raises(ImportError) as excinfo:
+        loader._import_freesolo_environment_tools()
+
+    message = str(excinfo.value)
+    # the real cause, not a generic substitute
+    assert "No module named 'pyarrow'" in message
+    # which interpreter failed: `flash` runs from its own uv-tool env
+    assert sys.executable in message
+    # and the original exception stays chained for a traceback
+    assert isinstance(excinfo.value.__cause__, ImportError)
