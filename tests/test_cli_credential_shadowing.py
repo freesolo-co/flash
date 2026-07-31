@@ -116,16 +116,15 @@ def test_every_org_binding_command_is_registered():
     }
 
 
-def test_env_eval_warns_only_when_uploading(monkeypatch, capsys):
-    # a plain `env eval` runs locally and never picks an org, so naming one would describe a
-    # request it does not make. `--upload` does bind an org, and the warning has to land before
-    # the run: by the time the upload is rejected, every paid request is already spent.
+@pytest.mark.parametrize("upload", [False, True])
+def test_env_eval_warns_whether_or_not_it_uploads(monkeypatch, capsys, upload):
+    # gating this on --upload treated a plain eval as local, but every case still makes an
+    # authenticated chat_stream request and the target's accessibility is resolved from the ambient
+    # key. so a plain eval can report the target inaccessible, or spend the whole suite against the
+    # unintended org, with no warning at all (codex[bot]).
     monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
 
-    cli._warn_if_login_shadowed(argparse.Namespace(func=cmd_env_eval, upload=False))
-    assert capsys.readouterr().err == ""
-
-    cli._warn_if_login_shadowed(argparse.Namespace(func=cmd_env_eval, upload=True))
+    cli._warn_if_login_shadowed(argparse.Namespace(func=cmd_env_eval, upload=upload))
     assert "shadowed!" in capsys.readouterr().err
 
 
