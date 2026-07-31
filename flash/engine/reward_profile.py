@@ -1,8 +1,8 @@
 """Warm-up measurement of an env's real per-completion grading latency.
 
 Single-turn grpo grades a step's completions one at a time (the verl bridge holds a lock to keep it
-that way), so grading is pure wall-clock the gpu spends idle. On an A100 PCIe at the default 64x8 shape that is 80.8% of every step at a 1s
-grader and 92.7% at a 3s judge.
+that way), so grading is pure wall-clock the gpu spends idle. On an A100 PCIe at the default 64x8
+shape that is 80.8% of every step at a 1s grader and 92.7% at a 3s judge.
 
 The cost model has to price that from a single ``AVG_REWARD_SECONDS_PER_COMPLETION = 1.0`` guess
 covering graders whose real span is ~0.01s (regex) to ~3s (llm judge). This measures the actual

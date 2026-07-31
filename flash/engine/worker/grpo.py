@@ -9,7 +9,7 @@ from flash.engine.worker._pkg import W as _w
 
 
 def resolve_grpo_prompts_per_step(requested: int, available_prompts: int) -> int:
-    """Cap GRPO prompt batch to the retained dataset size to avoid zero-batch TRL errors."""
+    """Cap GRPO prompt batch to the retained dataset size so a step never gets an empty batch."""
     requested = max(1, int(requested))
     available_prompts = int(available_prompts)
     if available_prompts <= 0:
@@ -74,7 +74,8 @@ def card_vram_gb() -> float | None:
 def grpo_mask_truncated_completions(train) -> bool:
     """Whether GRPO should drop truncated (non-EOS) completions from the loss.
 
-    Default True — TRL's footgun defaults to False. GATED OFF when stop_sequences is set:
+    Default True: a truncated completion was cut off mid-thought, so training on it teaches the
+    policy to stop early. GATED OFF when stop_sequences is set:
     stop-string rollouts don't end on EOS, so masking would wrongly drop every completion.
     """
     return not (train and train.stop_sequences)
