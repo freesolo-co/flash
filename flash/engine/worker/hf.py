@@ -37,14 +37,27 @@ class RequiredSaveError(RuntimeError):
     """permanent exact-save contract failure."""
 
 
-def error_artifact_name(mode: str, attempt: int = 0) -> str:
-    """Per-mode, per-attempt error filename (e.g. error_sft_attempt0.txt). Attempt-scoped so a prior
-    attempt's stale traceback can't be mistaken for the current attempt's crash on a retry host-loss."""
+def _attempt_scoped_name(kind: str, mode: str, attempt: int) -> str:
     if isinstance(attempt, bool) or not isinstance(attempt, int):
         raise ValueError("attempt must be a nonnegative integer")
     if attempt < 0 or attempt > _MAX_ATTEMPT_ID:
         raise ValueError("attempt must be a bounded nonnegative integer")
-    return f"error_{mode}_attempt{attempt}.txt"
+    return f"{kind}_{mode}_attempt{attempt}.txt"
+
+
+def error_artifact_name(mode: str, attempt: int = 0) -> str:
+    """Per-mode, per-attempt error filename (e.g. error_sft_attempt0.txt). Attempt-scoped so a prior
+    attempt's stale traceback can't be mistaken for the current attempt's crash on a retry host-loss."""
+    return _attempt_scoped_name("error", mode, attempt)
+
+
+def ray_log_artifact_name(mode: str, attempt: int = 0) -> str:
+    """Per-mode, per-attempt name for ray's own failure logs (e.g. raylogs_rl_attempt0.txt).
+
+    Attempt-scoped for the same reason the traceback beside it is: ``hf_prefix()`` is per-RUN, not
+    per-attempt, so an unscoped name would let a retry's ray logs overwrite the attempt that actually
+    reproduced the raylet failure -- the one case this artifact exists to explain."""
+    return _attempt_scoped_name("raylogs", mode, attempt)
 
 
 def hf_api():

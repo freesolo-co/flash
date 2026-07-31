@@ -25,6 +25,8 @@ import subprocess
 import time
 from collections.abc import Callable
 
+from flash.diagnostics import sanitize_diagnostic
+
 # verl 0.8.0 exactly, plus the truncation-mask and 3d position id commits. it must stay on the 0.8.0
 # base: the opd plugin patches 0.8.0 internals and imports verl.trainer.main_ppo_sync, which verl
 # deleted after 0.8.0, and opd's exact-version gate reads the version file this branch pins to the
@@ -642,8 +644,9 @@ RAY_FAILURE_LOGS = (
     "dashboard_agent.log",
     "dashboard.log",
 )
-# enough to carry a stack and the lines before it, without turning an artifact upload into the
-# reason a failing run takes even longer to report.
+# per file. enough to carry a stack and the lines before it, without turning an artifact upload into
+# the reason a failing run takes even longer to report. this is the ONLY bound on the result: the
+# sanitize pass below is given the same number so it can never truncate a tail we chose to keep.
 RAY_LOG_TAIL_BYTES = 64 * 1024
 
 
@@ -668,23 +671,27 @@ def latest_ray_session_dir(root: str = "/tmp/ray") -> str | None:
 
 
 def collect_ray_failure_logs(
-    dest_dir: str, *, root: str = "/tmp/ray", tail_bytes: int = RAY_LOG_TAIL_BYTES
-) -> list[str]:
-    """copy the tail of ray's own logs into ``dest_dir`` so a dead raylet leaves evidence.
+    *, root: str = "/tmp/ray", tail_bytes: int = RAY_LOG_TAIL_BYTES
+) -> str:
+    """ray's own logs about why a raylet died, as one credential-safe artifact body ("" if none).
 
     when a raylet dies the driver prints only its own downstream failure, and ray's session dir --
     which holds the actual cause -- lives on the pod and goes away with it. that makes a raylet
     failure undiagnosable from uploaded artifacts and costs a paid gpu run per guess (VERL-115).
 
+    one string rather than a directory of copies: the caller writes it exactly like the traceback
+    artifact beside it, so a dying pod does one upload instead of six against the same bounded hf
+    deadline allowance, and there is no staging directory whose only purpose is to be uploaded.
+
     best-effort by construction: this runs on a path that is ALREADY failing, so it must not be able
-    to replace the real error with its own. every step is guarded and the return value is simply
-    whichever files were captured.
+    to replace the real error with its own. every read is guarded and a file that cannot be read is
+    simply absent from the result.
     """
     session = latest_ray_session_dir(root)
     if session is None:
-        return []
+        return ""
     logs_dir = os.path.join(session, "logs")
-    captured: list[str] = []
+    sections: list[str] = []
     for name in RAY_FAILURE_LOGS:
         src = os.path.join(logs_dir, name)
         try:
@@ -696,15 +703,17 @@ def collect_ray_failure_logs(
                 payload = handle.read()
         except OSError:
             continue
-        dst = os.path.join(dest_dir, f"ray_{name}")
-        try:
-            os.makedirs(dest_dir, exist_ok=True)
-            with open(dst, "wb") as out:
-                out.write(payload)
-        except OSError:
-            continue
-        captured.append(dst)
-    return captured
+        # seeking to a byte offset can land mid-codepoint, and a decode error here would lose the
+        # whole file for a cosmetic reason on the one path that exists to preserve evidence.
+        text = payload.decode("utf-8", errors="replace")
+        # ray logs a raylet's argv, and flash passes credentials to the worker through the
+        # environment -- so these are third-party text that has never been through flash's redactor.
+        # limit is tail_bytes so sanitizing cannot cut below the tail already bounded at read time.
+        sections.append(
+            f"===== {name} (last {tail_bytes} bytes) =====\n"
+            f"{sanitize_diagnostic(text, limit=tail_bytes)}"
+        )
+    return "\n\n".join(sections)
 
 
 def run_verl_training(

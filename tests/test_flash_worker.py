@@ -434,6 +434,20 @@ def test_error_artifact_name_is_per_phase_and_attempt():
             error_artifact_name("sft", invalid)
 
 
+def test_ray_log_artifact_name_is_scoped_exactly_like_the_traceback_beside_it():
+    """Ray's failure logs upload to the same per-RUN hf_prefix() as the traceback, so they need the
+    same per-attempt scoping. A raylet failure is precisely the case that gets retried, and an
+    unscoped name would let the retry overwrite the attempt that actually reproduced it."""
+    from flash.engine.worker import error_artifact_name, ray_log_artifact_name
+
+    assert ray_log_artifact_name("rl") == "raylogs_rl_attempt0.txt"
+    assert ray_log_artifact_name("rl", 0) != ray_log_artifact_name("rl", 1)
+    assert ray_log_artifact_name("rl", 1) != error_artifact_name("rl", 1)
+    for invalid in ("3", "", True, 1.5, -1, 1 << 63):
+        with pytest.raises(ValueError, match="attempt must be"):
+            ray_log_artifact_name("sft", invalid)
+
+
 def test_train_body_imports_every_name_it_uses():
     """Flash ships only _train_body's source to the worker, where module-level
     imports are out of scope, so every stdlib/3p name it references must be

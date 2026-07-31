@@ -1763,13 +1763,17 @@ def test_ray_failure_logs_are_collected_so_a_dead_raylet_leaves_evidence(tmp_pat
             "dashboard_agent.log": "agent failed to start",
         },
     )
-    dest = tmp_path / "artifacts"
 
-    captured = vc.collect_ray_failure_logs(str(dest), root=str(root))
+    body = vc.collect_ray_failure_logs(root=str(root))
 
-    names = sorted(os.path.basename(p) for p in captured)
-    assert names == ["ray_dashboard_agent.log", "ray_gcs_server.out", "ray_raylet.err"]
-    assert "have not registered within the timeout" in (dest / "ray_raylet.err").read_text()
+    assert "have not registered within the timeout" in body
+    assert "agent failed to start" in body
+    # each section is labelled: six candidate files land in ONE artifact, so an unlabelled
+    # concatenation would leave a reader unable to tell which daemon produced which lines.
+    for name in ("raylet.err", "gcs_server.out", "dashboard_agent.log"):
+        assert f"===== {name}" in body
+    # absent files are simply absent -- not an empty section implying the daemon logged nothing.
+    assert "raylet.out" not in body
 
 
 def test_ray_log_collection_picks_the_newest_session_not_a_stale_one(tmp_path):
@@ -1778,11 +1782,11 @@ def test_ray_log_collection_picks_the_newest_session_not_a_stale_one(tmp_path):
     root = tmp_path / "ray"
     _ray_session(root, "session_old", files={"raylet.err": "STALE"}, mtime=1_000_000)
     _ray_session(root, "session_new", files={"raylet.err": "CURRENT"}, mtime=2_000_000)
-    dest = tmp_path / "artifacts"
 
-    vc.collect_ray_failure_logs(str(dest), root=str(root))
+    body = vc.collect_ray_failure_logs(root=str(root))
 
-    assert (dest / "ray_raylet.err").read_text() == "CURRENT"
+    assert "CURRENT" in body
+    assert "STALE" not in body
 
 
 def test_ray_log_collection_keeps_the_tail_because_the_crash_is_at_the_end(tmp_path):
@@ -1791,23 +1795,60 @@ def test_ray_log_collection_keeps_the_tail_because_the_crash_is_at_the_end(tmp_p
     root = tmp_path / "ray"
     body = ("filler\n" * 20000) + "FATAL: the actual cause\n"
     _ray_session(root, "session_1", files={"raylet.out": body})
-    dest = tmp_path / "artifacts"
 
-    vc.collect_ray_failure_logs(str(dest), root=str(root), tail_bytes=2048)
+    collected = vc.collect_ray_failure_logs(root=str(root), tail_bytes=2048)
 
-    written = (dest / "ray_raylet.out").read_text()
-    assert "FATAL: the actual cause" in written
-    assert len(written) <= 2048
+    assert "FATAL: the actual cause" in collected
+    # the per-file bound still holds after the header is added.
+    assert len(collected) <= 2048 + 100
+
+
+def test_ray_logs_are_redacted_because_they_are_third_party_text(tmp_path):
+    # ray logs a raylet's argv and flash passes credentials to the worker through the environment,
+    # so this content has never been through flash's redactor -- unlike the traceback beside it,
+    # which main() sanitizes before upload. an unsanitized path here would publish a live token to
+    # the run's HF artifacts.
+    root = tmp_path / "ray"
+    _ray_session(
+        root,
+        "session_1",
+        files={"raylet.err": "started with --token=hunter2seekrit and Authorization: Bearer abc.def"},
+    )
+
+    body = vc.collect_ray_failure_logs(root=str(root))
+
+    assert "hunter2seekrit" not in body
+    assert "abc.def" not in body
+    assert "<redacted>" in body
+    # redaction must not eat the diagnostic context around the secret.
+    assert "started with" in body
+
+
+def test_ray_log_collection_survives_a_tail_that_splits_a_codepoint(tmp_path):
+    # seeking to a byte offset lands wherever it lands. a strict decode would raise on a split
+    # multibyte character and lose the whole file for a cosmetic reason, on the one path whose
+    # entire purpose is preserving evidence.
+    root = tmp_path / "ray"
+    logs = root / "session_1" / "logs"
+    logs.mkdir(parents=True)
+    # the seek offset must land INSIDE the multibyte character, or this test passes under a strict
+    # decode and proves nothing. 47 bytes total with the 3-byte codepoint at [30:33), so a 16-byte
+    # tail seeks to 31 -- one byte into it.
+    raw = b"x" * 30 + "中".encode() + b"\nFATAL: cause\n"
+    (logs / "raylet.err").write_bytes(raw)
+    assert 30 < len(raw) - 16 < 33, "tail offset must split the codepoint or this test cannot fail"
+
+    body = vc.collect_ray_failure_logs(root=str(root), tail_bytes=16)
+
+    assert "FATAL: cause" in body
 
 
 def test_ray_log_collection_cannot_mask_the_real_error_it_runs_after(tmp_path):
     # this runs on an ALREADY-failing path. if a missing/unreadable ray dir could raise here, the
     # collector would replace the run's real traceback with its own and make things strictly worse.
-    dest = tmp_path / "artifacts"
-
-    assert vc.collect_ray_failure_logs(str(dest), root=str(tmp_path / "nonexistent")) == []
+    assert vc.collect_ray_failure_logs(root=str(tmp_path / "nonexistent")) == ""
     assert vc.latest_ray_session_dir(str(tmp_path / "nonexistent")) is None
 
     # a session dir with no logs subdir at all -- ray died before creating it.
     (tmp_path / "ray" / "session_1").mkdir(parents=True)
-    assert vc.collect_ray_failure_logs(str(dest), root=str(tmp_path / "ray")) == []
+    assert vc.collect_ray_failure_logs(root=str(tmp_path / "ray")) == ""

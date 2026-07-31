@@ -74,6 +74,7 @@ from flash.engine.worker.hf import (
     prefetch_model,
     publish_deployable_checkpoint,
     publish_opd_optimizer_start_marker,
+    ray_log_artifact_name,
     upload_debug_jsonl,
     upload_resume_checkpoint,
     write_base_model_provenance,
@@ -391,14 +392,19 @@ def main():
         except Exception as up_err:
             print("error-upload warn:", sanitize_diagnostic(up_err, limit=500))
         try:
-            # when a raylet dies, the driver traceback uploaded above records only the downstream
-            # symptom ("Failed to register worker to Raylet: ... End of file"); the reason is in
-            # ray's session logs, which live on the pod and vanish with it. that makes a raylet
-            # failure undiagnosable from artifacts and costs a paid gpu run per guess (VERL-115).
-            # runs for every mode: all three backends start ray, and collection is a no-op when the
-            # failure had nothing to do with it.
-            for log_path in collect_ray_failure_logs("/tmp/ray-failure-logs"):
-                hf_upload_file(log_path, os.path.basename(log_path))
+            # when a raylet dies, the traceback uploaded above records only the downstream symptom
+            # ("Failed to register worker to Raylet: ... End of file"); the reason is in ray's
+            # session logs, which live on the pod and vanish with it. that makes a raylet failure
+            # undiagnosable from artifacts and costs a paid gpu run per guess (VERL-115). runs for
+            # every mode: all three backends start ray, and this is empty when the failure had
+            # nothing to do with it.
+            ray_logs = collect_ray_failure_logs()
+            if ray_logs:
+                ray_name = ray_log_artifact_name(RUN_MODE, ATTEMPT)
+                ray_path = f"/tmp/{ray_name}"
+                with open(ray_path, "w") as f:
+                    f.write(ray_logs)
+                hf_upload_file(ray_path, ray_name)
         except Exception as ray_err:
             # this is the failure path already. a collector that could raise here would replace the
             # run's real error with its own.
@@ -531,6 +537,7 @@ __all__ = [
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
     "publish_opd_optimizer_start_marker",
+    "ray_log_artifact_name",
     "render_prompt",
     "require_active_env",
     "require_vllm_for_rollout_func",
