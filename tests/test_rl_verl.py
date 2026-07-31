@@ -3029,10 +3029,10 @@ def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
     recorded: list[tuple] = []
     env = _BridgeEnv(episode=0.75)
     bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+        env, [{"index": 0}], [[]], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "answer"})
     bridge.score({"session_id": "a", "turn_count": 1})
 
     assert len(recorded) == 1
@@ -3057,10 +3057,10 @@ def test_the_recorded_transcript_excludes_the_prompt_it_was_seeded_from():
     ]
     env = _BridgeEnv(episode=0.75, prompt=prompt)
     bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+        env, [{"index": 0}], [prompt], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "7"})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "7"})
     bridge.score({"session_id": "a", "turn_count": 1})
 
     published_prompt, transcript, _ = recorded[0]
@@ -3080,12 +3080,12 @@ def test_the_transcript_slice_keeps_a_turn_that_merely_looks_like_a_prompt_messa
     prompt = [{"role": "user", "content": "repeat after me: go"}]
     env = _BridgeEnv(episode=1.0, done_after=99, prompt=prompt)
     bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+        env, [{"index": 0}], [prompt], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     # the env replies with the prompt message verbatim, then the model answers.
     env.replies = [dict(prompt[0])]
-    bridge.step({"session_id": "a", "completion_text": "go"})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "go"})
     bridge.score({"session_id": "a", "turn_count": 1})
 
     transcript = recorded[0][1]
@@ -3097,11 +3097,11 @@ def test_the_recorded_episode_is_the_zeroed_reward_not_the_raw_nan():
     # a reward in the log that no advantage was ever computed from.
     recorded: list[tuple] = []
     bridge = rl_verl.MultiTurnBridge(
-        _BridgeEnv(episode=float("nan")), [{"index": 0}], max_turns=4,
+        _BridgeEnv(episode=float("nan")), [{"index": 0}], [[]], max_turns=4,
         on_episode_scored=lambda *row: recorded.append(row),
     )
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "answer"})
     bridge.score({"session_id": "a", "turn_count": 1})
 
     assert [row[2] for row in recorded] == [0.0]
@@ -3113,13 +3113,13 @@ def test_the_recorded_transcript_is_a_snapshot_that_later_turns_cannot_mutate():
     recorded: list[tuple] = []
     env = _BridgeEnv(done_after=99)
     bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+        env, [{"index": 0}], [[]], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "first"})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "first"})
     bridge.score({"session_id": "a", "turn_count": 1})
     snapshot = list(recorded[0][1])
-    bridge.step({"session_id": "a", "completion_text": "second"})
+    bridge.step({"session_id": "a", "turn_ordinal": 1, "completion_text": "second"})
 
     assert list(recorded[0][1]) == snapshot
     assert "second" not in [m.get("content") for m in recorded[0][1]]
@@ -3132,11 +3132,11 @@ def test_the_episode_recorder_runs_outside_the_session_lock():
     observed: list[bool] = []
     env = _BridgeEnv()
     bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4,
+        env, [{"index": 0}], [[]], max_turns=4,
         on_episode_scored=lambda *_: observed.append(bridge._lock.acquire(blocking=False)),
     )
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "answer"})
     bridge.score({"session_id": "a", "turn_count": 1})
 
     assert observed == [True], "the session lock was still held when the recorder ran"
@@ -3148,7 +3148,7 @@ def test_a_bridge_without_a_recorder_still_scores():
     # (and testable) without a sample buffer behind it.
     bridge = _bridge(_BridgeEnv(episode=0.5))
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "answer"})
     assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.5}
 
 
@@ -3165,10 +3165,10 @@ def test_a_first_turn_abort_is_still_shown_in_the_sample(abort):
     recorded: list[tuple] = []
     env = _BridgeEnv(done_after=99)
     bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+        env, [{"index": 0}], [[]], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
-    assert bridge.step({"session_id": "a", "completion_text": "ran out of ro", **abort}) == {
+    assert bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "ran out of ro", **abort}) == {
         "terminal": True,
         "messages": [],
     }
@@ -3183,10 +3183,10 @@ def test_the_env_never_scores_the_aborted_turn_it_is_shown_in_the_sample():
     # asserting only on the sample would pass an implementation that also appended it to `messages`,
     # which is the truncated-text-gets-graded bug the abort branch exists to prevent.
     env = _BridgeEnv(done_after=99)
-    bridge = rl_verl.MultiTurnBridge(env, [{"index": 0}], max_turns=4)
+    bridge = rl_verl.MultiTurnBridge(env, [{"index": 0}], [[]], max_turns=4)
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "good turn"})
-    bridge.step({"session_id": "a", "completion_text": "cut off", "truncated": True})
+    bridge.step({"session_id": "a", "turn_ordinal": 0, "completion_text": "good turn"})
+    bridge.step({"session_id": "a", "turn_ordinal": 1, "completion_text": "cut off", "truncated": True})
     bridge.score({"session_id": "a", "turn_count": 2})
 
     scored = [m.get("content") for m in env.scored[0]["messages"]]
@@ -4875,8 +4875,8 @@ def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
             return [RolloutReward(episode=1.0, turns=(0.25, 0.75)) for _ in items]
 
     examples = [{"question": "q"}]
-    episode_only = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2)
-    per_turn = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2, per_turn_credit=True)
+    episode_only = rl_verl.MultiTurnBridge(_Env(), examples, [[] for _ in examples], max_turns=2)
+    per_turn = rl_verl.MultiTurnBridge(_Env(), examples, [[] for _ in examples], max_turns=2, per_turn_credit=True)
     for bridge in (episode_only, per_turn):
         bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
     assert episode_only.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0}
@@ -4901,7 +4901,7 @@ def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
             # one reward for two turns: the validator rejects the count and drops to None.
             return [RolloutReward(episode=1.0, turns=(0.5,)) for _ in items]
 
-    bridge = rl_verl.MultiTurnBridge(_Env(), [{"question": "q"}], max_turns=2, per_turn_credit=True)
+    bridge = rl_verl.MultiTurnBridge(_Env(), [{"question": "q"}], [[]], max_turns=2, per_turn_credit=True)
     bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
     assert bridge.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0, "turns": None}
 
@@ -4920,9 +4920,13 @@ def _drive_multi_turn_episode(
     monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
     monkeypatch.setenv("FLASH_VERL_MAX_TURNS", str(max_turns))
     monkeypatch.setenv("FLASH_VERL_MAX_MODEL_LEN", "4096")
+    # the parent always exports this alongside the two above (see the child_env test); the child
+    # reads it with [] rather than .get so a missing per-turn cap fails loudly instead of silently
+    # generating to the model width. this harness builds the child env by hand, so it must too.
+    monkeypatch.setenv("FLASH_VERL_MAX_COMPLETION", "512")
 
     bridge = rl_verl.MultiTurnBridge(
-        env, [{"question": "q"}], max_turns=max_turns, per_turn_credit=per_turn_credit
+        env, [{"question": "q"}], [[]], max_turns=max_turns, per_turn_credit=per_turn_credit
     )
     routes = bridge.routes()
 
