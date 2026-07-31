@@ -1931,6 +1931,55 @@ def test_a_secret_split_by_the_tail_boundary_is_not_uploaded_in_part(tmp_path):
     assert "raylet died: worker registration timeout" in collected
 
 
+def test_a_multiline_secret_cut_by_the_boundary_is_redacted_past_the_first_line(
+    monkeypatch, tmp_path
+):
+    """Dropping the partial first line does NOT contain a multiline secret.
+
+    ``environment.secrets`` values are arbitrary strings, so a PEM key or JSON credential is legal.
+    When the tail begins inside such a value's first line, that line is dropped -- but every
+    LATER line of the same secret is whole, lands after the cut, and no longer matches the
+    whole-value replace, so it uploads verbatim. Redaction must therefore know a secret's
+    individual lines (codex[bot]).
+    """
+    root = tmp_path / "ray"
+    body_lines = ["MIIEowIBAAKCAQEAx" + "Q" * 40, "kJ9vTinRUME7Fw3n" + "R" * 40]
+    secret = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(body_lines) + "\n-----END PRIVATE KEY-----"
+    monkeypatch.setenv("CUSTOMER_API_KEY", secret)
+
+    log = f"--key={secret}\nraylet died: worker registration timeout\n"
+    _ray_session(root, "session_1", files={"raylet.err": log})
+    # begin the tail inside the FIRST line of the secret, leaving its later lines intact.
+    tail = len(log) - log.index("BEGIN") - 2
+    assert "-----BEGIN PRIVATE KEY-----" not in log[-tail:], "boundary must split the first line"
+    assert body_lines[0] in log[-tail:], (
+        "later secret lines must survive the cut, or nothing is proven"
+    )
+
+    collected = vc.collect_ray_failure_logs(root=str(root), tail_bytes=tail)
+
+    for line in body_lines:
+        assert line not in collected, "a live private key line reached the artifact"
+    assert "raylet died: worker registration timeout" in collected
+
+
+def test_redacting_secret_lines_does_not_strip_ordinary_log_punctuation(monkeypatch, tmp_path):
+    """The line-wise needles must not be short enough to gut the diagnostic.
+
+    A JSON credential ends in lines like ``}`` that every innocent log also contains. Registering
+    those as needles would redact unrelated text and destroy the evidence this collector exists to
+    produce, so short components are excluded.
+    """
+    root = tmp_path / "ray"
+    monkeypatch.setenv("CUSTOMER_API_KEY", '{\n  "private_key": "' + "k" * 40 + '"\n}')
+    _ray_session(root, "session_1", files={"raylet.err": "raylet died: cfg {\n}\nexit code 1\n"})
+
+    collected = vc.collect_ray_failure_logs(root=str(root), tail_bytes=4096)
+
+    assert "raylet died: cfg {" in collected, "an ordinary brace line was redacted as a secret"
+    assert "exit code 1" in collected
+
+
 def test_a_read_is_capped_even_when_ray_is_still_writing(monkeypatch, tmp_path):
     # ray writes while the worker is failing. sizing the file and THEN reading to EOF consumes
     # everything appended in between -- unbounded, on a dying pod with a bounded upload deadline.

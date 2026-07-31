@@ -756,9 +756,11 @@ def collect_ray_failure_logs(
             # worker through the environment, so this is third-party text carrying live tokens.
             # sanitize_diagnostic matches a secret by its `key=` prefix or by its full value, and a
             # tail boundary landing inside either leaves the REST of a real credential unmatched and
-            # uploaded. a secret cannot span a newline (env values hold none, and the key=value
-            # regex stops at whitespace), so dropping the partial first line makes a partial secret
-            # impossible -- at the cost of at most one line we could not have redacted anyway.
+            # uploaded. dropping the partial first line removes every single-line secret the
+            # boundary could have split, at the cost of one line we could not have redacted anyway.
+            # a MULTILINE secret survives this -- its later lines are whole and land after the cut --
+            # so sanitize_diagnostic redacts multiline values line-by-line as well; both halves are
+            # required, neither is sufficient.
             newline = text.find("\n")
             text = text[newline + 1 :] if newline != -1 else ""
             if not text:

@@ -14,6 +14,14 @@ _SECRET_KEY_RE = re.compile(
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 
+# a secret value may be multiline -- a PEM private key or a JSON service-account blob is a legal
+# `environment.secrets` value. redaction below is a whole-value match, so text holding only PART of
+# such a value (a log tail that began mid-secret, a truncated capture) would match nothing and be
+# emitted verbatim. registering each line as its own needle closes that, but only for lines long
+# enough to be secret-bearing: a PEM `-----BEGIN...-----` or base64 body line is worth redacting,
+# while a JSON `}` is shared with every innocent line in the log and would gut the diagnostic.
+_MIN_SECRET_COMPONENT = 8
+
 
 def _configured_secrets() -> tuple[str, ...]:
     values: set[str] = set()
@@ -24,10 +32,20 @@ def _configured_secrets() -> tuple[str, ...]:
             or upper.endswith(_SECRET_ENV_SUFFIXES)
         ):
             continue
-        values.add(value)
-        encoded = urllib.parse.quote(value, safe="")
-        if encoded != value:
-            values.add(encoded)
+        parts = [value]
+        if "\n" in value:
+            parts.extend(
+                line
+                for raw in value.splitlines()
+                if len(line := raw.strip()) >= _MIN_SECRET_COMPONENT
+            )
+        for part in parts:
+            values.add(part)
+            encoded = urllib.parse.quote(part, safe="")
+            if encoded != part:
+                values.add(encoded)
+    # longest first: a component is a substring of the whole value, so replacing the whole value
+    # before its parts keeps the redaction count honest instead of leaving `<redacted>` fragments.
     return tuple(sorted(values, key=len, reverse=True))
 
 
