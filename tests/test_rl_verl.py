@@ -9,9 +9,11 @@ import json
 import os
 import re
 import shutil
+import sys
 import textwrap
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -1304,6 +1306,83 @@ def test_reward_server_scorer_can_capture_samples():
         assert [c[0] for c in captured] == ["c0", "c1", "c2"]
     finally:
         server.shutdown()
+
+
+def test_reentrant_checkpointing_shim_is_emitted_only_for_models_that_need_it():
+    # verl hardcodes use_reentrant=False and offers no knob. a dense non-GDN model is fine on that
+    # default and must not get a patch on its import path; a GDN/MoE model dies on the FIRST
+    # backward without one, so for those the shim is what makes the run possible at all.
+    assert rl_verl.render_reentrant_checkpointing_shim(False) == ""
+    source = rl_verl.render_reentrant_checkpointing_shim(True)
+    assert source
+    assert '{"use_reentrant": True}' in source
+    # must patch the class GRPO's actor actually builds through: FSDPEngineWithLMHead inherits
+    # _build_module from FSDPEngine, so patching the base covers the actor.
+    assert "FSDPEngine as _FlashReentrantEngine" in source
+    assert "_FlashReentrantEngine._build_module = _flash_reentrant_build_module" in source
+
+
+def test_the_reentrant_shim_is_wired_for_gdn_and_moe_models_and_not_for_dense_ones():
+    # the flag has to be resolved from the model id, not left to verl. grpo_use_reentrant is the
+    # same helper the sft verl path and the retired trl path both keyed on.
+    resolved = inspect.getsource(rl_verl._resolve_grpo_inputs)
+    assert '"reentrant_checkpointing": bool(_w.grpo_use_reentrant(model_id))' in resolved
+    written = inspect.getsource(rl_verl.run_rl_verl)
+    assert 'render_reentrant_checkpointing_shim(inp["reentrant_checkpointing"])' in written
+    # the curated GDN hybrids and the MoE need it; an uncataloged dense model does not.
+    assert W.grpo_use_reentrant("Qwen/Qwen3.5-4B") is True
+    assert W.grpo_use_reentrant("Qwen/Qwen3.6-35B-A3B") is True
+    assert W.grpo_use_reentrant("meta-llama/Llama-3.1-8B") is False
+
+
+def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alone():
+    # execute the rendered source against a stand-in engine: asserting on the string alone would not
+    # catch a patch that never runs, or one that turns checkpointing ON for a model verl left off.
+    class _Cfg:
+        def __init__(self, on):
+            self.enable_gradient_checkpointing = on
+
+    class _Module:
+        def __init__(self):
+            self.kwargs = None
+
+        def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+            self.kwargs = gradient_checkpointing_kwargs
+
+    class _Engine:
+        def __init__(self, on):
+            self.model_config = _Cfg(on)
+            self.module = _Module()
+
+        def _build_module(self):
+            return self.module
+
+    module_stub = types.ModuleType("verl.workers.engine.fsdp.transformer_impl")
+    module_stub.FSDPEngine = _Engine
+    parents = [
+        "verl",
+        "verl.workers",
+        "verl.workers.engine",
+        "verl.workers.engine.fsdp",
+    ]
+    saved = {name: sys.modules.get(name) for name in [*parents, module_stub.__name__]}
+    try:
+        for name in parents:
+            sys.modules.setdefault(name, types.ModuleType(name))
+        sys.modules[module_stub.__name__] = module_stub
+        exec(rl_verl.render_reentrant_checkpointing_shim(True), {})
+        # checkpointing on -> the flag is put back to reentrant
+        engine = _Engine(True)
+        assert engine._build_module().kwargs == {"use_reentrant": True}
+        # checkpointing off -> untouched, so the shim cannot silently raise the memory profile
+        off = _Engine(False)
+        assert off._build_module().kwargs is None
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
 
 
 def test_entropy_quantile_shim_is_emitted_only_when_masking_is_requested():
