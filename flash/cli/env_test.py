@@ -46,6 +46,13 @@ _TOML_BOOLEAN_WORDS = frozenset({"true", "false"})
 # float -- or an environment coercing it back gets the non-finite value the lowercase spelling was
 # rejected for (codex[bot]). so a case variant is malformed, not prose, either way.
 _TOML_NON_FINITE_WORDS = frozenset({"inf", "nan"})
+# TOML has no null. these are the spellings people reach for anyway, borrowed from json, python, and
+# yaml -- all bare words, so they land in the same blind spot: the parse fails, the value carries no
+# structural character, and it forwards as its own literal STRING. an env testing `if value is None`
+# or `if not value` then reads a truthy string, and no [environment.params] assignment could have
+# produced it, since the config has no way to spell an absent value either (codex[bot]). omitting the
+# parameter is what expresses that, so say so rather than forwarding text nothing asked for.
+_TOML_NULL_WORDS = frozenset({"null", "none", "nil"})
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:
@@ -268,6 +275,14 @@ def _parse_param_value(key: str, raw: str) -> object:
                     f"since it is not JSON; pass a finite number, or "
                     f"--param '{key}=\"{value}\"' to pass it as text"
                 ) from exc
+            # the null spellings, the last bare-word family. unlike the others there is no lowercase
+            # form to point at, because TOML cannot express an absent value at all.
+            if value.lower() in _TOML_NULL_WORDS:
+                raise ValueError(
+                    f"--param {key} is not a valid TOML value: {exc}. TOML has no null, so "
+                    f"[environment.params] could not carry this either; omit --param {key} to "
+                    f"leave it unset, or --param '{key}=\"{value}\"' to pass it as text"
+                ) from exc
             if value[0] not in _TOML_SCALAR_LEADING_CHARS:
                 return value
             # quoting is the escape hatch, and it is the same spelling the config needs -- a
@@ -363,6 +378,50 @@ def _literal_param_key(key: str) -> str:
     return name
 
 
+def _quoted_key_end(item: str, start: int) -> int | None:
+    """Index of the quote closing the one at ``start``, or None when it is never closed."""
+    quote = item[start]
+    index = start + 1
+    while index < len(item):
+        # only a basic string takes escapes. in a literal string a backslash is just a character,
+        # so consuming the next one there would step over the closing quote.
+        if item[index] == "\\" and quote == '"':
+            index += 2
+            continue
+        if item[index] == quote:
+            return index
+        index += 1
+    return None
+
+
+def _split_param_assignment(item: str) -> tuple[str, str, str]:
+    """Split one ``--param`` argument at the ``=`` that separates its key from its value.
+
+    Mirrors ``str.partition("=")`` in shape, but skips over quoted stretches of the key first. A
+    quoted TOML key may itself contain an ``=`` -- ``[environment.params]`` accepts ``"a=b" = 1``
+    as the flat key ``a=b`` -- and splitting at the first one turned that spelling into the key
+    ``"a`` and rejected it, leaving a loadable config with no CLI spelling that could validate it
+    (codex[bot]).
+
+    An unterminated quote is not a key this can find the end of, so it falls back to the first
+    ``=``; the key check then reports the malformed spelling rather than this returning something
+    arbitrary.
+    """
+    index = 0
+    while index < len(item):
+        char = item[index]
+        if char in "\"'":
+            closing = _quoted_key_end(item, index)
+            if closing is None:
+                break
+            index = closing + 1
+            continue
+        if char == "=":
+            return item[:index], "=", item[index + 1 :]
+        index += 1
+    return item.partition("=")
+
+
 def _env_params(args) -> dict:
     """Build the ``load_environment()`` kwargs from ``--split`` / ``--param KEY=VALUE``.
 
@@ -372,7 +431,7 @@ def _env_params(args) -> dict:
     """
     params: dict = {}
     for item in getattr(args, "param", None) or []:
-        key, sep, raw = str(item).partition("=")
+        key, sep, raw = _split_param_assignment(str(item))
         key = key.strip()
         if not sep or not key:
             raise ValueError(f"--param must be KEY=VALUE (got {item!r})")

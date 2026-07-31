@@ -610,6 +610,40 @@ def test_a_quoted_param_key_names_itself_rather_than_nesting(monkeypatch, tmp_pa
     assert name in seen["kwargs"]
 
 
+@pytest.mark.parametrize(
+    ("value", "name", "expected"),
+    [
+        ('"a=b"=1', "a=b", 1),
+        ("'a=b'=2", "a=b", 2),
+        ('"pct=100"="done"', "pct=100", "done"),
+    ],
+)
+def test_a_quoted_param_key_may_contain_an_equals_sign(
+    monkeypatch, tmp_path, value, name, expected
+):
+    # `[environment.params] "a=b" = 1` loads as the flat key `a=b`, so the run really can receive
+    # this name. splitting at the first `=` made the key `"a` and rejected the argument, leaving
+    # that config with no --param spelling able to validate it (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 0
+    assert seen["kwargs"][name] == expected
+
+
+def test_a_null_spelling_is_not_forwarded_as_text(monkeypatch, tmp_path, capsys):
+    # TOML has no null, so these bare words fail the parse, carry no structural character, and
+    # forward as their own literal string -- truthy, where the spelling asked for absent. no
+    # [environment.params] entry could produce that value either (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    for spelling in ("null", "NULL", "None", "none", "nil"):
+        seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+        assert cmd_env_test(_args(env_dir, param=[f"value={spelling}"])) == 1
+        assert "kwargs" not in seen
+        assert "TOML has no null" in capsys.readouterr().err
+
+
 def test_a_malformed_param_key_spelling_is_rejected(monkeypatch, tmp_path, capsys):
     # resolving the spelling through tomllib means an unterminated quote is a key TOML cannot read
     # at all, not a name. [environment.params] would reject it too, so forwarding it literally
