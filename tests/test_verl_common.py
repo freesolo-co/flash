@@ -5,7 +5,9 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import pathlib
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -111,7 +113,7 @@ def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_pa
     python_bin = vc.resolve_verl_python(str(tmp_path))
 
     assert python_bin.endswith("/verl-venv/bin/python")
-    assert vc.VERL_REQUIREMENT in calls[1]
+    assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1])
 
 
 def test_worker_env_remedies_are_copy_pasteable_toml():
@@ -172,7 +174,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert vc.VERL_REQUIREMENT == (
         "verl @ git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
     )
-    assert vc.VERL_REQUIREMENT in install
+    assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     assert "liger-kernel" in install
     assert "bitsandbytes>=0.49" in install
     assert "qwen-vl-utils" in install
@@ -184,6 +186,69 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     # the stamp is written only after a successful install, so a crashed install is never reused.
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_REQUIREMENT
+
+
+def test_the_fallback_install_overrides_the_three_ceilings_it_violates(monkeypatch, tmp_path):
+    """The pin set is deliberately unsatisfiable against declared metadata, so it needs --override.
+
+    A bare `vllm==0.19.1` on the command line is a CONSTRAINT, not an override: the resolver must
+    still satisfy verl[vllm]'s declared `vllm<=0.12.0` alongside it, so the pair is unsatisfiable
+    and the install fails outright rather than picking the pin. Only `--override` makes uv ignore
+    the declaration. Dockerfile.worker:253-258 records the same three violations and the same fix
+    (codex[bot]).
+    """
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    install = calls[1]
+    assert "--override" in install
+    override_file = install[install.index("--override") + 1]
+    written = pathlib.Path(override_file).read_text()
+    # all three are required: dropping any one leaves the set unsatisfiable.
+    assert "vllm==0.19.1" in written  # verl[vllm] declares <=0.12.0
+    assert "numpy==2.2.6" in written  # verl + transferqueue declare numpy<2.0.0
+    assert "xgrammar==0.1.25" in written  # vllm declares xgrammar>=0.1.32
+
+
+def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch, tmp_path):
+    # grpo used to stay in flash's own interpreter, so this fallback only ever had to satisfy sft and
+    # opd. now every backend routes through it, and Dockerfile.worker records what a verl-only install
+    # yields: `main_ppo` dies on ModuleNotFoundError cachetools, `main_ppo_sync` on uvicorn. verl
+    # declares none of vllm/cachetools/uvicorn/fastapi yet imports them at module level on the launch
+    # path, so an install of VERL_REQUIREMENT alone provisions an interpreter that cannot launch.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    install = calls[1]
+    # the [vllm] extra, as Dockerfile.worker's VERL_SPEC asks for it, on the same commit.
+    assert f"verl[vllm] @ {vc.VERL_REQUIREMENT_URL}" in install
+    # the extra's own ceiling is vllm<=0.12.0, which registers neither Qwen3.5 arch. pin past it.
+    assert "vllm==0.19.1" in install
+    for module in ("cachetools", "uvicorn", "fastapi"):
+        assert module in install, f"verl imports {module} at module level but never declares it"
+    # opd's entrypoint calls tq.init()/tq.close() and verl's setup.py omits TransferQueue.
+    assert "TransferQueue==0.1.7" in install
+
+
+def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_path):
+    # the stamp gates rebuilds. if it recorded the extra-bearing spec while VERL_REQUIREMENT stayed
+    # bare, every later call would see a mismatch and rebuild the venv from scratch on a paid pod.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+    assert (tmp_path / "verl-venv" / "flash-verl-requirement").read_text() == vc.VERL_REQUIREMENT
+
+    (tmp_path / "verl-venv" / "bin" / "python").write_text("")
+    vc.resolve_verl_python(str(tmp_path))
+    assert len(calls) == 2, "a venv built from the current pin must not be rebuilt"
 
 
 def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatch, tmp_path):
@@ -265,7 +330,7 @@ def test_resolve_verl_python_installs_wandb_best_effort_when_requested(
 
     vc.resolve_verl_python(str(tmp_path), install_wandb=True)
 
-    assert vc.VERL_REQUIREMENT in calls[1][0]
+    assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1][0])
     assert calls[2] == (
         ["uv", "pip", "install", "--python", str(tmp_path / "verl-venv/bin/python"), "wandb"],
         False,
@@ -525,3 +590,137 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
     assert len(carried) == vc.STALL_TAIL_LINES
     # the most recent lines are the ones that matter: they are what the child said last.
     assert carried[-1] == f"line{vc.STALL_TAIL_LINES + 24}"
+
+
+def _flashinfer_probe(monkeypatch, *, flashinfer_ok=True):
+    """stub the one remaining subprocess probe: `import flashinfer`."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0 if flashinfer_ok else 1)
+
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    return calls
+
+
+def _cc_probe(monkeypatch, cc):
+    """stub the capability probe; `cc` is what torch reports, or () for no cuda."""
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=f"{cc}\n", stderr="")
+
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+
+
+def test_the_capability_probe_reads_what_torch_reports(monkeypatch):
+    _cc_probe(monkeypatch, (8, 9))
+    assert vc.resolve_verl_device_capability("/verl/bin/python") == (8, 9)
+
+
+def test_the_capability_probe_reports_no_cuda_as_none(monkeypatch):
+    # torch prints () with no visible card; literal_eval yields an empty tuple, and indexing it
+    # raises -- which must surface as None, not as a crash on the launch path.
+    _cc_probe(monkeypatch, ())
+    assert vc.resolve_verl_device_capability("/verl/bin/python") is None
+
+
+def test_the_capability_probe_reports_failure_as_none(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("no interpreter")
+
+    monkeypatch.setattr(vc.subprocess, "run", boom)
+    assert vc.resolve_verl_device_capability("/verl/bin/python") is None
+
+
+def test_the_capability_probe_runs_against_the_verl_interpreter(monkeypatch):
+    # verl owns the rollout engine and pins its own torch/vllm, so flash's own torch would answer
+    # for the wrong environment -- and on a heterogeneous host, potentially the wrong card.
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="(8, 9)\n", stderr="")
+
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    vc.resolve_verl_device_capability("/verl/bin/python")
+    assert calls
+    assert all(cmd[0] == "/verl/bin/python" for cmd in calls)
+
+
+def test_the_capability_is_probed_once_for_both_rollout_decisions(monkeypatch):
+    # both decisions below are functions OF the capability, not probes of it. asking the verl
+    # interpreter twice would spawn a second torch import on every launch to re-learn a constant.
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="(12, 0)\n", stderr="")
+
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    cc = vc.resolve_verl_device_capability("/verl/bin/python")
+    assert len(calls) == 1
+    # neither decision may go back to the interpreter for the capability it was handed.
+    vc.resolve_rollout_enforce_eager(cc)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("cc", [(8, 6), (8, 9), (7, 5), (11, 0)])
+def test_unvalidated_arches_force_the_rollout_eager(cc):
+    # vllm 0.19.1's graph capture dies in aot_compile (sm86) / triton slot-mapping on the arches the
+    # retired trl driver never validated. verl defaults enforce_eager False AND asks for
+    # FULL_AND_PIECEWISE, so without this an sm89 rtx 4090 -- the catalog's recommended_gpu for the
+    # small models, i.e. the DEFAULT grpo route -- captures more graphs than the config known to fail.
+    assert vc.resolve_rollout_enforce_eager(cc) is True
+
+
+@pytest.mark.parametrize("cc", [(8, 0), (9, 0), (10, 0), (12, 0)])
+def test_validated_arches_keep_verl_graph_capture(cc):
+    # a100/h100 were validated with graphs, and blackwell (incl. the b200 rollout work) depends on
+    # them. forcing eager here would be a silent throughput regression, not a safety net.
+    assert vc.resolve_rollout_enforce_eager(cc) is False
+
+
+def test_an_unknown_capability_leaves_verl_graph_capture_alone():
+    # a probe that could not answer must not guess eager onto an unknown card.
+    assert vc.resolve_rollout_enforce_eager(None) is False
+
+
+@pytest.mark.parametrize("major", [10, 12])
+def test_blackwell_pins_flashinfer_and_sdpa_vit(monkeypatch, major):
+    _flashinfer_probe(monkeypatch)
+    assert vc.resolve_blackwell_attention_backends("/verl/bin/python", (major, 0)) == (
+        "FLASHINFER",
+        "TORCH_SDPA",
+    )
+
+
+def test_blackwell_falls_back_to_triton_when_flashinfer_is_abi_broken(monkeypatch):
+    # flashinfer can install yet fail to import against this torch. an unconditional FLASHINFER would
+    # ship fine and only die at engine init on a paid gpu, so degrade to a registered PTX-independent
+    # decoder backend. the ViT pin is unaffected -- it is a separate selection.
+    _flashinfer_probe(monkeypatch, flashinfer_ok=False)
+    assert vc.resolve_blackwell_attention_backends("/verl/bin/python", (12, 0)) == (
+        "TRITON_ATTN",
+        "TORCH_SDPA",
+    )
+
+
+@pytest.mark.parametrize("cc", [(8, 0), (8, 9), (9, 0), None])
+def test_non_blackwell_leaves_both_backends_to_vllm(monkeypatch, cc):
+    # vllm's capability-ordered defaults are correct off blackwell (flash-attn is the right decoder
+    # choice on ampere/hopper), so pinning anything there would override a working selection. an
+    # unknown capability is treated the same way: leave the defaults in place.
+    calls = _flashinfer_probe(monkeypatch)
+    assert vc.resolve_blackwell_attention_backends("/verl/bin/python", cc) == (None, None)
+    # and off blackwell the flashinfer probe must not run at all -- nothing consumes its answer.
+    assert calls == []
+
+
+def test_the_flashinfer_probe_runs_against_the_verl_interpreter(monkeypatch):
+    # verl owns the rollout engine and pins its own vllm stack, so a flash-side `import flashinfer`
+    # would answer for the wrong environment.
+    calls = _flashinfer_probe(monkeypatch)
+    vc.resolve_blackwell_attention_backends("/verl/bin/python", (12, 0))
+    assert len(calls) == 1
+    assert calls[0][0] == "/verl/bin/python"

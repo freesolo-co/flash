@@ -18,8 +18,8 @@ class RolloutScoreRequest:
 def _validated_reward(reward: RolloutReward, request: RolloutScoreRequest) -> RolloutReward:
     episode = float(reward.episode)
     # a non-finite episode reward is unscorable and has no valid scalar fallback. canonicalize it to
-    # nan, which is trl's ONLY unscorable marker (trl uses torch.isnan to exclude the row from the
-    # group baseline and then nan_to_num zeros its advantage, matching stock grpo). forwarding a raw
+    # nan, the ONLY unscorable marker: torch.isnan excludes the row from the group baseline and
+    # nan_to_num then zeros its advantage, matching stock grpo. forwarding a raw
     # inf instead would NOT be recognized as unscorable and would contaminate the whole group with
     # huge advantages. per-turn credit is disabled so the unscorable row is never revived.
     if not math.isfinite(episode):

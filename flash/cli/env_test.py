@@ -133,7 +133,7 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     reference_turns = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
-    # mirror the worker turn loop (flash/engine/multiturn_rollout.py): drive one model
+    # mirror the worker turn loop (flash/engine/worker/grpo_multiturn.py): drive one model
     # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
     # env yields no reply. the hard cap is fixed at what the trainer passes (env.max_turns)
     # and the turn counter rises every turn until it reaches the cap, so a cooperatively-

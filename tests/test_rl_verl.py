@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import json
+import math
 import os
 import re
 import shutil
+import sys
 import textwrap
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -26,20 +30,21 @@ from flash.engine.worker.heartbeat import RewardObservabilityBuffer
 
 
 # ------------------------------- dispatch -------------------------------
-def test_run_rl_delegates_to_verl_backend(monkeypatch):
-    """FLASH_RL_BACKEND=verl delegates to run_rl_verl without touching the trl body."""
+@pytest.mark.parametrize("stale", [None, "verl", "trl", "megatron"])
+def test_run_rl_always_delegates_to_verl(monkeypatch, stale):
+    """run_rl delegates to run_rl_verl unconditionally -- no env key selects a backend.
+
+    verl is the only trainer, so a stale FLASH_RL_BACKEND left in a config must be inert rather than
+    routing anywhere else or raising.
+    """
     called = []
     monkeypatch.setattr(rl_verl, "run_rl_verl", lambda: called.append(True))
-    monkeypatch.setenv("FLASH_RL_BACKEND", "verl")
-    # if the trl body ran instead of delegating, it would fail hard before returning.
+    if stale is None:
+        monkeypatch.delenv("FLASH_RL_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("FLASH_RL_BACKEND", stale)
     rl.run_rl()
     assert called == [True]
-
-
-def test_run_rl_rejects_unknown_backend(monkeypatch):
-    monkeypatch.setenv("FLASH_RL_BACKEND", "megatron")
-    with pytest.raises(RuntimeError, match="not a known grpo backend"):
-        rl.run_rl()
 
 
 # ------------------------------- data conversion -------------------------------
@@ -253,6 +258,7 @@ def _overrides_cfg(**over):
         "structured_outputs": None, "thinking": False,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
         "steps": 60, "gpu_mem_util": 0.5, "n_gpus": 1, "loggers": "console", "fp8_kv": False,
+        "enforce_eager": False,
         "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
         "mask_truncated_completions": True,
         "total_epochs": 1, "save_freq": 20, "ckpt_to_keep": 1, "local_dir": "/w/ckpt",
@@ -366,6 +372,24 @@ def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():
             assert [o for o in one if o.startswith(key)] == [o for o in many if o.startswith(key)]
 
 
+def test_one_optimizer_step_consumes_exactly_the_requested_unique_prompts():
+    # the invariant the old trl batching helper existed to protect: an optimizer step must optimize
+    # prompts_per_step UNIQUE PROMPTS, not prompts_per_step COMPLETIONS. trl sized batches in
+    # completions, so it needed group_size folded into grad-accum or a step silently optimized
+    # prompts_per_step/group_size prompts. verl sizes in prompts and expands group_size itself via
+    # rollout.n, so the guard here is that flash never pre-divides or pre-multiplies by the group:
+    # train_batch_size (prompts drawn) and ppo_mini_batch_size (prompts per update) both stay the
+    # raw request, and rollout.n carries the group. off-by-a-group here is silent -- the run trains,
+    # just on 1/group_size of the intended data.
+    for prompts, group in ((64, 8), (5, 8), (2, 2), (1, 6)):
+        o = rl_verl.build_verl_overrides(
+            _overrides_cfg(prompts_per_step=prompts, group_size=group)
+        )
+        assert f"data.train_batch_size={prompts}" in o
+        assert f"actor_rollout_ref.actor.ppo_mini_batch_size={prompts}" in o
+        assert f"actor_rollout_ref.rollout.n={group}" in o
+
+
 def test_build_verl_overrides_sets_truncation_mask_when_enabled():
     o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=True))
     # `++` (append-or-override), because the key exists in the fork's rollout.yaml but not stock's.
@@ -377,6 +401,29 @@ def test_build_verl_overrides_omits_truncation_mask_when_disabled():
     # behavior, so emitting `=false` would break stock runs while changing nothing.
     o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=False))
     assert not any("mask_truncated_completions" in override for override in o)
+
+
+def test_build_verl_overrides_pins_both_blackwell_attention_backends():
+    o = rl_verl.build_verl_overrides(
+        _overrides_cfg(attention_backend="FLASHINFER", mm_encoder_attn_backend="TORCH_SDPA")
+    )
+    # verl spreads engine_kwargs.vllm straight into AsyncEngineArgs, where both are real fields in
+    # the pinned vllm 0.19.1. `+` appends under the existing struct, as kv_cache_dtype does.
+    assert (
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHINFER" in o
+    )
+    assert (
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend=TORCH_SDPA" in o
+    )
+
+
+def test_build_verl_overrides_leaves_attention_backends_to_vllm_off_blackwell():
+    # off blackwell vllm's own capability-ordered defaults are correct, and pinning a backend there
+    # would override a working choice. the resolver returns None/None, so nothing may be emitted.
+    o = rl_verl.build_verl_overrides(
+        _overrides_cfg(attention_backend=None, mm_encoder_attn_backend=None)
+    )
+    assert not any("attention_backend" in override for override in o)
 
 
 def test_build_verl_overrides_sizes_engine_to_the_job_not_the_architecture():
@@ -457,6 +504,46 @@ def test_build_verl_training_cfg_carries_the_multimodal_flag():
     assert '"multimodal": bool(inp.get("multimodal"))' in source
 
 
+def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
+    """VERL-091: a model whose vLLM wake HANGS must never be offloaded between steps.
+
+    verl defaults free_cache_engine and enable_sleep_mode BOTH True and sleeps the rollout engine at
+    every step boundary, so without an explicit override a catalog model flagged sleep_unsupported
+    wedges on the first wake instead of failing fast. The flag comes from the catalog, so assert
+    against a real flagged entry rather than a fabricated one.
+    """
+    from flash.catalog import MODELS
+
+    flagged = [m for m, i in MODELS.items() if getattr(i, "sleep_unsupported", False)]
+    assert flagged, "no catalog model is sleep_unsupported; this guard now has no subject"
+
+    def _argv(model_id):
+        inp = {
+            "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
+            "prompts_per_step": 16, "mask_truncated_completions": True,
+            "max_prompt_len": 3072, "max_completion": 1024, "max_response_len": 1024,
+            "multi_turn": False, "engine_len": 4096, "temperature": 1.0, "top_p": 0.95,
+            "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (),
+            "structured_outputs": None, "seed": 42, "ppo_epochs": 1, "steps": 60,
+            "warmstart_adapter": "", "model_id": model_id, "verl_total_epochs": 2,
+            "save_freq": 20, "ckpt_to_keep": 1,
+        }
+        # go through the real builder so the flag cannot drift out of the cfg it emits.
+        cfg = rl_verl._build_verl_training_cfg(
+            inp, train_files="/w/t.parquet", val_files="/w/v.parquet", model_id="/w/model",
+            thinking=False, loggers="console", fp8_kv=False, enforce_eager=False,
+            attention_backend=None, mm_encoder_attn_backend=None, reward_path="/w/r.py",
+            local_dir="/w/ckpt", project_name="flash", experiment_name="flash-rl-run123",
+        )
+        return rl_verl.build_verl_overrides(cfg)
+
+    for key in ("free_cache_engine", "enable_sleep_mode"):
+        assert f"actor_rollout_ref.rollout.{key}=false" in _argv(flagged[0])
+        # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
+        # what lets a large rollout fit alongside the training weights.
+        assert not [a for a in _argv("Qwen/Qwen3-4B") if key in a]
+
+
 def test_build_verl_training_cfg_derives_engine_len_and_budget():
     inp = {
         "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
@@ -465,11 +552,13 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "multi_turn": False, "engine_len": 4096,
         "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (), "structured_outputs": None, "seed": 42,
         "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
-        "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
+        "model_id": "Qwen/Qwen3-4B", "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
     }
     common = {
         "train_files": "/w/t.parquet", "val_files": "/w/v.parquet", "model_id": "Qwen/Qwen3-4B",
         "thinking": False, "loggers": "console", "fp8_kv": False,
+        "enforce_eager": False,
+        "attention_backend": None, "mm_encoder_attn_backend": None,
         "reward_path": "/w/r.py", "local_dir": "/w/ckpt",
         "project_name": "flash", "experiment_name": "flash-rl-run123",
     }
@@ -560,6 +649,9 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        enforce_eager=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
         project_name="flash",
@@ -607,7 +699,7 @@ def test_save_steps_reach_the_horizon_they_were_validated_against(monkeypatch):
 
 
 def test_final_publish_is_suppressed_when_exact_save_steps_are_set():
-    # parity with the trl path (rl.py: `if final_save_due(...)`): with save_at_steps set the customer
+    # parity with the retired trl path: with save_at_steps set the customer
     # asked for those steps and nothing else, so the final step must not add an unrequested
     # deployable. without them the final checkpoint is still preserved.
     from flash.engine.steps import final_save_due
@@ -761,6 +853,9 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        enforce_eager=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
         project_name="flash",
@@ -803,6 +898,28 @@ def test_build_verl_overrides_fp8_kv_gated_on_hardware():
     assert not any("kv_cache_dtype" in x for x in off)
     on = rl_verl.build_verl_overrides(_overrides_cfg(fp8_kv=True))
     assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8" in on
+
+
+def test_build_verl_overrides_enforce_eager_gated_on_hardware():
+    off = rl_verl.build_verl_overrides(_overrides_cfg(enforce_eager=False))
+    assert not any("enforce_eager" in x for x in off)
+    on = rl_verl.build_verl_overrides(_overrides_cfg(enforce_eager=True))
+    # plain override, not '+': enforce_eager is a declared verl RolloutConfig field
+    # (workers/config/rollout.py:195), so appending it would be a duplicate-key error.
+    assert "actor_rollout_ref.rollout.enforce_eager=True" in on
+
+
+def test_the_resolved_eager_flag_reaches_the_verl_config():
+    # the string assertions above pass against a resolver whose answer is never carried into the
+    # config, which is exactly how the retired trl workaround got dropped. pin the wiring.
+    built = inspect.getsource(rl_verl.run_rl_verl)
+    assert "enforce_eager = resolve_rollout_enforce_eager(verl_cc)" in built
+    assert "enforce_eager=enforce_eager," in built
+    # and the capability it decides from is the one probe both rollout decisions share.
+    assert "verl_cc = resolve_verl_device_capability(python_bin)" in built
+    assert "resolve_blackwell_attention_backends(\n            python_bin, verl_cc\n        )" in built
+    cfg = inspect.getsource(rl_verl._build_verl_training_cfg)
+    assert '"enforce_eager": enforce_eager,' in cfg
 
 
 def test_build_verl_overrides_kl_off_by_default():
@@ -917,6 +1034,70 @@ def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
         server.shutdown()
 
 
+def test_a_slow_env_call_is_not_cut_off_by_a_client_deadline(monkeypatch):
+    # verl fans reward scoring out hard -- RewardLoopManager spawns reward.num_workers ray workers
+    # and each asyncio.gathers its whole chunk -- and start_reward_server serializes them behind one
+    # lock. a per-request deadline therefore bounds QUEUE WAIT, not the env call, so the Nth caller
+    # in line fails for arriving Nth. a wedged env is the stall watchdog's job, not this client's.
+    waited = []
+    server, url = rl_verl.start_reward_server(
+        lambda idx, solution: waited.append(idx) or 7.0, example_count=2
+    )
+    try:
+        ns: dict = {}
+        exec(compile(rl_verl.render_reward_module("TEST_URL"), "<reward>", "exec"), ns)
+        real_urlopen = ns["urllib"].request.urlopen
+        seen = []
+
+        def urlopen_recording_deadline(req, *args, **kwargs):
+            seen.append((args, kwargs))
+            return real_urlopen(req)
+
+        monkeypatch.setattr(ns["urllib"].request, "urlopen", urlopen_recording_deadline)
+        ns["_URL"] = url
+        assert ns["compute_score"]("env", "answer", "unused", extra_info={"index": 0}) == 7.0
+        assert waited == [0]
+        assert seen == [((), {})], f"reward client still carries a deadline: {seen!r}"
+    finally:
+        server.shutdown()
+
+
+def test_concurrent_scorers_are_serialized_for_the_env():
+    # a flash env is a plain python object with no concurrency contract; the retired trl path only
+    # ever called it from one thread. verl's reward workers do not, so the server must impose it.
+    import concurrent.futures
+
+    live = []
+    peak = []
+    lock = threading.Lock()
+
+    def score(idx, solution):
+        with lock:
+            live.append(idx)
+            peak.append(len(live))
+        time.sleep(0.02)
+        with lock:
+            live.remove(idx)
+        return float(idx)
+
+    server, url = rl_verl.start_reward_server(score, example_count=8)
+    try:
+        ns: dict = {}
+        exec(compile(rl_verl.render_reward_module("TEST_URL"), "<reward>", "exec"), ns)
+        ns["_URL"] = url
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(
+                pool.map(
+                    lambda i: ns["compute_score"]("env", "a", "u", extra_info={"index": i}),
+                    range(8),
+                )
+            )
+        assert sorted(results) == [float(i) for i in range(8)]
+        assert max(peak) == 1, f"env saw {max(peak)} concurrent calls"
+    finally:
+        server.shutdown()
+
+
 # ------------------------------- reward parity -------------------------------
 class _BreakdownEnv:
     def scores_breakdown(self, graded, ex, state):
@@ -971,6 +1152,66 @@ def test_score_single_turn_env_error_is_zero():
         prompt_opened_thinking=False, think_penalty=0.0,
     )
     assert s == 0.0
+
+
+class _UnscorableRewardEnv:
+    def reward(self, graded, ex, state):
+        return float("nan")
+
+
+class _UnscorableBreakdownEnv:
+    def scores_breakdown(self, graded, ex, state):
+        return {"total": float("nan"), "judge": 1.0}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+@pytest.mark.parametrize(
+    "env", [_UnscorableRewardEnv(), _UnscorableBreakdownEnv()], ids=["reward", "scores_breakdown"]
+)
+def test_an_unscorable_reward_is_masked_before_it_reaches_verl(env):
+    """A non-finite reward must not be forwarded, from EITHER env hook.
+
+    verl's grpo baseline is a plain torch.mean/torch.std over the group (core_algos.py:320-326)
+    with no nan-aware variant on its path, so one nan row makes the mean, the std, and all
+    `group_size` advantages nan -- the whole group, not just the unscorable row. The retired trl
+    path could forward it because it masked nan rows out of the baseline and zeroed their
+    advantage (grpo_trainer.py:2171, :2222); nothing downstream of here does that now (codex[bot]).
+    """
+    breakdowns: list[dict[str, float] | None] = []
+    s = rl_verl.score_single_turn(
+        env, "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert s == 0.0
+    assert math.isfinite(s)
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_an_infinite_reward_is_masked_too_even_with_a_penalty_applied():
+    # inf, not just nan: nan is score_rollouts' canonical unscorable marker, but an env returning
+    # inf poisons verl's baseline exactly as thoroughly and is not covered by testing nan alone.
+    # the penalty is live here because that arithmetic runs between the env's return and the mask;
+    # inf minus a finite penalty is still inf, so the mask is what has to catch it.
+    class _InfEnv:
+        def reward(self, graded, ex, state):
+            return float("inf")
+
+    s = rl_verl.score_single_turn(
+        _InfEnv(), "x", {"gt": "1"}, tok=object(), thinking=True,
+        prompt_opened_thinking=True, think_penalty=0.1,
+    )
+    assert s == 0.0
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_an_unscorable_reward_still_re_raises_for_the_latency_profiler():
+    # same contract as a raising env: the profiler must tell a real 0.0 apart from a grader that
+    # is not returning a usable number, or it reports a broken grader as fast and confident.
+    with pytest.raises(ValueError, match="non-finite"):
+        rl_verl.score_single_turn(
+            _UnscorableRewardEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+            prompt_opened_thinking=False, think_penalty=0.0, raise_on_error=True,
+        )
 
 
 class _RaisingProbeEnv:
@@ -1217,6 +1458,236 @@ def test_reward_server_scorer_can_capture_samples():
         assert [c[0] for c in captured] == ["c0", "c1", "c2"]
     finally:
         server.shutdown()
+
+
+def test_reentrant_checkpointing_shim_is_emitted_only_for_models_that_need_it():
+    # verl hardcodes use_reentrant=False and offers no knob. a dense non-GDN model is fine on that
+    # default and must not get a patch on its import path; a GDN/MoE model dies on the FIRST
+    # backward without one, so for those the shim is what makes the run possible at all.
+    assert rl_verl.render_reentrant_checkpointing_shim(False) == ""
+    source = rl_verl.render_reentrant_checkpointing_shim(True)
+    assert source
+    assert '{"use_reentrant": True}' in source
+    # must patch the class GRPO's actor actually builds through: FSDPEngineWithLMHead inherits
+    # _build_module from FSDPEngine, so patching the base covers the actor.
+    assert "FSDPEngine as _FlashReentrantEngine" in source
+    assert "_FlashReentrantEngine._build_module = _flash_reentrant_build_module" in source
+
+
+def test_the_reentrant_shim_is_wired_for_gdn_and_moe_models_and_not_for_dense_ones():
+    # the flag has to be resolved from the model id, not left to verl. grpo_use_reentrant is the
+    # same helper the sft verl path and the retired trl path both keyed on.
+    resolved = inspect.getsource(rl_verl._resolve_grpo_inputs)
+    assert '"reentrant_checkpointing": bool(_w.grpo_use_reentrant(model_id))' in resolved
+    written = inspect.getsource(rl_verl.run_rl_verl)
+    assert (
+        "render_reentrant_checkpointing_shim( "
+        'inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"]) )'
+        in " ".join(written.split())
+    )
+    # the curated GDN hybrids and the MoE need it; an uncataloged dense model does not.
+    assert W.grpo_use_reentrant("Qwen/Qwen3.5-4B") is True
+    assert W.grpo_use_reentrant("Qwen/Qwen3.6-35B-A3B") is True
+    assert W.grpo_use_reentrant("meta-llama/Llama-3.1-8B") is False
+
+
+def test_the_reentrant_shim_installs_vision_input_grads_only_for_multimodal_runs():
+    # reentrant recompute DROPS the backward for a checkpointed block when none of that block's
+    # inputs require grad. the vision tower's patch embeddings are exactly that case -- the pixels
+    # are frozen inputs -- so without a forward hook marking the patch-embed output as requiring
+    # grad the visual modules silently train on nothing while the language side trains normally and
+    # the run reports success. the retired trl path installed the same hook via a trainer callback;
+    # verl has no callback surface, so it rides this shim.
+    text_only = rl_verl.render_reentrant_checkpointing_shim(True)
+    assert "_flash_install_vision_input_grads" not in text_only, (
+        "a text-only run pays for a vision hook that can never match"
+    )
+    multimodal = rl_verl.render_reentrant_checkpointing_shim(True, multimodal=True)
+    # compile FIRST. an earlier version asserted only that the call text appeared, which the
+    # helper's own `def _flash_install_vision_input_grads(module):` line satisfies on its own --
+    # so the assertion held while the call site was emitted at the wrong indent and the rendered
+    # sitecustomize was a SyntaxError. this shim is exec'd in verl's child, where a syntax error
+    # is a silent no-op rather than a test failure, so compiling here is the only real gate.
+    compile(multimodal, "sitecustomize.py", "exec")
+    assert "visual.patch_embed" in multimodal
+    # the call has to land INSIDE the checkpointing branch: dedented one level it would run for
+    # every module verl builds, including engines whose checkpointing verl deliberately left off.
+    assert "\n        _flash_install_vision_input_grads(module)\n" in multimodal
+    # the flag is independent of the shim: a multimodal run on a model that does not need reentrant
+    # checkpointing gets no shim at all, and therefore no hook.
+    assert rl_verl.render_reentrant_checkpointing_shim(False, multimodal=True) == ""
+
+
+@contextlib.contextmanager
+def _vision_hook_installer(torch_module):
+    """yield the rendered vision helper with a stand-in torch visible to it.
+
+    the helper imports torch INSIDE the function body, so the stand-in has to stay in sys.modules
+    for the duration of the call rather than just the exec -- which is also the property that lets
+    the real shim run inside verl's child, where torch is imported long after sitecustomize.
+    """
+    source = rl_verl.render_reentrant_checkpointing_shim(True, multimodal=True)
+    helper_start = source.index("def _flash_install_vision_input_grads")
+    helper_end = source.index("def _flash_reentrant_build_module")
+    namespace: dict = {}
+    exec(source[helper_start:helper_end], namespace)
+    saved = sys.modules.get("torch")
+    sys.modules["torch"] = torch_module
+    try:
+        yield namespace["_flash_install_vision_input_grads"]
+    finally:
+        if saved is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = saved
+
+
+class _FakeTensor:
+    """the two attributes the hook interrogates, plus the mutation it performs."""
+
+    def __init__(self, *, floating=True):
+        self.requires_grad = False
+        self._floating = floating
+
+    def is_floating_point(self):
+        return self._floating
+
+    def requires_grad_(self, value=True):
+        self.requires_grad = value
+        return self
+
+
+class _FakeTorch:
+    Tensor = _FakeTensor
+
+
+class _FakeSubmodule:
+    def __init__(self):
+        self.hooks = []
+
+    def register_forward_hook(self, hook):
+        self.hooks.append(hook)
+
+    def forward(self, output):
+        for hook in self.hooks:
+            hook(self, (), output)
+        return output
+
+
+class _FakeVisionModel:
+    """named_modules() the way the hook walks it, at the paths a real vlm exposes."""
+
+    def __init__(self, *, patch_embed_path="visual.patch_embed"):
+        self.patch_embed = _FakeSubmodule()
+        self.other = _FakeSubmodule()
+        self._paths = {patch_embed_path: self.patch_embed, "model.layers.0": self.other}
+
+    def named_modules(self):
+        return list(self._paths.items())
+
+
+def test_the_vision_hook_marks_patch_embed_output_as_requiring_grad():
+    # runs the rendered helper for real rather than asserting on its text: a hook registered on the
+    # wrong submodule, or one that inspects the output incorrectly, still renders a plausible
+    # string. torch is absent from the unit env, so the stand-in reproduces exactly the contract
+    # the hook depends on -- `is_floating_point()` and `requires_grad_()` on a `torch.Tensor`.
+    model = _FakeVisionModel()
+    with _vision_hook_installer(_FakeTorch) as install:
+        install(model)
+        assert len(model.patch_embed.hooks) == 1
+        assert model.other.hooks == [], "the hook was installed on a non-vision submodule"
+
+        output = _FakeTensor()
+        assert output.requires_grad is False, "the fixture cannot demonstrate the bug"
+        assert model.patch_embed.forward(output).requires_grad is True
+
+        # a tuple output is what a real patch-embed returns; the hook must reach inside it.
+        tupled = _FakeTensor()
+        model.patch_embed.forward((tupled, None))
+        assert tupled.requires_grad is True
+
+        # an integer output (ids, not activations) must be left alone: requires_grad_ on a
+        # non-float tensor raises in real torch, taking the run down at the first forward.
+        integral = _FakeTensor(floating=False)
+        model.patch_embed.forward(integral)
+        assert integral.requires_grad is False
+
+
+def test_the_vision_hook_reports_when_it_finds_no_patch_embed(capsys):
+    # a silent no-op is the failure mode being fixed: visual modules training on nothing while the
+    # run reports success. if the path ever moves, the log line is what makes that visible.
+    with _vision_hook_installer(_FakeTorch) as install:
+        install(_FakeVisionModel(patch_embed_path="vision_tower.embeddings"))
+    assert "no visual.patch_embed found" in capsys.readouterr().out
+
+
+def test_the_vision_hook_unwraps_a_peft_model_to_find_the_vision_tower():
+    # grpo trains through a peft wrapper, so named_modules() on the wrapper is prefixed. the hook
+    # unwraps to the base model first; without that it would find nothing and silently no-op.
+    class _PeftWrapped:
+        def __init__(self, base):
+            self._base = base
+
+        def get_base_model(self):
+            return self._base
+
+        def named_modules(self):
+            raise AssertionError("the wrapper's own module list must not be walked")
+
+    base = _FakeVisionModel()
+    with _vision_hook_installer(_FakeTorch) as install:
+        install(_PeftWrapped(base))
+    assert len(base.patch_embed.hooks) == 1
+
+
+def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alone():
+    # execute the rendered source against a stand-in engine: asserting on the string alone would not
+    # catch a patch that never runs, or one that turns checkpointing ON for a model verl left off.
+    class _Cfg:
+        def __init__(self, on):
+            self.enable_gradient_checkpointing = on
+
+    class _Module:
+        def __init__(self):
+            self.kwargs = None
+
+        def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+            self.kwargs = gradient_checkpointing_kwargs
+
+    class _Engine:
+        def __init__(self, on):
+            self.model_config = _Cfg(on)
+            self.module = _Module()
+
+        def _build_module(self):
+            return self.module
+
+    module_stub = types.ModuleType("verl.workers.engine.fsdp.transformer_impl")
+    module_stub.FSDPEngine = _Engine
+    parents = [
+        "verl",
+        "verl.workers",
+        "verl.workers.engine",
+        "verl.workers.engine.fsdp",
+    ]
+    saved = {name: sys.modules.get(name) for name in [*parents, module_stub.__name__]}
+    try:
+        for name in parents:
+            sys.modules.setdefault(name, types.ModuleType(name))
+        sys.modules[module_stub.__name__] = module_stub
+        exec(rl_verl.render_reentrant_checkpointing_shim(True), {})
+        # checkpointing on -> the flag is put back to reentrant
+        engine = _Engine(True)
+        assert engine._build_module().kwargs == {"use_reentrant": True}
+        # checkpointing off -> untouched, so the shim cannot silently raise the memory profile
+        off = _Engine(False)
+        assert off._build_module().kwargs is None
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
 
 
 def test_entropy_quantile_shim_is_emitted_only_when_masking_is_requested():
@@ -1653,6 +2124,29 @@ def test_model_revision_resolves_pinned_snapshot_for_verl():
     assert 'revision=inp["model_revision"]' in run_src
 
 
+def test_pinned_snapshot_dir_is_what_reaches_verl_model_path():
+    # resolving the pinned snapshot is only half the invariant: the RESOLVED path has to be the value
+    # verl gets as actor_rollout_ref.model.path. passing inp["model_id"] here would resolve the cached
+    # "main" ref offline and silently train the wrong commit, with every other assertion still green.
+    # read the call with ast, not a substring: the argument list is multi-line and reformats.
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_build_verl_training_cfg"
+    ]
+    assert len(calls) == 1
+    model_id = next(k for k in calls[0].keywords if k.arg == "model_id")
+    assert isinstance(model_id.value, ast.Name)
+    assert model_id.value.id == "model_path_for_verl"
+
+
 def test_resolve_verl_loggers_console_when_no_api_key(monkeypatch):
     # no WANDB_API_KEY -> console only, and no wandb probe of the verl interpreter.
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
@@ -1844,10 +2338,9 @@ def test_run_rl_verl_wires_the_gradient_check_into_the_publish_path():
     # a helper nothing calls is not a guard. assert the training path actually invokes it, and that
     # it does so before the adapter export rather than after a publish has already happened.
     source = inspect.getsource(rl_verl.run_rl_verl)
-    assert (
-        "_check_grpo_had_a_gradient(reward_history, adv_spread_history, resumed=bool(resume_step))"
-        in source
-    )
+    assert "_check_grpo_had_a_gradient(" in source
+    assert "resumed=bool(resume_step)," in source
+    assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in source
     assert source.index("_check_grpo_had_a_gradient") < source.index("_export_peft_adapter")
     # and that the spread series it passes is actually collected from the child's output.
     assert 'parse_verl_metric(line, "critic/advantages/max")' in source
@@ -1869,6 +2362,23 @@ def test_grpo_gradient_check_abstains_for_a_resumed_run():
     # about the resume boundary, not a weakening of the guard.
     with pytest.raises(RuntimeError, match="zero advantage spread"):
         rl_verl._check_grpo_had_a_gradient([1.0], [0.0], resumed=False)
+
+
+def test_grpo_gradient_check_accepts_a_resume_that_is_already_complete():
+    # a resume whose checkpoint ALREADY sits at the target runs zero steps: verl computes
+    # current_epoch = global_steps // len(dataloader), the epoch range comes out empty, and the child
+    # exits 0 having emitted no metric lines. both histories are therefore empty for a policy that is
+    # fully trained -- which the empty-history branch would report as a reward-bridge wiring
+    # regression, failing a complete run. (trl exempted exactly this via
+    # _grpo_resume_already_complete; the port dropped the exemption.)
+    rl_verl._check_grpo_had_a_gradient([], [], resumed=True, already_complete=True)
+
+    # the exemption is ONLY for the zero-step case. a resume that ran steps and produced no metrics
+    # is still a wiring regression, and a fresh run can never claim it.
+    with pytest.raises(RuntimeError, match="never consulted"):
+        rl_verl._check_grpo_had_a_gradient([], [], resumed=True, already_complete=False)
+    with pytest.raises(RuntimeError, match="never consulted"):
+        rl_verl._check_grpo_had_a_gradient([], [], resumed=False)
 
 
 def test_resume_uploader_withholds_deployables_until_spread_appears():
@@ -2254,8 +2764,12 @@ def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, mon
     with pytest.raises(RuntimeError, match="required saves were not durably published"):
         uploader.raise_if_incomplete()
     # ordering is asserted at the call site: the verdict precedes stop()/raise_if_incomplete().
+    # match on the call name alone -- the argument list spans several lines, so pinning an argument
+    # would make this fail on a reformat rather than on a reordering, which is the real invariant.
     source = inspect.getsource(rl_verl.run_rl_verl)
-    verdict = source.index("_check_grpo_had_a_gradient(reward_history")
+    assert source.count("_check_grpo_had_a_gradient(") == 1
+    assert source.count("resume_uploader.raise_if_incomplete()") == 1
+    verdict = source.index("_check_grpo_had_a_gradient(")
     completeness = source.index("resume_uploader.raise_if_incomplete()")
     assert verdict < completeness
 
@@ -2281,7 +2795,7 @@ def _notes_inp():
         "temperature": 1.0,
         "top_p": 1.0,
         "ppo_epochs": 1,
-        "verl_total_epochs": 3,
+        "model_id": "Qwen/Qwen3-4B", "verl_total_epochs": 3,
         "seed": 7,
         "max_completion": 512,
         "prompts_per_step": 8,
@@ -2295,7 +2809,7 @@ def _notes_common():
 
 def test_train_notes_carry_the_trl_observability_fields():
     # the console is uploaded only on FAILURE, so a successful run's train_meta is the sole record
-    # of how it ran. the trl path reports these; without them a verl run cannot be compared to a
+    # of how it ran. the retired trl path reported these; without them a verl run cannot be compared to a
     # trl one, and the fp8-kv decision (resolved per-card at runtime) leaves no trace at all.
     notes = rl_verl._build_verl_train_notes(
         _notes_inp(),
@@ -2361,7 +2875,7 @@ def test_verl_grpo_wandb_names_survive_hydra_special_characters():
 
 
 def test_train_notes_record_the_batch_shape_one_step_consumed():
-    # the trl path reports the batch shape, so without it a verl run's reward curve cannot be read
+    # the retired trl path reported the batch shape, so without it a verl run's reward curve cannot be read
     # against a trl one: the same step count at a different batch size is a different experiment.
     notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common())
     assert notes["max_completion_len"] == 512
@@ -2558,6 +3072,9 @@ def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        enforce_eager=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
         project_name="flash",
@@ -2680,11 +3197,10 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
 
 
 def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch, capsys):
-    # per_turn only diverges from per_episode when there is more than one assistant turn to credit:
-    # trl reaches GRPOPerTurnTrainer solely through use_rollout_func, which requires is_multi_turn.
+    # per_turn only diverges from per_episode when there is more than one assistant turn to credit.
     # the multi-turn/tool guard above already rejects every env that could get there, so anything
-    # reaching here is single-turn and the two modes are the same objective -- trl accepts the key on
-    # exactly these envs. rejecting it would break configs that run correctly on the trl backend.
+    # reaching here is single-turn and the two modes are the same objective. rejecting a key that
+    # is merely redundant would break configs that are asking for nothing wrong.
     inp = _capability_resolve(
         monkeypatch,
         _capability_env(),
@@ -2724,6 +3240,7 @@ def _multi_turn_inp(**over):
     return {
         "max_turns": 4,
         "engine_len": 8192,
+        "max_completion": 512,
         "stop_sequences": ("</answer>",),
         "eos_token_ids": frozenset({151645, 151643}),
         **over,
@@ -2771,6 +3288,7 @@ def test_multi_turn_child_env_serializes_values_the_child_can_parse_back():
     assert all(isinstance(value, str) for value in emitted.values())
     assert int(emitted["FLASH_VERL_MAX_TURNS"]) == 4
     assert int(emitted["FLASH_VERL_MAX_MODEL_LEN"]) == 8192
+    assert int(emitted["FLASH_VERL_MAX_COMPLETION_TOKENS"]) == 512
     assert json.loads(emitted["FLASH_VERL_STOP_SEQUENCES"]) == ["</answer>"]
     # sorted, not set-ordered: the child compares against this list every turn and an unstable order
     # would make halting depend on hash seed.
@@ -2836,6 +3354,47 @@ def test_the_run_body_puts_the_shim_dir_on_the_child_path_for_multi_turn():
     assert 'if inp["multi_turn"]:\n        copy_multi_turn_child_modules(shim_dir)' in src
 
 
+# ---------------------- multi-turn per-turn generation cap ----------------------
+def test_the_child_caps_each_turn_at_max_completion_tokens_not_the_whole_episode():
+    # parity with the retired trl driver, which passed per_turn_max_tokens=max_completion into
+    # _turn_budget. without the cap the first turn may spend the ENTIRE episode budget: the other
+    # two bounds are transcript-wide, so a 4096-token engine window lets turn one generate 4096
+    # tokens and leaves nothing for the rest of the episode. asserted on the child's own source
+    # because the alternative is a full engine rollout to observe one min().
+    from flash.engine.worker import grpo_multiturn
+
+    body = " ".join(inspect.getsource(grpo_multiturn).split())
+    assert 'max_completion_tokens = int(os.environ["FLASH_VERL_MAX_COMPLETION_TOKENS"])' in body
+    assert (
+        "max_tokens = min( max_completion_tokens, max_model_len - len(prefix_ids), "
+        "response_capacity - len(response_ids), )" in body
+    ), "the per-turn cap is not one of the three budgets bounding a turn"
+
+
+def test_the_child_puts_no_deadline_on_a_bridge_call():
+    # MultiTurnBridge serializes every env touch behind one lock, so with a whole generation in
+    # flight a request spends most of its life QUEUED rather than being served slowly. a client
+    # timeout there fails healthy episodes for arriving Nth -- a function of batch size, not of
+    # the environment. a genuinely wedged env is caught by the stall watchdog instead, which
+    # measures training progress rather than one request.
+    from flash.engine.worker import grpo_multiturn
+
+    body = " ".join(inspect.getsource(grpo_multiturn.post_json).split())
+    assert "urllib.request.urlopen(request) as response" in body
+    assert "timeout=" not in body.split('"""')[-1], (
+        "a client-side deadline is back on the bridge call"
+    )
+
+
+def test_the_parent_sends_the_per_turn_cap_from_the_configured_completion_budget():
+    # the cap is only real if the parent actually exports it; the child KeyErrors mid-rollout
+    # otherwise, after the engine is already up and paid for.
+    emitted = rl_verl.multi_turn_child_env(
+        _multi_turn_inp(max_completion=321), reward_url="http://127.0.0.1:9/", thinking=False
+    )
+    assert emitted["FLASH_VERL_MAX_COMPLETION_TOKENS"] == "321"
+
+
 # ---------------------- multi-turn bridge routes ----------------------
 class _BridgeEnv:
     """the four calls MultiTurnBridge drives, recording what it was asked."""
@@ -2882,9 +3441,14 @@ class _BridgeEnv:
         return [RolloutReward(episode=self.episode, turns=None) for _ in items]
 
 
-def _bridge(env, *, max_turns=4, examples=None):
+def _bridge(env, *, max_turns=4, examples=None, env_prompts=None, **kwargs):
+    examples = examples if examples is not None else [{"index": 0}, {"index": 1}]
+    if env_prompts is None:
+        # what dataset preparation would have produced for these examples: the same opening the
+        # env's own start_episode returns. tests that care about the two DISAGREEING pass their own.
+        env_prompts = [[dict(message) for message in getattr(env, "prompt", ())] for _ in examples]
     return rl_verl.MultiTurnBridge(
-        env, examples if examples is not None else [{"index": 0}, {"index": 1}], max_turns=max_turns
+        env, examples, env_prompts=env_prompts, max_turns=max_turns, **kwargs
     )
 
 
@@ -2920,6 +3484,49 @@ def test_bridge_start_lets_a_per_example_budget_lower_the_cap_but_never_raise_it
     assert _bridge(_BridgeEnv(max_episode_turns=0), max_turns=4).start(
         {"index": 0, "session_id": "a"}
     ) == {"max_turns": 1}
+
+
+def test_bridge_start_adopts_the_datasets_prompt_over_a_second_start_episode():
+    # `new_rollout_state` calls `start_episode` a SECOND time; dataset preparation already called
+    # it to build the prompt the child generates against. an env that randomizes per episode hands
+    # back a DIFFERENT opening here, and the run would then score a response generated for prompt A
+    # against a reward computed for prompt B. the env below returns a fresh secret every call, the
+    # way a randomized env does.
+    class _RandomizingEnv(_BridgeEnv):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def new_rollout_state(self, example):
+            self.calls += 1
+            return {
+                "example": example,
+                "prompt": [{"role": "user", "content": f"secret-{self.calls}"}],
+                "messages": [{"role": "user", "content": f"secret-{self.calls}"}],
+            }
+
+    env = _RandomizingEnv()
+    dataset_prompt = [{"role": "user", "content": "secret-0"}]
+    bridge = _bridge(env, examples=[{"index": 0}], env_prompts=[dataset_prompt])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    scored = env.scored[0]
+    assert scored["prompt"] == dataset_prompt, (
+        "the episode was scored against a prompt the model never saw"
+    )
+    assert scored["messages"][0] == dataset_prompt[0]
+
+
+def test_bridge_rejects_prompts_that_do_not_align_with_its_examples():
+    # the two are indexed by the SAME integer the child sends. a length mismatch means some index
+    # reads the wrong row's prompt, or IndexErrors mid-rollout; both are worth failing at
+    # construction, before the engine is paid for.
+    with pytest.raises(ValueError, match="one-to-one"):
+        rl_verl.MultiTurnBridge(
+            _BridgeEnv(), [{"index": 0}, {"index": 1}], env_prompts=[[]], max_turns=4
+        )
 
 
 def test_bridge_start_rejects_an_out_of_range_index_before_touching_the_env():
@@ -3019,8 +3626,8 @@ def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
     # so the transcript IS the only thing this path can publish for `flash runs log`.
     recorded: list[tuple] = []
     env = _BridgeEnv(episode=0.75)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     bridge.step({"session_id": "a", "completion_text": "answer"})
@@ -3047,8 +3654,8 @@ def test_the_recorded_transcript_excludes_the_prompt_it_was_seeded_from():
         {"role": "user", "content": "what is 3+4"},
     ]
     env = _BridgeEnv(episode=0.75, prompt=prompt)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     bridge.step({"session_id": "a", "completion_text": "7"})
@@ -3070,8 +3677,8 @@ def test_the_transcript_slice_keeps_a_turn_that_merely_looks_like_a_prompt_messa
     recorded: list[tuple] = []
     prompt = [{"role": "user", "content": "repeat after me: go"}]
     env = _BridgeEnv(episode=1.0, done_after=99, prompt=prompt)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     # the env replies with the prompt message verbatim, then the model answers.
@@ -3087,8 +3694,9 @@ def test_the_recorded_episode_is_the_zeroed_reward_not_the_raw_nan():
     # the sample carries the reward the rollout actually trained on. publishing nan here would show
     # a reward in the log that no advantage was ever computed from.
     recorded: list[tuple] = []
-    bridge = rl_verl.MultiTurnBridge(
-        _BridgeEnv(episode=float("nan")), [{"index": 0}], max_turns=4,
+    bridge = _bridge(
+        _BridgeEnv(episode=float("nan")),
+        examples=[{"index": 0}],
         on_episode_scored=lambda *row: recorded.append(row),
     )
     bridge.start({"index": 0, "session_id": "a"})
@@ -3103,8 +3711,8 @@ def test_the_recorded_transcript_is_a_snapshot_that_later_turns_cannot_mutate():
     # a concurrent episode's turn appear inside an already-published sample.
     recorded: list[tuple] = []
     env = _BridgeEnv(done_after=99)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     bridge.step({"session_id": "a", "completion_text": "first"})
@@ -3122,8 +3730,9 @@ def test_the_episode_recorder_runs_outside_the_session_lock():
     # any grading that touches both deadlocks.
     observed: list[bool] = []
     env = _BridgeEnv()
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4,
+    bridge = _bridge(
+        env,
+        examples=[{"index": 0}],
         on_episode_scored=lambda *_: observed.append(bridge._lock.acquire(blocking=False)),
     )
     bridge.start({"index": 0, "session_id": "a"})
@@ -3155,8 +3764,8 @@ def test_a_first_turn_abort_is_still_shown_in_the_sample(abort):
     (codex[bot])."""
     recorded: list[tuple] = []
     env = _BridgeEnv(done_after=99)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     assert bridge.step({"session_id": "a", "completion_text": "ran out of ro", **abort}) == {
@@ -3174,7 +3783,7 @@ def test_the_env_never_scores_the_aborted_turn_it_is_shown_in_the_sample():
     # asserting only on the sample would pass an implementation that also appended it to `messages`,
     # which is the truncated-text-gets-graded bug the abort branch exists to prevent.
     env = _BridgeEnv(done_after=99)
-    bridge = rl_verl.MultiTurnBridge(env, [{"index": 0}], max_turns=4)
+    bridge = _bridge(env, examples=[{"index": 0}])
     bridge.start({"index": 0, "session_id": "a"})
     bridge.step({"session_id": "a", "completion_text": "good turn"})
     bridge.step({"session_id": "a", "completion_text": "cut off", "truncated": True})
@@ -3183,6 +3792,212 @@ def test_the_env_never_scores_the_aborted_turn_it_is_shown_in_the_sample():
     scored = [m.get("content") for m in env.scored[0]["messages"]]
     assert "cut off" not in scored, "the truncated turn reached the env's scoring state"
     assert "good turn" in scored
+
+
+# ---------------------- multi-turn batched episode scoring ----------------------
+def test_concurrently_finished_episodes_are_scored_in_one_env_call():
+    # a generation is prompts_per_step * group_size episodes. scoring them one at a time turns one
+    # judge round into hundreds of serial round-trips with the gpu idle. the env below records the
+    # SIZE of every batch it is handed, so a regression to per-episode scoring shows up as many
+    # calls of one rather than one call of many.
+    class _BatchRecordingEnv(_BridgeEnv):
+        def __init__(self):
+            super().__init__()
+            self.batch_sizes: list[int] = []
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            self.batch_sizes.append(len(items))
+            return [RolloutReward(episode=1.0, turns=None) for _ in items]
+
+    env = _BatchRecordingEnv()
+    examples = [{"index": i} for i in range(8)]
+    bridge = _bridge(env, examples=examples)
+    for i in range(8):
+        bridge.start({"index": i, "session_id": f"s{i}"})
+        bridge.step({"session_id": f"s{i}", "completion_text": "answer"})
+
+    scores: dict[int, float] = {}
+    threads = [
+        threading.Thread(
+            target=lambda i=i: scores.__setitem__(
+                i, bridge.score({"session_id": f"s{i}", "turn_count": 1})["score"]
+            )
+        )
+        for i in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not [t for t in threads if t.is_alive()], "a scoring episode never completed"
+
+    assert scores == dict.fromkeys(range(8), 1.0)
+    assert max(env.batch_sizes) > 1, (
+        f"every episode was scored alone: batch sizes {env.batch_sizes}"
+    )
+    assert sum(env.batch_sizes) == 8, "an episode was scored twice or not at all"
+
+
+def test_a_batched_score_reaches_the_env_under_the_same_lock_every_other_call_takes():
+    # scoring is batched to shorten how long the lock is held, NOT to drop it. `reward_thread_safe`
+    # licenses racing the scorer against ITSELF; it says nothing about racing it against a
+    # concurrent episode's `env_reply`, and no env contract permits that.
+    class _LockObservingEnv(_BridgeEnv):
+        def __init__(self):
+            super().__init__()
+            self.held_during_scoring: list[bool] = []
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            acquired = bridge._lock.acquire(blocking=False)
+            self.held_during_scoring.append(not acquired)
+            if acquired:
+                bridge._lock.release()
+            return [RolloutReward(episode=1.0, turns=None) for _ in items]
+
+    env = _LockObservingEnv()
+    bridge = _bridge(env, examples=[{"index": 0}])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+    assert env.held_during_scoring == [True], "the env was scored without the session lock held"
+
+
+def test_a_failing_batch_fails_every_episode_in_it_rather_than_hanging_them():
+    # the scoring thread scatters results back to waiters. if a raise completed only the waiter
+    # that provoked it, every OTHER episode in that batch would block on its event forever and the
+    # run would wedge with no error -- the worst shape of failure, since the stall watchdog only
+    # fires 25 minutes later.
+    #
+    # the batch has to actually CONTAIN several episodes for this to test anything. an earlier
+    # version just started four threads and hoped; each arrived alone, `_take_batch` returned it by
+    # itself, and `batch[0]` WAS the whole batch -- so it passed against code that completed only
+    # the first waiter (VERL-100). the gate below parks the scorer inside the env call until the
+    # rest have queued, which is the interleave the assertion is actually about.
+    entered = threading.Event()
+    release = threading.Event()
+
+    batch_sizes: list[int] = []
+
+    class _FailingEnv(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            batch_sizes.append(len(items))
+            entered.set()
+            release.wait(timeout=30)
+            raise RuntimeError("judge is down")
+
+    bridge = _bridge(_FailingEnv(), examples=[{"index": i} for i in range(5)])
+    for i in range(5):
+        bridge.start({"index": i, "session_id": f"s{i}"})
+        bridge.step({"session_id": f"s{i}", "completion_text": "answer"})
+
+    outcomes: list[str] = []
+    outcome_lock = threading.Lock()
+
+    def _record(session_id):
+        result = _score_capturing(bridge, session_id)
+        with outcome_lock:
+            outcomes.append(result)
+
+    # s0 goes first and parks the scorer inside the env call. the other four queue behind it and
+    # are taken as ONE batch on the next pass -- that is the batch whose failure must scatter.
+    # daemon: a waiter this test proves is WEDGED never returns, and a non-daemon thread would
+    # then block interpreter shutdown after the assertion had already fired -- turning a named
+    # failure into a hang that reports nothing and burns the whole ci timeout.
+    first = threading.Thread(target=lambda: _record("s0"), daemon=True)
+    first.start()
+    assert entered.wait(timeout=30), "the scorer never reached the env"
+
+    rest = [
+        threading.Thread(target=lambda i=i: _record(f"s{i}"), daemon=True) for i in range(1, 5)
+    ]
+    for thread in rest:
+        thread.start()
+
+    # wait for all four to be QUEUED before releasing the in-flight call. `_pending` is the wrong
+    # field to watch: the batcher drains it into `_in_flight` the moment it takes a batch, so
+    # sampling it races to zero and the assertion fails against working code. count the waiters
+    # that exist in either place instead.
+    # do NOT gate on `_scorer._pending`: `bridge.score()` takes the bridge lock to look up its
+    # session, and `_score_batch` holds that same lock for the whole parked env call -- so the four
+    # sit inside `score()` and never reach the batcher's queue while s0 is in flight. `_pending`
+    # stays 0 the entire time and any wait on it times out against perfectly good code. they
+    # coalesce the moment the lock is released, which is what `batch_sizes` below actually proves.
+    time.sleep(0.5)
+    release.set()
+
+    threads = [first, *rest]
+    for thread in threads:
+        thread.join(timeout=30)
+    alive = [t for t in threads if t.is_alive()]
+    assert not alive, f"{len(alive)} episode(s) left hanging by a failed batch"
+    assert sorted(outcomes) == ["judge is down"] * 5
+    # the point of the test: a batch of MORE THAN ONE actually failed together. without this the
+    # queue-depth wait above would still pass if each episode were scored on its own, which is the
+    # shape under which the buggy `batch[0]`-only completion is indistinguishable from correct.
+    assert max(batch_sizes) > 1, f"no shared batch ever formed; env saw batches {batch_sizes}"
+
+
+def _score_capturing(bridge, session_id):
+    """score one episode, returning the failure text instead of raising (for use off-thread)."""
+    try:
+        bridge.score({"session_id": session_id, "turn_count": 1})
+    except Exception as error:
+        return str(error)
+    return "scored"
+
+
+def test_the_scoring_thread_starts_on_first_use_rather_than_an_explicit_call():
+    # the batcher's consumer thread is what drains the queue. constructed-but-never-started is a
+    # silent wedge: `score` blocks on an event nothing will ever set, and it is invisible until a
+    # multi-turn run hangs on real gpu. binding the start to first use makes that state
+    # unreachable, so no caller can forget.
+    #
+    # the score call is bounded on its own thread rather than made inline: if the start is ever
+    # dropped, an inline call would HANG here, and a hanging test is only marginally better than one
+    # that cannot fail -- it burns the whole ci timeout and reports no assertion. off-thread with a
+    # join deadline turns that same regression into a named failure.
+    bridge = _bridge(_BridgeEnv(), examples=[{"index": 0}])
+    assert bridge._scorer._thread is None, "the thread was started before any episode needed it"
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+
+    scored: list = []
+    worker = threading.Thread(
+        target=lambda: scored.append(bridge.score({"session_id": "a", "turn_count": 1})),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=30)
+    assert not worker.is_alive(), "score blocked forever: nothing is draining the queue"
+    assert scored == [{"score": 1.0}]
+    assert bridge._scorer._thread is not None
+
+
+def test_bridge_shutdown_stops_the_scoring_thread():
+    # the run's finally calls this before the server goes down. a thread left running would keep
+    # the worker process alive past the point flash considers the run finished.
+    bridge = _bridge(_BridgeEnv(), examples=[{"index": 0}])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+    thread = bridge._scorer._thread
+    assert thread is not None
+    assert thread.is_alive()
+    bridge.shutdown()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the scoring thread outlived the bridge"
+
+
+def test_the_run_shuts_the_bridge_down_before_the_server_it_is_mounted_on():
+    # ordering matters: the server's routes block on the scoring thread, so stopping the server
+    # first would strand a scoring episode on an event nothing will ever set.
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    assert "multi_turn_bridge.shutdown()" in src
+    assert src.index("multi_turn_bridge.shutdown()") < src.index("server.shutdown()")
 
 
 def test_bridge_close_releases_the_session():
@@ -3232,7 +4047,9 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
     src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
     assert src.count("MultiTurnBridge(") == 1
     assert (
-        'MultiTurnBridge( env, rollout_examples, max_turns=int(inp["max_turns"]), '
+        "MultiTurnBridge( env, rollout_examples, "
+        '# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. '
+        'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
         'per_turn_credit=bool(inp["per_turn_credit"]), '
         "on_episode_scored=observability.record, )" in src
     )
@@ -3275,6 +4092,9 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        enforce_eager=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
         project_name="flash",
@@ -3598,6 +4418,51 @@ def test_score_grades_before_it_records():
 
     assert body.count("observability.record(") == 1
     assert body.index("score = score_single_turn(") < body.index("observability.record(")
+
+
+def test_the_recorded_prompt_is_the_one_the_completion_was_graded_against():
+    """A sample pairs a prompt with a completion, so the two must come from the SAME index.
+
+    `_score` receives an index and a completion; the prompt is looked up, and looking it up under
+    anything but that index publishes a rollout whose `prompt_tail` belongs to a different example.
+    Nothing downstream can detect it -- the pair is well-formed, just not a pair -- and every
+    reader of `flash runs log` is then reading the model answering a question it was never asked.
+    `_score_buffer` below reimplements these two calls, so it cannot catch this; read the call.
+
+    Asserted with ast: the lookup is one subscript expression, and a substring needle would fail on
+    a reformat rather than on the re-indexing that is the actual invariant.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
+    score = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_score"
+    )
+    index_arg, completion_arg = (a.arg for a in score.args.args[:2])
+    calls = [
+        node
+        for node in ast.walk(score)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "record"
+    ]
+    assert len(calls) == 1
+    prompt, completion = calls[0].args[:2]
+    # the completion is passed straight through, unindexed: it IS the graded text.
+    assert isinstance(completion, ast.Name)
+    assert completion.id == completion_arg
+    # the prompt is subscripted by _score's own index argument, not by a separate cursor.
+    assert isinstance(prompt, ast.Subscript)
+    assert ast.unparse(prompt.slice) in (index_arg, f"int({index_arg})")
+    # and it is the same list the grading example comes from -- one dataset order for both.
+    graded = next(
+        node
+        for node in ast.walk(score)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "rollout_examples"
+    )
+    assert ast.unparse(graded.slice) == ast.unparse(prompt.slice)
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -4361,29 +5226,35 @@ def test_per_turn_credit_shim_centres_each_turn_against_its_group_sibling():
     assert advantages[1].tolist() == [-0.5, -0.5, 0.5, 0.5]
 
 
-def test_per_turn_credit_shim_matches_trl_per_turn_advantages():
-    # the two backends must produce the SAME advantages for the same rollouts, which is what makes
-    # this a port rather than a second implementation. trl's builder is the reference oracle.
+def test_per_turn_credit_shim_reproduces_the_reference_advantages():
+    # the port's defining property: for the same rollouts it must produce the SAME advantages the
+    # original per-turn builder did, which is what makes it a port rather than a second
+    # implementation.
+    #
+    # the reference values below were computed from that builder before it was deleted with the trl
+    # backend. they are pinned as literals deliberately: an oracle that no longer ships cannot be
+    # imported, and re-deriving them from the shim under test would make this assert on itself.
+    #
+    # by hand, for spans [(0,3),(3,5)] / [(0,2),(2,6)] and turn rewards [.25,.75] / [1.0,.5]:
+    # turn 0 group mean is (0.25+1.0)/2 = 0.625, so its centred credits are -0.375 and +0.375;
+    # turn 1 group mean is (0.75+0.5)/2 = 0.625, giving +0.125 and -0.125. each credit is broadcast
+    # across its own token span, and index 5 of row 0 lies past its last span, so it stays 0.
     pytest.importorskip("torch")
     import torch
 
-    from flash.engine.worker.grpo_perturn_trainer import build_per_turn_advantages
-
     spans = [[(0, 3), (3, 5)], [(0, 2), (2, 6)]]
     turns = [[0.25, 0.75], [1.0, 0.5]]
-    expected = build_per_turn_advantages(
-        spans,
-        turns,
-        num_generations=2,
-        completion_len=6,
-        # trl centres the episode itself; per-turn rows never read this, so its value is
-        # irrelevant to the comparison and any finite tensor proves the same thing.
-        episode_advantages=torch.zeros(2, dtype=torch.float32),
+    expected = torch.tensor(
+        [[-0.375, -0.375, -0.375, 0.125, 0.125, 0.0],
+         [0.375, 0.375, -0.125, -0.125, -0.125, -0.125]],
+        dtype=torch.float32,
     )
     got = _run_per_turn_shim(
         [(tuple(map(tuple, spans[0])), tuple(turns[0])),
          (tuple(map(tuple, spans[1])), tuple(turns[1]))],
         ["p0", "p0"],
+        # the episode tensor is what per-turn credit REPLACES, so its value cannot affect the
+        # result; zeros make an accidental passthrough visible as a row of zeros.
         torch.zeros((2, 6), dtype=torch.float32),
     )
     assert torch.allclose(got, expected)
@@ -4535,8 +5406,8 @@ def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
             return [RolloutReward(episode=1.0, turns=(0.25, 0.75)) for _ in items]
 
     examples = [{"question": "q"}]
-    episode_only = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2)
-    per_turn = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2, per_turn_credit=True)
+    episode_only = _bridge(_Env(), examples=examples, max_turns=2)
+    per_turn = _bridge(_Env(), examples=examples, max_turns=2, per_turn_credit=True)
     for bridge in (episode_only, per_turn):
         bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
     assert episode_only.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0}
@@ -4561,13 +5432,20 @@ def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
             # one reward for two turns: the validator rejects the count and drops to None.
             return [RolloutReward(episode=1.0, turns=(0.5,)) for _ in items]
 
-    bridge = rl_verl.MultiTurnBridge(_Env(), [{"question": "q"}], max_turns=2, per_turn_credit=True)
+    bridge = _bridge(_Env(), examples=[{"question": "q"}], max_turns=2, per_turn_credit=True)
     bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
     assert bridge.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0, "turns": None}
 
 
 def _drive_multi_turn_episode(
-    *, stop_reasons, env, per_turn_credit=True, max_turns=4, monkeypatch=None
+    *,
+    stop_reasons,
+    env,
+    per_turn_credit=True,
+    max_turns=4,
+    monkeypatch=None,
+    multi_modal_data=None,
+    return_instance=False,
 ):
     """run the real child loop end to end against a real bridge, returning its agent loop output.
 
@@ -4580,9 +5458,12 @@ def _drive_multi_turn_episode(
     monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
     monkeypatch.setenv("FLASH_VERL_MAX_TURNS", str(max_turns))
     monkeypatch.setenv("FLASH_VERL_MAX_MODEL_LEN", "4096")
+    # generous enough that the per-turn cap never binds here: these tests exercise termination and
+    # span accounting, and a cap that clipped a turn would change what they are measuring.
+    monkeypatch.setenv("FLASH_VERL_MAX_COMPLETION_TOKENS", "4096")
 
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"question": "q"}], max_turns=max_turns, per_turn_credit=per_turn_credit
+    bridge = _bridge(
+        env, examples=[{"question": "q"}], max_turns=max_turns, per_turn_credit=per_turn_credit
     )
     routes = bridge.routes()
 
@@ -4605,16 +5486,37 @@ def _drive_multi_turn_episode(
             return "".join(str(m.get("content") or "") for m in messages)
 
     class _Base:
+        """mirrors the parts of verl's AgentLoopBase the loop actually calls."""
+
         def __init__(self):
             self.tokenizer = _Tokenizer()
             self.rollout_config = SimpleNamespace(response_length=256)
             self.server_manager = self
             self._sent = list(stop_reasons)
+            # every generate call's media, so a test can assert the pixels ride along on turn 2+.
+            self.generate_media = []
 
-        async def apply_chat_template(self, messages):
+        def _get_mm_processor_kwargs(self, audio_data=None):
+            return {}
+
+        async def process_multi_modal_info(self, messages):
+            return dict(multi_modal_data or {})
+
+        async def apply_chat_template(self, messages, **kwargs):
             return [1, 2, 3]
 
-        async def generate(self, *, request_id, prompt_ids, sampling_params):
+        async def generate(
+            self,
+            *,
+            request_id,
+            prompt_ids,
+            sampling_params,
+            image_data=None,
+            video_data=None,
+            audio_data=None,
+            mm_processor_kwargs=None,
+        ):
+            self.generate_media.append(image_data)
             text, stop_reason = self._sent.pop(0)
             return SimpleNamespace(
                 token_ids=[ord(c) for c in text],
@@ -4636,14 +5538,19 @@ def _drive_multi_turn_episode(
         bridge_post=bridge_post,
     )
 
+    driven = {}
+
     async def _go():
         instance = loop_class()
         # the loop offloads the bridge's blocking posts onto this executor, so it has to be the
         # one actually running the coroutine.
         instance.loop = asyncio.get_running_loop()
+        driven["instance"] = instance
         await instance.run({}, raw_prompt=[{"role": "user", "content": "go"}], index=0)
 
     asyncio.run(_go())
+    if return_instance:
+        return captured, driven["instance"]
     return captured
 
 
@@ -4706,6 +5613,44 @@ def test_an_unspanned_truncated_turns_tokens_are_still_generated_and_masked_as_m
     )
     assert out["response_ids"][-2:] == [ord("c"), ord("d")], "the truncated turn's tokens were lost"
     assert out["response_mask"][-2:] == [1, 1], "the truncated turn's tokens were not model-masked"
+
+
+def test_multi_turn_rollout_carries_the_prompts_images_into_every_turn(monkeypatch):
+    # an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. the engine needs
+    # the decoded media alongside them on EVERY generate call, because each turn re-sends the whole
+    # prefix -- turn 2 conditioning on placeholders alone is the same failure as turn 1 doing it.
+    # the training pass re-tokenizes the episode through the processor, so the output has to carry
+    # the media too.
+    env = _SpanEnv()
+    sentinel = ["<pil-image>"]
+    out, instance = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed")] * 4,
+        env=env,
+        monkeypatch=monkeypatch,
+        multi_modal_data={"images": sentinel},
+        return_instance=True,
+    )
+    assert instance.generate_media == [sentinel] * 4, (
+        "the prompt's images did not reach every turn's generate call"
+    )
+    assert out["multi_modal_data"] == {"images": sentinel}, (
+        "the episode was emitted without the media the training pass re-tokenizes against"
+    )
+
+
+def test_a_text_only_multi_turn_rollout_sends_no_media(monkeypatch):
+    # the control: a text-only prompt must not start shipping an empty media payload. verl treats an
+    # empty multi_modal_data dict as a multimodal row, so passing {} rather than None would push a
+    # text-only episode down the processor path it has no pixels for.
+    env = _SpanEnv()
+    out, instance = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed")] * 4,
+        env=env,
+        monkeypatch=monkeypatch,
+        return_instance=True,
+    )
+    assert instance.generate_media == [None] * 4
+    assert out["multi_modal_data"] is None
 
 
 def test_every_turn_is_spanned_when_none_of_them_abort(monkeypatch):

@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import math
 import re
 import sys
 import threading
@@ -315,81 +314,6 @@ def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
     assert seen[-1].get("liveness") is True, "a liveness ping is stamped liveness=True"
 
 
-def test_reward_heartbeat_projects_bounded_per_step_metrics(monkeypatch):
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
-    import flash.engine.worker as w
-
-    transformers = types.ModuleType("transformers")
-    transformers.TrainerCallback = type("TrainerCallback", (), {})
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-    monkeypatch.setattr(hb, "_maybe_attach_gpu_diag", lambda payload, last, now: last)
-    emitted = []
-    monkeypatch.setattr(w, "heartbeat", lambda stage, **payload: emitted.append((stage, payload)))
-
-    callback = hb.make_reward_heartbeat_callback()
-    args = types.SimpleNamespace(max_completion_length=256)
-    state = types.SimpleNamespace(global_step=1)
-    callback.on_log(
-        args,
-        state,
-        None,
-        logs={
-            "reward": 0.75,
-            "reward_std": 0.12,
-            "grad_norm": 1.5,
-            "kl": 0.03,
-            "entropy": 0.82,
-            "frac_reward_zero_std": 0.25,
-            "completions/mean_length": 48.5,
-            "completions/clipped_ratio": 0.125,
-        },
-    )
-
-    stage, payload = emitted[-1]
-    assert stage == "rl_step"
-    expected = {
-        "step": 1,
-        "reward": 0.75,
-        "reward_std": 0.12,
-        "grad_norm": 1.5,
-        "kl": 0.03,
-        "entropy": 0.82,
-        "frac_reward_zero_std": 0.25,
-        "mean_completion_tokens": 48.5,
-        "truncation_rate": 0.125,
-        "max_completion_tokens": 256,
-    }
-    for key, value in expected.items():
-        assert payload[key] == value
-    assert payload["metrics_last"] == [expected]
-
-    state.global_step = 2
-    callback.on_log(
-        args,
-        state,
-        None,
-        logs={
-            "reward": 0.8,
-            "reward_std": float("nan"),
-            "grad_norm": float("inf"),
-            "entropy": 0.79,
-        },
-    )
-    payload = emitted[-1][1]
-    assert payload["reward"] == 0.8
-    assert payload["entropy"] == 0.79
-    for key in ("reward_std", "grad_norm", "kl"):
-        assert key not in payload
-        assert key not in payload["metrics_last"][-1]
-
-    for step in range(3, 1027):
-        state.global_step = step
-        callback.on_log(args, state, None, logs={"reward": step / 1027})
-    metrics_last = emitted[-1][1]["metrics_last"]
-    assert len(metrics_last) == 1024
-    assert [item["step"] for item in metrics_last] == list(range(3, 1027))
-
-
 def test_heartbeat_console_summarizes_metric_backlog():
     import json
 
@@ -414,9 +338,9 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     import ast
     import textwrap
 
-    from flash.engine.worker import rl
+    from flash.engine.worker import rl_verl
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl.run_rl)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
     terminal_calls = [
         node
         for node in ast.walk(tree)
@@ -430,7 +354,10 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     assert len(terminal_calls) == 1
     terminal_keywords = {keyword.arg: keyword.value for keyword in terminal_calls[0].keywords}
     assert "metrics_last" in terminal_keywords
-    assert "hb_cb" in ast.unparse(terminal_keywords["metrics_last"])
+    # the value must be a COPY of the live accumulator, not the bare name: run_rl_verl keeps appending
+    # to metrics_last while heartbeats are in flight, and the heartbeat payload is serialized
+    # asynchronously, so passing the list itself would let the snapshot mutate after it was taken.
+    assert ast.unparse(terminal_keywords["metrics_last"]) == "list(metrics_last)"
 
     liveness_calls = [
         node
@@ -446,8 +373,10 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     for call in liveness_calls:
         keywords = {keyword.arg: keyword.value for keyword in call.keywords}
         assert "fields" in keywords
-        assert "metrics_last" in ast.unparse(keywords["fields"])
-        assert "hb_cb" in ast.unparse(keywords["fields"])
+        # same copy requirement, and `fields` must be a callable so the daemon re-reads the
+        # accumulator on every tick rather than freezing whatever it held at context entry.
+        assert "list(metrics_last)" in ast.unparse(keywords["fields"])
+        assert isinstance(keywords["fields"], ast.Lambda)
 
     write_calls = [
         node
@@ -459,8 +388,7 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     assert len(write_calls) == 1
     write_keywords = {keyword.arg: keyword.value for keyword in write_calls[0].keywords}
     assert "heartbeat_fields" in write_keywords
-    assert "metrics_last" in ast.unparse(write_keywords["heartbeat_fields"])
-    assert "hb_cb" in ast.unparse(write_keywords["heartbeat_fields"])
+    assert "list(metrics_last)" in ast.unparse(write_keywords["heartbeat_fields"])
 
 
 def test_error_heartbeat_fallback_preserves_metric_backlog():
@@ -1034,16 +962,13 @@ def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatc
 # --------------------------------------------------------------------------------------------
 # Wiring: each long blocking phase runs under the shared liveness_heartbeat helper (behaviour covered
 # above; these pin the call sites so coverage can't silently regress).
-def test_rl_init_wraps_trainer_build_in_liveness_heartbeat():
-    from flash.engine.worker import rl
-
-    assert 'liveness_heartbeat("rl_initializing")' in inspect.getsource(rl.run_rl)
-
-
+# rl_initializing is intentionally absent, for the same reason SFT is absent from the chalk test
+# below: verl builds its trainer in a subprocess, so there is no in-process build window to wrap.
+# The setup silence that wrap used to cover is now covered by rl_data_loading.
 @pytest.mark.parametrize(
     ("modname", "outer", "stage"),
     [
-        ("flash.engine.worker.rl", "run_rl", "rl_step"),
+        ("flash.engine.worker.rl_verl", "run_rl_verl", "rl_step"),
         ("flash.engine.worker.sft_train", "run_sft_train", "sft_step"),
     ],
 )
@@ -1085,9 +1010,9 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
             ("sft_data_loading", "sft_finalizing"),
         ),
         (
-            "flash.engine.worker.rl",
-            "run_rl",
-            ("rl_data_loading", "rl_adapter_loading", "rl_finalizing"),
+            "flash.engine.worker.rl_verl",
+            "run_rl_verl",
+            ("rl_data_loading", "rl_finalizing"),
         ),
     ],
 )
@@ -1104,50 +1029,23 @@ def test_quiet_phases_are_wrapped_in_liveness_heartbeat(modname, outer, stages):
         )
 
 
+def test_rl_warmstart_adapter_download_is_wrapped_in_liveness_heartbeat():
+    """The warm-start adapter pull is multi-GB and lives in the input resolver rather than the
+    entry point, so it carries its own wrap; the sibling test above cannot see it."""
+    from flash.engine.worker import rl_verl
+
+    src = inspect.getsource(rl_verl._resolve_grpo_inputs)
+    assert 'liveness_heartbeat("rl_adapter_loading")' in src, (
+        "the multi-GB warm-start adapter download must keep the heartbeat fresh"
+    )
+
+
 def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
     from flash.engine.worker import hf
 
     src = inspect.getsource(hf.hf_resume_checkpoint)
     assert 'liveness_heartbeat("checkpoint_prefetching")' in src, (
         "the multi-GB resume checkpoint download must keep the heartbeat fresh"
-    )
-
-
-# SFT is intentionally absent: chalk kernels are installed against an in-process trainer model, and
-# the verl SFT path launches training as a subprocess, so there is no in-process model to patch and
-# no *_initializing window to wrap. rl still builds its trainer in-process and keeps the guarantee.
-@pytest.mark.parametrize(
-    ("modname", "outer"),
-    [("flash.engine.worker.rl", "run_rl")],
-)
-def test_chalk_kernel_install_runs_inside_init_liveness_wrap(modname, outer):
-    """install_chalk_kernels can JIT-compile for minutes right after trainer init; it must run
-    INSIDE the *_initializing liveness wrap (checked structurally via the AST, not indentation)."""
-    import ast
-    import textwrap
-
-    def _call_name(call):
-        return getattr(call.func, "id", None) or getattr(call.func, "attr", None)
-
-    mod = importlib.import_module(modname)
-    tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(mod, outer))))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.With):
-            continue
-        for item in node.items:
-            call = item.context_expr
-            if not (isinstance(call, ast.Call) and _call_name(call) == "liveness_heartbeat"):
-                continue
-            stage = call.args[0].value if call.args and isinstance(call.args[0], ast.Constant) else ""
-            if not str(stage).endswith("_initializing"):
-                continue
-            if any(
-                isinstance(n, ast.Call) and _call_name(n) == "install_chalk_kernels"
-                for n in ast.walk(node)
-            ):
-                return
-    raise AssertionError(
-        f"{outer}: install_chalk_kernels must run inside the *_initializing liveness wrap"
     )
 
 
@@ -1182,28 +1080,3 @@ def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
     assert "step" not in bounded
 
 
-def test_reward_heartbeat_carries_bounded_finite_named_metrics(monkeypatch):
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
-    worker = importlib.import_module("flash.engine.worker")
-    emitted = []
-    monkeypatch.setattr(worker, "heartbeat", lambda stage, **payload: emitted.append((stage, payload)))
-    monkeypatch.setattr(hb, "_maybe_attach_gpu_diag", lambda payload, last, now: last)
-
-    transformers = types.ModuleType("transformers")
-    transformers.TrainerCallback = type("TrainerCallback", (), {})
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-
-    metrics = {
-        "nan_metric": float("nan"),
-        "inf_metric": float("inf"),
-        **{f"metric_{index:02d}": float(index) for index in reversed(range(14))},
-    }
-    callback = hb.make_reward_heartbeat_callback(lambda: metrics)
-    state = types.SimpleNamespace(global_step=3)
-    callback.on_log(None, state, None, logs={"reward": 0.65})
-
-    assert emitted[0][0] == "rl_step"
-    reward_metrics = emitted[0][1]["reward_metrics"]
-    assert list(reward_metrics) == [f"metric_{index:02d}" for index in range(12)]
-    assert all(math.isfinite(value) for value in reward_metrics.values())
-    assert callback.latest_fields() == {"reward_metrics": reward_metrics}

@@ -51,8 +51,8 @@ except ImportError:  # in-tree (tests, lint)
 
 # reserve enough room after gluing an environment reply that the next model turn can actually
 # generate. gluing right up to the limit leaves zero completion tokens, so the engine would
-# immediately truncate a turn that was never really sampled. same constant and same reason as the
-# trl driver's token budget (multiturn_rollout.rollout_one).
+# immediately truncate a turn that was never really sampled. carried over from the retired trl
+# driver's token budget, which reserved the same slack for the same reason.
 _NEXT_TURN_SLACK = 8
 
 
@@ -63,6 +63,14 @@ def post_json(url: str, path: str, payload: dict) -> dict:
     0.0 because one bad completion must not kill a run -- a broken turn here has already consumed
     gpu time and left the parent's episode state half-advanced, and continuing would train on a
     transcript the environment never agreed to.
+
+    carries NO deadline, for the same reason the single-turn reward client does not: MultiTurnBridge
+    guards every env touch with one lock, so with many rollouts in flight a request spends most of
+    its life queued behind other episodes rather than being served slowly. a client timeout there
+    fails healthy episodes for arriving Nth, which is a property of the batch size and not of the
+    environment. a genuinely wedged env is caught by the stall watchdog instead
+    (``flash/providers/_poll.py`` STALL_AFTER_S), which measures training progress rather than one
+    request (codex[bot]).
     """
     request = urllib.request.Request(
         url.rstrip("/") + path,
@@ -71,7 +79,7 @@ def post_json(url: str, path: str, payload: dict) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=600) as response:
+        with urllib.request.urlopen(request) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
         with contextlib.suppress(Exception):
@@ -106,11 +114,27 @@ def build_flash_grpo_multi_turn_agent_loop(
             raw_prompt = validate_transcript_messages(
                 [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
             )
-            prompt_ids = await self.apply_chat_template(raw_prompt)
+            # an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. both
+            # apply_chat_template and every generate call need the decoded media alongside the ids,
+            # or the engine sees placeholders it cannot expand and the rollout either dies on a
+            # feature/placeholder mismatch or conditions on nothing. text-only prompts yield {}.
+            multi_modal_data = await self.process_multi_modal_info(raw_prompt)
+            images = multi_modal_data.get("images")
+            videos = multi_modal_data.get("videos")
+            audios = multi_modal_data.get("audios")
+            mm_processor_kwargs = self._get_mm_processor_kwargs(audios)
+            prompt_ids = await self.apply_chat_template(
+                raw_prompt,
+                images=images,
+                videos=videos,
+                audios=audios,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
             bridge_url = os.environ["FLASH_VERL_MULTITURN_URL"]
             example_index = int(kwargs["index"])
             max_turns = int(os.environ["FLASH_VERL_MAX_TURNS"])
             max_model_len = int(os.environ["FLASH_VERL_MAX_MODEL_LEN"])
+            max_completion_tokens = int(os.environ["FLASH_VERL_MAX_COMPLETION_TOKENS"])
             stop_sequences = tuple(
                 str(value) for value in json.loads(os.environ.get("FLASH_VERL_STOP_SEQUENCES", "[]"))
             )
@@ -162,7 +186,12 @@ def build_flash_grpo_multi_turn_agent_loop(
                         "flash multi-turn bridge returned an invalid per-example turn limit"
                     )
                 for turn_ordinal in range(turn_limit):
+                    # three budgets, all binding: the configured per-turn cap, the engine's
+                    # remaining context, and the response tensor's remaining width. the first is
+                    # what the user asked for and the other two are what the episode can still
+                    # hold, so one turn never spends the whole transcript.
                     max_tokens = min(
+                        max_completion_tokens,
                         max_model_len - len(prefix_ids),
                         response_capacity - len(response_ids),
                     )
@@ -176,10 +205,16 @@ def build_flash_grpo_multi_turn_agent_loop(
                     if eos_token_ids:
                         params["stop_token_ids"] = sorted(eos_token_ids)
                     request_started = time.perf_counter()
+                    # the media rides along on EVERY turn, not just the first: each turn re-sends the
+                    # whole prefix, whose placeholder tokens still need their pixels to expand.
                     generated = await self.server_manager.generate(
                         request_id=uuid4().hex,
                         prompt_ids=prefix_ids,
                         sampling_params=params,
+                        image_data=images,
+                        video_data=videos,
+                        audio_data=audios,
+                        mm_processor_kwargs=mm_processor_kwargs,
                     )
                     generated_seconds += time.perf_counter() - request_started
                     num_preempted = sum_preemptions(num_preempted, generated.num_preempted)
@@ -201,8 +236,8 @@ def build_flash_grpo_multi_turn_agent_loop(
                     # more span than there are rewards, which score_rollouts rejects as a count
                     # mismatch -- dropping the row, and with it its whole group, to episode credit.
                     # the tokens stay in response_ids and stay trained on; they just carry no turn
-                    # coordinate. this is the same identity the trl driver scores on, where the
-                    # turn IS recorded and so IS spanned (multiturn_rollout.rollout_one).
+                    # coordinate. this is the same identity the retired trl driver scored on, where
+                    # the turn was recorded and so was spanned.
                     if not (turn["truncated"] or turn["skip_reason"]):
                         turn_spans.append((turn_start, len(response_ids)))
                     if have_logprobs and generated.log_probs is not None:
@@ -249,7 +284,7 @@ def build_flash_grpo_multi_turn_agent_loop(
                     response_mask.extend([0] * len(glue_ids))
                     if have_logprobs:
                         # the model did not generate the glue, so it has no logprob. 0.0 is the
-                        # same filler trl uses (multiturn_rollout.rollout_one); the zeroed
+                        # same filler the retired trl driver used; the zeroed
                         # response_mask is what keeps these positions out of the loss.
                         response_logprobs.extend([0.0] * len(glue_ids))
                     prefix_ids.extend(glue_ids)
@@ -299,6 +334,11 @@ def build_flash_grpo_multi_turn_agent_loop(
                 response_ids=response_ids,
                 response_mask=response_mask,
                 response_logprobs=response_logprobs if have_logprobs else None,
+                # the training pass re-tokenizes this episode through the processor, so it needs the
+                # same media the rollout conditioned on; without it the actor's forward would see
+                # placeholders with no pixels behind them.
+                multi_modal_data=multi_modal_data or None,
+                mm_processor_kwargs=mm_processor_kwargs,
                 num_turns=turn_count,
                 # verl reads reward_score BEFORE its reward manager runs: _compute_score skips any
                 # output that already carries one, _postprocess writes it into rm_scores on the
