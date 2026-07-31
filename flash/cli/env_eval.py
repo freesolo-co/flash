@@ -6,7 +6,6 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
 
 from flash._channel import CLI_NAME
 from flash.envs.evaluations import (
@@ -20,6 +19,7 @@ from flash.envs.evaluations import (
 )
 
 from . import render
+from .env_test import _env_params
 from .envpush import _err, _resolve_local_env_entrypoint
 
 _MAX_CONCURRENCY = 32
@@ -70,24 +70,26 @@ def _generate_response(client, target: str, case: EvalCase, args) -> str:
     return response
 
 
-def _run_case(
-    client, target: str, suite, case: EvalCase, case_id: str, args, score_lock: Lock
-) -> EvalResult:
-    # SystemExit and KeyboardInterrupt derive from BaseException, so a sidecar that calls
-    # sys.exit() inside score() would tear down the whole suite mid-run and lose every case
-    # already graded. A sidecar that exits is a broken scorer, which is this case's error.
+def _generate_case(client, target: str, case: EvalCase, args) -> tuple[str, str | None]:
+    """Generate one response. Returns (response, error); only this half runs off-thread.
+
+    SystemExit derives from BaseException, so an environment or client that calls sys.exit()
+    would otherwise tear down the whole suite mid-run and lose every case already graded."""
     try:
-        response = _generate_response(client, target, case, args)
+        return _generate_response(client, target, case, args), None
     except (Exception, SystemExit) as exc:
-        return _generation_error(
-            case_id, f"generation failed: {str(exc) or exc.__class__.__name__}"
-        )
+        return "", f"generation failed: {str(exc) or exc.__class__.__name__}"
+
+
+def _score_case(suite, case: EvalCase, case_id: str, response: str) -> EvalResult:
+    """Grade one response on the caller's thread.
+
+    Scoring never runs in a worker. A lock would serialize it but still execute it off the
+    main thread, and scorers routinely cannot run there at all: anything installing a
+    signal-based timeout raises `signal only works in main thread`, which would be recorded
+    as the model failing the case rather than as a broken harness."""
     try:
-        # suites are user objects shared across worker threads. a scorer holding mutable state
-        # (a tokenizer, a counter, a cached client) would be raced under --concurrency and
-        # produce silently wrong scores, which is worse than scoring serially.
-        with score_lock:
-            scored = suite.score(case, response)
+        scored = suite.score(case, response)
         return normalize_eval_result(case, response, scored, case_id=case_id)
     except (Exception, SystemExit) as exc:
         return EvalResult(
@@ -99,6 +101,13 @@ def _run_case(
         )
 
 
+def _resolve_case(suite, case: EvalCase, case_id: str, generated: tuple[str, str | None]):
+    response, error = generated
+    if error is not None:
+        return _generation_error(case_id, error)
+    return _score_case(suite, case, case_id, response)
+
+
 def _case_ids(cases: list[EvalCase]) -> list[str]:
     """Stable per-case ids, disambiguating sidecars that reuse one id across cases.
 
@@ -106,32 +115,57 @@ def _case_ids(cases: list[EvalCase]) -> list[str]:
     report, silently reporting one graded case where two ran."""
     ids: list[str] = []
     seen: dict[str, int] = {}
+    # a disambiguated id can itself collide with a raw id: cases "x", "x", "x#2" resolve to
+    # "x", "x#2", "x#2" if the suffix is not re-checked, putting the collision back. taken
+    # holds every id already handed out, so the suffix advances until it is actually free.
+    taken: set[str] = set()
     for index, case in enumerate(cases, start=1):
         case_id = case.id or str(index)
         count = seen.get(case_id, 0)
         seen[case_id] = count + 1
-        ids.append(case_id if count == 0 else f"{case_id}#{count + 1}")
+        resolved = case_id if count == 0 else f"{case_id}#{count + 1}"
+        while resolved in taken:
+            count += 1
+            seen[case_id] = count + 1
+            resolved = f"{case_id}#{count + 1}"
+        taken.add(resolved)
+        ids.append(resolved)
     return ids
 
 
 def _run_cases(client, target: str, suite, cases: list[EvalCase], args) -> tuple[EvalResult, ...]:
     case_ids = _case_ids(cases)
-    score_lock = Lock()
     if args.concurrency == 1 or len(cases) <= 1:
         return tuple(
-            _run_case(client, target, suite, case, case_id, args, score_lock)
+            _resolve_case(suite, case, case_id, _generate_case(client, target, case, args))
             for case, case_id in zip(cases, case_ids, strict=True)
         )
 
-    results: list[EvalResult | None] = [None] * len(cases)
-    with ThreadPoolExecutor(max_workers=min(args.concurrency, len(cases))) as pool:
+    generated: list[tuple[str, str | None] | None] = [None] * len(cases)
+    # cancel_futures drops everything still queued on Ctrl-C. without it the interrupt is
+    # only raised after every already-submitted request drains, so a --concurrency 32 run
+    # over hundreds of cases keeps buying generations for minutes after the user stopped it.
+    pool = ThreadPoolExecutor(max_workers=min(args.concurrency, len(cases)))
+    try:
         futures = {
-            pool.submit(_run_case, client, target, suite, case, case_id, args, score_lock): index
-            for index, (case, case_id) in enumerate(zip(cases, case_ids, strict=True))
+            pool.submit(_generate_case, client, target, case, args): index
+            for index, case in enumerate(cases)
         }
         for future in as_completed(futures):
-            results[futures[future]] = future.result()
-    return tuple(result for result in results if result is not None)
+            generated[futures[future]] = future.result()
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+
+    # scoring happens here, on the caller's thread, in case order: suites are user objects
+    # that may hold mutable state or install signal handlers, neither of which survives a
+    # worker thread.
+    return tuple(
+        _resolve_case(suite, case, case_id, item)
+        for case, case_id, item in zip(cases, case_ids, generated, strict=True)
+        if item is not None
+    )
 
 
 def _case_payload(case: EvalCase | None, result: EvalResult) -> dict:
@@ -260,9 +294,18 @@ def cmd_env_eval(args) -> int:
         )
 
     try:
+        params = _env_params(args)
+    except ValueError as exc:
+        _err(f"env eval failed: {exc}")
+        return _err("overall: FAIL")
+
+    try:
         _, _, entrypoint, _ = _resolve_local_env_entrypoint(Path(args.path))
         entrypoint = entrypoint.resolve()
-        environment = load_freesolo_environment(str(entrypoint))
+        # the same params a run submits under [environment.params]. an environment whose
+        # load_environment() requires one would fail to load here, and one that merely
+        # branches on it would be graded on a different dataset or split than it trains on.
+        environment = load_freesolo_environment(str(entrypoint), **params)
         suites = load_evaluation_suites(entrypoint, environment=environment)
     except (Exception, SystemExit) as exc:
         # a load failure is a bug in the sidecar or the package layout, not a measurement.
