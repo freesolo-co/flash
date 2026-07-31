@@ -639,6 +639,53 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     assert "walking past the cheapest class" in log.getvalue()
 
 
+def test_pinned_gpu_retry_says_there_is_no_untried_class_left(orch, monkeypatch):
+    """A pinned gpu.type gives the picker a ONE-ENTRY candidate list, so a no_capacity retry
+    re-selects the same unavailable class and burns another full capacity grace on it. That is the
+    right call (never strand a run), but it used to be silent: the walk line only prints when the
+    class CHANGES, so the operator saw two identical attempts and no reason for either. The fix the
+    log has to point at is unpinning gpu.type, not waiting longer."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    # exactly what a pinned spec produces: the allocator only ever offers the pinned class.
+    candidates = (Candidate("runpod", "H200", 4.0, 141),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(
+        runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True
+    )
+
+    submitted_gpus = []
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        if attempt == 0:
+            return PollResult(
+                False,
+                failure="no_capacity",
+                detail="never scheduled: job stuck IN_QUEUE for 903s",
+            )
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id="flash-pinned-gpu-nowalk", type="H200")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    # the retry re-picked the SAME class, so the walk line cannot fire...
+    assert submitted_gpus == ["H200", "H200"]
+    out = log.getvalue()
+    assert "walking past the cheapest class" not in out
+    # ...and the operator is told why, plus that the pin is what made the list a singleton.
+    assert "no untried class left; re-selecting H200" in out
+    assert "gpu.type is pinned" in out
+
+
 def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult

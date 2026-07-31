@@ -772,6 +772,19 @@ def _submit_seed_supervised(
                     file=log,
                     flush=True,
                 )
+            elif attempt and not untried:
+                # every fitting class has been tried, so the picker re-selects the one that just
+                # failed -- correct (never strand a run with no candidates), but silent: a
+                # no_capacity retry then spends another full LAST_GPU_CAPACITY_GRACE_S waiting on
+                # the same unavailable class. say so, because the operator's fix is to unpin
+                # gpu.type rather than to keep waiting.
+                print(
+                    f"retry {attempt}: no untried class left; re-selecting {chosen.gpu} "
+                    f"@ {chosen.provider}"
+                    + (" (gpu.type is pinned)" if getattr(spec.gpu, "type", None) else ""),
+                    file=log,
+                    flush=True,
+                )
             effective_spec = _spec_with_gpu(spec, chosen.gpu)
             if drop_weight_cache:
                 effective_spec = _drop_weight_cache(effective_spec)
