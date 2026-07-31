@@ -1321,7 +1321,9 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                         # which is emitted here in arrival order. neither happened -- the buffer was
                         # left to the end-of-stream flush, which yielded a stray `</think>` behind
                         # the new block's own close (cursor).
-                        settled = "" if _is_only_retained_delimiter(closing, reasoning_text) else closing
+                        settled = (
+                            "" if _is_only_retained_delimiter(closing, reasoning_text) else closing
+                        )
                         closing = None
                         if settled:
                             yield settled
