@@ -738,7 +738,17 @@ def rollout_async(
         # may already have exited after reporting the error.
         to_env.put(_CLOSE_OUT)
         while True:
-            msg = to_submit.get()
+            # waits on liveness, not just on an answer. the worker reports through `to_submit`
+            # only for exceptions it catches; a BaseException -- KeyboardInterrupt during a
+            # close-out env_reply is the realistic one -- unwinds the thread without putting
+            # anything, so an unbounded get() here would block the training step forever on a
+            # queue nothing can ever fill. a dead worker means the close-out is over.
+            try:
+                msg = to_submit.get(timeout=0.1)
+            except queue.Empty:
+                if not worker.is_alive():
+                    break
+                continue
             if msg[0] == "closed":
                 break
             if msg[0] == "error":
