@@ -412,6 +412,45 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
     assert cases["sum"]["error"] is None
 
 
+def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
+    monkeypatch, tmp_path
+) -> None:
+    # results carry the disambiguated id (`same#2`), so a payload keyed on the raw `case.id`
+    # both drops the second case and hands the first result the *second* case's input and
+    # expected value. that uploads a graded case describing a question it never answered.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'dupes'\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id='same', input='first', expected='first'),\n"
+        "        EvalCase(id='same', input='second', expected='second'),\n"
+        "    ]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield messages[0]["content"]
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 0
+    )
+
+    cases = {case["case_id"]: case for case in uploader.calls[0]["cases"]}
+    assert set(cases) == {"same", "same#2"}
+    assert cases["same"]["input"] == "first"
+    assert cases["same"]["expected"] == "first"
+    assert cases["same#2"]["input"] == "second"
+    assert cases["same#2"]["expected"] == "second"
+
+
 def test_env_eval_upload_failure_does_not_relabel_a_passing_suite(
     monkeypatch, tmp_path, capsys
 ) -> None:
