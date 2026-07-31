@@ -6,12 +6,14 @@ import ast
 import inspect
 import json
 import os
+import re
 import shutil
 import textwrap
 import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -241,7 +243,9 @@ def _overrides_cfg(**over):
         "target_modules": "all-linear", "lr": 1e-5, "group_size": 8,
         "prompts_per_step": 16, "max_prompt_len": 2048,
         "max_model_len": 2368, "max_token_len_per_gpu": 2368,
-        "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
+        # single-turn: the response tensor holds one completion, so it is max_completion wide.
+        "max_completion": 320, "max_response_len": 320, "multi_turn": False,
+        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
         "entropy_quantile": None,
         "stop_sequences": (),
         "structured_outputs": None, "thinking": False,
@@ -445,7 +449,7 @@ def test_text_overrides_omit_every_multimodal_key():
 
 
 def test_build_verl_training_cfg_carries_the_multimodal_flag():
-    # the flag is resolved in _resolve_single_turn_inputs but consumed by build_verl_overrides, so
+    # the flag is resolved in _resolve_grpo_inputs but consumed by build_verl_overrides, so
     # a cfg that dropped it would produce a text-shaped override list from a multimodal parquet.
     source = inspect.getsource(rl_verl._build_verl_training_cfg)
     assert '"multimodal": bool(inp.get("multimodal"))' in source
@@ -455,7 +459,8 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
     inp = {
         "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
         "prompts_per_step": 16, "mask_truncated_completions": True,
-        "max_prompt_len": 3072, "max_completion": 1024, "engine_len": 4096,
+        "max_prompt_len": 3072, "max_completion": 1024, "max_response_len": 1024,
+        "multi_turn": False, "engine_len": 4096,
         "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (), "structured_outputs": None, "seed": 42,
         "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
         "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
@@ -745,7 +750,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
     # the context-limit probe reads the model config off the hub; keep this unit test offline.
     monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 40960)
 
-    inp = rl_verl._resolve_single_turn_inputs()
+    inp = rl_verl._resolve_grpo_inputs()
     cfg = rl_verl._build_verl_training_cfg(
         inp,
         train_files="/w/train.parquet",
@@ -973,7 +978,9 @@ def test_reward_server_round_trip():
     )
     try:
         body = json.dumps({"index": 3, "solution_str": "abcd"}).encode()
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            url + "/score", data=body, headers={"Content-Type": "application/json"}
+        )
         with urllib.request.urlopen(req, timeout=10) as r:
             got = json.loads(r.read().decode())
         assert got["score"] == 7.0  # 3 + len("abcd")
@@ -993,7 +1000,9 @@ def test_reward_server_rejects_out_of_range_index_before_lookup(index):
     server, url = rl_verl.start_reward_server(scorer, example_count=len(examples))
     try:
         body = json.dumps({"index": index, "solution_str": "answer"}).encode()
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            url + "/score", data=body, headers={"Content-Type": "application/json"}
+        )
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(req, timeout=10)
         assert exc_info.value.code == 400
@@ -1039,7 +1048,9 @@ def test_reward_server_scorer_can_capture_samples():
     try:
         for i in range(3):
             body = json.dumps({"index": i, "solution_str": f"c{i}"}).encode()
-            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(
+                url + "/score", data=body, headers={"Content-Type": "application/json"}
+            )
             urllib.request.urlopen(req, timeout=10).read()
         assert [c[0] for c in captured] == ["c0", "c1", "c2"]
     finally:
@@ -1090,10 +1101,10 @@ def test_entropy_quantile_overrides_enable_verl_entropy_and_stay_off_by_default(
     )
 
 
-def test_resolve_single_turn_inputs_no_longer_rejects_entropy_quantile():
+def test_resolve_grpo_inputs_no_longer_rejects_entropy_quantile():
     # the guard this replaces raised on any entropy_quantile < 1.0. the shim implements the masking,
     # so the resolver must pass the value through instead of failing the run.
-    source = inspect.getsource(rl_verl._resolve_single_turn_inputs)
+    source = inspect.getsource(rl_verl._resolve_grpo_inputs)
     assert "is not yet supported" not in source.split("entropy_quantile")[1].split("\n\n")[0]
     assert '"entropy_quantile": entropy_quantile' in source
 
@@ -1198,7 +1209,7 @@ def test_stop_sequences_gate_off_truncated_completion_masking():
     # main couples these: stop-string rollouts do not end on EOS, so masking truncated completions
     # would wrongly drop every one of them. the verl resolver must inherit that coupling, not
     # re-derive it.
-    source = inspect.getsource(rl_verl._resolve_single_turn_inputs)
+    source = inspect.getsource(rl_verl._resolve_grpo_inputs)
     assert "_w.grpo_mask_truncated_completions(_t)" in source
     assert not W.grpo_mask_truncated_completions(
         SimpleNamespace(stop_sequences=("</answer>",))
@@ -1315,7 +1326,7 @@ def test_model_revision_resolves_pinned_snapshot_for_verl():
     # snapshot dir as model.path (a bare repo id would resolve the cached "main" ref offline).
     import inspect
 
-    resolver_src = inspect.getsource(rl_verl._resolve_single_turn_inputs)
+    resolver_src = inspect.getsource(rl_verl._resolve_grpo_inputs)
     assert "model_revision pinning is not yet supported" not in resolver_src
     run_src = inspect.getsource(rl_verl.run_rl_verl)
     assert "local_files_only=True" in run_src
@@ -2052,12 +2063,12 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
     assert notes["vllm_max_num_batched_tokens"] is None
 
 
-# ------------------- capability guards: the four specs verl grpo refuses -------------------
-# these four raises are the ONLY thing standing between a trl-supported job and a verl run that
-# trains on a different contract. they had no regression coverage: every resolver test above drives
-# the happy path, so deleting any guard left the suite green. each test below asserts one rejection
-# by its own message, because a bare pytest.raises(RuntimeError) passes on any of the ~20 other
-# raises in this resolver.
+# ------------------- capability guards: the specs verl grpo refuses -------------------
+# these raises are the ONLY thing standing between a trl-supported job and a verl run that trains
+# on a different contract. they had no regression coverage: every resolver test above drives the
+# happy path, so deleting any guard left the suite green. each test below asserts one rejection by
+# its own message, because a bare pytest.raises(RuntimeError) passes on any of the ~20 other raises
+# in this resolver.
 
 
 def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
@@ -2074,9 +2085,24 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
         def __init__(self):
             self.multi_turn = multi_turn
             self.is_tool_env = is_tool_env
+            self.max_turns = 3 if multi_turn else 0
 
         def dataset(self):
             return [{"index": i} for i in range(8)]
+
+        # the four calls the multi-turn bridge drives an env through. defined unconditionally so a
+        # test can delete one and assert the capability gate catches it.
+        def new_rollout_state(self, ex):
+            return {}
+
+        def record_model_turn(self, state, text):
+            return None
+
+        def env_reply(self, state):
+            return [{"role": "user", "content": "reply"}]
+
+        def rollout_done(self, state):
+            return True
 
         def prompt_messages(self, ex):
             if image_uri:
@@ -2112,7 +2138,11 @@ class _CapabilityTokenizer:
     eos_token = "<eos>"
 
     def apply_chat_template(self, messages, **kwargs):
-        return "prompt"
+        # renders each message's content, the way a real template does. a constant string would
+        # make the multi-turn glue probe unfindable and fail the pre-rollout template gate -- which
+        # is the gate working, not the code under test being wrong.
+        rendered = "".join(f"<|{m['role']}|>{m['content']}<eos>" for m in messages)
+        return rendered + ("<|assistant|>" if kwargs.get("add_generation_prompt") else "")
 
     def __call__(self, text, **kwargs):
         return SimpleNamespace(input_ids=[1])
@@ -2182,21 +2212,67 @@ def _capability_resolve(monkeypatch, env, train=None, overrides=None, processor=
     monkeypatch.setattr(_PkgW, "load_tokenizer", lambda *a, **k: _Tokenizer(), raising=False)
     monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
     monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 32768)
-    return rl_verl._resolve_single_turn_inputs()
-
-
-def test_capability_guard_rejects_multi_turn_env(monkeypatch):
-    # trl grpo drives multi-turn through a rollout func (rl.py select_grpo_trainer); the verl path
-    # has no equivalent, so it must refuse rather than train only the first turn.
-    with pytest.raises(RuntimeError, match="single-turn, non-tool"):
-        _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+    return rl_verl._resolve_grpo_inputs()
 
 
 def test_capability_guard_rejects_tool_env(monkeypatch):
     # trl grpo hands tool schemas AND callables to the trainer; verl gets neither, so a tool env
     # would train against completions that never call a tool.
-    with pytest.raises(RuntimeError, match="single-turn, non-tool"):
+    with pytest.raises(RuntimeError, match="function-calling tool environments"):
         _capability_resolve(monkeypatch, _capability_env(is_tool_env=True))
+
+
+def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
+    # the inverse of the guard this replaces: a multi-turn env used to be refused outright and fall
+    # back to trl. it must now resolve, and the resolution must reach the ONE override that decides
+    # which agent loop verl runs -- on the stock single_turn_agent the episode would end after the
+    # first assistant turn and every environment reply would be dropped.
+    inp = _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+    assert inp["multi_turn"] is True
+    assert inp["max_turns"] == 3
+    cfg = rl_verl._build_verl_training_cfg(
+        inp,
+        train_files="/w/train.parquet",
+        val_files="/w/val.parquet",
+        model_id=inp["model_id"],
+        thinking=False,
+        loggers="console",
+        fp8_kv=False,
+        reward_path="/w/reward.py",
+        local_dir="/w/ckpt",
+        project_name="flash",
+        experiment_name="flash-rl-run123",
+    )
+    o = rl_verl.build_verl_overrides(cfg)
+    assert "actor_rollout_ref.rollout.agent.default_agent_loop=flash_grpo_multi_turn" in o
+
+
+def test_single_turn_env_leaves_the_agent_loop_on_verl_default(monkeypatch):
+    # the override must be GATED: emitting it on a single-turn job would route text rollouts
+    # through the multi-turn bridge, which has no episode state for them.
+    inp = _capability_resolve(monkeypatch, _capability_env())
+    assert inp["multi_turn"] is False
+    assert not [
+        o for o in rl_verl.build_verl_overrides(_overrides_cfg()) if "default_agent_loop" in o
+    ]
+
+
+def test_multi_turn_env_missing_a_rollout_method_is_refused(monkeypatch):
+    # the bridge calls exactly four env methods; a missing one would otherwise surface mid-rollout
+    # on the first episode, after the gpu time is already spent.
+    env = _capability_env(multi_turn=True)
+    del type(env).env_reply
+    with pytest.raises(RuntimeError, match="missing required rollout methods"):
+        _capability_resolve(monkeypatch, env)
+
+
+def test_multi_turn_env_without_a_turn_limit_is_refused(monkeypatch):
+    # an unbounded episode cannot be budgeted: the response tensor is sized from the turn limit and
+    # a runaway env would loop until the engine context is exhausted every single rollout.
+    env = _capability_env(multi_turn=True)
+    env.max_turns = 0
+    with pytest.raises(RuntimeError, match="bounded turn limit"):
+        _capability_resolve(monkeypatch, env)
 
 
 def test_resolver_admits_image_prompts_and_carries_the_processor(monkeypatch):
@@ -2309,11 +2385,394 @@ def test_capability_guards_admit_the_supported_single_turn_text_env(monkeypatch)
     assert inp["max_prompt_len"] > 0
 
 
+# ---------------------- multi-turn child wiring ----------------------
+# the parent resolves the episode contract; the child enforces it. everything between the two
+# crosses one of exactly three channels -- env vars, copied-in modules, and the bridge's http
+# routes -- and none of them is type-checked at either end. a typo'd key or a dropped copy does not
+# fail here: it fails on the first rollout of a paid run, after the engine is already up.
+
+
+def _multi_turn_inp(**over):
+    """the keys multi_turn_child_env reads, at their resolved types."""
+    return {
+        "max_turns": 4,
+        "engine_len": 8192,
+        "stop_sequences": ("</answer>",),
+        "eos_token_ids": frozenset({151645, 151643}),
+        **over,
+    }
+
+
+def test_multi_turn_child_env_carries_every_variable_the_loop_reads():
+    # the child reads these by name out of os.environ and has no defaults for the first three: a
+    # missing FLASH_VERL_MULTITURN_URL/MAX_TURNS/MAX_MODEL_LEN raises KeyError inside the rollout.
+    # asserted against the loop's OWN source rather than a hardcoded list, so renaming a key on one
+    # side and not the other fails here instead of on the first episode.
+    from flash.engine.worker import grpo_multiturn
+
+    emitted = rl_verl.multi_turn_child_env(
+        _multi_turn_inp(), reward_url="http://127.0.0.1:9/", thinking=False
+    )
+    read_by_child = set(
+        re.findall(r"os\.environ(?:\.get)?[\[(]\"(FLASH_VERL_[A-Z_]+)\"", inspect.getsource(grpo_multiturn))
+    )
+    assert read_by_child, "the loop reads no FLASH_VERL_* variable; this test found nothing to pin"
+    assert read_by_child <= set(emitted), (
+        f"the child reads variables the parent never sets: {sorted(read_by_child - set(emitted))}"
+    )
+
+
+def test_multi_turn_child_env_registers_the_plugin_with_verl():
+    # the agent-loop override names `flash_grpo_multi_turn`, but the name only exists once verl
+    # imports the plugin -- which happens ONLY through this variable (import_external_libs). without
+    # it the child dies at rollout build with an unregistered-loop error, having already paid for
+    # engine startup.
+    emitted = rl_verl.multi_turn_child_env(
+        _multi_turn_inp(), reward_url="http://127.0.0.1:9/", thinking=False
+    )
+    assert emitted["VERL_USE_EXTERNAL_MODULES"] == "flash_grpo_plugin"
+    # the module name must match the file actually copied in, or the import fails at child startup.
+    assert ("grpo_plugin.py", "flash_grpo_plugin.py") in rl_verl.MULTI_TURN_CHILD_MODULES
+
+
+def test_multi_turn_child_env_serializes_values_the_child_can_parse_back():
+    # every value crosses as a string. the child json-loads two of them and int()s two others, so a
+    # repr() or a str(frozenset) here would raise mid-rollout rather than at launch.
+    emitted = rl_verl.multi_turn_child_env(
+        _multi_turn_inp(), reward_url="http://127.0.0.1:9/", thinking=True
+    )
+    assert all(isinstance(value, str) for value in emitted.values())
+    assert int(emitted["FLASH_VERL_MAX_TURNS"]) == 4
+    assert int(emitted["FLASH_VERL_MAX_MODEL_LEN"]) == 8192
+    assert json.loads(emitted["FLASH_VERL_STOP_SEQUENCES"]) == ["</answer>"]
+    # sorted, not set-ordered: the child compares against this list every turn and an unstable order
+    # would make halting depend on hash seed.
+    assert json.loads(emitted["FLASH_VERL_EOS_TOKEN_IDS"]) == [151643, 151645]
+    assert emitted["FLASH_VERL_THINKING"] == "1"
+    assert (
+        rl_verl.multi_turn_child_env(
+            _multi_turn_inp(), reward_url="http://127.0.0.1:9/", thinking=False
+        )["FLASH_VERL_THINKING"]
+        == "0"
+    )
+
+
+def test_multi_turn_child_modules_are_copied_under_the_names_they_import_each_other_by(tmp_path):
+    # each module falls back to a flat `flash_`-prefixed import of the next one. copying a file
+    # under the wrong name leaves that fallback unresolvable, and the child's ImportError arrives
+    # inside verl's plugin loader where it reads as a verl problem.
+    written = rl_verl.copy_multi_turn_child_modules(str(tmp_path))
+    names = {os.path.basename(path) for path in written}
+    assert names == {name for _, name in rl_verl.MULTI_TURN_CHILD_MODULES}
+    imported = set()
+    for path in written:
+        source = Path(path).read_text()
+        assert source
+        # every copy must parse standalone in the child interpreter.
+        ast.parse(source)
+        imported |= set(re.findall(r"from (flash_[a-z_]+) import", source))
+    # the fallback import targets must be exactly the names copied in.
+    assert imported <= {name.removesuffix(".py") for name in names}
+
+
+def test_multi_turn_child_modules_do_not_import_flash(tmp_path):
+    # flash is NOT importable in the verl interpreter (incompatible torch/vllm pins). each module
+    # keeps an in-tree `from flash...` fallback for the parent's own lint and tests, so the rule is
+    # that no flash import may be reachable without the flat one failing first -- i.e. every one of
+    # them sits in an except ImportError handler.
+    for path in rl_verl.copy_multi_turn_child_modules(str(tmp_path)):
+        tree = ast.parse(Path(path).read_text())
+        guarded = {
+            id(node)
+            for tries in ast.walk(tree)
+            if isinstance(tries, ast.Try)
+            for handler in tries.handlers
+            for node in ast.walk(handler)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("flash."):
+                assert id(node) in guarded, (
+                    f"{os.path.basename(path)} imports {node.module} outside an ImportError "
+                    "fallback; the child interpreter cannot import flash"
+                )
+
+
+def test_the_run_body_puts_the_shim_dir_on_the_child_path_for_multi_turn():
+    # the copies above are useless unless shim_dir is importable. the condition used to be
+    # `if shim_source:` -- true only when some OTHER feature wanted a sitecustomize patch, so a
+    # plain multi-turn job copied three modules the child could never import. source-level because
+    # the assignment sits inside run_rl_verl, past the subprocess launch.
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    assert 'if shim_source or inp["multi_turn"]:' in src, (
+        "PYTHONPATH is not extended for a multi-turn job with no other shim"
+    )
+    assert 'if inp["multi_turn"]:\n        copy_multi_turn_child_modules(shim_dir)' in src
+
+
+# ---------------------- multi-turn bridge routes ----------------------
+class _BridgeEnv:
+    """the four calls MultiTurnBridge drives, recording what it was asked."""
+
+    def __init__(self, *, replies=None, done_after=1, episode=1.0, max_episode_turns=None):
+        self.replies = replies if replies is not None else [{"role": "user", "content": "next"}]
+        self.done_after = done_after
+        self.episode = episode
+        self.max_episode_turns = max_episode_turns
+        self.recorded: list[str] = []
+        self.scored: list[dict] = []
+
+    def new_rollout_state(self, example):
+        state: dict = {"messages": [], "example": example}
+        if self.max_episode_turns is not None:
+            state["max_episode_turns"] = self.max_episode_turns
+        return state
+
+    def record_model_turn(self, state, text):
+        self.recorded.append(text)
+        state["messages"].append({"role": "assistant", "content": text})
+
+    def env_reply(self, messages, state):
+        state["messages"].extend(self.replies)
+        return self.replies
+
+    def rollout_done(self, state, max_turns):
+        return len(self.recorded) >= self.done_after
+
+    def rollout_rewards_many(self, items):
+        from flash.envs.base import RolloutReward
+
+        self.scored.extend(state for _, state in items)
+        return [RolloutReward(episode=self.episode, turns=None) for _ in items]
+
+
+def _bridge(env, *, max_turns=4, examples=None):
+    return rl_verl.MultiTurnBridge(
+        env, examples if examples is not None else [{"index": 0}, {"index": 1}], max_turns=max_turns
+    )
+
+
+def test_bridge_exposes_exactly_the_routes_the_child_posts_to():
+    # the child posts to four literal paths and the server 404s anything else, with the failure
+    # surfacing as a transport error mid-episode. pinned against the child's own source so a rename
+    # on either side fails here.
+    from flash.engine.worker import grpo_multiturn
+
+    routes = set(_bridge(_BridgeEnv()).routes())
+    posted = set(re.findall(r"\"(/multiturn/[a-z]+)\"", inspect.getsource(grpo_multiturn)))
+    assert posted, "the child posts to no /multiturn path; this test found nothing to pin"
+    assert posted <= routes, f"the child posts to unrouted paths: {sorted(posted - routes)}"
+
+
+def test_bridge_start_mints_a_session_and_returns_the_turn_budget():
+    env = _BridgeEnv()
+    bridge = _bridge(env, max_turns=4)
+    assert bridge.start({"index": 1, "session_id": "a"}) == {"max_turns": 4}
+    assert bridge.open_sessions() == 1
+
+
+def test_bridge_start_lets_a_per_example_budget_lower_the_cap_but_never_raise_it():
+    # a per-example limit is the env asking for a SHORTER episode; honoring one that is longer would
+    # let a single row overrun the response tensor the batch was sized for.
+    assert _bridge(_BridgeEnv(max_episode_turns=2), max_turns=4).start(
+        {"index": 0, "session_id": "a"}
+    ) == {"max_turns": 2}
+    assert _bridge(_BridgeEnv(max_episode_turns=99), max_turns=4).start(
+        {"index": 0, "session_id": "a"}
+    ) == {"max_turns": 4}
+    # zero would make the loop skip generation entirely and score an empty transcript.
+    assert _bridge(_BridgeEnv(max_episode_turns=0), max_turns=4).start(
+        {"index": 0, "session_id": "a"}
+    ) == {"max_turns": 1}
+
+
+def test_bridge_start_rejects_an_out_of_range_index_before_touching_the_env():
+    # the index selects which dataset row the episode scores against. python's negative indexing
+    # would silently score the wrong row, so the check has to run before the lookup.
+    env = _BridgeEnv()
+    bridge = _bridge(env, examples=[{"index": 0}])
+    for index in (-1, 1, 99):
+        with pytest.raises(IndexError, match="outside"):
+            bridge.start({"index": index, "session_id": "a"})
+    assert bridge.open_sessions() == 0
+
+
+def test_bridge_start_refuses_to_reuse_a_live_session_id():
+    # session ids key the episode state. silently replacing one would strand the first episode's
+    # transcript and score the second one twice.
+    bridge = _bridge(_BridgeEnv())
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(KeyError, match="duplicate"):
+        bridge.start({"index": 1, "session_id": "a"})
+
+
+def test_bridge_step_records_the_turn_and_returns_the_env_reply():
+    env = _BridgeEnv(done_after=2, replies=[{"role": "user", "content": "again"}])
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    out = bridge.step({"session_id": "a", "completion_text": "first"})
+    assert env.recorded == ["first"]
+    assert out == {"terminal": False, "messages": [{"role": "user", "content": "again"}]}
+
+
+def test_bridge_step_does_not_show_the_env_an_unusable_turn():
+    # a truncated or skipped turn is terminal on the child side too. recording it would append a
+    # cut-off assistant message to the transcript that then gets SCORED as if the model produced it.
+    for payload in (
+        {"session_id": "a", "completion_text": "cut", "truncated": True},
+        {"session_id": "a", "completion_text": "cut", "skip_reason": "no room for a turn"},
+    ):
+        env = _BridgeEnv()
+        bridge = _bridge(env)
+        bridge.start({"index": 0, "session_id": "a"})
+        assert bridge.step(payload) == {"terminal": True, "messages": []}
+        assert env.recorded == [], "an unusable turn reached the env"
+
+
+def test_bridge_step_stops_before_asking_a_finished_env_for_a_reply():
+    # rollout_done is checked between recording and replying: an env that ended the episode must not
+    # be asked to produce another user message, which its contract does not define past terminal.
+    env = _BridgeEnv(done_after=1)
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    assert bridge.step({"session_id": "a", "completion_text": "done"}) == {
+        "terminal": True,
+        "messages": [],
+    }
+
+
+def test_bridge_step_on_an_unknown_session_raises_rather_than_scoring_a_blank_episode():
+    with pytest.raises(KeyError, match="unknown multi-turn session"):
+        _bridge(_BridgeEnv()).step({"session_id": "ghost", "completion_text": "x"})
+
+
+def test_bridge_score_returns_the_episode_reward_for_that_session():
+    env = _BridgeEnv(episode=0.75)
+    bridge = _bridge(env)
+    bridge.start({"index": 1, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.75}
+    # scored against the state the turns accumulated into, not a fresh one.
+    assert env.scored[0]["messages"][0]["content"] == "answer"
+
+
+def test_bridge_score_converts_an_unscorable_episode_to_zero(capsys):
+    # nan is score_rollouts' unscorable marker. verl has no equivalent: a nan advantage propagates
+    # through the group baseline and poisons every OTHER rollout in the group, so one ungradable
+    # episode would corrupt the whole step.
+    env = _BridgeEnv(episode=float("nan"))
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
+    assert "unscorable" in capsys.readouterr().out
+
+
+def test_bridge_score_converts_a_non_finite_episode_to_zero():
+    # inf reaches the group baseline the same way nan does, and is NOT caught by an isnan check.
+    for episode in (float("inf"), float("-inf")):
+        env = _BridgeEnv(episode=episode)
+        bridge = _bridge(env)
+        bridge.start({"index": 0, "session_id": "a"})
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+        assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
+
+
+def test_bridge_close_releases_the_session():
+    # every in-flight episode holds env state. a leak here grows for the whole run, and the child
+    # closes in a finally precisely so a failed episode still frees it -- so close must tolerate a
+    # session that was never started.
+    bridge = _bridge(_BridgeEnv())
+    bridge.start({"index": 0, "session_id": "a"})
+    assert bridge.close({"session_id": "a"}) == {"closed": True}
+    assert bridge.open_sessions() == 0
+    assert bridge.close({"session_id": "a"}) == {"closed": True}
+
+
+def test_bridge_routes_are_served_alongside_single_turn_scoring():
+    # one server, one port: the child gets a single url and posts both /score and /multiturn/* to
+    # it. mounting the bridge on its own server would leave the child's reward path pointing at a
+    # port that only answers episodes.
+    env = _BridgeEnv()
+    bridge = _bridge(env)
+    server, url = rl_verl.start_reward_server(
+        lambda index, text: 1.0, example_count=2, multi_turn_bridge=bridge
+    )
+    try:
+        def _post(path, payload):
+            request = urllib.request.Request(
+                url + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read().decode())
+
+        assert _post("/score", {"index": 0, "solution_str": "x"}) == {"score": 1.0}
+        assert _post("/multiturn/start", {"index": 0, "session_id": "a"}) == {"max_turns": 4}
+        _post("/multiturn/step", {"session_id": "a", "completion_text": "answer"})
+        assert _post("/multiturn/score", {"session_id": "a", "turn_count": 1}) == {"score": 1.0}
+        assert _post("/multiturn/close", {"session_id": "a"}) == {"closed": True}
+    finally:
+        server.shutdown()
+
+
+def test_the_bridge_is_built_only_for_multi_turn_jobs():
+    # a bridge on a single-turn job would expose episode routes with no episode state behind them,
+    # and mounting it costs a lock the single-turn scoring path already has.
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    assert 'MultiTurnBridge(env, rollout_examples, max_turns=int(inp["max_turns"]))' in src
+    assert 'if inp["multi_turn"]\n        else None' in src
+
+
+# ---------------------- multi-turn response tensor width ----------------------
+def test_multi_turn_widens_the_response_tensor_to_hold_a_whole_episode(monkeypatch):
+    # verl right-pads response_ids to data.max_response_length and DROPS the overflow
+    # (_pad_token_ids). on multi-turn the response is the whole transcript -- every assistant turn
+    # plus every glued env reply -- so a max_completion-wide tensor would cut episodes mid-turn and
+    # train on the fragment, silently. the width has to cover the longest episode the engine can
+    # produce: the child stops generating at max_model_len, so engine_len minus the SHORTEST
+    # admitted prompt bounds it.
+    inp = _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+    assert inp["max_response_len"] > inp["max_completion"], "the episode tensor was not widened"
+    assert inp["max_response_len"] == inp["engine_len"] - min(
+        int(p["prompt_len"]) for p in inp["prompts"]
+    )
+    # max_completion stays the PER-TURN cap, exactly as the trl driver uses it.
+    assert inp["max_completion"] < inp["engine_len"]
+
+
+def test_single_turn_leaves_the_response_tensor_at_the_completion_width(monkeypatch):
+    # the control: one completion IS the response, so widening it would inflate every rollout's
+    # padded tensor and the token budget derived from it for no reason.
+    inp = _capability_resolve(monkeypatch, _capability_env())
+    assert inp["max_response_len"] == inp["max_completion"]
+
+
+def test_the_response_width_reaches_verls_config_rather_than_max_completion(monkeypatch):
+    # the derivation is worthless if the override still emits max_completion. this is the one line
+    # that decides how wide the tensor verl allocates actually is.
+    inp = _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+    cfg = rl_verl._build_verl_training_cfg(
+        inp,
+        train_files="/w/train.parquet",
+        val_files="/w/val.parquet",
+        model_id=inp["model_id"],
+        thinking=False,
+        loggers="console",
+        fp8_kv=False,
+        reward_path="/w/reward.py",
+        local_dir="/w/ckpt",
+        project_name="flash",
+        experiment_name="flash-rl-run123",
+    )
+    assert f"data.max_response_length={inp['max_response_len']}" in rl_verl.build_verl_overrides(cfg)
+
+
 # ---------------------- measured reward latency in train_meta ----------------------
 def _resolved_inputs_for_notes(monkeypatch):
     """A resolved single-turn input dict, offline.
 
-    Mirrors the resolver fixture above: _resolve_single_turn_inputs needs a loaded env, a spec and
+    Mirrors the resolver fixture above: _resolve_grpo_inputs needs a loaded env, a spec and
     a tokenizer, none of which exist in a unit test.
     """
     from flash.engine.worker._pkg import W
@@ -2355,7 +2814,7 @@ def _resolved_inputs_for_notes(monkeypatch):
     monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
     monkeypatch.setattr(rl_verl, "seed_training_rngs", lambda seed: None)
     monkeypatch.setattr(rl_verl, "model_max_position_embeddings", lambda *a, **k: 40960)
-    return rl_verl._resolve_single_turn_inputs()
+    return rl_verl._resolve_grpo_inputs()
 
 
 def _profile(seconds: float, *, trustworthy: bool = True):
@@ -2561,5 +3020,19 @@ def test_the_run_body_passes_the_measured_profile_into_train_meta():
     pass while train_meta always recorded None.
     """
     src = inspect.getsource(rl_verl.run_rl_verl)
-    assert "reward_profile = _log_reward_profile(" in src, "the hook's reading is discarded"
+    assert "_log_reward_profile(" in src, "the hook is never called"
+    assert "reward_profile = " in src, "the hook's reading is discarded"
     assert "reward_profile=reward_profile" in src, "the reading never reaches train_meta"
+
+
+def test_the_reward_profiler_is_skipped_on_multi_turn():
+    """The profiler times the SINGLE-TURN grading path, which a multi-turn env does not have.
+
+    Source-level for the same reason as above. Running it on a multi-turn env would call
+    env.reward/scores_breakdown on one completion -- a call that env's contract does not define --
+    and record the resulting number as if it described the episode reward path.
+    """
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    profile_call = src[src.index("reward_profile = ") : src.index("multi_turn_bridge = ")]
+    assert 'if inp["multi_turn"]' in profile_call, "the profiler is not gated off multi-turn"
+    assert "None" in profile_call, "multi-turn must record no profile rather than a wrong one"

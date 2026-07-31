@@ -8,6 +8,8 @@ orchestration and batched loss path.
 
 from __future__ import annotations
 
+import contextlib
+
 from flash.engine.worker.tokenizer_align import StudentToken
 
 
@@ -55,6 +57,34 @@ def _generation_eos_ids(model, tok) -> frozenset:
         if obj is not None:
             _add(getattr(obj, "eos_token_id", None))
     return frozenset(ids)
+
+
+def generation_eos_from_cached_config(
+    model_id: str, model_revision: str, tokenizer
+) -> frozenset[int]:
+    """``_generation_eos_ids`` for a model that is on disk but NOT loaded.
+
+    The verl paths never hold the model in this process -- it is trained in a separate interpreter --
+    so the config and generation_config are read from the local hf cache and presented as the
+    attributes ``_generation_eos_ids`` expects. ``local_files_only`` because the caller prefetched
+    the model and the child runs with HF_HUB_OFFLINE.
+    """
+    from transformers import AutoConfig, GenerationConfig
+
+    config = AutoConfig.from_pretrained(
+        model_id, trust_remote_code=True, revision=model_revision or None, local_files_only=True
+    )
+    generation_config = None
+    with contextlib.suppress(OSError):
+        generation_config = GenerationConfig.from_pretrained(
+            model_id, revision=model_revision or None, local_files_only=True
+        )
+    model_like = type(
+        "ModelGenerationMetadata",
+        (),
+        {"config": config, "generation_config": generation_config},
+    )()
+    return _generation_eos_ids(model_like, tokenizer)
 
 
 def _rollout_terminated(completion_ids, stop_text, eos_ids, stop_sequences) -> bool:
