@@ -336,6 +336,40 @@ def test_env_test_fails_when_a_scorer_reports_an_error(monkeypatch, tmp_path, ca
     assert "overall: FAIL" in captured.err
 
 
+def test_env_test_fails_when_a_held_out_case_breaks_prompt_construction(
+    monkeypatch, tmp_path, capsys
+):
+    """The offline gate builds each case's prompt, because `flash env eval` will.
+
+    prompt_messages() runs against the held-out case, not the dataset row, so an env that raises
+    for a case's input printed `overall: PASS` here while `flash env eval` recorded a
+    prompt-construction error for every case of the same suite.
+    """
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'held-out'\n"
+        "    def cases(self): return [EvalCase(id='a', input='held-out only', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class _PickyPrompt(_SingleTurnEnv):
+        def prompt_messages(self, example):
+            if example["input"] != "what is 2 + 2?":
+                raise KeyError("no template for this input")
+            return super().prompt_messages(example)
+
+    _patch_loader(monkeypatch, _PickyPrompt())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "evaluation suite held-out failed contract checks" in captured.err
+    assert "no template for this input" in captured.err
+    assert "cases passed contract checks" not in captured.out
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_test_malformed_evaluation_sidecar_fails(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     sidecar = env_dir / "evaluations.py"

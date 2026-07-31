@@ -234,7 +234,16 @@ def _evaluation_example(case) -> dict:
 
 
 def _evaluation_response(env, case) -> tuple[str, str]:
-    reference_turns = _reference_turns(env, _evaluation_example(case))
+    example = _evaluation_example(case)
+    # build the prompt even though the replayed response does not need it. `flash env eval`
+    # sends every case through prompt_messages() (flash/cli/env_eval.py `_case_messages`), so a
+    # prompt that raises or returns malformed messages for a held-out case is a suite the online
+    # command records a prompt-construction error for. checking only the scorer let this offline
+    # gate print `overall: PASS` for exactly that sidecar (cursor[bot]).
+    build = getattr(env, "prompt_messages", None)
+    if callable(build):
+        _check_messages(build(example), "prompt")
+    reference_turns = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     response = (
         "\n".join(turn for turn in reference_turns if turn)

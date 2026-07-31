@@ -481,6 +481,37 @@ def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bo
     return not (path.is_dir() or path.is_file())
 
 
+def _imported_module_names(tree) -> set[str]:
+    """Top-level names a parsed module imports absolutely."""
+    import ast
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".", 1)[0])
+    return names
+
+
+def _helper_imports(helper: Path) -> set[str]:
+    """Top-level names a packaged helper imports, for following its own dependencies.
+
+    A helper that fails to parse is still shipped verbatim: refusing the push over a file the
+    sidecar may never execute would be a harsher failure than the ModuleNotFoundError this
+    lookahead exists to avoid, and the sidecar's own syntax is validated separately."""
+    import ast
+
+    if helper.suffix != ".py":
+        return set()
+    try:
+        return _imported_module_names(
+            ast.parse(helper.read_text(encoding="utf-8"), filename=str(helper))
+        )
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return set()
+
+
 def _iter_env_sidecar_files(
     env_root: Path, *, entrypoint: Path, include_full_tree: bool
 ) -> Iterator[tuple[Path, Path]]:
@@ -519,22 +550,25 @@ def _iter_env_sidecar_files(
                 raise ValueError(
                     f"{sidecar}: invalid evaluation sidecar syntax: {exc.msg}"
                 ) from exc
-            imported_modules: set[str] = set()
             # walk the whole tree, not just tree.body: the loader deliberately keeps the package
             # dir on sys.path so a sidecar can import its helpers lazily inside cases() or score()
             # (flash/envs/evaluations.py). scanning only top-level nodes skips exactly that
             # pattern, so `env test` passes locally and the pushed environment is missing the
             # helper the sidecar imports the moment it grades a case.
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    imported_modules.update(alias.name.split(".", 1)[0] for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                    imported_modules.add(node.module.split(".", 1)[0])
-            # exact-file pushes include only direct siblings named by the sidecar. a helper
-            # importing another helper is intentionally out of scope and requires a directory push;
-            # following transitive imports here would turn the bounded single-file mode into a partial
-            # python dependency resolver that still could not reproduce package imports reliably.
-            for module_name in sorted(imported_modules):
+            imported_modules = _imported_module_names(tree)
+            # a helper that imports another sibling needs that sibling too: shipping `scorer.py`
+            # without the `thresholds` it imports published an environment that raised
+            # ModuleNotFoundError on its first case, having passed every local check because the
+            # source directory was importable (cursor[bot]). the queue is seeded from the sidecar
+            # and grows only through siblings actually reached, so it stays a closure over files
+            # this push already carries rather than a general dependency resolver.
+            pending = sorted(imported_modules)
+            visited: set[str] = set()
+            while pending:
+                module_name = pending.pop()
+                if module_name in visited:
+                    continue
+                visited.add(module_name)
                 # `from graders.rules import score` resolves to a sibling PACKAGE, not graders.py.
                 # matching only the module spelling published an environment whose sidecar raises
                 # ModuleNotFoundError on its first case, having passed every local check.
@@ -569,6 +603,7 @@ def _iter_env_sidecar_files(
                             ):
                                 continue
                             yielded.add(child)
+                            pending.extend(_helper_imports(child))
                             yield child, child.relative_to(env_root)
                     continue
                 helper = env_root / f"{module_name}.py"
@@ -579,6 +614,7 @@ def _iter_env_sidecar_files(
                     and not _ignore_env_push_path(helper, env_root=env_root, entrypoint=entrypoint)
                 ):
                     yielded.add(helper)
+                    pending.extend(_helper_imports(helper))
                     yield helper, helper.relative_to(env_root)
         roots = [
             env_root / name
@@ -605,12 +641,47 @@ def _iter_env_sidecar_files(
                 yield child, child.relative_to(env_root)
 
 
+def _entrypoint_alias_source(module_name: str) -> str:
+    """The alias module that rebinds a noncanonical entrypoint name to environment.py."""
+    return (
+        "# generated by `flash env push`: this environment's entrypoint was published as\n"
+        f"# {_ENV_ENTRYPOINT}, so `import {module_name}` keeps resolving to the same module.\n"
+        "import sys\n"
+        "\n"
+        "import environment as _environment\n"
+        "\n"
+        "sys.modules[__name__] = _environment\n"
+    )
+
+
+def _write_entrypoint_alias(pkg: Path, *, entrypoint: Path) -> None:
+    """Keep a noncanonical entrypoint importable under the name it had locally.
+
+    Packaging writes the entrypoint's contents as environment.py whatever it was called, so a
+    sidecar doing `from custom import SCORER` -- which resolves locally, and is the only way to
+    reach the entrypoint when it is not named environment.py -- raised ModuleNotFoundError once
+    published (cursor[bot]). The alias rebinds sys.modules rather than re-importing, so the
+    sidecar and the runner share ONE module object and one set of module-level state; importing
+    the source twice would give the sidecar a second copy of every constant it scores against.
+
+    No sibling can collide with the alias: the entrypoint lives in the package root, and
+    `_ignore_env_push_path` excludes it from the sidecar walk, so its name is unclaimed."""
+    if entrypoint.name == _ENV_ENTRYPOINT:
+        return
+    (pkg / entrypoint.name).write_text(_entrypoint_alias_source(entrypoint.stem))
+
+
 def _check_env_push_limits(
     env_root: Path, *, entrypoint: Path, include_full_tree: bool, env_name: str
 ) -> None:
     """Reject oversized source trees before copying or building an in-memory archive."""
     files = 1
     total_bytes = entrypoint.stat().st_size + len(_ENV_SYSPATH_BOOTSTRAP.encode())
+    if entrypoint.name != _ENV_ENTRYPOINT:
+        # the import alias `cmd_env_push` writes beside environment.py counts against the same
+        # member cap the server enforces, so it cannot be free here.
+        files += 1
+        total_bytes += len(_entrypoint_alias_source(entrypoint.stem).encode())
     directories: set[Path] = set()
     has_readme = False
     for child, relative in _iter_env_sidecar_files(
@@ -808,6 +879,7 @@ def cmd_env_push(args) -> int:
         pkg = Path(tmp)
         module_source = entrypoint.read_text()
         (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
+        _write_entrypoint_alias(pkg, entrypoint=entrypoint)
         _copy_env_sidecars(
             env_root,
             pkg,
