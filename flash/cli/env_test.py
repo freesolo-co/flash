@@ -59,6 +59,11 @@ class _Score:
 
     episode: float
     turns: tuple[float, ...] | None = None
+    # whether each assistant turn actually emitted text, positionally. `build_per_turn_advantages`
+    # skips a turn index whose span is zero-width, so a reward coordinate belonging to a text-free
+    # turn is one the trainer never reads (see `_overlap`). None means "not known", which only
+    # arises where there is no per-turn vector to qualify.
+    emitted: tuple[bool, ...] | None = None
 
     def is_finite(self) -> bool:
         return math.isfinite(self.episode) and all(
@@ -66,23 +71,40 @@ class _Score:
         )
 
     def _overlap(self, other: _Score) -> tuple[tuple[float, float], ...] | None:
-        """Pair the turns both vectors actually reach, or None when neither has one.
+        """Pair the turns both vectors actually reach and both credited, or None when neither has one.
 
         `build_per_turn_advantages` walks to the group's longest vector and, at each index, centres
         only the members present there. A shorter rollout therefore does not void the comparison:
         the turns both reached are still centred against each other. Comparing that overlap is what
         the trainer does, so a wrong control that merely terminated early stays evidence rather than
         being discarded (codex[bot]).
+
+        A turn whose span is zero-width is excluded from that walk entirely
+        (`grpo_perturn_trainer.py:67-75` filters members on `spans[i][1] > spans[i][0]`), so its
+        reward coordinate is one no advantage is ever computed from. Counting it here read
+        separation into a pair the trainer resolves to zero advantage at every turn -- a replay of
+        ("", "answer") scoring (1, 0) against a control's (0, 0) looks separated at turn 0, while
+        training drops gold from that turn, centres the identical controls alone, and learns
+        nothing (codex[bot]).
         """
         mine, theirs = self.turns, other.turns
         if mine is None or theirs is None:
             return None
-        return tuple(zip(mine, theirs, strict=False))
+        pairs = zip(mine, theirs, strict=False)
+        credited = zip(self.emitted or (), other.emitted or (), strict=False)
+        # both sides must have emitted at an index for the trainer to compare them there. an absent
+        # `emitted` means the caller could not say, and the pairs are taken as they were.
+        if self.emitted is None or other.emitted is None:
+            return tuple(pairs)
+        return tuple(
+            pair for pair, (mine_ok, theirs_ok) in zip(pairs, credited, strict=False)
+            if mine_ok and theirs_ok
+        )
 
     def outranks(self, gold: _Score, *, per_turn: bool) -> bool:
         """Report whether this deliberately wrong control beats gold where training reads.
 
-        Asymmetric on purpose. ``_controlled_scores`` admits a control only when it is disjoint from
+        Asymmetric on purpose. ``_prepare_controls`` admits a control only when it is disjoint from
         EVERY gold turn, so there is no turn at which this completion legitimately scores above the
         replayed gold answer. One credited turn above gold is therefore enough: each turn index is
         centred against its own group mean, so that turn hands the wrong text a positive advantage
@@ -229,21 +251,38 @@ def _resolve_policy(reference_turns: list[str]) -> str:
     return "replay" if "".join(reference_turns).strip() else "echo"
 
 
-def _env_turns_reproduce(env, example: dict, state: dict) -> bool:
+def _observation(message: dict) -> tuple[str, str]:
+    """One environment-side turn as the replay check compares it: its role and its text.
+
+    The role is carried, not just the text. A reference recording ``{"role": "tool", ...}`` against
+    a rollout emitting the same string as ``{"role": "user", ...}`` is a materially different
+    transcript -- it renders differently under the chat template and a role-aware grader scores it
+    differently -- so reducing both sides to content alone reported a faithful replay for a
+    trajectory the grader never saw (codex[bot]).
+    """
+    return str(message.get("role", "")).strip().lower(), _message_text(message.get("content"))
+
+
+def _env_turns_reproduce(env, example: dict, state: dict, prompt: list[dict]) -> bool:
     """Whether the driven rollout's environment-side turns match the reference trajectory's.
 
     Only meaningful when the reference records them: a gold completion of assistant turns alone
     says nothing about what the env replied, so there is nothing to contradict and the replay
     stands. When it does record them, they must come back at the same positions with the same
-    text -- a stochastic or externally-sourced observation otherwise reaches the grader as a
-    different episode wearing the reference's assistant strings.
+    role and text -- a stochastic or externally-sourced observation otherwise reaches the grader as
+    a different episode wearing the reference's assistant strings.
 
     The reference covers the completion only, so it is compared as a prefix of what followed the
     prompt. Whatever the env replied past the reference's last recorded turn is outside what the
     trajectory claims and is not evidence either way.
+
+    `prompt` is the rollout's opening messages, captured BEFORE the turn loop ran. It cannot be
+    recovered from `state` afterwards: an env that keeps its transcript under `messages` with no
+    separate `prompt` key has by then appended every driven turn to that same list, so there is
+    nothing left to distinguish the opening from the completion.
     """
     reference = [
-        _message_text(message["content"])
+        _observation(message)
         for message in _check_messages(env.sft_completion(example), "sft_completion")
         if message["role"].strip().lower() != "assistant"
     ]
@@ -253,7 +292,7 @@ def _env_turns_reproduce(env, example: dict, state: dict) -> bool:
     # env whose env_reply emits one look unreproduced on an exact replay, since the reference keeps
     # it (codex[bot]). the opening prompt is excluded by position below instead.
     driven = [
-        _message_text(message.get("content"))
+        _observation(message)
         for message in state.get("messages") or []
         if str(message.get("role", "")).strip().lower() != "assistant"
     ]
@@ -265,7 +304,7 @@ def _env_turns_reproduce(env, example: dict, state: dict) -> bool:
     # coincidental trailing match hide a divergence earlier in the trajectory (cursor).
     prompt_turns = sum(
         1
-        for message in _check_messages(state.get("prompt") or [], "prompt")
+        for message in prompt
         if str(message.get("role", "")).strip().lower() != "assistant"
     )
     completion = driven[prompt_turns:]
@@ -304,9 +343,14 @@ def _new_record() -> dict:
         "reference_turns": [],
         # True when the gold transcript could not be replayed verbatim (see _turn_is_representable).
         "partial_replay": False,
-        # multi-turn only: the terminal (example, state, turn_count) the gold reward came from, so
-        # the controls can be rescored alongside it in one batched call.
+        # multi-turn only: the terminal (example, state, responses) the gold reward comes from, so
+        # it can be scored alongside every control in one batched call.
         "rollout": None,
+        # multi-turn only: the driven control rollouts, in the same shape, awaiting that same batch.
+        # None means no control was provably wrong for this example.
+        "control_rollouts": None,
+        # the control scores, once that batch has run. None means the episode carries no evidence.
+        "control_scores": None,
     }
 
 
@@ -339,13 +383,22 @@ def _drive_single_turn(env, example: dict, record: dict) -> None:
     record["reward"] = _Score(episode=_grade_single_turn(env, response, example))
 
 
-def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str]]:
-    """Drive one offline multi-turn rollout, returning the final state and the turns taken.
+def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], list[dict]]:
+    """Drive one offline multi-turn rollout, returning the final state, turns taken, and prompt.
 
     `turn_content(index)` supplies the model's text for each turn, so the same loop can replay a
     gold transcript or a deliberately wrong one.
+
+    The opening messages are snapshotted before the loop runs, and for the same reason the worker
+    reads them there (`flash/engine/multiturn_rollout.py`): an env may expose its transcript as
+    `messages` with no separate `prompt` key, and once the loop has appended to that list the
+    opening is no longer recoverable from the state.
     """
     state = env.new_rollout_state(example)
+    # `prompt` or `messages`, exactly as the production driver accepts them
+    # (flash/engine/multiturn_rollout.py:171-175). requiring `prompt` afterwards failed a state
+    # shape supported everywhere else in the codebase, before the reward gate ever ran (codex[bot]).
+    prompt = [dict(m) for m in _check_messages(state.get("prompt") or state.get("messages"), "prompt")]
     # mirror the worker turn loop (flash/engine/multiturn_rollout.py): drive one model
     # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
     # env yields no reply. the hard cap is fixed at what the trainer passes (env.max_turns)
@@ -369,7 +422,7 @@ def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str]]:
         _check_messages(env_msgs, "env_reply")
         if env.rollout_done(state, max_turns=hard_cap):
             break
-    return state, responses
+    return state, responses, prompt
 
 
 def _drive_multi_turn(env, example: dict, record: dict) -> None:
@@ -382,8 +435,11 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
             return reference_turns[index]
         return _ECHO_RESPONSE
 
-    state, responses = _run_rollout(env, example, content)
-    record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
+    state, responses, prompt = _run_rollout(env, example, content)
+    # the snapshot, not a re-read of the state: for an env exposing only `messages` the loop has
+    # appended every driven turn to that list by now, so re-reading would record the whole
+    # transcript as the prompt and report it back to the user as one.
+    record["prompt"] = prompt
     record["responses"].extend(responses)
     record["turns"] = len(responses)
     record["reference_turns"] = reference_turns
@@ -398,13 +454,13 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     # under the same assistant strings, so a correct grader scores this "gold" rollout like the
     # controls and the gate reports a flat grader for an env that ranks fine (codex[bot]). the
     # reference records what the env replied last time, so compare against it where it does.
-    if policy == "replay" and not _env_turns_reproduce(env, example, state):
+    if policy == "replay" and not _env_turns_reproduce(env, example, state, prompt):
         record["partial_replay"] = True
 
-    # the terminal rollout, kept unscored: the caller batches it with the control rollouts so a
-    # listwise grader ranks them together, exactly as the worker submits them (codex[bot]).
-    # _grade_unscored_gold covers the episodes that batch never runs.
-    record["rollout"] = (example, state, len(responses))
+    # the terminal rollout, kept unscored: the whole run's rollouts are scored in one batch so a
+    # listwise grader ranks them together, exactly as the worker submits them (codex[bot]). see
+    # _score_multi_turn_rollouts.
+    record["rollout"] = (example, state, responses)
 
 
 def _control_is_disjoint(control: str, reference: str) -> bool:
@@ -467,7 +523,18 @@ def _grade_single_turn(env, completion: str, example: dict) -> float:
     return float(env.reward(completion, example, None))
 
 
-def _grade_rollouts(env, rollouts: list[tuple[dict, dict, int]]) -> list[_Score]:
+def _emitted_turns(responses: list[str]) -> tuple[bool, ...]:
+    """Which assistant turns put tokens on the wire, positionally.
+
+    The production rollout appends one span per assistant turn and the per-turn trainer skips any
+    whose span is zero-width (`multiturn_rollout.py:192-195`, `grpo_perturn_trainer.py:67-75`). Here
+    the turn text is replayed rather than generated, so the analogue of "no tokens" is the empty
+    string -- whitespace still tokenizes to something and is credited in a real run.
+    """
+    return tuple(bool(response) for response in responses)
+
+
+def _grade_rollouts(env, rollouts: list[tuple[dict, dict, list[str]]]) -> list[_Score]:
     """Score terminal rollouts through the multi-turn worker's own path, in one batched call.
 
     The multi-turn trainer never calls ``env.reward`` itself: it calls ``score_rollouts``
@@ -487,16 +554,22 @@ def _grade_rollouts(env, rollouts: list[tuple[dict, dict, int]]) -> list[_Score]
     may hold the episode score constant while the per-turn vector still separates a gold rollout
     from a wrong one. Reading the episode scalar alone would report that env as unable to rank while
     training learns from it perfectly well (codex[bot]).
+
+    Each rollout carries its turn TEXTS rather than just a count, so the score records which turns
+    emitted anything -- the coordinates the per-turn trainer actually reads.
     """
     from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
 
     requests = [
-        RolloutScoreRequest(example=example, state=state, turn_count=turn_count)
-        for example, state, turn_count in rollouts
+        RolloutScoreRequest(example=example, state=state, turn_count=len(responses))
+        for example, state, responses in rollouts
     ]
+    rewards = score_rollouts(env, requests)
     return [
-        _Score(episode=float(reward.episode), turns=reward.turns)
-        for reward in score_rollouts(env, requests)
+        _Score(
+            episode=float(reward.episode), turns=reward.turns, emitted=_emitted_turns(responses)
+        )
+        for reward, (_example, _state, responses) in zip(rewards, rollouts, strict=True)
     ]
 
 
@@ -531,38 +604,22 @@ def _score_single_turn_control(env, example: dict, control: str) -> _Score | Non
     return score
 
 
-def _score_multi_turn_episode(
-    env, example: dict, gold: tuple[dict, dict, int], controls: list[str]
-) -> tuple[_Score, list[_Score]]:
-    """Drive the control rollouts and score them with the gold one in a single batched call.
+def _drive_multi_turn_controls(
+    env, example: dict, controls: list[str]
+) -> list[tuple[dict, dict, list[str]]]:
+    """Drive one wrong episode per control, leaving them unscored for the caller's batch.
 
     A multi-turn reward reads the accumulated rollout state, so a comparable wrong episode has to be
-    driven, not assembled -- replay the same loop answering each control at every turn. The scoring
-    that follows is deliberately one call over the whole list: the worker submits its entire rollout
-    request list to ``score_rollouts`` at once (flash/engine/multiturn_rollout.py), so an env with
-    listwise ``rollout_rewards_many`` semantics ranks these candidates against each other exactly as
-    training would. Scoring each rollout in its own singleton call can hand back identical numbers
-    for a grader that ranks fine in a batch, reporting it as flat, or a different ordering than
-    training sees (codex[bot]).
-
-    Unlike single-turn, a raising scorer is not softened to 0.0 here: the rollout path calls
-    ``score_rollouts`` with no except branch, so a scorer that raises there aborts the run.
-    Swallowing it would pass an environment that cannot survive its first rollout (codex[bot]).
-
-    A control the grader marks unscorable is dropped rather than failed. ``score_rollouts`` turns a
-    non-finite episode into NaN deliberately -- it is the trainer's supported marker for a row the
-    group baseline excludes and whose advantage is then zeroed -- so an env that marks completions
-    outside its grammar unscorable is behaving as designed, not violating the contract. Failing on
-    it rejected such an env for the single reason that a fixed control is not valid input for it
-    (codex[bot]).
+    driven, not assembled -- replay the same loop answering each control at every turn. Scoring is
+    deliberately left to the caller, which submits every episode's gold and controls together (see
+    ``_score_multi_turn_rollouts``).
     """
-    driven = [_run_rollout(env, example, lambda _index, text=control: text) for control in controls]
-    scores = _grade_rollouts(
-        env, [gold, *((example, state, len(responses)) for state, responses in driven)]
-    )
-    # an unscorable control earns no advantage, so it is evidence of neither ranking nor flatness.
-    # keeping it would compare gold against a number the trainer never acts on.
-    return scores[0], [score for score in scores[1:] if score.is_finite()]
+    return [
+        (example, state, responses)
+        for state, responses, _prompt in (
+            _run_rollout(env, example, lambda _index, text=control: text) for control in controls
+        )
+    ]
 
 
 def _usable_controls(references: list[str]) -> list[str] | None:
@@ -602,37 +659,63 @@ def _usable_controls(references: list[str]) -> list[str] | None:
     return usable or None
 
 
-def _grade_unscored_gold(env, records: list[dict]) -> None:
-    """Score every gold rollout no batched control call reached, in one batch.
+def _score_multi_turn_rollouts(env, records: list[dict]) -> None:
+    """Score every multi-turn rollout of the whole run -- gold and controls -- in ONE call.
 
-    Multi-turn gold is normally scored inside ``_score_multi_turn_episode``, in the same request
-    list as the controls. Episodes that never reach that batch -- an echo policy, a partial replay,
-    no provably wrong control, or a control whose scorer raised under the never-grades exemption --
-    still need a reward to report. They are collected across episodes and submitted together rather
-    than one call each: the worker submits its whole rollout list to ``score_rollouts`` at once
-    (flash/engine/multiturn_rollout.py), so a listwise ``rollout_rewards_many`` that cannot score a
-    singleton would work under GRPO and fail its contract check here (codex[bot]).
+    The worker submits its entire rollout request list to ``score_rollouts`` at once
+    (flash/engine/multiturn_rollout.py:687-695), and that list spans the whole generation batch, not
+    one example. A ``rollout_rewards_many`` that normalizes or ranks across the list it is handed
+    therefore returns different numbers when called once per episode, which is enough to read a
+    working grader as flat or as inverted (codex[bot]). So every driven rollout in the run goes into
+    a single request list here, and the results are mapped back by position.
 
-    Gold is graded either here or in the control batch, never both: showing a stateful or listwise
-    grader a rollout the real run never submits is the thing this avoids.
+    Unlike single-turn, a raising scorer is not softened to 0.0: the rollout path calls
+    ``score_rollouts`` with no except branch, so a scorer that raises there aborts the run.
+    Swallowing it would pass an environment that cannot survive its first rollout (codex[bot]). A
+    raise here belongs to every episode in the batch for the same reason -- production makes exactly
+    this one call.
+
+    A control the grader marks unscorable is dropped rather than failed. ``score_rollouts`` turns a
+    non-finite episode into NaN deliberately -- it is the trainer's supported marker for a row the
+    group baseline excludes and whose advantage is then zeroed -- so an env that marks completions
+    outside its grammar unscorable is behaving as designed, not violating the contract. Failing on
+    it rejected such an env for the single reason that a fixed control is not valid input for it
+    (codex[bot]).
     """
-    pending = [
-        record for record in records if record["reward"] is None and record["rollout"] is not None
-    ]
-    if not pending:
+    batch: list[tuple[dict, dict, list[str]]] = []
+    # (record, slice of `batch` holding its controls) so each result returns to its own episode.
+    layout: list[tuple[dict, slice]] = []
+    for record in records:
+        if record["rollout"] is None:
+            continue
+        batch.append(record["rollout"])
+        controls = record["control_rollouts"] or []
+        start = len(batch)
+        batch.extend(controls)
+        layout.append((record, slice(start, start + len(controls))))
+    if not batch:
         return
-    scores = _grade_rollouts(env, [record["rollout"] for record in pending])
-    for record, score in zip(pending, scores, strict=True):
-        record["reward"] = score
+    scores = _grade_rollouts(env, batch)
+    gold_index = 0
+    for record, control_slice in layout:
+        record["reward"] = scores[gold_index]
+        gold_index = control_slice.stop
+        if record["control_rollouts"] is None:
+            continue
+        # an unscorable control earns no advantage, so it is evidence of neither ranking nor
+        # flatness. keeping it would compare gold against a number the trainer never acts on.
+        record["control_scores"] = [
+            score for score in scores[control_slice] if score.is_finite()
+        ]
 
 
-def _controlled_scores(env, example: dict, record: dict) -> list[_Score] | None:
-    """Score this episode's deliberately wrong answers, or None when none is provably wrong.
+def _prepare_controls(env, example: dict, record: dict) -> list[_Score] | None:
+    """Prepare this episode's deliberately wrong answers, or None when none is provably wrong.
 
-    For multi-turn this rescores the gold rollout in the same batch and writes the batched value
-    back to ``record``, so the comparison is always between scores the grader produced from one
-    request list. Comparing a singleton gold score against batched control scores would be the same
-    listwise mismatch, moved one step (codex[bot]).
+    Single-turn scores them here and returns the scores. Multi-turn only DRIVES them, parking the
+    rollouts on the record for the whole run's single batched scoring call
+    (``_score_multi_turn_rollouts``) and returning None -- the caller reads ``control_scores`` after
+    that batch instead.
 
     May also return an empty list, when every control was scored but none produced usable evidence.
     The caller treats that the same way it treats None -- the episode is not counted as controlled,
@@ -646,9 +729,8 @@ def _controlled_scores(env, example: dict, record: dict) -> list[_Score] | None:
         # advantage, so it is evidence of neither ranking nor flatness.
         scored = [_score_single_turn_control(env, example, control) for control in controls]
         return [score for score in scored if score is not None]
-    gold, control_scores = _score_multi_turn_episode(env, example, record["rollout"], controls)
-    record["reward"] = gold
-    return control_scores
+    record["control_rollouts"] = _drive_multi_turn_controls(env, example, controls)
+    return None
 
 
 def _load_failure(reason: str) -> int:
@@ -748,9 +830,10 @@ def cmd_env_test(args) -> int:
     scored_flat = 0
     inverted = 0
     control_errors: list[str] = []
-    # driven first, reported second. the gold rollouts no control batch reached are graded together
-    # between the two passes, in the batch shape the worker submits (see _grade_unscored_gold), so
-    # nothing here shows the grader a singleton request the real run never makes (codex[bot]).
+    # driven first, scored second, reported third. every multi-turn rollout of the run -- gold and
+    # controls, across all episodes -- is scored between the passes in the one batch shape the
+    # worker submits (see _score_multi_turn_rollouts), so nothing here shows the grader a smaller
+    # request list than the real run makes (codex[bot]).
     episodes: list[tuple[int, dict, str | None, list[_Score] | None]] = []
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
@@ -773,7 +856,7 @@ def cmd_env_test(args) -> int:
                 # completions below it. what makes a grader unusable for RL is that it cannot
                 # SEPARATE a good completion from a bad one, so score wrong answers and compare.
                 try:
-                    controls = _controlled_scores(env, example, record)
+                    controls = _prepare_controls(env, example, record)
                 except (Exception, SystemExit) as exc:
                     # a control that cannot be graded is a real defect wherever the scorer is
                     # actually called, and an unknown algorithm is not grounds to assume it is not
@@ -789,17 +872,35 @@ def cmd_env_test(args) -> int:
             failure = str(exc) or exc.__class__.__name__
         episodes.append((index, record, failure, controls))
 
-    # multi-turn gold gets its reward from the control batch when one ran; this covers every other
-    # path. the call is one batch over every episode that needs it, so a listwise grader sees the
-    # request shape training submits. a raise here belongs to all of them: production makes exactly
-    # this one call, and it would abort the run.
+    # one scoring call for the whole run, gold rollouts and their controls together: that is the
+    # request shape the worker submits, and it spans the generation batch rather than one example
+    # (see _score_multi_turn_rollouts). a raise belongs to every episode in it, since production
+    # makes exactly this one call and it would abort the run.
+    graded = [record for _, record, failure, _ in episodes if not failure]
+    batch_failure = None
     try:
-        _grade_unscored_gold(env, [record for _, record, failure, _ in episodes if not failure])
-        batch_failure = None
+        _score_multi_turn_rollouts(env, graded)
     except (Exception, SystemExit) as exc:
         batch_failure = str(exc) or exc.__class__.__name__
+        # the controls are this command's own additions, not rollouts any run would submit. under
+        # the never-grades exemption a scorer that only chokes on them is a fact about the CONTROL,
+        # so drop them and score the gold rollouts training really does submit.
+        affected = [record for record in graded if record["control_rollouts"]]
+        if _never_grades(args) and affected:
+            for record in affected:
+                record["control_rollouts"] = None
+            try:
+                _score_multi_turn_rollouts(env, graded)
+            except (Exception, SystemExit):
+                pass
+            else:
+                control_errors.extend(batch_failure for _ in affected)
+                batch_failure = None
 
     for index, record, failure, controls in episodes:
+        # multi-turn controls are scored in that batch rather than inline, so they arrive here.
+        if controls is None:
+            controls = record["control_scores"]
         reward = record["reward"]
         if not failure:
             # a gold reward that only goes non-finite in a batch is the same contract violation as
@@ -835,36 +936,39 @@ def cmd_env_test(args) -> int:
             group_per_turn = per_turn and all(
                 score.turns is not None for score in (reward, *controls)
             )
-            # a SINGLE control outranking gold does not establish an inverted grader. where the
-            # reward is an open-ended property rather than the reference -- one point per "z", say
-            # -- "z"*64 legitimately beats a gold "pizza", and training toward it is correct
-            # (codex[bot]). what no such property explains is EVERY control winning: the candidates
-            # are built on mutually exclusive alphabets (see _CONTROL_CANDIDATES), so an English
-            # sentence, a run of "z" and a run of "0" hold no property in common. unanimity across
-            # that set leaves the grader's sign as the explanation. below it, stay silent.
+            # every control outranking gold is worth reporting, but it does NOT establish an
+            # inverted grader, so it is reported and never failed on. the controls are disjoint from
+            # the gold text LEXICALLY; they are not known-negative answers, and they still share
+            # non-lexical properties -- all three run to 64-67 characters, for one. a healthy
+            # open-ended grader rewarding response length outscores a short gold reference with
+            # every one of them, and maximizing that reward is correct (codex[bot]). only the
+            # environment knows which completions are genuinely wrong for its task, and this command
+            # has no hook to ask, so the finding stays a warning rather than a verdict.
             outranking = [
                 control for control in controls if control.outranks(reward, per_turn=group_per_turn)
             ]
             if len(controls) > 1 and len(outranking) == len(controls):
-                # strictly worse than a flat grader: GRPO maximizes this number, so the run would
-                # train away from every gold answer, and no separation elsewhere redeems it.
                 inverted += 1
-                # report the numbers the verdict actually read. on the per-turn path the episode
+                # report the numbers the finding actually read. on the per-turn path the episode
                 # scalars are not what trains, and a crossing pair has equal ones -- printing them
                 # would read "1.000000 scored higher than 1.000000".
                 if group_per_turn:
-                    message = (
+                    observed = (
                         "every deliberately wrong answer was credited above the replayed gold "
                         f"answer at a turn they share (gold turns {_fmt_turns(reward)}, wrong "
-                        f"answer {_fmt_turns(outranking[0])}); the reward direction looks inverted"
+                        f"answer {_fmt_turns(outranking[0])})"
                     )
                 else:
                     highest = max(control.episode for control in outranking)
-                    message = (
+                    observed = (
                         f"every deliberately wrong answer scored higher (up to {highest:.6f}) than "
-                        f"the replayed gold answer ({reward.episode:.6f}); the reward direction "
-                        "looks inverted"
+                        f"the replayed gold answer ({reward.episode:.6f})"
                     )
+                message = (
+                    f"{observed}; the reward direction may be inverted, though a grader rewarding "
+                    "an open-ended property these answers share -- their length, say -- would look "
+                    "the same. check the grader's sign"
+                )
                 print(
                     render.warn(message) if render.styled() else f"warning: {message}",
                     file=sys.stderr,
@@ -902,26 +1006,36 @@ def cmd_env_test(args) -> int:
             render.warn(message) if render.styled() else f"warning: {message}",
             file=sys.stderr,
         )
+    if inverted:
+        # reported, never failed on. a wrong answer outscoring gold is worth a look, but the
+        # controls are only LEXICALLY disjoint from the gold text -- they are not known-negative
+        # answers, and a grader rewarding an open-ended property they happen to share (length, for
+        # one: they run 64-67 characters) outranks a short gold reference while being exactly right
+        # to maximize (codex[bot]). failing here would block a working environment, and nothing this
+        # command can observe tells the two cases apart.
+        message = (
+            f"{inverted} replayed episode(s) scored a deliberately wrong answer higher than the "
+            "gold answer. check the grader's sign -- though a reward for an open-ended property "
+            "those answers share would look the same and be correct."
+        )
+        print(
+            render.warn(message) if render.styled() else f"warning: {message}",
+            file=sys.stderr,
+        )
     # a grader that hands every deliberately wrong answer the same score as its own gold answer on
     # every sampled episode cannot rank completions at all: a broken reward function or a missing
-    # runtime dependency, not a hard dataset. one that ranks them ABOVE gold is worse still, since
-    # GRPO would maximize its way off the references. both send a run to a gpu that cannot learn
-    # what the dataset teaches. episodes whose transcript the driver could not reproduce verbatim,
-    # and those with no control provably wrong for their gold answer, are excluded above. this
-    # samples the first few rows, so the flat finding is deliberately a claim about the sample:
-    # separation anywhere in it is enough to pass.
+    # runtime dependency, not a hard dataset. that sends a run to a gpu that cannot learn what the
+    # dataset teaches, and unlike the ordering above it is conclusive -- identical scores are zero
+    # advantage whatever property the grader rewards. episodes whose transcript the driver could not
+    # reproduce verbatim, and those with no control provably wrong for their gold answer, are
+    # excluded above. this samples the first few rows, so the finding is deliberately a claim about
+    # the sample: separation anywhere in it is enough to pass.
     #
     # only failed for an algorithm that actually consumes reward(). SFT never calls it, so a
     # placeholder scorer there is not a defect, and without --algorithm the intent is unknown --
     # report the finding without failing rather than block a working environment.
     finding = ""
-    if inverted:
-        finding = (
-            f"{inverted} replayed episode(s) scored a deliberately wrong answer higher than the "
-            "gold answer; the reward direction is inverted and training would move away from the "
-            "references. check the grader's sign."
-        )
-    elif controlled and scored_flat == controlled:
+    if controlled and scored_flat == controlled:
         finding = (
             f"all {controlled} replayed episode(s) scored every deliberately wrong answer exactly "
             "as high as the gold answer; the reward function cannot rank completions. check the "
