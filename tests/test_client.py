@@ -43,6 +43,7 @@ def stub():
             if self.path.startswith("/v1/envs/") and self.path.endswith("/package"):
                 self._send_bytes(200, b"package-bytes")
             elif self.path == "/v1/health":
+                seen["health_calls"] = seen.get("health_calls", 0) + 1
                 capabilities = [] if seen.get("old_chat_server") else ["chat_step_selector_v1"]
                 self._send(200, {"ok": True, "capabilities": capabilities})
             elif self.path == "/v1/runs/old-api/worker":
@@ -352,6 +353,38 @@ def test_chat_checkpoint_shorthand_rejects_older_server(stub):
         client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
 
     assert seen["path"] == "/v1/health"
+    assert "body" not in seen
+
+
+def test_chat_checkpoint_capability_is_probed_once_per_client(stub):
+    # the capability is a property of the control plane, not of the request. `env eval` sends one
+    # chat per case, so re-probing each time doubled the request count and let a single transient
+    # /v1/health blip fail an arbitrary case while the chat endpoint was healthy (codex[bot]).
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    for _ in range(3):
+        client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
+    list(client.chat_stream("run-a/step-40", [{"role": "user", "content": "hi"}]))
+
+    assert seen["health_calls"] == 1
+    # a separate client has its own plane to verify, so the cache is not process-global
+    ApiClient(url, "fslo-user-test").chat("run-a/step-40", [{"role": "user", "content": "hi"}])
+    assert seen["health_calls"] == 2
+
+
+def test_chat_checkpoint_capability_failure_is_not_cached(stub):
+    # only a positive result is cached: a plane that genuinely lacks the capability must keep
+    # failing, not fall through to an unsupported request on the second call.
+    url, seen = stub
+    seen["old_chat_server"] = True
+    client = ApiClient(url, "fslo-user-test")
+
+    for _ in range(2):
+        with pytest.raises(ClientError, match="chat_step_selector_v1"):
+            client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
+
+    assert seen["health_calls"] == 2
     assert "body" not in seen
 
 

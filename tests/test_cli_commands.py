@@ -985,6 +985,58 @@ def test_chat_checkpoint_ref_is_forwarded_unchanged(fake_client) -> None:
     assert fake_client.calls[-1][1] == target
 
 
+def test_chat_stream_caches_a_successful_checkpoint_capability_check(monkeypatch) -> None:
+    # env eval opens one stream per case. repeating the health preflight makes a large suite pay
+    # hundreds of extra requests and lets one transient health failure replace a model measurement.
+    from flash.client import ApiClient, ClientError
+
+    class Response:
+        def __init__(self):
+            self.headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+    client = ApiClient("https://flash.test")
+    successful_health_calls = 0
+
+    def successful_health():
+        nonlocal successful_health_calls
+        successful_health_calls += 1
+        return {"capabilities": ["chat_step_selector_v1"]}
+
+    monkeypatch.setattr(client, "health", successful_health)
+    monkeypatch.setattr(
+        "flash.client.http.urllib.request.urlopen", lambda *args, **kwargs: Response()
+    )
+
+    for _ in range(2):
+        assert list(client.chat_stream("flash-1/step-3", [])) == ["ok"]
+
+    assert successful_health_calls == 1
+
+    failing_client = ApiClient("https://flash.test")
+    failing_health_calls = 0
+
+    def failing_health():
+        nonlocal failing_health_calls
+        failing_health_calls += 1
+        return {"capabilities": []}
+
+    monkeypatch.setattr(failing_client, "health", failing_health)
+    for _ in range(2):
+        with pytest.raises(ClientError, match="chat_step_selector_v1"):
+            list(failing_client.chat_stream("flash-1/step-3", []))
+
+    assert failing_health_calls == 2
+
+
 def test_chat_accepts_full_immutable_revision(fake_client) -> None:
     revision = "flash-1@step-40." + "a" * 40
     assert _run(["models", "chat", revision, "-m", "What is 6*7?"]) == 0
@@ -1021,6 +1073,30 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     assert (tmp_path / "environment.py").is_file()
+    evaluations = tmp_path / "evaluations.py"
+    assert evaluations.is_file()
+    evaluations_text = evaluations.read_text()
+    assert "load_evaluations(environment=None)" in evaluations_text
+    assert "self.environment.reward(response, example)" in evaluations_text
+    assert "flash env eval TARGET ." in evaluations_text
+
+    class StarterEnvironment:
+        def reward(self, response, example):
+            assert response == "12"
+            assert example["output"] == "12"
+            return 0.75
+
+        def grade(self, response, example):
+            return True
+
+    from flash.envs.evaluations import load_evaluation_suites
+
+    starter_suite = load_evaluation_suites(tmp_path, environment=StarterEnvironment())[0]
+    starter_case = starter_suite.cases()[0]
+    starter_scored = starter_suite.score(starter_case, "12")
+    assert starter_scored.score == 0.75
+    assert starter_scored.passed is True
+
     dataset = tmp_path / "dataset/train.jsonl"
     assert dataset.is_file()
     assert not (tmp_path / "datasets").exists()
@@ -1080,10 +1156,37 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "runpod" not in training_text.lower()
     assert "lambda" not in training_text.lower()
     out = capsys.readouterr().out
+    assert "evaluations.py" in out
     assert "dataset/train.jsonl" in out
     assert "configs/rl.toml" in out
     assert "configs/opd.toml" in out
     assert "TRAINING.md" in out
+
+
+def test_env_setup_does_not_overwrite_existing_evaluations(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    existing = tmp_path / "evaluations.py"
+    existing.write_text("# keep this evaluation sidecar\n")
+
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+
+    assert existing.read_text() == "# keep this evaluation sidecar\n"
+
+
+def test_env_setup_does_not_add_starter_evaluations_to_a_custom_environment(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    # the arithmetic starter scorer calls the neighboring environment's reward with its own
+    # example, so adding it on a rerun makes an unrelated custom environment fail or score nonsense.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "environment.py").write_text("def load_environment(): return object()\n")
+
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+
+    assert not (tmp_path / "evaluations.py").exists()
+    assert "evaluations.py" not in capsys.readouterr().out
+    # the rest of the scaffold still lands: this is about the suite, not about refusing to run.
+    assert (tmp_path / "configs/rl.toml").is_file()
 
 
 def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path, capsys) -> None:
@@ -1099,6 +1202,13 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
 
     env_py = (tmp_path / "environment.py").read_text()
     assert "EnvironmentMultiTurn" in env_py  # genuinely a multi-turn scaffold
+    evaluations_text = (tmp_path / "evaluations.py").read_text()
+    assert "load_evaluations(environment=None)" in evaluations_text
+    # the multi-turn scaffold gets its own suite. `reward(response, example)` with no episode state
+    # sends `_score_one` down the single-turn branch (flash/envs/adapter.py:237-243), which grades an
+    # EMPTY transcript -- the arithmetic suite scored this guess-the-number env 1.0 on "12".
+    assert "self.environment.reward(response, example)" not in evaluations_text
+    assert "step_episode" in evaluations_text
     # the docstring documents all three algorithms train off the multi-turn env (no opd carve-out)
     assert "distils EVERY assistant turn" in env_py
     assert "single-turn only" not in env_py
@@ -1163,6 +1273,106 @@ def test_env_setup_multi_turn_flag_scaffolds_multiturn(monkeypatch, tmp_path) ->
     )
     assert "EnvironmentMultiTurn" in (tmp_path / "environment.py").read_text()
     assert "secret whole number" in (tmp_path / "dataset/train.jsonl").read_text()
+
+
+def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_path) -> None:
+    # the multi-turn scaffold ships its own evaluations.py, and `env eval` sends one prompt and
+    # grades one reply. so the starter grades the FIRST action's format rather than delegating to
+    # the environment, which with no episode state would score an empty transcript. asserting the
+    # file exists would not catch a sidecar that raises on every case, which reads as the model
+    # failing rather than as a broken template.
+    monkeypatch.chdir(tmp_path)
+    assert (
+        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
+        == 0
+    )
+    assert (tmp_path / "evaluations.py").is_file()
+
+    from flash.envs.evaluations import load_evaluation_suites
+    from flash.envs.loader import load_freesolo_environment
+
+    environment = load_freesolo_environment(str(tmp_path / "environment.py"))
+    suite = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0]
+    case = suite.cases()[0]
+
+    # a reply `step_episode` can read: a single in-range integer scores full marks.
+    passing = suite.score(case, "50")
+    assert passing.passed is True
+    assert passing.score == 1.0
+
+    # and one it cannot is graded, not raised: the template reports why rather than erroring out.
+    failing = suite.score(case, "somewhere in the middle")
+    assert failing.passed is False
+    assert failing.score == 0.0
+    assert "single integer" in failing.reason
+
+
+def test_env_setup_multi_turn_eval_case_does_not_duplicate_the_episode_prompt(
+    monkeypatch, tmp_path
+) -> None:
+    # `env eval` builds the request through environment.prompt_messages(), so the scaffolded
+    # case's `input` is a dataset row, not a finished prompt. spelling the reply-instructions
+    # block into the case as well sent it twice and evaluated a prompt training never used,
+    # defeating the fix that made eval match training in the first place (cursor).
+    monkeypatch.chdir(tmp_path)
+    assert (
+        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
+        == 0
+    )
+
+    from flash.envs.evaluations import load_evaluation_suites
+    from flash.envs.loader import load_freesolo_environment
+
+    environment = load_freesolo_environment(str(tmp_path / "environment.py"))
+    case = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0].cases()[
+        0
+    ]
+    prompt = "\n".join(
+        str(message.get("content") or "")
+        for message in environment.prompt_messages({"input": case.input})
+    )
+
+    # the instructions reach the model exactly once, and they come from the environment.
+    assert prompt.count("Reply with a single integer per turn") == 1
+    assert "Reply with a single integer per turn" not in case.input
+    # and the case still carries the part of the prompt only the dataset row knows.
+    assert "secret whole number between 1 and 100" in case.input
+
+
+def test_starter_evaluator_fails_a_near_miss_the_environment_rejects(monkeypatch, tmp_path) -> None:
+    """A shaped reward's partial credit is not a pass.
+
+    The starter sidecar delegates to the environment, and a shaped reward pays partial credit for a
+    wrong answer -- the multi-turn starter's `score_episode` scores a near miss as `closeness * 0.5`
+    with `success=False`. Returning that bare float let `normalize_eval_result` mark every positive
+    score as passed, so an incorrect answer was reported as a passing evaluation case: a graded
+    failure reading as model success, which is the one thing the suite exists to detect.
+
+    The scaffolded single-turn environment happens to reward 1.0/0.0, where "positive" and "the
+    environment says this succeeded" coincide -- so the two rules are only distinguishable against
+    an environment that actually shapes its reward, which is what any real one does.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+
+    from flash.envs.evaluations import load_evaluation_suites
+
+    class ShapedEnvironment:
+        """Pays partial credit for a wrong answer, exactly as the multi-turn starter does."""
+
+        def reward(self, response, example):
+            return 0.5
+
+        def grade(self, response, example):
+            return False
+
+    suite = load_evaluation_suites(tmp_path / "environment.py", environment=ShapedEnvironment())[0]
+    case = suite.cases()[0]
+
+    scored = suite.score(case, "the wrong answer, but close")
+
+    assert scored.score == 0.5, "the shaped reward must reach the report unchanged"
+    assert scored.passed is False
 
 
 def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp_path) -> None:
