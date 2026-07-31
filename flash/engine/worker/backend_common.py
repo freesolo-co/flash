@@ -630,6 +630,83 @@ def stall_tail_fields(
     return fields
 
 
+# the ray logs worth keeping when a raylet dies. the driver's own stdout only ever shows the
+# downstream symptom ("Failed to register worker to Raylet: ... End of file"); the reason the raylet
+# went away is in these. deliberately a small allowlist -- a ray session dir also holds per-worker
+# logs that can run to hundreds of files on a 128-core box.
+RAY_FAILURE_LOGS = (
+    "raylet.out",
+    "raylet.err",
+    "gcs_server.out",
+    "gcs_server.err",
+    "dashboard_agent.log",
+    "dashboard.log",
+)
+# enough to carry a stack and the lines before it, without turning an artifact upload into the
+# reason a failing run takes even longer to report.
+RAY_LOG_TAIL_BYTES = 64 * 1024
+
+
+def latest_ray_session_dir(root: str = "/tmp/ray") -> str | None:
+    """the most recent ray session directory, or None if ray never started one.
+
+    ray names these ``session_<timestamp>_<pid>`` and also maintains a ``session_latest`` symlink,
+    but the symlink is removed on a clean shutdown, so pick the newest real directory instead: the
+    case this exists for is the one where ray did NOT shut down cleanly.
+    """
+    try:
+        sessions = [
+            os.path.join(root, name)
+            for name in os.listdir(root)
+            if name.startswith("session_") and os.path.isdir(os.path.join(root, name))
+        ]
+    except OSError:
+        return None
+    if not sessions:
+        return None
+    return max(sessions, key=lambda path: os.path.getmtime(path))
+
+
+def collect_ray_failure_logs(
+    dest_dir: str, *, root: str = "/tmp/ray", tail_bytes: int = RAY_LOG_TAIL_BYTES
+) -> list[str]:
+    """copy the tail of ray's own logs into ``dest_dir`` so a dead raylet leaves evidence.
+
+    when a raylet dies the driver prints only its own downstream failure, and ray's session dir --
+    which holds the actual cause -- lives on the pod and goes away with it. that makes a raylet
+    failure undiagnosable from uploaded artifacts and costs a paid gpu run per guess (VERL-115).
+
+    best-effort by construction: this runs on a path that is ALREADY failing, so it must not be able
+    to replace the real error with its own. every step is guarded and the return value is simply
+    whichever files were captured.
+    """
+    session = latest_ray_session_dir(root)
+    if session is None:
+        return []
+    logs_dir = os.path.join(session, "logs")
+    captured: list[str] = []
+    for name in RAY_FAILURE_LOGS:
+        src = os.path.join(logs_dir, name)
+        try:
+            size = os.path.getsize(src)
+            with open(src, "rb") as handle:
+                # the tail, not the head: a crash reason is at the end of the file.
+                if size > tail_bytes:
+                    handle.seek(size - tail_bytes)
+                payload = handle.read()
+        except OSError:
+            continue
+        dst = os.path.join(dest_dir, f"ray_{name}")
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            with open(dst, "wb") as out:
+                out.write(payload)
+        except OSError:
+            continue
+        captured.append(dst)
+    return captured
+
+
 def run_verl_training(
     cmd: list[str],
     *,

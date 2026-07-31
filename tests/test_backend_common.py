@@ -1736,3 +1736,78 @@ def test_the_flashinfer_probe_runs_against_the_verl_interpreter(monkeypatch):
     vc.resolve_blackwell_attention_backends("/verl/bin/python", (12, 0))
     assert len(calls) == 1
     assert calls[0][0] == "/verl/bin/python"
+
+
+def _ray_session(root, name, *, files, mtime=None):
+    """build a ray session dir the way ray lays one out: session_<ts>_<pid>/logs/<file>."""
+    logs = root / name / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    for filename, body in files.items():
+        (logs / filename).write_text(body)
+    if mtime is not None:
+        os.utime(root / name, (mtime, mtime))
+    return root / name
+
+
+def test_ray_failure_logs_are_collected_so_a_dead_raylet_leaves_evidence(tmp_path):
+    # a raylet death prints only the driver's downstream symptom ("Failed to register worker to
+    # Raylet: ... End of file"). the reason lives in ray's own session logs, which die with the pod.
+    # without this, every raylet failure costs a paid gpu run per guess (VERL-115).
+    root = tmp_path / "ray"
+    _ray_session(
+        root,
+        "session_2026-07-31_19-19-30_1_1",
+        files={
+            "raylet.err": "worker_pool.cc:600: Some workers have not registered within the timeout",
+            "gcs_server.out": "gcs alive",
+            "dashboard_agent.log": "agent failed to start",
+        },
+    )
+    dest = tmp_path / "artifacts"
+
+    captured = vc.collect_ray_failure_logs(str(dest), root=str(root))
+
+    names = sorted(os.path.basename(p) for p in captured)
+    assert names == ["ray_dashboard_agent.log", "ray_gcs_server.out", "ray_raylet.err"]
+    assert "have not registered within the timeout" in (dest / "ray_raylet.err").read_text()
+
+
+def test_ray_log_collection_picks_the_newest_session_not_a_stale_one(tmp_path):
+    # a reused worker accumulates session dirs. collecting an older one would report a PREVIOUS
+    # run's raylet as this run's cause -- worse than collecting nothing, because it reads as evidence.
+    root = tmp_path / "ray"
+    _ray_session(root, "session_old", files={"raylet.err": "STALE"}, mtime=1_000_000)
+    _ray_session(root, "session_new", files={"raylet.err": "CURRENT"}, mtime=2_000_000)
+    dest = tmp_path / "artifacts"
+
+    vc.collect_ray_failure_logs(str(dest), root=str(root))
+
+    assert (dest / "ray_raylet.err").read_text() == "CURRENT"
+
+
+def test_ray_log_collection_keeps_the_tail_because_the_crash_is_at_the_end(tmp_path):
+    # raylet.out on a 128-core box is large and the reason it died is the LAST thing in it. taking
+    # the head would upload megabytes of startup chatter and drop the only line that matters.
+    root = tmp_path / "ray"
+    body = ("filler\n" * 20000) + "FATAL: the actual cause\n"
+    _ray_session(root, "session_1", files={"raylet.out": body})
+    dest = tmp_path / "artifacts"
+
+    vc.collect_ray_failure_logs(str(dest), root=str(root), tail_bytes=2048)
+
+    written = (dest / "ray_raylet.out").read_text()
+    assert "FATAL: the actual cause" in written
+    assert len(written) <= 2048
+
+
+def test_ray_log_collection_cannot_mask_the_real_error_it_runs_after(tmp_path):
+    # this runs on an ALREADY-failing path. if a missing/unreadable ray dir could raise here, the
+    # collector would replace the run's real traceback with its own and make things strictly worse.
+    dest = tmp_path / "artifacts"
+
+    assert vc.collect_ray_failure_logs(str(dest), root=str(tmp_path / "nonexistent")) == []
+    assert vc.latest_ray_session_dir(str(tmp_path / "nonexistent")) is None
+
+    # a session dir with no logs subdir at all -- ray died before creating it.
+    (tmp_path / "ray" / "session_1").mkdir(parents=True)
+    assert vc.collect_ray_failure_logs(str(dest), root=str(tmp_path / "ray")) == []

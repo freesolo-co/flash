@@ -27,6 +27,7 @@ from flash.engine.worker.adapter import (
     require_vllm_for_rollout_func,
     stamp_adapter_provenance,
 )
+from flash.engine.worker.backend_common import collect_ray_failure_logs
 from flash.engine.worker.decoding import (
     graded_text,
     prompt_opens_thinking,
@@ -389,6 +390,19 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", sanitize_diagnostic(up_err, limit=500))
+        try:
+            # when a raylet dies, the driver traceback uploaded above records only the downstream
+            # symptom ("Failed to register worker to Raylet: ... End of file"); the reason is in
+            # ray's session logs, which live on the pod and vanish with it. that makes a raylet
+            # failure undiagnosable from artifacts and costs a paid gpu run per guess (VERL-115).
+            # runs for every mode: all three backends start ray, and collection is a no-op when the
+            # failure had nothing to do with it.
+            for log_path in collect_ray_failure_logs("/tmp/ray-failure-logs"):
+                hf_upload_file(log_path, os.path.basename(log_path))
+        except Exception as ray_err:
+            # this is the failure path already. a collector that could raise here would replace the
+            # run's real error with its own.
+            print("ray-log-collect warn:", sanitize_diagnostic(ray_err, limit=500))
         # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Infra failures
         # keep same-size retry semantics and must never be reclassified as OOM.
         hb_flags = _worker_failure_flags(e)
