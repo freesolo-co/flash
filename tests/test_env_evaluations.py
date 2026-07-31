@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import threading
 import time
@@ -1487,6 +1488,52 @@ def test_a_sidecar_package_submodule_wins_over_one_already_cached(
             del sys.modules[name]
 
 
+def test_a_sidecar_namespace_package_wins_over_one_already_cached(tmp_path) -> None:
+    """A sibling directory without __init__.py owns its plain name just as a package does.
+
+    PEP 420 makes a bare `graders/` importable, but the owned-name scan required the marker file,
+    so a namespace sibling was never counted -- another environment's cached `graders.rules`
+    survived the sweep and the suite graded with that environment's scoring code (codex[bot]).
+    """
+    unrelated = tmp_path / "unrelated"
+    (unrelated / "graders").mkdir(parents=True)
+    (unrelated / "graders" / "__init__.py").write_text("")
+    (unrelated / "graders" / "rules.py").write_text("GOLD = 'UNRELATED'\n")
+    sys.path.insert(0, str(unrelated))
+    try:
+        import graders.rules as preexisting
+
+        assert preexisting.GOLD == "UNRELATED"
+    finally:
+        sys.path.remove(str(unrelated))
+
+    env_dir = tmp_path / "env"
+    # no __init__.py: this environment's `graders` is a namespace package
+    (env_dir / "graders").mkdir(parents=True)
+    (env_dir / "environment.py").write_text("def load_environment():\n    return None\n")
+    (env_dir / "graders" / "rules.py").write_text("GOLD = 'OWN-SIBLING'\n")
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'namespace'\n"
+        "    def cases(self):\n"
+        "        from graders.rules import GOLD\n"
+        "        return [EvalCase(id='c', input=GOLD, expected=GOLD)]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    try:
+        suite = load_evaluation_suites(env_dir)[0]
+        # this environment's own rules, not the ones another package left cached
+        assert suite.cases()[0].input == "OWN-SIBLING"
+        # and the process keeps the module it had before the sidecar ran
+        assert sys.modules["graders.rules"] is preexisting
+        assert sys.modules["graders.rules"].GOLD == "UNRELATED"
+    finally:
+        for name in [n for n in list(sys.modules) if n == "graders" or n.startswith("graders.")]:
+            del sys.modules[name]
+
+
 def test_a_lazily_imported_helper_keeps_its_state_across_cases(tmp_path) -> None:
     """A helper's module-level state survives from one callback to the next.
 
@@ -1659,6 +1706,47 @@ def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_pat
         aborting.join(timeout=10)
 
 
+def test_env_eval_abort_does_not_hold_the_process_open(tmp_path) -> None:
+    """The aborted eval must let the INTERPRETER exit, not just return from main().
+
+    `shutdown(wait=False)` returns immediately but concurrent.futures registers an
+    interpreter-exit hook that joins every worker anyway, so the process stayed alive until the
+    in-flight chat_stream hit its 30-minute timeout even though the CLI had already reported
+    `aborted` (codex[bot]). The test above measures main()'s return, which the executor already
+    satisfied; only process exit can distinguish the two, so this one runs a real subprocess.
+    """
+    driver = tmp_path / "abort_driver.py"
+    driver.write_text(
+        "import argparse, threading, sys\n"
+        "from flash.cli.env_eval import _generate_concurrently\n"
+        "release = threading.Event()\n"
+        "def chat(*a, **k):\n"
+        # stands in for a generation still streaming when the user aborts. a real one blocks on
+        # the client's 30-minute read timeout; 300s is far past any plausible clean exit.
+        "    release.wait(timeout=300)\n"
+        "    return 'late'\n"
+        "import flash.cli.env_eval as env_eval\n"
+        "env_eval._generate_case = chat\n"
+        "args = argparse.Namespace(concurrency=2)\n"
+        "worker = threading.Thread(\n"
+        "    target=_generate_concurrently, args=(None, 't', [[{'role': 'user'}]], args),\n"
+        "    daemon=True,\n"
+        ")\n"
+        "worker.start()\n"
+        "import time; time.sleep(0.5)\n"  # let the generation actually start
+        "print('aborted', flush=True)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, str(driver)],
+        capture_output=True,
+        text=True,
+        # generous vs a clean exit, far under the 300s the blocked generation would impose
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "aborted" in completed.stdout
+
+
 def test_case_ids_stay_unique_when_an_id_looks_like_a_disambiguated_one() -> None:
     # the disambiguated form is itself a legal explicit id, so the suffix has to be retried
     # until it is free. cases `a`, `a`, `a#2` resolved to `a`, `a#2`, `a#2` and reintroduced
@@ -1724,6 +1812,58 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
     assert generation_threads
     assert threading.current_thread().name not in generation_threads
     assert "overall: PASS" in capsys.readouterr().out
+
+
+def test_env_eval_grades_the_answer_not_the_reasoning(monkeypatch, tmp_path, capsys) -> None:
+    # a thinking deployment answers with a balanced `<think>...</think>answer`, and handing the
+    # whole string to the suite failed every case for a scorer that reads the answer strictly --
+    # it saw `<think>` (codex[bot]). training grades the answer-only view, so an evaluation that
+    # grades the raw emission disagrees with training about the same checkpoint.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'strict'\n"
+        "    def cases(self): return [EvalCase(id='c1', input='2+2', expected='4')]\n"
+        "    def score(self, case, response):\n"
+        # the strictness is the point: int() is what a scorer parsing the first token does, and
+        # it raises on the `<` of `<think>` rather than merely scoring 0.
+        "        return int(response.strip()) == int(case.expected)\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "<think>2+2 is 4</think>4"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 0
+    assert "overall: PASS" in capsys.readouterr().out
+
+
+def test_env_eval_reports_the_whole_completion_it_graded() -> None:
+    # stripping for the scorer must not shorten what is recorded: the reasoning is what makes a
+    # failed case diagnosable, so the result keeps the full emission and the upload carries it.
+    from flash.cli.env_eval import _score_case
+
+    seen: list[str] = []
+
+    class Suite:
+        def score(self, case, response):
+            seen.append(response)
+            # a thinking-aware scorer can still reach the reasoning through the structured views
+            assert response.thinking == "2+2 is 4"
+            assert response.raw == "<think>2+2 is 4</think>4"
+            return response == "4"
+
+    case = EvalCase(id="c1", input="2+2", expected="4")
+    result = _score_case(Suite(), case, "c1", "<think>2+2 is 4</think>4")
+
+    assert seen == ["4"]
+    assert result.passed
+    assert result.response == "<think>2+2 is 4</think>4"
 
 
 def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, capsys) -> None:
