@@ -692,7 +692,7 @@ def test_save_steps_reach_the_horizon_they_were_validated_against(monkeypatch):
 
 
 def test_final_publish_is_suppressed_when_exact_save_steps_are_set():
-    # parity with the trl path (rl.py: `if final_save_due(...)`): with save_at_steps set the customer
+    # parity with the retired trl path: with save_at_steps set the customer
     # asked for those steps and nothing else, so the final step must not add an unrequested
     # deployable. without them the final checkpoint is still preserved.
     from flash.engine.steps import final_save_due
@@ -2425,7 +2425,7 @@ def _notes_common():
 
 def test_train_notes_carry_the_trl_observability_fields():
     # the console is uploaded only on FAILURE, so a successful run's train_meta is the sole record
-    # of how it ran. the trl path reports these; without them a verl run cannot be compared to a
+    # of how it ran. the retired trl path reported these; without them a verl run cannot be compared to a
     # trl one, and the fp8-kv decision (resolved per-card at runtime) leaves no trace at all.
     notes = rl_verl._build_verl_train_notes(
         _notes_inp(),
@@ -2491,7 +2491,7 @@ def test_verl_grpo_wandb_names_survive_hydra_special_characters():
 
 
 def test_train_notes_record_the_batch_shape_one_step_consumed():
-    # the trl path reports the batch shape, so without it a verl run's reward curve cannot be read
+    # the retired trl path reported the batch shape, so without it a verl run's reward curve cannot be read
     # against a trl one: the same step count at a different batch size is a different experiment.
     notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common())
     assert notes["max_completion_len"] == 512
@@ -2812,11 +2812,10 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
 
 
 def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch, capsys):
-    # per_turn only diverges from per_episode when there is more than one assistant turn to credit:
-    # trl reaches GRPOPerTurnTrainer solely through use_rollout_func, which requires is_multi_turn.
+    # per_turn only diverges from per_episode when there is more than one assistant turn to credit.
     # the multi-turn/tool guard above already rejects every env that could get there, so anything
-    # reaching here is single-turn and the two modes are the same objective -- trl accepts the key on
-    # exactly these envs. rejecting it would break configs that run correctly on the trl backend.
+    # reaching here is single-turn and the two modes are the same objective. rejecting a key that
+    # is merely redundant would break configs that are asking for nothing wrong.
     inp = _capability_resolve(
         monkeypatch,
         _capability_env(),

@@ -251,20 +251,20 @@ def build_verl_overrides(cfg: dict) -> list[str]:
 
     carries the flash grpo recipe: dr-grpo advantages (no std norm, constant-length loss), the
     job's kl coefficient (flash default 0 = no kl term), constant lr, seed, sampling top_p, and one
-    ppo epoch so total_training_steps counts optimizer updates. unlike trl's generation-batch reuse,
+    ppo epoch so total_training_steps counts optimizer updates. unlike a generation-batch-reuse trainer,
     verl samples a fresh rollout per update, so rollout volume and policy staleness still differ.
     """
     kl_on = float(cfg["kl_coef"]) > 0
     o = [
         "algorithm.adv_estimator=grpo",
         # dr-grpo recipe: group-mean-centered advantages with NO std normalization, and a
-        # constant-length loss aggregation (no per-response length bias). matches the trl path's
+        # constant-length loss aggregation (no per-response length bias). matches the retired trl path's
         # scale_rewards=none + loss_type=dr_grpo.
         "algorithm.norm_adv_by_std_in_grpo=False",
         f"actor_rollout_ref.actor.loss_agg_mode={cfg['loss_agg_mode']}",
         "algorithm.use_kl_in_reward=False",
         # truncated importance sampling (token-level, cap 2.0): corrects the vllm-rollout vs
-        # fsdp-train policy mismatch. matches the trl path's tis recipe (token_truncate, c_max=2.0);
+        # fsdp-train policy mismatch. matches the retired trl path's tis recipe (token_truncate, c_max=2.0);
         # verl otherwise defaults to sequence-level tis, so pin token to match flash.
         "algorithm.rollout_correction.rollout_is=token",
         "algorithm.rollout_correction.rollout_is_threshold=2.0",
@@ -279,7 +279,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"data.max_response_length={cfg['max_response_len']}",
         "data.prompt_key=prompt",
         # rollout prompt parity: verl renders raw messages with the tokenizer's chat template;
-        # thread flash's thinking mode so the rollout sees the same prompt as the trl path.
+        # thread flash's thinking mode so the rollout sees the same prompt the retired trl path saw.
         f"+data.apply_chat_template_kwargs.enable_thinking={str(bool(cfg.get('thinking', False))).lower()}",
         f"data.seed={cfg['seed']}",
         # rollout sampling seed. NOT `rollout.seed`: verl 0.8.0's RolloutConfig declares no such
@@ -317,7 +317,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
-        # memory: match the trl path's gradient checkpointing.
+        # memory: match the retired trl path's gradient checkpointing.
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         # 32k contexts: fused linear-CE computes logprobs/entropy from hidden states + lm_head in
         # chunks (FusedLinearForPPO), never materializing the [tokens, vocab] logits tensor
@@ -333,7 +333,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.actor.optim.lr={cfg['lr']}",
         # only the lora adapter is trainable; decaying its weights toward zero is not part of grpo.
         "actor_rollout_ref.actor.optim.weight_decay=0.0",
-        # 0 warmup -> verl's warmup+constant scheduler holds lr flat, matching the trl constant recipe.
+        # 0 warmup -> verl's warmup+constant scheduler holds lr flat, matching the retired constant recipe.
         "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={cfg['prompts_per_step']}",
         # 32k contexts: bound the backward pass by TOKENS, not by sequence count. a fixed
@@ -346,7 +346,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         "actor_rollout_ref.actor.use_dynamic_bsz=true",
         f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={cfg['max_token_len_per_gpu']}",
         # ppo_epochs multiplies verl's update loop, so its default of 1 preserves the requested update
-        # count and on-policy baseline. unlike trl reuse, verl samples a fresh rollout for every update.
+        # count and on-policy baseline: verl samples a fresh rollout for every update, with no reuse.
         f"actor_rollout_ref.actor.ppo_epochs={cfg['ppo_epochs']}",
         # multi-gpu shape: shard every card along the sequence (ulysses) rather than the batch, and
         # give vllm the same width for tensor parallelism. verl builds mesh_shape=(dp, sp) from this,
@@ -466,7 +466,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # this the shim would receive no entropy and raise rather than silently skip the masking.
         o.append("actor_rollout_ref.actor.calculate_entropy=True")
     if cfg.get("fp8_kv"):
-        # fp8 kv cache on ada/hopper+ (cc>=8.9), matching the trl colocate path; tis (above) covers
+        # fp8 kv cache on ada/hopper+ (cc>=8.9), matching engine/vram.py's sizing; tis (above) covers
         # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
         # engine_kwargs.vllm struct (it is not a default field).
         o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
@@ -490,7 +490,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     )
     if _reasoning_parser:
         # the engine half of structured outputs: hold the guided grammar until </think> closes, so a
-        # thinking model reasons freely and only its answer is constrained. on the trl path this is
+        # thinking model reasons freely and only its answer is constrained. on the retired trl path this is
         # injected into the colocate llm kwargs; verl spreads engine_kwargs.vllm straight into
         # AsyncEngineArgs, where reasoning_parser is a real field, so a plain override suffices.
         # '+' appends under the existing engine_kwargs.vllm struct, as kv_cache_dtype does above.
@@ -664,7 +664,7 @@ def _build_verl_train_notes(
         "steps": steps_run,
         "epochs": inp["epochs"],
         "retained_prompts": retained_prompts,
-        # matches the trl path: without it a resumed run is indistinguishable from a fresh one.
+        # matches the retired trl path: without it a resumed run is indistinguishable from a fresh one.
         "resumed": resumed,
         "group_size": inp["group_size"],
         "reward_history": reward_history,
@@ -689,7 +689,7 @@ def _build_verl_train_notes(
         # engaged. this is resolved per-card (cc>=8.9, and never for gdn hybrids), so it is a property
         # of the run rather than of the config.
         "vllm_kv_cache_dtype": "fp8" if fp8_kv else None,
-        # trl pins vllm's prefill batch explicitly because it hardcodes 4096; the verl path sets no
+        # an explicit vllm prefill-batch pin is only needed when the caller hardcodes 4096; this path sets no
         # such override, so the engine keeps its own default. None records "not pinned by flash"
         # rather than asserting a number flash never chose.
         "vllm_max_num_batched_tokens": None,
@@ -698,7 +698,7 @@ def _build_verl_train_notes(
         # one optimizer step consumes exactly this many completions: ulysses shards along the
         # sequence, so dp stays 1 and the global batch is not split across cards.
         "generations_per_step": inp["prompts_per_step"] * inp["group_size"],
-        # trl fixes a per-device SEQUENCE count and carries the rest in grad accumulation. verl
+        # the retired trl path fixed a per-device SEQUENCE count and carried the rest in grad accumulation. verl
         # bounds the backward pass by TOKENS instead (use_dynamic_bsz + ppo_max_token_len_per_gpu),
         # so a micro-batch holds however many sequences fit the budget and varies step to step.
         # there is no constant to report, and reporting a fabricated one would read as comparable.
@@ -707,7 +707,7 @@ def _build_verl_train_notes(
         "ppo_max_token_len_per_gpu": inp["engine_len"],
         "wandb_project": wandb_project,
         "wandb_run_name": wandb_run_name,
-        # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
+        # the sdk's link_wandb reads notes["wandb_url"]; an in-process trainer gets it from the parent's live
         # wandb.run, verl from the child marker (see verl_common.render_wandb_link_shim).
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
@@ -872,9 +872,9 @@ def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
 
     the value MUST be wrapped in ``StructuredOutputsParams``. vllm accepts a raw dict here, passes
     ``_verify_args()``, and then stores a plain dict with no ``.json`` attribute -- constraining
-    nothing, with no error and no log line. trl avoids this by wrapping in its colocate path
-    (generation/vllm_generation.py), which is exactly why flash's trl path passes the spec as a
-    plain dict; on verl nothing wraps it, so the shim must.
+    nothing, with no error and no log line. the retired trl path got the wrapping for free from its
+    colocate generation layer and so passed the spec as a plain dict; on verl nothing wraps it, so
+    the shim must.
 
     the object survives the worker -> server hop: that hop is ``server.generate.remote(...)``, a ray
     actor rpc (cloudpickle), not http/json, so it arrives as the same dataclass it left as.
@@ -893,7 +893,7 @@ def _flash_patch_structured_outputs():
 
     patched on ``_run_agent_loop`` for the same reason as the stop strings: it receives the
     per-sample dict after verl's validate/greedy overrides, so the constraint also applies to
-    validation rollouts -- matching trl, where it lives in generation_kwargs and is not swapped out
+    validation rollouts -- as on the retired trl path, where it lived in generation_kwargs and was not swapped out
     for eval.
     """
     original = _flash_so_agent_loop.AgentLoopWorker._run_agent_loop
@@ -976,9 +976,9 @@ if not getattr(
 
 
 def render_stop_sequences_shim(stop_sequences: tuple[str, ...]) -> str:
-    """return the sitecustomize source that gives verl's rollout trl's stop-string behavior.
+    """return the sitecustomize source that gives verl's rollout flash's stop-string behavior.
 
-    on the trl backend flash puts ``stop`` into ``generation_kwargs``, which reaches vllm's
+    on the retired trl backend flash puts ``stop`` into ``generation_kwargs``, which reaches vllm's
     ``SamplingParams`` unchanged. verl builds its sampling params as a literal dict in
     ``AgentLoopWorker.generate_sequences`` (agent_loop.py) with no stop field and no passthrough, so
     the key has to be inserted there. the value then rides the existing dict all the way into
@@ -988,7 +988,7 @@ def render_stop_sequences_shim(stop_sequences: tuple[str, ...]) -> str:
     dict: patching further down would have to reconstruct which request the params belong to, and
     the tool/multi-turn loops pass the same dict through untouched.
 
-    token-level semantics match trl exactly. vllm truncates ``output_text`` at a stop-string match
+    token-level semantics match the retired trl path exactly. vllm truncates ``output_text`` at a stop-string match
     but leaves ``token_ids`` intact, and both backends read ``output.token_ids`` -- so the trained
     tokens are the same on either backend, including the trailing delimiter tokens.
     """
@@ -1005,7 +1005,7 @@ def _flash_patch_run_agent_loop():
 
     ``_run_agent_loop`` receives the fully-built dict for one sample, after verl has applied its
     validation/greedy overrides. patching here rather than at dict construction means the stop
-    strings survive those overrides and apply to validation rollouts too, matching trl, where the
+    strings survive those overrides and apply to validation rollouts too, as on the retired trl path, where the
     stop list lives in generation_kwargs and is not swapped out for eval.
     """
     original = _flash_agent_loop.AgentLoopWorker._run_agent_loop
@@ -1075,10 +1075,10 @@ if not getattr(
 
 
 def render_per_turn_credit_shim(per_turn_credit: bool) -> str:
-    """return the sitecustomize source that gives verl trl's per-turn group-relative credit.
+    """return the sitecustomize source that gives verl per-turn group-relative credit.
 
     verl credits a whole episode: ``compute_grpo_outcome_advantage`` centres one scalar per rollout
-    against its group and broadcasts it across every response token. trl's per-turn mode centres
+    against its group and broadcasts it across every response token. per-turn mode instead centres
     each TURN against the same turn of its group siblings, so a good turn inside a bad episode
     still gets positive advantage.
 
@@ -1086,8 +1086,8 @@ def render_per_turn_credit_shim(per_turn_credit: bool) -> str:
     estimator would be the tidier hook, but ``compute_advantage`` forwards ``non_tensor_batch`` to
     exactly one estimator by name (``if adv_estimator in (AdvantageEstimator.GDPO, "gdpo")``), so a
     custom one could never see the spans it needs. wrapping keeps stock grpo as the baseline and
-    overwrites only the token axis, which is the same shape as trl's GRPOPerTurnTrainer overriding
-    its parent's scalar advantages.
+    overwrites only the token axis, so the episode-level centring stays exactly as stock grpo
+    computed it and only the per-turn refinement is layered on top.
 
     the fallback is per GROUP, not per row: grpo centres each rollout against its group, so a group
     holding a mix of per-turn and episode credit would compare quantities of different scales. one
@@ -1205,20 +1205,19 @@ _flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage
 
 
 def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
-    """return the sitecustomize source that adds trl's top-entropy token masking to verl.
+    """return the sitecustomize source that adds top-entropy token masking to verl.
 
-    trl's GRPOTrainer keeps only the top ``entropy_quantile`` fraction of response tokens in the
-    policy-gradient term (``get_high_entropy_mask``); verl has no such knob. the mask is expressible
+    the objective keeps only the top ``entropy_quantile`` fraction of response tokens in the
+    policy-gradient term; verl has no such knob. the mask is expressible
     as an extra factor on ``response_mask``, so this patches ``ppo_loss`` rather than registering a
     custom policy loss: ``ppo_loss`` computes per-token entropy but never forwards it to
     ``policy_loss_fn``, so a registered loss could not see the entropy it needs to threshold on.
 
-    the mask applies to the policy-gradient term ONLY, which is what trl does -- it multiplies
+    the mask applies to the policy-gradient term ONLY: it multiplies
     ``per_token_loss`` by the mask and then adds the kl term, so kl and the entropy bonus stay on the
     full response mask. equivalence also needs a mask-independent denominator: flash pins
     ``seq-mean-token-sum-norm``, which divides by ``global_batch_size * loss_scale_factor``, so
-    dropping tokens from the numerator does not rescale the remaining ones (the same property that
-    makes trl's dr_grpo normalizer ``per_token_loss.size(0) * max_completion_length``).
+    dropping tokens from the numerator does not rescale the remaining ones.
     """
     if entropy_quantile is None or float(entropy_quantile) >= 1.0:
         return ""
@@ -1241,10 +1240,10 @@ _flash_entropy_state = _flash_threading.local()
 
 
 def _flash_high_entropy_mask(entropy, response_mask):
-    """trl get_high_entropy_mask: keep tokens at or above the global entropy quantile."""
+    """keep tokens at or above the global entropy quantile."""
     local = entropy[response_mask.bool()].float().reshape(-1)
     # the quantile is over the whole global batch, not the local shard, so every rank thresholds
-    # identically. trl gathers via accelerate; verl's actor shards over the default process group.
+    # identically. verl's actor shards over the default process group, so the quantile must be global.
     if _flash_dist.is_available() and _flash_dist.is_initialized() and _flash_dist.get_world_size() > 1:
         sizes = [_flash_torch.zeros(1, dtype=_flash_torch.long, device=local.device)
                  for _ in range(_flash_dist.get_world_size())]
@@ -1253,7 +1252,7 @@ def _flash_high_entropy_mask(entropy, response_mask):
         if largest == 0:
             return _flash_torch.zeros_like(entropy, dtype=_flash_torch.bool)
         # pad with a negative sentinel: entropy is non-negative, so it can never collide with a
-        # real value and is dropped after the gather (trl uses the same -1e9 trick).
+        # real value and is dropped after the gather.
         padded = _flash_torch.full((largest,), -1e9, dtype=_flash_torch.float32, device=local.device)
         padded[: local.numel()] = local
         buckets = [_flash_torch.empty_like(padded) for _ in range(_flash_dist.get_world_size())]
@@ -1273,7 +1272,7 @@ def _flash_masked_policy_loss_fn(loss_mode):
 
     masking here rather than in ppo_loss keeps the mask on the policy-gradient term only: ppo_loss
     aggregates the kl and entropy-bonus terms against its own unmasked response_mask, exactly as
-    trl adds its kl term after multiplying per_token_loss by the entropy mask.
+    the kl term is added after multiplying per_token_loss by the entropy mask.
     """
     inner = _flash_original_get_policy_loss_fn(loss_mode)
 
@@ -1372,7 +1371,7 @@ def score_single_turn(
     raise_on_error: bool = False,
     breakdowns: list[dict[str, float] | None] | None = None,
 ) -> float:
-    """score one single-turn text completion exactly as the trl reward path does.
+    """score one single-turn text completion against flash's live env.
 
     mirrors run_rl.reward_fn's single-turn text branch: graded text -> env.scores_breakdown
     (preferred) or env.reward, minus the optional thinking-length penalty. env scoring errors
@@ -1387,7 +1386,7 @@ def score_single_turn(
     with a plain scalar ``reward`` has no components, and appending an empty dict for it would put a
     real denominator under no numerators and publish a flat 0 for a run that simply has no named
     metrics. a failed grading appends ``None``, which the mean counts as a zero for every name the
-    other completions did report, exactly as trl does; the caller owns the list's lock and bound.
+    other completions did report; the caller owns the list's lock and bound.
     """
     # optimistic until the probe answers: a probe that RAISES is itself a failed grading, and the
     # except branch has to be able to record it -- omitting it instead would drop this completion
@@ -1554,13 +1553,13 @@ class MultiTurnBridge:
 
     the child owns tokens and the engine; this owns the flash env. one session per in-flight
     episode, keyed by the id the child mints. the env's own rollout state is the source of truth
-    for turn budget, doneness, and the terminal episode that gets scored -- exactly the state the
-    trl driver accumulates, so both backends score the same object.
+    for turn budget, doneness, and the terminal episode that gets scored, so the object scored here
+    is the env's own terminal episode rather than a transcript reassembled from the rollout.
 
     ``on_episode_scored(prompt, transcript, reward)`` receives each scored episode so the caller can
     surface it as a rollout sample. multi-turn has no per-completion breakdown to report -- the env
     scores a whole episode through ``rollout_rewards_many``, which returns a scalar -- so only the
-    sample side of the reward observability pair applies here, exactly as on the trl path.
+    sample side of the reward observability pair applies here, exactly as on the retired trl path.
     """
 
     def __init__(
@@ -1756,7 +1755,7 @@ def start_reward_server(score_by_index, *, example_count: int, multi_turn_bridge
     done. single-turn scoring lives at ``<base_url>/score``; when ``multi_turn_bridge`` is given,
     its four episode routes are served alongside it from the same thread pool.
     """
-    # serialize scoring so the flash env sees sequential calls, matching the trl reward path's
+    # serialize scoring so the flash env sees sequential calls, matching the retired trl reward path's
     # contract; verl's reward manager may otherwise call the reward with several workers at once.
     score_lock = threading.Lock()
 
@@ -2270,7 +2269,7 @@ def _resolve_grpo_inputs():
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
     # fail loud on grpo features the verl backend does not yet honor, so a migration never silently
     # trains without a requested behavior.
-    # structured_outputs: two halves, mirroring the trl path. the constraint itself rides the
+    # structured_outputs: two halves, mirroring the retired trl path. the constraint itself rides the
     # per-sample sampling params via a shim (render_structured_outputs_shim); the reasoning_parser
     # that defers the grammar past </think> is an engine arg, applied as a plain hydra override in
     # _build_verl_overrides. parse raises on a corrupt payload rather than training unconstrained.
@@ -2282,7 +2281,7 @@ def _resolve_grpo_inputs():
             f"[rl-verl] structured outputs: every rollout constrained to "
             f"{describe_structured_outputs(structured_outputs)}"
         )
-    # stop_sequences: on the trl backend these ride generation_kwargs["stop"] into vllm's
+    # stop_sequences: on the retired trl backend these ride generation_kwargs["stop"] into vllm's
     # SamplingParams. verl builds its sampling params without a stop field, so a sitecustomize shim
     # inserts the key; see render_stop_sequences_shim. note grpo_mask_truncated_completions below
     # gates itself OFF when stop_sequences is set, on either backend.
@@ -2331,12 +2330,12 @@ def _resolve_grpo_inputs():
     think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     # flash defaults kl_penalty_coef to 0 (dr-grpo, no kl term); honor it rather than forcing a kl.
     kl_coef = float(gcfg.get("kl_penalty_coef") or 0.0)
-    # advantage_clip is recorded but not applied (the trl path centers advantages without a value
+    # advantage_clip is recorded but not applied (the retired trl path centered advantages without a value
     # clip; verl's grpo advantage is likewise group-centered). log it for parity, do not apply.
     if float(gcfg.get("advantage_clip") or 0.0) > 0:
         print(
             f"[rl-verl] advantage_clip={gcfg['advantage_clip']} recorded; verl centers grpo "
-            "advantages (no value clip), matching the trl path",
+            "advantages (no value clip), matching the retired trl path",
             flush=True,
         )
     mask_truncated_completions = _w.grpo_mask_truncated_completions(_t)
@@ -2344,7 +2343,7 @@ def _resolve_grpo_inputs():
         _t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate
     )
     # warm-start forbids lora_rank, so a set init_from_adapter already raised above; read rank/alpha
-    # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
+    # from the job spec (falling back to the recipe) exactly like the retired trl path's lora config.
     lora_rank = int(_t.lora_rank) if (_t and _t.lora_rank) else int(RECIPE.lora.rank)
     lora_alpha = int(_t.lora_alpha) if (_t and _t.lora_alpha) else int(RECIPE.lora.alpha)
     # warm-start: continue the sft adapter in place (verl lora_adapter_path). uses the SOURCE
@@ -2507,8 +2506,8 @@ def _resolve_grpo_inputs():
     # transcript mid-turn and train on the fragment. the tightest width that can hold any episode
     # this dataset can produce is the engine budget minus the SHORTEST admitted prompt: the child
     # stops generating once the prefix reaches max_model_len, so no episode can exceed that.
-    # max_completion stays the PER-TURN cap, which is exactly what the trl driver does
-    # (per_turn_max_tokens=max_completion, episode budget=engine_len-prompt_len-slack).
+    # max_completion stays the PER-TURN cap (per_turn_max_tokens=max_completion, episode
+    # budget=engine_len-prompt_len-slack).
     max_response_len = (
         max(max_completion, vllm_max_len - min(int(p["prompt_len"]) for p in prompts))
         if multi_turn
@@ -2518,7 +2517,7 @@ def _resolve_grpo_inputs():
     prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
     prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
 
-    # optimizer-update horizon, honoring [train].max_steps exactly like the trl path.
+    # optimizer-update horizon, honoring [train].max_steps exactly like the retired trl path.
     epochs = int(_t.epochs) if (_t and _t.epochs is not None) else int(rl.num_epochs)
     derived_steps = on_policy_steps(
         epochs=epochs, prompt_count=len(prompts), prompts_per_step=prompts_per_step
@@ -2601,7 +2600,7 @@ def _resolve_grpo_inputs():
         "save_freq": save_freq,
         "save_at_steps": save_at_steps,
         "ckpt_to_keep": ckpt_to_keep,
-        # verl's default preserves the update horizon and on-policy baseline; unlike trl reuse, each
+        # verl's default preserves the update horizon and on-policy baseline; with no generation reuse, each
         # update gets a fresh rollout batch.
         "ppo_epochs": 1,
         "seed": int(backend_seed(_w.SEED)),
@@ -2658,7 +2657,7 @@ def run_rl_verl():
     else:
         download_seconds = _w.prefetch_model(inp["model_id"])
 
-    # stable int index -> rollout example, exactly as the trl path (reward maps back via this).
+    # stable int index -> rollout example, exactly as the retired trl path (reward maps back via this).
     ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
     message_prompts = [p["prompt"] for p in prompts]
     indices = [int(r["example_idx"]) for r in ds_rows]
@@ -2740,8 +2739,8 @@ def run_rl_verl():
     if inp["multi_turn"]:
         copy_multi_turn_child_modules(shim_dir)
 
-    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. the buffer
-    # carries what trl's reward TrainerCallback carries -- recent rollouts for the per-step log dump
+    # reward bridge: verl (out of process) -> flash live env. the buffer
+    # carries recent rollouts for the per-step log dump
     # and `sampled_completions`, plus per-name components for `reward_metrics` (#607).
     # the generation size lets the buffer close each generation on the scoring thread that finishes
     # it, rather than when the child's `step:N` line reaches this process: those are the same
@@ -2851,7 +2850,7 @@ def run_rl_verl():
         _spec = _w.JOB_SPEC
         project_name = (_spec.wandb.project if _spec and _spec.wandb else None) or "flash"
         experiment_name = _w.wandb_run_name()
-        # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path — but NOT for
+        # fp8 kv cache on ada/hopper+ (cc>=8.9), matching the sizing math in engine/vram.py. NOT for
         # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
         # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
         try:
@@ -2958,7 +2957,7 @@ def run_rl_verl():
         # session's seconds by every step the checkpoint ever took.
         step_line_times: list[float] = []
         # per-step backlog for `flash runs log -f`, rebuilt from verl's own step lines because its
-        # trainer runs out of process and cannot host trl's callback. read by the liveness thread
+        # trainer runs out of process and cannot host an in-process trainer callback. read by the liveness thread
         # below, so mutate it in place (append_step_metrics) rather than rebinding.
         metrics_last: list[dict] = []
         sent_first_metrics = False
@@ -2966,7 +2965,7 @@ def run_rl_verl():
         def _reward_observability() -> dict:
             """the `reward_metrics` / `sampled_completions` fields for one heartbeat emission.
 
-            trl publishes both from a TrainerCallback on the trainer's own thread. verl's trainer is
+            an in-process trainer would publish both from a callback on its own thread. verl's trainer is
             out of process, so this is called from the liveness thread and from the stdout loop
             instead -- reading the buffer the reward bridge fills on its server threads.
 
@@ -2999,7 +2998,7 @@ def run_rl_verl():
                     m = step_re.search(line)
                     if m:
                         step_box[0] = int(m.group(1))
-                        # dump one sample completion per new step to the flash log (matches trl #607).
+                        # dump one sample completion per new step to the flash log (#607).
                         if step_box[0] != last_dump_step[0]:
                             # the generation boundary: verl logs this line once its step is scored,
                             # so everything the reward bridge buffered since the last one is that
@@ -3022,8 +3021,8 @@ def run_rl_verl():
                     step_metrics = parse_verl_step_metrics(line)
                     if step_metrics is not None:
                         step_line_times.append(time.time())
-                        # a run constant rather than a verl metric, so it is stamped here the way
-                        # trl's callback reads it off args.max_completion_length.
+                        # a run constant rather than a verl metric, so it is stamped here from
+                        # the resolved run config.
                         step_metrics["max_completion_tokens"] = inp["max_completion"]
                         append_step_metrics(
                             metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT
@@ -3033,7 +3032,7 @@ def run_rl_verl():
                         LATEST_GRPO_METRICS_LAST[:] = metrics_last
                         # the rl_train_start ping arms the 900s rl_step throttle, and the liveness
                         # daemon never forces, so the first backlog would stay invisible for 15
-                        # minutes. force it through the way trl does (heartbeat.py
+                        # minutes. force it through the same way the sample path does (heartbeat.py
                         # force_first_samples), and keep retrying until one commits: the daemon may
                         # claim this step first, which is fine because its payload carries the same
                         # backlog. only the FIRST is forced, so the hf commit cap stays protected.
@@ -3138,8 +3137,8 @@ def run_rl_verl():
         _stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # preserve the final checkpoint only when exact save steps are not configured, matching the
-        # trl path: with save_at_steps set the customer asked for those steps and nothing else.
+        # preserve the final checkpoint only when exact save steps are not configured: with
+        # save_at_steps set the customer asked for those steps and nothing else.
         if final_save_due(steps_run, inp["save_at_steps"]):
             _w.publish_deployable_checkpoint(adapter_dir, steps_run)
 
