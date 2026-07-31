@@ -1204,6 +1204,43 @@ _flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage
 '''
 
 
+def render_reentrant_checkpointing_shim(reentrant: bool) -> str:
+    """return the sitecustomize source that makes verl's gradient checkpointing REENTRANT.
+
+    verl hardcodes ``use_reentrant=False`` at its single checkpointing site
+    (``workers/engine/fsdp/transformer_impl.py:304``) and exposes no knob for it. non-reentrant
+    recompute asserts that every recomputed activation's metadata matches the forward pass, which
+    the MoE router and the GDN chunk-scan both violate: they save shape-/data-dependent tensors the
+    recompute lays out differently, so the run dies on the FIRST backward, before a single optimizer
+    step. ``grpo_use_reentrant`` documents both live-confirmed cases.
+
+    patches ``_build_module`` and re-enables checkpointing with ``use_reentrant=True`` on the way
+    out, so verl's own call still runs and only the flag differs. the same hook the SFT verl path
+    uses (``sft_train.py``), against the same class: GRPO's actor is ``FSDPEngineWithLMHead``, which
+    inherits ``_build_module`` from ``FSDPEngine``.
+    """
+    if not reentrant:
+        return ""
+    return '''
+from verl.workers.engine.fsdp.transformer_impl import FSDPEngine as _FlashReentrantEngine
+
+_flash_reentrant_original_build_module = _FlashReentrantEngine._build_module
+
+
+def _flash_reentrant_build_module(self):
+    module = _flash_reentrant_original_build_module(self)
+    # only when verl actually enabled checkpointing: calling gradient_checkpointing_enable on a
+    # model verl deliberately left uncheckpointed would turn it ON and change the memory profile.
+    if getattr(self.model_config, "enable_gradient_checkpointing", False):
+        module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+        print("[rl-verl] reentrant gradient checkpointing is active", flush=True)
+    return module
+
+
+_FlashReentrantEngine._build_module = _flash_reentrant_build_module
+'''
+
+
 def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
     """return the sitecustomize source that adds top-entropy token masking to verl.
 
@@ -2577,6 +2614,10 @@ def _resolve_grpo_inputs():
         "think_penalty": think_penalty,
         "kl_coef": kl_coef,
         "entropy_quantile": entropy_quantile,
+        # verl always checkpoints (enable_gradient_checkpointing=True) and always asks for
+        # non-reentrant recompute, which the MoE router and GDN chunk-scan die on. resolved here so
+        # the child shim can put the flag back to what the model needs.
+        "reentrant_checkpointing": bool(_w.grpo_use_reentrant(model_id)),
         "per_turn_credit": per_turn_credit,
         "stop_sequences": stop_sequences,
         "structured_outputs": structured_outputs,
@@ -2712,6 +2753,7 @@ def run_rl_verl():
     shim_source = "".join(
         part
         for part in (
+            render_reentrant_checkpointing_shim(inp["reentrant_checkpointing"]),
             render_entropy_quantile_shim(inp["entropy_quantile"]),
             render_per_turn_credit_shim(inp["per_turn_credit"]),
             render_stop_sequences_shim(inp["stop_sequences"]),
