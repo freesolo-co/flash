@@ -93,7 +93,7 @@ def test_whitespace_before_the_sampled_close_is_still_the_block_delimiter():
 
     Requiring an exactly empty prefix rejected `\\n</think>answer`, fell through to wrapping the
     whole string, and produced `<think>reasoned</think>\\n</think>answer` -- two close tags, with
-    the real answer stranded behind the first one. `_thinking_structured_answer` splits on that
+    the real answer stranded behind the first one. `_thinking_answer` splits on that
     first close, so the smoke then read `\\n</think>answer` as the answer (cursor).
     """
     message = {"content": "\n</think>answer", "reasoning_content": "reasoned"}
@@ -166,7 +166,7 @@ def test_an_answer_that_is_the_literal_open_tag_is_still_closed():
 
     Asking only whether the opener appears anywhere reported that answer as an already-balanced
     block and returned it with no close tag, after which
-    `flash/server/routes/serving.py::_thinking_structured_answer` rejects the deployment smoke.
+    `flash/server/routes/serving.py::_thinking_answer` rejects the deployment smoke.
     Balance means an opener that precedes a close, not the mere presence of the substring.
     """
     message = {"content": "<think>", "reasoning_content": "r"}
