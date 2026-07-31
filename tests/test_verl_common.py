@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -525,3 +526,63 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
     assert len(carried) == vc.STALL_TAIL_LINES
     # the most recent lines are the ones that matter: they are what the child said last.
     assert carried[-1] == f"line{vc.STALL_TAIL_LINES + 24}"
+
+
+def _blackwell_probe(monkeypatch, *, major, flashinfer_ok=True):
+    """stub the two subprocess probes: capability first, then `import flashinfer`."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "import flashinfer" in cmd[-1]:
+            return SimpleNamespace(returncode=0 if flashinfer_ok else 1)
+        return SimpleNamespace(returncode=0, stdout=f"{major}\n", stderr="")
+
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    return calls
+
+
+@pytest.mark.parametrize("major", [10, 12])
+def test_blackwell_pins_flashinfer_and_sdpa_vit(monkeypatch, major):
+    _blackwell_probe(monkeypatch, major=major)
+    assert vc.resolve_blackwell_attention_backends("/verl/bin/python") == (
+        "FLASHINFER",
+        "TORCH_SDPA",
+    )
+
+
+def test_blackwell_falls_back_to_triton_when_flashinfer_is_abi_broken(monkeypatch):
+    # flashinfer can install yet fail to import against this torch. an unconditional FLASHINFER would
+    # ship fine and only die at engine init on a paid gpu, so degrade to a registered PTX-independent
+    # decoder backend. the ViT pin is unaffected -- it is a separate selection.
+    _blackwell_probe(monkeypatch, major=12, flashinfer_ok=False)
+    assert vc.resolve_blackwell_attention_backends("/verl/bin/python") == (
+        "TRITON_ATTN",
+        "TORCH_SDPA",
+    )
+
+
+@pytest.mark.parametrize("major", [8, 9, -1])
+def test_non_blackwell_leaves_both_backends_to_vllm(monkeypatch, major):
+    # vllm's capability-ordered defaults are correct off blackwell (flash-attn is the right decoder
+    # choice on ampere/hopper), so pinning anything there would override a working selection.
+    _blackwell_probe(monkeypatch, major=major)
+    assert vc.resolve_blackwell_attention_backends("/verl/bin/python") == (None, None)
+
+
+def test_blackwell_probe_failure_leaves_vllm_defaults_alone(monkeypatch):
+    # a probe that cannot answer must not guess an override onto an unknown card.
+    def boom(*a, **k):
+        raise OSError("no interpreter")
+
+    monkeypatch.setattr(vc.subprocess, "run", boom)
+    assert vc.resolve_blackwell_attention_backends("/verl/bin/python") == (None, None)
+
+
+def test_blackwell_probe_runs_against_the_verl_interpreter(monkeypatch):
+    # verl owns the rollout engine and pins its own vllm stack, so a flash-side `import flashinfer`
+    # would answer for the wrong environment. both probes must target the passed interpreter.
+    calls = _blackwell_probe(monkeypatch, major=12)
+    vc.resolve_blackwell_attention_backends("/verl/bin/python")
+    assert len(calls) == 2
+    assert all(cmd[0] == "/verl/bin/python" for cmd in calls)

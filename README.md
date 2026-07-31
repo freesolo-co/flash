@@ -23,7 +23,7 @@ This repository contains:
 - the `flash` CLI (`flash/cli/`) — no declared runtime dependencies (commands that run
   an environment locally, such as `flash env test`, need the `freesolo` SDK),
 - the FastAPI control plane (`flash/server/`) — run submission, auth, project scoping,
-- the GPU worker and training recipes (`flash/engine/`) — TRL plus colocated vLLM
+- the GPU worker and training recipes (`flash/engine/`) — verl plus colocated vLLM
   rollouts,
 - the GPU provider substrate (`flash/providers/`) — pricing, allocation, submit/poll,
 - the environment loading machinery (`flash/envs/`).
@@ -171,7 +171,7 @@ model — in short, **pull requests go into `dev`**.
 - `flash/providers/` — GPU substrate (pricing, GPU classes, durable submit/poll,
   preflight) behind the `base.Provider` protocol, with `allocator.py` picking the cheapest
   fitting class
-- `flash/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts; distillation scores
+- `flash/engine/` — the on-GPU worker (verl + colocated vLLM rollouts; distillation scores
   on-policy student samples against a remote teacher) and the shared recipe. SFT targets
   and RL rewards route through the active environment, so task-specific grading lives with
   the example, not in the engine

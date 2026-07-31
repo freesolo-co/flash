@@ -194,6 +194,74 @@ def resolve_verl_loggers(python_bin: str) -> list[str]:
     return ["console", "wandb"]
 
 
+def resolve_blackwell_attention_backends(python_bin: str) -> tuple[str | None, str | None]:
+    """the rollout ``(attention_backend, mm_encoder_attn_backend)`` this GPU needs, or ``(None, None)``.
+
+    vLLM 0.19.1 picks both by capability, and on Blackwell both defaults are wrong:
+
+    * **decoder.** ``_get_backend_priorities`` (vllm/platforms/cuda.py:99-111) heads its non-MLA list
+      with FLASH_ATTN for every arch except cc-major 10, and FlashAttention validates at
+      ``>= (8, 0)`` -- so sm120 (RTX 5090 / RTX Pro 6000) selects it, and its prebuilt PTX is
+      unreliable on consumer Blackwell hosts, which surfaces as SILENT EMPTY ROLLOUTS rather than a
+      crash. Pin FLASHINFER, which the same table already prefers on B200. flashinfer can install yet
+      be ABI-broken against this torch, so gate on the import and fall back to TRITON_ATTN: a
+      registered, PTX-independent decoder backend that trains on the 5090. NOT TORCH_SDPA -- that tag
+      is ``""`` in the 0.19.1 registry (ViT-only) and raises at decoder backend validation.
+    * **ViT.** ``get_supported_vit_attn_backends`` (cuda.py:344-351) heads its list with FLASH_ATTN on
+      every cc>=8.0 card, and on Blackwell that routes to vLLM's CUTE flash-attn, which is
+      unimportable against every published ``nvidia-cutlass-dsl``: the vendored cute needs
+      ``cutlass.cute.core.ThrMma`` (<=4.5.x) while ``vit_attn_wrappers`` needs
+      ``cutlass._mlir_helpers`` (>=4.6.0) -- the two never coexist, so the first ViT attention aborts
+      and takes the rollout with it (a version pin cannot fix it; measured 2026-07-07). A VL model
+      builds its vision tower even for a text-only rollout, so this reaches text-only GRPO too.
+      ``get_vit_attn_backend`` honors an explicit backend unconditionally (cuda.py:367-373), and
+      TORCH_SDPA is a supported ViT backend on cc>=8.0, so pinning it sidesteps the CUTE import. The
+      decoder attention is unaffected -- that is chosen separately, above.
+
+    Probed in the VERL interpreter, not flash's: verl owns the rollout engine and pins its own vllm
+    stack, so flash's ``import flashinfer`` would answer for the wrong environment. A probe failure
+    degrades to TRITON_ATTN rather than leaving the fragile default in place.
+
+    Returns ``(None, None)`` off Blackwell, where vLLM's own defaults are correct.
+    """
+    probe = (
+        "import torch;"
+        "print(torch.cuda.get_device_capability(0)[0] if torch.cuda.is_available() else -1)"
+    )
+    try:
+        out = subprocess.run(
+            [python_bin, "-c", probe], capture_output=True, text=True, timeout=120
+        )
+        major = int((out.stdout or "").strip().splitlines()[-1])
+    except Exception as e:  # no cuda / probe failure -> leave vllm's defaults alone
+        print(f"[verl] Blackwell attention probe skipped: {e}")
+        return (None, None)
+    if major not in (10, 12):
+        return (None, None)
+    has_flashinfer = (
+        subprocess.run(
+            [python_bin, "-c", "import flashinfer"], capture_output=True
+        ).returncode
+        == 0
+    )
+    decoder = "FLASHINFER" if has_flashinfer else "TRITON_ATTN"
+    if not has_flashinfer:
+        print(
+            f"[verl] sm{major}0 (Blackwell): flashinfer is not importable in the verl interpreter "
+            "-> attention_backend=TRITON_ATTN (PTX-independent registered decoder backend)"
+        )
+    else:
+        print(
+            f"[verl] sm{major}0 (Blackwell): attention_backend=FLASHINFER "
+            "(flash-attn PTX is unreliable on consumer Blackwell -> empty-rollout failures)"
+        )
+    print(
+        f"[verl] sm{major}0 (Blackwell): mm_encoder_attn_backend=TORCH_SDPA "
+        "(vllm 0.19.1 ViT CUTE flash-attn is unimportable vs every nvidia-cutlass-dsl)"
+    )
+    return (decoder, "TORCH_SDPA")
+
+
 def resolve_checkpoint_actor_dir(step_dir: str) -> str:
     """return the directory inside ``global_step_N`` that holds the saved model + ``huggingface/``.
 

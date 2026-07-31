@@ -19,58 +19,6 @@ os.environ["RUN_MODE"] = "rl"
 os.environ["SEED"] = "0"
 
 
-def test_grpo_batching_matches_prompts_per_step():
-    """Regression guard for the GRPO batch bug: TRL sizes batches in COMPLETIONS, so
-    grad-accum must include the group size. Each optimizer step must optimize the intended
-    number of *unique prompts* (64), not prompts_per_step/group_size (the old 8/step bug)."""
-    import flash.engine.worker as ne
-
-    for per_device in (8, 4, 16, 1):
-        b = ne.compute_grpo_batching(prompts_per_step=64, group_size=8, per_device_comps=per_device)
-        assert b["unique_prompts_per_step"] == 64, (per_device, b)
-        assert b["generations_per_step"] == 512, (per_device, b)
-        assert b["divisible_by_group"] is True, (per_device, b)
-        assert b["per_device_train_batch_size"] * b["gradient_accumulation_steps"] == 512
-
-    # The OLD formula would have given only 8 prompts/step (what we are fixing):
-    old_grad_accum = 64 // 8
-    assert (8 * old_grad_accum) // 8 == 8
-
-
-def test_grpo_batching_matches_requested_prompts_when_per_device_does_not_divide():
-    """When the short-seq micro-batch growth returns a per_device that does NOT divide the target
-    completion batch, we must optimize EXACTLY the requested prompts -- neither fewer (the floor
-    bug) nor more (ceil over-shoots and asks TRL for more unique prompts than the dataset-capped
-    prompts_per_step, which yields no batches on a small retained dataset). The fix shrinks
-    per_device to the largest divisor of target_comps <= the requested per_device, lowering (never
-    raising) peak VRAM, so per_device * grad_accum == target_comps exactly."""
-    import flash.engine.worker as ne
-
-    # codex P2 case: batch_size=5, group_size=8, per_device=16 -> target=40. Floor (40//16=2) gives
-    # 4 prompts (< 5); ceil gives 6 prompts (> the 5 retained). Shrinking per_device 16->10 yields
-    # exactly 40 completions = 5 prompts, never exceeding the dataset.
-    b = ne.compute_grpo_batching(prompts_per_step=5, group_size=8, per_device_comps=16)
-    assert b["unique_prompts_per_step"] == 5, b  # exactly the request, no over/under-shoot
-    assert b["generations_per_step"] == 40, b
-    assert b["per_device_train_batch_size"] <= 16, b  # never raised above the VRAM cap
-    assert b["divisible_by_group"] is True, b
-
-    # General invariant across odd prompt counts and per_device that doesn't divide the target:
-    # optimize EXACTLY the requested prompts, stay group-divisible, and never raise per_device
-    # above the requested VRAM knob, for any per_device the cap can return.
-    for prompts in (1, 3, 5, 7, 13):
-        for per_device in (1, 4, 8, 12, 16):
-            b = ne.compute_grpo_batching(
-                prompts_per_step=prompts, group_size=8, per_device_comps=per_device
-            )
-            assert b["generations_per_step"] == prompts * 8, (prompts, per_device, b)
-            assert b["unique_prompts_per_step"] == prompts, (prompts, per_device, b)
-            assert b["per_device_train_batch_size"] <= max(1, min(per_device, prompts * 8)), (
-                prompts, per_device, b,
-            )
-            assert b["divisible_by_group"] is True, (prompts, per_device, b)
-
-
 def test_on_policy_epochs_resolve_to_prompt_pool_passes():
     from flash.engine.steps import on_policy_steps
 
