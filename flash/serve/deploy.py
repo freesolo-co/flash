@@ -1027,6 +1027,12 @@ def _balanced_thinking_content(message: dict, *, thinking: bool) -> str:
         # survives and the answer stays intact behind the delimiter.
         return f"{_TAG_OPEN}{reasoning}{_TAG_CLOSE}{content}"
     close = content.find(_TAG_CLOSE)
+    if _is_terminal_reasoning_repeat(content, reasoning):
+        # the repeat with nothing behind it, so there is no answer to keep. appending it would
+        # hand the smoke `why</think>` as an answer and activate a deployment that answered
+        # nothing; folding to the block alone lets the smoke reject it. same failure direction
+        # the opener-carrying form already takes.
+        return f"{_TAG_OPEN}{reasoning}{_TAG_CLOSE}"
     end = _retained_delimiter_end(content, close, reasoning) if close >= 0 else None
     if end is not None:
         return f"{_TAG_OPEN}{reasoning}{_TAG_CLOSE}{content[end:]}"
@@ -1173,6 +1179,19 @@ def _is_only_retained_delimiter(text: str, reasoning: str) -> bool:
     return not text[close + len(_TAG_CLOSE) :].strip()
 
 
+def _is_terminal_reasoning_repeat(text: str, reasoning: str) -> bool:
+    """Whether ``text`` is the reasoning repeated inline with nothing behind its close.
+
+    Narrower than `_is_only_retained_delimiter` in requiring text before the close, with or
+    without an opener: a delimiter with nothing at all ahead of it is the answer that IS the tag,
+    and a checkpoint answering its grammar that way must still reach the smoke.
+    """
+    close = text.find(_TAG_CLOSE)
+    if close < 0 or not text[:close].strip():
+        return False
+    return _is_only_retained_delimiter(text, reasoning)
+
+
 def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[str]:
     # reasoning arrives on its own delta field (see _balanced_thinking_content). re-open the block
     # around it and close it at the answer boundary, so the streamed text matches the balanced
@@ -1305,22 +1324,11 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
         # generation stopped inside the block (a length cap, usually). still close it: an
         # unbalanced opener is the same defect as the unbalanced closer, mirrored.
         yield _TAG_CLOSE
-    if closing:
-        inline = _inline_reasoning_block(closing)
-        if (
-            inline is not None
-            and not closing[: inline[0]].strip()
-            and not closing[inline[1] + len(_TAG_CLOSE) :].strip()
-            and closing[inline[0] + len(_TAG_OPEN) : inline[1]].strip() == reasoning_text.strip()
-        ):
-            # a complete inline block whose body is the reasoning, with nothing behind it. end of
-            # stream is where this is decidable: nothing more can arrive, so the pair can only be
-            # the compatibility build's repeat, which `_duplicates_reasoning` folds to one.
-            closing = ""
-        # otherwise the stream ended mid-delimiter and the buffered text was answer after all,
-        # which covers the answer that IS the delimiter.
-        if closing:
-            yield closing
+    # the buffer holds the block's own retained close and nothing else, in either the bare or the
+    # opener-carrying form. only decidable at end of stream, since nothing more can arrive. any
+    # other buffer was answer text after all, covering the answer that IS the delimiter.
+    if closing and not _is_terminal_reasoning_repeat(closing, reasoning_text):
+        yield closing
     if held:
         # no delimiter ever arrived, so nothing marked a reasoning phase: a plain answer. release
         # it as sent rather than wrapping it, which would label a valid answer as reasoning.
