@@ -2934,6 +2934,115 @@ def test_a_lone_episode_still_scores_without_waiting_out_the_batch_deadline():
     assert time.monotonic() - started < 10.0, "a lone episode waited for peers that cannot exist"
 
 
+def test_no_env_call_runs_while_a_batch_is_being_scored():
+    # the drain releases the lock across score_rollouts, so holding the lock is not proof the env is
+    # free. a peer still in start or step would otherwise call into the env concurrently with a
+    # remote grader reading the same object, and the env is not required to be thread-safe.
+    depth = [0]
+    overlaps = []
+    depth_lock = threading.Lock()
+    scoring_entered = threading.Event()
+    release_scorer = threading.Event()
+
+    class _Env(_BridgeEnv):
+        def _enter(self):
+            with depth_lock:
+                depth[0] += 1
+                if depth[0] > 1:
+                    overlaps.append(depth[0])
+
+        def _exit(self):
+            with depth_lock:
+                depth[0] -= 1
+
+        def new_rollout_state(self, example):
+            self._enter()
+            try:
+                return super().new_rollout_state(example)
+            finally:
+                self._exit()
+
+        def record_model_turn(self, state, text):
+            self._enter()
+            try:
+                super().record_model_turn(state, text)
+            finally:
+                self._exit()
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            self._enter()
+            try:
+                # hold the env open and let a peer try to touch it; a correct bridge makes it wait.
+                scoring_entered.set()
+                release_scorer.wait(timeout=30)
+                return [RolloutReward(episode=1.0, turns=None) for _ in items]
+            finally:
+                self._exit()
+
+    env = _Env(done_after=1)
+    bridge = _bridge(env, examples=[{"index": 0}, {"index": 1}], max_turns=1)
+    bridge.start({"index": 0, "session_id": "a"})
+
+    scorer = threading.Thread(target=lambda: bridge.score({"session_id": "a", "turn_count": 1}))
+    scorer.start()
+    assert scoring_entered.wait(timeout=30), "the batch never reached the env"
+
+    # this must NOT enter the env until the drain above finishes.
+    peer = threading.Thread(target=lambda: bridge.start({"index": 1, "session_id": "b"}))
+    peer.start()
+    peer.join(timeout=2)
+    touched_during_scoring = not peer.is_alive()
+
+    release_scorer.set()
+    scorer.join(timeout=30)
+    peer.join(timeout=30)
+    assert not scorer.is_alive(), "the scorer hung"
+    assert not peer.is_alive(), "the peer hung"
+    assert not overlaps, f"env was entered concurrently (depth {overlaps})"
+    assert not touched_during_scoring, "start touched the env while a batch was being scored"
+
+
+def test_an_early_episode_waits_for_peers_that_have_not_opened_yet():
+    # _sessions counts only episodes that already called start, so an episode finishing before its
+    # peers open sees a group of one. draining that singleton re-serializes the very round trips the
+    # batch exists to collapse, so a quiescent-looking group has to settle first.
+    calls: list[int] = []
+
+    class _Env(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            calls.append(len(items))
+            return [RolloutReward(episode=1.0, turns=None) for _ in items]
+
+    env = _Env(done_after=1)
+    bridge = _bridge(env, examples=[{"index": 0}, {"index": 1}], max_turns=1)
+    bridge.start({"index": 0, "session_id": "a"})
+
+    results: dict[str, float] = {}
+
+    def _score(session):
+        results[session] = bridge.score({"session_id": session, "turn_count": 1})["score"]
+
+    early = threading.Thread(target=_score, args=("a",))
+    early.start()
+    # the peer opens AFTER the first episode has already parked in score, which is exactly the
+    # interleave that produced a singleton batch.
+    time.sleep(0.3)
+    bridge.start({"index": 1, "session_id": "b"})
+    late = threading.Thread(target=_score, args=("b",))
+    late.start()
+
+    for thread in (early, late):
+        thread.join(timeout=30)
+    assert not early.is_alive(), "the early scorer never returned"
+    assert not late.is_alive(), "the late scorer never returned"
+    assert calls == [2], f"the late peer did not join the batch: {calls}"
+    assert results == {"a": 1.0, "b": 1.0}
+
+
 def test_a_peer_that_dies_before_scoring_does_not_hold_the_batch(monkeypatch):
     # an episode that fails mid-turn closes without ever reaching score. the survivors must still
     # get scored: close notifies, so the group becomes quiescent without waiting out the deadline.

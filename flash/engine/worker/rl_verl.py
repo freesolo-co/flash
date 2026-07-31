@@ -1253,6 +1253,12 @@ def _require_episode_matches_prompt(state: dict, prompt_messages, index: int) ->
 # stuck group still returns a reward instead of failing the whole rollout on transport.
 _MULTI_TURN_SCORE_BATCH_SECONDS = 120.0
 
+# how long a quiescent-looking group waits for episodes that have not opened yet. _sessions only
+# counts episodes that already called start, so a fast episode can find itself alone and score a
+# singleton before its peers exist. short enough to be invisible against a rollout step, long enough
+# for the rest of a wave to open.
+_MULTI_TURN_SCORE_SETTLE_SECONDS = 2.0
+
 
 class MultiTurnBridge:
     """parent-side episode state for the child's multi-turn agent loop.
@@ -1311,6 +1317,7 @@ class MultiTurnBridge:
         with self._lock:
             if session_id in self._sessions:
                 raise KeyError(f"duplicate multi-turn session {session_id}")
+            self._await_env_quiescent()
             state = self._env.new_rollout_state(example)
             # the dataset prompt came from an EARLIER env.prompt_messages call; this is a second,
             # independent episode initialization. an env that randomizes its opening would hand the
@@ -1342,6 +1349,7 @@ class MultiTurnBridge:
             if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
                 return {"terminal": True, "messages": []}
             turn_limit = int(session["turn_limit"])
+            self._await_env_quiescent()
             self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
             # the turn just recorded is the (turn_ordinal + 1)-th. once that reaches the limit the
             # child will not generate again, so asking the env for a reply would only append a
@@ -1360,6 +1368,18 @@ class MultiTurnBridge:
                 for message in replies
             ],
         }
+
+    def _await_env_quiescent(self) -> None:
+        """block until no batch is in the env. call with the lock held, before EVERY env touch.
+
+        a drain releases the lock across score_rollouts, so holding the lock is not by itself proof
+        that the env is free. without this, a peer still in start or step would call into the env
+        concurrently with a remote grader reading the same object -- the exact concurrency the
+        single-turn path's score_lock exists to prevent, and the env is not required to be
+        thread-safe (cursor, codex[bot]).
+        """
+        while self._scoring:
+            self._lock.wait()
 
     def _batch_is_ready(self) -> bool:
         """true once every episode still open has parked in score, so nothing more can join."""
@@ -1425,6 +1445,7 @@ class MultiTurnBridge:
             # a peer that dies without reaching score would leave the group one arrival short
             # forever, so quiescence is a fast path, not the only way out.
             deadline = time.monotonic() + _MULTI_TURN_SCORE_BATCH_SECONDS
+            settle = time.monotonic() + _MULTI_TURN_SCORE_SETTLE_SECONDS
             while not entry["done"]:
                 if self._score_leader or self._scoring:
                     # someone else is already scoring or waiting to; just wait for our result. this
@@ -1432,11 +1453,21 @@ class MultiTurnBridge:
                     # second batch then would run the env concurrently with the first.
                     self._lock.wait(timeout=_MULTI_TURN_SCORE_BATCH_SECONDS)
                     continue
-                if not self._batch_is_ready() and time.monotonic() < deadline:
+                now = time.monotonic()
+                # quiescence alone does not prove the group is complete. _sessions counts episodes
+                # that have already OPENED, so an episode finishing before a peer has even called
+                # start sees a group of one and drains a singleton -- re-serializing the round trips
+                # this batch exists to collapse (codex[bot]). hold a short settle window so peers
+                # still opening can join. waiting for a known group size instead would be worse than
+                # the defect: a parked score holds its agent-loop worker, so if verl ever runs the
+                # batch in waves the tail of the group cannot arrive and every wave burns the full
+                # deadline. settle is bounded and never blocks on an episode that is not coming.
+                if now < deadline and not (self._batch_is_ready() and now >= settle):
                     self._score_leader = True
                     try:
                         # released inside wait, so later arrivals can join the batch we lead.
-                        self._lock.wait(timeout=max(0.0, deadline - time.monotonic()))
+                        wake = settle if self._batch_is_ready() else deadline
+                        self._lock.wait(timeout=max(0.0, min(wake, deadline) - now))
                     finally:
                         self._score_leader = False
                     continue
