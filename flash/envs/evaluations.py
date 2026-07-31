@@ -298,28 +298,38 @@ def _call_factory(factory, kwargs: dict[str, object]) -> object:
     )
     if accepts_var_kwargs:
         return factory(**kwargs)
-    # a positional-only parameter is recognized by name but cannot be passed by one, so
-    # `load_evaluations(environment, /)` was accepted by the filter and then rejected by
-    # python itself -- a sidecar the documented contract says is supported (codex[bot]).
+    # a positional-only parameter is in signature.parameters but cannot be passed by name, so
+    # matching on membership alone would raise TypeError for `load_evaluations(environment, /)`.
+    # such a factory declared the argument, so pass it positionally rather than dropping it and
+    # handing the suite environment=None -- which downgrades a real scorer to substring matching.
     #
-    # position is the only thing that binds these, so a parameter we have no value for cannot
-    # be skipped: `load_evaluations(options=None, environment=None, /)` would otherwise pass
-    # the environment as `options` and leave `environment` at its default -- the wrong argument
-    # silently accepted, which is worse than the TypeError it replaced (codex[bot]). fill an
-    # unsupplied one from its default and stop at the first that has none, leaving the rest to
-    # python's own signature error.
+    # a positional-only parameter we have no value for still has to be filled, otherwise every
+    # parameter after it shifts left. use its default; a required one cannot be satisfied at all,
+    # so stop and let the factory raise its own TypeError rather than passing a wrong argument.
     positional: list[object] = []
-    filtered_kwargs: dict[str, object] = {}
+    from_kwargs: list[bool] = []
     for name, parameter in signature.parameters.items():
-        if parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
-            if name in kwargs:
-                positional.append(kwargs[name])
-            elif parameter.default is not inspect.Parameter.empty:
-                positional.append(parameter.default)
-            else:
-                break
-        elif name in kwargs:
-            filtered_kwargs[name] = kwargs[name]
+        if parameter.kind != inspect.Parameter.POSITIONAL_ONLY:
+            break
+        if name in kwargs:
+            positional.append(kwargs[name])
+            from_kwargs.append(True)
+            continue
+        if parameter.default is inspect.Parameter.empty:
+            break
+        positional.append(parameter.default)
+        from_kwargs.append(False)
+    # trailing arguments filled from their own defaults carry no information, so drop them and
+    # let the factory apply those defaults itself.
+    while from_kwargs and not from_kwargs[-1]:
+        positional.pop()
+        from_kwargs.pop()
+    consumed = list(signature.parameters)[: len(positional)]
+    filtered_kwargs = {
+        name: value
+        for name, value in kwargs.items()
+        if name in signature.parameters and name not in consumed
+    }
     return factory(*positional, **filtered_kwargs)
 
 
