@@ -6,9 +6,9 @@ name: Version parity
 # would ship two channels claiming different versions. Bump both together.
 on:
   push:
-    branches: [main, dev, devV2]
+    branches: [main, dev]
   pull_request:
-    branches: [main, dev, devV2]
+    branches: [main, dev]
 
 permissions:
   contents: read
