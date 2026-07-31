@@ -498,6 +498,11 @@ def run_verl_training(
     finally:
         if proc.poll() is None:
             proc.wait()
+        # every job boundary, not just the failing ones. a straggler an earlier teardown SIGKILLed
+        # but could not drain in time exits shortly after, and `kill_process_group` -- the only other
+        # caller of this -- runs on exceptions alone: a worker whose later jobs all succeed would
+        # hold that zombie for its whole life, as pid 1 with nothing else to reap it (codex[bot]).
+        _reap_stragglers()
     return int(proc.returncode)
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import builtins
 import contextlib
 import ctypes
@@ -543,9 +544,18 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
 # probe. the rest of the suite is os-independent, so guard rather than fail on a platform that
 # cannot answer (codex[bot]). checked at runtime like the /proc/self/maps test in test_worker_stack,
 # instead of on the platform name, so the condition is the capability actually required.
+def _has_libc() -> bool:
+    """whether `libc.so.6` loads here, for the subreaper probe the adoption tests need."""
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError:  # pragma: no cover - not reachable on linux
+        return False
+    return True
+
+
 _needs_process_teardown = pytest.mark.skipif(
-    not hasattr(os, "fork") or not os.path.isdir("/proc"),
-    reason="teardown tests drive real process groups: needs os.fork and /proc",
+    not hasattr(os, "fork") or not os.path.isdir("/proc") or not _has_libc(),
+    reason="teardown tests drive real process groups: needs os.fork, /proc and libc",
 )
 
 
@@ -694,6 +704,7 @@ def test_kill_process_group_reaps_a_grandchild_that_outlives_the_leader(quick_te
             leader.stdout.close()
 
 
+@_needs_process_teardown
 def test_a_group_whose_only_member_is_a_zombie_is_not_read_as_alive():
     # Dockerfile.worker runs python directly as pid 1 with no init, so an orphaned EngineCore is
     # never reaped and sits as a zombie indefinitely. killpg(pgid, 0) succeeds for that group, so
@@ -731,6 +742,7 @@ def test_a_group_whose_only_member_is_a_zombie_is_not_read_as_alive():
             os.waitpid(pid, 0)
 
 
+@_needs_process_teardown
 def test_teardown_returns_promptly_when_the_survivor_is_only_a_zombie():
     # the cost of the bug, measured. with a zombie-only group reading as alive, kill_process_group
     # spins out the escalation deadline AND then the drain deadline -- two full grace periods --
@@ -766,6 +778,7 @@ def test_teardown_returns_promptly_when_the_survivor_is_only_a_zombie():
             os.waitpid(pid, 0)
 
 
+@_needs_process_teardown
 def test_an_unreadable_process_status_does_not_read_as_exited(monkeypatch):
     # teardown can run with the worker out of file descriptors, where opening /proc/<pid>/stat
     # raises EMFILE for every live member at once. reading that as a zombie made the whole group
@@ -803,6 +816,7 @@ def test_a_missing_process_still_reads_as_exited():
     assert vc._process_is_zombie(child.pid), "a reaped pid must not read as alive"
 
 
+@_needs_process_teardown
 def test_an_empty_group_snapshot_is_rechecked_against_the_kernel(monkeypatch):
     # /proc can be listed just before a fork publishes a new child while the member that WAS there
     # exits inside the same window, so one snapshot can show nobody in a group that still holds the
@@ -888,6 +902,7 @@ def test_a_group_that_really_is_zombie_only_still_drains(subreaper):
             os.waitpid(pid, 0)
 
 
+@_needs_process_teardown
 def test_the_subreaper_setting_does_not_outlive_the_test_that_enabled_it():
     """Both halves in one test rather than across two: a later test asserting the flag is back to 0
     also passes when it happens to run FIRST, so it would prove nothing under random ordering.
@@ -913,6 +928,7 @@ def test_the_subreaper_setting_does_not_outlive_the_test_that_enabled_it():
         libc.prctl(_PR_SET_CHILD_SUBREAPER, entered, 0, 0, 0)
 
 
+@_needs_process_teardown
 def test_an_empty_snapshot_of_a_gone_group_is_still_drained():
     # and the recheck must not make teardown unfailable: when the group is genuinely gone, the walk
     # being empty has to stay an answer or every teardown burns both deadlines.
@@ -1052,6 +1068,41 @@ def test_a_straggler_that_was_never_ours_is_not_tracked_forever(monkeypatch):
         child.wait(timeout=10)
 
 
+@_needs_process_teardown
+def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(monkeypatch):
+    # `kill_process_group` is the only OTHER caller of the sweep, and both of its call sites sit in
+    # `except BaseException` blocks. a worker whose later jobs all SUCCEED therefore never schedules
+    # the future wait a straggler needs, holding that zombie for the process's whole life -- as pid 1
+    # there is nothing else to reap it. the drain has to happen at every job boundary (codex[bot]).
+    monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs only in the forked child
+        os._exit(0)
+    try:
+        # the state an earlier teardown leaves behind: exited, owed to this process, and recorded
+        # because it was still running when that teardown's deadline passed.
+        deadline = time.monotonic() + 10
+        while not vc._process_is_zombie(pid):
+            assert time.monotonic() < deadline, "the straggler never exited"
+            time.sleep(0.01)
+        vc._UNREAPED_STRAGGLERS.add(pid)
+
+        # a job that runs to completion and exits 0 -- no callback failure, no nonzero code, nothing
+        # that routes through the error teardown. drive the real entry point rather than the sweep,
+        # or this passes just as well with the sweep never wired into the success path.
+        code = vc.run_verl_training(["bash", "-c", "echo 'step: 1'"], env=dict(os.environ))
+
+        assert code == 0
+        assert not os.path.exists(f"/proc/{pid}"), (
+            "a successful job left an earlier run's zombie in the table: one leaked pid per run"
+        )
+        assert pid not in vc._UNREAPED_STRAGGLERS
+    finally:
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
 def test_grpo_teardown_uses_the_shared_escalating_kill():
     # the grpo path used to hand-roll killpg(pid, 15) and swallow the wait timeout, so a vllm
     # EngineCore that ignored the term kept its cuda context and stranded the gpu for later jobs.
@@ -1059,3 +1110,37 @@ def test_grpo_teardown_uses_the_shared_escalating_kill():
     source = inspect.getsource(rl_verl)
     assert "kill_process_group(proc)" in source
     assert "os.killpg" not in source, "grpo teardown must not hand-roll a non-escalating killpg"
+
+
+def test_every_test_touching_a_linux_only_api_carries_the_platform_guard():
+    """The guard was applied test-by-test and kept being missed on the next one added.
+
+    A skipif on some of them still fails the run on a platform without `fork` or `/proc`, so this
+    reads THIS file and requires the marker wherever such an api appears -- the whole block, not a
+    remembered list (codex[bot]). Source inspection is exempt: asserting that a string is absent
+    from `rl_verl` runs anywhere.
+    """
+    linux_only = ("os.fork", "os.getpgid", "os.killpg", "os.waitpid", "libc.so.6", "/proc/")
+    exempt = {"test_every_test_touching_a_linux_only_api_carries_the_platform_guard"}
+    source = inspect.getsource(sys.modules[__name__])
+    lines = source.splitlines()
+
+    unguarded = []
+    for node in ast.parse(source).body:
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            continue
+        if node.name in exempt:
+            continue
+        body = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+        if "inspect.getsource" in body:
+            continue
+        needs = [api for api in linux_only if api in body]
+        needs += [f for f in ("subreaper",) if f in {a.arg for a in node.args.args}]
+        guarded = any(
+            isinstance(d, ast.Name) and d.id == "_needs_process_teardown"
+            for d in node.decorator_list
+        )
+        if needs and not guarded:
+            unguarded.append(f"{node.name} uses {sorted(set(needs))}")
+
+    assert not unguarded, "these tests need @_needs_process_teardown:\n  " + "\n  ".join(unguarded)
