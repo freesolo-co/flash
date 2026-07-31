@@ -181,6 +181,13 @@ PARITY_CASES: dict[str, tuple[dict, str]] = {
         {"content": "<think>why</think>", "reasoning_content": "why"},
         "<think>why</think>",
     ),
+    # the same repeat without its opener, which the prompt carried. the EOF predicate keyed on a
+    # balanced pair and so missed this form, appending it as an answer: a stop firing right after
+    # the reasoning then passed the smoke and activated a deployment that never answered.
+    "terminal-duplicate-bare": (
+        {"content": "why</think>", "reasoning_content": "why"},
+        "<think>why</think>",
+    ),
     # ... which keys on the body matching. an answer that is its own literal pair is not the
     # repeat, so it must survive rather than be swallowed.
     "terminal-pair-that-is-not-the-reasoning": (
@@ -354,6 +361,10 @@ STREAM_CASES: dict[str, tuple[tuple[dict, ...], str]] = {
     ),
     "terminal-duplicate-split": (
         ({"reasoning_content": "why"}, {"content": "<think>why<"}, {"content": "/think>"}),
+        "<think>why</think>",
+    ),
+    "terminal-duplicate-bare-split": (
+        ({"reasoning_content": "why"}, {"content": "why<"}, {"content": "/think>"}),
         "<think>why</think>",
     ),
     # `_delimiter_may_complete` gave up on an empty body and released the head as answer, so the
