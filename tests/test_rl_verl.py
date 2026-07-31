@@ -57,6 +57,182 @@ def test_build_verl_dataset_rows_length_mismatch_raises():
         rl_verl.build_verl_dataset_rows([[{"role": "user", "content": "q"}]], [1, 2], ["a", "b"])
 
 
+# ------------------------------- multimodal parquet contract -------------------------------
+# verl's RLHFDataset._build_messages re-splits each prompt on "<image>" and then asserts the
+# placeholder count equals len(images). the two halves of that invariant are produced in different
+# places here (message flattening vs the images column), so they are exactly the kind of pair that
+# drifts silently: a row can look well-formed on both sides and still raise inside verl.
+
+
+def _image_placeholder_count(row) -> int:
+    return sum(str(m["content"]).count("<image>") for m in row["prompt"])
+
+
+def test_multimodal_rows_match_verl_placeholder_assertion():
+    rows = rl_verl.build_verl_dataset_rows(
+        [
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "q0"}, {"type": "image"}],
+                }
+            ],
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image"}, {"type": "image"}, {"type": "text", "text": "q1"}],
+                }
+            ],
+        ],
+        [0, 1],
+        ["a", "b"],
+        image_uris=[["file:///w/0-0.png"], ["file:///w/1-0.png", "file:///w/1-1.png"]],
+    )
+    # this is verl's own assertion, restated: image_offset == len(images) or the dataset raises.
+    for row in rows:
+        assert _image_placeholder_count(row) == len(row["images"])
+    assert rows[1]["images"] == [
+        {"image": "file:///w/1-0.png"},
+        {"image": "file:///w/1-1.png"},
+    ]
+    # content is flattened to a string; verl re-expands it. leaving content blocks in place would
+    # make the re-split find zero placeholders while images is non-empty.
+    assert all(isinstance(m["content"], str) for row in rows for m in row["prompt"])
+
+
+def test_text_rows_carry_no_images_column():
+    # the control: without image_uris the rows must stay exactly as before. an unconditional images
+    # column would make every text job take verl's multimodal dataset path.
+    rows = rl_verl.build_verl_dataset_rows([[{"role": "user", "content": "q"}]], [0], ["a"])
+    assert "images" not in rows[0]
+
+
+def test_multimodal_rows_reject_a_mismatched_uri_list():
+    with pytest.raises(ValueError, match="image_uris length mismatch"):
+        rl_verl.build_verl_dataset_rows(
+            [[{"role": "user", "content": "q"}]], [0], ["a"], image_uris=[[], []]
+        )
+
+
+def test_multimodal_rows_reject_a_literal_image_placeholder_in_text():
+    # verl splits prompt text on "<image>" and re-expands each hit into a real image block, so a
+    # prompt that merely TALKS about the token consumes an image the row does not have. verl would
+    # abort dataset loading with a bare offset assertion; catching it here names the example.
+    with pytest.raises(ValueError, match="reserved by verl"):
+        rl_verl.build_verl_dataset_rows(
+            [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "the <image> token marks an image"},
+                            {"type": "image"},
+                        ],
+                    }
+                ]
+            ],
+            [7],
+            ["a"],
+            image_uris=[["file:///w/0-0.png"]],
+        )
+
+
+def test_text_only_row_of_a_mixed_job_rejects_a_literal_placeholder():
+    # the row itself has no images, but verl's split is driven by the row's OWN modality columns and
+    # a mixed job writes an images column on every row -- so a text row with a literal "<image>"
+    # asserts against its empty list. this is the case a per-job (rather than per-row) check misses.
+    with pytest.raises(ValueError, match="reserved by verl"):
+        rl_verl.build_verl_dataset_rows(
+            [
+                [{"role": "user", "content": [{"type": "text", "text": "describe <image> please"}]}],
+                [{"role": "user", "content": [{"type": "image"}]}],
+            ],
+            [0, 1],
+            ["a", "b"],
+            image_uris=[[], ["file:///w/1-0.png"]],
+        )
+
+
+@pytest.mark.parametrize("reserved", ["<video>", "<audio>"])
+def test_multimodal_rows_reject_other_reserved_media_placeholders(reserved):
+    # _build_messages splits on all three markers. flash never writes a videos/audios column, so a
+    # single literal occurrence asserts against an empty list -- the count check on <image> alone
+    # would pass this row straight through.
+    with pytest.raises(ValueError, match="reserves as a media placeholder"):
+        rl_verl.build_verl_dataset_rows(
+            [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"a {reserved} marker"},
+                            {"type": "image"},
+                        ],
+                    }
+                ]
+            ],
+            [3],
+            ["a"],
+            image_uris=[["file:///w/0-0.png"]],
+        )
+
+
+def test_text_job_does_not_police_reserved_placeholders():
+    # the control: without an images column verl never splits, so "<image>" is ordinary text and
+    # rejecting it would break text jobs that legitimately discuss the token.
+    rows = rl_verl.build_verl_dataset_rows(
+        [[{"role": "user", "content": "what does <image> mean?"}]], [0], ["a"]
+    )
+    assert rows[0]["prompt"] == [{"role": "user", "content": "what does <image> mean?"}]
+
+
+def test_mixed_job_parquet_round_trips_the_images_column(tmp_path):
+    # Dataset.from_list infers ONE type per column across all rows. in a mixed job the text rows
+    # have an empty images list, and inference on an all-empty-or-partly-empty column can land on a
+    # type verl cannot read back as a struct. this asserts the round trip, not the schema object,
+    # because the schema is only interesting insofar as the read-back works.
+    rows = rl_verl.build_verl_dataset_rows(
+        [
+            [{"role": "user", "content": [{"type": "text", "text": "text only"}]}],
+            [{"role": "user", "content": [{"type": "image"}]}],
+        ],
+        [0, 1],
+        ["a", "b"],
+        image_uris=[[], ["file:///w/1-0.png"]],
+    )
+    path = str(tmp_path / "train.parquet")
+    rl_verl.write_verl_grpo_parquet(rows, path)
+
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path)
+    assert table.num_rows == 2
+    images = table.column("images").to_pylist()
+    assert images == [[], [{"image": "file:///w/1-0.png"}]]
+    # the empty row must still be a LIST OF STRUCTS, not a null column: verl indexes row["images"]
+    # per element, so a null-typed column fails on read rather than on the empty row. asserted
+    # structurally because arrow spells the list field "item" or "element" by version.
+    import pyarrow as pa
+
+    images_type = table.schema.field("images").type
+    assert pa.types.is_list(images_type)
+    assert [f.name for f in images_type.value_type] == ["image"]
+    assert pa.types.is_string(images_type.value_type.field("image").type)
+    assert table.column("extra_info").to_pylist()[1]["index"] == 1
+
+
+def test_text_only_parquet_does_not_pin_the_multimodal_schema(tmp_path):
+    # the control: a text job's rows have no images column at all, so pinning the multimodal schema
+    # would fail the write outright.
+    rows = rl_verl.build_verl_dataset_rows([[{"role": "user", "content": "q"}]], [0], ["a"])
+    path = str(tmp_path / "train.parquet")
+    rl_verl.write_verl_grpo_parquet(rows, path)
+
+    import pyarrow.parquet as pq
+
+    assert "images" not in pq.read_table(path).schema.names
+
+
 # ------------------------------- override generation -------------------------------
 def _overrides_cfg(**over):
     cfg = {
@@ -236,6 +412,43 @@ def test_dynamic_bsz_replaces_sequence_count_micro_batches():
     o = rl_verl.build_verl_overrides(_overrides_cfg())
     assert not any("ppo_micro_batch_size_per_gpu" in x for x in o)
     assert not any("log_prob_micro_batch_size_per_gpu" in x for x in o)
+
+
+def test_multimodal_overrides_hand_verl_the_images_column():
+    # the parquet's images column is inert unless verl is told to read it: without image_key the
+    # dataset treats the rows as text, the <image> placeholders never re-expand, and the model
+    # trains on the caption alone -- silently, which is the failure this whole port exists to avoid.
+    o = rl_verl.build_verl_overrides(_overrides_cfg(multimodal=True))
+    assert "data.image_key=images" in o
+    # a processor rather than a bare tokenizer, and raw chat so verl owns the expansion.
+    assert "actor_rollout_ref.model.trust_remote_code=true" in o
+    assert "data.return_raw_chat=true" in o
+    # verl RAISES on an over-budget multimodal prompt rather than truncating it, so truncation must
+    # be error (never left on a silent trim) and the length filter must be armed.
+    assert "data.truncation=error" in o
+    assert "data.filter_overlong_prompts=true" in o
+    # the processor's image loader is not fork-safe under verl's default dataloader workers.
+    assert "data.dataloader_num_workers=0" in o
+
+
+def test_text_overrides_omit_every_multimodal_key():
+    # the control: these keys must be absent, not merely false. data.image_key=images on a text job
+    # points verl at a column the parquet does not have.
+    o = rl_verl.build_verl_overrides(_overrides_cfg())
+    for key in (
+        "data.image_key",
+        "data.return_raw_chat",
+        "data.return_multi_modal_inputs",
+        "data.dataloader_num_workers",
+    ):
+        assert not any(x.startswith(key) for x in o), key
+
+
+def test_build_verl_training_cfg_carries_the_multimodal_flag():
+    # the flag is resolved in _resolve_single_turn_inputs but consumed by build_verl_overrides, so
+    # a cfg that dropped it would produce a text-shaped override list from a multimodal parquet.
+    source = inspect.getsource(rl_verl._build_verl_training_cfg)
+    assert '"multimodal": bool(inp.get("multimodal"))' in source
 
 
 def test_build_verl_training_cfg_derives_engine_len_and_budget():
@@ -428,7 +641,7 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
         python_bin="python",
         model_id="Qwen/Qwen3.5-0.8B",
         model_revision="rev",
-        tokenizer=_Tok(),
+        preprocessor=_Tok(),
     )
     uploader.start()
     uploader.stop()
@@ -454,7 +667,7 @@ def test_resume_credits_required_steps_already_durable_on_hf(tmp_path, monkeypat
         str(tmp_path),
         resume_step=20,
         required_steps=(10, 15, 25),
-        tokenizer=_Tok(),
+        preprocessor=_Tok(),
     )
     uploader.credit_durable_required_steps(20)
 
@@ -909,6 +1122,76 @@ def test_stop_sequences_shim_patches_the_per_sample_params_not_the_config():
 def test_stop_sequences_shim_refuses_to_wrap_itself_twice():
     source = rl_verl.render_stop_sequences_shim(("</answer>",))
     assert '_flash_stop_patched", False)' in source
+
+
+def test_image_pad_ban_shim_is_emitted_only_on_a_multimodal_job():
+    # a text run has no image-pad token to ban, and injecting a logit_bias key into every rollout's
+    # sampling params would change sampling on jobs that never asked for it.
+    assert rl_verl.render_image_pad_ban_shim(None) == ""
+    source = rl_verl.render_image_pad_ban_shim(151655)
+    assert source
+    assert "151655" in source
+    assert rl_verl._IMAGE_PAD_BAN_MARKER in source
+    # -100.0 matches the bias trl applies through generation_kwargs (rl.py), so the two backends
+    # suppress the token equally hard rather than one of them merely discouraging it.
+    assert "logit_bias[_flash_image_pad_token_id] = -100.0" in source
+    # same reason as the stop shim: verl reuses the params dict across the batch.
+    assert "params = dict(sampling_params)" in source
+
+
+def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
+    # both wrap AgentLoopWorker._run_agent_loop. each guards itself with its own marker attribute,
+    # and a shared marker would make whichever ran second silently no-op -- leaving either stop
+    # strings or the image-pad ban missing with no error. executing both is the only way to catch
+    # that: the sources look correct in isolation either way.
+    import asyncio
+    import sys
+    from types import ModuleType
+
+    seen: dict = {}
+
+    class _AgentLoopWorker:
+        async def _run_agent_loop(self, sampling_params, *args, **kwargs):
+            seen.update(sampling_params)
+            return "ok"
+
+    # both shims import the same verl module; hand them one stub so the two patches stack on the
+    # very same function object, exactly as they do in the child.
+    agent_loop_module = ModuleType("verl.experimental.agent_loop.agent_loop")
+    agent_loop_module.AgentLoopWorker = _AgentLoopWorker
+    package = ModuleType("verl.experimental.agent_loop")
+    package.agent_loop = agent_loop_module
+    stubs = {
+        "verl": ModuleType("verl"),
+        "verl.experimental": ModuleType("verl.experimental"),
+        "verl.experimental.agent_loop": package,
+        "verl.experimental.agent_loop.agent_loop": agent_loop_module,
+    }
+    source = rl_verl.render_stop_sequences_shim(("</answer>",)) + rl_verl.render_image_pad_ban_shim(
+        151655
+    )
+    for name, module in stubs.items():
+        sys.modules[name] = module
+    try:
+        exec(compile(source, "sitecustomize.py", "exec"), {})
+        asyncio.run(_AgentLoopWorker()._run_agent_loop({"temperature": 1.0}))
+    finally:
+        for name in stubs:
+            sys.modules.pop(name, None)
+
+    assert seen["stop"] == ["</answer>"]
+    assert seen["logit_bias"] == {151655: -100.0}
+    # the untouched key proves each patch COPIED the dict rather than replacing it wholesale.
+    assert seen["temperature"] == 1.0
+
+
+def test_image_pad_ban_shim_is_composed_into_the_sitecustomize(monkeypatch):
+    source = inspect.getsource(rl_verl.run_rl_verl)
+    assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in source
+    combined = rl_verl.render_stop_sequences_shim(("</answer>",)) + rl_verl.render_image_pad_ban_shim(
+        151655
+    )
+    compile(combined, "sitecustomize.py", "exec")
 
 
 def test_stop_sequences_gate_off_truncated_completion_masking():
@@ -1777,10 +2060,17 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
 # raises in this resolver.
 
 
-def _capability_env(*, multi_turn=False, is_tool_env=False, images=False):
-    """a minimal single-turn text env, optionally flipped to a shape verl grpo rejects."""
+def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
+    """a minimal single-turn text env, optionally flipped to a shape verl grpo handles differently.
+
+    ``image_uri`` must be a source the normalizer accepts offline (a data uri): a remote https url
+    is rejected outright unless the trusted-dataset opt-in is set, so it would fail the test for
+    the wrong reason.
+    """
 
     class _Env:
+        package_root = None
+
         def __init__(self):
             self.multi_turn = multi_turn
             self.is_tool_env = is_tool_env
@@ -1789,15 +2079,15 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, images=False):
             return [{"index": i} for i in range(8)]
 
         def prompt_messages(self, ex):
-            if images:
+            if image_uri:
                 # record_has_images matches an image content BLOCK, so build the real shape rather
-                # than a sentinel key the guard would not see.
+                # than a sentinel key the resolver would not see.
                 return [
                     {
                         "role": "user",
                         "content": [
                             {"type": "text", "text": f"question {ex['index']}"},
-                            {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+                            {"type": "image_url", "image_url": {"url": image_uri}},
                         ],
                     }
                 ]
@@ -1806,20 +2096,75 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, images=False):
     return _Env()
 
 
-def _capability_resolve(monkeypatch, env, train=None, overrides=None):
+def _capability_image_uri():
+    """a 2x2 png as a data uri, the smallest source normalize_image_source accepts offline."""
+    import base64
+    import io
+
+    image_module = pytest.importorskip("PIL.Image")
+    out = io.BytesIO()
+    image_module.new("RGB", (2, 2), (255, 0, 0)).save(out, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+
+
+class _CapabilityTokenizer:
+    pad_token = None
+    eos_token = "<eos>"
+
+    def apply_chat_template(self, messages, **kwargs):
+        return "prompt"
+
+    def __call__(self, text, **kwargs):
+        return SimpleNamespace(input_ids=[1])
+
+    def convert_tokens_to_ids(self, token):
+        return 151655 if token == "<|image_pad|>" else 0
+
+
+class _CapabilityProcessor:
+    """the shape rl_verl asks of AutoProcessor on a multimodal job.
+
+    it must expose ``tokenizer`` (the resolver reads pad/eos off it), render a chat template, and
+    tokenize text+images together. the returned ids are what the prompt-budget filter measures, so
+    a test that wants a row dropped controls it through the length here.
+    """
+
+    image_token_id = 151655
+
+    def __init__(self, expanded_len=4):
+        self.tokenizer = _CapabilityTokenizer()
+        self.expanded_len = expanded_len
+        self.calls: list[dict] = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        return "prompt"
+
+    def __call__(self, text=None, images=None, **kwargs):
+        self.calls.append({"text": text, "images": images})
+        return {"input_ids": [[1] * self.expanded_len]}
+
+
+def _capability_resolve(monkeypatch, env, train=None, overrides=None, processor=None):
     """run the resolver against one env, with everything else on the supported path."""
+    import transformers
+
     from flash.engine.worker._pkg import W as _PkgW
     from flash.spec import JobSpec
 
-    class _Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
+    _Tokenizer = _CapabilityTokenizer
 
-        def apply_chat_template(self, messages, **kwargs):
-            return "prompt"
-
-        def __call__(self, text, **kwargs):
-            return SimpleNamespace(input_ids=[1])
+    # a multimodal resolve builds a processor rather than a bare tokenizer. AutoProcessor
+    # .from_pretrained would hit the hub, so stub it on the live module: the resolver's
+    # `from transformers import AutoProcessor` runs inside the function and reads the attribute
+    # at call time. imported unconditionally rather than probed out of sys.modules -- a guard that
+    # skips the patch when transformers is not yet imported lets the resolver reach the real loader,
+    # which fails on a missing backend instead of testing anything.
+    monkeypatch.setattr(
+        transformers,
+        "AutoProcessor",
+        SimpleNamespace(from_pretrained=lambda *a, **k: processor or _CapabilityProcessor()),
+        raising=False,
+    )
 
     spec = JobSpec.from_dict(
         {
@@ -1854,12 +2199,65 @@ def test_capability_guard_rejects_tool_env(monkeypatch):
         _capability_resolve(monkeypatch, _capability_env(is_tool_env=True))
 
 
-def test_capability_guard_rejects_image_prompts(monkeypatch):
-    # this guard runs AFTER prompt_messages is built, so it needs a real image content block, not a
-    # flag. trl selects a multimodal trainer here; verl grpo is text-only and would silently drop
-    # the image, training the model on the caption alone.
-    with pytest.raises(RuntimeError, match="non-multimodal grpo only"):
-        _capability_resolve(monkeypatch, _capability_env(images=True))
+def test_resolver_admits_image_prompts_and_carries_the_processor(monkeypatch):
+    # the inverse of the guard this replaces: an image env used to be refused outright and fall
+    # back to trl. it must now resolve, and it must resolve through a PROCESSOR -- a bare tokenizer
+    # would under-count the prompt by the whole placeholder expansion. asserting the processor is
+    # carried out (not merely that resolve returned) is what pins the multimodal path: a resolver
+    # that quietly took the text branch would still return a valid dict.
+    processor = _CapabilityProcessor()
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(image_uri=_capability_image_uri()),
+        processor=processor,
+    )
+    assert inp["multimodal"] is True
+    assert inp["processor"] is processor
+    assert inp["image_pad_token_id"] == 151655
+    # every prompt was measured through the processor, with its decoded image attached: a call
+    # carrying images=None would mean the pixels never reached the token count.
+    assert len(processor.calls) == len(inp["prompts"])
+    assert all(len(call["images"] or []) == 1 for call in processor.calls)
+
+
+def test_multimodal_prompts_carry_descriptors_and_rendered_text(monkeypatch):
+    # the parquet writer needs each prompt's image DESCRIPTORS and the thinking probe needs the
+    # RENDERED text. both are produced only on the multimodal branch, so a branch that returned
+    # bare messages would break the writer downstream rather than here.
+    inp = _capability_resolve(
+        monkeypatch, _capability_env(image_uri=_capability_image_uri())
+    )
+    first = inp["prompts"][0]
+    assert len(first["images"]) == 1
+    assert first["rendered"] == "prompt"
+    # the image block is normalized to a bare {"type": "image"} marker: the source moved into the
+    # descriptor list, which is what _materialize_verl_images later writes to disk.
+    blocks = first["prompt"][0]["content"]
+    assert {"type": "image"} in blocks
+
+
+def test_multimodal_budget_filter_measures_the_expanded_prompt(monkeypatch):
+    # verl RAISES on an over-budget multimodal prompt instead of truncating, so this filter is the
+    # only thing between a long image prompt and a dead run. the tokenizer says 1 token; the
+    # processor says the prompt is huge. the filter must believe the processor -- if it measured
+    # with the tokenizer every row would be admitted and the run would die mid-rollout.
+    processor = _CapabilityProcessor(expanded_len=10**6)
+    with pytest.raises(ValueError, match="every training prompt exceeds"):
+        _capability_resolve(
+            monkeypatch,
+            _capability_env(image_uri=_capability_image_uri()),
+            processor=processor,
+        )
+
+
+def test_text_env_resolves_without_building_a_processor(monkeypatch):
+    # the control for the three tests above: a text-only job must NOT pay for a processor, and must
+    # not carry an image-pad ban into its rollouts. without this a resolver hardcoded to the
+    # multimodal branch would pass every multimodal test above.
+    inp = _capability_resolve(monkeypatch, _capability_env())
+    assert inp["multimodal"] is False
+    assert inp["processor"] is None
+    assert inp["image_pad_token_id"] is None
 
 
 def test_capability_guard_rejects_kl_anchored_warm_start(monkeypatch):
