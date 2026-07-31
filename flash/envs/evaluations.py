@@ -347,17 +347,25 @@ def _shadowed_cached_modules(directory: Path) -> dict[str, ModuleType]:
     module's cases and scoring constants. `_forget_sidecar_siblings` cannot correct it either --
     it only examines names absent before the scope, and this one was present (cursor[bot]).
 
+    Submodules are displaced with their package. Evicting `graders` alone leaves
+    `sys.modules["graders.rules"]` cached, and `from graders.rules import score` resolves the
+    submodule entry directly -- so the current environment scored with the other package's rules
+    while its own file sat unread (codex[bot]). Verified by probe: the second import returned the
+    first package's value.
+
     Only names this directory can actually supply are displaced, and only ones resolving
     elsewhere: a module already loaded FROM this directory is the right one to keep."""
     shadowed: dict[str, ModuleType] = {}
     for name in _sidecar_module_names(directory):
-        cached = sys.modules.get(name)
-        if cached is None:
-            continue
-        origin = getattr(getattr(cached, "__spec__", None), "origin", None)
-        if origin and _is_under(origin, directory):
-            continue
-        shadowed[name] = cached
+        prefix = name + "."
+        for cached_name in [name, *(n for n in sys.modules if n.startswith(prefix))]:
+            cached = sys.modules.get(cached_name)
+            if cached is None:
+                continue
+            origin = getattr(getattr(cached, "__spec__", None), "origin", None)
+            if origin and _is_under(origin, directory):
+                continue
+            shadowed[cached_name] = cached
     return shadowed
 
 
