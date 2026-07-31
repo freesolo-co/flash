@@ -107,6 +107,60 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+def _spec_with_resolved_env_sha(spec: JobSpec, sha: str) -> JobSpec:
+    """The spec carrying an already-resolved environment SHA, or the spec unchanged."""
+    if not sha or spec.environment.resolved_sha == sha:
+        return spec
+    d = spec.to_internal_dict()
+    d["environment"] = {**d["environment"], "resolved_sha": sha}
+    return JobSpec.from_dict(d)
+
+
+def _pin_environment_for_run(spec: JobSpec, log, *, attempt_started: bool) -> JobSpec:
+    """Resolve the environment ref to a SHA once, before any attempt runs, and keep that pin.
+
+    Submit already tries this, but best-effort: a GitHub outage or rate limit there returns the spec
+    unpinned, and the failure is only visible in a server-side log the user never sees. Retrying then
+    re-resolves the ref, and for a managed slug that ref is ``environment-hub@main`` -- so a push
+    landing between attempt 1 and attempt 2 trains the retry on different environment code, with no
+    error and nothing in the run record distinguishing it.
+
+    ``attempt_started`` is the fail-closed half. Once an attempt has run unpinned it already resolved
+    the symbolic ref on its worker, and that commit is unknowable here. Resolving now would pin a ref
+    that may have advanced since, which reintroduces the same split -- and a retry resumes from the
+    unpinned attempt's checkpoint, so the run would carry both commits. Leave it symbolic instead:
+    unpinned-throughout is one consistent story, and the warning below is what tells the user.
+    """
+    if spec.environment.resolved_sha:
+        return spec
+    if attempt_started:
+        # no pin is recoverable from here; see the docstring. warn once more so the condition is
+        # visible in the log at the point the retry is launched, not only at the start of the run.
+        print(
+            f"warning: environment {spec.environment.id!r} ran unpinned on an earlier attempt; "
+            "leaving it unpinned so this retry cannot resolve a different commit",
+            file=log,
+            flush=True,
+        )
+        return spec
+    from flash.runner import _assign_resolved_env_sha
+
+    pinned = _assign_resolved_env_sha(spec)
+    sha = pinned.environment.resolved_sha
+    if not sha:
+        # still unpinned: the ref stays symbolic and every attempt resolves it on its own worker. say
+        # so in the run log, which is the one place the user actually reads.
+        print(
+            f"warning: could not pin environment {spec.environment.id!r} to a commit; "
+            "a retry may resolve it to a newer push",
+            file=log,
+            flush=True,
+        )
+        return spec
+    print(f"environment {spec.environment.id!r} pinned to {sha}", file=log, flush=True)
+    return pinned
+
+
 def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     """Spec with the SHARED weight-cache volume removed for an unrestricted cross-region retry.
 
@@ -160,9 +214,7 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
         # per-request retry budget before returning None, stalling the reconciler each pass.
         # the wall+grace value governs only the pending-output decision below, never the probe.
         probe_deadline_at = (
-            time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S
-            if deadline_at is not None
-            else None
+            time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S if deadline_at is not None else None
         )
         job = runpod_api.job_status(
             data["endpoint_id"],
@@ -208,8 +260,7 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
             # recovery (raise pending) so callers keep reconciling instead of tearing down
             # a job that already completed.
             grace_expired = (
-                deadline_at is None
-                or time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
+                deadline_at is None or time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
             )
             if grace_expired:
                 return None
@@ -628,6 +679,12 @@ def _submit_seed_supervised(
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str]] = set()
     oom_vram_floor = 0
+    # Pin the environment ref ONCE, here, before any attempt runs -- not per attempt. Submit's pin
+    # is best-effort, so a GitHub blip there leaves resolved_sha empty, and a managed slug points at
+    # environment-hub@main, which moves. attempt_start > 0 means a previous invocation already ran an
+    # attempt (post-restart recovery), so resolving now could pin a commit different from the one
+    # that attempt used; _pin_environment_for_run fails closed on that.
+    spec = _pin_environment_for_run(spec, log, attempt_started=attempt_start > 0)
     for local_attempt in range(retry_budget.max_attempts):
         attempt = attempt_start + local_attempt
         try:
@@ -810,6 +867,12 @@ def _submit_seed_supervised(
             effective_spec = _spec_with_gpu(spec, chosen.gpu)
             if drop_weight_cache:
                 effective_spec = _drop_weight_cache(effective_spec)
+            # carry the run's one pin (resolved above the loop) onto this attempt's spec. _spec_with_gpu
+            # and _drop_weight_cache rebuild the spec, so the pin has to be re-applied, but it is never
+            # re-resolved: every attempt is handed the same commit.
+            effective_spec = _spec_with_resolved_env_sha(
+                effective_spec, spec.environment.resolved_sha
+            )
             try:
                 run_spec = _spec_with_remaining_wall(
                     effective_spec,
