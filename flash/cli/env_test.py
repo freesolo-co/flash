@@ -98,7 +98,8 @@ class _Score:
         if self.emitted is None or other.emitted is None:
             return tuple(pairs)
         return tuple(
-            pair for pair, (mine_ok, theirs_ok) in zip(pairs, credited, strict=False)
+            pair
+            for pair, (mine_ok, theirs_ok) in zip(pairs, credited, strict=False)
             if mine_ok and theirs_ok
         )
 
@@ -159,7 +160,7 @@ def _credited_turns(score: _Score, group: Sequence[_Score]) -> tuple[float, ...]
     credited = [
         index
         for index in range(width)
-        if any((member.emitted or ())[index:index + 1] == (True,) for member in group)
+        if any((member.emitted or ())[index : index + 1] == (True,) for member in group)
     ]
     turns = score.turns or ()
     emitted = score.emitted
@@ -332,7 +333,7 @@ def _observation(message: dict) -> tuple[str, str]:
 
 
 def _observation_blocks(
-    messages: list[dict], *, skip_observations: int = 0
+    messages: list[dict], *, skip_messages: int = 0
 ) -> tuple[tuple[tuple[str, str], ...], ...]:
     """The environment-side turns, grouped by the assistant turn each block follows.
 
@@ -340,27 +341,26 @@ def _observation_blocks(
     message between two turns is indistinguishable from one whose next turn simply replied twice;
     kept in blocks, the two differ in the block that holds the extra.
 
-    ``skip_observations`` drops that many leading observations before grouping, which is how the
-    prompt's own opening turns are excluded from the driven side. Assistant turns within the
-    skipped span do not open a block, so the first block is the one following the first assistant
-    turn of the completion.
+    ``skip_messages`` drops that many leading messages outright, which is how the prompt is excluded
+    from the driven side. It is a POSITIONAL prefix, not a filtered count: the rollout state's
+    transcript begins as a copy of the prompt (flash/envs/adapter.py:392), so the opening is exactly
+    the first ``len(prompt)`` entries whatever roles they hold. Counting only the prompt's
+    non-assistant messages instead meant a prompt ENDING in an assistant turn -- a prefill, which
+    flash/engine/multiturn_rollout.py copies through unfiltered -- left that turn to open a block,
+    shifting every reference block by one and marking a faithful replay `partial_replay`
+    (codex[bot]).
     """
     blocks: list[tuple[tuple[str, str], ...]] = []
     current: list[tuple[str, str]] = []
-    remaining = skip_observations
-    for message in messages:
+    for message in messages[skip_messages:]:
         if str(message.get("role", "")).strip().lower() == "assistant":
-            if not remaining:
-                blocks.append(tuple(current))
-                current = []
-            continue
-        if remaining:
-            remaining -= 1
+            blocks.append(tuple(current))
+            current = []
             continue
         current.append(_observation(message))
     blocks.append(tuple(current))
     # the leading block holds whatever preceded the first assistant turn. on the driven side the
-    # prompt is skipped by count and it is empty; a reference that opens with an observation keeps
+    # prompt is skipped by position and it is empty; a reference that opens with an observation keeps
     # it, and both sides are built the same way, so they stay aligned.
     return tuple(blocks)
 
@@ -394,24 +394,17 @@ def _env_turns_reproduce(env, example: dict, state: dict, prompt: list[dict]) ->
     # the same role filter on both sides. dropping system turns from the driven side alone made an
     # env whose env_reply emits one look unreproduced on an exact replay, since the reference keeps
     # it (codex[bot]). the opening prompt is excluded by position below instead.
-    reference = _observation_blocks(
-        _check_messages(env.sft_completion(example), "sft_completion")
-    )
+    reference = _observation_blocks(_check_messages(env.sft_completion(example), "sft_completion"))
     if not any(reference):
         return True
-    # align on where the completion begins, not on where the transcript ends. the prompt's own
-    # turns open the driven transcript and are not part of the completion, so they are dropped by
-    # count; what follows is compared positionally. the turn loop appends one more env_reply after
-    # the final assistant turn, so anchoring on the tail instead would shift every observation by
-    # that trailing reply -- marking a faithful replay unreproduced, and letting a coincidental
-    # trailing match hide a divergence earlier in the trajectory (cursor).
-    prompt_turns = sum(
-        1
-        for message in prompt
-        if str(message.get("role", "")).strip().lower() != "assistant"
-    )
+    # align on where the completion begins, not on where the transcript ends. the prompt opens the
+    # driven transcript and is not part of the completion, so it is dropped as a positional prefix;
+    # what follows is compared positionally. the turn loop appends one more env_reply after the
+    # final assistant turn, so anchoring on the tail instead would shift every observation by that
+    # trailing reply -- marking a faithful replay unreproduced, and letting a coincidental trailing
+    # match hide a divergence earlier in the trajectory (cursor).
     driven = state.get("messages") or []
-    completion = _observation_blocks(driven, skip_observations=prompt_turns)
+    completion = _observation_blocks(driven, skip_messages=len(prompt))
     # a reference recording more turns than were driven cannot match either way.
     if len(completion) < len(reference):
         return False
@@ -511,7 +504,9 @@ def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], lis
     # `prompt` or `messages`, exactly as the production driver accepts them
     # (flash/engine/multiturn_rollout.py:171-175). requiring `prompt` afterwards failed a state
     # shape supported everywhere else in the codebase, before the reward gate ever ran (codex[bot]).
-    prompt = [dict(m) for m in _check_messages(state.get("prompt") or state.get("messages"), "prompt")]
+    prompt = [
+        dict(m) for m in _check_messages(state.get("prompt") or state.get("messages"), "prompt")
+    ]
     # mirror the worker turn loop (flash/engine/multiturn_rollout.py): drive one model
     # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
     # env yields no reply. the hard cap is fixed at what the trainer passes (env.max_turns)
@@ -679,9 +674,7 @@ def _grade_rollouts(env, rollouts: list[tuple[dict, dict, list[str]]]) -> list[_
     ]
     rewards = score_rollouts(env, requests)
     return [
-        _Score(
-            episode=float(reward.episode), turns=reward.turns, emitted=_emitted_turns(responses)
-        )
+        _Score(episode=float(reward.episode), turns=reward.turns, emitted=_emitted_turns(responses))
         for reward, (_example, _state, responses) in zip(rewards, rollouts, strict=True)
     ]
 
@@ -817,9 +810,7 @@ def _score_multi_turn_rollouts(env, records: list[dict]) -> None:
             continue
         # an unscorable control earns no advantage, so it is evidence of neither ranking nor
         # flatness. keeping it would compare gold against a number the trainer never acts on.
-        record["control_scores"] = [
-            score for score in scores[control_slice] if score.is_finite()
-        ]
+        record["control_scores"] = [score for score in scores[control_slice] if score.is_finite()]
 
 
 def _prepare_controls(env, example: dict, record: dict) -> list[_Score] | None:
@@ -1177,9 +1168,20 @@ def cmd_env_test(args) -> int:
         _err(finding)
         return _err("overall: FAIL")
     if finding and not conclusive:
+        # `not conclusive` is `scored_zero != controlled`, which covers a MIXED sample too -- some
+        # episodes tying at zero, some above it. claiming every score was non-zero was then simply
+        # false, and it named the wrong episodes to go looking at (cursor). so describe what was
+        # actually seen: the reason this is not failed on is that at least one tie was above zero,
+        # which is what a grader rewarding a shared property produces.
+        tied_above_zero = controlled - scored_zero
+        detail = (
+            f"{tied_above_zero} of {controlled} tied above zero"
+            if scored_zero
+            else "every score was the same non-zero value"
+        )
         message = (
-            f"{finding} every score was the same non-zero value, which a grader rewarding a "
-            "property these answers share would also produce, so this is not failed on."
+            f"{finding} {detail}, which a grader rewarding a property these answers share would "
+            "also produce, so this is not failed on."
         )
         print(
             render.warn(message) if render.styled() else f"warning: {message}",
