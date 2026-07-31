@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -146,6 +147,73 @@ def _fmt_turns(score: _Score) -> str:
     return "(" + ", ".join(f"{value:.6f}" for value in score.turns or ()) + ")"
 
 
+def _credited_turns(score: _Score, group: Sequence[_Score]) -> tuple[float, ...]:
+    """This member's rewards at the turn indexes the trainer actually credits in `group`.
+
+    A turn is credited when at least one member emitted text there: `build_per_turn_advantages`
+    skips an index whose spans are all zero-width, and centres whoever remains at the others
+    (`grpo_perturn_trainer.py:66-76`). A member absent from a credited turn contributes nothing
+    there and is simply not represented in its own vector.
+    """
+    width = max((len(member.turns or ()) for member in group), default=0)
+    credited = [
+        index
+        for index in range(width)
+        if any((member.emitted or ())[index:index + 1] == (True,) for member in group)
+    ]
+    turns = score.turns or ()
+    emitted = score.emitted
+    return tuple(
+        turns[index]
+        for index in credited
+        if index < len(turns) and (emitted is None or emitted[index])
+    )
+
+
+def _group_separates(gold: _Score, controls: Sequence[_Score], *, per_turn: bool) -> bool:
+    """Whether training could tell ANY two members of this group apart.
+
+    The group is the gold rollout plus its controls, and `build_per_turn_advantages` centres each
+    credited turn against the members present there -- gold included only where it emitted. So at a
+    turn gold sat out, the controls are centred against ONE ANOTHER, and controls scoring 1, 0, and
+    -1 receive nonzero advantages from a group this function must therefore not call flat. Asking
+    only whether each control separates from gold missed exactly that case, since `_overlap` drops
+    the coordinate from every gold pairing (codex[bot]).
+
+    On the episode path there is no such asymmetry, but the question is the same one -- any two
+    members scoring differently is a group the trainer can rank -- so it is asked uniformly.
+    """
+    group = (gold, *controls)
+    return any(
+        member.separates_from(other, per_turn=per_turn)
+        for index, member in enumerate(group)
+        for other in group[index + 1 :]
+    )
+
+
+def _scores_zero(gold: _Score, controls: Sequence[_Score], *, per_turn: bool) -> bool:
+    """Whether this group's tie sits at zero, where training reads it.
+
+    The all-zero tie is the finding this gate was built for (LS-005): a grader returning nothing for
+    its own reference answer is broken or missing a dependency, and no reward shape explains it. A
+    tie at any other value has an innocent reading and is only warned about.
+    """
+    group = (gold, *controls)
+    if per_turn:
+        return all(value == 0.0 for member in group for value in _credited_turns(member, group))
+    return all(member.episode == 0.0 for member in group)
+
+
+def _fmt_credited_turns(gold: _Score, controls: Sequence[_Score]) -> str:
+    """Gold's rewards at the credited turns, which is what the flat finding compared.
+
+    Printing the raw vector instead described turns the comparison had already dropped, so a group
+    the trainer genuinely cannot rank was reported with numbers that visibly differ (cursor).
+    """
+    values = _credited_turns(gold, (gold, *controls))
+    return "(" + ", ".join(f"{value:.6f}" for value in values) + ")"
+
+
 def _check_messages(messages: object, label: str) -> list[dict]:
     """Validate that `messages` is a well-formed chat message list and return it."""
     if not isinstance(messages, list) or not messages:
@@ -263,6 +331,40 @@ def _observation(message: dict) -> tuple[str, str]:
     return str(message.get("role", "")).strip().lower(), _message_text(message.get("content"))
 
 
+def _observation_blocks(
+    messages: list[dict], *, skip_observations: int = 0
+) -> tuple[tuple[tuple[str, str], ...], ...]:
+    """The environment-side turns, grouped by the assistant turn each block follows.
+
+    Grouping is what makes an extra observation visible. Flattened, an env emitting one unexpected
+    message between two turns is indistinguishable from one whose next turn simply replied twice;
+    kept in blocks, the two differ in the block that holds the extra.
+
+    ``skip_observations`` drops that many leading observations before grouping, which is how the
+    prompt's own opening turns are excluded from the driven side. Assistant turns within the
+    skipped span do not open a block, so the first block is the one following the first assistant
+    turn of the completion.
+    """
+    blocks: list[tuple[tuple[str, str], ...]] = []
+    current: list[tuple[str, str]] = []
+    remaining = skip_observations
+    for message in messages:
+        if str(message.get("role", "")).strip().lower() == "assistant":
+            if not remaining:
+                blocks.append(tuple(current))
+                current = []
+            continue
+        if remaining:
+            remaining -= 1
+            continue
+        current.append(_observation(message))
+    blocks.append(tuple(current))
+    # the leading block holds whatever preceded the first assistant turn. on the driven side the
+    # prompt is skipped by count and it is empty; a reference that opens with an observation keeps
+    # it, and both sides are built the same way, so they stay aligned.
+    return tuple(blocks)
+
+
 def _env_turns_reproduce(env, example: dict, state: dict, prompt: list[dict]) -> bool:
     """Whether the driven rollout's environment-side turns match the reference trajectory's.
 
@@ -272,44 +374,55 @@ def _env_turns_reproduce(env, example: dict, state: dict, prompt: list[dict]) ->
     role and text -- a stochastic or externally-sourced observation otherwise reaches the grader as
     a different episode wearing the reference's assistant strings.
 
-    The reference covers the completion only, so it is compared as a prefix of what followed the
-    prompt. Whatever the env replied past the reference's last recorded turn is outside what the
-    trajectory claims and is not evidence either way.
+    The comparison is per assistant turn, not over one flattened list. Both sides are cut into the
+    blocks of observations that followed each assistant turn, and each block the reference records
+    must come back whole: same observations, same order, no extras among them. Reading the driven
+    side as a flat prefix accepted an env that interleaved an unexpected system or tool message --
+    reference a1/x/a2 against a driven a1/x/<extra>/a2 -- as a faithful replay, though the grader
+    received a materially different episode and could score this "gold" transcript like the
+    controls (codex[bot]).
+
+    Only what follows the reference's last block is unconstrained: the turn loop appends one more
+    env_reply after the final assistant turn, past where the gold transcript stops recording, so it
+    is outside what the trajectory claims and is not evidence either way.
 
     `prompt` is the rollout's opening messages, captured BEFORE the turn loop ran. It cannot be
     recovered from `state` afterwards: an env that keeps its transcript under `messages` with no
     separate `prompt` key has by then appended every driven turn to that same list, so there is
     nothing left to distinguish the opening from the completion.
     """
-    reference = [
-        _observation(message)
-        for message in _check_messages(env.sft_completion(example), "sft_completion")
-        if message["role"].strip().lower() != "assistant"
-    ]
-    if not reference:
-        return True
     # the same role filter on both sides. dropping system turns from the driven side alone made an
     # env whose env_reply emits one look unreproduced on an exact replay, since the reference keeps
     # it (codex[bot]). the opening prompt is excluded by position below instead.
-    driven = [
-        _observation(message)
-        for message in state.get("messages") or []
-        if str(message.get("role", "")).strip().lower() != "assistant"
-    ]
+    reference = _observation_blocks(
+        _check_messages(env.sft_completion(example), "sft_completion")
+    )
+    if not any(reference):
+        return True
     # align on where the completion begins, not on where the transcript ends. the prompt's own
     # turns open the driven transcript and are not part of the completion, so they are dropped by
-    # count; what follows is compared positionally, as a prefix. the turn loop appends one more
-    # env_reply after the final assistant turn, so anchoring on the tail instead would shift every
-    # observation by that trailing reply -- marking a faithful replay unreproduced, and letting a
-    # coincidental trailing match hide a divergence earlier in the trajectory (cursor).
+    # count; what follows is compared positionally. the turn loop appends one more env_reply after
+    # the final assistant turn, so anchoring on the tail instead would shift every observation by
+    # that trailing reply -- marking a faithful replay unreproduced, and letting a coincidental
+    # trailing match hide a divergence earlier in the trajectory (cursor).
     prompt_turns = sum(
         1
         for message in prompt
         if str(message.get("role", "")).strip().lower() != "assistant"
     )
-    completion = driven[prompt_turns:]
-    # a reference longer than what was driven cannot match either way.
-    return completion[: len(reference)] == reference
+    driven = state.get("messages") or []
+    completion = _observation_blocks(driven, skip_observations=prompt_turns)
+    # a reference recording more turns than were driven cannot match either way.
+    if len(completion) < len(reference):
+        return False
+    # every block the reference closed with an assistant turn must come back whole, extras
+    # included. its LAST block is the one recording stopped inside, so it is compared as a prefix:
+    # the loop appends one more env_reply after the final assistant turn, past anything the gold
+    # transcript claims.
+    if completion[: len(reference) - 1] != reference[:-1]:
+        return False
+    tail = reference[-1]
+    return completion[len(reference) - 1][: len(tail)] == tail
 
 
 def _preview(value: object) -> str:
@@ -828,6 +941,7 @@ def cmd_env_test(args) -> int:
     passed = 0
     controlled = 0
     scored_flat = 0
+    scored_zero = 0
     inverted = 0
     control_errors: list[str] = []
     # driven first, scored second, reported third. every multi-turn rollout of the run -- gold and
@@ -973,12 +1087,23 @@ def cmd_env_test(args) -> int:
                     render.warn(message) if render.styled() else f"warning: {message}",
                     file=sys.stderr,
                 )
-            elif not any(
-                control.separates_from(reward, per_turn=group_per_turn) for control in controls
-            ):
+            elif not _group_separates(reward, controls, per_turn=group_per_turn):
                 scored_flat += 1
+                # a tie is only conclusive when it sits at zero. that is the signature this gate
+                # exists for -- a grader that cannot recognize its OWN reference answer, from a
+                # broken scorer or a missing runtime dependency -- and no property of the controls
+                # explains it away. above zero the tie has an innocent reading: the controls are
+                # only LEXICALLY disjoint from gold, so a healthy grader rewarding a property they
+                # happen to share (a safety scorer awarding 1 to anything without a prohibited
+                # phrase, say) ties them with gold while ranking real completions fine (codex[bot]).
+                if _scores_zero(reward, controls, per_turn=group_per_turn):
+                    scored_zero += 1
                 scored_as = (
-                    f"produced the same per-turn rewards {_fmt_turns(reward)}"
+                    # the credited turns, not the raw vector: a coordinate no member emitted at is
+                    # dropped before the comparison, so printing the whole vector claimed rewards
+                    # were identical where they visibly differ (cursor).
+                    f"produced the same rewards at every turn training reads "
+                    f"({_fmt_credited_turns(reward, controls)})"
                     if group_per_turn
                     else f"scored {reward.episode:.6f}"
                 )
@@ -1022,14 +1147,20 @@ def cmd_env_test(args) -> int:
             render.warn(message) if render.styled() else f"warning: {message}",
             file=sys.stderr,
         )
-    # a grader that hands every deliberately wrong answer the same score as its own gold answer on
-    # every sampled episode cannot rank completions at all: a broken reward function or a missing
-    # runtime dependency, not a hard dataset. that sends a run to a gpu that cannot learn what the
-    # dataset teaches, and unlike the ordering above it is conclusive -- identical scores are zero
-    # advantage whatever property the grader rewards. episodes whose transcript the driver could not
-    # reproduce verbatim, and those with no control provably wrong for their gold answer, are
-    # excluded above. this samples the first few rows, so the finding is deliberately a claim about
-    # the sample: separation anywhere in it is enough to pass.
+    # a grader that returns the same score for its own gold answer and for every deliberately wrong
+    # one produces zero advantage on every sampled episode, so the run reaches a gpu unable to learn
+    # what the dataset teaches. episodes whose transcript the driver could not reproduce verbatim,
+    # and those with no control provably wrong for their gold answer, are excluded above. this
+    # samples the first few rows, so the finding is deliberately a claim about the sample:
+    # separation anywhere in it is enough to pass.
+    #
+    # conclusive only when the tie sits at ZERO -- the LS-005 signature this gate was built for, a
+    # grader scoring nothing for its own reference answer, which is a broken scorer or a missing
+    # runtime dependency however the reward is shaped. a tie at any other value is reported and
+    # never failed on: the controls are only LEXICALLY disjoint from gold, so a healthy grader
+    # rewarding a property they happen to share ties with them while ranking sampled completions
+    # perfectly well. a safety scorer awarding 1 to any response without a prohibited phrase does
+    # exactly that, and failing it would block a working environment (codex[bot]).
     #
     # only failed for an algorithm that actually consumes reward(). SFT never calls it, so a
     # placeholder scorer there is not a defect, and without --algorithm the intent is unknown --
@@ -1041,10 +1172,20 @@ def cmd_env_test(args) -> int:
             "as high as the gold answer; the reward function cannot rank completions. check the "
             "grader and that its runtime dependencies are installed in this environment."
         )
-    if finding and grades:
+    conclusive = bool(finding) and scored_zero == controlled
+    if finding and grades and conclusive:
         _err(finding)
         return _err("overall: FAIL")
-    if finding:
+    if finding and not conclusive:
+        message = (
+            f"{finding} every score was the same non-zero value, which a grader rewarding a "
+            "property these answers share would also produce, so this is not failed on."
+        )
+        print(
+            render.warn(message) if render.styled() else f"warning: {message}",
+            file=sys.stderr,
+        )
+    elif finding:
         message = f"{finding} pass --algorithm to fail on this instead of warning."
         print(
             render.warn(message) if render.styled() else f"warning: {message}",
