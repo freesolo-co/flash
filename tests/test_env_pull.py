@@ -224,15 +224,29 @@ def _hint_command(err: str) -> str:
     raise AssertionError(f"no hint command in:\n{err}")
 
 
+def _split_as_shell(command: str) -> list[str]:
+    """Split a suggested command the way the shell it was quoted FOR would.
+
+    `_quote_shell_token` picks its quoting per platform, so the split has to match: a native
+    Windows run emits an unquoted `--output=C:\\Users\\...` whenever the path holds no space, and
+    POSIX `shlex.split` reads those backslashes as escapes and deletes them -- turning a correct
+    hint into `--output=C:Usersinto-here` and failing the assertion (codex[bot]). Non-POSIX mode
+    keeps them, but also keeps the surrounding quotes `list2cmdline` adds, so strip those back off.
+    """
+    if not envpush._on_windows():
+        return shlex.split(command)
+    return [token.strip('"') for token in shlex.split(command, posix=False)]
+
+
 def _parse_as_cli(command: str) -> Namespace:
-    """Round-trip a suggested command through a POSIX shell split and the real `env pull` parser.
+    """Round-trip a suggested command through a shell split and the real `env pull` parser.
 
     A hint is only useful if pasting it back works, so assert against the parser the user would
     actually hit rather than against the string we happened to build.
     """
     from flash.cli import _build_parser
 
-    argv = shlex.split(command)
+    argv = _split_as_shell(command)
     assert argv[:3] == [CLI_NAME, "env", "pull"], argv
     return _build_parser().parse_args(argv[1:])
 
@@ -296,6 +310,60 @@ def test_cmd_env_pull_absolute_positional_dir_is_diagnosed(monkeypatch, tmp_path
     parsed = _parse_as_cli(_hint_command(err))
     assert parsed.output == str(absolute)
     assert parsed.path is None
+
+
+@pytest.mark.parametrize("positional", ["../into-here", "sub/../../into-here"])
+def test_cmd_env_pull_parent_relative_dir_is_diagnosed(monkeypatch, tmp_path, capsys, positional):
+    """An upward-traversing positional cannot name anything inside the environment.
+
+    `_safe_repo_relative_path` rejects every component of `..`, so there is no in-env reading to
+    protect and no ambiguity for the multi-component gate to resolve. Suppressing the hint here
+    downloaded the package only to fail with an invalid environment path, instead of explaining
+    `--output`.
+
+    The second form matters because the rejection is on the parts, not on a leading `..`:
+    `sub/../../into-here` is equally impossible as an env path.
+    """
+    _patch_client(monkeypatch, _package_tarball({"environment.py": b"# env\n"}))
+    work = tmp_path / "work"
+    (work / "sub").mkdir(parents=True)
+    (tmp_path / "into-here").mkdir()
+    monkeypatch.chdir(work)
+
+    rc = cmd_env_pull(_margs(path=positional, output=None, force=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "drop the second positional" in err, err
+    # the destination the user named, not one resolved to somewhere else on disk.
+    parsed = _parse_as_cli(_hint_command(err))
+    assert parsed.output == positional
+    assert parsed.path is None
+
+
+@pytest.mark.parametrize(
+    "dest", [r"C:\Users\runner\into-here", r"C:\Program Files\into here", "-dest", "into-here"]
+)
+def test_windows_quoted_token_survives_the_split_used_to_check_it(monkeypatch, dest):
+    """A token quoted for Windows must come back out of `_split_as_shell` unchanged.
+
+    Asserted on the quote/split pair rather than through `cmd_env_pull`, because the command can
+    never carry a backslash on this platform: it normalizes `\\` to `/` on the way in, and a POSIX
+    `Path` renders the destination with forward slashes regardless. So a hint built from a real
+    Windows path is only reachable in the unit, and a round-trip test driven through the CLI passes
+    identically with the split fixed and broken.
+
+    `list2cmdline` quotes only when it has to, so an ordinary `C:\\Users\\...` comes back bare;
+    reading that with POSIX rules treats each backslash as an escape and deletes it, mangling a
+    correct hint into `C:Usersinto-here` (codex[bot]). The spaced form takes the other branch --
+    quoted, which POSIX mode would strip correctly but non-POSIX mode leaves in place -- so both
+    halves of the split are pinned by the same assertion.
+    """
+    monkeypatch.setattr(envpush, "_on_windows", lambda: True)
+
+    token = envpush._quote_shell_token(f"--output={dest}")
+
+    assert _split_as_shell(f"{CLI_NAME} env pull ns/env {token}")[4:] == [f"--output={dest}"]
 
 
 def test_cmd_env_pull_hint_omits_a_command_cmd_exe_would_mangle(monkeypatch, tmp_path, capsys):

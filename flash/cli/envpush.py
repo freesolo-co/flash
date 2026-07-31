@@ -172,7 +172,15 @@ def cmd_env_pull(args) -> int:
             # local ./assets/config the user never mentioned. a destination is written as its own
             # name (`into here`, `./-dest`, `.`) or absolute, which is exactly `positional == out`
             # plus the absolute form that `out` has already reduced to a basename (cursor).
-            could_be_destination = positional == out or positional.is_absolute()
+            #
+            # a path that traverses upward is the third form. `..` cannot name anything inside the
+            # environment -- `_safe_repo_relative_path` rejects every component of it -- so there is
+            # no in-env reading to protect and no ambiguity to resolve. without this
+            # `env pull ns/env ../into-here` downloaded the package only to fail with an invalid
+            # environment path, instead of explaining `--output` (codex[bot], cursor). tested on the
+            # parts rather than a leading `..` because `assets/../config` is rejected just the same.
+            traverses_up = ".." in positional.parts
+            could_be_destination = positional == out or positional.is_absolute() or traverses_up
             mistaken_dest = (
                 positional
                 if (
