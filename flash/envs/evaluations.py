@@ -68,6 +68,15 @@ class EvalResult:
             value = getattr(self, field_name)
             if value is not None and not isinstance(value, str):
                 raise TypeError(f"EvalResult.{field_name} must be a string when provided")
+        # an error means the case was never graded, so it cannot also have passed. the report
+        # already excludes it from the metrics and fails the command, but the console labelled it
+        # PASS and the upload recorded `success: true` beside the error -- three readings of one
+        # case that disagree (codex[bot]). reject the state rather than pick a winner downstream.
+        if self.error and self.passed:
+            raise ValueError(
+                f"EvalResult.passed must be False when an error is reported, "
+                f"got error={self.error!r}"
+            )
 
 
 @dataclass(frozen=True)

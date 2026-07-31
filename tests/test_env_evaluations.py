@@ -192,6 +192,22 @@ def test_normalize_eval_result_accepts_bool_and_float() -> None:
     assert scored == EvalResult(case_id="one", passed=True, score=0.25, response="answer")
 
 
+def test_eval_result_rejects_a_pass_that_also_reports_an_error() -> None:
+    # an error means the case was never graded, so three readings of it disagreed: the report
+    # excluded it and failed the command, the console printed PASS, and the upload recorded
+    # `success: true` beside the error (codex[bot]). one contract, checked where it is built.
+    with pytest.raises(ValueError, match="passed must be False when an error is reported"):
+        EvalResult(
+            case_id="a", passed=True, score=1.0, response="4", error="judge unavailable"
+        )
+
+    # a failed result carrying an error is the normal shape and still builds.
+    errored = EvalResult(
+        case_id="a", passed=False, score=0.0, response="4", error="judge unavailable"
+    )
+    assert errored.error == "judge unavailable"
+
+
 def test_eval_suite_report_math_and_zero_case_edge() -> None:
     report = EvalSuiteReport(
         name="math",
@@ -758,6 +774,36 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
     assert cases["dead"]["error"] is not None
     assert "generation failed" in cases["dead"]["error"]
     assert cases["sum"]["error"] is None
+    # and the recorded run agrees with the exit code above. only failures BEFORE case execution
+    # used to be marked failed, so a suite whose cases died mid-run uploaded as a completed run
+    # with no error while the cli printed `overall: FAIL` (codex[bot]).
+    assert uploader.calls[0]["status"] == "failed"
+    assert "1/2 case(s) failed to generate or score" == uploader.calls[0]["error"]
+
+
+def test_env_eval_upload_records_a_clean_suite_as_completed(monkeypatch, tmp_path) -> None:
+    # the mirror of the case above: deriving status from report.errors must not relabel a suite
+    # that graded every case, which is the state the dashboard reads as a real measurement.
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(
+            ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--upload", "--project", _PROJECT_ID]
+        )
+        == 0
+    )
+
+    assert uploader.calls[0]["status"] == "completed"
+    assert uploader.calls[0]["error"] is None
 
 
 def test_env_eval_upload_records_suites_that_cannot_load_cases(monkeypatch, tmp_path) -> None:

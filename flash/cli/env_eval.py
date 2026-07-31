@@ -350,6 +350,13 @@ def _upload_report(
     # misses it and hands the first result the *second* case's input and expected value.
     by_id = dict(zip(_case_ids(cases), cases, strict=True))
     payload = [_case_payload(by_id.get(result.case_id), result) for result in report.results]
+    # a suite whose cases failed to generate or score is not a completed run. only failures
+    # BEFORE case execution passed status="failed", so a suite where every case errored
+    # uploaded as `completed` with no run-level error while the CLI printed `overall: FAIL`
+    # -- the dashboard and the exit code disagreeing about the same run (codex[bot]).
+    if status == "completed" and report.errors:
+        status = "failed"
+        error = f"{report.errors}/{report.total} case(s) failed to generate or score"
     try:
         upload_eval_run(
             project_id=project_id,
