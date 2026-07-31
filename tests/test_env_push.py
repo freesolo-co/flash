@@ -140,6 +140,40 @@ def test_push_single_py_module_carries_lazily_imported_evaluation_helpers(monkey
     assert "unrelated.py" not in files
 
 
+def test_push_single_py_module_carries_an_imported_sibling_package(monkeypatch, tmp_path):
+    """`from graders.rules import score` ships the graders/ package, not just graders.py.
+
+    Local loading succeeds because the environment directory stays on sys.path, so every offline
+    check passes. Matching only the `<name>.py` spelling published an environment whose sidecar
+    raises ModuleNotFoundError the first time it grades a case.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from graders.rules import score\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    graders = tmp_path / "graders"
+    (graders / "nested").mkdir(parents=True)
+    (graders / "__init__.py").write_text("")
+    (graders / "rules.py").write_text("def score(value): return True\n")
+    (graders / "nested" / "__init__.py").write_text("")
+    (graders / "nested" / "deep.py").write_text("THRESHOLD = 0.5\n")
+    unused = tmp_path / "unused_pkg"
+    unused.mkdir()
+    (unused / "__init__.py").write_text("VALUE = 'do not publish'\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "graders/__init__.py" in files
+    assert "graders/rules.py" in files
+    # the whole package tree ships: a subpackage the imported module itself uses is part of it.
+    assert "graders/nested/deep.py" in files
+    # but an unimported sibling package still must not turn this into a whole-dir push.
+    assert "unused_pkg/__init__.py" not in files
+
+
 def test_push_dir_infers_entrypoint_ignoring_the_evaluations_sidecar(monkeypatch, tmp_path):
     # a legacy package whose sole module is custom.py resolved fine before evaluations.py
     # existed. counting the sidecar as a candidate entrypoint makes adding one turn that

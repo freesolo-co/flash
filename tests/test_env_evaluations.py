@@ -433,6 +433,54 @@ def _patch_upload(monkeypatch, uploader) -> None:
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
 
 
+def test_env_eval_records_the_exact_entrypoint_it_graded(monkeypatch, tmp_path) -> None:
+    """Two environments in one package must not upload the same provenance.
+
+    Recording only the parent directory made `/env/easy.py` and `/env/hard.py` indistinguishable in
+    the dashboard, even though a different environment supplied the scorer for each -- and the
+    directory alone cannot be resolved back to either module.
+    """
+    env_dir = tmp_path / "environment"
+    env_dir.mkdir()
+    (env_dir / "easy.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "hard.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'math'\n"
+        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    for module in ("easy.py", "hard.py"):
+        assert (
+            cli.main(
+                [
+                    "env",
+                    "eval",
+                    _EXPLICIT_TARGET,
+                    str(env_dir / module),
+                    "--upload",
+                    "--project",
+                    _PROJECT_ID,
+                ]
+            )
+            == 0
+        )
+
+    references = [call["environment_reference"] for call in uploader.calls]
+    assert references == [str(env_dir / "easy.py"), str(env_dir / "hard.py")]
+
+
 def test_env_eval_upload_requires_a_project_id(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.setattr(
         "flash.client.client_from_config",
@@ -1467,6 +1515,33 @@ def test_load_evaluations_receives_the_environment_after_other_positional_parame
 
     # the real environment must arrive; None would silently downgrade a scorer that needs it.
     assert suites[0].environment is sentinel
+
+
+def test_load_evaluations_receives_a_positional_only_environment_beside_var_kwargs(
+    tmp_path,
+) -> None:
+    # `**kwargs` accepts any NAME, but it cannot make a positional-only parameter keyword-passable.
+    # taking the kwargs shortcut put `environment` into the **options bag and left the required
+    # positional unfilled, so this valid factory raised TypeError and the sidecar never loaded.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'positional-kwargs'\n"
+        "    def __init__(self, environment, options): \n"
+        "        self.environment = environment\n"
+        "        self.options = options\n"
+        "    def cases(self): return [EvalCase(id='a', input='a', expected='a')]\n"
+        "def load_evaluations(environment, /, **options):\n"
+        "    return [Suite(environment, options)]\n"
+    )
+    sentinel = object()
+
+    suites = load_evaluation_suites(env_dir / "environment.py", environment=sentinel)
+
+    assert suites[0].environment is sentinel
+    # and it arrived positionally, not duplicated into the kwargs bag.
+    assert suites[0].options == {}
 
 
 def test_env_eval_pins_a_run_serving_a_step_checkpoint(monkeypatch, tmp_path, capsys) -> None:
