@@ -51,8 +51,8 @@ except ImportError:  # in-tree (tests, lint)
 
 # reserve enough room after gluing an environment reply that the next model turn can actually
 # generate. gluing right up to the limit leaves zero completion tokens, so the engine would
-# immediately truncate a turn that was never really sampled. same constant and same reason as the
-# trl driver's token budget (multiturn_rollout.rollout_one).
+# immediately truncate a turn that was never really sampled. carried over from the retired trl
+# driver's token budget, which reserved the same slack for the same reason.
 _NEXT_TURN_SLACK = 8
 
 
@@ -201,8 +201,8 @@ def build_flash_grpo_multi_turn_agent_loop(
                     # more span than there are rewards, which score_rollouts rejects as a count
                     # mismatch -- dropping the row, and with it its whole group, to episode credit.
                     # the tokens stay in response_ids and stay trained on; they just carry no turn
-                    # coordinate. this is the same identity the trl driver scores on, where the
-                    # turn IS recorded and so IS spanned (multiturn_rollout.rollout_one).
+                    # coordinate. this is the same identity the retired trl driver scored on, where
+                    # the turn was recorded and so was spanned.
                     if not (turn["truncated"] or turn["skip_reason"]):
                         turn_spans.append((turn_start, len(response_ids)))
                     if have_logprobs and generated.log_probs is not None:
@@ -249,7 +249,7 @@ def build_flash_grpo_multi_turn_agent_loop(
                     response_mask.extend([0] * len(glue_ids))
                     if have_logprobs:
                         # the model did not generate the glue, so it has no logprob. 0.0 is the
-                        # same filler trl uses (multiturn_rollout.rollout_one); the zeroed
+                        # same filler the retired trl driver used; the zeroed
                         # response_mask is what keeps these positions out of the loss.
                         response_logprobs.extend([0.0] * len(glue_ids))
                     prefix_ids.extend(glue_ids)

@@ -238,12 +238,16 @@ def resolve_blackwell_attention_backends(python_bin: str) -> tuple[str | None, s
         return (None, None)
     if major not in (10, 12):
         return (None, None)
-    has_flashinfer = (
-        subprocess.run(
-            [python_bin, "-c", "import flashinfer"], capture_output=True
-        ).returncode
-        == 0
-    )
+    try:
+        has_flashinfer = (
+            subprocess.run(
+                [python_bin, "-c", "import flashinfer"], capture_output=True, timeout=120
+            ).returncode
+            == 0
+        )
+    except Exception as e:  # a hung/failed import must not wedge the launch -> treat as unavailable
+        print(f"[verl] flashinfer probe failed ({e}); treating it as unavailable")
+        has_flashinfer = False
     decoder = "FLASHINFER" if has_flashinfer else "TRITON_ATTN"
     if not has_flashinfer:
         print(
