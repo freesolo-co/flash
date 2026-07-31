@@ -469,7 +469,7 @@ def test_non_streaming_chat_balances_before_returning(monkeypatch):
             return _Resp()
 
     monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
-    monkeypatch.setattr(deploy, "_internal_key_header", lambda: {})
+    monkeypatch.setattr(deploy, "_internal_key_header", dict)
     monkeypatch.setattr(deploy, "_chat_http_client", lambda: _Client())
 
     result = deploy.chat("run-1", [{"role": "user", "content": "hi"}], thinking=True)
@@ -501,7 +501,7 @@ def test_non_thinking_chat_returns_serving_content_unchanged(monkeypatch):
             return _Resp()
 
     monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
-    monkeypatch.setattr(deploy, "_internal_key_header", lambda: {})
+    monkeypatch.setattr(deploy, "_internal_key_header", dict)
     monkeypatch.setattr(deploy, "_chat_http_client", lambda: _Client())
 
     result = deploy.chat("run-1", [{"role": "user", "content": "hi"}])
@@ -691,7 +691,9 @@ def test_a_terminal_duplicate_that_is_split_across_deltas_is_also_folded():
     # settled at end of stream either way.
     lines = _sse({"reasoning_content": "why"}, {"content": "<think>why<"}, {"content": "/think>"})
 
-    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "<think>why</think>"
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "<think>why</think>"
+    )
 
 
 def test_a_terminal_pair_that_is_not_the_reasoning_still_survives():
@@ -741,7 +743,9 @@ def test_a_retained_close_does_not_survive_a_later_reasoning_block():
     # reasoning delta opens a NEW block, and the stale buffer was never cleared -- so the
     # end-of-stream branch flushed it behind the new block's close and the stream carried an extra
     # `</think>` the non-streaming path never produces (cursor).
-    lines = _sse({"reasoning_content": "why"}, {"content": "</think>"}, {"reasoning_content": "more"})
+    lines = _sse(
+        {"reasoning_content": "why"}, {"content": "</think>"}, {"reasoning_content": "more"}
+    )
     streamed = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
 
     assert streamed == "<think>why</think><think>more</think>"
