@@ -2051,6 +2051,94 @@ def test_a_prompt_ending_in_an_assistant_turn_still_replays_faithfully(
     assert "cannot rank completions" in capsys.readouterr().err
 
 
+def test_an_unscorable_control_still_decides_the_groups_reward_path(monkeypatch, tmp_path, capsys):
+    # an unscorable control is dropped from the comparisons because it earns no advantage -- but it
+    # is still a MEMBER of the group the trainer builds, and build_per_turn_advantages demotes the
+    # whole group to episode scalars as soon as one member has no turn vector
+    # (grpo_perturn_trainer.py:59-63). judging the path on the survivors alone read per_turn where
+    # production falls back to the tied scalars and produces no learning signal (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _UnscorableControlEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            rewards = []
+            for example, state in items:
+                gold = {turn["content"] for turn in example["output"]}
+                said = [
+                    message["content"]
+                    for message in state["messages"]
+                    if message.get("role") == "assistant"
+                ]
+                if all(text in gold for text in said) and said:
+                    # gold: tied at zero on the episode scalar, separated only per turn.
+                    rewards.append(RolloutReward(episode=0.0, turns=(1.0, 1.0)))
+                elif said and said[0].startswith("z"):
+                    # one control the grader cannot score. NaN is the trainer's unscorable marker,
+                    # and it arrives here with NO turn vector -- which is what demotes the group.
+                    rewards.append(RolloutReward(episode=float("nan"), turns=None))
+                else:
+                    rewards.append(RolloutReward(episode=0.0, turns=(0.0, 0.0)))
+            return rewards
+
+    _patch_loader(monkeypatch, _UnscorableControlEnv())
+
+    # the group really trains on the tied ZERO episode scalars, so this must be reported, not passed
+    # on the per-turn vectors the trainer never reaches.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", credit_assignment="per_turn")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
+def test_the_reference_completion_is_read_once_per_episode(monkeypatch, tmp_path, capsys):
+    # sft_completion is not required to be pure: one that samples a stored trajectory or consumes an
+    # iterator answers differently each call. it was called twice per episode -- once to pick the
+    # assistant strings to replay, once again to build the observations to compare against -- so an
+    # exact replay was checked against a trajectory it never replayed, marked partial_replay, and
+    # dropped from the control gate, letting a flat-zero grader pass unreported (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _StatefulReferenceEnv(_MultiTurnEnv):
+        """Answers sft_completion from a different stored trajectory on each call."""
+
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def sft_completion(self, example):
+            self.calls += 1
+            # both trajectories replay the SAME assistant turns; they differ only in what the env
+            # is recorded as having said back, which is exactly what the observation check reads.
+            observation = "continue" if self.calls == 1 else "something else entirely"
+            return [
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": observation},
+                {"role": "assistant", "content": "second"},
+            ]
+
+        def reward(self, completion, example, state=None):
+            # flat at zero, which is conclusive -- but only reportable if the episode reaches the
+            # gate. a spurious partial_replay excludes it and the run passes silently instead.
+            return 0.0
+
+    env = _StatefulReferenceEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
 def test_a_mixed_tie_sample_is_not_described_as_entirely_non_zero(monkeypatch, tmp_path, capsys):
     # `not conclusive` is `scored_zero != controlled`, which a MIXED sample satisfies too. claiming
     # every score was non-zero was then false, and pointed at the wrong episodes (cursor).
