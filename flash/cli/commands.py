@@ -549,6 +549,19 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
             parts.append("(prev attempt)")
     if attempt:
         parts.append(f"attempt={attempt}")
+    # what this run has committed to spend so far. while it is live that is the submit-time quote,
+    # since the settled charge is not written until the terminal transition -- following a run for an
+    # hour and never seeing a cost is how a user loses track of what it is costing. it sits next to
+    # realized_cost below so the quote and the settled charge read as one pair.
+    #
+    # a settled zero is a real answer and prints: `runs list` and `runs status` both show $0.0000
+    # there, and dropping it only here made the same terminal run read as costed in one surface and
+    # uncosted in another. what stays suppressed is the pre-settlement zero -- state carries no
+    # cost yet, and `cost=$0.0000` on a queued run states a charge nobody has computed (cursor).
+    amount, is_estimate = render.run_cost(status)
+    settled = str(status.get("state") or "") in render.SETTLED_COST_STATES
+    if amount or is_estimate or settled:
+        parts.append(f"cost={'~' if is_estimate else ''}${amount:.4f}")
     realized = status.get("realized_cost_usd")
     if realized is not None:
         if isinstance(realized, (int, float)):
@@ -760,9 +773,10 @@ def cmd_runs(args) -> int:
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
         where = render.gpu_label(spec, r.get("remote") or {})
+        amount, is_estimate = render.run_cost(r)
+        cost = f"{'~' if is_estimate else ''}{amount:.4f}"
         print(
-            f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "
-            f"{r.get('cost_usd', 0.0):>8.4f}  {where:<22}  {model}"
+            f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  {cost:>8}  {where:<22}  {model}"
         )
     return 0
 
