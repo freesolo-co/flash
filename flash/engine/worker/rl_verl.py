@@ -1,11 +1,11 @@
 """verl-backed grpo training path for the fine-tuning worker.
 
-selected by the private worker env FLASH_RL_BACKEND=verl. this path exists so grpo can run on
-verl (volcengine hybridflow) instead of trl, as the first step toward multi-node rl. verl's
+the only grpo backend: run_rl delegates here unconditionally, and a stale FLASH_RL_BACKEND left in
+a config is inert. verl (volcengine hybridflow) is what makes multi-node rl reachable. verl's
 torch/vllm pins are incompatible with flash's, so flash NEVER imports verl in-process: verl runs
 as a subprocess against a separate interpreter (FLASH_VERL_PYTHON, or a venv provisioned on the
-pod). reward parity with the trl path is provided by a localhost rpc bridge that scores each
-completion against flash's live env, so verl and trl compute identical rewards.
+pod). rewards come from a localhost rpc bridge that scores each completion against flash's live
+env, so the objective is flash's own regardless of which trainer computes the gradient.
 
 scope: non-tool grpo, single- or multi-turn, text or multimodal. a multi-turn env is driven by
 flash's own verl agent loop (grpo_multiturn.py), which runs in the verl interpreter and calls back
@@ -759,8 +759,8 @@ def render_kl_ref_adapter_shim(warmstart: bool) -> str:
     ``engine.disable_adapter()`` -- the BARE BASE. for a fresh-start run that is correct. for a
     warm-started run it is not: the kl term would pull the policy back toward the base and undo the
     sft adapter the run was told to continue, which is why the warm-start + kl combination was
-    refused until now. trl instead snapshots a frozen reference adapter and evaluates the reference
-    under it (rl.py's grpo path); this ports that behavior.
+    refused until now. the retired trl driver instead snapshotted a frozen reference adapter and
+    evaluated the reference under it; this ports that behavior.
 
     the snapshot is registered as NON-PERSISTENT BUFFERS rather than as a second peft adapter's
     parameters, which is what keeps it out of every downstream consumer:
@@ -1034,12 +1034,13 @@ def render_image_pad_ban_shim(image_pad_token_id: int | None) -> str:
     it inside a *completion*. nothing there expands it back into pixels, so the trained sequence
     then contains a token the model can only have produced by hallucinating an image -- and on the
     next forward pass the processor's image/text alignment counts a placeholder with no image
-    behind it. trl bans it through ``generation_kwargs["logit_bias"]`` (rl.py); verl builds its
-    sampling params as a literal dict, so the key is inserted the same way the stop-strings shim
-    inserts ``stop``.
+    behind it. the retired trl driver banned it through ``generation_kwargs["logit_bias"]``; verl
+    builds its sampling params as a literal dict, so the key is inserted the same way the
+    stop-strings shim inserts ``stop``.
 
     unconditional rather than gated on the row: this shim is only written for a multimodal job, and
-    a text-only row in such a job still must not invent a placeholder. -100.0 matches trl's bias.
+    a text-only row in such a job still must not invent a placeholder. -100.0 is a large enough
+    negative bias to make the token unreachable at any temperature this trainer allows.
     """
     if image_pad_token_id is None:
         return ""
@@ -2286,16 +2287,15 @@ def _resolve_grpo_inputs():
     # inserts the key; see render_stop_sequences_shim. note grpo_mask_truncated_completions below
     # gates itself OFF when stop_sequences is set, on either backend.
     stop_sequences = tuple(str(s) for s in (getattr(_t, "stop_sequences", ()) or ())) if _t else ()
-    # entropy_quantile drives trl GRPOTrainer's internal top-entropy token masking
-    # (top_entropy_quantile). verl has no such knob, so a sitecustomize shim adds it; see
-    # render_entropy_quantile_shim. a value >= 1.0 (or unset) masks nothing and needs no shim.
+    # entropy_quantile keeps the loss to the top-entropy tokens of each completion. verl has no
+    # such knob, so a sitecustomize shim adds it; see render_entropy_quantile_shim. a value >= 1.0
+    # (or unset) masks nothing and needs no shim.
     _eq = getattr(_t, "entropy_quantile", None) if _t else None
     entropy_quantile = float(_eq) if _eq is not None and float(_eq) < 1.0 else None
     # credit_assignment: per_turn only changes the objective when there is more than one assistant
-    # turn to credit -- trl reaches GRPOPerTurnTrainer solely via use_rollout_func, which requires
-    # is_multi_turn (rl.py select_grpo_trainer). single-turn envs cannot get there, and trl says so
-    # itself while accepting the key ("per-turn is equivalent to per-episode for single-turn
-    # environments", rl.py). match that: log it, do not reject.
+    # turn to credit -- per-turn IS per-episode when the episode is one turn, so a single-turn env
+    # cannot observe the difference. accept the key and log it rather than rejecting a request that
+    # is merely redundant.
     #
     # on multi-turn it centres each turn against the same turn of its group siblings instead of
     # broadcasting one episode advantage across the transcript. the agent loop records a token span
