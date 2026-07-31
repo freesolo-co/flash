@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +37,17 @@ def bounded_concurrency(value: str) -> int:
     parsed = positive_int(value)
     if parsed > _MAX_CONCURRENCY:
         raise argparse.ArgumentTypeError(f"must be at most {_MAX_CONCURRENCY}")
+    return parsed
+
+
+def finite_float(value: str) -> float:
+    """Reject nan/inf, which the chat route refuses per request.
+
+    Without this, every case submits the invalid value and comes back a generation
+    failure, so one malformed flag reads as the model failing the whole suite."""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be a finite number")
     return parsed
 
 
@@ -349,9 +361,12 @@ def cmd_env_eval(args) -> int:
         evaluation_target = candidate.strip()
         print(f"resolved evaluation target {run_id} to {evaluation_target}")
 
-    started_at = datetime.now(UTC).isoformat()
     reports: list[EvalSuiteReport] = []
     for suite in suites:
+        # each suite uploads as its own run, so each needs its own start. sharing one timestamp
+        # across suites backdates every later run to before the earlier suites' work and
+        # inflates its dashboard duration by time it did not spend.
+        started_at = datetime.now(UTC).isoformat()
         try:
             cases = validate_evaluation_cases(
                 suite, source=entrypoint.parent / _DEFAULT_EVALUATIONS_PATH

@@ -992,3 +992,130 @@ def test_env_eval_forwards_environment_params_to_the_loader(monkeypatch, tmp_pat
     )
 
     assert seen == {"split": "held_out", "difficulty": 3}
+
+
+def test_env_eval_rejects_non_finite_temperature(monkeypatch, capsys) -> None:
+    # the chat route refuses non-finite temperatures per request, so without an argparse-level
+    # guard every case submits the bad value and comes back a generation failure -- one
+    # malformed flag reading as the model failing the whole suite.
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
+    )
+
+    for bad in ("nan", "inf", "-inf"):
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(["env", "eval", _EXPLICIT_TARGET, "--temperature", bad])
+        assert excinfo.value.code == 2
+    assert "must be a finite number" in capsys.readouterr().err
+
+
+def test_env_eval_uploads_each_suite_with_its_own_start_time(
+    monkeypatch, tmp_path
+) -> None:
+    # every suite uploads as its own run. sharing one timestamp backdates each later run to
+    # before the earlier suites ran and inflates its dashboard duration with their work.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class First(BaseEvalSuite):\n"
+        "    name = 'first'\n"
+        "    def cases(self): return [EvalCase(id='a', input='a', expected='a')]\n"
+        "class Second(BaseEvalSuite):\n"
+        "    name = 'second'\n"
+        "    def cases(self): return [EvalCase(id='b', input='b', expected='b')]\n"
+        "def load_evaluations(environment=None): return [First(), Second()]\n"
+    )
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            time.sleep(0.01)
+            yield messages[0]["content"]
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(
+            ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--upload", "--project", _PROJECT_ID]
+        )
+        == 0
+    )
+
+    starts = [call["started_at"] for call in uploader.calls]
+    assert len(starts) == 2
+    # the second suite cannot have started before the first one finished its work.
+    assert starts[1] > starts[0]
+
+
+def test_env_eval_reports_upload_timeout_without_a_traceback(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    # a socket timeout surfaces as a bare TimeoutError, not a URLError. untranslated it escapes
+    # the upload handler after the whole paid evaluation ran, replacing the promised nonfatal
+    # message and final verdict with a traceback. the real upload path runs here, so the socket
+    # is what fails -- patching upload_eval_run itself would skip the translation being tested.
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    def _timeout(req, timeout=None):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
+    monkeypatch.setattr("urllib.request.urlopen", _timeout)
+
+    assert (
+        cli.main(
+            ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--upload", "--project", _PROJECT_ID]
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert "upload failed" in captured.err
+    # the suite itself passed, so the verdict must survive the upload failure.
+    assert "overall: PASS" in captured.out
+
+
+def test_freesolo_request_translates_socket_timeout(monkeypatch) -> None:
+    from flash.client.http import RequestTimeoutError, _freesolo_request
+
+    def _timeout(req, timeout=None):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", _timeout)
+
+    with pytest.raises(RequestTimeoutError) as excinfo:
+        _freesolo_request("POST", "/v1/eval-runs", "key-1", base_url="https://example.test")
+    assert "timed out" in str(excinfo.value)
+
+
+def test_load_evaluations_receives_the_environment_after_other_positional_parameters(
+    tmp_path,
+) -> None:
+    # a factory whose `environment` follows another positional-only parameter used to stop the
+    # match at the earlier name and pass `environment` by keyword, which positional-only
+    # syntax forbids -- so the sidecar failed to load rather than being graded by its scorer.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'positional'\n"
+        "    def __init__(self, environment): self.environment = environment\n"
+        "    def cases(self): return [EvalCase(id='a', input='a', expected='a')]\n"
+        "def load_evaluations(options=None, environment=None, /):\n"
+        "    return [Suite(environment)]\n"
+    )
+    sentinel = object()
+
+    suites = load_evaluation_suites(env_dir / "environment.py", environment=sentinel)
+
+    # the real environment must arrive; None would silently downgrade a scorer that needs it.
+    assert suites[0].environment is sentinel
