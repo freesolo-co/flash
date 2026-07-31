@@ -88,6 +88,11 @@ dev = [
     "datasets>=2.19",
     "freesolo>=0.2.60",
     "transformers>=5.6,<5.11",
+    # flash/multimodal.py imports PIL directly to validate and decode every image source, so the
+    # image tests are not optional coverage: without Pillow they importorskip and CI reports green
+    # on a multimodal path it never executed. test-only, hence dev and not server -- the control
+    # plane does not decode images.
+    "pillow>=11",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on separate machines.
@@ -142,6 +147,11 @@ dev = [
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
     "freesolo>=0.2.60",
+    # flash/multimodal.py imports PIL directly to validate and decode every image source, so the
+    # image tests are not optional coverage: without Pillow they importorskip and CI reports green
+    # on a multimodal path it never executed. test-only, hence dev and not server -- the control
+    # plane does not decode images.
+    "pillow>=11",
 ]
 
 [tool.mypy]

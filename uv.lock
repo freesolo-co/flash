@@ -1037,6 +1037,7 @@ dev = [
     { name = "huggingface-hub" },
     { name = "jsonschema" },
     { name = "mypy" },
+    { name = "pillow" },
     { name = "pytest" },
     { name = "referencing" },
     { name = "regex" },
@@ -1077,6 +1078,7 @@ dev = [
     { name = "datasets" },
     { name = "freesolo" },
     { name = "mypy" },
+    { name = "pillow" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -1102,6 +1104,7 @@ requires-dist = [
     { name = "jsonschema", marker = "extra == 'server'", specifier = ">=4.23" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0" },
     { name = "peft", marker = "extra == 'gpu'", specifier = ">=0.19" },
+    { name = "pillow", marker = "extra == 'dev'", specifier = ">=11" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "referencing", marker = "extra == 'dev'", specifier = ">=0.28.4" },
     { name = "referencing", marker = "extra == 'server'", specifier = ">=0.28.4" },
@@ -1127,6 +1130,7 @@ dev = [
     { name = "datasets", specifier = ">=2.19" },
     { name = "freesolo", specifier = ">=0.2.60" },
     { name = "mypy", specifier = ">=1.13.0" },
+    { name = "pillow", specifier = ">=11" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.6" },
 ]

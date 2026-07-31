@@ -7,9 +7,9 @@ as a subprocess against a separate interpreter (FLASH_VERL_PYTHON, or a venv pro
 pod). reward parity with the trl path is provided by a localhost rpc bridge that scores each
 completion against flash's live env, so verl and trl compute identical rewards.
 
-scope (bounded first pr): single-turn, non-multimodal, non-tool grpo only. sft, opd, and
-multi-turn / tool / rollout_func rewards stay on the trl path (run_rl). anything outside this
-scope raises rather than silently training on a different contract.
+scope: single-turn, non-tool grpo, text or multimodal. multi-turn / tool / rollout_func rewards
+stay on the trl path (run_rl). anything outside this scope raises rather than silently training
+on a different contract.
 """
 
 from __future__ import annotations
@@ -53,7 +53,13 @@ from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import sanitize_rollout_text
-from flash.engine.worker.sft_train import _hydra_val, _NvidiaSmiPeakSampler
+from flash.engine.worker.sft_train import (
+    _hydra_val,
+    _materialize_verl_images,
+    _multimodal_messages_with_images,
+    _NvidiaSmiPeakSampler,
+    _verl_image_message_content,
+)
 from flash.engine.worker.verl_common import (
     VERL_REQUIREMENT,
     agent_loop_workers,
@@ -95,27 +101,117 @@ def build_verl_dataset_rows(
     message_prompts: list[list[dict]],
     example_indices: list[int],
     ground_truths: list[str],
+    image_uris: list[list[str]] | None = None,
 ) -> list[dict]:
     """convert flash chat-message prompts into verl parquet rows.
 
     verl passes ``extra_info`` through to the reward fn; we carry the flash ``example_idx`` in
     ``extra_info.index`` so the reward bridge can map a completion back to its rollout example.
+
+    on a multimodal job every row also carries an ``images`` column of ``file://`` uris and its
+    message content is flattened to a ``<image>``-bearing string: verl's RLHFDataset re-expands
+    those placeholders back into content blocks (``_build_messages``) and asserts the placeholder
+    count equals ``len(images)``, so the two must be produced together. this is the same contract
+    the sft and opd verl paths already write.
     """
     if not (len(message_prompts) == len(example_indices) == len(ground_truths)):
         raise ValueError("message_prompts / example_indices / ground_truths length mismatch")
+    if image_uris is not None and len(image_uris) != len(message_prompts):
+        raise ValueError("image_uris length mismatch")
     rows = []
-    for messages, idx, gt in zip(message_prompts, example_indices, ground_truths, strict=True):
-        rows.append(
-            {
-                "data_source": DATA_SOURCE,
-                "prompt": messages,
-                "ability": "flash",
-                "reward_model": {"style": "rule", "ground_truth": str(gt)},
-                # verl's example index is the flash rollout_examples index; the reward bridge keys on it.
-                "extra_info": {"split": "train", "index": int(idx)},
-            }
-        )
+    for position, (messages, idx, gt) in enumerate(
+        zip(message_prompts, example_indices, ground_truths, strict=True)
+    ):
+        row = {
+            "data_source": DATA_SOURCE,
+            "prompt": (
+                [
+                    {
+                        "role": str(message.get("role") or ""),
+                        "content": _verl_image_message_content(message.get("content")),
+                    }
+                    for message in messages
+                ]
+                if image_uris is not None
+                else messages
+            ),
+            "ability": "flash",
+            "reward_model": {"style": "rule", "ground_truth": str(gt)},
+            # verl's example index is the flash rollout_examples index; the reward bridge keys on it.
+            "extra_info": {"split": "train", "index": int(idx)},
+        }
+        if image_uris is not None:
+            row["images"] = [{"image": uri} for uri in image_uris[position]]
+        rows.append(row)
     return rows
+
+
+def _processor_expanded_prompt(
+    processor,
+    messages: list[dict],
+    image_descriptors: tuple[str, ...],
+    package_root: str | None,
+    *,
+    enable_thinking: bool,
+) -> tuple[list[int], str]:
+    """count a multimodal prompt the way the rollout will actually see it.
+
+    an image is one content block on the way in and hundreds of placeholder tokens on the way out,
+    and only the processor knows the expansion (it depends on the image's resolution). counting
+    with the bare tokenizer would therefore under-measure an image row by most of its length, so
+    the budget filter would admit prompts the engine then rejects.
+
+    returns the expanded ids alongside the rendered text, because the caller needs the same text to
+    decide whether the chat template left an open ``<think>`` span.
+    """
+    from flash.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(image_descriptors), package_root)
+    prepared = _multimodal_messages_with_images(messages, images)
+    rendered = processor.apply_chat_template(
+        prepared, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
+    )
+    model_inputs = processor(
+        text=[rendered], images=images or None, videos=None, return_tensors="pt"
+    )
+    input_ids = model_inputs["input_ids"]
+    if hasattr(input_ids, "tolist"):
+        input_ids = input_ids.tolist()
+    if input_ids and isinstance(input_ids[0], list | tuple):
+        input_ids = input_ids[0]
+    return [int(token_id) for token_id in input_ids], rendered
+
+
+def _verl_grpo_parquet_features():
+    """explicit arrow schema for multimodal grpo rows.
+
+    ``Dataset.from_list`` infers one type per column across all rows. a mixed text/image job has
+    rows whose ``images`` list is empty, and inference on an all-empty column picks a null type
+    that verl's dataset then cannot read back as a struct. pinning the schema keeps every row the
+    same shape regardless of how many images it happens to carry -- the same reason the opd verl
+    writer pins its own.
+    """
+    from datasets import Features, Value
+
+    return Features(
+        {
+            "data_source": Value("string"),
+            "prompt": [{"role": Value("string"), "content": Value("string")}],
+            "images": [{"image": Value("string")}],
+            "ability": Value("string"),
+            "reward_model": {"style": Value("string"), "ground_truth": Value("string")},
+            "extra_info": {"split": Value("string"), "index": Value("int64")},
+        }
+    )
+
+
+def write_verl_grpo_parquet(rows: list[dict], path: str) -> None:
+    """write grpo rows to parquet, pinning the schema when the job is multimodal."""
+    from datasets import Dataset
+
+    multimodal = any("images" in row for row in rows)
+    features = _verl_grpo_parquet_features() if multimodal else None
+    Dataset.from_list(rows, features=features).to_parquet(path)
 
 
 def build_verl_overrides(cfg: dict) -> list[str]:
@@ -157,6 +253,30 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # "seed" entry, so it wins. `++` because the sub-key is absent from the composed node.
         # single replica here (tp == n_gpus, nnodes=1), so verl's replica_rank offset is always 0.
         f"++actor_rollout_ref.rollout.engine_kwargs.vllm.seed={cfg['seed']}",
+        # multimodal: hand verl the images column and let it own prompt expansion. the parquet
+        # carries `<image>` placeholders plus a top-level `images` list of file:// uris, which
+        # RLHFDataset re-expands into content blocks and qwen_vl_utils.fetch_image loads. the
+        # trainer must build a processor rather than a bare tokenizer, hence trust_remote_code and
+        # return_raw_chat. filter_overlong_prompts is verl's own budget drop; flash pre-filters
+        # with the SAME processor above, so it should find nothing left to drop -- it is a
+        # belt-and-braces guard because verl RAISES rather than truncating an over-budget
+        # multimodal prompt (agent_loop.py), which would kill the run mid-rollout.
+        *(
+            [
+                "data.image_key=images",
+                "data.return_raw_chat=true",
+                # the agent loop recomputes multi-modal inputs itself; materializing them in the
+                # dataloader as well doubles the pixel tensors held per row for no consumer.
+                "data.return_multi_modal_inputs=false",
+                "data.filter_overlong_prompts=true",
+                "data.truncation=error",
+                # the processor's image loader is not fork-safe under verl's default workers.
+                "data.dataloader_num_workers=0",
+                "actor_rollout_ref.model.trust_remote_code=true",
+            ]
+            if cfg.get("multimodal")
+            else []
+        ),
         f"actor_rollout_ref.model.path={cfg['model_id']}",
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
@@ -329,6 +449,7 @@ def _build_verl_training_cfg(
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
         "target_modules": "all-linear",
+        "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],
         "group_size": inp["group_size"],
         "prompts_per_step": inp["prompts_per_step"],
@@ -530,6 +651,7 @@ _ENTROPY_QUANTILE_MARKER = "[flash-verl] top-entropy token masking active"
 _STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
 _STRUCTURED_OUTPUTS_MARKER = "[flash-verl] rollout structured outputs active"
 _EXACT_SAVE_STEPS_MARKER = "[flash-verl] exact save steps active"
+_IMAGE_PAD_BAN_MARKER = "[flash-verl] image-pad token banned from rollouts"
 
 
 def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
@@ -694,6 +816,52 @@ if not getattr(_flash_agent_loop.AgentLoopWorker._run_agent_loop, "_flash_stop_p
     _flash_patch_run_agent_loop()
     _flash_agent_loop.AgentLoopWorker._run_agent_loop._flash_stop_patched = True
     print({_STOP_SEQUENCES_MARKER!r} + " " + repr(_flash_stop_sequences), flush=True)
+'''
+
+
+def render_image_pad_ban_shim(image_pad_token_id: int | None) -> str:
+    """return the sitecustomize source that stops a multimodal rollout emitting the image-pad token.
+
+    the vision placeholder token is a real vocabulary entry, so an unconstrained sampler can emit
+    it inside a *completion*. nothing there expands it back into pixels, so the trained sequence
+    then contains a token the model can only have produced by hallucinating an image -- and on the
+    next forward pass the processor's image/text alignment counts a placeholder with no image
+    behind it. trl bans it through ``generation_kwargs["logit_bias"]`` (rl.py); verl builds its
+    sampling params as a literal dict, so the key is inserted the same way the stop-strings shim
+    inserts ``stop``.
+
+    unconditional rather than gated on the row: this shim is only written for a multimodal job, and
+    a text-only row in such a job still must not invent a placeholder. -100.0 matches trl's bias.
+    """
+    if image_pad_token_id is None:
+        return ""
+    return f'''
+from verl.experimental.agent_loop import agent_loop as _flash_image_agent_loop
+
+_flash_image_pad_token_id = {int(image_pad_token_id)!r}
+
+
+def _flash_patch_image_pad_ban():
+    original = _flash_image_agent_loop.AgentLoopWorker._run_agent_loop
+
+    async def _run_agent_loop(self, sampling_params, *args, **kwargs):
+        params = dict(sampling_params)
+        logit_bias = dict(params.get("logit_bias") or {{}})
+        logit_bias[_flash_image_pad_token_id] = -100.0
+        params["logit_bias"] = logit_bias
+        return await original(self, params, *args, **kwargs)
+
+    _flash_image_agent_loop.AgentLoopWorker._run_agent_loop = _run_agent_loop
+
+
+# patch once, and independently of the stop-strings patch: both wrap the same method, so each
+# needs its own marker attribute or the second would be skipped by the first one's flag.
+if not getattr(
+    _flash_image_agent_loop.AgentLoopWorker._run_agent_loop, "_flash_image_pad_patched", False
+):
+    _flash_patch_image_pad_ban()
+    _flash_image_agent_loop.AgentLoopWorker._run_agent_loop._flash_image_pad_patched = True
+    print({_IMAGE_PAD_BAN_MARKER!r} + " " + repr(_flash_image_pad_token_id), flush=True)
 '''
 
 
@@ -1142,7 +1310,7 @@ class _VerlResumeUploader:
         python_bin: str = "",
         model_id: str = "",
         model_revision: str = "",
-        tokenizer=None,
+        preprocessor=None,
         had_gradient: Callable[[], bool] | None = None,
     ) -> None:
         self.local_dir = local_dir
@@ -1167,7 +1335,10 @@ class _VerlResumeUploader:
         self.python_bin = python_bin
         self.model_id = model_id
         self.model_revision = model_revision
-        self.tokenizer = tokenizer
+        # the processor on a multimodal job, else the tokenizer: an image model cannot be served
+        # from an adapter dir that carries only tokenizer files, since the runtime needs the
+        # preprocessor config to turn pixels back into tokens.
+        self.preprocessor = preprocessor
         # gates DEPLOYABLE publication (not resume upload) on the run having produced a real
         # gradient. these publishes land while training is still running, so without the gate a
         # degenerate-reward run makes untrained adapters durable and servable minutes before
@@ -1274,9 +1445,9 @@ class _VerlResumeUploader:
         _export_peft_adapter(
             actor_dir, adapter_dir, base_model_id=self.model_id, python_bin=self.python_bin
         )
-        # the served adapter needs its tokenizer alongside it, exactly as the final publish does.
-        # grpo verl rejects multimodal upstream, so a tokenizer (not a processor) is the whole set.
-        self.tokenizer.save_pretrained(adapter_dir)
+        # the served adapter needs its preprocessor alongside it, exactly as the final publish does:
+        # the processor on a multimodal job (tokenizer + image preprocessor), else the tokenizer.
+        self.preprocessor.save_pretrained(adapter_dir)
         _stamp_adapter_dir_provenance(adapter_dir, self.model_id, self.model_revision)
         _w.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
         return adapter_dir
@@ -1607,15 +1778,32 @@ def _resolve_single_turn_inputs():
     rng.shuffle(train)
     message_prompts = [env.prompt_messages(ex) for ex in train]
 
-    from flash.multimodal import record_has_images
+    from flash.multimodal import (
+        normalize_prompt_images,
+        record_has_images,
+        resolve_image_pad_token_id,
+        validate_multimodal_training,
+    )
 
-    if any(record_has_images(ex, m) for ex, m in zip(train, message_prompts, strict=True)):
-        raise RuntimeError(
-            "FLASH_RL_BACKEND=verl supports non-multimodal grpo only; this env has image prompts. "
-            "use the trl backend for it."
+    multimodal = any(
+        record_has_images(ex, messages) for ex, messages in zip(train, message_prompts, strict=True)
+    )
+    package_root = getattr(env, "package_root", None)
+    processor = None
+    image_pad_token_id = None
+    if multimodal:
+        # the model must actually support image training; this raises for a text-only checkpoint
+        # rather than letting the processor silently drop the pixels.
+        validate_multimodal_training(model_id, "grpo", multi_turn=False)
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=True, **_w.model_revision_kwargs(model_revision)
         )
-
-    tok = _w.load_tokenizer(model_id, revision=model_revision)
+        tok = processor.tokenizer
+        image_pad_token_id = resolve_image_pad_token_id(processor, tok)
+    else:
+        tok = _w.load_tokenizer(model_id, revision=model_revision)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -1644,12 +1832,48 @@ def _resolve_single_turn_inputs():
         )
 
     prompts = []
-    for ex, messages in zip(train, message_prompts, strict=True):
-        rendered = tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
+    if multimodal:
+        # verl RAISES on an over-budget multimodal prompt instead of truncating it (agent_loop.py:
+        # "truncating multimodal token sequences corrupts vision/audio feature alignment"), so this
+        # pre-filter is what keeps a long prompt from killing the run mid-rollout rather than just
+        # being dropped.
+        #
+        # every row goes through the PROCESSOR, including the text-only rows of a mixed job: the
+        # verl child tokenizes the whole dataset through the multimodal path, so a row measured
+        # with the bare tokenizer here would be measured against a different expansion there. an
+        # image expands to hundreds of placeholder tokens, so a tokenizer-only count on an image
+        # row is not merely imprecise, it is off by most of the prompt.
+        for ex, messages in zip(train, message_prompts, strict=True):
+            normalized = normalize_prompt_images(ex, messages, package_root)
+            expanded, rendered = _processor_expanded_prompt(
+                processor,
+                normalized.messages,
+                tuple(normalized.descriptors),
+                package_root,
+                enable_thinking=bool(_w.THINKING),
+            )
+            if 0 < len(expanded) <= prompt_budget:
+                prompts.append(
+                    {
+                        "prompt": normalized.messages,
+                        "images": list(normalized.descriptors),
+                        "rendered": rendered,
+                        "example": ex,
+                    }
+                )
+    else:
+        for ex, messages in zip(train, message_prompts, strict=True):
+            rendered = tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
+            )
+            if 0 < len(tok(rendered, add_special_tokens=False).input_ids) <= prompt_budget:
+                prompts.append({"prompt": messages, "rendered": rendered, "example": ex})
+    if len(prompts) < len(train):
+        print(
+            f"[rl-verl] dropped {len(train) - len(prompts)} prompts over the "
+            f"{prompt_budget}-token prompt budget",
+            flush=True,
         )
-        if 0 < len(tok(rendered, add_special_tokens=False).input_ids) <= prompt_budget:
-            prompts.append({"prompt": messages, "rendered": rendered, "example": ex})
     if not prompts:
         raise ValueError(f"every training prompt exceeds the {prompt_budget}-token prompt budget")
 
@@ -1690,6 +1914,10 @@ def _resolve_single_turn_inputs():
     return {
         "env": env,
         "tok": tok,
+        "processor": processor,
+        "multimodal": multimodal,
+        "package_root": package_root,
+        "image_pad_token_id": image_pad_token_id,
         "model_id": model_id,
         "model_revision": model_revision,
         "prompts": prompts,
@@ -1729,8 +1957,6 @@ def _resolve_single_turn_inputs():
 
 def run_rl_verl():
     """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
-    import pandas as pd
-
     t_start = time.time()
     _w.heartbeat("rl_start", gpu=gpu_diagnostics())
     wait_for_gpu(
@@ -1741,6 +1967,9 @@ def run_rl_verl():
 
     inp = _resolve_single_turn_inputs()
     env, tok = inp["env"], inp["tok"]
+    # what gets saved next to a published adapter. a multimodal adapter is unservable without its
+    # image preprocessor, so save the whole processor there; a text run saves the tokenizer alone.
+    preprocessor = inp["processor"] or tok
     prompts = inp["prompts"]
 
     # cache the base model before launching verl, then run verl fully offline so its vllm /
@@ -1796,9 +2025,23 @@ def run_rl_verl():
     val_pq = os.path.join(workdir, "val.parquet")
     reward_py = os.path.join(workdir, "reward.py")
 
-    rows = build_verl_dataset_rows(message_prompts, indices, ground_truths)
-    pd.DataFrame(rows).to_parquet(train_pq)
-    pd.DataFrame(rows[: max(1, min(4, len(rows)))]).to_parquet(val_pq)
+    # multimodal: decode each prompt's images to png on disk and carry file:// uris in the parquet.
+    # verl's dataset loads them through qwen_vl_utils.fetch_image, which reads file:// natively, so
+    # the pixels never have to round-trip through arrow. same contract the opd verl path writes.
+    image_uris = None
+    if inp["multimodal"]:
+        image_dir = os.path.join(workdir, "images")
+        shutil.rmtree(image_dir, ignore_errors=True)
+        image_uris = [
+            _materialize_verl_images(
+                list(prompt.get("images") or []), inp["package_root"], image_dir, index
+            )
+            for index, prompt in enumerate(prompts)
+        ]
+
+    rows = build_verl_dataset_rows(message_prompts, indices, ground_truths, image_uris)
+    write_verl_grpo_parquet(rows, train_pq)
+    write_verl_grpo_parquet(rows[: max(1, min(4, len(rows)))], val_pq)
     with open(reward_py, "w") as f:
         f.write(render_reward_module())
 
@@ -1815,6 +2058,7 @@ def run_rl_verl():
         for part in (
             render_entropy_quantile_shim(inp["entropy_quantile"]),
             render_stop_sequences_shim(inp["stop_sequences"]),
+            render_image_pad_ban_shim(inp["image_pad_token_id"]),
             render_structured_outputs_shim(inp["structured_outputs"]),
             render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"]),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
@@ -1961,7 +2205,7 @@ def run_rl_verl():
             python_bin=python_bin,
             model_id=inp["model_id"],
             model_revision=inp["model_revision"],
-            tokenizer=tok,
+            preprocessor=preprocessor,
             # a resumed run's restored weights already carry the earlier steps' updates, so this
             # worker's own spread history cannot speak for them; let it publish as before and leave
             # the verdict to the same abstention _check_grpo_had_a_gradient makes.
@@ -2146,7 +2390,7 @@ def run_rl_verl():
         _export_peft_adapter(
             actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
         )
-        tok.save_pretrained(adapter_dir)
+        preprocessor.save_pretrained(adapter_dir)
         _stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
