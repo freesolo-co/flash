@@ -68,6 +68,41 @@ def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):
     assert "published freesolo-co/u-environment" in capsys.readouterr().out
 
 
+def test_push_single_py_module_carries_its_evaluations_sidecar(monkeypatch, tmp_path):
+    # `env eval` loads evaluations.py next to an exact .py target, so a single-file push that
+    # dropped it would publish an environment whose suite passed locally and is simply gone
+    # once pushed -- a green local check for a package that cannot reproduce it.
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text("def load_evaluations(environment=None): return []\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "environment.py" in files
+    assert "evaluations.py" in files
+
+
+def test_push_dir_infers_entrypoint_ignoring_the_evaluations_sidecar(monkeypatch, tmp_path):
+    # a legacy package whose sole module is custom.py resolved fine before evaluations.py
+    # existed. counting the sidecar as a candidate entrypoint makes adding one turn that
+    # directory into "multiple top-level .py modules" and reject it before either file loads.
+    env_dir = tmp_path / "legacy-env"
+    env_dir.mkdir()
+    (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "evaluations.py").write_text("def load_evaluations(environment=None): return []\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir, name="legacy-env")) == 0
+    files = _members(cap["package_b64"])
+    # packaging canonicalizes the inferred entrypoint to environment.py, so the assertion is
+    # that custom.py was chosen and published at all -- before the fix this raised instead.
+    assert "return None" in files["environment.py"]
+    assert "evaluations.py" in files
+
+
 def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
     env_dir = tmp_path / "my-env"
     env_dir.mkdir()

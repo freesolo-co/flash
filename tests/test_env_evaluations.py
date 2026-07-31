@@ -19,6 +19,9 @@ from flash.envs.evaluations import (
     normalize_eval_result,
 )
 
+# --upload validates the project id before spending anything, so tests must pass a real UUID.
+_PROJECT_ID = "11111111-1111-1111-1111-111111111111"
+
 
 def _environment_dir(tmp_path: Path) -> Path:
     env_dir = tmp_path / "environment"
@@ -326,7 +329,7 @@ def test_env_eval_upload_requires_a_project_id(monkeypatch, tmp_path, capsys) ->
 
     # the guard must fire before any generation happens, so no paid work is wasted.
     assert cli.main(["env", "eval", "flash-1", str(env_dir), "--upload"]) == 1
-    assert "--upload requires --project" in capsys.readouterr().err
+    assert "--upload requires a valid --project" in capsys.readouterr().err
 
 
 def test_env_eval_project_without_upload_is_rejected(monkeypatch, tmp_path, capsys) -> None:
@@ -336,7 +339,7 @@ def test_env_eval_project_without_upload_is_rejected(monkeypatch, tmp_path, caps
     )
     env_dir = _upload_env_dir(tmp_path)
 
-    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--project", "p-1"]) == 1
+    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--project", _PROJECT_ID]) == 1
     assert "--project only applies with --upload" in capsys.readouterr().err
 
 
@@ -370,12 +373,13 @@ def test_env_eval_upload_sends_every_case_with_the_project_id(monkeypatch, tmp_p
     _patch_upload(monkeypatch, uploader)
 
     assert (
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 0
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 0
     )
 
     assert len(uploader.calls) == 1
     call = uploader.calls[0]
-    assert call["project_id"] == "proj-9"
+    assert call["project_id"] == _PROJECT_ID
     assert call["suite_name"] == "math"
     assert call["model"] == "flash-1"
     assert [case["case_id"] for case in call["cases"]] == ["sum"]
@@ -400,7 +404,8 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
 
     # the suite fails overall because one case never generated...
     assert (
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 1
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 1
     )
 
     # ...but both cases are still uploaded, and the failure carries its error rather than
@@ -410,6 +415,26 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
     assert cases["dead"]["error"] is not None
     assert "generation failed" in cases["dead"]["error"]
     assert cases["sum"]["error"] is None
+
+
+def test_env_eval_rejects_a_malformed_project_before_generating(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    # upload_eval_run requires a canonical UUID. validating only that --project is nonblank
+    # would buy every model request and then fail at the upload -- and because upload failure
+    # deliberately does not change the verdict, the run would still print `overall: PASS`
+    # with nothing recorded anywhere.
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
+    )
+    env_dir = _upload_env_dir(tmp_path)
+
+    assert (
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "not-a-uuid"])
+        == 1
+    )
+    assert "must be a valid UUID" in capsys.readouterr().err
 
 
 def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
@@ -440,7 +465,8 @@ def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
     _patch_upload(monkeypatch, uploader)
 
     assert (
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 0
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 0
     )
 
     cases = {case["case_id"]: case for case in uploader.calls[0]["cases"]}
@@ -472,7 +498,8 @@ def test_env_eval_upload_failure_does_not_relabel_a_passing_suite(
     # the suite genuinely passed; a failed upload is reported but must not turn it into a
     # FAIL, which would read as the model having gotten the answer wrong.
     assert (
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 0
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 0
     )
     captured = capsys.readouterr()
     assert "upload failed" in captured.err
@@ -495,7 +522,8 @@ def test_env_eval_upload_without_login_reports_the_missing_key(
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", None))
 
     assert (
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", "proj-9"]) == 0
+        cli.main(["env", "eval", "flash-1", str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 0
     )
     assert "not logged in" in capsys.readouterr().err
     # no key means no request was attempted at all.
