@@ -2093,6 +2093,84 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
     assert "persisted spec is malformed" in (status.error or "")
 
 
+def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
+    # when `_strict_teardown_handle` cannot confirm the delete, the handle is recorded for the
+    # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
+    # snapshotted an empty list, and it returns early on empty (cursor). so the record sat there
+    # with nothing scheduled to retry it, and the worker kept billing until the next restart.
+    import flash.providers as providers
+    import flash.runner as runner
+    import flash.server._runtime as runtime
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    # a COMPLETE handle: `_record_cleanup_remote` drops anything it cannot resolve to an exact
+    # provider resource identity, so a partial one would make this test pass for the wrong reason.
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "ep-unconfirmed",
+        "endpoint_name": "flash-recover-unconfirmed",
+        "key_fingerprint": "rpk-0123456789ab",
+        "attempt": 0,
+        "started_ts": 1.0,
+    }
+    assert runner._remote_resource_identity(remote) is not None
+    runner._save_status(
+        runner.RunStatus(
+            run_id="recover-unconfirmed",
+            state="running",
+            spec=JobSpec(
+                run_id="recover-unconfirmed", model="Qwen/Qwen3.5-4B", algorithm="sft"
+            ).to_dict(),
+            remote=dict(remote),
+        )
+    )
+    stored_path = runner.runs_file_path("recover-unconfirmed", ".json")
+    with open(stored_path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["algorithm"] = "retired-algorithm"
+    with open(stored_path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "recover-unconfirmed"}])
+    monkeypatch.setattr(providers, "configured_providers", list)
+
+    torn: list[str] = []
+
+    def fake_teardown(handle, run_id):
+        # the direct teardown is handed the raw dict; the drain rebuilds a JobHandle from the
+        # persisted record, so the two call sites are distinguishable here.
+        torn.append("drain" if hasattr(handle, "provider") else "direct")
+        return False  # unconfirmed, both times: this is the case that records for the drain
+
+    monkeypatch.setattr("flash.runner.lifecycle._strict_teardown_handle", fake_teardown)
+    monkeypatch.setattr(runner, "attach_run", lambda rid: None)
+    # persisting a cleanup record reports the new status, which blocks on its reporter thread. that
+    # thread is real in production; here the fake below would stand in for it and never run.
+    monkeypatch.setattr(runner, "_report_status", lambda status: None)
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    # patch the ATTRIBUTE recover_runs reads, not threading.Thread globally: the module-wide patch
+    # also replaced the status reporter's own worker thread, so nothing serviced its queue.
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    # the drain runs twice: once before the teardown (nothing recorded yet, so it tears down
+    # nothing) and once after, which is the retry. without the second dispatch the sequence is
+    # ["direct"] and the recorded resource is never attempted at all.
+    assert torn == ["direct", "drain"]
+    # and it is still recorded, because the retry did not confirm the delete either -- so the next
+    # restart's drain will find it and try again, rather than the record being dropped unconfirmed.
+    with open(stored_path, encoding="utf-8") as handle:
+        assert json.load(handle)["cleanup_remotes"] == [remote]
+
+
 def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypatch, tmp_path):
     import time as time_mod
 
