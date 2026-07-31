@@ -64,6 +64,17 @@ _KV_BLOCK_TOKENS = 16
 # floor remains authoritative at short context; longer contexts retain 1.5 gb plus 25% fragmentation.
 _KV_PROFILE_OVERHEAD_GB = 1.5
 _KV_FRAGMENTATION_MARGIN = 1.25
+# adapter bytes per trainable parameter. the 8-bit paged optimizer needs ~10; fp32 AdamW needs 16
+# (4 param + 2 gradient + 8 moments + 2 bf16 shadow). SFT and OPD size on AdamW because verl builds
+# torch.optim.AdamW for both -- OPD inherits verl's own default, and SFT names it explicitly since
+# bitsandbytes' 8-bit blockwise update is not a distributed operator and dies on FSDP2's DTensor
+# parameters. the backend is a [worker_env] property that never reaches this sizing path, so the
+# heavier optimizer is the only safe basis: under-reserving OOMs a paid run.
+#
+# GRPO stays on the paged constant. verl GRPO also runs AdamW, so it is under-sized by the same
+# 6 bytes/param -- but GRPO's estimate is already at the B200 ceiling (the 35B MoE at 4096 ctx sizes
+# to 180 GB exactly), and widening it there REJECTS a configuration that runs today. that gap is real
+# and tracked separately; correcting it needs the resident-peak model retuned, not a constant swap.
 _LORA_PAGED_BYTES_PER_PARAM = 10.0
 _LORA_ADAMW_BYTES_PER_PARAM = 16.0
 
@@ -231,9 +242,9 @@ def _lora_memory_gb(
     )
     trainable_params = max(1, int(lora_rank)) * target_dims
     bytes_per_param = (
-        _LORA_ADAMW_BYTES_PER_PARAM
-        if (algorithm or "").lower() == "opd"
-        else _LORA_PAGED_BYTES_PER_PARAM
+        _LORA_PAGED_BYTES_PER_PARAM
+        if (algorithm or "").lower() in ("grpo", "rl")
+        else _LORA_ADAMW_BYTES_PER_PARAM
     )
     exact = trainable_params * bytes_per_param / 1e9
     return max(floor, exact)
@@ -445,8 +456,11 @@ _SFT_CHUNKED_NLL_TOKENS = 256
 _LIGER_MIN_PARAMS_B = 3.0
 _LIGER_LONG_CTX_TOKENS = 2048
 
-# trl 1.6 chunked_nll is validated against these model families. other models keep plain nll
-# until their output-head and backbone traversal are covered by the same parity tests.
+# the fused, dense-logit-free sft loss is validated against these model families. other models keep
+# plain nll until their output-head and backbone traversal are covered by the same parity tests.
+# the implementation moved from trl's chunked_nll to verl's use_fused_kernels + use_liger (set
+# unconditionally in engine/worker/sft_train.py); the sizing property -- no dense [b, s, vocab]
+# logits tensor -- is what this set gates, and it holds for both.
 _SFT_CHUNKED_NLL_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-0.8B",
@@ -459,7 +473,7 @@ _SFT_CHUNKED_NLL_MODELS = frozenset(
 
 
 def sft_chunked_nll_enabled(model_id: str) -> bool:
-    """whether the sft worker uses trl's dense-logit-free chunked nll path."""
+    """whether the sft worker uses a dense-logit-free fused loss path."""
     return model_id in _SFT_CHUNKED_NLL_MODELS
 
 
@@ -528,6 +542,31 @@ def grpo_kv_floor_gb(
     return upper
 
 
+def _declares_linear_attention(model_info, model_id: str = "") -> bool:
+    """True for a GDN hybrid, using the catalog rather than a network config fetch.
+
+    The two vLLM rollout workers refuse an fp8 KV cache for these models (vllm's fp8 wake path
+    init_fp8_kv_scales assumes a plain kv tensor and crashes on the hybrid cache), so sizing must
+    not apply the fp8 discount to them or it reserves half the cache the run allocates. This is the
+    offline half of engine/worker/packing.py:model_is_gdn_hybrid, which probes the HF config; the
+    catalog carries num_linear_attention_layers for every model it routes.
+
+    ``model_id`` is the fallback the pinned-revision path needs. A pinned commit drops to generic
+    architecture sizing (``sizing_info = None``), which is right for geometry but wrong here:
+    attention family is a property of the model, not of the commit, and the worker's runtime gate
+    reads the pinned config and refuses fp8 all the same. Consulting the catalog by id keeps the two
+    in agreement instead of handing pinned GDN runs a discount their cache never takes.
+    """
+    if int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0:
+        return True
+    if not model_id:
+        return False
+    from flash.catalog import MODELS
+
+    catalog_info = MODELS.get(model_id)
+    return int(getattr(catalog_info, "num_linear_attention_layers", 0) or 0) > 0
+
+
 def _rollout_kv_floor_gb(
     params_b: float,
     vllm_max_len: int,
@@ -535,6 +574,7 @@ def _rollout_kv_floor_gb(
     *,
     active_params_b: float | None = None,
     model_info=None,
+    model_id: str = "",
     preserve_legacy_floor: bool = False,
 ) -> int:
     floor = grpo_kv_floor_gb(
@@ -547,6 +587,8 @@ def _rollout_kv_floor_gb(
     )
     from flash.providers.base import max_non_fp8_kv_vram_gb
 
+    if _declares_linear_attention(model_info, model_id):
+        return floor
     ceiling = max_non_fp8_kv_vram_gb()
     if floor <= ceiling:
         return floor
@@ -999,14 +1041,21 @@ def model_required_vram_gb(
         """Re-size an OPD requirement with an fp8 KV cache once the run is provably modern-card-only.
 
         The colocated OPD vLLM rollout engine reserves an fp8 KV cache on cc >= 8.9 hardware
-        (engine/worker/opd_vllm.py), but the estimate defaults to a bf16 KV pool. Any OPD run needing
+        (engine/worker/opd_train.py sends engine_kwargs.vllm.kv_cache_dtype=fp8), but the estimate
+        defaults to a bf16 KV pool. Any OPD run needing
         more VRAM than the biggest non-fp8 validated card (the 80 GB A100) can ONLY land on a modern
         (cc >= 8.9) card, so that bf16 pool is a phantom: it doubles the real KV and wrongly rejects
         full-context / grouped OPD configs on the 35B that actually fit a B200. Halve it — but only
         while the fp8-sized requirement still clears the non-fp8 ceiling, so the discount can never
-        pull the run back onto a card that would NOT use fp8 (which would then OOM)."""
+        pull the run back onto a card that would NOT use fp8 (which would then OOM).
+
+        Skipped entirely for GDN hybrids: both workers refuse fp8 KV for them (opd_train.py,
+        rl_verl.py), so their cache really is bf16 and the discount would admit a run onto a card
+        that cannot hold it."""
         from flash.providers.base import max_non_fp8_kv_vram_gb
 
+        if _declares_linear_attention(model_info, model_id):
+            return need
         ceiling = max_non_fp8_kv_vram_gb()
         if need <= ceiling:
             return need
@@ -1032,9 +1081,9 @@ def model_required_vram_gb(
     vllm_concurrency = (
         opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
     )
-    # trl chunked_nll removes ignored positions before the lm head and projects valid tokens in
-    # bounded chunks. size validated qwen sft jobs without a dense [batch, seq, vocab] term; models
-    # outside that validated set keep the conservative plain-nll estimate and micro-batch cap.
+    # the fused sft loss removes ignored positions before the lm head and projects valid tokens
+    # without materializing dense logits. size validated qwen sft jobs without a [batch, seq, vocab]
+    # term; models outside that validated set keep the conservative plain-nll estimate and cap.
     sft_fused_ce = None if is_grpo else sft_chunked_nll_enabled(model_id)
     if info is not None:
         params_b = info.params_b
@@ -1126,6 +1175,7 @@ def model_required_vram_gb(
                     vllm_concurrency,
                     active_params_b=active_b,
                     model_info=sizing_info,
+                    model_id=model_id,
                     preserve_legacy_floor=is_opd,
                 ),
             )
@@ -1150,7 +1200,11 @@ def model_required_vram_gb(
         floor_gb = 24 if params_b <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
         if is_opd and params_b >= 2.0:
             floor_gb = max(floor_gb, int(_OPD_VLLM_COLOCATE_FLOOR_GB))
-        need = max(need, floor_gb, _rollout_kv_floor_gb(params_b, seq_len, vllm_concurrency))
+        need = max(
+            need,
+            floor_gb,
+            _rollout_kv_floor_gb(params_b, seq_len, vllm_concurrency, model_id=model_id),
+        )
     return need
 
 

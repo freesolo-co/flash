@@ -511,7 +511,140 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     # Never scheduled (no capacity) is reported distinctly from a scheduled-then-stalled worker.
     assert res.failure == "no_capacity"
     assert "IN_QUEUE" in res.detail
-    assert "next-best GPU" in res.detail
+    # the detail states the OBSERVED condition and stops there. poll_job cannot know what happens
+    # next: the retry disposition lives in _run_training, which owns the candidate list and the
+    # retry budget and already prints "retrying ..." / "not retrying" alongside this detail.
+    # a provider-side guess contradicts that line whenever the budget is exhausted.
+    assert "no RunPod capacity" in res.detail
+    assert "retrying" not in res.detail
+
+
+def test_no_capacity_detail_never_predicts_the_retry_disposition(monkeypatch):
+    # Same never-scheduled stall, polled with the NON-last grace. The detail must be IDENTICAL in
+    # wording regardless of grace: the grace does not determine what happens next.
+    #
+    # on_last_gpu (lifecycle.py:781) is an OR of two unrelated conditions -- "last untried class"
+    # and "infra retry budget exhausted" -- so a 900s grace can mean the walk wraps back to an
+    # already-tried class, OR that can_retry() returns false and the run TERMINATES. Any wording
+    # derived from the grace alone is wrong in at least one of those paths, and "retrying on the
+    # same class" on a max_retries=0 run directly contradicts lifecycle's own "not retrying".
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: (_ for _ in ()).throw(RuntimeError("no workers yet")),
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    h = _runpod_handle(jobs)
+    res = jobs.poll_job(
+        h,
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=5000.0,
+        queue_grace_s=300.0,  # not the last GPU
+    )
+    assert not res.ok
+    assert res.failure == "no_capacity"
+    assert "no RunPod capacity" in res.detail
+    # no next-step claim in EITHER direction -- that is _run_training's line to print.
+    assert "retrying" not in res.detail
+    assert "next-best" not in res.detail
+
+
+def _queued_forever(monkeypatch, health, *, step=20.0):
+    """Poll a job that never leaves IN_QUEUE, with ``health`` driving endpoint_health_for_fingerprint.
+
+    ``step`` seconds per mocked ``time.time()`` call. poll_job calls it ~2-3x per iteration, so the
+    loop advances ~40-60s at a time: slow enough that the 90s health-probe cadence and the 300s
+    coming-up TTL are both exercised at their real granularity rather than skipped over in one jump.
+    """
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=step)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    return jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=3000.0,
+        queue_grace_s=900.0,
+    )
+
+
+def test_slow_image_pull_is_not_reported_as_missing_capacity(monkeypatch):
+    # A RunPod job stays IN_QUEUE for the WHOLE worker cold start, multi-GB image pull included.
+    # So the queue timer alone cannot tell "RunPod never gave us a GPU" from "the GPU arrived and
+    # the worker is still pulling" -- and a heavy image (flash-worker:cu128-verl) pulls for longer
+    # than the 900s last-GPU capacity grace. Reporting that as no_capacity is self-perpetuating:
+    # the runner tears the endpoint down and re-provisions a FRESH one, which (workersMin=0) pulls
+    # the same image cold again, so every retry re-pays the cost that failed the previous attempt.
+    #
+    # The unhealthy/throttled timers already refuse to fire while a worker is initializing or
+    # usable; the capacity timer must honour the same observation. Once a worker exists the wait is
+    # startup, bounded by the much larger setup_grace_s -- which is what fires here.
+    res = _queued_forever(
+        monkeypatch, lambda eid, _fp, **_kw: {"workers": {"initializing": 1, "ready": 0}}
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "setup (pre-training)" in res.detail
+
+
+def test_capacity_timer_stays_suppressed_once_the_worker_is_ready(monkeypatch):
+    # Same shape one step later in the cold start: the worker has finished pulling and reports
+    # ready/idle, but the job has not been dequeued yet. This is the exact health series the real
+    # false-positive run showed (idle: 1, ready: 1 fifteen minutes before it was failed
+    # no_capacity), so it must not be read as RunPod withholding the GPU either.
+    res = _queued_forever(monkeypatch, lambda eid, _fp, **_kw: {"workers": {"idle": 1, "ready": 1}})
+    assert not res.ok
+    assert res.failure == "stalled"
+
+
+def test_capacity_timer_rearms_when_worker_health_stops_being_readable(monkeypatch):
+    # The health probe lives inside `except Exception: pass`, so a bare "a worker came up" flag
+    # would survive a probe outage and suppress the capacity timer for the rest of the run. The
+    # observation is stamped and expires after WORKER_COMING_UP_TTL_S: one good reading buys a
+    # bounded suppression, not a permanent one. Here the probe answers once and then fails
+    # forever, so the capacity verdict must come back.
+    from flash.providers.runpod import jobs
+
+    calls = {"n": 0}
+
+    def health(eid, _fp, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"workers": {"initializing": 1}}
+        raise RuntimeError("health unavailable")
+
+    res = _queued_forever(monkeypatch, health)
+    assert not res.ok
+    assert res.failure == "no_capacity"
+    assert calls["n"] > 1  # the probe really did keep being attempted and kept failing
+    # the suppression window is bounded by a named constant, not by however long the run lasts.
+    assert jobs.WORKER_COMING_UP_TTL_S == 300.0
+
+
+def test_no_worker_at_all_is_still_reported_as_missing_capacity(monkeypatch):
+    # Non-regression for the case the backstop actually exists for: health is readable and reports
+    # NO worker in any state. Nothing is coming up, so nothing suppresses the timer and the run
+    # hands off to the next-best GPU class on schedule.
+    res = _queued_forever(monkeypatch, lambda eid, _fp, **_kw: {"workers": {}})
+    assert not res.ok
+    assert res.failure == "no_capacity"
+    assert "no RunPod capacity" in res.detail
 
 
 def test_capacity_grace_scales_with_gpu_walk_position():

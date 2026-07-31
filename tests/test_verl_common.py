@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import time
@@ -34,12 +35,39 @@ def test_agent_loop_workers_rejects_a_nonpositive_batch():
 
 def test_latest_global_step_dir_picks_highest(tmp_path):
     for step in (1, 5, 20, 3):
-        os.makedirs(tmp_path / f"global_step_{step}" / "actor", exist_ok=True)
+        os.makedirs(tmp_path / f"global_step_{step}" / "actor" / "huggingface", exist_ok=True)
     # a non-checkpoint dir must be ignored, not crash the scan.
     os.makedirs(tmp_path / "not_a_step", exist_ok=True)
     actor, step = vc.latest_global_step_dir(str(tmp_path))
     assert step == 20
     assert actor == os.path.join(str(tmp_path), "global_step_20", "actor")
+
+
+def test_latest_global_step_dir_resolves_the_sft_layout(tmp_path):
+    # verl's sft trainer saves straight into global_step_N with no actor/ level. hardcoding the rl
+    # convention here pointed the model merger at a path that does not exist, and AutoConfig
+    # reinterpreted it as a hub repo id -- so the run died on a bogus HFValidationError.
+    for step in (1, 2):
+        os.makedirs(tmp_path / f"global_step_{step}" / "huggingface", exist_ok=True)
+    actor, step = vc.latest_global_step_dir(str(tmp_path))
+    assert step == 2
+    assert actor == os.path.join(str(tmp_path), "global_step_2")
+
+
+def test_resolve_checkpoint_actor_dir_prefers_the_nested_rl_layout(tmp_path):
+    # rl checkpoints carry huggingface/ at both levels (the merger wants the actor one).
+    os.makedirs(tmp_path / "actor" / "huggingface")
+    os.makedirs(tmp_path / "huggingface")
+    assert vc.resolve_checkpoint_actor_dir(str(tmp_path)) == os.path.join(str(tmp_path), "actor")
+
+
+def test_resolve_checkpoint_actor_dir_falls_back_when_no_marker_exists(tmp_path):
+    # an interrupted save has no huggingface/ anywhere; name the rl path the caller likely wanted.
+    os.makedirs(tmp_path / "actor")
+    assert vc.resolve_checkpoint_actor_dir(str(tmp_path)) == os.path.join(str(tmp_path), "actor")
+    empty = tmp_path / "empty"
+    os.makedirs(empty)
+    assert vc.resolve_checkpoint_actor_dir(str(empty)) == str(empty)
 
 
 def test_latest_global_step_dir_raises_when_empty(tmp_path):
@@ -68,6 +96,46 @@ def test_stamp_adapter_dir_provenance_rejects_base_mismatch(tmp_path):
 def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):
     monkeypatch.setenv("FLASH_VERL_PYTHON", "/opt/verl/bin/python")
     assert vc.resolve_verl_python(str(tmp_path)) == "/opt/verl/bin/python"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_path, blank):
+    # a worker IMAGE can export FLASH_VERL_PYTHON itself, and [worker_env] can only SET a key, never
+    # delete one -- so omitting it from a spec leaves the image's interpreter in place. an empty
+    # value is the only way a run can say "ignore the image's verl and provision the pinned fork",
+    # and the error at rl_verl.py's mask_truncated_completions gate names exactly this remedy.
+    calls = []
+    monkeypatch.setenv("FLASH_VERL_PYTHON", blank)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    python_bin = vc.resolve_verl_python(str(tmp_path))
+
+    assert python_bin.endswith("/verl-venv/bin/python")
+    assert vc.VERL_REQUIREMENT in calls[1]
+
+
+def test_worker_env_remedies_are_copy_pasteable_toml():
+    # a [worker_env] snippet in an error gets pasted into a config verbatim, so it has to survive the
+    # real parser: '[worker_env] KEY = "..."' reads fine in prose but is invalid TOML, because a
+    # table header must end its line. a blocked run would just hit a second, more confusing error.
+    import re
+    import tomllib
+
+    from flash.engine.worker import rl_verl
+
+    # only assignment forms -- '[worker_env] can set a key but never delete one' is prose, not a
+    # snippet, and carries no '=' to paste.
+    pattern = re.compile(r"\[worker_env\][^\n]*?[A-Z_]+\s*=\s*(\"[^\"]*\"|'[^']*')")
+    snippets = [m.group(0) for m in pattern.finditer(inspect.getsource(rl_verl))]
+    assert snippets, "expected rl_verl to advertise at least one [worker_env] remedy"
+
+    for snippet in snippets:
+        # a valid snippet is the header, a newline, then the assignment -- exactly what we tell users.
+        header, _, assignment = snippet.partition("]")
+        parsed = tomllib.loads(f"{header}]\n{assignment.split('as ')[-1].strip()}")
+        assert parsed == {"worker_env": {"FLASH_VERL_PYTHON": ""}}
+        # and the prose must not run the header into the assignment on one line.
+        assert not re.match(r"\[worker_env\]\s+[A-Z_]+\s*=", snippet), snippet
 
 
 def _fake_verl_venv(tmp_path, *, stamp: str | None):
@@ -173,10 +241,10 @@ def test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork():
 
 
 def test_verl_pin_matches_the_version_opd_requires_exactly():
-    # the pin MUST stay on the verl 0.8.0 base. opd_verl_plugin patches 0.8.0 internals and imports
+    # the pin MUST stay on the verl 0.8.0 base. opd_plugin patches 0.8.0 internals and imports
     # verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, so a pin built on a newer base
     # installs a verl that fails opd's exact-version gate and cannot import its own entrypoint.
-    from flash.engine.worker import opd_verl_plugin as plugin
+    from flash.engine.worker import opd_plugin as plugin
 
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
     # asserting the constant alone would let a newer-base commit land silently, so bind the pinned
@@ -321,3 +389,139 @@ def test_run_verl_training_kills_the_grandchild_not_just_the_direct_child(tmp_pa
             return
         time.sleep(0.05)
     pytest.fail(f"grandchild {grandchild} survived teardown and is still holding the gpu")
+
+
+def test_child_output_tail_retains_bounded_recent_lines():
+    tail = vc.ChildOutputTail(limit=3)
+    for i in range(6):
+        tail.record(f"line{i}\n")
+    # bounded: the oldest are evicted, the most recent survive in order.
+    assert tail.tail() == ["line3", "line4", "line5"]
+    assert tail.tail(limit=2) == ["line4", "line5"]
+    # a limit wider than the buffer is not an error and does not pad.
+    assert tail.tail(limit=99) == ["line3", "line4", "line5"]
+
+
+def test_child_output_tail_drops_blank_lines_and_caps_line_width():
+    tail = vc.ChildOutputTail()
+    tail.record("\n")
+    tail.record("   \n")  # whitespace-only survives rstrip("\n") and is intentionally kept
+    tail.record("x" * 5000 + "\n")
+    kept = tail.tail()
+    assert "" not in kept, "a bare newline must not occupy a slot in the window"
+    widest = max(len(line) for line in kept)
+    assert widest <= vc._CHILD_TAIL_LINE_CHARS, (
+        f"retained a {widest}-char line; verl prints multi-KB config blocks and the tail "
+        "has to ride inside an uploaded heartbeat payload"
+    )
+
+
+def test_run_verl_training_records_child_output_into_the_tail():
+    """the child's words must reach the tail, because the parent's stdout reaches no log stream."""
+    tail = vc.ChildOutputTail()
+    code = vc.run_verl_training(
+        ["bash", "-c", "echo 'ray placement group pending'; echo 'step: 1'; echo 'wedged here'"],
+        env=dict(os.environ),
+        tail=tail,
+    )
+    assert code == 0
+    captured = tail.tail()
+    # this is the diagnostic that was unretrievable in production: the child's last line before it
+    # stopped producing output (ISSUES VERL-061).
+    assert captured[-1] == "wedged here"
+    assert "ray placement group pending" in captured
+
+
+def test_run_verl_training_without_a_tail_is_unchanged():
+    """tail is opt-in; omitting it must not alter streaming or the exit code."""
+    lines: list[str] = []
+    code = vc.run_verl_training(
+        ["bash", "-c", "echo 'step: 4'; exit 3"],
+        env=dict(os.environ),
+        on_line=lines.append,
+    )
+    assert code == 3
+    assert lines == ["step: 4\n"]
+
+
+def test_stall_tail_fields_reports_only_before_the_first_step():
+    tail = vc.ChildOutputTail()
+    tail.record("ray: placement group pending\n")
+
+    # pre-first-step: this is the blind window, so the child's words must be carried out.
+    fields = vc.stall_tail_fields(0, tail)
+    assert fields == {"child_tail": ["ray: placement group pending"]}
+
+    # once training progresses the step/loss stream is the diagnostic; the tail would be pure
+    # payload bloat on every tick.
+    assert vc.stall_tail_fields(1, tail) == {}
+    assert vc.stall_tail_fields(500, tail) == {}
+
+
+def test_stall_tail_fields_is_empty_when_the_child_has_said_nothing():
+    # an empty key would claim the child spoke and said nothing, which is a different fact from
+    # "the child has produced no output at all".
+    assert vc.stall_tail_fields(0, vc.ChildOutputTail()) == {}
+
+
+def test_stall_tail_fields_reports_how_long_the_child_has_been_silent():
+    # the whole point: a child still loading shards and a child wedged forever both present a fully
+    # populated tail whose newest line looks plausible. only whether the tail CHANGED separates them,
+    # and without this the comparison has to be reconstructed by hand from consecutive heartbeats.
+    tail = vc.ChildOutputTail()
+    staleness = vc.ChildTailStaleness()
+    tail.record("Started a local Ray instance\n")
+
+    first = vc.stall_tail_fields(0, tail, staleness=staleness)
+    assert first["child_tail_silent_ticks"] == 0
+
+    # two more ticks with the child saying nothing new: same tail, rising silence.
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 1
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 2
+
+    # the child speaks again, so it is slow rather than stuck and the counter resets.
+    tail.record("loading checkpoint shards 1/4\n")
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+
+
+def test_child_tail_silence_survives_the_retention_limit():
+    # staleness is counted from lines WRITTEN, not from the retained window: once the ring buffer is
+    # full its contents can keep changing while its length does not, and a length-based comparison
+    # would then report a talking child as silent.
+    tail = vc.ChildOutputTail(limit=3)
+    staleness = vc.ChildTailStaleness()
+    for i in range(3):
+        tail.record(f"line{i}\n")
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    tail.record("line3\n")  # evicts line0; the deque stays length 3
+    assert len(tail.tail()) == 3
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+
+
+def test_child_tail_silence_is_measured_from_the_childs_first_line():
+    # a child silent for the first ticks then talking must not be credited with the silence that
+    # preceded its first line -- otherwise a slow starter reports as long-wedged the moment it speaks.
+    tail = vc.ChildOutputTail()
+    staleness = vc.ChildTailStaleness()
+    for _ in range(4):
+        assert vc.stall_tail_fields(0, tail, staleness=staleness) == {}
+    tail.record("first words\n")
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+
+
+def test_stall_tail_fields_omits_silence_when_no_tracker_is_supplied():
+    # the field must not appear as a fabricated 0 for callers that do not track staleness: absent and
+    # "zero ticks silent" are different claims.
+    tail = vc.ChildOutputTail()
+    tail.record("only line\n")
+    assert vc.stall_tail_fields(0, tail) == {"child_tail": ["only line"]}
+
+
+def test_stall_tail_fields_narrows_to_the_most_recent_lines():
+    tail = vc.ChildOutputTail()
+    for i in range(vc.STALL_TAIL_LINES + 25):
+        tail.record(f"line{i}\n")
+    carried = vc.stall_tail_fields(0, tail)["child_tail"]
+    assert len(carried) == vc.STALL_TAIL_LINES
+    # the most recent lines are the ones that matter: they are what the child said last.
+    assert carried[-1] == f"line{vc.STALL_TAIL_LINES + 24}"

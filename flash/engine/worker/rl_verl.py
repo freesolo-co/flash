@@ -7,27 +7,32 @@ as a subprocess against a separate interpreter (FLASH_VERL_PYTHON, or a venv pro
 pod). reward parity with the trl path is provided by a localhost rpc bridge that scores each
 completion against flash's live env, so verl and trl compute identical rewards.
 
-scope (bounded first pr): single-turn, non-multimodal, non-tool grpo only. sft, opd, and
-multi-turn / tool / rollout_func rewards stay on the trl path (run_rl). anything outside this
-scope raises rather than silently training on a different contract.
+scope: non-tool grpo, single- or multi-turn, text or multimodal. a multi-turn env is driven by
+flash's own verl agent loop (grpo_multiturn.py), which runs in the verl interpreter and calls back
+into this process for every environment reply. openai function-calling tool envs are still out of
+scope and raise rather than silently training on a different contract.
 """
 
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import math
 import os
 import random
 import re
 import shutil
+import statistics
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from functools import reduce
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import gcd
 
+from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import (
     final_save_due,
@@ -42,26 +47,42 @@ from flash.engine.structured_outputs import (
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import (
-    _GRPO_METRIC_HISTORY_LIMIT,
+    GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
+    RewardObservabilityBuffer,
     liveness_heartbeat,
 )
 from flash.engine.worker.hf import _deployable_adapter_on_hf
+from flash.engine.worker.multiturn_glue import validate_glue_template
+from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
-from flash.engine.worker.rollout_samples import sanitize_rollout_text
-from flash.engine.worker.sft_verl import _hydra_val, _NvidiaSmiPeakSampler
+from flash.engine.worker.rollout_samples import (
+    sample_completion_text,
+    sanitize_rollout_text,
+)
+from flash.engine.worker.sft_train import (
+    _hydra_val,
+    _materialize_verl_images,
+    _multimodal_messages_with_images,
+    _NvidiaSmiPeakSampler,
+    _verl_image_message_content,
+)
 from flash.engine.worker.verl_common import (
     VERL_REQUIREMENT,
     agent_loop_workers,
+    append_step_metrics,
     clamp_engine_len,
     model_max_position_embeddings,
+    parse_verl_metric,
+    parse_verl_step_metrics,
     parse_wandb_link,
     render_wandb_link_shim,
+    resolve_verl_loggers,
     resolve_verl_python,
     verl_supports_rollout_field,
 )
-from flash.spec import gpu_count_of
+from flash.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 
 DATA_SOURCE = "flash_env"
 
@@ -88,27 +109,140 @@ def build_verl_dataset_rows(
     message_prompts: list[list[dict]],
     example_indices: list[int],
     ground_truths: list[str],
+    image_uris: list[list[str]] | None = None,
 ) -> list[dict]:
     """convert flash chat-message prompts into verl parquet rows.
 
     verl passes ``extra_info`` through to the reward fn; we carry the flash ``example_idx`` in
     ``extra_info.index`` so the reward bridge can map a completion back to its rollout example.
+
+    on a multimodal job every row also carries an ``images`` column of ``file://`` uris and its
+    message content is flattened to a ``<image>``-bearing string: verl's RLHFDataset re-expands
+    those placeholders back into content blocks (``_build_messages``) and asserts the placeholder
+    count equals ``len(images)``, so the two must be produced together. this is the same contract
+    the sft and opd verl paths already write.
+
+    ``<image>``, ``<video>`` and ``<audio>`` are therefore reserved substrings, not ordinary text,
+    on every row of a multimodal job -- including a text-only row in a mixed dataset, because verl
+    splits on all three whenever ANY modality column is non-empty for that row. a prompt that merely
+    talks about one of these tokens would be re-expanded as real media and abort dataset loading
+    inside verl with a bare offset assertion (and for video/audio we never write a column at all, so
+    a single literal occurrence asserts against an empty list). reject it here instead, where the
+    message is still attributable to its example.
     """
     if not (len(message_prompts) == len(example_indices) == len(ground_truths)):
         raise ValueError("message_prompts / example_indices / ground_truths length mismatch")
+    if image_uris is not None and len(image_uris) != len(message_prompts):
+        raise ValueError("image_uris length mismatch")
     rows = []
-    for messages, idx, gt in zip(message_prompts, example_indices, ground_truths, strict=True):
-        rows.append(
-            {
-                "data_source": DATA_SOURCE,
-                "prompt": messages,
-                "ability": "flash",
-                "reward_model": {"style": "rule", "ground_truth": str(gt)},
-                # verl's example index is the flash rollout_examples index; the reward bridge keys on it.
-                "extra_info": {"split": "train", "index": int(idx)},
-            }
-        )
+    for position, (messages, idx, gt) in enumerate(
+        zip(message_prompts, example_indices, ground_truths, strict=True)
+    ):
+        prompt: list[dict] | list
+        if image_uris is None:
+            prompt = messages
+        else:
+            prompt = [
+                {
+                    "role": str(message.get("role") or ""),
+                    "content": _verl_image_message_content(message.get("content")),
+                }
+                for message in messages
+            ]
+            placeholders = sum(str(message["content"]).count("<image>") for message in prompt)
+            if placeholders != len(image_uris[position]):
+                raise ValueError(
+                    f"multimodal prompt for example {int(idx)} has {placeholders} <image> "
+                    f"placeholder(s) but {len(image_uris[position])} image(s); a literal "
+                    "'<image>' in prompt text is reserved by verl's dataset loader"
+                )
+            for reserved in ("<video>", "<audio>"):
+                if any(reserved in str(message["content"]) for message in prompt):
+                    raise ValueError(
+                        f"multimodal prompt for example {int(idx)} contains a literal "
+                        f"'{reserved}', which verl's dataset loader reserves as a media "
+                        "placeholder; flash writes no such column"
+                    )
+        row = {
+            "data_source": DATA_SOURCE,
+            "prompt": prompt,
+            "ability": "flash",
+            "reward_model": {"style": "rule", "ground_truth": str(gt)},
+            # verl's example index is the flash rollout_examples index; the reward bridge keys on it.
+            "extra_info": {"split": "train", "index": int(idx)},
+        }
+        if image_uris is not None:
+            row["images"] = [{"image": uri} for uri in image_uris[position]]
+        rows.append(row)
     return rows
+
+
+def _processor_expanded_prompt(
+    processor,
+    messages: list[dict],
+    image_descriptors: tuple[str, ...],
+    package_root: str | None,
+    *,
+    enable_thinking: bool,
+) -> tuple[list[int], str]:
+    """count a multimodal prompt the way the rollout will actually see it.
+
+    an image is one content block on the way in and hundreds of placeholder tokens on the way out,
+    and only the processor knows the expansion (it depends on the image's resolution). counting
+    with the bare tokenizer would therefore under-measure an image row by most of its length, so
+    the budget filter would admit prompts the engine then rejects.
+
+    returns the expanded ids alongside the rendered text, because the caller needs the same text to
+    decide whether the chat template left an open ``<think>`` span.
+    """
+    from flash.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(image_descriptors), package_root)
+    prepared = _multimodal_messages_with_images(messages, images)
+    rendered = processor.apply_chat_template(
+        prepared, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
+    )
+    model_inputs = processor(
+        text=[rendered], images=images or None, videos=None, return_tensors="pt"
+    )
+    input_ids = model_inputs["input_ids"]
+    if hasattr(input_ids, "tolist"):
+        input_ids = input_ids.tolist()
+    if input_ids and isinstance(input_ids[0], list | tuple):
+        input_ids = input_ids[0]
+    return [int(token_id) for token_id in input_ids], rendered
+
+
+def _verl_grpo_parquet_features():
+    """explicit arrow schema for multimodal grpo rows.
+
+    ``Dataset.from_list`` infers one type per column across all rows. a mixed text/image job has
+    rows whose ``images`` list is empty, and inference on an all-empty column picks a null type
+    that verl's dataset then cannot read back as a struct. pinning the schema keeps every row the
+    same shape regardless of how many images it happens to carry -- the same reason the opd verl
+    writer pins its own.
+    """
+    from datasets import Features, Value
+
+    return Features(
+        {
+            "data_source": Value("string"),
+            "prompt": [{"role": Value("string"), "content": Value("string")}],
+            "images": [{"image": Value("string")}],
+            "ability": Value("string"),
+            "reward_model": {"style": Value("string"), "ground_truth": Value("string")},
+            "extra_info": {"split": Value("string"), "index": Value("int64")},
+        }
+    )
+
+
+def write_verl_grpo_parquet(rows: list[dict], path: str) -> None:
+    """write grpo rows to parquet, pinning the schema when the job is multimodal."""
+    from datasets import Dataset
+
+    multimodal = any("images" in row for row in rows)
+    features = _verl_grpo_parquet_features() if multimodal else None
+    Dataset.from_list(rows, features=features).to_parquet(path)
 
 
 def build_verl_overrides(cfg: dict) -> list[str]:
@@ -137,7 +271,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"data.val_files={cfg['val_files']}",
         f"data.train_batch_size={cfg['prompts_per_step']}",
         f"data.max_prompt_length={cfg['max_prompt_len']}",
-        f"data.max_response_length={cfg['max_completion']}",
+        # rollout.response_length interpolates from this key, and it is BOTH the response tensor's
+        # width and the default per-request generation cap. on multi-turn it is the episode budget,
+        # not the per-turn cap -- the agent loop passes an explicit per-turn max_tokens, so the
+        # wider default is never used as a single turn's limit.
+        f"data.max_response_length={cfg['max_response_len']}",
         "data.prompt_key=prompt",
         # rollout prompt parity: verl renders raw messages with the tokenizer's chat template;
         # thread flash's thinking mode so the rollout sees the same prompt as the trl path.
@@ -150,6 +288,30 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # "seed" entry, so it wins. `++` because the sub-key is absent from the composed node.
         # single replica here (tp == n_gpus, nnodes=1), so verl's replica_rank offset is always 0.
         f"++actor_rollout_ref.rollout.engine_kwargs.vllm.seed={cfg['seed']}",
+        # multimodal: hand verl the images column and let it own prompt expansion. the parquet
+        # carries `<image>` placeholders plus a top-level `images` list of file:// uris, which
+        # RLHFDataset re-expands into content blocks and qwen_vl_utils.fetch_image loads. the
+        # trainer must build a processor rather than a bare tokenizer, hence trust_remote_code and
+        # return_raw_chat. filter_overlong_prompts is verl's own budget drop; flash pre-filters
+        # with the SAME processor above, so it should find nothing left to drop -- it is a
+        # belt-and-braces guard because verl RAISES rather than truncating an over-budget
+        # multimodal prompt (agent_loop.py), which would kill the run mid-rollout.
+        *(
+            [
+                "data.image_key=images",
+                "data.return_raw_chat=true",
+                # the agent loop recomputes multi-modal inputs itself; materializing them in the
+                # dataloader as well doubles the pixel tensors held per row for no consumer.
+                "data.return_multi_modal_inputs=false",
+                "data.filter_overlong_prompts=true",
+                "data.truncation=error",
+                # the processor's image loader is not fork-safe under verl's default workers.
+                "data.dataloader_num_workers=0",
+                "actor_rollout_ref.model.trust_remote_code=true",
+            ]
+            if cfg.get("multimodal")
+            else []
+        ),
         f"actor_rollout_ref.model.path={cfg['model_id']}",
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
@@ -206,6 +368,14 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # pool to the batch instead: the largest divisor of the rollout batch that is <= 8, which is
         # always valid and still parallelizes whenever the batch allows it.
         f"actor_rollout_ref.rollout.agent.num_workers={agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']))}",
+        # multi-turn runs flash's own agent loop, registered in the child by flash_grpo_plugin. the
+        # stock single_turn_agent generates once and returns; it has no notion of an environment
+        # reply, so a multi-turn env on the default loop would train on first turns only.
+        *(
+            ["actor_rollout_ref.rollout.agent.default_agent_loop=flash_grpo_multi_turn"]
+            if cfg["multi_turn"]
+            else []
+        ),
         # fork-only rollout field, so `++` (append-or-override): it exists in the fork's rollout.yaml
         # but not in stock verl 0.8.0's, where a bare key or `+` would break. omitted entirely when
         # false, since not masking is already stock behavior and stock verl rejects the unknown key.
@@ -322,6 +492,7 @@ def _build_verl_training_cfg(
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
         "target_modules": "all-linear",
+        "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],
         "group_size": inp["group_size"],
         "prompts_per_step": inp["prompts_per_step"],
@@ -335,6 +506,8 @@ def _build_verl_training_cfg(
         "max_token_len_per_gpu": engine_len,
         "max_prompt_len": inp["max_prompt_len"],
         "max_completion": inp["max_completion"],
+        "max_response_len": inp["max_response_len"],
+        "multi_turn": bool(inp["multi_turn"]),
         "temperature": inp["temperature"],
         "top_p": inp["top_p"],
         "kl_coef": inp["kl_coef"],
@@ -363,51 +536,59 @@ def _build_verl_training_cfg(
     }
 
 
-# verl prints every per-step metric on one stdout line, under its own names. map them onto the
-# payload keys the cli step table already renders (_FOLLOW_METRIC_FIELDS in cli/commands.py) so a
-# verl run shows the same history a trl run does.
-#
-# only keys the PINNED verl actually prints belong here. its reporter emits critic/rewards/mean,
-# /max and /min but no /std (verl/trainer/ppo/metric_utils.py:220-222 at the pinned commit), so a
-# reward_std pattern would never match real output -- it would only make the parser look complete
-# while every production row silently lacked the column. reward_std and frac_reward_zero_std are
-# both computed inside the trl trainer, so both stay blank on a verl run.
-_VERL_STEP_METRIC_KEYS = (
-    ("reward", r"critic/rewards/mean:([-\d.eE+]+)"),
-    ("grad_norm", r"actor/grad_norm:([-\d.eE+]+)"),
-    ("kl", r"actor/kl_loss:([-\d.eE+]+)"),
-    ("entropy", r"actor/entropy(?:_loss)?:([-\d.eE+]+)"),
-    ("mean_completion_tokens", r"response_length/mean:([-\d.eE+]+)"),
-    ("truncation_rate", r"response_length/clip_ratio:([-\d.eE+]+)"),
-)
-_VERL_STEP_METRIC_RES = tuple((key, re.compile(pat)) for key, pat in _VERL_STEP_METRIC_KEYS)
+def _step_intervals(step_line_times: list[float]) -> list[float]:
+    """Wall-clock length of each step, from the times its metric lines arrived.
 
-
-def _verl_step_metrics(line: str, *, max_completion_tokens: int | None = None) -> dict | None:
-    """Parse one verl stdout line into a ``metrics_last`` row, or None if it is not a step line.
-
-    The trl backend builds these rows in its trainer callback (``heartbeat.py``), which verl never
-    instantiates because it trains out of process -- so without this the cli's per-step metrics table
-    is empty for every verl run. Only the step number is required; each metric is independent, so a
-    verl version that omits one still yields a row carrying the rest.
+    N step lines bound N-1 whole steps. The span BEFORE the first line is not one of them: it holds
+    engine init, weight load and cudagraph capture, which a later step never pays again. Nothing is
+    known about the span after the last line either, since the run may have been cancelled mid-step.
     """
-    step_hit = re.search(r"step:\s*(\d+)", line)
-    if not step_hit:
+    return [
+        later - earlier for earlier, later in itertools.pairwise(step_line_times) if later > earlier
+    ]
+
+
+def _measured_idle_fraction(
+    reward_profile,
+    *,
+    completions_per_step: int,
+    step_intervals: list[float],
+) -> float | None:
+    """Share of a step the gpu spent waiting on grading, from this run's OWN numbers.
+
+    Both inputs are measured rather than modelled: the per-completion latency comes from the
+    warm-up profile against the real env, and the gpu-bound half is the observed step wall minus
+    the grading it contains. A modelled step time would report the estimator's opinion of the run
+    back to the estimator, which cannot then be used to check it.
+
+    ``step_intervals`` are the wall-clock gaps between consecutive step metric lines, so each one
+    is a real step and nothing else. ``train_wall / steps_run`` is NOT a step wall and cannot
+    substitute: it charges subprocess startup and the checkpoint-upload drain to the numerator,
+    while ``steps_run`` is the absolute checkpoint step, so a run resuming at 90 and training to
+    100 would divide ten steps of wall time by a hundred.
+
+    The MEDIAN, not the mean: any single step can absorb a checkpoint save or a lazily compiled
+    kernel, and one such step would drag a mean far enough to change the verdict. A median needs
+    most steps to be slow before it moves.
+
+    None whenever the reading would not mean anything -- no trustworthy profile, no completed step,
+    or grading that accounts for the entire step wall (which makes the gpu-bound remainder zero or
+    negative, i.e. the step wall and the profile disagree and neither can arbitrate).
+    """
+    if reward_profile is None or not reward_profile.trustworthy:
         return None
-    metrics: dict = {"step": int(step_hit.group(1))}
-    for key, pattern in _VERL_STEP_METRIC_RES:
-        hit = pattern.search(line)
-        if not hit:
-            continue
-        try:
-            value = float(hit.group(1))
-        except ValueError:
-            continue
-        if math.isfinite(value):
-            metrics[key] = value
-    if max_completion_tokens is not None:
-        metrics["max_completion_tokens"] = int(max_completion_tokens)
-    return metrics
+    completions = max(0, int(completions_per_step))
+    intervals = [float(gap) for gap in step_intervals if gap > 0]
+    if completions <= 0 or not intervals:
+        return None
+    step_wall = statistics.median(intervals)
+    reward_s = reward_profile.seconds_per_completion * completions
+    gpu_seconds = step_wall - reward_s
+    if gpu_seconds <= 0:
+        return None
+    from flash.engine.reward_profile import gpu_idle_fraction
+
+    return gpu_idle_fraction(reward_profile.seconds_per_completion, completions, gpu_seconds)
 
 
 def _build_verl_train_notes(
@@ -425,6 +606,8 @@ def _build_verl_train_notes(
     wandb_run_name: str | None = None,
     wandb_url: str | None = None,
     wandb_id: str | None = None,
+    reward_profile=None,
+    step_intervals: list[float] | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -478,6 +661,21 @@ def _build_verl_train_notes(
         # wandb.run, verl from the child marker (see verl_common.render_wandb_link_shim).
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
+        # what this env's grader actually cost, and what share of a step the gpu spent waiting on
+        # it. measured, not modelled: the cost model prices every grader at one global average
+        # (1.0 s/completion) spanning regex graders to llm judges, and those two sit at opposite
+        # ends of the utilization range. None when the profile was skipped or untrustworthy --
+        # recording a number with nothing behind it is worse than recording no number.
+        "reward_seconds_per_completion": (
+            reward_profile.seconds_per_completion
+            if reward_profile is not None and reward_profile.trustworthy
+            else None
+        ),
+        "reward_gpu_idle_fraction": _measured_idle_fraction(
+            reward_profile,
+            completions_per_step=inp["prompts_per_step"] * inp["group_size"],
+            step_intervals=step_intervals or [],
+        ),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],
@@ -498,6 +696,120 @@ _ENTROPY_QUANTILE_MARKER = "[flash-verl] top-entropy token masking active"
 _STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
 _STRUCTURED_OUTPUTS_MARKER = "[flash-verl] rollout structured outputs active"
 _EXACT_SAVE_STEPS_MARKER = "[flash-verl] exact save steps active"
+_IMAGE_PAD_BAN_MARKER = "[flash-verl] image-pad token banned from rollouts"
+_KL_REF_ADAPTER_MARKER = "[flash-verl] kl reference anchored to the warm-start adapter"
+
+
+def render_kl_ref_adapter_shim(warmstart: bool) -> str:
+    """return the sitecustomize source that anchors verl's kl reference to the warm-start adapter.
+
+    verl computes reference logprobs on the actor whenever lora is active (``ref_in_actor`` in
+    ray_trainer.py is ``lora_rank > 0 or lora_adapter_path is not None``, always true on flash) and
+    marks that call ``no_lora_adapter=True``, which engine_workers.py turns into
+    ``engine.disable_adapter()`` -- the BARE BASE. for a fresh-start run that is correct. for a
+    warm-started run it is not: the kl term would pull the policy back toward the base and undo the
+    sft adapter the run was told to continue, which is why the warm-start + kl combination was
+    refused until now. trl instead snapshots a frozen reference adapter and evaluates the reference
+    under it (rl.py's grpo path); this ports that behavior.
+
+    the snapshot is registered as NON-PERSISTENT BUFFERS rather than as a second peft adapter's
+    parameters, which is what keeps it out of every downstream consumer:
+
+    - ``named_parameters()`` never sees it, so fsdp does not flatten it and the optimizer cannot
+      train it (a trainable reference would drift with the policy and anchor nothing).
+    - ``state_dict()`` never sees it, so it stays out of the saved shards. that matters more than
+      it looks: verl's merger does not call ``save_pretrained`` for the adapter, it hand-builds one
+      from every state-dict key containing ``lora_`` and derives ``target_modules`` from
+      ``key.split(".")[-3]`` (base_model_merger.save_lora_adapter). a second adapter's keys do not
+      match its ``.default.weight`` rewrite, so they would resolve to ``lora_A``/``lora_B`` and ship
+      a deliverable adapter with bogus target modules.
+    - a resumed run reloads the same shards with ``strict=True``; absent keys would fail that load.
+      the snapshot is rebuilt from ``lora_adapter_path``, which flash passes on every warm-start
+      run including a resume, so the anchor re-forms identically rather than being restored.
+
+    the swap is ``BaseTunerLayer._active_adapter``, not peft's ``set_adapter``: ``set_adapter``
+    flips ``requires_grad`` on both adapters, and verl wraps fsdp1 with ``use_orig_params=false``
+    where that breaks flat-param uniformity. writing ``_active_adapter`` changes zero flags and
+    restores the policy forward bit-exactly.
+    """
+    if not warmstart:
+        return ""
+    return f'''
+from contextlib import contextmanager as _flash_ref_contextmanager
+
+import torch.nn as _flash_ref_nn
+from peft.tuners.tuners_utils import BaseTunerLayer as _flash_ref_tuner_layer
+from verl.workers.engine.fsdp import transformer_impl as _flash_ref_impl
+
+_FLASH_REF_ADAPTER = "flash_kl_ref"
+
+
+def _flash_ref_snapshot(module):
+    """freeze a copy of the warm-start adapter under a second, non-trainable adapter name."""
+    if _FLASH_REF_ADAPTER in getattr(module, "peft_config", {{}}):
+        return module
+    module.add_adapter(_FLASH_REF_ADAPTER, module.peft_config[module.active_adapter])
+    for name, param in module.named_parameters():
+        if ".default." in name:
+            twin = module.get_parameter(name.replace(".default.", f".{{_FLASH_REF_ADAPTER}}."))
+            twin.data.copy_(param.data)
+    # demote the snapshot from parameters to non-persistent buffers. lora_A/lora_B are ModuleDicts
+    # keyed by adapter name, so the snapshot's leaves are exactly the ones under our key.
+    demoted = 0
+    for container in module.modules():
+        if isinstance(container, _flash_ref_nn.ModuleDict) and _FLASH_REF_ADAPTER in container:
+            leaf = container[_FLASH_REF_ADAPTER]
+            for attr, value in list(leaf.named_parameters(recurse=False)):
+                frozen = value.detach().clone()
+                delattr(leaf, attr)
+                leaf.register_buffer(attr, frozen, persistent=False)
+                demoted += 1
+    if not demoted:
+        raise RuntimeError("flash kl reference snapshot found no adapter weights to freeze")
+    print({_KL_REF_ADAPTER_MARKER!r} + " " + repr(demoted), flush=True)
+    return module
+
+
+_flash_ref_original_build_lora = _flash_ref_impl.FSDPEngine._build_lora_module
+
+
+def _flash_ref_build_lora_module(self, module):
+    # after the warm-start adapter is loaded, before _build_fsdp_module wraps it.
+    return _flash_ref_snapshot(_flash_ref_original_build_lora(self, module))
+
+
+@_flash_ref_contextmanager
+def _flash_ref_use_ref_adapter(module):
+    """activate the frozen snapshot without touching any requires_grad flag."""
+    layers = [m for m in module.modules() if isinstance(m, _flash_ref_tuner_layer)]
+    if not layers:
+        raise RuntimeError("flash kl reference: no lora layers on the actor module")
+    saved = [layer._active_adapter for layer in layers]
+    for layer in layers:
+        layer._active_adapter = [_FLASH_REF_ADAPTER]
+    try:
+        yield
+    finally:
+        for layer, previous in zip(layers, saved, strict=True):
+            layer._active_adapter = previous
+
+
+def _flash_ref_disable_adapter(self):
+    # this shim is only written for a warm start, so the snapshot must exist. falling back to the
+    # stock disable_adapter() here would silently anchor the kl term to the base -- the exact
+    # defect this patch removes -- and the run would look healthy while training the wrong thing.
+    module = self.module
+    inner = getattr(module, "_fsdp_wrapped_module", module)
+    if _FLASH_REF_ADAPTER not in getattr(inner, "peft_config", {{}}):
+        raise RuntimeError(
+            "flash kl reference adapter missing: expected " + _FLASH_REF_ADAPTER + " on the actor"
+        )
+    return _flash_ref_use_ref_adapter(module)
+
+
+_flash_ref_impl.FSDPEngine._build_lora_module = _flash_ref_build_lora_module
+_flash_ref_impl.FSDPEngine.disable_adapter = _flash_ref_disable_adapter
+'''
 
 
 def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
@@ -567,7 +879,7 @@ def render_exact_save_steps_shim(save_at_steps: tuple[int, ...], total_steps: in
 
     this drops the writes flash never asked for, so only the required steps (and the last step,
     which the run's final publish needs) reach disk. the sft verl backend already does exactly this
-    (sft_verl.py); this is the same suppression on the ppo driver.
+    (sft_train.py); this is the same suppression on the ppo driver.
 
     ``RayPPOTrainer._save_checkpoint`` takes no step argument -- it reads ``self.global_steps`` --
     so the filter reads it off the instance rather than a parameter. returning early is safe
@@ -662,6 +974,182 @@ if not getattr(_flash_agent_loop.AgentLoopWorker._run_agent_loop, "_flash_stop_p
     _flash_patch_run_agent_loop()
     _flash_agent_loop.AgentLoopWorker._run_agent_loop._flash_stop_patched = True
     print({_STOP_SEQUENCES_MARKER!r} + " " + repr(_flash_stop_sequences), flush=True)
+'''
+
+
+def render_image_pad_ban_shim(image_pad_token_id: int | None) -> str:
+    """return the sitecustomize source that stops a multimodal rollout emitting the image-pad token.
+
+    the vision placeholder token is a real vocabulary entry, so an unconstrained sampler can emit
+    it inside a *completion*. nothing there expands it back into pixels, so the trained sequence
+    then contains a token the model can only have produced by hallucinating an image -- and on the
+    next forward pass the processor's image/text alignment counts a placeholder with no image
+    behind it. trl bans it through ``generation_kwargs["logit_bias"]`` (rl.py); verl builds its
+    sampling params as a literal dict, so the key is inserted the same way the stop-strings shim
+    inserts ``stop``.
+
+    unconditional rather than gated on the row: this shim is only written for a multimodal job, and
+    a text-only row in such a job still must not invent a placeholder. -100.0 matches trl's bias.
+    """
+    if image_pad_token_id is None:
+        return ""
+    return f'''
+from verl.experimental.agent_loop import agent_loop as _flash_image_agent_loop
+
+_flash_image_pad_token_id = {int(image_pad_token_id)!r}
+
+
+def _flash_patch_image_pad_ban():
+    original = _flash_image_agent_loop.AgentLoopWorker._run_agent_loop
+
+    async def _run_agent_loop(self, sampling_params, *args, **kwargs):
+        params = dict(sampling_params)
+        logit_bias = dict(params.get("logit_bias") or {{}})
+        logit_bias[_flash_image_pad_token_id] = -100.0
+        params["logit_bias"] = logit_bias
+        return await original(self, params, *args, **kwargs)
+
+    _flash_image_agent_loop.AgentLoopWorker._run_agent_loop = _run_agent_loop
+
+
+# patch once, and independently of the stop-strings patch: both wrap the same method, so each
+# needs its own marker attribute or the second would be skipped by the first one's flag.
+if not getattr(
+    _flash_image_agent_loop.AgentLoopWorker._run_agent_loop, "_flash_image_pad_patched", False
+):
+    _flash_patch_image_pad_ban()
+    _flash_image_agent_loop.AgentLoopWorker._run_agent_loop._flash_image_pad_patched = True
+    print({_IMAGE_PAD_BAN_MARKER!r} + " " + repr(_flash_image_pad_token_id), flush=True)
+'''
+
+
+def render_per_turn_credit_shim(per_turn_credit: bool) -> str:
+    """return the sitecustomize source that gives verl trl's per-turn group-relative credit.
+
+    verl credits a whole episode: ``compute_grpo_outcome_advantage`` centres one scalar per rollout
+    against its group and broadcasts it across every response token. trl's per-turn mode centres
+    each TURN against the same turn of its group siblings, so a good turn inside a bad episode
+    still gets positive advantage.
+
+    this wraps ``compute_advantage`` rather than registering a custom estimator. a registered
+    estimator would be the tidier hook, but ``compute_advantage`` forwards ``non_tensor_batch`` to
+    exactly one estimator by name (``if adv_estimator in (AdvantageEstimator.GDPO, "gdpo")``), so a
+    custom one could never see the spans it needs. wrapping keeps stock grpo as the baseline and
+    overwrites only the token axis, which is the same shape as trl's GRPOPerTurnTrainer overriding
+    its parent's scalar advantages.
+
+    the fallback is per GROUP, not per row: grpo centres each rollout against its group, so a group
+    holding a mix of per-turn and episode credit would compare quantities of different scales. one
+    unusable row therefore drops its whole group to episode credit.
+    """
+    if not per_turn_credit:
+        return ""
+    return '''
+import torch as _flash_pt_torch
+from verl.trainer.ppo import ray_trainer as _flash_pt_ray_trainer
+
+_flash_pt_original_compute_advantage = _flash_pt_ray_trainer.compute_advantage
+_flash_pt_logged = False
+
+
+def _flash_pt_rows(non_tensor_batch, batch_size):
+    """per-row (spans, turns) or None when this batch carries no usable per-turn metadata."""
+    spans_column = non_tensor_batch.get("flash_turn_spans")
+    rewards_column = non_tensor_batch.get("flash_turn_rewards")
+    if spans_column is None or rewards_column is None:
+        return None
+    if len(spans_column) != batch_size or len(rewards_column) != batch_size:
+        return None
+    rows = []
+    for spans, turns in zip(spans_column, rewards_column):
+        if spans is None or turns is None or len(spans) != len(turns):
+            # a row the loop could not align. keep the row so its group can be identified and
+            # dropped whole, rather than silently centring the rest against a smaller sample.
+            rows.append(None)
+            continue
+        rows.append(
+            (
+                tuple((int(start), int(end)) for start, end in spans),
+                tuple(float(value) for value in turns),
+            )
+        )
+    return rows
+
+
+def _flash_pt_per_turn_advantages(rows, index, episode_advantages):
+    """centre each turn against the same turn of its group; returns [B, width].
+
+    starts from stock grpo's own output and overwrites only the rows of groups that earned
+    per-turn credit. a group that falls back therefore keeps the exact tensor grpo produced rather
+    than a reconstruction of it -- there is no scalar to recover, so nothing can drift.
+    """
+    advantages = episode_advantages.clone()
+    groups = {}
+    for row_index, uid in enumerate(index):
+        groups.setdefault(uid, []).append(row_index)
+    for member_indexes in groups.values():
+        if any(rows[row_index] is None for row_index in member_indexes):
+            continue
+        for row_index in member_indexes:
+            advantages[row_index] = 0.0
+        turn_total = max(len(rows[row_index][1]) for row_index in member_indexes)
+        for turn_index in range(turn_total):
+            scoring = [
+                row_index
+                for row_index in member_indexes
+                if turn_index < len(rows[row_index][1])
+                and rows[row_index][0][turn_index][1] > rows[row_index][0][turn_index][0]
+            ]
+            if not scoring:
+                # every member emitted nothing for this turn; an empty turn carries no signal and
+                # must not skew the baseline for the members that did emit one.
+                continue
+            baseline = sum(rows[row_index][1][turn_index] for row_index in scoring) / len(scoring)
+            for row_index in scoring:
+                start, end = rows[row_index][0][turn_index]
+                advantages[row_index, start:end] = rows[row_index][1][turn_index] - baseline
+    return advantages
+
+
+def _flash_pt_compute_advantage(data, *args, **kwargs):
+    global _flash_pt_logged
+    data = _flash_pt_original_compute_advantage(data, *args, **kwargs)
+    episode = data.batch.get("advantages")
+    if episode is None or episode.dim() != 2:
+        return data
+    batch_size, width = episode.shape
+    rows = _flash_pt_rows(data.non_tensor_batch, batch_size)
+    if rows is None or all(row is None for row in rows):
+        return data
+    index = data.non_tensor_batch.get("uid")
+    if index is None or len(index) != batch_size:
+        return data
+    for row in rows:
+        if row is None:
+            continue
+        for start, end in row[0]:
+            if not 0 <= start <= end <= width:
+                raise ValueError(
+                    f"turn span [{start}, {end}) exceeds the response width {width}"
+                )
+    advantages = _flash_pt_per_turn_advantages(rows, index, episode)
+    if not bool(_flash_pt_torch.isfinite(advantages).all()):
+        raise ValueError("per-turn advantages must be finite")
+    # keep the response mask authoritative: glue tokens sit inside a turn span only when the
+    # environment reply was appended mid-turn, and they must never carry gradient.
+    response_mask = data.batch.get("response_mask")
+    if response_mask is not None:
+        advantages = advantages * response_mask.to(dtype=advantages.dtype)
+    data.batch["advantages"] = advantages
+    # returns feeds the critic, which grpo does not use; stock grpo sets it to the same tensor.
+    data.batch["returns"] = advantages
+    if not _flash_pt_logged:
+        print("[rl-verl] multi-turn per-turn group-relative credit is active", flush=True)
+        _flash_pt_logged = True
+    return data
+
+
+_flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage
 '''
 
 
@@ -807,7 +1295,9 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         "        raise RuntimeError('flash reward bridge received an invalid example index: %r' % idx)\n"
         "    idx = exact_idx\n"
         "    body = json.dumps({'index': idx, 'solution_str': solution_str or ''}).encode()\n"
-        "    req = urllib.request.Request(_URL, data=body, headers={'Content-Type': 'application/json'})\n"
+        "    req = urllib.request.Request(\n"
+        "        _URL.rstrip('/') + '/score', data=body, headers={'Content-Type': 'application/json'}\n"
+        "    )\n"
         "    try:\n"
         "        with urllib.request.urlopen(req, timeout=120) as r:\n"
         "            payload = json.loads(r.read().decode())\n"
@@ -828,30 +1318,66 @@ def score_single_turn(
     thinking: bool,
     prompt_opened_thinking: bool,
     think_penalty: float,
+    raise_on_error: bool = False,
+    breakdowns: list[dict[str, float] | None] | None = None,
 ) -> float:
     """score one single-turn text completion exactly as the trl reward path does.
 
     mirrors run_rl.reward_fn's single-turn text branch: graded text -> env.scores_breakdown
     (preferred) or env.reward, minus the optional thinking-length penalty. env scoring errors
     are swallowed to 0.0 so a bad completion never kills the run.
+
+    ``raise_on_error`` re-raises instead, for callers that must tell a real 0.0 score apart from a
+    failed grading. training never sets it; the latency profiler does, because a swallowed error
+    turns a grader that is failing on every call into a fast, confident, wrong reading.
+
+    ``breakdowns`` collects this completion's per-name reward components for the ``reward_metrics``
+    heartbeat field. appended to only when the env actually exposes ``scores_breakdown`` -- an env
+    with a plain scalar ``reward`` has no components, and appending an empty dict for it would put a
+    real denominator under no numerators and publish a flat 0 for a run that simply has no named
+    metrics. a failed grading appends ``None``, which the mean counts as a zero for every name the
+    other completions did report, exactly as trl does; the caller owns the list's lock and bound.
     """
+    # optimistic until the probe answers: a probe that RAISES is itself a failed grading, and the
+    # except branch has to be able to record it -- omitting it instead would drop this completion
+    # from the denominator and bias every named metric high. narrowed the instant the probe returns.
+    collect_breakdown = breakdowns is not None
     try:
+        # probe INSIDE the guard: `scores_breakdown` may be a property or a proxy whose lookup
+        # raises something other than AttributeError, and out here that escapes into the reward http
+        # handler -- the verl child reads a bridge failure and aborts the run, when this function's
+        # whole contract is to turn an env scoring fault into 0.0.
+        has_breakdown = hasattr(env, "scores_breakdown")
+        collect_breakdown = collect_breakdown and has_breakdown
         graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
         state = (
             {
                 "raw": solution_str,
                 "completion": graded,
-                "thinking": _w.thinking_text(solution_str, prompt_opened_thinking=prompt_opened_thinking),
+                "thinking": _w.thinking_text(
+                    solution_str, prompt_opened_thinking=prompt_opened_thinking
+                ),
             }
             if thinking
             else None
         )
-        if hasattr(env, "scores_breakdown"):
-            r = float(env.scores_breakdown(graded, ex, state).get("total", 0.0))
+        if has_breakdown:
+            breakdown = env.scores_breakdown(graded, ex, state)
+            # convert total FIRST: a breakdown whose total is not a number is a failed grading, and
+            # recording its named components would credit metrics to a completion that scored 0.0.
+            r = float(breakdown.get("total", 0.0))
+            if collect_breakdown:
+                breakdowns.append(breakdown)
         else:
             r = float(env.reward(graded, ex, state))
     except Exception as exc:  # env scoring must not kill the run
-        print(f"[rl-verl] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0", flush=True)
+        if raise_on_error:
+            raise
+        if collect_breakdown:
+            breakdowns.append(None)
+        print(
+            f"[rl-verl] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0", flush=True
+        )
         return 0.0
     if think_penalty > 0 and thinking:
         r -= think_penalty * _w.think_token_count(
@@ -860,41 +1386,360 @@ def score_single_turn(
     return float(r)
 
 
+# the total startup delay this hook is allowed to add, covering reference extraction AND timing.
+# both call user code, so one shared ceiling is the only number that means anything to a caller.
+_PROFILE_BUDGET_S = 30.0
+
+
+def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_step: int):
+    """Measure this env's real grading latency once, before training starts, and report it.
+
+    Returns the ``RewardProfile`` when one was measured, else None. The reading is RETURNED as
+    well as printed because a log line cannot be read by the cost model or by a scheduler: this
+    env's latency is what separates a compute-bound run from a latency-bound one, and that is a
+    placement input, not just an observability line.
+
+    Single-turn grading is serial, so it is pure gpu-idle wall time -- at the default 64x8 shape a
+    1s grader idles the gpu for ~80% of every step. The cost model has to guess that number from
+    one global average spanning regex graders to llm judges; this prints what it actually is for
+    THIS env, so a mispriced run is visible in the log instead of only in the bill.
+
+    Profiles against each example's own reference completion rather than blank text: an empty
+    string does not exercise a grader, so a blank-text profile measures the early-return.
+
+    Bounded by ``_PROFILE_BUDGET_S`` end to end. Both halves call into user code -- gathering a
+    reference completion runs the env's own ``sft_completion``, grading runs its scorer -- so they
+    share one deadline. Bounding only the half that gets timed would still let this hook stall
+    startup forever on the half that does not.
+
+    SKIPPED for an env that declares ``reward_thread_safe = False``. That flag means the scorer
+    keeps mutable or thread-bound state (flash/envs/adapter.py documents it), so grading extra
+    completions before training starts could advance a counter, consume a quota or warm a cache,
+    and change the rewards training then receives. A measurement must not be able to move the
+    thing it measures, and the profiler also needs a worker thread to bound a hung call, which
+    such an env must not be given. The cost of skipping is one unmeasured latency in the log.
+
+    Note the flag is read here as covering ``sft_completion`` too, though the adapter documents it
+    against ``reward()``. This hook is the only caller of ``sft_completion`` in a grpo run, so state
+    it advances starves nothing downstream; what the flag is standing in for is the narrower case of
+    a hook that lazily builds a thread-affine handle shared with the scorer. One declared signal for
+    "do not touch me off-thread" covers both, and no env currently distinguishes them.
+
+    Advisory only, and never fatal -- it must not be able to break a run it is only measuring.
+    """
+    try:
+        from flash.engine.reward_profile import call_bounded, profile_reward_latency
+        from flash.multimodal import assistant_completion_text
+
+        if not getattr(env, "reward_thread_safe", True):
+            print(
+                "[rl-verl] reward profiling skipped: env declares reward_thread_safe = False, "
+                "so grading it early could change the rewards training sees",
+                flush=True,
+            )
+            return None
+
+        # sft_completion reaches user code (FreesoloEnvAdapter delegates to the env's own hook), so
+        # it can block on i/o exactly like a grader can. it shares the profiler's deadline instead
+        # of running before it: bounding only the timing phase would leave the startup delay this
+        # hook adds unbounded, which is the ceiling the docstring promises.
+        deadline = time.perf_counter() + _PROFILE_BUDGET_S
+        samples: list[tuple[int, str]] = []
+        for index, example in enumerate(rollout_examples[:4]):
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            # the env's own assistant-text semantics: takes the last assistant turn and
+            # flattens openai-style text blocks. hand-rolling this stringifies block dicts
+            # into a python repr and mixes in user/system turns.
+            ok, _, messages = call_bounded(
+                lambda ex=example: assistant_completion_text(env.sft_completion(ex)), remaining
+            )
+            if ok is None:
+                # the shared deadline is spent either way, so there is no timing budget left and
+                # this returns regardless. report how far it got: "no reference completion could be
+                # gathered" is false once an earlier example has already yielded one, and a skip
+                # reason that misstates what happened sends a reader after the wrong env hook.
+                #
+                # count only the USABLE ones, by the same test the profiler itself applies. a failed
+                # call still appends its empty placeholder to keep example indices aligned, and a
+                # succeeded-but-blank one is dropped downstream by ``text.strip()``; counting either
+                # would claim references were gathered that nothing could be profiled from -- exactly
+                # as misleading as the message this replaced, in the opposite direction.
+                usable = sum(1 for _, text in samples if text and text.strip())
+                print(
+                    "[rl-verl] reward profiling skipped: env.sft_completion did not return within "
+                    f"{_PROFILE_BUDGET_S:.0f}s ({usable} usable reference completion(s) gathered "
+                    "before the deadline)",
+                    flush=True,
+                )
+                return None
+            samples.append((index, messages if ok and isinstance(messages, str) else ""))
+        if not samples:
+            return None
+        profile = profile_reward_latency(
+            score_one, samples, budget_s=max(0.0, deadline - time.perf_counter())
+        )
+        print(f"[rl-verl] {profile.describe()}", flush=True)
+        if profile.trustworthy and completions_per_step > 0:
+            per_step_s = profile.seconds_per_completion * completions_per_step
+            print(
+                f"[rl-verl] serial reward grading costs ~{per_step_s:.0f}s per step "
+                f"({completions_per_step} completions x {profile.seconds_per_completion:.3f}s), "
+                "all of it gpu-idle.",
+                flush=True,
+            )
+        return profile
+    except Exception as exc:
+        print(f"[rl-verl] reward profiling skipped: {exc}", flush=True)
+        return None
+
+
 # --------------------------------------------------------------------------------------------
 # reward rpc bridge: verl subprocess -> flash live env.
 # --------------------------------------------------------------------------------------------
-def start_reward_server(score_by_index, *, example_count: int):
+class MultiTurnBridge:
+    """parent-side episode state for the child's multi-turn agent loop.
+
+    the child owns tokens and the engine; this owns the flash env. one session per in-flight
+    episode, keyed by the id the child mints. the env's own rollout state is the source of truth
+    for turn budget, doneness, and the terminal episode that gets scored -- exactly the state the
+    trl driver accumulates, so both backends score the same object.
+
+    ``on_episode_scored(prompt, transcript, reward)`` receives each scored episode so the caller can
+    surface it as a rollout sample. multi-turn has no per-completion breakdown to report -- the env
+    scores a whole episode through ``rollout_rewards_many``, which returns a scalar -- so only the
+    sample side of the reward observability pair applies here, exactly as on the trl path.
+    """
+
+    def __init__(
+        self,
+        env,
+        examples: list[dict],
+        *,
+        max_turns: int,
+        per_turn_credit: bool = False,
+        on_episode_scored: Callable[[object, object, float], None] | None = None,
+    ) -> None:
+        self._env = env
+        self._examples = examples
+        self._max_turns = int(max_turns)
+        self._per_turn_credit = bool(per_turn_credit)
+        self._on_episode_scored = on_episode_scored
+        # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
+        # every env touch below happens under this lock, matching the single-turn path's contract.
+        self._lock = threading.Lock()
+        self._sessions: dict[str, dict] = {}
+
+    def routes(self) -> dict:
+        return {
+            "/multiturn/start": self.start,
+            "/multiturn/step": self.step,
+            "/multiturn/score": self.score,
+            "/multiturn/close": self.close,
+        }
+
+    def _session(self, payload: dict) -> dict:
+        session_id = str(payload["session_id"])
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"unknown multi-turn session {session_id}")
+        return session
+
+    def start(self, payload: dict) -> dict:
+        index = int(payload["index"])
+        if index < 0 or index >= len(self._examples):
+            raise IndexError(
+                f"multi-turn example index {index} is outside [0, {len(self._examples)})"
+            )
+        session_id = str(payload["session_id"])
+        example = self._examples[index]
+        with self._lock:
+            if session_id in self._sessions:
+                raise KeyError(f"duplicate multi-turn session {session_id}")
+            state = self._env.new_rollout_state(example)
+            self._sessions[session_id] = {"example": example, "state": state}
+        # the per-example budget wins over the batch-wide cap, same precedence as rollout_done.
+        episode_turns = state.get("max_episode_turns")
+        turns = self._max_turns if episode_turns is None else int(episode_turns)
+        return {"max_turns": max(1, min(self._max_turns, turns))}
+
+    def step(self, payload: dict) -> dict:
+        with self._lock:
+            session = self._session(payload)
+            state = session["state"]
+            # an unusable turn is terminal and must NOT be shown to the env: recording it would
+            # append a truncated or empty assistant message to the transcript that gets scored.
+            # the child stops on the same condition, so this only decides what the env sees.
+            if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
+                # it is still the turn the model generated and the child trained on, so it is kept
+                # for the DIAGNOSTIC transcript. dropping it entirely would publish an empty
+                # completion for a first-turn truncation -- the one sample worth reading, since it
+                # is the failure being diagnosed (codex[bot]).
+                session["aborted_turn"] = {
+                    "role": "assistant",
+                    "content": str(payload.get("completion_text") or ""),
+                }
+                return {"terminal": True, "messages": []}
+            self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
+            if self._env.rollout_done(state, self._max_turns):
+                return {"terminal": True, "messages": []}
+            replies = self._env.env_reply(list(state.get("messages") or ()), state)
+            terminal = bool(self._env.rollout_done(state, self._max_turns))
+        return {
+            "terminal": terminal,
+            "messages": [
+                {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
+                for message in replies
+            ],
+        }
+
+    def score(self, payload: dict) -> dict:
+        turn_count = int(payload["turn_count"])
+        with self._lock:
+            session = self._session(payload)
+            state = session["state"]
+            reward = score_rollouts(
+                self._env,
+                [
+                    RolloutScoreRequest(
+                        example=session["example"],
+                        state=state,
+                        turn_count=turn_count,
+                    )
+                ],
+            )[0]
+            # snapshot under the same lock that guards the session: `step` mutates this list in
+            # place, and a concurrent episode's turn would otherwise be read mid-append.
+            prompt = list(state.get("prompt") or ())
+            # the episode transcript, NOT the whole message list: new_rollout_state seeds `messages`
+            # with a copy of `prompt` and appends turns onto it, so publishing it whole would repeat
+            # the prompt inside `completion` when it already rides the sample as `prompt_tail`.
+            # slice by length rather than by equality -- an env may legitimately produce a turn that
+            # matches a prompt message, and dropping it would silently truncate the episode.
+            transcript = list(state.get("messages") or ())[len(prompt) :]
+            # the aborted turn never entered `messages` -- the env must not score it -- but the
+            # child trained on its tokens, so the sample shows what was actually generated.
+            aborted = session.get("aborted_turn")
+            if aborted is not None:
+                transcript.append(aborted)
+        # nan is score_rollouts' unscorable marker; verl has no equivalent, and a nan would
+        # propagate into the group baseline and poison every other rollout in the group, so an
+        # unscorable episode scores 0.0 the way a failed single-turn grading does.
+        episode = float(reward.episode)
+        if not math.isfinite(episode):
+            print("[rl-verl] multi-turn episode unscorable; scoring 0.0", flush=True)
+            episode = 0.0
+        if self._on_episode_scored is not None:
+            # outside the lock: the callback is the caller's buffer, which has its own lock, and
+            # nesting them in this order would invert the single-turn path's acquisition order.
+            self._on_episode_scored(prompt, transcript, episode)
+        if not self._per_turn_credit:
+            return {"score": episode}
+        # score_rollouts already validated the vector against turn_count and canonicalised an
+        # unusable one to None (multiturn_reward_scoring), so nothing further is checked here.
+        # None means this episode falls back to episode credit; the shim widens that fallback to
+        # the whole group so a group is never centred on a mix of the two.
+        turns = None if reward.turns is None else [float(value) for value in reward.turns]
+        return {"score": episode, "turns": turns}
+
+    def close(self, payload: dict) -> dict:
+        with self._lock:
+            self._sessions.pop(str(payload["session_id"]), None)
+        return {"closed": True}
+
+    def open_sessions(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+
+# the three stdlib-only modules the child needs beside its shim, mapped to the flat names it
+# imports them under. flat and `flash_`-prefixed because the child imports them as top-level
+# modules, not as a package: flash itself is NOT importable in the verl interpreter (incompatible
+# torch/vllm pins), which is why they are copied rather than imported. same mechanism the opd verl
+# path uses for its own loop.
+MULTI_TURN_CHILD_MODULES = (
+    ("multiturn_glue.py", "flash_multiturn_glue.py"),
+    ("grpo_multiturn.py", "flash_grpo_multiturn.py"),
+    ("grpo_plugin.py", "flash_grpo_plugin.py"),
+)
+
+
+def copy_multi_turn_child_modules(shim_dir: str) -> tuple[str, ...]:
+    """copy the child-side agent loop next to the shim; returns the paths written."""
+    written = []
+    for source_name, child_name in MULTI_TURN_CHILD_MODULES:
+        target = os.path.join(shim_dir, child_name)
+        shutil.copy2(os.path.join(os.path.dirname(__file__), source_name), target)
+        written.append(target)
+    return tuple(written)
+
+
+def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[str, str]:
+    """the child env vars the multi-turn agent loop reads, and nothing else.
+
+    the loop runs in the verl interpreter and cannot import flash, so every decision it makes about
+    turn budget, halting and glue rendering has to arrive as a string here. the parent is the only
+    process that can resolve them: the eos set needs the model's generation_config and the turn
+    limit needs the live env.
+    """
+    return {
+        # verl imports this at the end of `verl/__init__` (import_external_libs), which is what
+        # registers the loop under the name the agent-loop override selects. without it the
+        # override names a loop that was never registered and the child dies at rollout build.
+        "VERL_USE_EXTERNAL_MODULES": "flash_grpo_plugin",
+        "FLASH_VERL_MULTITURN_URL": reward_url,
+        "FLASH_VERL_MAX_TURNS": str(int(inp["max_turns"])),
+        "FLASH_VERL_MAX_MODEL_LEN": str(int(inp["engine_len"])),
+        "FLASH_VERL_STOP_SEQUENCES": json.dumps(list(inp["stop_sequences"])),
+        # sorted so the child sees a stable set regardless of frozenset iteration order.
+        "FLASH_VERL_EOS_TOKEN_IDS": json.dumps(sorted(inp["eos_token_ids"])),
+        "FLASH_VERL_THINKING": "1" if thinking else "0",
+    }
+
+
+def start_reward_server(score_by_index, *, example_count: int, multi_turn_bridge=None):
     """start a localhost http reward server. score_by_index(index, solution_str) -> float.
 
-    returns (server, url). the server runs in a daemon thread; call server.shutdown() when done.
+    returns (server, base_url). the server runs in a daemon thread; call server.shutdown() when
+    done. single-turn scoring lives at ``<base_url>/score``; when ``multi_turn_bridge`` is given,
+    its four episode routes are served alongside it from the same thread pool.
     """
     # serialize scoring so the flash env sees sequential calls, matching the trl reward path's
     # contract; verl's reward manager may otherwise call the reward with several workers at once.
     score_lock = threading.Lock()
+
+    def _score_route(payload: dict) -> dict:
+        index = int(payload["index"])
+        if index < 0 or index >= example_count:
+            raise IndexError(f"reward example index {index} is outside [0, {example_count})")
+        with score_lock:
+            return {"score": float(score_by_index(index, payload.get("solution_str", "")))}
+
+    routes = {"/score": _score_route}
+    if multi_turn_bridge is not None:
+        routes.update(multi_turn_bridge.routes())
 
     class _Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def do_POST(self):
-            if self.path != "/score":
+            route = routes.get(self.path)
+            if route is None:
                 self.send_response(404)
                 self.end_headers()
                 return
             try:
                 n = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
-                index = int(payload["index"])
-                if index < 0 or index >= example_count:
-                    raise IndexError(f"reward example index {index} is outside [0, {example_count})")
-                with score_lock:
-                    score = float(score_by_index(index, payload.get("solution_str", "")))
+                result = route(payload)
             except Exception as exc:
                 print(f"[rl-verl] reward server request failed: {exc}", flush=True)
                 body = json.dumps({"error": str(exc)}).encode()
                 self.send_response(400)
             else:
-                body = json.dumps({"score": score}).encode()
+                body = json.dumps(result).encode()
                 self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -904,25 +1749,15 @@ def start_reward_server(score_by_index, *, example_count: int):
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
-    return server, f"http://127.0.0.1:{port}/score"
+    return server, f"http://127.0.0.1:{port}"
 
 
 # --------------------------------------------------------------------------------------------
 # verl interpreter + checkpoint export.
 # --------------------------------------------------------------------------------------------
 def _resolve_verl_loggers(python_bin: str) -> str:
-    """verl's ``trainer.logger`` list. verl logs from its own interpreter, so enable the wandb
-    logger only when WANDB_API_KEY is set AND wandb is importable in that interpreter; otherwise
-    console-only. this never inits a flash-side run (flash does not train in-process on this path,
-    so a flash-side run would stay empty) and never aborts verl when its env lacks wandb."""
-    if not os.environ.get("WANDB_API_KEY"):
-        return "console"
-    has_wandb = (
-        subprocess.run([python_bin, "-c", "import wandb"], capture_output=True).returncode == 0
-    )
-    if not has_wandb:
-        print("[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; using console logger only")
-    return "console,wandb" if has_wandb else "console"
+    """verl's ``trainer.logger`` list, as the comma-joined form this module's override emits."""
+    return ",".join(resolve_verl_loggers(python_bin))
 
 
 def _export_peft_adapter(
@@ -952,9 +1787,20 @@ def _export_peft_adapter(
     merge_env["TRANSFORMERS_OFFLINE"] = "1"
     merge_env["HF_HUB_DISABLE_XET"] = "1"
     subprocess.run(
-        [python_bin, "-m", "verl.model_merger", "merge", "--backend", "fsdp",
-         "--local_dir", ckpt_actor_dir, "--target_dir", merge_out],
-        check=True, env=merge_env,
+        [
+            python_bin,
+            "-m",
+            "verl.model_merger",
+            "merge",
+            "--backend",
+            "fsdp",
+            "--local_dir",
+            ckpt_actor_dir,
+            "--target_dir",
+            merge_out,
+        ],
+        check=True,
+        env=merge_env,
     )
     lora_dir = os.path.join(merge_out, "lora_adapter")
     if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
@@ -987,18 +1833,42 @@ class _VerlResumeUploader:
         python_bin: str = "",
         model_id: str = "",
         model_revision: str = "",
-        tokenizer=None,
+        preprocessor=None,
+        had_gradient: Callable[[], bool] | None = None,
     ) -> None:
         self.local_dir = local_dir
-        # whatever this run resumed from is already durable; re-uploading it would waste the
-        # upload slot on state hf already holds.
-        self.processed_steps: set[int] = {resume_step} if resume_step else set()
         self.required_steps = frozenset(required_steps)
+        # whatever this run resumed from is already durable as RESUME state, so re-uploading it
+        # would waste the upload slot on state hf already holds. that is tracked in uploaded_steps
+        # below; processed_steps is deliberately NOT seeded for a required resume step, because its
+        # DEPLOYABLE can still be missing -- a previous worker resume-uploads a checkpoint while
+        # withholding its adapter behind the gradient gate -- and _pending must yield that step once
+        # so its adapter gets staged from the checkpoint this run restored.
+        self.processed_steps: set[int] = (
+            {resume_step} if resume_step and resume_step not in self.required_steps else set()
+        )
+        # tracked separately from processed_steps: a required resume step is left unprocessed so it
+        # can be staged, but its resume state is already on hf and must not be re-uploaded.
+        self.uploaded_steps: set[int] = {resume_step} if resume_step else set()
+        # required step -> staged adapter directory, populated the sweep a checkpoint appears and
+        # drained by publication once the gradient gate opens. this is what decouples publication
+        # from verl's checkpoint retention.
+        self.staged_steps: dict[int, str] = {}
         self.export_root = export_root
         self.python_bin = python_bin
         self.model_id = model_id
         self.model_revision = model_revision
-        self.tokenizer = tokenizer
+        # the processor on a multimodal job, else the tokenizer: an image model cannot be served
+        # from an adapter dir that carries only tokenizer files, since the runtime needs the
+        # preprocessor config to turn pixels back into tokens.
+        self.preprocessor = preprocessor
+        # gates DEPLOYABLE publication (not resume upload) on the run having produced a real
+        # gradient. these publishes land while training is still running, so without the gate a
+        # degenerate-reward run makes untrained adapters durable and servable minutes before
+        # _check_grpo_had_a_gradient fails the run -- the guard would reject the final adapter while
+        # the per-step ones stayed published. resume state is deliberately still uploaded: it is
+        # internal retry scaffolding, not something a customer can serve.
+        self.had_gradient = had_gradient
         # populated by credit_durable_required_steps() before start(): crediting a required step
         # needs an hf lookup, which does not belong in a constructor.
         self.published_steps: set[int] = set()
@@ -1042,6 +1912,20 @@ class _VerlResumeUploader:
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
 
+    def _deployable_allowed(self) -> bool:
+        """whether gradient evidence has appeared yet, so a deployable may be published.
+
+        no callback means no gate (the resume-only configuration and the tests that predate it).
+        a raising callback is treated as CLOSED: this decides whether an artifact becomes durable
+        and servable, so an unreadable signal must not be read as permission.
+        """
+        if self.had_gradient is None:
+            return True
+        try:
+            return bool(self.had_gradient())
+        except Exception:
+            return False
+
     def _completed_step(self) -> int:
         tracker = os.path.join(self.local_dir, "latest_checkpointed_iteration.txt")
         try:
@@ -1066,8 +1950,17 @@ class _VerlResumeUploader:
                 found.append((step, path))
         return sorted(found)
 
-    def _publish_deployable(self, step: int, checkpoint_dir: str) -> None:
-        """export a required step's checkpoint into a servable adapter and publish it."""
+    def _stage_deployable(self, step: int, checkpoint_dir: str) -> str:
+        """export a required step's checkpoint into a servable adapter under export_root.
+
+        staging is deliberately NOT gated on gradient evidence, while publication is. verl owns
+        ``checkpoint_dir`` and prunes it once max_actor_ckpt_to_keep newer saves exist, so an export
+        deferred until the gate opens can find its source already deleted -- with four or more
+        required steps ahead of the first varying-reward group, the earliest ones would then be
+        unpublishable and fail an otherwise valid run. export_root is flash's own workdir, so the
+        staged adapter outlives verl's retention. it is not servable until _publish_staged uploads
+        it, which is what keeps the gate's guarantee intact.
+        """
         actor_dir = os.path.join(checkpoint_dir, "actor")
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         shutil.rmtree(adapter_dir, ignore_errors=True)
@@ -1075,13 +1968,31 @@ class _VerlResumeUploader:
         _export_peft_adapter(
             actor_dir, adapter_dir, base_model_id=self.model_id, python_bin=self.python_bin
         )
-        # the served adapter needs its tokenizer alongside it, exactly as the final publish does.
-        # grpo verl rejects multimodal upstream, so a tokenizer (not a processor) is the whole set.
-        self.tokenizer.save_pretrained(adapter_dir)
+        # the served adapter needs its preprocessor alongside it, exactly as the final publish does:
+        # the processor on a multimodal job (tokenizer + image preprocessor), else the tokenizer.
+        self.preprocessor.save_pretrained(adapter_dir)
         _stamp_adapter_dir_provenance(adapter_dir, self.model_id, self.model_revision)
         _w.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
+        return adapter_dir
+
+    def _publish_staged(self, step: int, adapter_dir: str) -> None:
+        """make an already-staged adapter durable and servable."""
         _w.publish_deployable_checkpoint(adapter_dir, step, required=True, _provenance_ready=True)
         self.published_steps.add(step)
+
+    def _publish_ready(self) -> None:
+        """publish every staged step the gate now permits, oldest first.
+
+        driven off staged_steps rather than the pending sweep, so a step whose verl checkpoint has
+        since been pruned is still publishable: everything the upload needs already lives under
+        export_root. the gate is read once per call, so a spread recorded during a slow export is
+        honoured on the same pass that produced it.
+        """
+        if not self._deployable_allowed():
+            return
+        for step in sorted(self.staged_steps):
+            if step not in self.published_steps:
+                self._publish_staged(step, self.staged_steps[step])
 
     def _run(self) -> None:
         # a failed resume upload must not fail the run: the policy is still trained and published at
@@ -1090,15 +2001,53 @@ class _VerlResumeUploader:
         # it propagates and raise_if_incomplete() turns it into a run failure.
         try:
             while True:
+                # sampled before the sweep so a stop() arriving mid-sweep still gets one full pass
+                # over the checkpoints it made visible. verl advances
+                # latest_checkpointed_iteration.txt right up to the moment the child exits, so the
+                # newest resume checkpoint routinely appears in that window; exiting without
+                # sweeping it would drop durable work a preemption then has to redo.
+                stopping = self._stop.is_set()
                 for step, path in self._pending(self._completed_step()):
-                    if step in self.required_steps and step not in self.published_steps:
-                        self._publish_deployable(step, path)
-                    try:
-                        _w.upload_resume_checkpoint(step, path)
-                    except Exception as error:
-                        print(f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True)
+                    # stage while verl's checkpoint still exists; publication happens below, once
+                    # the gate opens. the two have different deadlines -- the source expires with
+                    # verl's retention, the permission arrives with the first varying-reward group --
+                    # so a step is staged on the sweep that finds it and published whenever it may be.
+                    if (
+                        step in self.required_steps
+                        and step not in self.published_steps
+                        and step not in self.staged_steps
+                    ):
+                        self.staged_steps[step] = self._stage_deployable(step, path)
+                        # published here, not once the sweep ends: staging a later step can raise,
+                        # and the resume upload below can be interrupted by a preemption. either
+                        # would leave an already-exported adapter local-only, so each step is made
+                        # durable as soon as it is both staged and permitted.
+                        self._publish_ready()
+                    # the resume upload is NOT gated on gradient evidence: it is internal retry
+                    # scaffolding rather than a servable artifact, and with exact save_at_steps these
+                    # are often the only on-disk checkpoints, so skipping it would leave a run
+                    # preempted before the first nonzero spread nothing to resume from. marked before
+                    # the attempt, so one permanently failing upload cannot spin every 0.5s -- which
+                    # is also the pre-existing non-fatal semantics for this upload.
+                    if step not in self.uploaded_steps:
+                        self.uploaded_steps.add(step)
+                        try:
+                            _w.upload_resume_checkpoint(step, path)
+                        except Exception as error:
+                            print(
+                                f"[rl-verl] resume checkpoint upload failed at step {step}: {error}",
+                                flush=True,
+                            )
                     self.processed_steps.add(step)
-                if self._stop.is_set() and not self._pending(self._completed_step()):
+                # a step staged while the gate was shut is published by a later sweep, so this runs
+                # every pass and not only when something was staged: the gate opens on the first
+                # varying-reward group, which is usually a sweep that finds no new checkpoint.
+                self._publish_ready()
+                # `stopping`, not a fresh read: the sweep above is the full pass over everything
+                # stop() had made visible, and only after running it may the loop exit. staged
+                # steps still awaiting the gate cannot hold the loop open -- with the gate shut they
+                # never clear, and waiting would hang stop(); raise_if_incomplete() reports them.
+                if stopping and not self._pending(self._completed_step()):
                     return
                 time.sleep(0.5)
         except BaseException as error:
@@ -1127,6 +2076,64 @@ def _restore_verl_resume(local_dir: str) -> int:
     return step
 
 
+def _check_grpo_had_a_gradient(
+    reward_history: list[float],
+    adv_spread_history: list[float],
+    *,
+    resumed: bool = False,
+) -> None:
+    """raise unless the run's rewards actually produced a nonzero policy gradient.
+
+    every other completion check a grpo run passes -- terminal state, a written checkpoint, an
+    exported adapter, a populated reward history -- is also passed by a run that trained on nothing.
+    grpo mean-centres its advantage within each group (A_i = r_i - mean(r_group)), so an environment
+    whose reward does not discriminate between completions gives every sample advantage exactly 0,
+    hence pg_loss exactly 0 and an adapter identical to its initialization. the spread of the
+    advantages is the only one of these series that can tell the two apart: the reward mean cannot
+    (a constant reward has a perfectly healthy mean) and neither can pg_loss, which is near zero at
+    step 1 for a genuinely training run too, because the importance ratio is still exactly 1.
+
+    ``resumed`` disables the spread verdict, because these series only cover the steps THIS worker
+    observed. a run resuming at step 9 of 10 sees one step, and if that step's group happens to tie
+    the history is all-zero even though the restored weights already carry nine steps of productive
+    updates -- rejecting it would discard a correctly trained policy. the evidence needed to judge a
+    resumed run lives in the steps a previous worker ran, which is not recoverable from this
+    worker's stdout, so the honest move is to abstain rather than guess. the degenerate-environment
+    case this guard exists for is unaffected: such a run fails on its first, unresumed attempt.
+    """
+    if not reward_history:
+        raise RuntimeError(
+            "verl reported no reward metrics for the whole run — the flash reward bridge was "
+            "never consulted (wiring regression); refusing to publish a policy trained on "
+            "default rewards"
+        )
+    if not adv_spread_history:
+        # advantages ride the same log line as critic/rewards/mean (both come from one
+        # compute_data_metrics dict), so reward metrics without advantage metrics means the parse
+        # broke, not that verl chose not to report. treat that as a regression rather than let the
+        # spread check below degrade into a guard that cannot fire.
+        raise RuntimeError(
+            "verl reported reward metrics but no advantage metrics for any step — "
+            "critic/advantages/max and /min could not be parsed (metric-format regression); "
+            "refusing to publish because the zero-gradient check cannot run"
+        )
+    if resumed:
+        # see the docstring: this worker's history is a suffix of the run's training, so an all-zero
+        # suffix is not evidence the run never had a gradient. the parse checks above still apply --
+        # they catch a wiring/format regression regardless of where training started.
+        return
+    # deliberately "no step ever had spread" rather than "some step had none": a run that genuinely
+    # converges, or that draws one unlucky all-equal group, legitimately reports zero spread on
+    # individual steps, and rejecting those would fail correct runs.
+    if not any(spread > 0.0 for spread in adv_spread_history):
+        raise RuntimeError(
+            f"grpo saw zero advantage spread on all {len(adv_spread_history)} steps — every group's "
+            "rewards were identical, so every advantage was 0 and the gradient was exactly 0; the "
+            "environment's reward does not discriminate between completions. refusing to publish an "
+            "adapter identical to its initialization"
+        )
+
+
 def _latest_global_step_dir(local_dir: str) -> tuple[str, int]:
     """return (actor_dir, step) for the highest global_step_N checkpoint verl wrote."""
     best_step, best = -1, ""
@@ -1141,7 +2148,9 @@ def _latest_global_step_dir(local_dir: str) -> tuple[str, int]:
     return best, best_step
 
 
-def _stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:
+def _stamp_adapter_dir_provenance(
+    adapter_dir: str, model_id: str, model_revision: str = ""
+) -> None:
     """stamp the saved adapter's immutable base identity into adapter_config.json.
 
     dir-based analogue of _w.stamp_adapter_provenance (which needs an in-memory peft model). same
@@ -1167,14 +2176,29 @@ def _stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revisio
 # --------------------------------------------------------------------------------------------
 # orchestration.
 # --------------------------------------------------------------------------------------------
-def _resolve_single_turn_inputs():
-    """reproduce run_rl's front-half config + dataset prep, fenced to single-turn text grpo."""
+def _resolve_grpo_inputs():
+    """reproduce run_rl's front-half config + dataset prep for text, multimodal, and multi-turn."""
     env = _w.require_active_env()
-    if getattr(env, "multi_turn", False) or getattr(env, "is_tool_env", False):
+    if getattr(env, "is_tool_env", False):
         raise RuntimeError(
-            "FLASH_RL_BACKEND=verl supports single-turn, non-tool grpo only; this env is "
-            "multi-turn/tool. use the trl backend (unset FLASH_RL_BACKEND) for it."
+            "verl grpo does not support openai function-calling tool environments; this env "
+            "reports is_tool_env"
         )
+    multi_turn = bool(getattr(env, "multi_turn", False))
+    if multi_turn:
+        # the bridge drives the env through exactly these four calls, so a missing one would only
+        # surface mid-rollout on the first episode. same gate the opd verl path applies.
+        missing = [
+            name
+            for name in ("new_rollout_state", "record_model_turn", "env_reply", "rollout_done")
+            if not callable(getattr(env, name, None))
+        ]
+        if missing:
+            raise RuntimeError(
+                f"multi-turn grpo environment is missing required rollout methods: {missing}"
+            )
+        if int(getattr(env, "max_turns", 0) or 0) <= 0:
+            raise RuntimeError("multi-turn grpo environment requires a positive bounded turn limit")
     seed_training_rngs(_w.SEED)
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
@@ -1205,6 +2229,29 @@ def _resolve_single_turn_inputs():
     # render_entropy_quantile_shim. a value >= 1.0 (or unset) masks nothing and needs no shim.
     _eq = getattr(_t, "entropy_quantile", None) if _t else None
     entropy_quantile = float(_eq) if _eq is not None and float(_eq) < 1.0 else None
+    # credit_assignment: per_turn only changes the objective when there is more than one assistant
+    # turn to credit -- trl reaches GRPOPerTurnTrainer solely via use_rollout_func, which requires
+    # is_multi_turn (rl.py select_grpo_trainer). single-turn envs cannot get there, and trl says so
+    # itself while accepting the key ("per-turn is equivalent to per-episode for single-turn
+    # environments", rl.py). match that: log it, do not reject.
+    #
+    # on multi-turn it centres each turn against the same turn of its group siblings instead of
+    # broadcasting one episode advantage across the transcript. the agent loop records a token span
+    # per turn, the bridge returns the env's per-turn vector alongside the episode reward, and a
+    # shim rewrites the advantage tensor after stock grpo has run; see
+    # render_per_turn_credit_shim.
+    credit_assignment = getattr(_t, "credit_assignment", DEFAULT_CREDIT_ASSIGNMENT) if _t else None
+    per_turn_credit = bool(
+        credit_assignment
+        and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT
+        and multi_turn
+    )
+    if credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT and not multi_turn:
+        print(
+            f"[rl-verl] credit assignment: {credit_assignment} is equivalent to "
+            f"{DEFAULT_CREDIT_ASSIGNMENT} for single-turn environments",
+            flush=True,
+        )
     # flash's lora dropout is fixed at 0.0; verl matches (peft default). guard defensively so a future
     # non-zero recipe value can never be silently ignored.
     if float(RECIPE.lora.dropout) != 0.0:
@@ -1213,7 +2260,9 @@ def _resolve_single_turn_inputs():
             "use the trl backend or add actor_rollout_ref.model.lora_dropout support."
         )
     gcfg = _w.grpo_overrides()
-    prompts_per_step = int(_t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step)
+    prompts_per_step = int(
+        _t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step
+    )
     group_size = int(gcfg.get("group_size") or rl.group_size)
     _gcfg_temp = gcfg.get("temperature")
     temperature = float(_gcfg_temp if _gcfg_temp is not None else rl.sampling_temperature)
@@ -1229,7 +2278,9 @@ def _resolve_single_turn_inputs():
             flush=True,
         )
     mask_truncated_completions = _w.grpo_mask_truncated_completions(_t)
-    learning_rate = float(_t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate)
+    learning_rate = float(
+        _t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate
+    )
     # warm-start forbids lora_rank, so a set init_from_adapter already raised above; read rank/alpha
     # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
     lora_rank = int(_t.lora_rank) if (_t and _t.lora_rank) else int(RECIPE.lora.rank)
@@ -1238,12 +2289,6 @@ def _resolve_single_turn_inputs():
     # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
     warmstart_adapter = ""
     if _t and getattr(_t, "init_from_adapter", ""):
-        if kl_coef > 0:
-            raise RuntimeError(
-                "warm-start (init_from_adapter) with kl_penalty_coef>0 anchors the kl reference to "
-                "the sft adapter; the verl backend's reference is the base, so this is not yet "
-                "supported. set kl_penalty_coef=0, or use the trl backend for kl-anchored warm-start."
-            )
         from flash.engine.worker.adapter import _download_adapter
 
         warmstart_adapter = _download_adapter(_t.init_from_adapter)
@@ -1275,15 +2320,32 @@ def _resolve_single_turn_inputs():
     rng.shuffle(train)
     message_prompts = [env.prompt_messages(ex) for ex in train]
 
-    from flash.multimodal import record_has_images
+    from flash.multimodal import (
+        normalize_prompt_images,
+        record_has_images,
+        resolve_image_pad_token_id,
+        validate_multimodal_training,
+    )
 
-    if any(record_has_images(ex, m) for ex, m in zip(train, message_prompts, strict=True)):
-        raise RuntimeError(
-            "FLASH_RL_BACKEND=verl supports non-multimodal grpo only; this env has image prompts. "
-            "use the trl backend for it."
+    multimodal = any(
+        record_has_images(ex, messages) for ex, messages in zip(train, message_prompts, strict=True)
+    )
+    package_root = getattr(env, "package_root", None)
+    processor = None
+    image_pad_token_id = None
+    if multimodal:
+        # the model must actually support image training; this raises for a text-only checkpoint
+        # rather than letting the processor silently drop the pixels.
+        validate_multimodal_training(model_id, "grpo", multi_turn=multi_turn)
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=True, **_w.model_revision_kwargs(model_revision)
         )
-
-    tok = _w.load_tokenizer(model_id, revision=model_revision)
+        tok = processor.tokenizer
+        image_pad_token_id = resolve_image_pad_token_id(processor, tok)
+    else:
+        tok = _w.load_tokenizer(model_id, revision=model_revision)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -1307,17 +2369,86 @@ def _resolve_single_turn_inputs():
         )
     prompt_budget = vllm_max_len - max_completion
     if prompt_budget <= 0:
-        raise ValueError("engine length leaves no room for the completion; raise max_context_tokens")
+        raise ValueError(
+            "engine length leaves no room for the completion; raise max_context_tokens"
+        )
+    if multi_turn:
+        # the child derives inter-turn glue by probing this template. a template that cannot
+        # round-trip assistant content would fail on the first environment reply, after the rollout
+        # has already burned gpu time -- fail here instead, before anything is launched.
+        validate_glue_template(tok, thinking=bool(_w.THINKING))
 
     prompts = []
-    for ex, messages in zip(train, message_prompts, strict=True):
-        rendered = tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
+    if multimodal:
+        # verl RAISES on an over-budget multimodal prompt instead of truncating it (agent_loop.py:
+        # "truncating multimodal token sequences corrupts vision/audio feature alignment"), so this
+        # pre-filter is what keeps a long prompt from killing the run mid-rollout rather than just
+        # being dropped.
+        #
+        # every row goes through the PROCESSOR, including the text-only rows of a mixed job: the
+        # verl child tokenizes the whole dataset through the multimodal path, so a row measured
+        # with the bare tokenizer here would be measured against a different expansion there. an
+        # image expands to hundreds of placeholder tokens, so a tokenizer-only count on an image
+        # row is not merely imprecise, it is off by most of the prompt.
+        for ex, messages in zip(train, message_prompts, strict=True):
+            normalized = normalize_prompt_images(ex, messages, package_root)
+            expanded, rendered = _processor_expanded_prompt(
+                processor,
+                normalized.messages,
+                tuple(normalized.descriptors),
+                package_root,
+                enable_thinking=bool(_w.THINKING),
+            )
+            if 0 < len(expanded) <= prompt_budget:
+                prompts.append(
+                    {
+                        "prompt": normalized.messages,
+                        "images": list(normalized.descriptors),
+                        "rendered": rendered,
+                        "example": ex,
+                        "prompt_len": len(expanded),
+                    }
+                )
+    else:
+        for ex, messages in zip(train, message_prompts, strict=True):
+            rendered = tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
+            )
+            prompt_len = len(tok(rendered, add_special_tokens=False).input_ids)
+            if 0 < prompt_len <= prompt_budget:
+                prompts.append(
+                    {
+                        "prompt": messages,
+                        "rendered": rendered,
+                        "example": ex,
+                        "prompt_len": prompt_len,
+                    }
+                )
+    if len(prompts) < len(train):
+        print(
+            f"[rl-verl] dropped {len(train) - len(prompts)} prompts over the "
+            f"{prompt_budget}-token prompt budget",
+            flush=True,
         )
-        if 0 < len(tok(rendered, add_special_tokens=False).input_ids) <= prompt_budget:
-            prompts.append({"prompt": messages, "rendered": rendered, "example": ex})
     if not prompts:
         raise ValueError(f"every training prompt exceeds the {prompt_budget}-token prompt budget")
+
+    # single-turn: one completion IS the response, so the response tensor is max_completion wide and
+    # prompt + response exactly fills the engine.
+    #
+    # multi-turn: the whole EPISODE is the response -- every assistant turn plus every environment
+    # glue span concatenated. verl right-pads response_ids to data.max_response_length and drops
+    # whatever is longer (_pad_token_ids), so a max_completion-wide tensor would silently cut a
+    # transcript mid-turn and train on the fragment. the tightest width that can hold any episode
+    # this dataset can produce is the engine budget minus the SHORTEST admitted prompt: the child
+    # stops generating once the prefix reaches max_model_len, so no episode can exceed that.
+    # max_completion stays the PER-TURN cap, which is exactly what the trl driver does
+    # (per_turn_max_tokens=max_completion, episode budget=engine_len-prompt_len-slack).
+    max_response_len = (
+        max(max_completion, vllm_max_len - min(int(p["prompt_len"]) for p in prompts))
+        if multi_turn
+        else max_completion
+    )
 
     prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
     prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
@@ -1356,6 +2487,21 @@ def _resolve_single_turn_inputs():
     return {
         "env": env,
         "tok": tok,
+        "processor": processor,
+        "multimodal": multimodal,
+        "multi_turn": multi_turn,
+        "max_turns": int(getattr(env, "max_turns", 0) or 0) if multi_turn else 0,
+        # the child decides whether an assistant turn ended naturally or was cut off, and it has no
+        # access to the model config -- so the full halting set is resolved here and handed over.
+        # the union of the tokenizer's eos and the model's generation_config eos, because a model can
+        # stop on a secondary id its tokenizer never exposes.
+        "eos_token_ids": (
+            generation_eos_from_cached_config(model_id, model_revision, tok)
+            if multi_turn
+            else frozenset()
+        ),
+        "package_root": package_root,
+        "image_pad_token_id": image_pad_token_id,
         "model_id": model_id,
         "model_revision": model_revision,
         "prompts": prompts,
@@ -1367,9 +2513,13 @@ def _resolve_single_turn_inputs():
         "think_penalty": think_penalty,
         "kl_coef": kl_coef,
         "entropy_quantile": entropy_quantile,
+        "per_turn_credit": per_turn_credit,
         "stop_sequences": stop_sequences,
         "structured_outputs": structured_outputs,
         "max_completion": max_completion,
+        # the response TENSOR's width. equals max_completion on a single-turn job; on multi-turn it
+        # holds the whole episode (see the derivation above).
+        "max_response_len": max_response_len,
         "max_prompt_len": prompt_budget,
         # the engine's full sequence length (prompt + completion), already clamped to the model's
         # own limit. sizes vllm's kv cache and the training token budget, and prompt_budget above is
@@ -1395,8 +2545,6 @@ def _resolve_single_turn_inputs():
 
 def run_rl_verl():
     """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
-    import pandas as pd
-
     t_start = time.time()
     _w.heartbeat("rl_start", gpu=gpu_diagnostics())
     wait_for_gpu(
@@ -1405,8 +2553,11 @@ def run_rl_verl():
     )
     setup_perf_backends()
 
-    inp = _resolve_single_turn_inputs()
+    inp = _resolve_grpo_inputs()
     env, tok = inp["env"], inp["tok"]
+    # what gets saved next to a published adapter. a multimodal adapter is unservable without its
+    # image preprocessor, so save the whole processor there; a text run saves the tokenizer alone.
+    preprocessor = inp["processor"] or tok
     prompts = inp["prompts"]
 
     # cache the base model before launching verl, then run verl fully offline so its vllm /
@@ -1426,8 +2577,10 @@ def run_rl_verl():
         _shared = _shared_weight_cache_dir()
         try:
             model_path_for_verl = _snap(
-                inp["model_id"], revision=inp["model_revision"],
-                cache_dir=_shared, local_files_only=True,
+                inp["model_id"],
+                revision=inp["model_revision"],
+                cache_dir=_shared,
+                local_files_only=True,
             )
         except Exception:
             model_path_for_verl = _snap(
@@ -1442,7 +2595,9 @@ def run_rl_verl():
     indices = [int(r["example_idx"]) for r in ds_rows]
     # ground_truth is a verl-schema placeholder only; the reward bridge scores by example_idx
     # against the live env and never reads it.
-    ground_truths = [str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples]
+    ground_truths = [
+        str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples
+    ]
 
     workdir = f"/tmp/rl_verl_seed{_w.SEED}"
     os.makedirs(workdir, exist_ok=True)
@@ -1458,9 +2613,23 @@ def run_rl_verl():
     val_pq = os.path.join(workdir, "val.parquet")
     reward_py = os.path.join(workdir, "reward.py")
 
-    rows = build_verl_dataset_rows(message_prompts, indices, ground_truths)
-    pd.DataFrame(rows).to_parquet(train_pq)
-    pd.DataFrame(rows[: max(1, min(4, len(rows)))]).to_parquet(val_pq)
+    # multimodal: decode each prompt's images to png on disk and carry file:// uris in the parquet.
+    # verl's dataset loads them through qwen_vl_utils.fetch_image, which reads file:// natively, so
+    # the pixels never have to round-trip through arrow. same contract the opd verl path writes.
+    image_uris = None
+    if inp["multimodal"]:
+        image_dir = os.path.join(workdir, "images")
+        shutil.rmtree(image_dir, ignore_errors=True)
+        image_uris = [
+            _materialize_verl_images(
+                list(prompt.get("images") or []), inp["package_root"], image_dir, index
+            )
+            for index, prompt in enumerate(prompts)
+        ]
+
+    rows = build_verl_dataset_rows(message_prompts, indices, ground_truths, image_uris)
+    write_verl_grpo_parquet(rows, train_pq)
+    write_verl_grpo_parquet(rows[: max(1, min(4, len(rows)))], val_pq)
     with open(reward_py, "w") as f:
         f.write(render_reward_module())
 
@@ -1476,9 +2645,14 @@ def run_rl_verl():
         part
         for part in (
             render_entropy_quantile_shim(inp["entropy_quantile"]),
+            render_per_turn_credit_shim(inp["per_turn_credit"]),
             render_stop_sequences_shim(inp["stop_sequences"]),
+            render_image_pad_ban_shim(inp["image_pad_token_id"]),
             render_structured_outputs_shim(inp["structured_outputs"]),
             render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"]),
+            render_kl_ref_adapter_shim(
+                bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
+            ),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
             # which is resolved after this file is written. the shim is inert either way -- it only
             # fires when verl actually calls wandb.init, which requires wandb in the logger list.
@@ -1492,28 +2666,93 @@ def run_rl_verl():
     elif os.path.exists(shim_py):
         os.remove(shim_py)
 
-    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. also keep a
-    # rolling buffer of recent (completion, score) so the training loop can dump one sample per step
-    # to the flash log, matching the trl path's #607 per-step completion dump.
-    recent_samples: list[tuple[str, float]] = []
+    # multi-turn: copy the child-side agent loop next to the shim so the verl interpreter can
+    # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
+    if inp["multi_turn"]:
+        copy_multi_turn_child_modules(shim_dir)
+
+    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. the buffer
+    # carries what trl's reward TrainerCallback carries -- recent rollouts for the per-step log dump
+    # and `sampled_completions`, plus per-name components for `reward_metrics` (#607).
+    # the generation size lets the buffer close each generation on the scoring thread that finishes
+    # it, rather than when the child's `step:N` line reaches this process: those are the same
+    # completions but not the same instant, and the next generation scores in between. verl is run
+    # with test_freq=-1 and val_before_train=False, so every completion reaching the bridge is a
+    # training rollout and the count is exact.
+    observability = RewardObservabilityBuffer(
+        generation_size=int(inp["prompts_per_step"]) * int(inp["group_size"]),
+    )
     # filled from the child's marker line; stays empty when wandb is off (see render_wandb_link_shim).
     wandb_link: dict[str, str | None] = {}
-    _samples_lock = threading.Lock()
 
     def _score(index: int, solution_str: str) -> float:
         ex = rollout_examples[int(index)]
+        # graded BEFORE the buffer is touched: grading calls user code and can block on i/o for
+        # seconds while verl scores many rollouts at once, and RewardObservabilityBuffer.record
+        # takes a lock every grading in the run would then serialize behind.
+        breakdowns: list[dict[str, float] | None] = []
         score = score_single_turn(
-            env, solution_str, ex,
-            tok=tok, thinking=bool(_w.THINKING),
+            env,
+            solution_str,
+            ex,
+            tok=tok,
+            thinking=bool(_w.THINKING),
             prompt_opened_thinking=inp["prompt_opened_thinking"],
             think_penalty=inp["think_penalty"],
+            breakdowns=breakdowns,
         )
-        with _samples_lock:
-            recent_samples.append((solution_str, score))
-            del recent_samples[:-64]
+        observability.record(message_prompts[int(index)], solution_str, score, breakdowns)
         return score
 
-    server, reward_url = start_reward_server(_score, example_count=len(rollout_examples))
+    def _score_for_profile(index: int, solution_str: str) -> float:
+        """the same grading path as _score, minus training's own bookkeeping.
+
+        deliberately NOT _score: that buffers the rollout, so profiling would seed the
+        per-step completion dump with gradings that never came from a rollout. it also propagates
+        scoring errors instead of scoring them 0.0, so a grader failing on every call reports as a
+        failure rather than as a fast latency.
+        """
+        return score_single_turn(
+            env,
+            solution_str,
+            rollout_examples[int(index)],
+            tok=tok,
+            thinking=bool(_w.THINKING),
+            prompt_opened_thinking=inp["prompt_opened_thinking"],
+            think_penalty=inp["think_penalty"],
+            raise_on_error=True,
+        )
+
+    # the profiler times the single-turn grading path (env.reward / env.scores_breakdown on one
+    # completion). a multi-turn env scores a terminal episode instead, so that timing would neither
+    # describe nor even validly reach its reward path.
+    reward_profile = (
+        None
+        if inp["multi_turn"]
+        else _log_reward_profile(
+            env,
+            _score_for_profile,
+            rollout_examples,
+            int(inp["prompts_per_step"]) * int(inp["group_size"]),
+        )
+    )
+
+    multi_turn_bridge = (
+        MultiTurnBridge(
+            env,
+            rollout_examples,
+            max_turns=int(inp["max_turns"]),
+            per_turn_credit=bool(inp["per_turn_credit"]),
+            on_episode_scored=observability.record,
+        )
+        if inp["multi_turn"]
+        else None
+    )
+    server, reward_url = start_reward_server(
+        _score,
+        example_count=len(rollout_examples),
+        multi_turn_bridge=multi_turn_bridge,
+    )
     # bound before the try so the finally can always ask whether it was started.
     resume_uploader: _VerlResumeUploader | None = None
     # verl trains out-of-process, so torch's in-process allocator counter never sees the trainer.
@@ -1534,7 +2773,8 @@ def run_rl_verl():
             raise RuntimeError(
                 f"grpo requested mask_truncated_completions but the verl at {python_bin} does not "
                 "support it. that verl predates the freesolo fork; point FLASH_VERL_PYTHON at an "
-                f"interpreter with '{VERL_REQUIREMENT}' installed, or unset it to provision one."
+                f"interpreter with '{VERL_REQUIREMENT}' installed, or set it EMPTY under "
+                '[worker_env] as FLASH_VERL_PYTHON = "" to provision one.'
             )
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).
@@ -1578,6 +2818,13 @@ def run_rl_verl():
         _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
         _w.heartbeat("rl_step", step=0, initial=True)
         t_train = time.time()
+        # grpo's advantage is within-group and mean-centred (A_i = r_i - mean(r_group)), so a group
+        # whose rewards are all equal yields advantage exactly 0 for every sample, hence a zero
+        # gradient. the spread of the advantages is what says whether the optimizer got a signal;
+        # neither the reward mean nor pg_loss can, so collect max/min per step and check below.
+        # declared here, ahead of the uploader, because the uploader's publication gate closes over
+        # it -- the metric loop that fills it starts further down.
+        adv_spread_history: list[float] = []
         resume_uploader = _VerlResumeUploader(
             local_dir,
             resume_step=resume_step,
@@ -1586,7 +2833,13 @@ def run_rl_verl():
             python_bin=python_bin,
             model_id=inp["model_id"],
             model_revision=inp["model_revision"],
-            tokenizer=tok,
+            preprocessor=preprocessor,
+            # a resumed run's restored weights already carry the earlier steps' updates, so this
+            # worker's own spread history cannot speak for them; let it publish as before and leave
+            # the verdict to the same abstention _check_grpo_had_a_gradient makes.
+            had_gradient=(
+                None if resume_step else lambda: any(spread > 0.0 for spread in adv_spread_history)
+            ),
         )
         resume_uploader.credit_durable_required_steps(resume_step)
         resume_uploader.start()
@@ -1601,35 +2854,63 @@ def run_rl_verl():
         env_for_verl["HF_HUB_OFFLINE"] = "1"
         env_for_verl["TRANSFORMERS_OFFLINE"] = "1"
         env_for_verl["HF_HUB_DISABLE_XET"] = "1"
-        if shim_source:
+        if inp["multi_turn"]:
+            # the plugin named here and the loop it builds live in shim_dir, so PYTHONPATH must
+            # carry it -- see below.
+            env_for_verl.update(
+                multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
+            )
+        if shim_source or inp["multi_turn"]:
             # python imports sitecustomize automatically at startup, so the shim patches verl before
             # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
             # install itself, and ray workers inherit this env so every actor gets the same patch.
+            # multi-turn needs the same entry for its copied-in agent loop modules.
             env_for_verl["PYTHONPATH"] = os.pathsep.join(
                 item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
             )
         step_re = re.compile(r"step:\s*(\d+)")
-        reward_re = re.compile(r"critic/rewards/mean:([-\d.eE+]+)")
-        loss_re = re.compile(r"actor/pg_loss:([-\d.eE+]+)")
         reward_history: list[float] = []
-        resp_len_re = re.compile(r"response_length/mean:([\d.eE+-]+)")
         resp_len_history: list[float] = []
         loss_curve: list[float] = []
         last_dump_step = [-1]
-        # per-step rows for the cli's step table; the trl backend fills this from its trainer
-        # callback, which verl has no counterpart for (it trains out of process).
+        # when each step metric line arrived. verl's LocalLogger emits exactly one such line per
+        # optimizer step, so the gaps between them are whole steps and nothing else -- the only
+        # honest denominator for the reward idle fraction. train_wall/steps_run is not: it charges
+        # subprocess startup and the checkpoint-upload drain to the numerator, and steps_run is the
+        # ABSOLUTE checkpoint step while the wall is session-only, so a resumed run divides this
+        # session's seconds by every step the checkpoint ever took.
+        step_line_times: list[float] = []
+        # per-step backlog for `flash runs log -f`, rebuilt from verl's own step lines because its
+        # trainer runs out of process and cannot host trl's callback. read by the liveness thread
+        # below, so mutate it in place (append_step_metrics) rather than rebinding.
         metrics_last: list[dict] = []
-        # one-shot latch for the forced first-row snapshot below (boxed: the reader is a closure).
-        sent_first_metrics_heartbeat = [False]
+        sent_first_metrics = False
 
-        def _hb_metrics_fields():
-            return {"metrics_last": list(metrics_last)}
+        def _reward_observability() -> dict:
+            """the `reward_metrics` / `sampled_completions` fields for one heartbeat emission.
 
-        with liveness_heartbeat("rl_step", progress=_progress, progress_step=True,
-                                fields=_hb_metrics_fields):
+            trl publishes both from a TrainerCallback on the trainer's own thread. verl's trainer is
+            out of process, so this is called from the liveness thread and from the stdout loop
+            instead -- reading the buffer the reward bridge fills on its server threads.
+
+            read-only: the generation boundary below owns the drain, so a 30s liveness tick landing
+            mid-generation republishes the last complete reading instead of publishing whichever
+            completions happened to be graded by then.
+            """
+            return observability.heartbeat_fields()
+
+        with liveness_heartbeat(
+            "rl_step",
+            progress=_progress,
+            fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
+            progress_step=True,
+        ):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env_for_verl,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env_for_verl,
                 start_new_session=True,
             )
             try:
@@ -1638,53 +2919,75 @@ def run_rl_verl():
                     link = parse_wandb_link(line)
                     if link is not None:
                         wandb_link.update(link)
-                    row = _verl_step_metrics(
-                        line, max_completion_tokens=inp.get("max_completion")
-                    )
-                    if row is not None:
-                        metrics_last[:] = [
-                            *[item for item in metrics_last if item["step"] != row["step"]][
-                                -(_GRPO_METRIC_HISTORY_LIMIT - 1) :
-                            ],
-                            row,
-                        ]
-                        # mirror the trl callback (heartbeat.py): the top-level error handler in
-                        # worker/__init__.py reads ONLY this module list, so without the sync a verl
-                        # run that parses steps and then raises sends its error heartbeat with an
-                        # empty backlog -- exactly the table this parser exists to restore.
-                        LATEST_GRPO_METRICS_LAST[:] = metrics_last
-                        # and force the FIRST parsed row past the throttle. rl_step is throttled on
-                        # _HB_MIN_INTERVAL_S (900s) and the initial=True ping just took the upload
-                        # slot, so a run finishing inside 15 minutes would otherwise keep every row
-                        # local until the terminal heartbeat and show no step table while training.
-                        if not sent_first_metrics_heartbeat[0] and _w.heartbeat(
-                            "rl_step", force=True, step=row["step"], metrics_last=list(metrics_last)
-                        ):
-                            sent_first_metrics_heartbeat[0] = True
                     m = step_re.search(line)
                     if m:
                         step_box[0] = int(m.group(1))
                         # dump one sample completion per new step to the flash log (matches trl #607).
                         if step_box[0] != last_dump_step[0]:
-                            with _samples_lock:
-                                samp = recent_samples[-1] if recent_samples else None
+                            # the generation boundary: verl logs this line once its step is scored,
+                            # so everything the reward bridge buffered since the last one is that
+                            # step's complete output. seal it before the preview reads `latest`, so
+                            # both the log line and the heartbeat describe the same generation.
+                            observability.close_generation(step_box[0])
+                            # asks for THIS step's rows, not merely the newest: when the line is
+                            # spent on a generation the queue already dropped, nothing is published
+                            # and the previous generation's text would print under this step.
+                            samp = observability.latest_for_step(step_box[0])
                             if samp:
                                 last_dump_step[0] = step_box[0]
-                                preview = " ".join(sanitize_rollout_text(samp[0])[:300].split())
+                                _, completion, reward = samp
+                                text = sanitize_rollout_text(sample_completion_text(completion))
+                                preview = " ".join(text[:300].split())
                                 print(
-                                    f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
+                                    f"[rl-verl] step {step_box[0]} sample (reward={reward:.3f}): {preview}",
                                     flush=True,
                                 )
-                    # capture verl's per-step reward + policy loss for train_meta observability parity.
-                    for pat, sink in (
-                        (reward_re, reward_history),
-                        (loss_re, loss_curve),
-                        (resp_len_re, resp_len_history),
-                    ):
-                        hit = pat.search(line)
-                        if hit:
-                            with contextlib.suppress(ValueError):
-                                sink.append(float(hit.group(1)))
+                    step_metrics = parse_verl_step_metrics(line)
+                    if step_metrics is not None:
+                        step_line_times.append(time.time())
+                        # a run constant rather than a verl metric, so it is stamped here the way
+                        # trl's callback reads it off args.max_completion_length.
+                        step_metrics["max_completion_tokens"] = inp["max_completion"]
+                        append_step_metrics(
+                            metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT
+                        )
+                        # the worker's error path reads this global, so a run that dies mid-training
+                        # still reports the steps it did complete (worker/__init__.py:_err_metrics).
+                        LATEST_GRPO_METRICS_LAST[:] = metrics_last
+                        # the rl_train_start ping arms the 900s rl_step throttle, and the liveness
+                        # daemon never forces, so the first backlog would stay invisible for 15
+                        # minutes. force it through the way trl does (heartbeat.py
+                        # force_first_samples), and keep retrying until one commits: the daemon may
+                        # claim this step first, which is fine because its payload carries the same
+                        # backlog. only the FIRST is forced, so the hf commit cap stays protected.
+                        if not sent_first_metrics:
+                            sent_first_metrics = _w.heartbeat(
+                                "rl_step",
+                                force=True,
+                                step=step_metrics["step"],
+                                metrics_last=list(metrics_last),
+                                **_reward_observability(),
+                                gpu=gpu_diagnostics(include_torch=False),
+                            )
+                        # per-step series for train_meta observability parity. these live on the same
+                        # line as everything else: verl's only console metric sink is LocalLogger,
+                        # which always prints "step:N - ..." (verl/utils/logger/aggregate_logger.py),
+                        # so a line without a step carries no metric to collect.
+                        for verl_key, sink in (
+                            ("critic/rewards/mean", reward_history),
+                            ("actor/pg_loss", loss_curve),
+                            ("response_length/mean", resp_len_history),
+                        ):
+                            value = parse_verl_metric(line, verl_key)
+                            if value is not None:
+                                sink.append(value)
+                        # advantages/max and /min are emitted for every step outside verl's
+                        # use_critic branch (trainer/ppo/metric_utils.py), so they are present under
+                        # grpo even though the key is namespaced critic/.
+                        adv_max = parse_verl_metric(line, "critic/advantages/max")
+                        adv_min = parse_verl_metric(line, "critic/advantages/min")
+                        if adv_max is not None and adv_min is not None:
+                            adv_spread_history.append(adv_max - adv_min)
                 rc = proc.wait()
             except BaseException:
                 # the stream loop died (upload error, cancel, oom in the parent): a still-running
@@ -1695,7 +2998,15 @@ def run_rl_verl():
                     proc.wait(timeout=10)
                 raise
         if rc != 0:
-            raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
+            raise RuntimeError(
+                f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
+            )
+        # the gradient verdict runs here, ahead of required-save completeness, because a zero-spread
+        # run withholds every required deployable BY DESIGN: checking completeness first would raise
+        # on artifacts the gate is deliberately holding and report a checkpoint-publication failure
+        # -- the symptom -- instead of the constant reward signal that caused it. raising inside the
+        # try still runs the finally below, so the reward server and gpu sampler shut down either way.
+        _check_grpo_had_a_gradient(reward_history, adv_spread_history, resumed=bool(resume_step))
         # training finished cleanly, so a missing required save is a real defect rather than a
         # side effect of a crash. stop here (not in finally, which suppresses) to surface it.
         # only when exact saves were requested: without them the drain stays best-effort, and
@@ -1719,24 +3030,26 @@ def run_rl_verl():
     shutil.rmtree(adapter_dir, ignore_errors=True)
     os.makedirs(adapter_dir, exist_ok=True)
     train_wall = time.time() - t_train
-    if not reward_history:
-        raise RuntimeError(
-            "verl reported no reward metrics for the whole run — the flash reward bridge was "
-            "never consulted (wiring regression); refusing to publish a policy trained on "
-            "default rewards"
-        )
+    # the zero-gradient verdict already ran inside the try above, ahead of required-save
+    # completeness, so that a withheld deployable reports the reward cause rather than the
+    # publication symptom.
     actor_dir, steps_run = _latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
-        raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")
+        raise RuntimeError(
+            f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
+        )
 
     with liveness_heartbeat(
         "rl_finalizing",
         progress=lambda: steps_run,
+        fields=lambda: {"metrics_last": list(metrics_last)},
         progress_step=True,
         keepalive=True,
     ):
-        _export_peft_adapter(actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin)
-        tok.save_pretrained(adapter_dir)
+        _export_peft_adapter(
+            actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
+        )
+        preprocessor.save_pretrained(adapter_dir)
         _stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
@@ -1761,8 +3074,11 @@ def run_rl_verl():
         train_tokens=0,
         heartbeat_fields={"metrics_last": list(metrics_last)},
         generated_tokens=int(
-            sum(resp_len_history) / max(1, len(resp_len_history))
-            * steps_run * inp["prompts_per_step"] * inp["group_size"]
+            sum(resp_len_history)
+            / max(1, len(resp_len_history))
+            * steps_run
+            * inp["prompts_per_step"]
+            * inp["group_size"]
         )
         if resp_len_history
         else 0,
@@ -1780,5 +3096,7 @@ def run_rl_verl():
             wandb_run_name=experiment_name if "wandb" in loggers else None,
             wandb_url=wandb_link.get("wandb_url"),
             wandb_id=wandb_link.get("wandb_id"),
+            reward_profile=reward_profile,
+            step_intervals=_step_intervals(step_line_times),
         ),
     )

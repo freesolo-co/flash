@@ -10,8 +10,10 @@ on top.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -114,7 +116,12 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     on verl_supports_rollout_field.
 
     a self-provisioned venv is flash's own, and is rebuilt whenever it does not record the current
-    VERL_REQUIREMENT, so unsetting FLASH_VERL_PYTHON always yields the pinned verl.
+    VERL_REQUIREMENT, so an empty/absent FLASH_VERL_PYTHON always yields the pinned verl.
+
+    an EMPTY value is deliberately equivalent to absent, and it is the only route a run has: worker
+    images can export FLASH_VERL_PYTHON themselves, and [worker_env] can set a key but never delete
+    one, so omitting it from the spec leaves the image's value in place. `""` is what lets a spec
+    say "ignore the image's interpreter and provision the pinned one".
     """
     preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
     if preset:
@@ -161,6 +168,61 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     return py
 
 
+def resolve_verl_loggers(python_bin: str) -> list[str]:
+    """verl's ``trainer.logger`` list, gated on the interpreter that actually logs.
+
+    verl logs from its own interpreter, so wandb must be importable THERE, not in flash's env. The
+    prebuilt worker image's /opt/verl-venv does not install wandb, and a preset FLASH_VERL_PYTHON is
+    returned by resolve_verl_python untouched (flash does not own that interpreter), so a run with
+    WANDB_API_KEY set would otherwise ask verl for a logger it cannot import and die at logger init
+    on a paid GPU. Fall back to console instead: losing the W&B mirror beats losing the run.
+
+    Never inits a flash-side run -- flash does not train in-process on this path, so it would stay
+    empty.
+    """
+    if not os.environ.get("WANDB_API_KEY"):
+        return ["console"]
+    has_wandb = (
+        subprocess.run([python_bin, "-c", "import wandb"], capture_output=True).returncode == 0
+    )
+    if not has_wandb:
+        print(
+            "[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; "
+            "using console logger only"
+        )
+        return ["console"]
+    return ["console", "wandb"]
+
+
+def resolve_checkpoint_actor_dir(step_dir: str) -> str:
+    """return the directory inside ``global_step_N`` that holds the saved model + ``huggingface/``.
+
+    verl's two trainers do not agree on this layout, and the difference is not configurable:
+
+    - RL nests per-role, ``global_step_N/actor/`` (``trainer/ppo/ray_trainer.py`` builds
+      ``os.path.join(local_global_step_folder, "actor")``).
+    - SFT writes the shards straight into ``global_step_N/`` (``utils/checkpoint/
+      checkpoint_handler.py`` passes ``local_path=local_global_step_folder`` unmodified).
+
+    So detect the layout from what verl actually wrote rather than hardcoding either convention.
+    ``huggingface/`` is the right marker because it is the subfolder ``verl.model_merger`` resolves
+    ``hf_model_config_path`` against, which is precisely what a wrong answer here breaks.
+
+    Getting this wrong does not surface as a missing path: ``AutoConfig.from_pretrained`` treats a
+    nonexistent local directory as a *hub repo id*, so the failure arrives as
+    ``HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name'`` and reads
+    like a credentials or network problem instead of a path bug.
+    """
+    nested = os.path.join(step_dir, "actor")
+    if os.path.isdir(os.path.join(nested, "huggingface")):
+        return nested
+    if os.path.isdir(os.path.join(step_dir, "huggingface")):
+        return step_dir
+    # neither marker is present (an interrupted save, or a layout this code has not seen). prefer the
+    # nested dir when it exists at all so the error names the RL path the caller most likely wanted.
+    return nested if os.path.isdir(nested) else step_dir
+
+
 def latest_global_step_dir(local_dir: str) -> tuple[str, int]:
     """return (actor_dir, step) for the highest global_step_N checkpoint verl wrote."""
     best_step, best = -1, ""
@@ -169,7 +231,7 @@ def latest_global_step_dir(local_dir: str) -> tuple[str, int]:
             m = re.fullmatch(r"global_step_(\d+)", name)
             if m and int(m.group(1)) > best_step:
                 best_step = int(m.group(1))
-                best = os.path.join(local_dir, name, "actor")
+                best = resolve_checkpoint_actor_dir(os.path.join(local_dir, name))
     if best_step < 0:
         raise RuntimeError(f"no global_step_N checkpoint found under {local_dir}")
     return best, best_step
@@ -184,11 +246,13 @@ def export_peft_adapter(
 ) -> None:
     """turn verl's saved lora checkpoint into a flash-servable peft adapter dir.
 
-    verl saves fsdp-sharded checkpoints under ``<local_dir>/global_step_N/actor`` (model/optim
-    shards + a ``huggingface/`` config+tokenizer subfolder). ``verl.model_merger merge`` writes a
-    standard peft adapter (adapter_config.json + adapter_model.safetensors) to a ``lora_adapter/``
-    subfolder of its target; we copy just that adapter into flash's adapter dir (the co-produced
-    merged full model is discarded -- flash serves the lora on the immutable base).
+    verl saves fsdp-sharded checkpoints (model/optim shards + a ``huggingface/`` config+tokenizer
+    subfolder) under ``<local_dir>/global_step_N/actor`` for RL and ``<local_dir>/global_step_N``
+    for SFT -- pass the dir that ``resolve_checkpoint_actor_dir`` picked, not a hardcoded one.
+    ``verl.model_merger merge`` writes a standard peft adapter (adapter_config.json +
+    adapter_model.safetensors) to a ``lora_adapter/`` subfolder of its target; we copy just that
+    adapter into flash's adapter dir (the co-produced merged full model is discarded -- flash
+    serves the lora on the immutable base).
 
     verified against verl 0.8 on an h100: merger emits ``<target>/lora_adapter/{adapter_config
     .json,adapter_model.safetensors}`` with ``base_model_name_or_path: null``.
@@ -244,6 +308,125 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
         json.dump(cfg, f, indent=2)
 
 
+# how many of the child's most recent output lines to retain for stall reporting. the child's last
+# words before it wedges are the whole diagnostic, and a stall is usually preceded by a short burst
+# (a ray warning, a placement-group notice, a partial traceback), so a small window suffices.
+CHILD_TAIL_LINES = 60
+# per-line cap when rendering the retained tail. verl prints resolved-config blocks thousands of
+# characters wide; an unbounded tail would blow the heartbeat payload it has to travel inside.
+_CHILD_TAIL_LINE_CHARS = 300
+# how many retained lines ride along on a pre-first-step heartbeat. narrower than what is retained:
+# this payload is uploaded every tick, so it stays small enough not to bloat the snapshot.
+STALL_TAIL_LINES = 15
+
+
+class ChildOutputTail:
+    """bounded ring buffer of a subprocess's most recent output lines.
+
+    exists because the verl child's stdout reaches **no collected log stream**. ``run_verl_training``
+    re-prints every child line to the parent worker's stdout, and the parent's stdout is not on the
+    path the plane scrapes -- only the ``HEARTBEAT <json>`` marker line is (``heartbeat.py``). so a
+    child that wedges produces zero retrievable bytes: an OPD arm stalled 3/3 attempts on 3 separate
+    endpoints and every attempt cost ~50 minutes of paid H100 time to learn nothing (ISSUES VERL-061).
+
+    retaining the tail in memory lets a stall report the child's own last words through the marker
+    channel that provably survives, instead of inferring the cause from the outside.
+    """
+
+    def __init__(self, limit: int = CHILD_TAIL_LINES) -> None:
+        self._lines: collections.deque[str] = collections.deque(maxlen=limit)
+        self._written = 0
+
+    def record(self, line: str) -> None:
+        text = line.rstrip("\n")
+        if text:
+            self._lines.append(text[:_CHILD_TAIL_LINE_CHARS])
+            self._written += 1
+
+    @property
+    def written(self) -> int:
+        """how many non-empty lines the child has produced, ever.
+
+        monotonic and independent of the retention limit, which is what makes it usable as a
+        staleness signal: a child looping on the same line still advances this, and a child that
+        has gone silent cannot advance it even though its retained tail stays fully populated.
+        """
+        return self._written
+
+    def tail(self, limit: int | None = None) -> list[str]:
+        """the retained lines, oldest first, optionally narrowed to the most recent ``limit``."""
+        lines = list(self._lines)
+        if limit is not None and limit >= 0:
+            lines = lines[len(lines) - limit :] if limit < len(lines) else lines
+        return lines
+
+
+class ChildTailStaleness:
+    """tracks how long a child has been silent, across the ticks that sample its tail.
+
+    the tail alone cannot answer the question a stall actually poses. a child still loading shards
+    and a child wedged forever both present a fully populated tail whose newest line is plausible,
+    so the only thing separating them is whether the tail CHANGED between two dumps -- and a
+    stateless report throws that comparison away, leaving it to be reconstructed by hand from
+    consecutive heartbeats after the money is already spent (ISSUES VERL-067).
+
+    holding the previous line count here turns that into a number the first dump already carries.
+    """
+
+    def __init__(self) -> None:
+        self._written = -1
+        self._since = 0
+
+    def observe(self, written: int) -> int:
+        """record this tick's line count; return consecutive ticks with no new output.
+
+        0 means the child spoke since the last observation. n>0 means it has been silent for n
+        ticks, which is the signal that separates a slow start from a wedge.
+        """
+        if written != self._written:
+            self._written = written
+            self._since = 0
+        else:
+            self._since += 1
+        return self._since
+
+
+def stall_tail_fields(
+    step: int,
+    tail: ChildOutputTail,
+    limit: int = STALL_TAIL_LINES,
+    staleness: ChildTailStaleness | None = None,
+) -> dict[str, object]:
+    """heartbeat fields carrying the child's last words, but only while it has made no progress.
+
+    a run that is training is diagnosable from its step/loss stream, so attaching the tail then would
+    add an uploaded payload every tick for no information. before the first step there is no such
+    stream, and that is exactly the window a setup stall lands in -- the child prints its complaint,
+    nobody collects the parent's stdout, and the run dies to a watchdog with zero evidence.
+
+    with ``staleness`` supplied, the payload also carries ``child_tail_silent_ticks``: how many
+    consecutive samples produced no new child output. the tail says what the child last said; this
+    says whether it is still saying anything, which is the difference between a slow start and a
+    wedge. without it the two are indistinguishable in a single heartbeat and have to be told apart
+    by hand-diffing consecutive dumps.
+
+    returns an empty dict once ``step`` advances, or when the child has said nothing yet.
+    """
+    if step > 0:
+        return {}
+    recent = tail.tail(limit=limit)
+    if not recent:
+        # observed even with nothing to report, so a child that starts talking later is measured
+        # from its first line rather than from whenever the payload happened to become non-empty.
+        if staleness is not None:
+            staleness.observe(tail.written)
+        return {}
+    fields: dict[str, object] = {"child_tail": recent}
+    if staleness is not None:
+        fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
+    return fields
+
+
 def run_verl_training(
     cmd: list[str],
     *,
@@ -253,6 +436,7 @@ def run_verl_training(
     heartbeat: Callable[[], None] | None = None,
     step_pattern: str = r"step:\s*(\d+)",
     heartbeat_interval_s: float = 20.0,
+    tail: ChildOutputTail | None = None,
 ) -> int:
     """run a verl trainer subprocess, streaming stdout and surfacing step progress.
 
@@ -260,6 +444,10 @@ def run_verl_training(
     receives every line, ``on_step`` receives each parsed training step, and ``heartbeat`` is called
     at most once per ``heartbeat_interval_s``. callback failures terminate the child before they are
     re-raised so a failed required checkpoint upload cannot leave paid training running unattended.
+
+    ``tail``, when supplied, retains the child's most recent lines so a caller that observes a stall
+    can report what the child last said. the parent's own stdout reaches no collected stream, so this
+    buffer is the only way the child's words escape the container (see ``ChildOutputTail``).
 
     the child gets its own session so teardown can signal the whole process group. verl spawns vllm's
     EngineCore as a grandchild, and terminating only the direct child reparents that grandchild to
@@ -281,6 +469,8 @@ def run_verl_training(
         assert proc.stdout is not None
         for line in proc.stdout:
             print(line, end="", flush=True)
+            if tail is not None:
+                tail.record(line)
             if on_line is not None:
                 on_line(line)
             m = step_re.search(line)
@@ -391,3 +581,101 @@ def parse_wandb_link(line: str) -> dict | None:
         return None
     wandb_id = payload.get("wandb_id")
     return {"wandb_url": url, "wandb_id": wandb_id if isinstance(wandb_id, str) else None}
+
+
+# --------------------------- per-step grpo metrics (verl -> `flash runs log -f`) ---------------------------
+# trl feeds `metrics_last` from a TrainerCallback (heartbeat.make_reward_heartbeat_callback), which
+# verl cannot use: its trainer runs out of process. verl's LocalLogger prints exactly one line per
+# optimizer update -- "step:N - key:value - key:value" over every scalar metric -- so the parent
+# reconstructs the same backlog from that line. the payload schema is the CLI's, not verl's: keys
+# below are what flash/cli/commands.py:_FOLLOW_METRIC_FIELDS renders.
+#
+# not anchored at line start: ray tags worker stdout with a "(TaskRunner pid=123) " prefix, so an
+# anchored match would parse nothing at all in production. the existing progress regex in rl_verl
+# is unanchored for the same reason.
+_VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+) - ")
+
+# verl metric key -> flash `metrics_last` field. verl has no counterpart for trl's
+# frac_reward_zero_std (an advantage-collapse fraction trl computes per group), so that column is
+# simply absent for verl runs rather than faked; the renderer skips fields it does not find.
+_VERL_METRIC_FIELDS = (
+    ("critic/rewards/mean", "reward"),
+    ("actor/grad_norm", "grad_norm"),
+    ("actor/kl_loss", "kl"),
+    ("actor/entropy", "entropy"),
+    ("response_length/mean", "mean_completion_tokens"),
+    ("response_length/clip_ratio", "truncation_rate"),
+)
+
+# verl reduces most metrics with np.mean and formats them through pprint, so under numpy>=2 a value
+# prints as "np.float32(1.25)" rather than "1.25". verl's own requirements pin numpy<2, but the
+# production interpreter comes from FLASH_VERL_PYTHON (a prebuilt image flash does not own), so
+# accept both spellings -- the numpy-2 form would otherwise drop these columns silently.
+_NUMPY_SCALAR_RE = re.compile(r"^np\.\w+\((.*)\)$")
+
+
+def _metric_value(raw: str) -> float | None:
+    """one verl-printed scalar as a finite float, or None when it is not usable."""
+    wrapper = _NUMPY_SCALAR_RE.match(raw)
+    if wrapper is not None:
+        raw = wrapper.group(1)
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    # nan/inf survive float() ("nan", "inf") but would render as a meaningless column and can poison
+    # a json payload downstream, so drop them the way the trl callback does.
+    return value if math.isfinite(value) else None
+
+
+def parse_verl_metric(line: str, verl_key: str) -> float | None:
+    """one verl metric's finite float value from a step line, or None when absent.
+
+    anchors the key on a separator so a metric whose name merely ends with another's
+    (response_length_non_aborted/mean vs response_length/mean) cannot cross-match, and accepts the
+    numpy>=2 ``np.float64(...)`` spelling (see _NUMPY_SCALAR_RE).
+    """
+    hit = re.search(rf"(?:^|[\s-]){re.escape(verl_key)}:(\S+)", line)
+    return None if hit is None else _metric_value(hit.group(1))
+
+
+def parse_verl_step_metrics(line: str) -> dict | None:
+    """the flash `metrics_last` entry a verl step line carries, or None when it carries none.
+
+    returns None rather than raising: this parses child stdout under multi-rank logging, where a
+    truncated or interleaved line must not take down a paid run.
+
+    a step line with no renderable metric yields None rather than a bare ``{"step": n}``: verl logs
+    its pre-training validation pass as its own record at the *current* step counter
+    (ray_trainer.py `logger.log(data=val_metrics, step=self.global_steps)`), and every key on that
+    line is namespaced val-core/ or val-aux/. keeping it would render a row with a step number and
+    no metrics, and -- because the backlog is deduplicated by step -- a resumed run's validation
+    pass would land on the resume step and displace a real training row.
+    """
+    match = _VERL_STEP_RE.search(line)
+    if match is None:
+        return None
+    metrics: dict[str, float | int] = {}
+    for verl_key, flash_key in _VERL_METRIC_FIELDS:
+        value = parse_verl_metric(line, verl_key)
+        if value is not None:
+            metrics[flash_key] = value
+    if not metrics:
+        return None
+    return {"step": int(match.group(1)), **metrics}
+
+
+def append_step_metrics(backlog: list[dict], metrics: dict, *, limit: int) -> None:
+    """record one step in a bounded, de-duplicated backlog, mirroring the trl callback.
+
+    verl reprints a step on a validation pass, and a resumed run replays its resume step, so a
+    repeat must replace rather than append -- otherwise the CLI renders the same step twice.
+
+    the heartbeat thread reads ``backlog`` while the stdout loop writes it, so the new contents are
+    published in ONE slice assignment: a filter/append/truncate sequence would let that reader
+    observe a torn intermediate state with the step momentarily missing.
+    """
+    step = metrics.get("step")
+    kept = [item for item in backlog if item.get("step") != step]
+    kept.append(metrics)
+    backlog[:] = kept[-limit:]

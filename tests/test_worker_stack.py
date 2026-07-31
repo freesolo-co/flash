@@ -905,16 +905,17 @@ def test_warmstart_base_loader_forwards_model_revision(monkeypatch):
     ]
 
 
-def test_sft_and_rl_wire_vl_full_lora_base_loader():
+def test_rl_wires_vl_full_lora_base_loader():
+    # SFT is not covered here any more: verl loads the base itself in its trainer subprocess from
+    # model.path, so there is no in-process model for the worker to hand over. The SFT-side half of
+    # this invariant -- that the resolved lora_rank and target_modules actually reach verl instead of
+    # falling back to its defaults -- is covered by the override-map assertion in test_sft_train.py.
     import inspect
 
-    from flash.engine.worker import rl, sft
+    from flash.engine.worker import rl
 
-    sft_src = inspect.getsource(sft.run_sft)
     rl_src = inspect.getsource(rl.run_rl)
 
-    assert "sft_model = _w.prepare_fresh_lora_base(" in sft_src
-    assert "model=sft_model" in sft_src
     assert "trainer_model = _w.prepare_fresh_lora_base(" in rl_src
     assert 'model_init_kwargs["device_map"] = None' in rl_src
     assert 'device_map", "auto"' not in rl_src

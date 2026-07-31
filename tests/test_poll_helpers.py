@@ -7,7 +7,11 @@ import time
 
 import pytest
 
-from flash.providers._poll import _attempt_int, heartbeat_progress_ts
+from flash.providers._poll import (
+    _attempt_int,
+    _format_heartbeat,
+    heartbeat_progress_ts,
+)
 
 
 def test_attempt_int_rejects_oversized_ascii_decimal():
@@ -49,9 +53,7 @@ def test_heartbeat_progress_pre_launch_leftover_is_not_fresh():
 def test_heartbeat_progress_rejects_unknown_launch_identity():
     now = time.time()
     for launch in (0.0, None):
-        _ts, fresh = heartbeat_progress_ts(
-            ("rl", 5, now - 30, 0), launch, current_attempt=0
-        )
+        _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 30, 0), launch, current_attempt=0)
         assert fresh is False
 
 
@@ -136,3 +138,85 @@ def test_heartbeat_progress_rejects_malformed_current_attempt(malformed_attempt)
         ("rl", 5, now - 1, 1), now - 10, current_attempt=malformed_attempt
     )
     assert fresh is False
+
+
+def test_format_heartbeat_renders_the_child_tail_for_a_stalled_worker():
+    # the whole point of carrying the tail: a stalled run's log must show what the child said.
+    msg = _format_heartbeat(
+        {
+            "stage": "opd_step",
+            "liveness": True,
+            "step": 0,
+            "child_tail": ["Ray placement group pending", "waiting for 3 CPUs"],
+        }
+    )
+    assert "stage=opd_step" in msg
+    assert "child output before the stall" in msg
+    assert "Ray placement group pending" in msg
+    assert "waiting for 3 CPUs" in msg
+    # oldest first, so the last line rendered is the child's most recent word
+    assert msg.index("Ray placement group pending") < msg.index("waiting for 3 CPUs")
+
+
+def test_format_heartbeat_renders_how_long_the_child_has_been_silent():
+    # the counter is the slow-vs-stuck signal, and the streamed log is where a stall is diagnosed:
+    # carrying it to the plane and not rendering it leaves the operator comparing tails by eye.
+    msg = _format_heartbeat(
+        {
+            "stage": "opd_step",
+            "step": 0,
+            "child_tail": ["Started a local Ray instance"],
+            "child_tail_silent_ticks": 7,
+        }
+    )
+    assert "unchanged for 7 ticks" in msg
+    assert "Started a local Ray instance" in msg
+
+
+def test_format_heartbeat_distinguishes_a_talking_child_from_a_silent_one():
+    # 0 is the load-bearing value: it says the child is still producing output, so a rendering that
+    # only shows a nonzero count reads a talking child as an unannotated stall.
+    talking = _format_heartbeat(
+        {"stage": "opd_step", "child_tail": ["loading weights"], "child_tail_silent_ticks": 0}
+    )
+    assert "still producing output" in talking
+    assert "unchanged for" not in talking
+    # singular, because "unchanged for 1 ticks" in an operator-facing log is a typo with a version
+    one = _format_heartbeat(
+        {"stage": "opd_step", "child_tail": ["loading weights"], "child_tail_silent_ticks": 1}
+    )
+    assert "unchanged for 1 tick," not in one
+    assert "unchanged for 1 tick:" in one
+
+
+def test_format_heartbeat_ignores_a_malformed_silent_tick_count():
+    # a bad counter must cost only the annotation, never the tail it annotates.
+    for bad in ("3", -1, 2.5, True, None, {"a": 1}):
+        msg = _format_heartbeat(
+            {"stage": "opd_step", "child_tail": ["ray init kwargs"], "child_tail_silent_ticks": bad}
+        )
+        assert "child output before the stall" in msg
+        assert "ray init kwargs" in msg
+        assert "unchanged for" not in msg
+        assert "still producing output" not in msg
+
+
+def test_format_heartbeat_is_unchanged_when_no_child_tail_is_present():
+    hb = {"stage": "opd_step", "liveness": True, "step": 4, "loss": 1.5}
+    assert "child output" not in _format_heartbeat(hb)
+
+
+def test_format_heartbeat_ignores_a_malformed_child_tail():
+    # this payload crosses a process boundary as json; a bad one must not break the whole line.
+    for bad in ("not a list", 17, {"a": 1}, [], [None, 3, ""], None):
+        msg = _format_heartbeat({"stage": "opd_step", "child_tail": bad})
+        assert "stage=opd_step" in msg
+        assert "child output" not in msg
+
+
+def test_format_heartbeat_neutralizes_control_chars_in_the_child_tail():
+    # verl children emit ansi progress bars; raw control bytes must not reach the streamed log.
+    msg = _format_heartbeat({"stage": "opd_step", "child_tail": ["a\x1b[2Kb\rc"]})
+    assert "child output before the stall" in msg
+    assert "\x1b" not in msg
+    assert "\r" not in msg

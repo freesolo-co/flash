@@ -485,6 +485,8 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   the student's generated tokens is the sum of its per-turn reverse-KLs. Env/observation tokens are
   never distilled (they're context, not the student's output). Set `[train] max_context_tokens` to bound the
   transcript; the teacher must cover it (the allow-listed teachers' contexts far exceed the default budget).
+  This holds for everything except multi-turn combined with `structured_outputs`, which is refused at
+  startup (see the backend section below).
 - **Judge it like SFT.** Distillation logs a falling per-token loss; a low loss alone is not proof.
   Keep a held-out split, `flash models deploy` the adapter, and score it — confirm the student actually
   moved toward the teacher's behavior, not just its surface tokens.
@@ -699,11 +701,8 @@ on a beyond-noise improvement.
 
 ## Multi-GPU training (`gpu.count > 1`)
 
-Flash trains on one card by default. The default `trl` backend is single-process and never
-reads `gpu.count`, so raising the count alone would rent n cards and train on one — submit
-rejects that rather than billing for idle hardware.
-
-To shard one job across several cards, select the `verl` backend for the phase you are running:
+Flash trains on one card by default. **SFT and OPD** run on the `verl` backend always, so they
+shard across `gpu.count` cards with nothing to select:
 
 ```toml
 [gpu]
@@ -711,15 +710,18 @@ type = "B200"
 count = 4
 # provider must also be pinned: not every provider puts all n cards on ONE machine, and
 # submit names the ones that qualify when it rejects an unpinned multi-gpu spec.
-
-[worker_env]
-FLASH_SFT_BACKEND = "verl"   # SFT
-# FLASH_RL_BACKEND  = "verl"   # GRPO  (the key is RL, not GRPO)
-# FLASH_OPD_BACKEND = "verl"   # OPD
 ```
 
-One key per phase, and GRPO's is `FLASH_RL_BACKEND`. The verl worker launches one rank per
-card with Ulysses sequence parallelism.
+**GRPO** still defaults to the single-process `trl` backend, which never reads `gpu.count` — so
+raising the count alone would rent n cards and train on one, and submit rejects that rather than
+billing for idle hardware. Select `verl` explicitly to shard a GRPO run:
+
+```toml
+[worker_env]
+FLASH_RL_BACKEND = "verl"   # GRPO only (the key is RL, not GRPO)
+```
+
+The verl worker launches one rank per card with Ulysses sequence parallelism.
 
 The verl GRPO backend covers single-turn, non-tool, non-multimodal runs; multi-turn, tool, and
 image-prompt environments stay on `trl` (which is single-GPU). Warm-starting with
@@ -727,6 +729,23 @@ image-prompt environments stay on `trl` (which is single-GPU). Warm-starting wit
 reference with adapters disabled, so the reference would be the bare base model instead of your
 SFT adapter, pulling the policy back toward base. Every one of these raises at startup rather
 than quietly training on a different contract.
+
+OPD has one unsupported combination, and because there is no other backend to fall back to it
+raises at startup: a multi-turn env together with `[train] structured_outputs`. Multi-turn OPD
+alone runs, and structured outputs alone run; only the combination is refused.
+
+Structured-output OPD on verl additionally requires the constraint to be exactly replayable on
+CPU, which pins it to xgrammar. These raise at startup even on a single-turn env: a
+`whitespace_pattern`, `disable_additional_properties` (guidance-backend only), a JSON schema using
+features that need vLLM's guidance fallback, or a model carrying a vLLM Mistral tokenizer.
+
+On either backend, note what a multi-turn structured-output run actually does: one schema is
+applied to EVERY assistant turn, mid-rollout turns included, because the env contract has no
+per-turn schema channel. If your intermediate turns and your final answer have different shapes,
+`trl` will constrain the intermediate ones to the final-answer schema rather than reject the run.
+That is the contract verl declines to guess at, and it is why the fix is a per-turn constraint
+channel rather than simply lifting the verl check. Like the GRPO gaps, verl raises at startup
+rather than training on a contract you did not ask for.
 
 ---
 

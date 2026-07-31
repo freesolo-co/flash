@@ -31,6 +31,7 @@ from flash.engine.steps import (
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.packing import completion_mask_from_ids
+from flash.engine.worker.rng import seed_training_rngs
 from flash.engine.worker.sft import (
     _model_arch_dims,
     _pretokenize_completion_only,
@@ -42,8 +43,11 @@ from flash.engine.worker.sft import (
 from flash.engine.worker.verl_common import (
     export_peft_adapter,
     latest_global_step_dir,
+    parse_verl_metric,
     parse_wandb_link,
     render_wandb_link_shim,
+    resolve_checkpoint_actor_dir,
+    resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
     stamp_adapter_dir_provenance,
@@ -53,7 +57,6 @@ from flash.engine.worker.verl_common import (
 _SFT_LORAPLUS_RATIO = 16.0
 _LORAPLUS_READY_MARKER = "FLASH_LORAPLUS_READY"
 _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
-_VERL_METRIC_RE = re.compile(r"(?:^| - )(?P<name>[^:]+):(?P<value>[^ ]+)")
 
 _REQUIRED_OVERRIDE_KEYS = (
     "train_files",
@@ -108,17 +111,31 @@ def _hydra_val(value) -> str:
     return text
 
 
+# the optimizer verl builds for SFT, named rather than imported: verl resolves it on the worker
+# with importlib(optim.optimizer_impl) + getattr(optim.optimizer), so the control path never needs
+# the class object -- and the control path has no torch.
+#
+# fp32 AdamW, NOT the TRL path's 8-bit paged optimizer. verl shards with FSDP2, whose parameters
+# are DTensor; bitsandbytes' optimizer_update_8bit_blockwise is a plain CUDA kernel, not a
+# distributed operator, so it raises "got mixed torch.Tensor and DTensor" on the first step.
+# fsdp1 would sidestep DTensor but flattens parameter names, and PEFT's LoRA+ builder groups by
+# name ("lora_B" in name or param.ndim == 1) -- under a flat_param every parameter is 1-D and
+# would land in the 16x group, corrupting training silently instead of crashing.
+_VERL_OPTIMIZER_IMPL = "torch.optim"
+_VERL_OPTIMIZER_NAME = "AdamW"
+
+
 def _optimizer_override_config(cfg: dict) -> dict:
     override = dict(cfg.get("optimizer_kwargs") or {})
     override.setdefault("eps", cfg.get("eps", 1e-8))
     return override
 
 
-def build_sft_verl_overrides(cfg: dict) -> list[str]:
+def build_sft_overrides(cfg: dict) -> list[str]:
     """build hydra overrides for verl's ``sft_trainer_engine.yaml`` config."""
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in cfg]
     if missing:
-        raise KeyError(f"build_sft_verl_overrides missing required cfg keys: {missing}")
+        raise KeyError(f"build_sft_overrides missing required cfg keys: {missing}")
     steps = cfg.get("total_training_steps")
     epochs = cfg.get("total_epochs")
     if bool(steps) == bool(epochs):
@@ -527,17 +544,6 @@ _FlashFSDPEngine._build_module = _flash_build_reentrant_module
     return source
 
 
-def _metric_value(line: str, name: str) -> float | None:
-    for match in _VERL_METRIC_RE.finditer(line):
-        if match.group("name") != name:
-            continue
-        try:
-            return float(match.group("value"))
-        except ValueError:
-            return None
-    return None
-
-
 def _copy_processing_sidecars(actor_dir: str, adapter_dir: str) -> None:
     source = os.path.join(actor_dir, "huggingface")
     if not os.path.isdir(source):
@@ -656,7 +662,7 @@ class _VerlCheckpointWatcher:
         if not self._should_publish(step):
             self.processed_steps.add(step)
             return
-        actor_dir = os.path.join(checkpoint_dir, "actor")
+        actor_dir = resolve_checkpoint_actor_dir(checkpoint_dir)
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         _export_checkpoint_adapter(
             actor_dir,
@@ -968,13 +974,17 @@ class _NvidiaSmiPeakSampler:
         return round(self.peak_mib / 1024, 3)
 
 
-def run_sft_verl(spec=None) -> None:
+def run_sft_train(spec=None) -> None:
     """run flash sft through verl's out-of-process fsdp trainer."""
     from flash.catalog import MODELS, resolve_vocab_size
     from flash.engine.vram import sft_grad_accum
 
     spec = spec or _w.JOB_SPEC
     env = _w.require_active_env()
+    # the child trainer is seeded through its shim, but the environment's dataset/completion calls
+    # run HERE in the parent. without this the documented top-level seed no longer reproduces sft
+    # targets for any env whose row construction uses python/numpy randomness.
+    seed_training_rngs(_w.SEED)
     started_at = time.time()
     _w.heartbeat("sft_start", gpu=_w.gpu_diagnostics(include_torch=False))
     gpu_probe = _probe_gpu_in_subprocess(
@@ -1229,12 +1239,10 @@ def run_sft_verl(spec=None) -> None:
         gradient_checkpointing and _w.grpo_use_reentrant(model_id)
     )
 
-    optimizer_cls, optimizer_kwargs = _w.loraplus_optimizer_cls(_w.fused_optim_name())
-    python_bin = resolve_verl_python(workdir)
+    python_bin = resolve_verl_python(workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY")))
     model_path = _cached_model_path(model_id, model_revision)
-    loggers = ["console"]
-    if os.environ.get("WANDB_API_KEY"):
-        loggers.append("wandb")
+    # verl logs from python_bin, so gate wandb on THAT interpreter (see resolve_verl_loggers).
+    loggers = resolve_verl_loggers(python_bin)
     project_name = (
         (spec.wandb.project if spec and spec.wandb else None) or "flash"
     )
@@ -1259,9 +1267,9 @@ def run_sft_verl(spec=None) -> None:
         "ulysses_sp_size": gpu_count,
         "lr": learning_rate,
         "warmup_ratio": RECIPE.sft.warmup_frac,
-        "optimizer_impl": optimizer_cls.__module__,
-        "optimizer_name": optimizer_cls.__name__,
-        "optimizer_kwargs": optimizer_kwargs or None,
+        "optimizer_impl": _VERL_OPTIMIZER_IMPL,
+        "optimizer_name": _VERL_OPTIMIZER_NAME,
+        "optimizer_kwargs": None,
         "local_dir": local_dir,
         "save_freq": save_freq,
         "n_gpus_per_node": gpu_count,
@@ -1275,7 +1283,7 @@ def run_sft_verl(spec=None) -> None:
         "total_training_steps": update_horizon if max_steps > 0 else None,
         "total_epochs": epochs if max_steps <= 0 else None,
     }
-    overrides = build_sft_verl_overrides(config)
+    overrides = build_sft_overrides(config)
 
     shim_source = _render_sft_sitecustomize(
         seed=config["seed"],
@@ -1346,9 +1354,15 @@ def run_sft_verl(spec=None) -> None:
             return
         if _SFT_LORAPLUS_RATIO > 1 and not loraplus_applied:
             raise RuntimeError("verl reached an optimizer step before the required lora+ shim succeeded")
-        loss = _metric_value(line, "train/loss")
-        grad_norm = _metric_value(line, "train/grad_norm")
-        learning_rate_value = _metric_value(line, "train/lr")
+        # these three reach the logger as plain python floats (engine_workers.py returns
+        # loss/grad_norm through .item() and lr through get_last_lr()), so unlike OPD's
+        # Metric(SUM) they do not print in numpy's np.float64(...) spelling today. they share
+        # the parser anyway: one upstream metric-type change would otherwise reintroduce the
+        # same silent drop here, and the shared helper also rejects nan/inf, which would
+        # serialize into the heartbeat as bare NaN and break strict json consumers.
+        loss = parse_verl_metric(line, "train/loss")
+        grad_norm = parse_verl_metric(line, "train/grad_norm")
+        learning_rate_value = parse_verl_metric(line, "train/lr")
         if loss is not None:
             loss_curve.append(round(loss, 4))
             progress["loss"] = loss
@@ -1459,7 +1473,7 @@ def run_sft_verl(spec=None) -> None:
             "loss_curve": loss_curve[:400],
             "peak_gpu_gb": device_peak_gpu_gb,
             "device_peak_gpu_gb": device_peak_gpu_gb,
-            "loraplus_optim": optimizer_cls.__name__,
+            "loraplus_optim": _VERL_OPTIMIZER_NAME,
             "loraplus_applied": loraplus_applied,
             "chalk_kernels": None,
             "verl_backend": "fsdp2",

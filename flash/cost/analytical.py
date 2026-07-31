@@ -7,8 +7,6 @@ policy/reference update.
 
 from __future__ import annotations
 
-import math
-
 from flash.providers.allocator import required_vram_gb, vram_headroom
 
 from .facts import (
@@ -18,6 +16,7 @@ from .facts import (
     effective_train_tflops,
     gpu_hourly_usd,
     gpu_vram_gb,
+    has_nvlink,
     model_quant,
     pick_gpu,
     reward_seconds_per_completion,
@@ -57,9 +56,21 @@ MOE_STEP_OVERHEAD_S = 2.0  # routing/dispatch/kernel-launch overhead an MoE pays
 COMPILE_MOE_SFT_S = 35.0
 COMPILE_MOE_ROLLOUT_S = 48.0  # GRPO / OPD (adds vLLM cudagraph capture)
 
-# Reward grading is CONCURRENT: a step's completions score in parallel slots, so the reward
-# wall is ceil(completions / slots) waves x latency, not completions x latency.
-REWARD_CONCURRENCY = 16.0
+# Single-turn grpo scores a step's completions SERIALLY, so the reward wall is the full
+# completions x latency sum. this is not an accident of either backend, it is a deliberate contract:
+# the trl reward_fn walks its completions in one loop (worker/rl.py), and the verl reward bridge
+# takes a global lock around the env call precisely so "the flash env sees sequential calls,
+# matching the trl reward path" (worker/rl_verl.py). the serialization protects envs whose scorers
+# are not thread-safe, so it cannot be removed to match a faster model.
+#
+# a concurrency divisor here was a flat 16x understatement of the reward term, and reward time lands
+# in the FIXED half of a step -- the half no gpu choice can shorten. under-counting it makes a
+# latency-bound judge env look gpu-bound, which over-weights raw flops and rents a fast card whose
+# speed the run cannot use. multi-turn envs do score concurrently, but multi-turn is unknowable at
+# quote time (RunConfig has no such field, and deciding it means LOADING user env code inside a
+# pricing function that is deliberately offline). serial is therefore the conservative default: for
+# a concurrent env it over-states fixed time, which can only steer the allocator to a cheaper card,
+# never to a more expensive one it cannot exploit.
 
 # Cold-start overhead (seconds): container boot + deps + model load (+ vLLM init for GRPO).
 #
@@ -151,16 +162,42 @@ def compile_seconds(config: RunConfig, gpu: str) -> float:
 # collective overhead means n cards never deliver n times one card's throughput: fsdp all-gathers
 # parameters and reduce-scatters gradients every layer, and the share of a step spent in collectives
 # grows with the card count. this is the realized fraction of linear scaling per ADDED card, applied
-# geometrically (1 card 1.00x, 2 cards 1.70x, 4 cards 2.46x). deliberately conservative: the
-# allocator must never rank a combination on a speedup the interconnect will not deliver, because
-# every card in it bills whether or not it contributes.
-MULTI_CARD_SCALING = 0.85
+# geometrically. the allocator must never rank a combination on a speedup the interconnect will not
+# deliver, because every card in it bills whether or not it contributes.
+#
+# BOTH constants are MEASURED, one identical 2-card fsdp benchmark per interconnect (same global
+# batch in both arms, both arms on one pod, slowest rank defining the step):
+#   nvlink 2x A100-SXM4-80GB: 0.39491 s -> 0.22343 s = 1.7675x, per-card 0.884
+#   pcie   2x L40S          : 0.57692 s -> 0.40596 s = 1.4212x, per-card 0.711
+# a single constant cannot cover both. the previous global 0.85 was ~4% conservative on nvlink but
+# ~20% OPTIMISTIC on pcie, and optimistic is the direction that actually misprices a run: it lets a
+# 2-card pcie combination win a ranking on scaling it does not deliver, then bills both cards for
+# the longer wall time. each constant is set to its own measured per-card efficiency.
+MULTI_CARD_SCALING_NVLINK = 0.88
+MULTI_CARD_SCALING_PCIE = 0.71
 
 
-def multi_card_speedup(gpu_count: int) -> float:
-    """Throughput multiplier for sharding the gpu-bound half of a step over ``gpu_count`` cards."""
+def multi_card_scaling(gpu: str) -> float:
+    """Realized fraction of linear scaling per added card of class ``gpu``."""
+    return MULTI_CARD_SCALING_NVLINK if has_nvlink(gpu) else MULTI_CARD_SCALING_PCIE
+
+
+def multi_card_speedup(gpu_count: int, gpu: str) -> float:
+    """Throughput multiplier for sharding the gpu-bound half of a step over ``gpu_count`` cards.
+
+    Both measurements are 2-card. Beyond that the geometric form is an extrapolation, and it errs
+    conservative by construction: real fabrics degrade faster than geometrically as the collective
+    fan-out grows, so this never credits a wide combination with more than it can deliver.
+
+    Clamped to be non-decreasing in ``gpu_count``. Below a scaling factor of ~0.72 the raw
+    geometric curve turns back down (at 0.71: 3 cards 1.512x but 4 cards 1.432x), which would model
+    a wider combination as SLOWER than a narrower one and let the allocator reject cards that do
+    add throughput. Adding a card cannot reduce aggregate throughput on any real fabric, so the
+    honest reading of the extrapolation is that scaling FLATTENS, not that it reverses.
+    """
     n = max(1, int(gpu_count))
-    return n * (MULTI_CARD_SCALING ** (n - 1))
+    scaling = multi_card_scaling(gpu)
+    return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
 
 
 def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
@@ -207,17 +244,16 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
-    # GRPO step = rollout (G completions/prompt) + concurrent reward grading + policy/ref update.
+    # GRPO step = rollout (G completions/prompt) + serial reward grading + policy/ref update.
     completions = n.batch_size * n.group_size
     gen_tokens = completions * n.completion_len
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * update_mfu)
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
-    reward_s = (
-        math.ceil(completions / REWARD_CONCURRENCY) * latency
-    )  # ceil: a partial wave still costs one latency
-    # reward grading runs off-gpu in concurrent waves, so like the opd teacher it is fixed wall time
-    # no card choice changes. a grpo step dominated by it is latency-bound, not compute-bound.
+    # every completion is scored, one at a time (see the serial-scoring note above).
+    reward_s = completions * latency
+    # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
+    # changes. a grpo step dominated by it is latency-bound, not compute-bound.
     return gen_s + update_s, overhead + reward_s
 
 

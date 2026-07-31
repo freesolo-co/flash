@@ -208,6 +208,42 @@ def _sampled_completion_scalar(sample: dict) -> tuple[str, float] | None:
     return None
 
 
+def _format_child_tail(tail: object, silent_ticks: object = None) -> str:
+    """Render a stalled worker's retained child output, or "" when there is none.
+
+    ``_format_heartbeat`` renders a fixed whitelist of scalar keys, so ``child_tail`` -- the verl
+    child's last words before it wedged (see ``verl_common.ChildOutputTail``) -- would otherwise be
+    carried all the way to the control plane and then dropped one step short of the log a human
+    reads. It survives in ``heartbeat.json`` and in the run's ``last_heartbeat``, but a stall is
+    diagnosed from the streamed log, so a tail nobody sees costs another paid attempt to learn
+    nothing.
+
+    ``silent_ticks`` rides the header for the same reason: a tail alone cannot tell slow from stuck,
+    and comparing two log lines by eye to find out is exactly the manual step the counter exists to
+    remove. It is rendered here rather than as a scalar because it describes this tail.
+
+    Non-string entries are skipped rather than coerced: this payload crosses a process boundary as
+    JSON, and a malformed one must not make the whole heartbeat line unrenderable.
+    """
+    if not isinstance(tail, list):
+        return ""
+    lines = [
+        f"    {neutralize_control_chars(line)}" for line in tail if isinstance(line, str) and line
+    ]
+    if not lines:
+        return ""
+    header = "\n  child output before the stall (most recent last)"
+    # bool is an int subclass, and a JSON payload can carry anything; a malformed counter drops the
+    # annotation rather than the tail it annotates.
+    if isinstance(silent_ticks, int) and not isinstance(silent_ticks, bool) and silent_ticks >= 0:
+        if silent_ticks == 0:
+            header += ", still producing output"
+        else:
+            plural = "" if silent_ticks == 1 else "s"
+            header += f", unchanged for {silent_ticks} tick{plural}"
+    return header + ":\n" + "\n".join(lines)
+
+
 def _format_heartbeat(hb: dict) -> str:
     msg = f"worker: stage={hb.get('stage')}"
     if hb.get("liveness"):
@@ -286,6 +322,7 @@ def _format_heartbeat(hb: dict) -> str:
             )
     if sample_lines:
         msg += "\n" + "\n".join(sample_lines)
+    msg += _format_child_tail(hb.get("child_tail"), hb.get("child_tail_silent_ticks"))
     return msg
 
 

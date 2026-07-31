@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import hashlib
 import http.client
@@ -28,25 +27,26 @@ from flash.engine.steps import (
 from flash.engine.structured_outputs import reasoning_parser_for
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.multiturn_glue import (
+    EnvGlueTokenizer,
+    dedup_seam_terminator,
+    validate_glue_template,
+    validate_transcript_messages,
+)
 from flash.engine.worker.opd import (
     _drop_fully_forced_groups,
     _resolve_opd_knobs,
     _thinking_prefill_text,
 )
 from flash.engine.worker.opd_gkd import (
-    _generation_eos_ids,
     _rollout_terminated,
     _teacher_prompt_text,
     _trim_trailing_stop,
+    generation_eos_from_cached_config,
     student_tokens_with_offsets,
 )
-from flash.engine.worker.opd_verl_multiturn import (
-    EnvGlueTokenizer,
-    _dedup_seam_terminator,
-    validate_glue_template,
-    validate_teacher_messages,
-)
-from flash.engine.worker.sft_verl import (
+from flash.engine.worker.rng import seed_training_rngs
+from flash.engine.worker.sft_train import (
     _build_verl_child_env,
     _cached_model_path,
     _durable_required_save_steps,
@@ -67,19 +67,23 @@ from flash.engine.worker.tokenizer_align import (
     groupwise_coverage,
 )
 from flash.engine.worker.verl_common import (
+    ChildOutputTail,
+    ChildTailStaleness,
     agent_loop_workers,
     clamp_engine_len,
     latest_global_step_dir,
     model_max_position_embeddings,
+    parse_verl_metric,
     parse_wandb_link,
     render_wandb_link_shim,
+    resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
+    stall_tail_fields,
 )
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resume_state_metadata
 
 _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
-_VERL_METRIC_RE = re.compile(r"(?:^| - )(?P<name>[^:]+):(?P<value>[^ ]+)")
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 _TEXT_TEACHER_BATCH_SIZE = 8
@@ -868,7 +872,7 @@ class _TeacherAlignmentBridge:
         prompt_ids = [int(token_id) for token_id in prompt_ids]
         if prompt_ids != list(prompt.prompt_ids):
             raise ValueError("multi-turn rollout prompt ids do not match the frozen flash prompt")
-        raw_prompt = validate_teacher_messages(raw_prompt, source="child initial prompt")
+        raw_prompt = validate_transcript_messages(raw_prompt, source="child initial prompt")
         if raw_prompt != prompt.student_messages:
             raise ValueError("multi-turn child prompt does not match the frozen environment prompt")
         session_id = self._validate_session_id(session_id)
@@ -891,7 +895,7 @@ class _TeacherAlignmentBridge:
             with self._env_lock:
                 state = self.active_env.new_rollout_state(prompt.example)
                 initial_messages = state.get("prompt") or state.get("messages")
-                initial_messages = validate_teacher_messages(
+                initial_messages = validate_transcript_messages(
                     initial_messages, source="environment initial prompt"
                 )
             if initial_messages != prompt.student_messages:
@@ -1028,7 +1032,7 @@ class _TeacherAlignmentBridge:
                 )
             if not terminal:
                 messages = self.active_env.env_reply(session["messages"], state)
-                messages = validate_teacher_messages(messages, source="environment reply")
+                messages = validate_transcript_messages(messages, source="environment reply")
                 session["messages"].extend(messages)
                 # the env's reply may itself end the episode (rollout_done consults the updated
                 # state); recheck before gluing a next-turn prompt no model turn will answer.
@@ -1038,7 +1042,7 @@ class _TeacherAlignmentBridge:
                 if not terminal:
                     assert self._env_glue is not None
                     next_prefix.extend(
-                        _dedup_seam_terminator(response_ids, self._env_glue(messages))
+                        dedup_seam_terminator(response_ids, self._env_glue(messages))
                     )
             step_response = {"messages": messages, "terminal": bool(terminal)}
             session["terminal"] = bool(terminal)
@@ -1447,11 +1451,11 @@ _REQUIRED_OVERRIDE_KEYS = (
 )
 
 
-def build_opd_verl_overrides(config: dict) -> list[str]:
+def build_opd_overrides(config: dict) -> list[str]:
     """Render the exact verl 0.8.0 synchronous PPO and distillation config surface."""
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in config]
     if missing:
-        raise KeyError(f"build_opd_verl_overrides missing required config keys: {missing}")
+        raise KeyError(f"build_opd_overrides missing required config keys: {missing}")
     # the full sequence length the engine is sized for. the caller derives max_prompt_length by
     # carving max_response_length out of this same value, so the token budget, the prompt filter,
     # and the engine always agree.
@@ -1476,6 +1480,17 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         # "seed" entry, so it wins. `++` because the sub-key is absent from the composed node.
         # per-request sampling is seeded separately by the plugin's deterministic_rollout_seed.
         f"++actor_rollout_ref.rollout.engine_kwargs.vllm.seed={_hydra_val(config.get('seed', 42))}",
+        # fp8 kv cache, exactly as the deleted trl colocate engine reserved it (it set
+        # kv_cache_dtype="fp8" on cc >= 8.9) and as rl_verl.py does for grpo. this is not an
+        # optimization: flash/engine/vram.py sizes an opd run against an fp8 kv pool once the
+        # requirement clears the largest non-fp8 card, so a bf16 cache here would allocate twice the
+        # kv the allocator reserved and OOM at rollout init on a card sizing called sufficient.
+        # the caller resolves the flag (cc probe + gdn exclusion); absent/false means bf16.
+        *(
+            ["+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8"]
+            if config.get("fp8_kv")
+            else []
+        ),
         "data.dataloader_num_workers=0",
         "data.image_key=images",
         "data.return_raw_chat=true",
@@ -1551,7 +1566,7 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
         "critic.enable=false",
         "reward.reward_model.enable=false",
-        "distillation._target_=flash_opd_verl_plugin.FlashRemoteDistillationConfig",
+        "distillation._target_=flash_opd_plugin.FlashRemoteDistillationConfig",
         "distillation.enabled=true",
         "distillation.n_gpus_per_node=0",
         "distillation.nnodes=0",
@@ -1650,7 +1665,7 @@ def _build_opd_child_env(
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
         {
-            "VERL_USE_EXTERNAL_MODULES": "flash_opd_verl_plugin",
+            "VERL_USE_EXTERNAL_MODULES": "flash_opd_plugin",
             "FLASH_OPD_BRIDGE_URL": bridge_url,
             "FLASH_OPD_BRIDGE_TOKEN": bridge_token,
             "FLASH_OPD_SEED": str(int(seed)),
@@ -1719,17 +1734,6 @@ def _write_opd_parquet(rows: list[dict], path: str) -> None:
 
     features = _opd_multimodal_parquet_features() if any("images" in row for row in rows) else None
     Dataset.from_list(rows, features=features).to_parquet(path)
-
-
-def _metric_value(line: str, name: str) -> float | None:
-    for match in _VERL_METRIC_RE.finditer(line):
-        if match.group("name").strip() != name:
-            continue
-        try:
-            return float(match.group("value"))
-        except ValueError:
-            return None
-    return None
 
 
 # the verl bridge stores the empty-alignment skip under its own internal key,
@@ -2047,26 +2051,7 @@ def _processed_resume_steps(
     return processed
 
 
-def _generation_eos_from_cached_config(model_id: str, model_revision: str, tokenizer) -> frozenset[int]:
-    from transformers import AutoConfig, GenerationConfig
-
-    config = AutoConfig.from_pretrained(
-        model_id, trust_remote_code=True, revision=model_revision or None, local_files_only=True
-    )
-    generation_config = None
-    with contextlib.suppress(OSError):
-        generation_config = GenerationConfig.from_pretrained(
-            model_id, revision=model_revision or None, local_files_only=True
-        )
-    model_like = type(
-        "ModelGenerationMetadata",
-        (),
-        {"config": config, "generation_config": generation_config},
-    )()
-    return _generation_eos_ids(model_like, tokenizer)
-
-
-def run_opd_verl(spec=None) -> None:
+def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
     from flash.engine.worker.teacher import TeacherClient
     from flash.multimodal import (
@@ -2106,9 +2091,9 @@ def run_opd_verl(spec=None) -> None:
         )
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
-    from flash.opd_verl_validation import validate_opd_verl_structured_outputs
+    from flash.opd_validation import validate_opd_structured_outputs
 
-    structured_validation = validate_opd_verl_structured_outputs(
+    structured_validation = validate_opd_structured_outputs(
         knobs.structured_outputs,
         model_id=model_id,
         model_revision=model_revision,
@@ -2117,6 +2102,12 @@ def run_opd_verl(spec=None) -> None:
     )
     structured_outputs = structured_validation.constraint
     model_vocab_size = structured_validation.model_vocab_size
+    # the child trainer is seeded through its own config, but the environment's dataset /
+    # prompt_messages calls run HERE in the parent. an unseeded parent can build a different prompt
+    # pool across attempts, whose fingerprint then rejects a valid resume checkpoint. seed just
+    # before the first env call that can consume randomness, so the cheap fail-closed guards above
+    # still raise without paying for the torch import.
+    seed_training_rngs(_w.SEED)
     train = list(env.dataset())
     if not train:
         raise RuntimeError("opd environment dataset is empty")
@@ -2148,7 +2139,6 @@ def run_opd_verl(spec=None) -> None:
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
     processor = None
     if multimodal:
@@ -2165,7 +2155,6 @@ def run_opd_verl(spec=None) -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     thinking_prefill = _thinking_prefill_text(tokenizer)
-    eos_token_ids = _generation_eos_from_cached_config(model_id, model_revision, tokenizer)
     requested_len = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
     # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
     # clamping only the engine would admit prompts sized against the unclamped budget and then fail
@@ -2195,7 +2184,7 @@ def run_opd_verl(spec=None) -> None:
             _prepped[0] += 1
             messages = env.prompt_messages(example)
             if multi_turn:
-                messages = validate_teacher_messages(messages, source="environment initial prompt")
+                messages = validate_transcript_messages(messages, source="environment initial prompt")
             if record_has_images(example, messages):
                 assert processor is not None
                 normalized = normalize_prompt_images(example, messages, package_root)
@@ -2250,6 +2239,13 @@ def run_opd_verl(spec=None) -> None:
             )
     if not prompts:
         raise RuntimeError("every OPD prompt exceeds the configured prompt budget")
+    # weights come AFTER the budget filter: a dataset whose every prompt is over budget is a
+    # deterministic input error, and downloading tens of GB before raising it burns paid worker
+    # minutes for a verdict the tokenizer already had. the tokenizer/processor/config loads above
+    # fetch kilobytes, not weights, so they are cheap to run first.
+    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
+    # reads the snapshot with local_files_only, so it has to follow the prefetch.
+    eos_token_ids = generation_eos_from_cached_config(model_id, model_revision, tokenizer)
     prompts_per_step = min(knobs.prompts_per_step, len(prompts))
     derived_steps = on_policy_steps(
         epochs=knobs.epochs,
@@ -2321,31 +2317,51 @@ def run_opd_verl(spec=None) -> None:
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
     warmstart_adapter = _warmstart_adapter_path(model_id, model_revision, lora_rank)
-    python_bin = resolve_verl_python(workdir)
+    python_bin = resolve_verl_python(workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY")))
     model_path = _cached_model_path(model_id, model_revision)
     gpu_count = int(getattr(spec.gpu, "count", 1) or 1)
     save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else knobs.save_every
-    loggers = ["console"]
-    if os.environ.get("WANDB_API_KEY"):
-        loggers.append("wandb")
+    # verl logs from python_bin, so gate wandb on THAT interpreter (see resolve_verl_loggers).
+    loggers = resolve_verl_loggers(python_bin)
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
+    # fp8 kv cache on ada/hopper+ (cc >= 8.9), matching rl_verl's grpo gate -- but NOT for hybrid
+    # linear-attention (gdn) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a plain kv
+    # tensor and crashes on the hybrid cache under verl's sleep/wake, which opd leaves enabled.
+    # the vram estimator applies an fp8 discount to opd above the non-fp8 card ceiling, so this must
+    # stay in lockstep with it: bf16 here against an fp8-sized reservation OOMs at rollout init.
+    try:
+        import torch as _torch_cc
 
-    plugin_path = os.path.join(shim_dir, "flash_opd_verl_plugin.py")
-    shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_verl_plugin.py"), plugin_path)
-    structured_helper_path = os.path.join(shim_dir, "flash_opd_verl_structured.py")
+        from flash.engine.worker.packing import model_is_gdn_hybrid
+
+        _cc_ok = bool(
+            _torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9)
+        )
+        fp8_kv = _cc_ok and not model_is_gdn_hybrid(model_id, revision=model_revision)
+    except Exception:  # no cuda / probe failure -> conservative bf16 kv
+        fp8_kv = False
+
+    plugin_path = os.path.join(shim_dir, "flash_opd_plugin.py")
+    shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_plugin.py"), plugin_path)
+    structured_helper_path = os.path.join(shim_dir, "flash_opd_structured.py")
     shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "opd_verl_structured.py"),
+        os.path.join(os.path.dirname(__file__), "opd_structured.py"),
         structured_helper_path,
     )
-    multiturn_helper_path = os.path.join(shim_dir, "flash_opd_verl_multiturn.py")
+    multiturn_helper_path = os.path.join(shim_dir, "flash_opd_multiturn.py")
     shutil.copy2(
-        os.path.join(os.path.dirname(__file__), "opd_verl_multiturn.py"),
+        os.path.join(os.path.dirname(__file__), "opd_multiturn.py"),
         multiturn_helper_path,
     )
-    entry_path = os.path.join(shim_dir, "flash_opd_verl_entry.py")
+    glue_helper_path = os.path.join(shim_dir, "flash_multiturn_glue.py")
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), "multiturn_glue.py"),
+        glue_helper_path,
+    )
+    entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
     with open(entry_path, "w", encoding="utf-8") as file:
-        file.write("import verl\nfrom flash_opd_verl_plugin import main\nmain()\n")
+        file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
     opd_shim_source = _render_opd_sitecustomize(
         save_at_steps=knobs.save_at_steps,
         total_steps=update_horizon,
@@ -2412,9 +2428,10 @@ def run_opd_verl(spec=None) -> None:
             "multi_turn": multi_turn,
             "thinking": bool(_w.THINKING),
             "structured_outputs": structured_outputs,
+            "fp8_kv": fp8_kv,
             "loggers": loggers,
         }
-        overrides = build_opd_verl_overrides(config)
+        overrides = build_opd_overrides(config)
         progress_state = _OpdProgressState(resume_state)
         watcher = _OpdVerlCheckpointWatcher(
             local_dir=local_dir,
@@ -2464,9 +2481,15 @@ def run_opd_verl(spec=None) -> None:
             step_match = _VERL_STEP_RE.search(line)
             if step_match is None:
                 return
-            loss = _metric_value(line, "actor/distillation/loss")
+            # parse_verl_metric, not a local float(): verl aggregates this metric with
+            # Metric(SUM) -> np.sum (verl/utils/metric/utils.py), and LocalLogger renders it
+            # through pprint, so under the image's numpy 2.2.6 it prints as
+            # "np.float64(0.64)". a bare float() raises on that spelling, dropping every step
+            # and leaving loss_curve empty -- which the publish guard below turns into a hard
+            # failure on a run that actually trained.
+            loss = parse_verl_metric(line, "actor/distillation/loss")
             if loss is None:
-                loss = _metric_value(line, "distillation/loss")
+                loss = parse_verl_metric(line, "distillation/loss")
             if loss is None:
                 # verl emits step-tagged lines that are not metric summaries (timers, val lines);
                 # skip those rather than killing the run. the end-of-run guard still fails loud
@@ -2486,6 +2509,16 @@ def run_opd_verl(spec=None) -> None:
         def child_heartbeat() -> None:
             _w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
 
+        child_tail = ChildOutputTail()
+        # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside
+        # the per-tick callback.
+        tail_staleness = ChildTailStaleness()
+
+        def liveness_fields() -> dict[str, object]:
+            return stall_tail_fields(
+                int(progress["step"] or 0), child_tail, staleness=tail_staleness
+            )
+
         gpu_sampler = _NvidiaSmiPeakSampler().start()
         train_started_at = time.time()
         return_code = 0
@@ -2498,6 +2531,7 @@ def run_opd_verl(spec=None) -> None:
                     "opd_step",
                     progress=lambda: int(progress["step"] or 0),
                     progress_step=True,
+                    fields=liveness_fields,
                 ):
                     return_code = run_verl_training(
                         command,
@@ -2505,6 +2539,7 @@ def run_opd_verl(spec=None) -> None:
                         on_step=on_step,
                         on_line=on_line,
                         heartbeat=child_heartbeat,
+                        tail=child_tail,
                     )
                     training_completed = return_code == 0
         finally:

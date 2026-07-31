@@ -373,10 +373,27 @@ def test_adapter_provenance_is_stamped_and_conflicts_fail(monkeypatch):
 
 
 def test_opd_model_revision_is_keyword_only():
-    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+    # a pinned revision must never be positional: model_id and model_revision are adjacent strings,
+    # so a positional call that transposes them silently loads the wrong commit and breaks the
+    # controlled comparison this file exists to protect. the guard moved from trl's rollout engine
+    # (OpdVllmRolloutEngine, deleted) to the verl checkpoint watcher, which is what carries the
+    # revision through opd now -- it re-exports each checkpoint adapter under that pin.
+    from flash.engine.worker.opd_train import _OpdVerlCheckpointWatcher
+    from flash.engine.worker.sft_train import _VerlCheckpointWatcher
 
-    parameter = inspect.signature(OpdVllmRolloutEngine).parameters["model_revision"]
-    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    # the opd subclass forwards **kwargs, so the binding it inherits is what has to be keyword-only.
+    assert issubclass(_OpdVerlCheckpointWatcher, _VerlCheckpointWatcher)
+    parameters = inspect.signature(_VerlCheckpointWatcher.__init__).parameters
+    assert parameters["model_revision"].kind is inspect.Parameter.KEYWORD_ONLY
+    # model_id sits next to it and is equally transposable.
+    assert parameters["model_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    # and the subclass must not reintroduce a positional path around the base.
+    opd_parameters = inspect.signature(_OpdVerlCheckpointWatcher.__init__).parameters
+    assert all(
+        parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+        for name, parameter in opd_parameters.items()
+        if name != "self"
+    )
 
 
 def test_resolve_vocab_size_is_revision_aware_for_open_policy_model(monkeypatch, tmp_path):

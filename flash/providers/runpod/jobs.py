@@ -101,6 +101,18 @@ def weight_cache_grow_headroom_s() -> float:
 
     return WEIGHT_CACHE_GROW_BUDGET_S * max(1, rp_keys.key_count())
 
+
+# capacity grace on the LAST candidate class: there is nowhere left to walk, so wait longer before
+# giving up. purely a timing knob -- it says nothing about whether a retry follows, because
+# on_last_gpu (runner/lifecycle.py) is also true when the infra retry budget is exhausted.
+LAST_GPU_CAPACITY_GRACE_S = 900.0
+
+# how long ONE "a worker is coming up" health reading keeps suppressing the capacity timer. probes
+# run every 90s, so this absorbs a couple of missed or failed probes and no more: if health stops
+# being readable entirely, the capacity timer re-arms rather than waiting out the run on an
+# observation nobody can still confirm.
+WORKER_COMING_UP_TTL_S = 300.0
+
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
@@ -109,7 +121,7 @@ TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:
     """poll_job stall-window kwargs. queue/throttled grace is ~5 min normally, ~15 min on last GPU (nowhere left to walk)."""
-    grace = 900.0 if on_last_gpu else 300.0
+    grace = LAST_GPU_CAPACITY_GRACE_S if on_last_gpu else 300.0
     return {
         "stall_after_s": 1500.0,
         "setup_grace_s": 3000.0,
@@ -891,6 +903,12 @@ def poll_job(
     unhealthy_timer = GraceTimer()
     throttled_timer = GraceTimer()
     queued_timer = GraceTimer()
+    # a runpod job stays IN_QUEUE for the whole worker cold start, image pull included, so the
+    # queue timer alone cannot tell "runpod never gave us the gpu" from "the gpu arrived and we
+    # are still pulling a multi-GB image". the unhealthy/throttled timers below already refuse to
+    # fire while a worker is initializing or usable; carry that same observation forward so the
+    # capacity timer gets it too, and a heavy image can never self-report as no_capacity.
+    worker_coming_up_at: float | None = None
     while True:
         if absolute_deadline is not None and time.time() >= absolute_deadline:
             return PollResult(False, failure="stalled", detail="run wall deadline exceeded")
@@ -953,12 +971,16 @@ def poll_job(
                 detail=f"[{status}] {detail}",
             )
         now = time.time()
-        if queued_timer.expired(status == "IN_QUEUE", now, queue_grace_s):
+        coming_up = (
+            worker_coming_up_at is not None
+            and (now - worker_coming_up_at) <= WORKER_COMING_UP_TTL_S
+        )
+        if queued_timer.expired(status == "IN_QUEUE" and not coming_up, now, queue_grace_s):
             return PollResult(
                 False,
                 failure="no_capacity",
                 detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
-                "(no RunPod capacity for the pinned GPU class); retrying on the next-best GPU",
+                "(no RunPod capacity for the pinned GPU class)",
             )
         if status != "IN_QUEUE":
             # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
@@ -979,6 +1001,11 @@ def poll_job(
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
                 recovering = workers.get("initializing")
+                # runpod granted the gpu the moment a worker is initializing or usable, so from
+                # here on the wait is startup, not capacity starvation. stamped rather than a bare
+                # flag: a probe that starts failing must not leave a stale True suppressing the
+                # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
+                worker_coming_up_at = now if (usable or recovering) else None
                 if (
                     any(workers.get(k) for k in ("throttled", "unhealthy", "initializing"))
                     or not usable
@@ -1005,8 +1032,8 @@ def poll_job(
                         False,
                         failure="no_capacity",
                         detail=f"never scheduled: worker stuck THROTTLED for "
-                        f"{int(now - throttled_timer.since)}s while IN_QUEUE (no RunPod "
-                        f"capacity for the pinned GPU class); retrying on the next-best GPU",
+                        f"{int(now - throttled_timer.since)}s while IN_QUEUE "
+                        f"(no RunPod capacity for the pinned GPU class)",
                     )
             except Exception:
                 pass

@@ -17,7 +17,7 @@ from __future__ import annotations
 import pathlib
 from dataclasses import fields
 
-import flash.engine.worker.sft as sft_mod
+import flash.engine.worker.sft_train as sft_train_mod
 from flash.engine.recipe import RECIPE
 from flash.spec import JobSpec, TrainSpec
 
@@ -31,13 +31,13 @@ def test_trainspec_exposes_max_context_tokens_and_not_the_stale_max_length():
 
 
 def test_sft_worker_reads_max_context_tokens_not_max_length():
-    # The worker resolves sft_max_len via `_train_opt("<key>", <recipe default>)`. The key MUST be a
+    # The worker resolves sft_max_len via `train_opt("<key>", <recipe default>)`. The key MUST be a
     # real TrainSpec field, else getattr(_t, key, None) silently returns the recipe default — the
     # non-thinking 1024 hard-cap that dropped every row of a >1024-token-prompt dataset. Compared
     # whitespace-insensitively so the multi-line call formatting doesn't matter.
-    src = "".join(pathlib.Path(sft_mod.__file__).read_text().split())
-    assert '_train_opt("max_context_tokens"' in src
-    assert '_train_opt("max_length"' not in src
+    src = "".join(pathlib.Path(sft_train_mod.__file__).read_text().split())
+    assert 'train_opt("max_context_tokens"' in src
+    assert 'train_opt("max_length"' not in src
 
 
 def test_sft_context_length_matches_cost_preflight_resolution():

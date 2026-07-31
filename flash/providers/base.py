@@ -142,7 +142,7 @@ KNOWN = tuple(GPU_INFO)
 VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
 
 # fp8 KV cache is an Ada/Hopper/Blackwell feature; the training workers enable it exactly when the
-# device compute capability is >= (8, 9) (see engine/worker/opd_vllm.py, grpo.py, rl.py). Sizing has
+# device compute capability is >= (8, 9) (see engine/worker/rl_verl.py and opd_train.py). Sizing has
 # no live device, so it infers fp8 support from a candidate class's ``sm`` string.
 _FP8_KV_MIN_CAPABILITY = (8, 9)
 
