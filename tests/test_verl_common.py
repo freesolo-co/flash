@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import pathlib
 import time
 from types import SimpleNamespace
 
@@ -185,6 +186,31 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     # the stamp is written only after a successful install, so a crashed install is never reused.
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_REQUIREMENT
+
+
+def test_the_fallback_install_overrides_the_three_ceilings_it_violates(monkeypatch, tmp_path):
+    """The pin set is deliberately unsatisfiable against declared metadata, so it needs --override.
+
+    A bare `vllm==0.19.1` on the command line is a CONSTRAINT, not an override: the resolver must
+    still satisfy verl[vllm]'s declared `vllm<=0.12.0` alongside it, so the pair is unsatisfiable
+    and the install fails outright rather than picking the pin. Only `--override` makes uv ignore
+    the declaration. Dockerfile.worker:253-258 records the same three violations and the same fix
+    (codex[bot]).
+    """
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    install = calls[1]
+    assert "--override" in install
+    override_file = install[install.index("--override") + 1]
+    written = pathlib.Path(override_file).read_text()
+    # all three are required: dropping any one leaves the set unsatisfiable.
+    assert "vllm==0.19.1" in written  # verl[vllm] declares <=0.12.0
+    assert "numpy==2.2.6" in written  # verl + transferqueue declare numpy<2.0.0
+    assert "xgrammar==0.1.25" in written  # vllm declares xgrammar>=0.1.32
 
 
 def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch, tmp_path):

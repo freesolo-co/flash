@@ -262,8 +262,12 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # ensurepip is not available"). --seed puts pip in the venv anyway. uv itself is already in the base
 # image at /usr/local/bin/uv.
 #
-# Two pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
-# PyExtensionType) and TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()).
+# Three pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
+# PyExtensionType), TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()),
+# and wandb (also absent from verl's setup.py). verl calls wandb.init from THIS interpreter, not
+# flash's, so a job that sets WANDB_API_KEY loses its curves and run link unless wandb is importable
+# in here; resolve_verl_loggers() degrades to console when it is not, which is the right behaviour
+# for a foreign FLASH_VERL_PYTHON but silently drops W&B on the default image (codex[bot]).
 ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-overrides.txt \
@@ -277,6 +281,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-o
         "datasets>=4.7,<6" \
         "TransferQueue==0.1.7" \
         liger-kernel "bitsandbytes>=0.49" qwen-vl-utils \
+        "wandb>=0.17" \
     && rm -f /tmp/verl-overrides.txt \
     && uv cache clean
 

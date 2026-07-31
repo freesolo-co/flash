@@ -148,6 +148,17 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
         # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
         subprocess.run(["uv", "venv", venv], check=True)
+        # the SAME three overrides Dockerfile.worker writes, for the same reason: this pin set
+        # deliberately violates three declared ceilings, and a bare pin cannot break any of them --
+        # a pin is a constraint the resolver must satisfy alongside the declaration, so the pair is
+        # simply unsatisfiable and the install fails outright. only --override makes uv IGNORE the
+        # declaration. all three lines are required; dropping any one leaves the set unsatisfiable:
+        #   verl + transferqueue declare numpy<2.0.0  -> vllm 0.19.1 needs numpy>=2
+        #   verl[vllm] declares vllm>=0.8.5,<=0.12.0  -> flash needs 0.19.1 for the Qwen3.5 archs
+        #   vllm declares xgrammar>=0.1.32            -> structured opd gates on EXACTLY 0.1.25
+        overrides = os.path.join(workdir, "verl-overrides.txt")
+        with open(overrides, "w") as f:
+            f.write("numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n")
         subprocess.run(
             [
                 "uv",
@@ -155,13 +166,14 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "install",
                 "--python",
                 py,
+                "--override",
+                overrides,
                 # the [vllm] extra, matching Dockerfile.worker's VERL_SPEC. verl's bare
                 # install_requires omits vllm, and every entrypoint flash launches needs it:
-                # main_ppo/main_ppo_sync set rollout.name=vllm. the extra's own ceiling is
-                # vllm<=0.12.0, so the exact pin below overrides it the same way the image's
-                # --override file does -- flash needs 0.19.1 for the Qwen3.5 archs.
+                # main_ppo/main_ppo_sync set rollout.name=vllm.
                 f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
                 "vllm==0.19.1",
+                "numpy==2.2.6",
                 # NOT transitively guaranteed: verl imports these at MODULE level on the launch path
                 # (main_ppo -> ppo.ray_trainer -> rollout.llm_server imports cachetools, and
                 # rollout.utils imports uvicorn + fastapi), yet declares none of them. vllm happens
