@@ -1012,6 +1012,25 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     assert (tmp_path / "environment.py").is_file()
+    evaluations = tmp_path / "evaluations.py"
+    assert evaluations.is_file()
+    evaluations_text = evaluations.read_text()
+    assert "load_evaluations(environment=None)" in evaluations_text
+    assert "self.environment.reward(response, example)" in evaluations_text
+    assert "flash env eval TARGET ." in evaluations_text
+
+    class StarterEnvironment:
+        def reward(self, response, example):
+            assert response == "12"
+            assert example["output"] == "12"
+            return 0.75
+
+    from flash.envs.evaluations import load_evaluation_suites
+
+    starter_suite = load_evaluation_suites(tmp_path, environment=StarterEnvironment())[0]
+    starter_case = starter_suite.cases()[0]
+    assert starter_suite.score(starter_case, "12") == 0.75
+
     dataset = tmp_path / "dataset/train.jsonl"
     assert dataset.is_file()
     assert not (tmp_path / "datasets").exists()
@@ -1071,10 +1090,21 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "runpod" not in training_text.lower()
     assert "lambda" not in training_text.lower()
     out = capsys.readouterr().out
+    assert "evaluations.py" in out
     assert "dataset/train.jsonl" in out
     assert "configs/rl.toml" in out
     assert "configs/opd.toml" in out
     assert "TRAINING.md" in out
+
+
+def test_env_setup_does_not_overwrite_existing_evaluations(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    existing = tmp_path / "evaluations.py"
+    existing.write_text("# keep this evaluation sidecar\n")
+
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
+
+    assert existing.read_text() == "# keep this evaluation sidecar\n"
 
 
 def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path, capsys) -> None:
@@ -1090,6 +1120,9 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
 
     env_py = (tmp_path / "environment.py").read_text()
     assert "EnvironmentMultiTurn" in env_py  # genuinely a multi-turn scaffold
+    evaluations_text = (tmp_path / "evaluations.py").read_text()
+    assert "load_evaluations(environment=None)" in evaluations_text
+    assert "self.environment.reward(response, example)" in evaluations_text
     # the docstring documents all three algorithms train off the multi-turn env (no opd carve-out)
     assert "distils EVERY assistant turn" in env_py
     assert "single-turn only" not in env_py

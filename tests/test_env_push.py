@@ -104,6 +104,7 @@ def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path
         "import helper\n\ndef load_environment(**k):\n    return helper.build()\n"
     )
     (env_dir / "helper.py").write_text("def build():\n    return None\n")
+    (env_dir / "evaluations.py").write_text("EVALUATIONS = []\n")
     (env_dir / "dataset").mkdir()
     (env_dir / "dataset" / "train.jsonl").write_text('{"input":"2+2","output":"4"}\n')
     cap: dict = {}
@@ -113,6 +114,7 @@ def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path
     files = _members(cap["package_b64"])
     assert "environment.py" in files
     assert "helper.py" in files
+    assert "evaluations.py" in files
     assert "dataset/train.jsonl" in files
     assert cap["name"] == "math"
 

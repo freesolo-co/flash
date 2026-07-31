@@ -8,6 +8,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+from flash.envs.evaluations import _DEFAULT_EVALUATIONS_PATH
+
 from . import render, traces
 from .training_doc import TRAINING_MD
 
@@ -73,6 +75,39 @@ _STARTER_DATASET_JSONL = """\
 {"input":"What is 2 + 2?","output":"4"}
 {"input":"What is 3 + 5?","output":"8"}
 """
+
+_STARTER_EVALUATIONS_PY = '''\
+"""Held-out checks for this environment.
+
+Run them against a deployed model with `flash env eval TARGET .`. This file is
+published beside environment.py by `flash env push --project PROJECT_UUID --name my-env .`.
+"""
+
+from __future__ import annotations
+
+from flash.envs.evaluations import BaseEvalSuite, EvalCase
+
+
+class StarterEvaluationSuite(BaseEvalSuite):
+    name = "starter"
+
+    def __init__(self, environment=None):
+        self.environment = environment
+
+    def cases(self):
+        return [EvalCase(id="addition", input="What is 7 + 5?", expected="12")]
+
+    def score(self, case, response):
+        if self.environment is None:
+            return super().score(case, response)
+        example = dict(case.metadata or {})
+        example.update(input=case.input, output=case.expected)
+        return self.environment.reward(response, example)
+
+
+def load_evaluations(environment=None):
+    return [StarterEvaluationSuite(environment)]
+'''
 
 
 _STARTER_ENV_MULTITURN_PY = '''\
@@ -348,6 +383,7 @@ def cmd_env_setup(args) -> int:
     project_id = _require_setup_project(args)
     _validate_existing_config_projects(project_id)
     starter_env = Path("environment.py")
+    starter_evaluations = Path(_DEFAULT_EVALUATIONS_PATH)
     dataset = Path("dataset/train.jsonl")
     # trace import is optional and can only read the selected project. an existing dataset is never
     # overwritten, so importing into it would be a silently discarded download.
@@ -438,6 +474,8 @@ def cmd_env_setup(args) -> int:
     )
     if not starter_env.exists():
         starter_env.write_text(env_py)
+    if not starter_evaluations.exists():
+        starter_evaluations.write_text(_STARTER_EVALUATIONS_PY.replace("PROJECT_UUID", project_id))
     project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
         "# Environment: upload this project folder with\n"
@@ -537,6 +575,7 @@ def cmd_env_setup(args) -> int:
         )
     scaffolded = [
         "environment.py",
+        _DEFAULT_EVALUATIONS_PATH,
         "dataset/train.jsonl",
         "configs/sft.toml",
         "configs/rl.toml",
