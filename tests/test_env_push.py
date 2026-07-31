@@ -141,12 +141,19 @@ def test_push_single_py_module_carries_lazily_imported_evaluation_helpers(monkey
     assert "unrelated.py" not in files
 
 
-def test_push_single_py_module_carries_an_imported_sibling_package(monkeypatch, tmp_path):
+@pytest.mark.parametrize("namespace", [False, True], ids=["regular-package", "namespace-package"])
+def test_push_single_py_module_carries_an_imported_sibling_package(
+    monkeypatch, tmp_path, namespace: bool
+):
     """`from graders.rules import score` ships the graders/ package, not just graders.py.
 
     Local loading succeeds because the environment directory stays on sys.path, so every offline
     check passes. Matching only the `<name>.py` spelling published an environment whose sidecar
     raises ModuleNotFoundError the first time it grades a case.
+
+    `__init__.py` is not what makes it a package: under PEP 420 a bare directory imports the same
+    way, so requiring the marker file dropped exactly the helper the sidecar needs while every
+    local check still passed (codex[bot]).
     """
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
@@ -155,9 +162,10 @@ def test_push_single_py_module_carries_an_imported_sibling_package(monkeypatch, 
     )
     graders = tmp_path / "graders"
     (graders / "nested").mkdir(parents=True)
-    (graders / "__init__.py").write_text("")
+    if not namespace:
+        (graders / "__init__.py").write_text("")
+        (graders / "nested" / "__init__.py").write_text("")
     (graders / "rules.py").write_text("def score(value): return True\n")
-    (graders / "nested" / "__init__.py").write_text("")
     (graders / "nested" / "deep.py").write_text("THRESHOLD = 0.5\n")
     unused = tmp_path / "unused_pkg"
     unused.mkdir()
@@ -167,10 +175,11 @@ def test_push_single_py_module_carries_an_imported_sibling_package(monkeypatch, 
 
     assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
     files = _members(cap["package_b64"])
-    assert "graders/__init__.py" in files
     assert "graders/rules.py" in files
     # the whole package tree ships: a subpackage the imported module itself uses is part of it.
     assert "graders/nested/deep.py" in files
+    if not namespace:
+        assert "graders/__init__.py" in files
     # but an unimported sibling package still must not turn this into a whole-dir push.
     assert "unused_pkg/__init__.py" not in files
 
