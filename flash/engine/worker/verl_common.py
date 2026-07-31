@@ -270,9 +270,20 @@ def export_peft_adapter(
     merge_env["TRANSFORMERS_OFFLINE"] = "1"
     merge_env["HF_HUB_DISABLE_XET"] = "1"
     subprocess.run(
-        [python_bin, "-m", "verl.model_merger", "merge", "--backend", "fsdp",
-         "--local_dir", ckpt_actor_dir, "--target_dir", merge_out],
-        check=True, env=merge_env,
+        [
+            python_bin,
+            "-m",
+            "verl.model_merger",
+            "merge",
+            "--backend",
+            "fsdp",
+            "--local_dir",
+            ckpt_actor_dir,
+            "--target_dir",
+            merge_out,
+        ],
+        check=True,
+        env=merge_env,
     )
     lora_dir = os.path.join(merge_out, "lora_adapter")
     if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
@@ -498,16 +509,62 @@ def _process_is_zombie(pid: int) -> bool:
 
     field 3 of /proc/<pid>/stat is the state character, and it follows a comm field that may itself
     contain spaces and parentheses -- so it is read after the LAST `)`, not by splitting the line.
+
+    only DISAPPEARANCE proves an exit. every other error says this process could not look, not that
+    there is nothing there, and the two must not collapse: teardown can run with the worker out of
+    file descriptors, where opening /proc/<pid>/stat raises EMFILE for every live member at once.
+    reading that as a zombie made the whole group report drained, so SIGKILL was never sent and an
+    EngineCore kept its cuda context precisely on a resource-failure path (codex[bot]). so an
+    unreadable status counts as alive -- over-reporting costs a signal to a group that ignores it,
+    under-reporting strands the gpu.
     """
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
             stat = handle.read()
-    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-        # gone, or unreadable. either way there is nothing to wait for that this can prove.
-        return True
+    except (FileNotFoundError, ProcessLookupError):
+        return True  # gone, so there is nothing left to wait for
+    except OSError:
+        return False  # unreadable, which is not evidence of an exit
     _, _, tail = stat.rpartition(")")
     fields = tail.split()
     return bool(fields) and fields[0] == "Z"
+
+
+def _process_group_addressable(pgid: int) -> bool:
+    """true while the kernel still knows `pgid`, whether or not its members are running."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, this process just may not signal it
+    except OSError:
+        return False
+    return True
+
+
+def _reap_group_zombies(pgid: int, skip: int) -> None:
+    """wait on any group member this process has adopted, clearing its process-table entry.
+
+    `Dockerfile.worker` runs python as pid 1, so an EngineCore orphaned when the trainer exits is
+    reparented HERE. once SIGKILL turns it into a zombie no signal can clear it -- only a wait can --
+    and leaving it costs the reusable worker one permanent pid per failed or cancelled run, walking
+    it toward the pid limit (codex[bot]).
+
+    `skip` is the direct child, which `subprocess.Popen` reaps itself. waiting on it here would take
+    the exit status Popen is owed, leaving `returncode` unset for a caller that asks which signal
+    reaped it. everything else in the group is a grandchild this process never spawned, so nothing
+    else has a reaper to conflict with.
+
+    scoped to the group so it can only ever touch descendants of this teardown, and non-blocking so
+    a member that is merely still running costs nothing. `ChildProcessError` means the pid was never
+    ours, which is the ordinary case anywhere but pid 1.
+    """
+    for pid in _process_group_members(pgid) or ():
+        if pid == skip:
+            continue
+        with contextlib.suppress(ChildProcessError, PermissionError, OSError):
+            os.waitpid(pid, os.WNOHANG)
 
 
 def _process_group_alive(pgid: int) -> bool:
@@ -523,20 +580,25 @@ def _process_group_alive(pgid: int) -> bool:
     So the group is alive only while some member is not a zombie. Membership is read from /proc
     rather than tracked, since the survivors are grandchildren this process never spawned.
     """
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # it exists, this process just may not signal it
-    except OSError:
+    if not _process_group_addressable(pgid):
         return False
     members = _process_group_members(pgid)
     if members is None:
         # /proc could not be enumerated, so fall back to what signal 0 already established. it
         # over-reports rather than returning early on a live process still holding the gpu.
         return True
-    return any(not _process_is_zombie(pid) for pid in members)
+    if any(not _process_is_zombie(pid) for pid in members):
+        return True
+    if not members:
+        # the kernel just said this group exists and the walk found nobody in it. that contradiction
+        # is exactly what one snapshot cannot settle: /proc can be listed just before a fork
+        # publishes a new child, and the member that WAS there can exit inside the same window --
+        # leaving a child that inherited the group and never received the earlier signal, still
+        # holding the gpu (codex[bot]). so re-ask the kernel rather than trusting the walk: if the
+        # group has gone the walk was merely late, and if it is still addressable the walk missed a
+        # member.
+        return _process_group_addressable(pgid)
+    return False
 
 
 def _process_group_members(pgid: int) -> list[int] | None:
@@ -588,7 +650,9 @@ def kill_process_group(proc: subprocess.Popen) -> None:
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=_TEARDOWN_GRACE_S)
     while _process_group_alive(pgid) and time.monotonic() < deadline:
+        _reap_group_zombies(pgid, skip=proc.pid)
         time.sleep(0.1)
+    _reap_group_zombies(pgid, skip=proc.pid)
     if not _process_group_alive(pgid):
         return
 
@@ -601,7 +665,12 @@ def kill_process_group(proc: subprocess.Popen) -> None:
     # reaper that is not coming stays addressable and there is nothing stronger left to send.
     drain_deadline = time.monotonic() + _TEARDOWN_GRACE_S
     while _process_group_alive(pgid) and time.monotonic() < drain_deadline:
+        _reap_group_zombies(pgid, skip=proc.pid)
         time.sleep(0.1)
+    # last pass after the loop: a member killed on the final iteration becomes a zombie only once the
+    # kernel has posted its status, which can land after the check that ended the loop. without this
+    # the group drains but its process-table entry stays behind for the worker's whole lifetime.
+    _reap_group_zombies(pgid, skip=proc.pid)
 
 
 # --------------------------- w&b run link (all three verl backends) ---------------------------

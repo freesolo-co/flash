@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import builtins
 import contextlib
+import ctypes
+import errno
 import inspect
 import json
 import os
@@ -203,8 +206,12 @@ def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatc
     assert calls == []
 
 
-@pytest.mark.parametrize("stale", ["verl @ git+https://github.com/freesolo-co/verl@" + "0" * 40, None])
-def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(monkeypatch, tmp_path, stale):
+@pytest.mark.parametrize(
+    "stale", ["verl @ git+https://github.com/freesolo-co/verl@" + "0" * 40, None]
+)
+def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
+    monkeypatch, tmp_path, stale
+):
     # a retry reuses the pod workdir. a venv from an earlier pin (or a partial install, stamp=None)
     # must be rebuilt rather than silently training on the wrong verl.
     calls = []
@@ -261,9 +268,7 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
     assert commit == "b7492fa3b7ab843294d06dbf754e887950f559c7"
 
 
-def test_resolve_verl_python_installs_wandb_best_effort_when_requested(
-    monkeypatch, tmp_path
-):
+def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
     monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
@@ -576,10 +581,10 @@ def test_kill_process_group_reaps_a_grandchild_that_outlives_the_leader():
     leader_src = (
         "import subprocess, sys, time\n"
         "g = subprocess.Popen([sys.executable, '-c',\n"
-        "    \"import signal,time\\n\"\n"
-        "    \"signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n\"\n"
+        '    "import signal,time\\n"\n'
+        '    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"\n'
         "    \"print('gready', flush=True)\\n\"\n"
-        "    \"time.sleep(300)\\n\"], stdout=subprocess.PIPE, text=True)\n"
+        '    "time.sleep(300)\\n"], stdout=subprocess.PIPE, text=True)\n'
         "assert g.stdout.readline().strip() == 'gready'\n"
         "print(g.pid, flush=True)\n"
         "time.sleep(300)\n"
@@ -691,6 +696,124 @@ def test_teardown_returns_promptly_when_the_survivor_is_only_a_zombie():
     finally:
         with contextlib.suppress(ChildProcessError):
             os.waitpid(pid, 0)
+
+
+def test_an_unreadable_process_status_does_not_read_as_exited(monkeypatch):
+    # teardown can run with the worker out of file descriptors, where opening /proc/<pid>/stat
+    # raises EMFILE for every live member at once. reading that as a zombie made the whole group
+    # report drained, so SIGKILL was never sent and an EngineCore kept its cuda context precisely on
+    # a resource-failure path (codex[bot]). only disappearance proves an exit.
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+    )
+    try:
+        pgid = os.getpgid(child.pid)
+        assert not vc._process_is_zombie(child.pid), "a running pid is not a zombie"
+
+        real_open = builtins.open
+
+        def out_of_descriptors(path, *args, **kwargs):
+            if str(path).startswith("/proc/") and str(path).endswith("/stat"):
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", out_of_descriptors)
+        assert not vc._process_is_zombie(child.pid), "EMFILE is not evidence that the pid exited"
+        assert vc._process_group_alive(pgid), (
+            "a group whose members are merely unreadable must still be signalled"
+        )
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def test_a_missing_process_still_reads_as_exited():
+    # the other half of the same split: narrowing to disappearance is only correct if disappearance
+    # is still caught, or a group that really has drained would spin out both deadlines.
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=10)  # reaped by Popen, so the pid is fully gone rather than a zombie
+    assert vc._process_is_zombie(child.pid), "a reaped pid must not read as alive"
+
+
+def test_an_empty_group_snapshot_is_rechecked_against_the_kernel(monkeypatch):
+    # /proc can be listed just before a fork publishes a new child while the member that WAS there
+    # exits inside the same window, so one snapshot can show nobody in a group that still holds the
+    # gpu. teardown then returned before SIGKILL and the newly forked child -- which inherited the
+    # group and never received the earlier signal -- kept its cuda context (codex[bot]).
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+    )
+    try:
+        pgid = os.getpgid(child.pid)
+        monkeypatch.setattr(vc, "_process_group_members", lambda _pgid: [])
+        assert vc._process_group_alive(pgid), (
+            "an empty walk of a group the kernel still knows is a missed member, not a drain"
+        )
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def test_an_empty_snapshot_of_a_gone_group_is_still_drained():
+    # and the recheck must not make teardown unfailable: when the group is genuinely gone, the walk
+    # being empty has to stay an answer or every teardown burns both deadlines.
+    child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    pgid = os.getpgid(child.pid)
+    child.wait(timeout=10)
+    assert vc._process_group_members(pgid) == []
+    assert not vc._process_group_alive(pgid), (
+        "a group with no members and no kernel entry is drained"
+    )
+
+
+def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie():
+    # pid 1 has no init in Dockerfile.worker, so an EngineCore orphaned when the trainer exits is
+    # reparented onto the worker. SIGKILL turns it into a zombie that no signal can clear -- only a
+    # wait can -- so leaving it costs one permanent process-table entry per failed or cancelled run
+    # (codex[bot]). PR_SET_CHILD_SUBREAPER reproduces that adoption inside this test process.
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # pragma: no cover - PR_SET_CHILD_SUBREAPER is linux 3.4+
+        pytest.skip("PR_SET_CHILD_SUBREAPER unavailable")
+    leader_src = (
+        "import subprocess, sys, time\n"
+        "g = subprocess.Popen([sys.executable, '-c',\n"
+        '    "import signal,time\\n"\n'
+        '    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"\n'
+        "    \"print('gready', flush=True)\\n\"\n"
+        '    "time.sleep(300)\\n"], stdout=subprocess.PIPE, text=True)\n'
+        "assert g.stdout.readline().strip() == 'gready'\n"
+        "print(g.pid, flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    leader = subprocess.Popen(
+        [sys.executable, "-c", leader_src],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    grandchild_pid = None
+    try:
+        assert leader.stdout is not None
+        grandchild_pid = int(leader.stdout.readline().strip())
+        vc.kill_process_group(leader)
+        # the escalation already proves it was killed; what is under test is that nothing is left in
+        # the process table afterwards.
+        assert not os.path.exists(f"/proc/{grandchild_pid}"), (
+            "an adopted grandchild was killed but never reaped, leaking a pid per run"
+        )
+        # the direct child is skipped so Popen keeps the status it is owed.
+        assert leader.returncode is not None
+    finally:
+        if grandchild_pid is not None:  # pragma: no cover - only on an unexpected failure
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(grandchild_pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(grandchild_pid, 0)
+        if leader.poll() is None:  # pragma: no cover - only on an unexpected failure
+            leader.kill()
+            leader.wait(timeout=10)
+        if leader.stdout is not None:
+            leader.stdout.close()
 
 
 def test_grpo_teardown_uses_the_shared_escalating_kill():
