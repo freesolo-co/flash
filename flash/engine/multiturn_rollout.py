@@ -36,6 +36,10 @@ class RolloutResult(TypedDict):
 
 RolloutCompletion = tuple[str, list[int], list[float], str]
 
+# asks the env worker to run the driver-side close-out before it exits, so every env_reply of an
+# episode happens on one thread. distinct from the None shutdown sentinel: this one is answered.
+_CLOSE_OUT = object()
+
 
 class RolloutRequestExhaustedError(RuntimeError):
     """Raised when one logical assistant turn exhausts its physical request attempts."""
@@ -646,6 +650,25 @@ def rollout_async(
             item = to_env.get()
             if item is None:
                 return
+            if item is _CLOSE_OUT:
+                # the driver-side close-out belongs on this thread too: an env that keeps
+                # thread-affine state (a lazily-opened sqlite connection, a tokenizer bound to its
+                # creating thread) built it here on the first turn, so running the last env_reply
+                # on the engine thread would raise and lose an otherwise finished episode.
+                try:
+                    for r in rollouts:
+                        _final_env_step(
+                            active_env,
+                            r.messages,
+                            r.state,
+                            max_turns,
+                            pending=r.env_step_pending,
+                        )
+                except Exception as exc:
+                    to_submit.put(("error", exc))
+                    return
+                to_submit.put(("closed",))
+                continue
             r, asst_ids, asst_lp, text = item
             try:
                 _advance_after_turn(
@@ -711,6 +734,16 @@ def rollout_async(
                     # the environment worker is mid-advance; block briefly instead of spinning.
                     with contextlib.suppress(queue.Empty):
                         take(to_submit.get(timeout=0.1))
+        # on the success path only: an episode that raised has no close-out to run, and the worker
+        # may already have exited after reporting the error.
+        to_env.put(_CLOSE_OUT)
+        while True:
+            msg = to_submit.get()
+            if msg[0] == "closed":
+                break
+            if msg[0] == "error":
+                err = msg[1]
+                raise err.with_traceback(err.__traceback__)
     finally:
         active = list(by_id)
         by_id.clear()
@@ -720,14 +753,6 @@ def rollout_async(
         to_env.put(None)
         worker.join()
 
-    for rollout in rollouts:
-        _final_env_step(
-            active_env,
-            rollout.messages,
-            rollout.state,
-            max_turns,
-            pending=rollout.env_step_pending,
-        )
     requests = [
         RolloutScoreRequest(
             example=rollout.example,
