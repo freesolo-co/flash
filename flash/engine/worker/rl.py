@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import random
 import time
@@ -23,7 +22,10 @@ from flash.engine.structured_outputs import (
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.grpo import resolve_grpo_sleep_mode
-from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.heartbeat import (
+    _latest_named_reward_metrics,
+    liveness_heartbeat,
+)
 from flash.engine.worker.perf import (
     _GpuPeakSampler,
     _metric_curve,
@@ -76,43 +78,6 @@ def _patch_colocate_rollout_compilation(cc: tuple[int, int]) -> dict | None:
         kwargs = {"enforce_eager": True}
     _w.patch_trl_colocate_llm_kwargs(**kwargs)
     return kwargs
-
-def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
-    totals: dict[str, float] = {}
-    denominator = len(breakdowns)
-    for breakdown in breakdowns:
-        if not isinstance(breakdown, dict):
-            continue
-        for name, value in breakdown.items():
-            if name == "total":
-                continue
-            totals.setdefault(name, 0.0)
-            try:
-                score = float(value)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(score):
-                totals[name] += score
-    if denominator == 0:
-        return {}
-    return {name: total / denominator for name, total in totals.items()}
-
-
-def _latest_named_reward_metrics(
-    breakdowns: list[dict[str, float] | None], latest: dict[str, float]
-) -> dict[str, float]:
-    if breakdowns:
-        metrics = _mean_named_reward_metrics(breakdowns)
-        breakdowns.clear()
-        if metrics:
-            latest.clear()
-            latest.update(metrics)
-        elif latest:
-            # every completion failed scoring this generation: surface the known metrics as
-            # zeros instead of dropping them, so a full scoring outage shows a flat 0 rather
-            # than hiding behind missing heartbeat fields.
-            latest.update(dict.fromkeys(latest, 0.0))
-    return dict(latest)
 
 
 def apply_grpo_entropy_quantile(grpo_kwargs: dict, entropy_quantile: float | None) -> None:
