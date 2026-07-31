@@ -269,6 +269,12 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
         results = []
         try:
             cases = validate_evaluation_cases(suite, source=source)
+            if not cases:
+                all_valid = False
+                _err(
+                    f"evaluation suite {suite.name} failed contract checks: suite produced no cases"
+                )
+                continue
             for index, case in enumerate(cases, start=1):
                 _policy, response = _evaluation_response(env, case)
                 scored = suite.score(case, response)

@@ -372,6 +372,7 @@ class ApiClient:
         self.api_key = api_key
         self.timeout = timeout
         self.key_source = key_source
+        self._chat_step_selector_available = False
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key:
@@ -472,6 +473,8 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     def _require_chat_step_selector(self) -> None:
+        if self._chat_step_selector_available:
+            return
         capabilities = self.health().get("capabilities")
         if not isinstance(capabilities, list) or _CHAT_STEP_SELECTOR_CAPABILITY not in capabilities:
             raise ClientError(
@@ -479,6 +482,10 @@ class ApiClient:
                 f"{_CHAT_STEP_SELECTOR_CAPABILITY}; use a full immutable adapter revision or "
                 "upgrade the control plane"
             )
+        # only a successful capability check is cached, so a transient failure remains visible and
+        # retryable. concurrent first calls may make the same benign request twice; a lock would add
+        # coordination to every client solely to optimize that one startup race.
+        self._chat_step_selector_available = True
 
     def publish_env(
         self,
