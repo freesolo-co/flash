@@ -1029,6 +1029,70 @@ def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
         server.shutdown()
 
 
+def test_a_slow_env_call_is_not_cut_off_by_a_client_deadline(monkeypatch):
+    # verl fans reward scoring out hard -- RewardLoopManager spawns reward.num_workers ray workers
+    # and each asyncio.gathers its whole chunk -- and start_reward_server serializes them behind one
+    # lock. a per-request deadline therefore bounds QUEUE WAIT, not the env call, so the Nth caller
+    # in line fails for arriving Nth. a wedged env is the stall watchdog's job, not this client's.
+    waited = []
+    server, url = rl_verl.start_reward_server(
+        lambda idx, solution: waited.append(idx) or 7.0, example_count=2
+    )
+    try:
+        ns: dict = {}
+        exec(compile(rl_verl.render_reward_module("TEST_URL"), "<reward>", "exec"), ns)
+        real_urlopen = ns["urllib"].request.urlopen
+        seen = []
+
+        def urlopen_recording_deadline(req, *args, **kwargs):
+            seen.append((args, kwargs))
+            return real_urlopen(req)
+
+        monkeypatch.setattr(ns["urllib"].request, "urlopen", urlopen_recording_deadline)
+        ns["_URL"] = url
+        assert ns["compute_score"]("env", "answer", "unused", extra_info={"index": 0}) == 7.0
+        assert waited == [0]
+        assert seen == [((), {})], f"reward client still carries a deadline: {seen!r}"
+    finally:
+        server.shutdown()
+
+
+def test_concurrent_scorers_are_serialized_for_the_env():
+    # a flash env is a plain python object with no concurrency contract; the retired trl path only
+    # ever called it from one thread. verl's reward workers do not, so the server must impose it.
+    import concurrent.futures
+
+    live = []
+    peak = []
+    lock = threading.Lock()
+
+    def score(idx, solution):
+        with lock:
+            live.append(idx)
+            peak.append(len(live))
+        time.sleep(0.02)
+        with lock:
+            live.remove(idx)
+        return float(idx)
+
+    server, url = rl_verl.start_reward_server(score, example_count=8)
+    try:
+        ns: dict = {}
+        exec(compile(rl_verl.render_reward_module("TEST_URL"), "<reward>", "exec"), ns)
+        ns["_URL"] = url
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(
+                pool.map(
+                    lambda i: ns["compute_score"]("env", "a", "u", extra_info={"index": i}),
+                    range(8),
+                )
+            )
+        assert sorted(results) == [float(i) for i in range(8)]
+        assert max(peak) == 1, f"env saw {max(peak)} concurrent calls"
+    finally:
+        server.shutdown()
+
+
 # ------------------------------- reward parity -------------------------------
 class _BreakdownEnv:
     def scores_breakdown(self, graded, ex, state):
