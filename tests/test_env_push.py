@@ -314,6 +314,36 @@ def test_push_ships_helpers_named_by_a_literal_dynamic_import(monkeypatch, tmp_p
     assert "weights.py" in files
 
 
+def test_push_ships_helpers_named_by_the_keyword_form_of_a_dynamic_import(monkeypatch, tmp_path):
+    """`import_module(name="judge")` imports identically to the positional form.
+
+    Reading only `node.args[0]` skipped the keyword spelling, so the helper never entered the
+    archive and the suite raised ModuleNotFoundError on its first published case -- the same
+    failure the positional scan exists to prevent.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import importlib\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    importlib.import_module(name='judge')\n"
+        "    __import__(name='rubric')\n"
+        "    return []\n"
+    )
+    (tmp_path / "judge.py").write_text("import weights\n")
+    (tmp_path / "weights.py").write_text("W = 1\n")
+    (tmp_path / "rubric.py").write_text("RULES = ()\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "judge.py" in files
+    assert "rubric.py" in files
+    # followed transitively, exactly as a positionally named helper is
+    assert "weights.py" in files
+
+
 def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monkeypatch, tmp_path):
     """`from custom import SCORER` must keep resolving after custom.py is published as environment.py.
 
