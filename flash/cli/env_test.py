@@ -227,6 +227,32 @@ def _resolve_policy(reference_turns: list[str]) -> str:
     return "replay" if "".join(reference_turns).strip() else "echo"
 
 
+def _env_turns_reproduce(env, example: dict, state: dict) -> bool:
+    """Whether the driven rollout's environment-side turns match the reference trajectory's.
+
+    Only meaningful when the reference records them: a gold completion of assistant turns alone
+    says nothing about what the env replied, so there is nothing to contradict and the replay
+    stands. When it does record them, they must come back in the same order with the same text --
+    a stochastic or externally-sourced observation otherwise reaches the grader as a different
+    episode wearing the reference's assistant strings.
+    """
+    reference = [
+        _message_text(message["content"])
+        for message in _check_messages(env.sft_completion(example), "sft_completion")
+        if message["role"].strip().lower() != "assistant"
+    ]
+    if not reference:
+        return True
+    driven = [
+        _message_text(message.get("content"))
+        for message in state.get("messages") or []
+        if str(message.get("role", "")).strip().lower() not in ("assistant", "system")
+    ]
+    # the prompt's own user turn opens the driven transcript and is not part of the completion, so
+    # compare against the tail. a reference longer than what was driven cannot match either way.
+    return driven[-len(reference) :] == reference
+
+
 def _preview(value: object) -> str:
     if isinstance(value, list):
         parts = []
@@ -346,6 +372,13 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     # would produce, which is not the gold reward and must not feed the flat-reward gate -- the same
     # reason a partially representable transcript is excluded.
     if policy == "replay" and len(responses) != len(reference_turns):
+        record["partial_replay"] = True
+    # the assistant turns are only half the transcript. an env whose observations do not reproduce
+    # -- a stochastic one, or one reading outside state -- hands the grader a different episode
+    # under the same assistant strings, so a correct grader scores this "gold" rollout like the
+    # controls and the gate reports a flat grader for an env that ranks fine (codex[bot]). the
+    # reference records what the env replied last time, so compare against it where it does.
+    if policy == "replay" and not _env_turns_reproduce(env, example, state):
         record["partial_replay"] = True
 
     # the terminal rollout, kept unscored: the caller batches it with the control rollouts so a
@@ -486,15 +519,21 @@ def _score_multi_turn_episode(
     Unlike single-turn, a raising scorer is not softened to 0.0 here: the rollout path calls
     ``score_rollouts`` with no except branch, so a scorer that raises there aborts the run.
     Swallowing it would pass an environment that cannot survive its first rollout (codex[bot]).
+
+    A control the grader marks unscorable is dropped rather than failed. ``score_rollouts`` turns a
+    non-finite episode into NaN deliberately -- it is the trainer's supported marker for a row the
+    group baseline excludes and whose advantage is then zeroed -- so an env that marks completions
+    outside its grammar unscorable is behaving as designed, not violating the contract. Failing on
+    it rejected such an env for the single reason that a fixed control is not valid input for it
+    (codex[bot]).
     """
     driven = [_run_rollout(env, example, lambda _index, text=control: text) for control in controls]
     scores = _grade_rollouts(
         env, [gold, *((example, state, len(responses)) for state, responses in driven)]
     )
-    control_scores = scores[1:]
-    for score in control_scores:
-        _require_finite_control(score)
-    return scores[0], control_scores
+    # an unscorable control earns no advantage, so it is evidence of neither ranking nor flatness.
+    # keeping it would compare gold against a number the trainer never acts on.
+    return scores[0], [score for score in scores[1:] if score.is_finite()]
 
 
 def _usable_controls(references: list[str]) -> list[str] | None:
@@ -557,6 +596,10 @@ def _controlled_scores(env, example: dict, record: dict) -> list[_Score] | None:
     back to ``record``, so the comparison is always between scores the grader produced from one
     request list. Comparing a singleton gold score against batched control scores would be the same
     listwise mismatch, moved one step (codex[bot]).
+
+    May also return an empty list, when every control was scored but none produced usable evidence.
+    The caller treats that the same way it treats None -- the episode is not counted as controlled,
+    so the gate never speaks for an episode it could not actually test.
     """
     controls = _usable_controls(record["reference_turns"] or record["responses"][:1])
     if controls is None:
@@ -738,31 +781,35 @@ def cmd_env_test(args) -> int:
             group_per_turn = per_turn and all(
                 score.turns is not None for score in (reward, *controls)
             )
-            if any(control.outranks(reward, per_turn=group_per_turn) for control in controls):
-                # strictly worse than a deliberately wrong answer. GRPO maximizes this number, so
-                # the run would train away from the gold answers -- a broken reward direction is
-                # worse than a flat one, and no amount of separation elsewhere redeems it.
+            # a SINGLE control outranking gold does not establish an inverted grader. where the
+            # reward is an open-ended property rather than the reference -- one point per "z", say
+            # -- "z"*64 legitimately beats a gold "pizza", and training toward it is correct
+            # (codex[bot]). what no such property explains is EVERY control winning: the candidates
+            # are built on mutually exclusive alphabets (see _CONTROL_CANDIDATES), so an English
+            # sentence, a run of "z" and a run of "0" hold no property in common. unanimity across
+            # that set leaves the grader's sign as the explanation. below it, stay silent.
+            outranking = [
+                control for control in controls if control.outranks(reward, per_turn=group_per_turn)
+            ]
+            if len(controls) > 1 and len(outranking) == len(controls):
+                # strictly worse than a flat grader: GRPO maximizes this number, so the run would
+                # train away from every gold answer, and no separation elsewhere redeems it.
                 inverted += 1
                 # report the numbers the verdict actually read. on the per-turn path the episode
                 # scalars are not what trains, and a crossing pair has equal ones -- printing them
                 # would read "1.000000 scored higher than 1.000000".
                 if group_per_turn:
-                    offender = next(
-                        control
-                        for control in controls
-                        if control.outranks(reward, per_turn=group_per_turn)
-                    )
                     message = (
-                        "a deliberately wrong answer was credited above the replayed gold answer "
-                        f"at a turn the two share (gold turns {_fmt_turns(reward)}, wrong answer "
-                        f"{_fmt_turns(offender)}); the reward direction looks inverted"
+                        "every deliberately wrong answer was credited above the replayed gold "
+                        f"answer at a turn they share (gold turns {_fmt_turns(reward)}, wrong "
+                        f"answer {_fmt_turns(outranking[0])}); the reward direction looks inverted"
                     )
                 else:
-                    highest = max(control.episode for control in controls)
+                    highest = max(control.episode for control in outranking)
                     message = (
-                        f"a deliberately wrong answer scored higher ({highest:.6f}) than the "
-                        f"replayed gold answer ({reward.episode:.6f}); the reward direction looks "
-                        "inverted"
+                        f"every deliberately wrong answer scored higher (up to {highest:.6f}) than "
+                        f"the replayed gold answer ({reward.episode:.6f}); the reward direction "
+                        "looks inverted"
                     )
                 print(
                     render.warn(message) if render.styled() else f"warning: {message}",
