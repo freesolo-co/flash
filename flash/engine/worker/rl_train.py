@@ -46,6 +46,23 @@ from flash.engine.structured_outputs import (
     reasoning_parser_for,
 )
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.backend_common import (
+    VERL_REQUIREMENT,
+    agent_loop_workers,
+    append_step_metrics,
+    clamp_engine_len,
+    model_max_position_embeddings,
+    parse_verl_metric,
+    parse_verl_step_metrics,
+    parse_wandb_link,
+    render_wandb_link_shim,
+    resolve_blackwell_attention_backends,
+    resolve_rollout_enforce_eager,
+    resolve_verl_device_capability,
+    resolve_verl_loggers,
+    resolve_verl_python,
+    verl_supports_rollout_field,
+)
 from flash.engine.worker.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
@@ -67,23 +84,6 @@ from flash.engine.worker.sft_train import (
     _multimodal_messages_with_images,
     _NvidiaSmiPeakSampler,
     _verl_image_message_content,
-)
-from flash.engine.worker.verl_common import (
-    VERL_REQUIREMENT,
-    agent_loop_workers,
-    append_step_metrics,
-    clamp_engine_len,
-    model_max_position_embeddings,
-    parse_verl_metric,
-    parse_verl_step_metrics,
-    parse_wandb_link,
-    render_wandb_link_shim,
-    resolve_blackwell_attention_backends,
-    resolve_rollout_enforce_eager,
-    resolve_verl_device_capability,
-    resolve_verl_loggers,
-    resolve_verl_python,
-    verl_supports_rollout_field,
 )
 from flash.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 
@@ -725,7 +725,7 @@ def _build_verl_train_notes(
         "wandb_project": wandb_project,
         "wandb_run_name": wandb_run_name,
         # the sdk's link_wandb reads notes["wandb_url"]; an in-process trainer gets it from the parent's live
-        # wandb.run, verl from the child marker (see verl_common.render_wandb_link_shim).
+        # wandb.run, verl from the child marker (see backend_common.render_wandb_link_shim).
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
         # what this env's grader actually cost, and what share of a step the gpu spent waiting on
@@ -2965,7 +2965,7 @@ def _resolve_grpo_inputs():
     }
 
 
-def run_rl_verl():
+def run_rl_train():
     """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
     t_start = time.time()
     _w.heartbeat("rl_start", gpu=gpu_diagnostics())
@@ -3025,7 +3025,7 @@ def run_rl_verl():
         str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples
     ]
 
-    workdir = f"/tmp/rl_verl_seed{_w.SEED}"
+    workdir = f"/tmp/rl_train_seed{_w.SEED}"
     os.makedirs(workdir, exist_ok=True)
     local_dir = os.path.join(workdir, "ckpt")
     # a retry reuses the pod workdir; stale global_step_N dirs from a prior attempt would satisfy

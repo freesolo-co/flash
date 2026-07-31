@@ -29,18 +29,7 @@ from flash.engine.steps import (
     validate_save_steps,
 )
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import liveness_heartbeat
-from flash.engine.worker.packing import completion_mask_from_ids
-from flash.engine.worker.rng import seed_training_rngs
-from flash.engine.worker.sft import (
-    _model_arch_dims,
-    _pretokenize_completion_only,
-    _reject_image_completion,
-    _select_indexed_sft_examples,
-    sft_completed_train_tokens,
-    sft_under_ran,
-)
-from flash.engine.worker.verl_common import (
+from flash.engine.worker.backend_common import (
     export_peft_adapter,
     latest_global_step_dir,
     parse_verl_metric,
@@ -51,6 +40,17 @@ from flash.engine.worker.verl_common import (
     resolve_verl_python,
     run_verl_training,
     stamp_adapter_dir_provenance,
+)
+from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.packing import completion_mask_from_ids
+from flash.engine.worker.rng import seed_training_rngs
+from flash.engine.worker.sft import (
+    _model_arch_dims,
+    _pretokenize_completion_only,
+    _reject_image_completion,
+    _select_indexed_sft_examples,
+    sft_completed_train_tokens,
+    sft_under_ran,
 )
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
@@ -1481,7 +1481,7 @@ def run_sft_train(spec=None) -> None:
             "wandb_project": project_name if "wandb" in loggers else None,
             "wandb_run_name": experiment_name if "wandb" in loggers else None,
             # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
-            # wandb.run, verl from the child marker (see verl_common.render_wandb_link_shim).
+            # wandb.run, verl from the child marker (see backend_common.render_wandb_link_shim).
             "wandb_url": wandb_link.get("wandb_url"),
             "wandb_id": wandb_link.get("wandb_id"),
         },
