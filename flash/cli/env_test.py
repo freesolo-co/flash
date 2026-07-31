@@ -129,6 +129,19 @@ def _resolve_policy(reference_turns: list[str]) -> str:
     return "replay" if "".join(reference_turns).strip() else "echo"
 
 
+def _carries_thinking_markup(reference_turns: list[str]) -> bool:
+    """Whether a gold answer is written in reasoning markup this command cannot reproduce.
+
+    A thinking run grades what `_scored_turn_text` leaves behind, which strips the `<think>` span
+    before the reward ever sees it (flash/envs/adapter.py). This command has no run config to read
+    `thinking` from -- it builds the environment locally, where it defaults off (adapter.py) -- so
+    it replays the tagged reference verbatim. Against a strict answer-only grader every reference
+    then scores zero, and the gate below reported a working environment as unable to recognize its
+    own gold answers (codex[bot]). The reward is still printed and still warned about; only the
+    blocking conclusion is withheld, because the evidence for it cannot be produced here."""
+    return any("<think>" in turn or "</think>" in turn for turn in reference_turns)
+
+
 def _preview(value: object) -> str:
     if isinstance(value, list):
         parts = []
@@ -150,15 +163,23 @@ def _preview(value: object) -> str:
 
 def _new_record() -> dict:
     """Mutable per-episode record so a failing episode still reports real progress."""
-    return {"policy": "n/a", "turns": 0, "reward": None, "prompt": [], "responses": []}
+    return {
+        "policy": "n/a",
+        "turns": 0,
+        "reward": None,
+        "prompt": [],
+        "responses": [],
+        "thinking_markup": False,
+    }
 
 
-def _drive_single_turn(env, example: dict, record: dict) -> None:
+def _drive_single_turn(env, example: dict, record: dict, *, force_echo: bool = False) -> None:
     prompt = _check_messages(env.prompt_messages(example), "prompt")
     record["prompt"] = prompt
     reference_turns = _reference_turns(env, example)
-    policy = _resolve_policy(reference_turns)
+    policy = "echo" if force_echo else _resolve_policy(reference_turns)
     record["policy"] = policy
+    record["thinking_markup"] = _carries_thinking_markup(reference_turns)
     response = (
         "\n".join(turn for turn in reference_turns if turn)
         if policy == "replay"
@@ -169,12 +190,13 @@ def _drive_single_turn(env, example: dict, record: dict) -> None:
     record["reward"] = float(env.reward(response, example))
 
 
-def _drive_multi_turn(env, example: dict, record: dict) -> None:
+def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = False) -> None:
     state = env.new_rollout_state(example)
     record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
     reference_turns = _reference_turns(env, example)
-    policy = _resolve_policy(reference_turns)
+    policy = "echo" if force_echo else _resolve_policy(reference_turns)
     record["policy"] = policy
+    record["thinking_markup"] = _carries_thinking_markup(reference_turns)
     # mirror the worker turn loop (flash/engine/multiturn_rollout.py): drive one model
     # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
     # env yields no reply. the hard cap is fixed at what the trainer passes (env.max_turns)
@@ -216,6 +238,37 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     # scores the state the run would score. reusing the helper is what keeps the two in step.
     _final_env_step(env, state["messages"], state, hard_cap, pending=env_step_pending)
     record["reward"] = float(env.reward("", example, state))
+
+
+def _scores_gold_no_better_than_junk(env, example: dict, gold_reward: float) -> bool:
+    """Whether the grader pays a deliberately wrong answer at least as well as its own gold one.
+
+    This is the evidence the flat-reward gate needs. The reward's own value cannot supply it: a
+    centered scale that pays 0 for a correct answer and negative for an incorrect one separates
+    them perfectly, and reading that zero as failure rejected a trainable environment. What does
+    not train is a grader whose gold answer earns no more than junk, whatever number it prints.
+
+    The junk run drives the same env through the same code path as the real episode, with the
+    replay suppressed so the echo placeholder stands in for a wrong model answer. A grader that
+    raises on it is not evidence of anything -- an env may legitimately require a parseable answer
+    -- so treat that as separation and leave the episode to its own contract checks.
+
+    Call this only after every episode has been scored. The probe is an extra pass through the same
+    env, and an env that advances state per call (a scripted reward sequence, a cursor into a
+    dataset) would hand a later episode the answer meant for this one -- the probe deciding the
+    outcome of the run it exists to measure."""
+    try:
+        probe = _new_record()
+        if env.multi_turn:
+            _drive_multi_turn(env, example, probe, force_echo=True)
+        else:
+            _drive_single_turn(env, example, probe, force_echo=True)
+        junk_reward = probe["reward"]
+    except (Exception, SystemExit):
+        return False
+    if junk_reward is None or not math.isfinite(junk_reward):
+        return False
+    return junk_reward >= gold_reward
 
 
 def _load_failure(reason: str) -> int:
@@ -615,10 +668,10 @@ def cmd_env_test(args) -> int:
 
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0
-    # only replay episodes carry a gold answer to score. an echo episode has none, so a zero there
+    # only replay episodes carry a gold answer to score. an echo episode has none, so its reward
     # says nothing about the grader and is counted in neither total.
     replayed = 0
-    replayed_zero = 0
+    replayed_zero: list[dict] = []
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
         failure: str | None = None
@@ -647,14 +700,17 @@ def cmd_env_test(args) -> int:
 
         passed += 1
         if record["policy"] == "replay" and reward is not None:
-            replayed += 1
-            # only an exact zero counts toward the blocking gate below. a negative scale is a
-            # legitimate grader -- -1 for a correct reference and -2 for an incorrect completion
-            # still separates them, which is all GRPO's relative advantage needs -- so counting
-            # every non-positive reward as a zero rejected those environments outright
-            # (codex[bot]). the warning stays wider, since it only advises.
-            if reward == 0.0:
-                replayed_zero += 1
+            # a reference written in reasoning markup cannot be replayed faithfully from here
+            # (see `_carries_thinking_markup`), so its score is not evidence about the grader and
+            # is kept out of the blocking gate's totals. the advisory warning below still fires:
+            # a low reward is worth surfacing either way, it just cannot be the reason to fail.
+            if not record["thinking_markup"]:
+                replayed += 1
+                # an exact zero is what a scorer that recognized nothing returns, so it stays the
+                # signature this gate looks for. it is confirmed against a wrong answer once every
+                # episode has run, not here: see `_scores_gold_no_better_than_junk`.
+                if reward == 0.0:
+                    replayed_zero.append(example)
             if reward <= 0.0:
                 message = (
                     f"replay gold answer scored low (reward={reward:.6f}); "
@@ -668,16 +724,27 @@ def cmd_env_test(args) -> int:
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
         return _err("overall: FAIL")
-    # a grader that scores zero for every one of its own reference answers cannot recognize them at
-    # all -- a broken scorer or a missing runtime dependency (LS-005) -- and the run reaches a gpu
-    # able to see only flat-zero reward. deliberately narrow: a PARTIAL zero stays the warning
-    # above and still passes, because a strict reward function with some hard rows is legitimate.
-    grader_recognizes_gold = not (replayed and replayed_zero == replayed)
+    # a grader that pays every one of its own reference answers zero cannot recognize them at all --
+    # a broken scorer or a missing runtime dependency (LS-005) -- and the run reaches a gpu able to
+    # see only flat reward. deliberately narrow: a PARTIAL failure stays the warning above and still
+    # passes, because a strict reward function with some hard rows is legitimate.
+    #
+    # zero alone does not settle it, though. a centered scale paying 0 for a correct answer and
+    # negative for an incorrect one separates them perfectly, which is all GRPO's relative advantage
+    # needs, and failing on its zero rejected those environments outright (codex[bot]). so ask the
+    # reward what a deliberately wrong answer is worth, and block only if it is worth as much. one
+    # probe settles it: the question is whether this reward can separate at all, and a grader that
+    # scored every gold answer identically will answer identically for each of them.
+    grader_recognizes_gold = not (
+        replayed
+        and len(replayed_zero) == replayed
+        and _scores_gold_no_better_than_junk(env, replayed_zero[0], 0.0)
+    )
     if not grader_recognizes_gold:
         _err(
-            f"all {replayed} replayed gold answer(s) scored zero; the reward function cannot "
-            "recognize its own reference answers. check the grader and that its runtime "
-            "dependencies are installed in this environment."
+            f"all {replayed} replayed gold answer(s) scored zero, no better than a deliberately "
+            "wrong answer; the reward function cannot recognize its own reference answers. check "
+            "the grader and that its runtime dependencies are installed in this environment."
         )
     # run the evaluation checks even when the grader gate already failed, so one `flash env test`
     # reports every broken surface at once instead of hiding the sidecar's errors behind the
