@@ -4751,7 +4751,14 @@ def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
 
 
 def _drive_multi_turn_episode(
-    *, stop_reasons, env, per_turn_credit=True, max_turns=4, monkeypatch=None
+    *,
+    stop_reasons,
+    env,
+    per_turn_credit=True,
+    max_turns=4,
+    monkeypatch=None,
+    multi_modal_data=None,
+    return_instance=False,
 ):
     """run the real child loop end to end against a real bridge, returning its agent loop output.
 
@@ -4789,16 +4796,37 @@ def _drive_multi_turn_episode(
             return "".join(str(m.get("content") or "") for m in messages)
 
     class _Base:
+        """mirrors the parts of verl's AgentLoopBase the loop actually calls."""
+
         def __init__(self):
             self.tokenizer = _Tokenizer()
             self.rollout_config = SimpleNamespace(response_length=256)
             self.server_manager = self
             self._sent = list(stop_reasons)
+            # every generate call's media, so a test can assert the pixels ride along on turn 2+.
+            self.generate_media = []
 
-        async def apply_chat_template(self, messages):
+        def _get_mm_processor_kwargs(self, audio_data=None):
+            return {}
+
+        async def process_multi_modal_info(self, messages):
+            return dict(multi_modal_data or {})
+
+        async def apply_chat_template(self, messages, **kwargs):
             return [1, 2, 3]
 
-        async def generate(self, *, request_id, prompt_ids, sampling_params):
+        async def generate(
+            self,
+            *,
+            request_id,
+            prompt_ids,
+            sampling_params,
+            image_data=None,
+            video_data=None,
+            audio_data=None,
+            mm_processor_kwargs=None,
+        ):
+            self.generate_media.append(image_data)
             text, stop_reason = self._sent.pop(0)
             return SimpleNamespace(
                 token_ids=[ord(c) for c in text],
@@ -4820,14 +4848,19 @@ def _drive_multi_turn_episode(
         bridge_post=bridge_post,
     )
 
+    driven = {}
+
     async def _go():
         instance = loop_class()
         # the loop offloads the bridge's blocking posts onto this executor, so it has to be the
         # one actually running the coroutine.
         instance.loop = asyncio.get_running_loop()
+        driven["instance"] = instance
         await instance.run({}, raw_prompt=[{"role": "user", "content": "go"}], index=0)
 
     asyncio.run(_go())
+    if return_instance:
+        return captured, driven["instance"]
     return captured
 
 
@@ -4890,6 +4923,44 @@ def test_an_unspanned_truncated_turns_tokens_are_still_generated_and_masked_as_m
     )
     assert out["response_ids"][-2:] == [ord("c"), ord("d")], "the truncated turn's tokens were lost"
     assert out["response_mask"][-2:] == [1, 1], "the truncated turn's tokens were not model-masked"
+
+
+def test_multi_turn_rollout_carries_the_prompts_images_into_every_turn(monkeypatch):
+    # an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. the engine needs
+    # the decoded media alongside them on EVERY generate call, because each turn re-sends the whole
+    # prefix -- turn 2 conditioning on placeholders alone is the same failure as turn 1 doing it.
+    # the training pass re-tokenizes the episode through the processor, so the output has to carry
+    # the media too.
+    env = _SpanEnv()
+    sentinel = ["<pil-image>"]
+    out, instance = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed")] * 4,
+        env=env,
+        monkeypatch=monkeypatch,
+        multi_modal_data={"images": sentinel},
+        return_instance=True,
+    )
+    assert instance.generate_media == [sentinel] * 4, (
+        "the prompt's images did not reach every turn's generate call"
+    )
+    assert out["multi_modal_data"] == {"images": sentinel}, (
+        "the episode was emitted without the media the training pass re-tokenizes against"
+    )
+
+
+def test_a_text_only_multi_turn_rollout_sends_no_media(monkeypatch):
+    # the control: a text-only prompt must not start shipping an empty media payload. verl treats an
+    # empty multi_modal_data dict as a multimodal row, so passing {} rather than None would push a
+    # text-only episode down the processor path it has no pixels for.
+    env = _SpanEnv()
+    out, instance = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed")] * 4,
+        env=env,
+        monkeypatch=monkeypatch,
+        return_instance=True,
+    )
+    assert instance.generate_media == [None] * 4
+    assert out["multi_modal_data"] is None
 
 
 def test_every_turn_is_spanned_when_none_of_them_abort(monkeypatch):
