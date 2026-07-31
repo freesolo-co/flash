@@ -22,7 +22,10 @@ from flash.envs.evaluations import (
 
 # --upload validates the project id before spending anything, so tests must pass a real UUID.
 _PROJECT_ID = "11111111-1111-1111-1111-111111111111"
-_EXPLICIT_TARGET = "flash-1/step-3"
+# a full immutable revision: the one target shape that needs no resolution, so a test about
+# anything else does not have to stub `deployments()`. `RUN/step-N` is a shorthand the CLI now
+# pins first, which is its own contract (`test_env_eval_pins_a_step_shorthand_...`).
+_EXPLICIT_TARGET = "flash-1@step-3." + "a" * 40
 
 
 def _environment_dir(tmp_path: Path) -> Path:
@@ -320,11 +323,12 @@ def test_env_eval_reports_error_count_and_fails_overall(monkeypatch, tmp_path, c
     assert "overall: FAIL" in captured.err
 
 
-@pytest.mark.parametrize(
-    "target",
-    ["flash-1/step-3", "flash-1@step-3." + "a" * 40],
-)
-def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys, target) -> None:
+def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) -> None:
+    """A full immutable revision is the one target that needs no resolution.
+
+    The shorthands -- a bare run id and `RUN/step-N` -- each name something the CLI must pin to a
+    revision first, which is their own contract (`test_env_eval_pins_...`).
+    """
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
@@ -350,7 +354,7 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys, 
         [
             "env",
             "eval",
-            target,
+            _EXPLICIT_TARGET,
             str(env_dir),
             "--temperature",
             "0.2",
@@ -362,7 +366,7 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys, 
     assert result == 0
     assert client.calls == [
         (
-            target,
+            _EXPLICIT_TARGET,
             [{"role": "user", "content": "2+2"}],
             {"temperature": 0.2, "max_tokens": 17},
         )
@@ -2046,6 +2050,102 @@ def test_env_eval_pins_a_run_serving_a_step_checkpoint(monkeypatch, tmp_path, ca
 
     assert client.targets == [revision]
     assert f"resolved evaluation target flash-1 to {revision}" in capsys.readouterr().out
+
+
+def test_env_eval_pins_a_step_shorthand_to_its_immutable_revision(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`RUN/step-N` names a step, not the weights that answer at it.
+
+    The chat route resolves a step against the run's whole verified ledger, which can hold several
+    revisions at one step, and picks the deployed one (`_resolve_explicit_chat_revision`). Sending
+    the shorthand therefore graded weights the report could not name, and a later rebuild of the
+    same step read as the same measurement (codex[bot]).
+    """
+    env_dir = _upload_env_dir(tmp_path)
+    shorthand = "flash-1/step-3"
+    revision = "flash-1@step-3." + "a" * 40
+
+    class Client:
+        def __init__(self):
+            self.targets = []
+
+        def deployments(self):
+            return [
+                {
+                    "run_id": "flash-1",
+                    "deployment": {
+                        "state": "ready",
+                        "checkpoint_step": 3,
+                        "adapter_revision": revision,
+                    },
+                }
+            ]
+
+        def chat_stream(self, target, messages, **kwargs):
+            self.targets.append(target)
+            yield "4"
+
+    client = Client()
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(["env", "eval", shorthand, str(env_dir), "--upload", "--project", _PROJECT_ID])
+        == 0
+    )
+
+    # both halves matter: generation must reach the immutable weights, and the uploaded report
+    # must name them, or the dashboard records a step whose contents can change underneath it.
+    assert client.targets == [revision]
+    assert uploader.calls[0]["model"] == revision
+    assert f"resolved evaluation target {shorthand} to {revision}" in capsys.readouterr().out
+
+
+def test_env_eval_refuses_a_step_shorthand_the_run_is_not_serving(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A step the live deployment is not on cannot be named, so it must not be graded.
+
+    The step may still be verified and servable, but nothing the CLI can read says WHICH revision
+    at that step would answer -- `deployments` reports the live record only. Grading under a name
+    that cannot be resolved is the defect itself.
+    """
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'math'\n"
+        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def deployments(self):
+            return [
+                {
+                    "run_id": "flash-1",
+                    "deployment": {
+                        "state": "ready",
+                        "checkpoint_step": 40,
+                        "adapter_revision": "flash-1@step-40." + "b" * 40,
+                    },
+                }
+            ]
+
+        def chat_stream(self, target, messages, **kwargs):
+            raise AssertionError(f"an unresolvable step must not be graded, got {target!r}")
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir)]) == 1
+
+    err = capsys.readouterr().err
+    assert "is deployed at step 40, not step 3" in err
+    assert "flash models deployments" in err
 
 
 def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> None:
