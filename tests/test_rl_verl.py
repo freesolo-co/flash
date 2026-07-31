@@ -1295,6 +1295,164 @@ def test_structured_outputs_shim_refuses_to_wrap_itself_twice():
     assert "_flash_so_patched = True" in source
 
 
+def _load_kl_ref_engine():
+    """exec the kl-reference shim against a stub verl engine and hand back the patched class.
+
+    the shim rebinds FSDPEngine._build_lora_module and .disable_adapter on import, so a stub that
+    stands in for verl's real class is enough to exercise both halves without a gpu.
+    """
+    import sys
+    from types import ModuleType
+
+    class _FSDPEngine:
+        def __init__(self, module):
+            self.module = module
+
+        def _build_lora_module(self, module):
+            return module
+
+        def disable_adapter(self):
+            raise AssertionError("the shim must replace disable_adapter, not defer to it")
+
+    impl = ModuleType("verl.workers.engine.fsdp.transformer_impl")
+    impl.FSDPEngine = _FSDPEngine
+    fsdp_pkg = ModuleType("verl.workers.engine.fsdp")
+    fsdp_pkg.transformer_impl = impl
+    stubs = {
+        "verl": ModuleType("verl"),
+        "verl.workers": ModuleType("verl.workers"),
+        "verl.workers.engine": ModuleType("verl.workers.engine"),
+        "verl.workers.engine.fsdp": fsdp_pkg,
+        "verl.workers.engine.fsdp.transformer_impl": impl,
+    }
+    for name, module in stubs.items():
+        sys.modules[name] = module
+    try:
+        source = rl_verl.render_kl_ref_adapter_shim(True)
+        exec(compile(source, "sitecustomize.py", "exec"), {})
+    finally:
+        for name in stubs:
+            sys.modules.pop(name, None)
+    return impl.FSDPEngine
+
+
+def test_kl_ref_adapter_shim_is_emitted_only_for_a_warm_start():
+    # a fresh-start run has no sft adapter to anchor to, so verl's bare-base reference is already
+    # what flash wants and the patch must stay out of the child's import path.
+    assert rl_verl.render_kl_ref_adapter_shim(False) == ""
+    source = rl_verl.render_kl_ref_adapter_shim(True)
+    assert source
+    assert rl_verl._KL_REF_ADAPTER_MARKER in source
+
+
+def test_kl_ref_adapter_shim_is_wired_only_when_warm_start_and_kl_are_both_on():
+    # with kl off no reference logprob is ever consumed, so patching disable_adapter would add a
+    # failure mode and buy nothing. both conditions have to gate the renderer, not just warm start.
+    source = inspect.getsource(rl_verl.run_rl_verl)
+    assert "render_kl_ref_adapter_shim(" in source
+    assert 'bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0' in source
+    combined = rl_verl.render_exact_save_steps_shim((7, 13), 20) + rl_verl.render_kl_ref_adapter_shim(
+        True
+    )
+    compile(combined, "sitecustomize.py", "exec")
+
+
+def test_kl_ref_adapter_shim_anchors_the_reference_to_the_warm_start_adapter():
+    # the defect this removes: verl sets ref_in_actor whenever lora is active (always, on flash) and
+    # marks the reference pass no_lora_adapter=True, which engine_workers turns into
+    # engine.disable_adapter() -- the BARE BASE. on a warm-started run the kl term would then pull
+    # the policy away from the sft adapter the run was told to continue. asserting on the rendered
+    # source cannot catch that; only running the patched engine and comparing the three forwards
+    # (sft / base / trained policy) can.
+    torch = pytest.importorskip("torch")
+    peft = pytest.importorskip("peft")
+
+    class _Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(8, 8, bias=False)
+
+        def forward(self, x):
+            return self.q_proj(x)
+
+    torch.manual_seed(0)
+    config = peft.LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj"])
+    model = peft.get_peft_model(_Tiny(), config)
+    # lora_B initializes to zeros, which makes a fresh adapter a no-op EQUAL to the base -- a
+    # fixture left that way could not tell "anchored to sft" from "anchored to base" at all.
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if "lora_B" in name:
+                param.copy_(torch.randn_like(param) * 0.1)
+
+    x = torch.randn(2, 8)
+    with torch.no_grad():
+        sft_out = model(x).clone()
+        with model.disable_adapter():
+            base_out = model(x).clone()
+    assert not torch.allclose(sft_out, base_out), "fixture cannot discriminate sft from base"
+
+    params_before = set(dict(model.named_parameters()))
+    state_before = set(model.state_dict())
+    engine = _load_kl_ref_engine()(model)
+    engine._build_lora_module(model)
+
+    with torch.no_grad():
+        # a training step moves only the trainable default adapter; the frozen snapshot must not
+        # follow it, or the anchor drifts with the policy and constrains nothing.
+        for name, param in model.named_parameters():
+            if ".default." in name and "lora_B" in name:
+                param.add_(torch.randn_like(param) * 0.5)
+        trained_out = model(x).clone()
+        with engine.disable_adapter():
+            ref_out = model(x).clone()
+        after_out = model(x).clone()
+
+    assert torch.allclose(ref_out, sft_out), "kl reference is not the warm-start adapter"
+    assert not torch.allclose(ref_out, base_out), "kl reference fell back to the bare base"
+    assert not torch.allclose(ref_out, trained_out), "kl reference drifted with the policy"
+    # the policy forward has to come back bit-exact: the reference pass runs inside training.
+    assert torch.equal(after_out, trained_out), "policy forward not restored after the reference"
+    # non-persistent buffers, not a second adapter's parameters. new named_parameters would be
+    # flattened by fsdp and trained by the optimizer; new state_dict keys would reach verl's merger,
+    # which hand-builds the shipped adapter from every "lora_" key and derives target_modules from
+    # key.split(".")[-3] -- a second adapter's keys resolve to lora_A/lora_B there.
+    assert not set(dict(model.named_parameters())) - params_before
+    assert not set(model.state_dict()) - state_before
+
+
+def test_kl_ref_adapter_shim_refuses_to_run_without_a_snapshot():
+    # both guards exist because the alternative is silent: an unpatched or half-applied snapshot
+    # would leave the reference on the bare base, and the run would look completely healthy while
+    # training against the wrong anchor. they must raise, never fall back.
+    pytest.importorskip("torch")
+    import torch
+
+    engine_cls = _load_kl_ref_engine()
+
+    class _NoAdapterWeights(torch.nn.Module):
+        # peft-shaped, but no ModuleDict holds the snapshot's leaves: nothing gets demoted.
+        def __init__(self):
+            super().__init__()
+            self.peft_config = {"default": SimpleNamespace(r=4)}
+            self.active_adapter = "default"
+
+        def add_adapter(self, name, config):
+            self.peft_config[name] = config
+
+    module = _NoAdapterWeights()
+    with pytest.raises(RuntimeError, match="no adapter weights to freeze"):
+        engine_cls(module)._build_lora_module(module)
+
+    class _NoSnapshot(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.peft_config = {"default": SimpleNamespace(r=4)}
+
+    with pytest.raises(RuntimeError, match="flash kl reference adapter missing"):
+        engine_cls(_NoSnapshot()).disable_adapter()
+
+
 def test_reasoning_parser_override_needs_both_thinking_and_a_constraint():
     # engine half. verl spreads engine_kwargs.vllm straight into AsyncEngineArgs, where
     # reasoning_parser is a real field, so this needs a plain hydra override and no shim.
@@ -2336,20 +2494,27 @@ def test_text_env_resolves_without_building_a_processor(monkeypatch):
     assert inp["image_pad_token_id"] is None
 
 
-def test_capability_guard_rejects_kl_anchored_warm_start(monkeypatch):
-    # verl computes its kl reference with adapters DISABLED, so under init_from_adapter the
-    # reference is the bare base model and the penalty drags the policy away from the sft start -
-    # the opposite of what the knob asks for. must raise until verl can hold a reference adapter.
-    # the kl coefficient arrives through grpo_overrides, so it must go through the helper: patching
-    # it separately gets clobbered by the helper's own patch and the test then fails on the adapter
-    # download instead, passing a bare raises() while proving nothing about this guard.
-    with pytest.raises(RuntimeError, match="kl_penalty_coef"):
-        _capability_resolve(
-            monkeypatch,
-            _capability_env(),
-            train={"init_from_adapter": "org/some-sft-adapter"},
-            overrides={"kl_penalty_coef": 0.1},
-        )
+def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
+    # verl's kl reference is the bare base whenever lora is active, so warm-start + kl used to be
+    # refused: the penalty would drag the policy away from the sft adapter the run was told to
+    # continue. render_kl_ref_adapter_shim anchors the reference to that adapter instead, so the
+    # combination now resolves. the kl coefficient arrives through grpo_overrides, so it must go
+    # through the helper rather than being patched separately.
+    import flash.engine.worker.adapter as _adapter_mod
+
+    adapter_dir = tmp_path / "warmstart"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32}))
+    monkeypatch.setattr(_adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
+
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(),
+        train={"init_from_adapter": "org/some-sft-adapter"},
+        overrides={"kl_penalty_coef": 0.1},
+    )
+    assert inp["warmstart_adapter"]
+    assert inp["kl_coef"] == pytest.approx(0.1)
 
 
 def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch, capsys):
