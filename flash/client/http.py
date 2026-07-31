@@ -39,6 +39,7 @@ FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
 FREESOLO_PROJECTS_PATH = "/api/projects"
 FREESOLO_TRACE_PROJECTS_PATH = "/api/traces/projects"
 FREESOLO_TRACES_EXPORT_PATH = "/api/traces/export"
+FREESOLO_EVAL_RUNS_PATH = "/api/evals/runs"
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
@@ -229,6 +230,47 @@ def export_trace_records(
     path = f"{FREESOLO_TRACES_EXPORT_PATH}?{urllib.parse.urlencode(query)}"
     # a whole project's traces can be a large read; give it room beyond the default.
     return _freesolo_get(path, api_key, base_url, timeout=300.0)
+
+
+def upload_eval_run(
+    *,
+    project_id: str,
+    suite_name: str,
+    environment_reference: str,
+    model: str | None,
+    status: str,
+    error: str | None,
+    started_at: str | None,
+    cases: list[dict[str, Any]],
+    api_key: str,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """Record one `flash env eval` suite run against one explicit Freesolo project.
+
+    The project id is required and never inferred: an API key identifies an org, not a
+    project, and picking a default here would file results under a project the caller
+    never named."""
+    try:
+        project_id = require_project_id(project_id)
+    except (TypeError, ValueError) as exc:
+        raise ClientError(str(exc).replace("project", "project id", 1)) from exc
+    body: dict[str, Any] = {
+        "project_id": project_id,
+        "suite_name": suite_name,
+        "environment_reference": environment_reference,
+        "model": model,
+        "status": status,
+        "error": error,
+        "started_at": started_at,
+        "cases": cases,
+    }
+    # a large suite is a bigger write than a normal control-plane call; give it room.
+    payload = _freesolo_request(
+        "POST", FREESOLO_EVAL_RUNS_PATH, api_key, base_url, body=body, timeout=300.0
+    )
+    if not isinstance(payload, dict):
+        raise ClientError("freesolo returned an invalid eval run response")
+    return payload
 
 
 class _ProgressReader:

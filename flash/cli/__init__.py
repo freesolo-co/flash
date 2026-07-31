@@ -395,6 +395,16 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=f"parallel model requests (1-{_MAX_CONCURRENCY})",
     )
+    env_eval.add_argument(
+        "--upload",
+        action="store_true",
+        help="record the results under a project so they show in the dashboard",
+    )
+    env_eval.add_argument(
+        "--project",
+        metavar="PROJECT_ID",
+        help="project id to record results under (required with --upload)",
+    )
     env_eval.set_defaults(func=cmd_env_eval)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
