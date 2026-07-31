@@ -8,6 +8,7 @@ verified the same way a real template (Qwen-style <|im_start|>/<|im_end|>) would
 from __future__ import annotations
 
 import sys
+import threading
 import types
 
 import pytest
@@ -1068,6 +1069,54 @@ def test_rollout_async_steps_the_env_on_the_final_turn_before_scoring():
     )
     assert out[0]["reward"] == 3.0
     assert env.env_reply_calls == 3
+
+
+def test_rollout_async_runs_every_env_step_on_one_thread():
+    """A thread-affine env must see its whole episode on the thread it built its state on.
+
+    Intermediate turns advance on `env_worker`, but the driver-side close-out used to run on the
+    engine thread after that worker was joined. An env that lazily creates thread-bound state on
+    its first `env_reply` -- the sqlite default of `check_same_thread=True` is the common one --
+    then raised on the last turn and lost an otherwise finished episode.
+
+    Asserting on thread identity rather than on a raised error is deliberate: it fails for the
+    right reason, and it keeps holding if the env's own affinity check is ever relaxed.
+    """
+
+    class _ThreadAffineEnv(_StatefulBoardEnv):
+        def __init__(self):
+            super().__init__()
+            self.owner = None
+
+        def env_reply(self, messages, state):
+            current = threading.current_thread().name
+            if self.owner is None:
+                self.owner = current
+            elif current != self.owner:
+                raise RuntimeError(f"env state built on {self.owner} was used from {current}")
+            return super().env_reply(messages, state)
+
+    env = _ThreadAffineEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    out = rollout_async(
+        examples=[{}],
+        active_env=env,
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=busy,
+        abort=lambda ids: None,
+        env_glue=env_glue,
+        max_turns=3,
+        per_turn_max_tokens=8,
+    )
+
+    assert out[0]["reward"] == 3.0
+    assert env.env_reply_calls == 3
+    # the episode really did run off the caller's thread, so the assertion above is about the
+    # worker holding every step rather than about everything collapsing onto the main thread.
+    assert env.owner is not None
+    assert env.owner != threading.current_thread().name
 
 
 def test_token_budget_exhaustion_also_steps_the_env():
