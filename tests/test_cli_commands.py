@@ -124,7 +124,8 @@ class _FakeClient:
         self.calls.append(("undeploy", run_id))
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
-    def deployments(self) -> list[dict]:
+    def deployments(self, timeout: float | None = None) -> list[dict]:
+        self.calls.append(("deployments", timeout))
         return [
             {
                 "run_id": "flash-1",
@@ -1446,6 +1447,92 @@ def test_deploy_wait_reports_a_rollback_to_a_different_checkpoint_step(
     assert "previously deployed revision is still serving" in err, err
     # the wrong explanation must be gone, not merely accompanied by the right one.
     assert "no longer an active deployment" not in err, err
+
+
+def test_deploy_wait_reports_a_rollback_from_the_final_adapter(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A bare run id is a revision too, and its failed redeploy rolls back like any other.
+
+    `deploy flash-1` asks for the final adapter, which `parse_checkpoint_ref` reports as step
+    `None`. A run already serving `step-20` whose final-adapter redeploy fails is restored to
+    step-20 by `mark_deployment_failed`, and `deployment_for` rejects the restored record because
+    its non-null step does not match the requested final adapter -- so the bare-run form reads as
+    absent exactly like the `/step-N` form does. Exempting it from the rollback lookup reported the
+    run as vanished and dropped `last_deploy_error`.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "queued", "requested_at": "T1"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "deployments",
+        lambda timeout=None: [
+            {
+                "run_id": "flash-1",
+                "deployment": {
+                    "run_id": "flash-1",
+                    "checkpoint_step": 20,
+                    "state": "ready",
+                    "requested_at": "T0",
+                    "last_deploy_error": "adapter merge failed",
+                },
+            }
+        ],
+        raising=False,
+    )
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 1
+    err = capsys.readouterr().err
+    assert "adapter merge failed" in err, err
+    assert "previously deployed revision is still serving" in err, err
+    assert "no longer an active deployment" not in err, err
+
+
+def test_deploy_wait_rollback_lookup_stays_inside_the_deadline(
+    fake_client, monkeypatch
+) -> None:
+    """The rollback read is one more read inside the wait, not a second full-length one.
+
+    It runs after a poll that has already spent part of the budget, so bounding it by the
+    remainder computed BEFORE that poll hands it time the wait no longer has: a `--wait 5` whose
+    poll consumed nearly all five seconds could block for close to ten.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    def _poll(run_id, timeout=None):
+        # a stalled plane answers at its bound, which is what leaves nothing for the next read.
+        clock["t"] += timeout if timeout is not None else 0.0
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+    reads: list[tuple[float, float | None]] = []
+
+    def _listing(timeout=None):
+        reads.append((clock["t"], timeout))
+        return []
+
+    monkeypatch.setattr(fake_client, "deployments", _listing, raising=False)
+
+    assert _run(["models", "deploy", "flash-1/step-40", "--wait", "5"]) == 1
+    assert reads, "the vanished branch issued no rollback lookup"
+    for start, bound in reads:
+        assert bound is not None, reads
+        # the expired case is allowed the zero-wait one-shot bound and nothing wider.
+        assert bound <= max(5.0 - start, cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS) + 0.001, (
+            reads
+        )
 
 
 @pytest.mark.parametrize(

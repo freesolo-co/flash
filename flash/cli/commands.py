@@ -809,7 +809,17 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
                 # reporting that as "no longer an active deployment" names the wrong event and
                 # drops `last_deploy_error`, the only record of why the requested revision did not
                 # make it (codex[bot]). look for the run's other revision before saying it vanished.
-                other = _rollback_record(client, run_id, budget)
+                # recomputed, not `budget`: that was the remainder BEFORE the read that just
+                # returned, and a poll which consumed nearly all of it would hand this lookup a
+                # second full-length bound -- so `--wait 5` could block for close to ten seconds,
+                # and the pinned one-shot of `--wait 0` for twice its fixed bound (codex[bot],
+                # cursor). the expired case still gets the zero-wait bound rather than being
+                # skipped: classifying rollback against vanished is the difference between
+                # reporting the real failure and naming the wrong event, and it is one read.
+                left = deadline - time.monotonic()
+                other = _rollback_record(
+                    client, run_id, left if left > 0 else _DEPLOY_ZERO_WAIT_READ_SECONDS
+                )
                 if other is not None:
                     return other
                 print(
@@ -846,11 +856,16 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
     parsed = parse_checkpoint_ref(run_id)
     if parsed is None:
         return None
-    base_run_id, step = parsed
-    if step is None:
-        # the request was for the final adapter, which is the run's only unstepped revision. an
-        # absent record there means gone, not rolled back.
-        return None
+    base_run_id, _ = parsed
+    # the requested step is not read here, and there is no early return for the final adapter.
+    # a run serving a checkpoint whose FINAL-adapter
+    # redeploy fails is rolled back to that checkpoint by `mark_deployment_failed`, and
+    # `deployment_for` rejects the restored record because its non-null `checkpoint_step` does not
+    # match the requested final adapter. exempting `step is None` therefore hit exactly the case
+    # this lookup exists for: the CLI reported the run as vanished and printed the stale queued
+    # record instead of the persisted error and the still-serving checkpoint (codex[bot], cursor).
+    # the rollback is always to a DIFFERENT revision, so the direction of the step change is not
+    # what makes it one -- `last_deploy_error` below is.
     try:
         entries = client.deployments(timeout=timeout)
     except (ApiError, ClientError):
