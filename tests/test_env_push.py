@@ -237,7 +237,9 @@ def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monke
     """
     env_dir = tmp_path / "legacy-env"
     env_dir.mkdir()
-    (env_dir / "custom.py").write_text("SCORER = 'gold'\n\ndef load_environment(**k):\n    return None\n")
+    (env_dir / "custom.py").write_text(
+        "SCORER = 'gold'\n\ndef load_environment(**k):\n    return None\n"
+    )
     (env_dir / "evaluations.py").write_text(
         "from custom import SCORER\n\ndef load_evaluations(environment=None): return []\n"
     )
