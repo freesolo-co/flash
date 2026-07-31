@@ -63,6 +63,14 @@ def post_json(url: str, path: str, payload: dict) -> dict:
     0.0 because one bad completion must not kill a run -- a broken turn here has already consumed
     gpu time and left the parent's episode state half-advanced, and continuing would train on a
     transcript the environment never agreed to.
+
+    carries NO deadline, for the same reason the single-turn reward client does not: MultiTurnBridge
+    guards every env touch with one lock, so with many rollouts in flight a request spends most of
+    its life queued behind other episodes rather than being served slowly. a client timeout there
+    fails healthy episodes for arriving Nth, which is a property of the batch size and not of the
+    environment. a genuinely wedged env is caught by the stall watchdog instead
+    (``flash/providers/_poll.py`` STALL_AFTER_S), which measures training progress rather than one
+    request (codex[bot]).
     """
     request = urllib.request.Request(
         url.rstrip("/") + path,
@@ -71,7 +79,7 @@ def post_json(url: str, path: str, payload: dict) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=600) as response:
+        with urllib.request.urlopen(request) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
         with contextlib.suppress(Exception):
@@ -126,6 +134,7 @@ def build_flash_grpo_multi_turn_agent_loop(
             example_index = int(kwargs["index"])
             max_turns = int(os.environ["FLASH_VERL_MAX_TURNS"])
             max_model_len = int(os.environ["FLASH_VERL_MAX_MODEL_LEN"])
+            max_completion_tokens = int(os.environ["FLASH_VERL_MAX_COMPLETION_TOKENS"])
             stop_sequences = tuple(
                 str(value) for value in json.loads(os.environ.get("FLASH_VERL_STOP_SEQUENCES", "[]"))
             )
@@ -177,7 +186,12 @@ def build_flash_grpo_multi_turn_agent_loop(
                         "flash multi-turn bridge returned an invalid per-example turn limit"
                     )
                 for turn_ordinal in range(turn_limit):
+                    # three budgets, all binding: the configured per-turn cap, the engine's
+                    # remaining context, and the response tensor's remaining width. the first is
+                    # what the user asked for and the other two are what the episode can still
+                    # hold, so one turn never spends the whole transcript.
                     max_tokens = min(
+                        max_completion_tokens,
                         max_model_len - len(prefix_ids),
                         response_capacity - len(response_ids),
                     )
