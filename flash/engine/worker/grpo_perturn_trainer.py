@@ -101,12 +101,12 @@ def build_per_turn_advantages(
                 # empty turn contributes no advantage and must not skew the group baseline.
                 continue
             mean_reward = sum(
-                cast(tuple[float, ...], rows[row_index].turns)[turn_index]
+                cast("tuple[float, ...]", rows[row_index].turns)[turn_index]
                 for row_index in member_indexes
             ) / len(member_indexes)
             for row_index in member_indexes:
                 row = rows[row_index]
-                reward = cast(tuple[float, ...], row.turns)[turn_index]
+                reward = cast("tuple[float, ...]", row.turns)[turn_index]
                 start, end = row.spans[turn_index]
                 advantages[row_index, start:end] = reward - mean_reward
 
@@ -119,9 +119,9 @@ class GRPOPerTurnTrainer(GRPOTrainer):
     """Replace scalar GRPO advantages with aligned per-turn advantages when supplied."""
 
     def _generate_and_score_completions(self, inputs: list[dict[str, object]]) -> dict[str, object]:
-        output = cast(dict[str, object], super()._generate_and_score_completions(inputs))
+        output = cast("dict[str, object]", super()._generate_and_score_completions(inputs))
         turn_rewards = cast(
-            list[list[float] | None],
+            "list[list[float] | None]",
             [item.get("turn_rewards") for item in inputs],
         )
         if not any(rewards is not None for rewards in turn_rewards):
@@ -137,16 +137,16 @@ class GRPOPerTurnTrainer(GRPOTrainer):
             )
 
         turn_spans = cast(
-            list[list[tuple[int, int]] | None],
+            "list[list[tuple[int, int]] | None]",
             [item.get("turn_spans") for item in inputs],
         )
         if any(spans is None for spans in turn_spans):
             raise ValueError("per-turn rollout rows must all include turn_spans")
-        aligned_turn_spans = cast(list[list[tuple[int, int]]], turn_spans)
-        scalar_advantages = cast(torch.Tensor, output["advantages"])
+        aligned_turn_spans = cast("list[list[tuple[int, int]]]", turn_spans)
+        scalar_advantages = cast("torch.Tensor", output["advantages"])
         if scalar_advantages.dim() != 1:
             raise ValueError("expected TRL scalar advantages with shape [B]")
-        completion_ids = cast(torch.Tensor, output["completion_ids"])
+        completion_ids = cast("torch.Tensor", output["completion_ids"])
         batch_size, completion_len = completion_ids.shape
         if len(inputs) != batch_size:
             raise ValueError(

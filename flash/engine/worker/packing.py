@@ -92,8 +92,11 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None, revision: str = "") 
             model_type = getattr(cfg, "model_type", None) or model_type
         mod = importlib.import_module(f"transformers.models.{model_type}.modeling_{model_type}")
         gdn_cls = next(
-            (c for n, c in vars(mod).items()
-             if isinstance(c, type) and n.endswith("GatedDeltaNet")),
+            (
+                c
+                for n, c in vars(mod).items()
+                if isinstance(c, type) and n.endswith("GatedDeltaNet")
+            ),
             None,
         )
         if gdn_cls is None:
@@ -118,7 +121,9 @@ def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bo
 
         if not (is_flash_linear_attention_available() and is_causal_conv1d_available()):
             return False
-        importlib.import_module("causal_conv1d")  # fail a built-but-broken ABI here, not at model load
+        importlib.import_module(
+            "causal_conv1d"
+        )  # fail a built-but-broken ABI here, not at model load
         if not _gdn_forward_threads_reset_kwargs(model_id, revision=revision):
             return False
         # causal_conv1d compiled without the current GPU arch imports fine but raises at first forward;
@@ -237,7 +242,9 @@ def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[l
     """Tokenize texts for packing, matching TRL's non-packed SFT prep (EOS appended, default add_special_tokens)."""
     eos = tokenizer.eos_token or ""
     rows = [t if (eos and t.endswith(eos)) else t + eos for t in texts]
-    enc = tokenizer(rows, truncation=True, max_length=max_length)  # default add_special_tokens (TRL parity)
+    enc = tokenizer(
+        rows, truncation=True, max_length=max_length
+    )  # default add_special_tokens (TRL parity)
     return enc["input_ids"]
 
 
@@ -306,7 +313,11 @@ class BlockDiagonalCollator:
         longest = max((len(r) for r in rows), default=0)
         m = self.pad_to_multiple_of
         # No padding on the varlen path: trailing pad not covered by cu_seqlens breaks the fla kernel.
-        total = longest if self.emit_varlen else (((longest + m - 1) // m) * m if m and m > 1 else longest)
+        total = (
+            longest
+            if self.emit_varlen
+            else (((longest + m - 1) // m) * m if m and m > 1 else longest)
+        )
         total = max(total, 1)
 
         input_ids = torch.full((bsz, total), self.pad_token_id, dtype=torch.long)

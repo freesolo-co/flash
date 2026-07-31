@@ -171,9 +171,7 @@ JOB_SPEC = load_job_spec_from_env()
 SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
 PHASE = os.environ.get(
     "PHASE",
-    JOB_SPEC.phase
-    if JOB_SPEC
-    else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
+    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
 )
 OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
 

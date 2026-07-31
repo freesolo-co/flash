@@ -216,23 +216,24 @@ def create_run(
             )
         except ServingPreflightError:
             raise
-        except Exception as exc:
+        # resolve the class off the module rather than binding it at import: flash.runner is
+        # reloaded (tests, and any reimport), which rebinds the class to a new object, and a
+        # bound name would silently stop matching the error the runner actually raises.
+        except _runner.WarmStartPreparationError as exc:
+            # only failures raised while resolving the warm-start source reach here, so the adapter
+            # really is the cause. the reason itself stays out of the response on purpose: it can
+            # name internal storage paths and source-run internals. it is logged instead.
             source_ref = spec.train.init_from_adapter
-            if source_ref:
-                _LOG.warning(
-                    "warm-start preparation failed for %s from %s",
-                    run_id,
-                    source_ref,
-                    exc_info=True,
-                )
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"train.init_from_adapter source {source_ref!r} could not be prepared; "
-                        "verify that the source adapter is complete, compatible, and unchanged"
-                    ),
-                ) from exc
-            raise
+            _LOG.warning(
+                "warm-start preparation failed for %s from %s", run_id, source_ref, exc_info=True
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"train.init_from_adapter source {source_ref!r} could not be prepared; "
+                    "verify that the source adapter is complete, compatible, and unchanged"
+                ),
+            ) from exc
         run_id = prepared.public_spec.run_id
         # validate the spec BEFORE charging affordability against it. submit_job runs these same
         # read-only gates, but it runs them after this point, so an unsupported spec would be told
