@@ -461,7 +461,7 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     # treat it as live, so create_app()'s lifespan recover_runs() would dispatch real sweep_orphans()
     # list calls at startup. This test only checks /v1/me, so stub the provider set to empty to keep it
     # hermetic. (Pre-PR this fixture set only RUNPOD_API_KEY, whose sweep is a no-op.)
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     # FREESOLO_INTERNAL_KEY also enables startup slot-store reconcile (urllib POST). No-op it so this
     # fixture's urlopen stub stays focused on /api/auth/verify.
     monkeypatch.setattr(

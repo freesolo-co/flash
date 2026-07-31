@@ -127,8 +127,7 @@ def _abort_ambiguous_launch(run_id: str, detail: str) -> None:
         ids = [
             str(instance["id"])
             for instance in instances
-            if instance.get("id")
-            and label_matches_run(str(instance.get("name") or ""), prefix)
+            if instance.get("id") and label_matches_run(str(instance.get("name") or ""), prefix)
         ]
         if ids:
             for instance_id in ids:
@@ -229,7 +228,9 @@ def launch_and_submit(
                 detail = sanitize_diagnostic(e, limit=1000)
                 # preload must not fall back cold because it would train instead of warming the cache.
                 if mode == "preload":
-                    say(f"weight cache unavailable in {inst.region} ({detail}); skipping (preload needs it)")
+                    say(
+                        f"weight cache unavailable in {inst.region} ({detail}); skipping (preload needs it)"
+                    )
                     continue
                 say(f"weight cache unavailable in {inst.region} ({detail}); launching cold")
         try:
@@ -348,9 +349,7 @@ def _failure_detail(
     boot_name = f"lambda_attempt{attempt}_boot.log"
     boot = _make_hf_file_reader(hf_repo, f"{prefix}/{boot_name}")(force=True)
     if boot:
-        parts.append(
-            f"--- {boot_name} (host) ---\n{sanitize_diagnostic(boot[-4096:], limit=4096)}"
-        )
+        parts.append(f"--- {boot_name} (host) ---\n{sanitize_diagnostic(boot[-4096:], limit=4096)}")
     return "\n".join(parts) or "lambda worker terminated without a strict terminal marker"
 
 

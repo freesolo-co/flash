@@ -334,9 +334,7 @@ def _install_opd_kwargs_test_gpu(monkeypatch, *, card_gb=80, free_gb=None):
             return SimpleNamespace(total_memory=card_gb * 1024**3)
 
     if free_gb is not None:
-        _Cuda.mem_get_info = staticmethod(
-            lambda: (int(free_gb * 1024**3), int(card_gb * 1024**3))
-        )
+        _Cuda.mem_get_info = staticmethod(lambda: (int(free_gb * 1024**3), int(card_gb * 1024**3)))
 
     torch_mod = types.ModuleType("torch")
     torch_mod.cuda = _Cuda
@@ -926,9 +924,7 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
     return _SamplingParams, _StructuredOutputsParams
 
 
-def test_opd_vllm_sync_atomically_publishes_before_dropping_old_adapter(
-    monkeypatch, tmp_path
-):
+def test_opd_vllm_sync_atomically_publishes_before_dropping_old_adapter(monkeypatch, tmp_path):
     from flash.engine.worker import opd_vllm
 
     _install_fake_vllm(monkeypatch)
