@@ -89,6 +89,15 @@ from flash.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 
 DATA_SOURCE = "flash_env"
 
+# how many concurrently-finished episodes the multi-turn bridge scores in ONE env call. a whole
+# generation is prompts_per_step * group_size episodes and they finish at different turn counts,
+# so the batch is whatever has landed when the first waiter's grace period expires rather than a
+# barrier over the step. the grace period is short because the cost being amortised is a judge
+# round-trip: an episode should never wait longer than one is worth.
+_MULTI_TURN_SCORE_BATCH_SIZE = 64
+_MULTI_TURN_SCORE_FLUSH_WAIT_S = 0.1
+_MULTI_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
+
 
 # --------------------------------------------------------------------------------------------
 # pure helpers (no verl, no gpu, no network) -- unit tested directly.
@@ -1212,7 +1221,7 @@ _flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage
 '''
 
 
-def render_reentrant_checkpointing_shim(reentrant: bool) -> str:
+def render_reentrant_checkpointing_shim(reentrant: bool, *, multimodal: bool = False) -> str:
     """return the sitecustomize source that makes verl's gradient checkpointing REENTRANT.
 
     verl hardcodes ``use_reentrant=False`` at its single checkpointing site
@@ -1235,21 +1244,69 @@ def render_reentrant_checkpointing_shim(reentrant: bool) -> str:
     flag-level change. the guard below exists for the same reason -- ``_build_module`` also builds
     engines whose config may legitimately have checkpointing off, and enabling it there would turn
     on a feature verl chose to leave off.
+
+    on a MULTIMODAL run the same hook also restores vision input gradients. reentrant recompute
+    drops the backward for a checkpointed block when none of that block's inputs require grad, and
+    the vision tower's patch embeddings are exactly that case: the pixels are frozen inputs, so
+    without a forward hook marking the patch-embed output as requiring grad the visual modules
+    silently receive nothing while the language side trains normally and the run reports success
+    (``tests/test_multimodal_input_grads.py``). the retired trl path installed the same hook via a
+    trainer callback; verl has no callback surface, so it rides this shim instead -- and only here,
+    because non-reentrant recompute does not have the behaviour that makes it necessary
+    (codex[bot]).
     """
     if not reentrant:
         return ""
-    return '''
+    # 8 spaces, not 4: this is interpolated INSIDE the `if enable_gradient_checkpointing` body
+    # below. at 4 it dedents out of the block and the rendered sitecustomize is a SyntaxError, so
+    # every multimodal reentrant run dies before the shim can do anything.
+    vision_hook = (
+        '''
+        _flash_install_vision_input_grads(module)'''
+        if multimodal
+        else ""
+    )
+    vision_helper = (
+        '''
+
+def _flash_install_vision_input_grads(module):
+    """mark the vision patch-embed output as requiring grad; see the docstring above."""
+    import torch as _flash_vision_torch
+
+    _get_base = getattr(module, "get_base_model", None)
+    if callable(_get_base):
+        _base = _get_base()
+    else:
+        _peft_base = getattr(module, "base_model", None)
+        _base = getattr(_peft_base, "model", module)
+
+    def _flash_require_output_grad(_module, _inputs, output):
+        tensor = output[0] if isinstance(output, tuple) and output else output
+        if isinstance(tensor, _flash_vision_torch.Tensor) and tensor.is_floating_point():
+            tensor.requires_grad_(True)
+
+    for _path, _submodule in _base.named_modules():
+        if _path.endswith("visual.patch_embed"):
+            _submodule.register_forward_hook(_flash_require_output_grad)
+            print(f"[rl-verl] vision input gradients enabled at {_path}", flush=True)
+            return
+    print("[rl-verl] no visual.patch_embed found; vision input gradients not installed", flush=True)
+'''
+        if multimodal
+        else ""
+    )
+    return f'''
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine as _FlashReentrantEngine
 
 _flash_reentrant_original_build_module = _FlashReentrantEngine._build_module
-
+{vision_helper}
 
 def _flash_reentrant_build_module(self):
     module = _flash_reentrant_original_build_module(self)
     # only when verl actually enabled checkpointing: calling gradient_checkpointing_enable on a
     # model verl deliberately left uncheckpointed would turn it ON and change the memory profile.
     if getattr(self.model_config, "enable_gradient_checkpointing", False):
-        module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+        module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={{"use_reentrant": True}}){vision_hook}
         print("[rl-verl] reentrant gradient checkpointing is active", flush=True)
     return module
 
@@ -1627,6 +1684,159 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
 # --------------------------------------------------------------------------------------------
 # reward rpc bridge: verl subprocess -> flash live env.
 # --------------------------------------------------------------------------------------------
+class _EpisodeScoreWaiter:
+    """one episode waiting on a batched scoring call."""
+
+    def __init__(self, request, enqueued_at: float) -> None:
+        self.request = request
+        self.enqueued_at = enqueued_at
+        self.done = threading.Event()
+        self.result = None
+        self.error: Exception | None = None
+        self._lock = threading.Lock()
+
+    def complete(self, *, result=None, error: Exception | None = None) -> None:
+        with self._lock:
+            if self.done.is_set():
+                return
+            self.result = result
+            self.error = error
+            self.done.set()
+
+    def wait(self):
+        # no deadline: the wait is the env's own scoring time plus however long the batch ahead of
+        # it takes, and the stall watchdog is what catches a genuinely wedged env.
+        self.done.wait()
+        if self.error is not None:
+            raise self.error
+        if self.result is None:
+            raise RuntimeError("multi-turn episode score waiter completed without a result")
+        return self.result
+
+
+class _EpisodeScoreBatcher:
+    """coalesce concurrently-finished episodes into one env scoring call.
+
+    same shape as the opd text-teacher batcher: a single daemon thread takes whatever is pending
+    once the oldest waiter's grace period expires, scores it in one call, and scatters the results
+    back in request order. one thread means the env still sees exactly one scoring call at a time,
+    which is the contract the rest of this bridge holds it to -- the concurrency it gains is the
+    env's OWN, inside the batched call.
+    """
+
+    def __init__(self, score_batch, *, max_batch_size: int, flush_wait_s: float) -> None:
+        if max_batch_size <= 0:
+            raise ValueError("multi-turn score batch size must be positive")
+        if flush_wait_s <= 0:
+            raise ValueError("multi-turn score flush wait must be positive")
+        self._score_batch = score_batch
+        self.max_batch_size = int(max_batch_size)
+        self.flush_wait_s = float(flush_wait_s)
+        self._condition = threading.Condition()
+        self._pending: list[_EpisodeScoreWaiter] = []
+        self._in_flight: list[_EpisodeScoreWaiter] = []
+        self._closed = False
+        self._thread: threading.Thread | None = None
+
+    def _ensure_running(self) -> None:
+        """start the consumer thread if it is not already running; idempotent and safe to race.
+
+        deliberately lazy rather than an explicit ``start()`` a caller must remember: with nothing
+        consuming ``_pending`` a scoring episode blocks on its event FOREVER, and a construct-but-
+        never-start bug is invisible until a multi-turn run wedges on real gpu. binding the start
+        to the first ``score`` makes that state unreachable.
+        """
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("multi-turn score batcher shut down")
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(
+                target=self._run, name="flash-grpo-episode-scorer", daemon=True
+            )
+            thread = self._thread
+        thread.start()
+
+    def score(self, request):
+        self._ensure_running()
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("multi-turn score batcher shut down")
+            waiter = _EpisodeScoreWaiter(request, enqueued_at=time.monotonic())
+            self._pending.append(waiter)
+            self._condition.notify_all()
+        return waiter.wait()
+
+    def _take_batch(self) -> list[_EpisodeScoreWaiter] | None:
+        with self._condition:
+            while not self._pending:
+                if self._closed:
+                    return None
+                self._condition.wait()
+            deadline = self._pending[0].enqueued_at + self.flush_wait_s
+            while len(self._pending) < self.max_batch_size and not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._condition.wait(remaining)
+            batch = self._pending[: self.max_batch_size]
+            del self._pending[: len(batch)]
+            self._in_flight = batch
+            return batch
+
+    def _run(self) -> None:
+        try:
+            while True:
+                batch = self._take_batch()
+                if batch is None:
+                    return
+                try:
+                    results = self._score_batch([waiter.request for waiter in batch])
+                    # materialize the pairing BEFORE completing anyone: zip(strict=True) checks the
+                    # lengths only when it reaches the end, so scattering as it iterates would
+                    # resolve a prefix of the waiters and only THEN raise on the mismatch. building
+                    # the list first moves that raise ahead of every completion, so the except
+                    # below always sees an all-or-nothing batch rather than a half-scattered one.
+                    scattered = list(zip(batch, results, strict=True))
+                    for waiter, result in scattered:
+                        waiter.complete(result=result)
+                except Exception as error:
+                    # EVERY waiter in the batch fails, not just the one that provoked it. each waiter
+                    # blocks on its OWN event, so the notify_all below cannot wake them -- a waiter
+                    # left uncompleted here hangs until the 1500s stall watchdog kills the run, with
+                    # no error anywhere. complete() ignores a second call, so waiters already
+                    # resolved by a partial scatter keep their result.
+                    for waiter in batch:
+                        waiter.complete(error=error)
+                finally:
+                    with self._condition:
+                        self._in_flight = []
+                        self._condition.notify_all()
+        finally:
+            error = RuntimeError("multi-turn score batcher stopped")
+            with self._condition:
+                stranded = [*self._pending, *self._in_flight]
+                self._pending.clear()
+                self._in_flight = []
+                self._closed = True
+                self._condition.notify_all()
+            for waiter in stranded:
+                waiter.complete(error=error)
+
+    def close(self, timeout_s: float = _MULTI_TURN_SCORE_SHUTDOWN_WAIT_S) -> None:
+        with self._condition:
+            self._closed = True
+            pending = list(self._pending)
+            self._pending.clear()
+            self._condition.notify_all()
+            thread = self._thread
+        error = RuntimeError("multi-turn score batcher shut down")
+        for waiter in pending:
+            waiter.complete(error=error)
+        if thread is not None:
+            thread.join(timeout=timeout_s)
+
+
 class MultiTurnBridge:
     """parent-side episode state for the child's multi-turn agent loop.
 
@@ -1646,12 +1856,18 @@ class MultiTurnBridge:
         env,
         examples: list[dict],
         *,
+        env_prompts: list[list[dict]],
         max_turns: int,
         per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
+        score_batch_size: int = _MULTI_TURN_SCORE_BATCH_SIZE,
+        score_flush_wait_s: float = _MULTI_TURN_SCORE_FLUSH_WAIT_S,
     ) -> None:
+        if len(env_prompts) != len(examples):
+            raise ValueError("multi-turn env prompts must align one-to-one with examples")
         self._env = env
         self._examples = examples
+        self._env_prompts = env_prompts
         self._max_turns = int(max_turns)
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
@@ -1659,6 +1875,19 @@ class MultiTurnBridge:
         # every env touch below happens under this lock, matching the single-turn path's contract.
         self._lock = threading.Lock()
         self._sessions: dict[str, dict] = {}
+        # episode scoring still happens under that lock, but ONE call now covers many episodes.
+        # scoring is the one env call that is both batchable and expensive (a judge round-trip),
+        # and score_rollouts hands a whole batch to `score_episodes`, which the env runs at its own
+        # `max_score_concurrency`. holding the lock per episode turned one judge round into
+        # hundreds of serial blocking calls with the gpu idle (codex[bot]). batching shortens the
+        # total time the lock is held rather than dropping it: `reward_thread_safe` licenses racing
+        # the scorer against ITSELF, which is not the same as racing it against `env_reply`, and no
+        # env contract permits the latter.
+        self._scorer = _EpisodeScoreBatcher(
+            self._score_batch,
+            max_batch_size=int(score_batch_size),
+            flush_wait_s=float(score_flush_wait_s),
+        )
 
     def routes(self) -> dict:
         return {
@@ -1667,6 +1896,11 @@ class MultiTurnBridge:
             "/multiturn/score": self.score,
             "/multiturn/close": self.close,
         }
+
+    def shutdown(self) -> None:
+        """stop the scoring thread. distinct from the ``/multiturn/close`` route, which ends one
+        episode. any episode still waiting is failed rather than left blocked on its event."""
+        self._scorer.close()
 
     def _session(self, payload: dict) -> dict:
         session_id = str(payload["session_id"])
@@ -1687,6 +1921,15 @@ class MultiTurnBridge:
             if session_id in self._sessions:
                 raise KeyError(f"duplicate multi-turn session {session_id}")
             state = self._env.new_rollout_state(example)
+            # `new_rollout_state` calls `start_episode` a SECOND time -- dataset preparation
+            # already called it to build the prompt the child is generating against. an env that
+            # randomizes per episode returns a different opening here, and the run would then
+            # train a response generated for prompt A on a reward computed for prompt B. adopt
+            # the dataset's prompt so the transcript and the score describe one episode. the rest
+            # of the state (task, env-internal fields) stays as the env built it (codex[bot]).
+            env_prompt = [dict(message) for message in self._env_prompts[index]]
+            state["prompt"] = env_prompt
+            state["messages"] = [dict(message) for message in env_prompt]
             self._sessions[session_id] = {"example": example, "state": state}
         # the per-example budget wins over the batch-wide cap, same precedence as rollout_done.
         episode_turns = state.get("max_episode_turns")
@@ -1723,21 +1966,32 @@ class MultiTurnBridge:
             ],
         }
 
+    def _score_batch(self, requests: list) -> list:
+        """score a whole batch of terminal episodes in ONE env call. runs on the batcher thread.
+
+        takes the same lock every other env touch takes, so scoring never overlaps a concurrent
+        episode's ``env_reply``. the win is that one lock acquisition now covers a whole batch.
+        """
+        with self._lock:
+            return score_rollouts(self._env, requests)
+
     def score(self, payload: dict) -> dict:
         turn_count = int(payload["turn_count"])
         with self._lock:
             session = self._session(payload)
             state = session["state"]
-            reward = score_rollouts(
-                self._env,
-                [
-                    RolloutScoreRequest(
-                        example=session["example"],
-                        state=state,
-                        turn_count=turn_count,
-                    )
-                ],
-            )[0]
+        # queued OUTSIDE the lock so concurrent episodes can coalesce into one env call; the
+        # batcher thread reacquires it to do the scoring. safe to read this session's state
+        # unlocked because the episode is terminal -- the child sends /score only after its turn
+        # loop has ended, so nothing else mutates this session.
+        reward = self._scorer.score(
+            RolloutScoreRequest(
+                example=session["example"],
+                state=state,
+                turn_count=turn_count,
+            )
+        )
+        with self._lock:
             # snapshot under the same lock that guards the session: `step` mutates this list in
             # place, and a concurrent episode's turn would otherwise be read mid-append.
             prompt = list(state.get("prompt") or ())
@@ -1820,6 +2074,12 @@ def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[
         "FLASH_VERL_MULTITURN_URL": reward_url,
         "FLASH_VERL_MAX_TURNS": str(int(inp["max_turns"])),
         "FLASH_VERL_MAX_MODEL_LEN": str(int(inp["engine_len"])),
+        # the PER-TURN cap. distinct from the two episode-wide budgets the child already derives:
+        # `[train].max_completion_tokens` bounds ONE assistant turn, while max_model_len and the
+        # response tensor bound the whole transcript. without it the first turn may consume the
+        # entire episode budget, which is both a cost and a behaviour change from the retired
+        # driver's `_turn_budget` (per_turn_max_tokens=max_completion) (codex[bot]).
+        "FLASH_VERL_MAX_COMPLETION_TOKENS": str(int(inp["max_completion"])),
         "FLASH_VERL_STOP_SEQUENCES": json.dumps(list(inp["stop_sequences"])),
         # sorted so the child sees a stable set regardless of frozenset iteration order.
         "FLASH_VERL_EOS_TOKEN_IDS": json.dumps(sorted(inp["eos_token_ids"])),
@@ -2550,6 +2810,10 @@ def _resolve_grpo_inputs():
                 prompts.append(
                     {
                         "prompt": normalized.messages,
+                        # the pre-normalization messages, i.e. exactly what this example's
+                        # start_episode returned. see the text branch below for why the bridge
+                        # needs them.
+                        "env_prompt": messages,
                         "images": list(normalized.descriptors),
                         "rendered": rendered,
                         "example": ex,
@@ -2566,6 +2830,13 @@ def _resolve_grpo_inputs():
                 prompts.append(
                     {
                         "prompt": messages,
+                        # the messages this row's prompt was BUILT from. `env.prompt_messages`
+                        # calls `start_episode`, and an env is free to randomize there (the
+                        # starter env's own secret is per-example, but nothing stops a per-EPISODE
+                        # one), so the bridge cannot call it a second time and get the same
+                        # episode back. it adopts these instead, keeping the transcript the model
+                        # generated and the state the env scores on the same episode (codex[bot]).
+                        "env_prompt": messages,
                         "rendered": rendered,
                         "example": ex,
                         "prompt_len": prompt_len,
@@ -2799,7 +3070,9 @@ def run_rl_verl():
     shim_source = "".join(
         part
         for part in (
-            render_reentrant_checkpointing_shim(inp["reentrant_checkpointing"]),
+            render_reentrant_checkpointing_shim(
+                inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"])
+            ),
             render_entropy_quantile_shim(inp["entropy_quantile"]),
             render_per_turn_credit_shim(inp["per_turn_credit"]),
             render_stop_sequences_shim(inp["stop_sequences"]),
@@ -2897,6 +3170,8 @@ def run_rl_verl():
         MultiTurnBridge(
             env,
             rollout_examples,
+            # index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order.
+            env_prompts=[p["env_prompt"] for p in prompts],
             max_turns=int(inp["max_turns"]),
             per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
@@ -3202,6 +3477,11 @@ def run_rl_verl():
                 resume_uploader.stop()
         with contextlib.suppress(Exception):
             device_peak_gpu_gb = gpu_sampler.stop_gb()
+        # bridge first: the scoring thread is what the server's routes block on, so stopping the
+        # server before it would strand a scoring episode on an event nothing will ever set.
+        if multi_turn_bridge is not None:
+            with contextlib.suppress(Exception):
+                multi_turn_bridge.shutdown()
         server.shutdown()
 
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.

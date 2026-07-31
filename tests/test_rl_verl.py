@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import json
 import math
@@ -1479,11 +1480,164 @@ def test_the_reentrant_shim_is_wired_for_gdn_and_moe_models_and_not_for_dense_on
     resolved = inspect.getsource(rl_verl._resolve_grpo_inputs)
     assert '"reentrant_checkpointing": bool(_w.grpo_use_reentrant(model_id))' in resolved
     written = inspect.getsource(rl_verl.run_rl_verl)
-    assert 'render_reentrant_checkpointing_shim(inp["reentrant_checkpointing"])' in written
+    assert (
+        "render_reentrant_checkpointing_shim( "
+        'inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"]) )'
+        in " ".join(written.split())
+    )
     # the curated GDN hybrids and the MoE need it; an uncataloged dense model does not.
     assert W.grpo_use_reentrant("Qwen/Qwen3.5-4B") is True
     assert W.grpo_use_reentrant("Qwen/Qwen3.6-35B-A3B") is True
     assert W.grpo_use_reentrant("meta-llama/Llama-3.1-8B") is False
+
+
+def test_the_reentrant_shim_installs_vision_input_grads_only_for_multimodal_runs():
+    # reentrant recompute DROPS the backward for a checkpointed block when none of that block's
+    # inputs require grad. the vision tower's patch embeddings are exactly that case -- the pixels
+    # are frozen inputs -- so without a forward hook marking the patch-embed output as requiring
+    # grad the visual modules silently train on nothing while the language side trains normally and
+    # the run reports success. the retired trl path installed the same hook via a trainer callback;
+    # verl has no callback surface, so it rides this shim.
+    text_only = rl_verl.render_reentrant_checkpointing_shim(True)
+    assert "_flash_install_vision_input_grads" not in text_only, (
+        "a text-only run pays for a vision hook that can never match"
+    )
+    multimodal = rl_verl.render_reentrant_checkpointing_shim(True, multimodal=True)
+    # compile FIRST. an earlier version asserted only that the call text appeared, which the
+    # helper's own `def _flash_install_vision_input_grads(module):` line satisfies on its own --
+    # so the assertion held while the call site was emitted at the wrong indent and the rendered
+    # sitecustomize was a SyntaxError. this shim is exec'd in verl's child, where a syntax error
+    # is a silent no-op rather than a test failure, so compiling here is the only real gate.
+    compile(multimodal, "sitecustomize.py", "exec")
+    assert "visual.patch_embed" in multimodal
+    # the call has to land INSIDE the checkpointing branch: dedented one level it would run for
+    # every module verl builds, including engines whose checkpointing verl deliberately left off.
+    assert "\n        _flash_install_vision_input_grads(module)\n" in multimodal
+    # the flag is independent of the shim: a multimodal run on a model that does not need reentrant
+    # checkpointing gets no shim at all, and therefore no hook.
+    assert rl_verl.render_reentrant_checkpointing_shim(False, multimodal=True) == ""
+
+
+@contextlib.contextmanager
+def _vision_hook_installer(torch_module):
+    """yield the rendered vision helper with a stand-in torch visible to it.
+
+    the helper imports torch INSIDE the function body, so the stand-in has to stay in sys.modules
+    for the duration of the call rather than just the exec -- which is also the property that lets
+    the real shim run inside verl's child, where torch is imported long after sitecustomize.
+    """
+    source = rl_verl.render_reentrant_checkpointing_shim(True, multimodal=True)
+    helper_start = source.index("def _flash_install_vision_input_grads")
+    helper_end = source.index("def _flash_reentrant_build_module")
+    namespace: dict = {}
+    exec(source[helper_start:helper_end], namespace)
+    saved = sys.modules.get("torch")
+    sys.modules["torch"] = torch_module
+    try:
+        yield namespace["_flash_install_vision_input_grads"]
+    finally:
+        if saved is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = saved
+
+
+class _FakeTensor:
+    """the two attributes the hook interrogates, plus the mutation it performs."""
+
+    def __init__(self, *, floating=True):
+        self.requires_grad = False
+        self._floating = floating
+
+    def is_floating_point(self):
+        return self._floating
+
+    def requires_grad_(self, value=True):
+        self.requires_grad = value
+        return self
+
+
+class _FakeTorch:
+    Tensor = _FakeTensor
+
+
+class _FakeSubmodule:
+    def __init__(self):
+        self.hooks = []
+
+    def register_forward_hook(self, hook):
+        self.hooks.append(hook)
+
+    def forward(self, output):
+        for hook in self.hooks:
+            hook(self, (), output)
+        return output
+
+
+class _FakeVisionModel:
+    """named_modules() the way the hook walks it, at the paths a real vlm exposes."""
+
+    def __init__(self, *, patch_embed_path="visual.patch_embed"):
+        self.patch_embed = _FakeSubmodule()
+        self.other = _FakeSubmodule()
+        self._paths = {patch_embed_path: self.patch_embed, "model.layers.0": self.other}
+
+    def named_modules(self):
+        return list(self._paths.items())
+
+
+def test_the_vision_hook_marks_patch_embed_output_as_requiring_grad():
+    # runs the rendered helper for real rather than asserting on its text: a hook registered on the
+    # wrong submodule, or one that inspects the output incorrectly, still renders a plausible
+    # string. torch is absent from the unit env, so the stand-in reproduces exactly the contract
+    # the hook depends on -- `is_floating_point()` and `requires_grad_()` on a `torch.Tensor`.
+    model = _FakeVisionModel()
+    with _vision_hook_installer(_FakeTorch) as install:
+        install(model)
+        assert len(model.patch_embed.hooks) == 1
+        assert model.other.hooks == [], "the hook was installed on a non-vision submodule"
+
+        output = _FakeTensor()
+        assert output.requires_grad is False, "the fixture cannot demonstrate the bug"
+        assert model.patch_embed.forward(output).requires_grad is True
+
+        # a tuple output is what a real patch-embed returns; the hook must reach inside it.
+        tupled = _FakeTensor()
+        model.patch_embed.forward((tupled, None))
+        assert tupled.requires_grad is True
+
+        # an integer output (ids, not activations) must be left alone: requires_grad_ on a
+        # non-float tensor raises in real torch, taking the run down at the first forward.
+        integral = _FakeTensor(floating=False)
+        model.patch_embed.forward(integral)
+        assert integral.requires_grad is False
+
+
+def test_the_vision_hook_reports_when_it_finds_no_patch_embed(capsys):
+    # a silent no-op is the failure mode being fixed: visual modules training on nothing while the
+    # run reports success. if the path ever moves, the log line is what makes that visible.
+    with _vision_hook_installer(_FakeTorch) as install:
+        install(_FakeVisionModel(patch_embed_path="vision_tower.embeddings"))
+    assert "no visual.patch_embed found" in capsys.readouterr().out
+
+
+def test_the_vision_hook_unwraps_a_peft_model_to_find_the_vision_tower():
+    # grpo trains through a peft wrapper, so named_modules() on the wrapper is prefixed. the hook
+    # unwraps to the base model first; without that it would find nothing and silently no-op.
+    class _PeftWrapped:
+        def __init__(self, base):
+            self._base = base
+
+        def get_base_model(self):
+            return self._base
+
+        def named_modules(self):
+            raise AssertionError("the wrapper's own module list must not be walked")
+
+    base = _FakeVisionModel()
+    with _vision_hook_installer(_FakeTorch) as install:
+        install(_PeftWrapped(base))
+    assert len(base.patch_embed.hooks) == 1
 
 
 def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alone():
@@ -3086,6 +3240,7 @@ def _multi_turn_inp(**over):
     return {
         "max_turns": 4,
         "engine_len": 8192,
+        "max_completion": 512,
         "stop_sequences": ("</answer>",),
         "eos_token_ids": frozenset({151645, 151643}),
         **over,
@@ -3133,6 +3288,7 @@ def test_multi_turn_child_env_serializes_values_the_child_can_parse_back():
     assert all(isinstance(value, str) for value in emitted.values())
     assert int(emitted["FLASH_VERL_MAX_TURNS"]) == 4
     assert int(emitted["FLASH_VERL_MAX_MODEL_LEN"]) == 8192
+    assert int(emitted["FLASH_VERL_MAX_COMPLETION_TOKENS"]) == 512
     assert json.loads(emitted["FLASH_VERL_STOP_SEQUENCES"]) == ["</answer>"]
     # sorted, not set-ordered: the child compares against this list every turn and an unstable order
     # would make halting depend on hash seed.
@@ -3198,6 +3354,47 @@ def test_the_run_body_puts_the_shim_dir_on_the_child_path_for_multi_turn():
     assert 'if inp["multi_turn"]:\n        copy_multi_turn_child_modules(shim_dir)' in src
 
 
+# ---------------------- multi-turn per-turn generation cap ----------------------
+def test_the_child_caps_each_turn_at_max_completion_tokens_not_the_whole_episode():
+    # parity with the retired trl driver, which passed per_turn_max_tokens=max_completion into
+    # _turn_budget. without the cap the first turn may spend the ENTIRE episode budget: the other
+    # two bounds are transcript-wide, so a 4096-token engine window lets turn one generate 4096
+    # tokens and leaves nothing for the rest of the episode. asserted on the child's own source
+    # because the alternative is a full engine rollout to observe one min().
+    from flash.engine.worker import grpo_multiturn
+
+    body = " ".join(inspect.getsource(grpo_multiturn).split())
+    assert 'max_completion_tokens = int(os.environ["FLASH_VERL_MAX_COMPLETION_TOKENS"])' in body
+    assert (
+        "max_tokens = min( max_completion_tokens, max_model_len - len(prefix_ids), "
+        "response_capacity - len(response_ids), )" in body
+    ), "the per-turn cap is not one of the three budgets bounding a turn"
+
+
+def test_the_child_puts_no_deadline_on_a_bridge_call():
+    # MultiTurnBridge serializes every env touch behind one lock, so with a whole generation in
+    # flight a request spends most of its life QUEUED rather than being served slowly. a client
+    # timeout there fails healthy episodes for arriving Nth -- a function of batch size, not of
+    # the environment. a genuinely wedged env is caught by the stall watchdog instead, which
+    # measures training progress rather than one request.
+    from flash.engine.worker import grpo_multiturn
+
+    body = " ".join(inspect.getsource(grpo_multiturn.post_json).split())
+    assert "urllib.request.urlopen(request) as response" in body
+    assert "timeout=" not in body.split('"""')[-1], (
+        "a client-side deadline is back on the bridge call"
+    )
+
+
+def test_the_parent_sends_the_per_turn_cap_from_the_configured_completion_budget():
+    # the cap is only real if the parent actually exports it; the child KeyErrors mid-rollout
+    # otherwise, after the engine is already up and paid for.
+    emitted = rl_verl.multi_turn_child_env(
+        _multi_turn_inp(max_completion=321), reward_url="http://127.0.0.1:9/", thinking=False
+    )
+    assert emitted["FLASH_VERL_MAX_COMPLETION_TOKENS"] == "321"
+
+
 # ---------------------- multi-turn bridge routes ----------------------
 class _BridgeEnv:
     """the four calls MultiTurnBridge drives, recording what it was asked."""
@@ -3244,9 +3441,14 @@ class _BridgeEnv:
         return [RolloutReward(episode=self.episode, turns=None) for _ in items]
 
 
-def _bridge(env, *, max_turns=4, examples=None):
+def _bridge(env, *, max_turns=4, examples=None, env_prompts=None, **kwargs):
+    examples = examples if examples is not None else [{"index": 0}, {"index": 1}]
+    if env_prompts is None:
+        # what dataset preparation would have produced for these examples: the same opening the
+        # env's own start_episode returns. tests that care about the two DISAGREEING pass their own.
+        env_prompts = [[dict(message) for message in getattr(env, "prompt", ())] for _ in examples]
     return rl_verl.MultiTurnBridge(
-        env, examples if examples is not None else [{"index": 0}, {"index": 1}], max_turns=max_turns
+        env, examples, env_prompts=env_prompts, max_turns=max_turns, **kwargs
     )
 
 
@@ -3282,6 +3484,49 @@ def test_bridge_start_lets_a_per_example_budget_lower_the_cap_but_never_raise_it
     assert _bridge(_BridgeEnv(max_episode_turns=0), max_turns=4).start(
         {"index": 0, "session_id": "a"}
     ) == {"max_turns": 1}
+
+
+def test_bridge_start_adopts_the_datasets_prompt_over_a_second_start_episode():
+    # `new_rollout_state` calls `start_episode` a SECOND time; dataset preparation already called
+    # it to build the prompt the child generates against. an env that randomizes per episode hands
+    # back a DIFFERENT opening here, and the run would then score a response generated for prompt A
+    # against a reward computed for prompt B. the env below returns a fresh secret every call, the
+    # way a randomized env does.
+    class _RandomizingEnv(_BridgeEnv):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def new_rollout_state(self, example):
+            self.calls += 1
+            return {
+                "example": example,
+                "prompt": [{"role": "user", "content": f"secret-{self.calls}"}],
+                "messages": [{"role": "user", "content": f"secret-{self.calls}"}],
+            }
+
+    env = _RandomizingEnv()
+    dataset_prompt = [{"role": "user", "content": "secret-0"}]
+    bridge = _bridge(env, examples=[{"index": 0}], env_prompts=[dataset_prompt])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    scored = env.scored[0]
+    assert scored["prompt"] == dataset_prompt, (
+        "the episode was scored against a prompt the model never saw"
+    )
+    assert scored["messages"][0] == dataset_prompt[0]
+
+
+def test_bridge_rejects_prompts_that_do_not_align_with_its_examples():
+    # the two are indexed by the SAME integer the child sends. a length mismatch means some index
+    # reads the wrong row's prompt, or IndexErrors mid-rollout; both are worth failing at
+    # construction, before the engine is paid for.
+    with pytest.raises(ValueError, match="one-to-one"):
+        rl_verl.MultiTurnBridge(
+            _BridgeEnv(), [{"index": 0}, {"index": 1}], env_prompts=[[]], max_turns=4
+        )
 
 
 def test_bridge_start_rejects_an_out_of_range_index_before_touching_the_env():
@@ -3381,8 +3626,8 @@ def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
     # so the transcript IS the only thing this path can publish for `flash runs log`.
     recorded: list[tuple] = []
     env = _BridgeEnv(episode=0.75)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     bridge.step({"session_id": "a", "completion_text": "answer"})
@@ -3409,8 +3654,8 @@ def test_the_recorded_transcript_excludes_the_prompt_it_was_seeded_from():
         {"role": "user", "content": "what is 3+4"},
     ]
     env = _BridgeEnv(episode=0.75, prompt=prompt)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     bridge.step({"session_id": "a", "completion_text": "7"})
@@ -3432,8 +3677,8 @@ def test_the_transcript_slice_keeps_a_turn_that_merely_looks_like_a_prompt_messa
     recorded: list[tuple] = []
     prompt = [{"role": "user", "content": "repeat after me: go"}]
     env = _BridgeEnv(episode=1.0, done_after=99, prompt=prompt)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     # the env replies with the prompt message verbatim, then the model answers.
@@ -3449,8 +3694,9 @@ def test_the_recorded_episode_is_the_zeroed_reward_not_the_raw_nan():
     # the sample carries the reward the rollout actually trained on. publishing nan here would show
     # a reward in the log that no advantage was ever computed from.
     recorded: list[tuple] = []
-    bridge = rl_verl.MultiTurnBridge(
-        _BridgeEnv(episode=float("nan")), [{"index": 0}], max_turns=4,
+    bridge = _bridge(
+        _BridgeEnv(episode=float("nan")),
+        examples=[{"index": 0}],
         on_episode_scored=lambda *row: recorded.append(row),
     )
     bridge.start({"index": 0, "session_id": "a"})
@@ -3465,8 +3711,8 @@ def test_the_recorded_transcript_is_a_snapshot_that_later_turns_cannot_mutate():
     # a concurrent episode's turn appear inside an already-published sample.
     recorded: list[tuple] = []
     env = _BridgeEnv(done_after=99)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     bridge.step({"session_id": "a", "completion_text": "first"})
@@ -3484,8 +3730,9 @@ def test_the_episode_recorder_runs_outside_the_session_lock():
     # any grading that touches both deadlocks.
     observed: list[bool] = []
     env = _BridgeEnv()
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4,
+    bridge = _bridge(
+        env,
+        examples=[{"index": 0}],
         on_episode_scored=lambda *_: observed.append(bridge._lock.acquire(blocking=False)),
     )
     bridge.start({"index": 0, "session_id": "a"})
@@ -3517,8 +3764,8 @@ def test_a_first_turn_abort_is_still_shown_in_the_sample(abort):
     (codex[bot])."""
     recorded: list[tuple] = []
     env = _BridgeEnv(done_after=99)
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    bridge = _bridge(
+        env, examples=[{"index": 0}], on_episode_scored=lambda *row: recorded.append(row)
     )
     bridge.start({"index": 0, "session_id": "a"})
     assert bridge.step({"session_id": "a", "completion_text": "ran out of ro", **abort}) == {
@@ -3536,7 +3783,7 @@ def test_the_env_never_scores_the_aborted_turn_it_is_shown_in_the_sample():
     # asserting only on the sample would pass an implementation that also appended it to `messages`,
     # which is the truncated-text-gets-graded bug the abort branch exists to prevent.
     env = _BridgeEnv(done_after=99)
-    bridge = rl_verl.MultiTurnBridge(env, [{"index": 0}], max_turns=4)
+    bridge = _bridge(env, examples=[{"index": 0}])
     bridge.start({"index": 0, "session_id": "a"})
     bridge.step({"session_id": "a", "completion_text": "good turn"})
     bridge.step({"session_id": "a", "completion_text": "cut off", "truncated": True})
@@ -3545,6 +3792,212 @@ def test_the_env_never_scores_the_aborted_turn_it_is_shown_in_the_sample():
     scored = [m.get("content") for m in env.scored[0]["messages"]]
     assert "cut off" not in scored, "the truncated turn reached the env's scoring state"
     assert "good turn" in scored
+
+
+# ---------------------- multi-turn batched episode scoring ----------------------
+def test_concurrently_finished_episodes_are_scored_in_one_env_call():
+    # a generation is prompts_per_step * group_size episodes. scoring them one at a time turns one
+    # judge round into hundreds of serial round-trips with the gpu idle. the env below records the
+    # SIZE of every batch it is handed, so a regression to per-episode scoring shows up as many
+    # calls of one rather than one call of many.
+    class _BatchRecordingEnv(_BridgeEnv):
+        def __init__(self):
+            super().__init__()
+            self.batch_sizes: list[int] = []
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            self.batch_sizes.append(len(items))
+            return [RolloutReward(episode=1.0, turns=None) for _ in items]
+
+    env = _BatchRecordingEnv()
+    examples = [{"index": i} for i in range(8)]
+    bridge = _bridge(env, examples=examples)
+    for i in range(8):
+        bridge.start({"index": i, "session_id": f"s{i}"})
+        bridge.step({"session_id": f"s{i}", "completion_text": "answer"})
+
+    scores: dict[int, float] = {}
+    threads = [
+        threading.Thread(
+            target=lambda i=i: scores.__setitem__(
+                i, bridge.score({"session_id": f"s{i}", "turn_count": 1})["score"]
+            )
+        )
+        for i in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not [t for t in threads if t.is_alive()], "a scoring episode never completed"
+
+    assert scores == dict.fromkeys(range(8), 1.0)
+    assert max(env.batch_sizes) > 1, (
+        f"every episode was scored alone: batch sizes {env.batch_sizes}"
+    )
+    assert sum(env.batch_sizes) == 8, "an episode was scored twice or not at all"
+
+
+def test_a_batched_score_reaches_the_env_under_the_same_lock_every_other_call_takes():
+    # scoring is batched to shorten how long the lock is held, NOT to drop it. `reward_thread_safe`
+    # licenses racing the scorer against ITSELF; it says nothing about racing it against a
+    # concurrent episode's `env_reply`, and no env contract permits that.
+    class _LockObservingEnv(_BridgeEnv):
+        def __init__(self):
+            super().__init__()
+            self.held_during_scoring: list[bool] = []
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            acquired = bridge._lock.acquire(blocking=False)
+            self.held_during_scoring.append(not acquired)
+            if acquired:
+                bridge._lock.release()
+            return [RolloutReward(episode=1.0, turns=None) for _ in items]
+
+    env = _LockObservingEnv()
+    bridge = _bridge(env, examples=[{"index": 0}])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+    assert env.held_during_scoring == [True], "the env was scored without the session lock held"
+
+
+def test_a_failing_batch_fails_every_episode_in_it_rather_than_hanging_them():
+    # the scoring thread scatters results back to waiters. if a raise completed only the waiter
+    # that provoked it, every OTHER episode in that batch would block on its event forever and the
+    # run would wedge with no error -- the worst shape of failure, since the stall watchdog only
+    # fires 25 minutes later.
+    #
+    # the batch has to actually CONTAIN several episodes for this to test anything. an earlier
+    # version just started four threads and hoped; each arrived alone, `_take_batch` returned it by
+    # itself, and `batch[0]` WAS the whole batch -- so it passed against code that completed only
+    # the first waiter (VERL-100). the gate below parks the scorer inside the env call until the
+    # rest have queued, which is the interleave the assertion is actually about.
+    entered = threading.Event()
+    release = threading.Event()
+
+    batch_sizes: list[int] = []
+
+    class _FailingEnv(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            batch_sizes.append(len(items))
+            entered.set()
+            release.wait(timeout=30)
+            raise RuntimeError("judge is down")
+
+    bridge = _bridge(_FailingEnv(), examples=[{"index": i} for i in range(5)])
+    for i in range(5):
+        bridge.start({"index": i, "session_id": f"s{i}"})
+        bridge.step({"session_id": f"s{i}", "completion_text": "answer"})
+
+    outcomes: list[str] = []
+    outcome_lock = threading.Lock()
+
+    def _record(session_id):
+        result = _score_capturing(bridge, session_id)
+        with outcome_lock:
+            outcomes.append(result)
+
+    # s0 goes first and parks the scorer inside the env call. the other four queue behind it and
+    # are taken as ONE batch on the next pass -- that is the batch whose failure must scatter.
+    # daemon: a waiter this test proves is WEDGED never returns, and a non-daemon thread would
+    # then block interpreter shutdown after the assertion had already fired -- turning a named
+    # failure into a hang that reports nothing and burns the whole ci timeout.
+    first = threading.Thread(target=lambda: _record("s0"), daemon=True)
+    first.start()
+    assert entered.wait(timeout=30), "the scorer never reached the env"
+
+    rest = [
+        threading.Thread(target=lambda i=i: _record(f"s{i}"), daemon=True) for i in range(1, 5)
+    ]
+    for thread in rest:
+        thread.start()
+
+    # wait for all four to be QUEUED before releasing the in-flight call. `_pending` is the wrong
+    # field to watch: the batcher drains it into `_in_flight` the moment it takes a batch, so
+    # sampling it races to zero and the assertion fails against working code. count the waiters
+    # that exist in either place instead.
+    # do NOT gate on `_scorer._pending`: `bridge.score()` takes the bridge lock to look up its
+    # session, and `_score_batch` holds that same lock for the whole parked env call -- so the four
+    # sit inside `score()` and never reach the batcher's queue while s0 is in flight. `_pending`
+    # stays 0 the entire time and any wait on it times out against perfectly good code. they
+    # coalesce the moment the lock is released, which is what `batch_sizes` below actually proves.
+    time.sleep(0.5)
+    release.set()
+
+    threads = [first, *rest]
+    for thread in threads:
+        thread.join(timeout=30)
+    alive = [t for t in threads if t.is_alive()]
+    assert not alive, f"{len(alive)} episode(s) left hanging by a failed batch"
+    assert sorted(outcomes) == ["judge is down"] * 5
+    # the point of the test: a batch of MORE THAN ONE actually failed together. without this the
+    # queue-depth wait above would still pass if each episode were scored on its own, which is the
+    # shape under which the buggy `batch[0]`-only completion is indistinguishable from correct.
+    assert max(batch_sizes) > 1, f"no shared batch ever formed; env saw batches {batch_sizes}"
+
+
+def _score_capturing(bridge, session_id):
+    """score one episode, returning the failure text instead of raising (for use off-thread)."""
+    try:
+        bridge.score({"session_id": session_id, "turn_count": 1})
+    except Exception as error:
+        return str(error)
+    return "scored"
+
+
+def test_the_scoring_thread_starts_on_first_use_rather_than_an_explicit_call():
+    # the batcher's consumer thread is what drains the queue. constructed-but-never-started is a
+    # silent wedge: `score` blocks on an event nothing will ever set, and it is invisible until a
+    # multi-turn run hangs on real gpu. binding the start to first use makes that state
+    # unreachable, so no caller can forget.
+    #
+    # the score call is bounded on its own thread rather than made inline: if the start is ever
+    # dropped, an inline call would HANG here, and a hanging test is only marginally better than one
+    # that cannot fail -- it burns the whole ci timeout and reports no assertion. off-thread with a
+    # join deadline turns that same regression into a named failure.
+    bridge = _bridge(_BridgeEnv(), examples=[{"index": 0}])
+    assert bridge._scorer._thread is None, "the thread was started before any episode needed it"
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+
+    scored: list = []
+    worker = threading.Thread(
+        target=lambda: scored.append(bridge.score({"session_id": "a", "turn_count": 1})),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=30)
+    assert not worker.is_alive(), "score blocked forever: nothing is draining the queue"
+    assert scored == [{"score": 1.0}]
+    assert bridge._scorer._thread is not None
+
+
+def test_bridge_shutdown_stops_the_scoring_thread():
+    # the run's finally calls this before the server goes down. a thread left running would keep
+    # the worker process alive past the point flash considers the run finished.
+    bridge = _bridge(_BridgeEnv(), examples=[{"index": 0}])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+    thread = bridge._scorer._thread
+    assert thread is not None
+    assert thread.is_alive()
+    bridge.shutdown()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the scoring thread outlived the bridge"
+
+
+def test_the_run_shuts_the_bridge_down_before_the_server_it_is_mounted_on():
+    # ordering matters: the server's routes block on the scoring thread, so stopping the server
+    # first would strand a scoring episode on an event nothing will ever set.
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    assert "multi_turn_bridge.shutdown()" in src
+    assert src.index("multi_turn_bridge.shutdown()") < src.index("server.shutdown()")
 
 
 def test_bridge_close_releases_the_session():
@@ -3594,7 +4047,9 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
     src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
     assert src.count("MultiTurnBridge(") == 1
     assert (
-        'MultiTurnBridge( env, rollout_examples, max_turns=int(inp["max_turns"]), '
+        "MultiTurnBridge( env, rollout_examples, "
+        '# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. '
+        'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
         'per_turn_credit=bool(inp["per_turn_credit"]), '
         "on_episode_scored=observability.record, )" in src
     )
@@ -4951,8 +5406,8 @@ def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
             return [RolloutReward(episode=1.0, turns=(0.25, 0.75)) for _ in items]
 
     examples = [{"question": "q"}]
-    episode_only = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2)
-    per_turn = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2, per_turn_credit=True)
+    episode_only = _bridge(_Env(), examples=examples, max_turns=2)
+    per_turn = _bridge(_Env(), examples=examples, max_turns=2, per_turn_credit=True)
     for bridge in (episode_only, per_turn):
         bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
     assert episode_only.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0}
@@ -4977,7 +5432,7 @@ def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
             # one reward for two turns: the validator rejects the count and drops to None.
             return [RolloutReward(episode=1.0, turns=(0.5,)) for _ in items]
 
-    bridge = rl_verl.MultiTurnBridge(_Env(), [{"question": "q"}], max_turns=2, per_turn_credit=True)
+    bridge = _bridge(_Env(), examples=[{"question": "q"}], max_turns=2, per_turn_credit=True)
     bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
     assert bridge.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0, "turns": None}
 
@@ -5003,9 +5458,12 @@ def _drive_multi_turn_episode(
     monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
     monkeypatch.setenv("FLASH_VERL_MAX_TURNS", str(max_turns))
     monkeypatch.setenv("FLASH_VERL_MAX_MODEL_LEN", "4096")
+    # generous enough that the per-turn cap never binds here: these tests exercise termination and
+    # span accounting, and a cap that clipped a turn would change what they are measuring.
+    monkeypatch.setenv("FLASH_VERL_MAX_COMPLETION_TOKENS", "4096")
 
-    bridge = rl_verl.MultiTurnBridge(
-        env, [{"question": "q"}], max_turns=max_turns, per_turn_credit=per_turn_credit
+    bridge = _bridge(
+        env, examples=[{"question": "q"}], max_turns=max_turns, per_turn_credit=per_turn_credit
     )
     routes = bridge.routes()
 
