@@ -1198,6 +1198,30 @@ def test_env_setup_multi_turn_flag_scaffolds_multiturn(monkeypatch, tmp_path) ->
     assert "secret whole number" in (tmp_path / "dataset/train.jsonl").read_text()
 
 
+def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_path) -> None:
+    # the multi-turn scaffold ships the same evaluations.py, and its starter scorer delegates to
+    # the environment. asserting the file exists would not catch a sidecar that raises on every
+    # case, which reads as the model failing rather than as a broken template.
+    monkeypatch.chdir(tmp_path)
+    assert (
+        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
+        == 0
+    )
+    assert (tmp_path / "evaluations.py").is_file()
+
+    from flash.envs.evaluations import load_evaluation_suites
+    from flash.envs.loader import load_freesolo_environment
+
+    environment = load_freesolo_environment(str(tmp_path / "environment.py"))
+    suite = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0]
+    case = suite.cases()[0]
+
+    scored = suite.score(case, str(case.expected))
+
+    # the multi-turn starter grades numerically, so the gold answer scores full marks.
+    assert scored == 1.0
+
+
 def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp_path) -> None:
     # A real terminal: the two survey questions are asked and answered "2" (multi-turn) then
     # "2" (reasoning). FLASH_STYLE forces the themed path; a fake stdin reports a tty; input()

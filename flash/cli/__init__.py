@@ -380,6 +380,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="local environment directory or environment.py path",
     )
     env_eval.add_argument("--suite", help="run only the named evaluation suite")
+    # the same knobs `env test` takes, for the same reason: an environment whose
+    # load_environment() requires a param cannot be loaded without them, and one that branches
+    # on a split would be graded against a different dataset than the run trains on.
+    env_eval.add_argument(
+        "--split",
+        metavar="NAME",
+        help="dataset split to evaluate, matching [environment.params] split",
+    )
+    env_eval.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "extra load_environment() kwarg, as in [environment.params] (repeatable). "
+            'values parse as TOML scalars, so 1/true/"x" keep their types'
+        ),
+    )
     env_eval.add_argument(
         "--max-cases",
         type=positive_int,
