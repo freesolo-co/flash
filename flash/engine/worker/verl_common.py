@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import ctypes
 import json
 import math
 import os
@@ -466,6 +467,10 @@ def run_verl_training(
     device memory that nothing will release.
     """
     step_re = re.compile(step_pattern)
+    # before the child exists, so any grandchild it orphans reparents here and can actually be
+    # reaped. this process is not pid 1 -- the runpod handler is -- so without it every wait below
+    # answers ChildProcessError for a zombie nobody will collect.
+    adopt_orphaned_descendants()
     proc = subprocess.Popen(
         cmd,
         env=env,
@@ -502,7 +507,7 @@ def run_verl_training(
         # but could not drain in time exits shortly after, and `kill_process_group` -- the only other
         # caller of this -- runs on exceptions alone: a worker whose later jobs all succeed would
         # hold that zombie for its whole life, as pid 1 with nothing else to reap it (codex[bot]).
-        _reap_stragglers()
+        reap_stragglers()
     return int(proc.returncode)
 
 
@@ -555,14 +560,54 @@ def _process_group_addressable(pgid: int) -> bool:
 # process it recorded.
 _UNREAPED_STRAGGLERS: set[int] = set()
 
+# PR_SET_CHILD_SUBREAPER, from linux/prctl.h.
+_PR_SET_CHILD_SUBREAPER = 36
+
+
+def adopt_orphaned_descendants() -> bool:
+    """become the reaper for descendants orphaned below this process. true if the kernel agreed.
+
+    without this every reap below is a no-op, because this process is NOT pid 1. `Dockerfile.worker`
+    runs `/rp_handler.py` as pid 1 and that handler spawns the flash worker as a subprocess
+    (`flash/providers/runpod/train/endpoints.py:539`), so an EngineCore orphaned when the trainer
+    exits reparents past us to the HANDLER. `waitpid` then raises `ChildProcessError` here and the
+    zombie is recorded as handled while it keeps its pid for the worker's whole life -- and the
+    handler only ever waits on the worker itself, so nothing else ever collects it either.
+
+    marking this process a subreaper makes the kernel reparent such orphans HERE instead, which is
+    the condition the rest of this module already assumes. set once at teardown-path entry rather
+    than at import, so merely importing this module cannot change an unrelated process's semantics.
+    """
+    global _ADOPTS_ORPHANS
+    if _ADOPTS_ORPHANS:
+        return True
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            return False
+    except (OSError, AttributeError, ValueError):
+        # no libc, or a kernel without the option (linux < 3.4). the reaps below degrade to what
+        # they did before rather than failing the run: a leaked zombie costs a pid, not the job.
+        return False
+    _ADOPTS_ORPHANS = True
+    return True
+
+
+# whether this process has already claimed orphaned descendants; the prctl is idempotent but the
+# call is not free, and teardown runs once per job on a reused worker.
+_ADOPTS_ORPHANS = False
+
 
 def _reap(pid: int) -> bool:
     """wait on `pid` without blocking. true once nothing is owed, false while it still owes a status.
 
     the return value is what distinguishes "reaped" from "ours and still running": `waitpid` answers
     `(0, 0)` for a live child of ours, which is the one case worth remembering. `ChildProcessError`
-    means the pid was never ours -- the ordinary case anywhere but pid 1 -- and whoever owns it will
-    reap it, so there is nothing left for this process to do either way.
+    means the pid is not ours to wait on, so there is no status left for this process to take.
+
+    that answer is only safe because `adopt_orphaned_descendants` runs first: it makes an orphaned
+    grandchild reparent to US, so `ChildProcessError` really does mean someone else owns the pid.
+    Without it the same error is returned for a zombie nobody will ever reap (codex[bot]).
     """
     try:
         reaped, _ = os.waitpid(pid, os.WNOHANG)
@@ -578,10 +623,10 @@ def _reap(pid: int) -> bool:
 def _reap_group_zombies(pgid: int, skip: int) -> None:
     """wait on any group member this process has adopted, clearing its process-table entry.
 
-    `Dockerfile.worker` runs python as pid 1, so an EngineCore orphaned when the trainer exits is
-    reparented HERE. once SIGKILL turns it into a zombie no signal can clear it -- only a wait can --
-    and leaving it costs the reusable worker one permanent pid per failed or cancelled run, walking
-    it toward the pid limit (codex[bot]).
+    an EngineCore orphaned when the trainer exits is reparented HERE, because
+    `adopt_orphaned_descendants` claimed it. once SIGKILL turns it into a zombie no signal can clear
+    it -- only a wait can -- and leaving it costs the reusable worker one permanent pid per failed or
+    cancelled run, walking it toward the pid limit (codex[bot]).
 
     `skip` is the direct child, which `subprocess.Popen` reaps itself. waiting on it here would take
     the exit status Popen is owed, leaving `returncode` unset for a caller that asks which signal
@@ -606,7 +651,7 @@ def _reap_group_zombies(pgid: int, skip: int) -> None:
             _UNREAPED_STRAGGLERS.add(pid)
 
 
-def _reap_stragglers() -> None:
+def reap_stragglers() -> None:
     """take the statuses still owed by processes an earlier teardown could not drain.
 
     this is the future wait that the final in-loop reap cannot schedule for itself: a member still
@@ -622,9 +667,10 @@ def _process_group_alive(pgid: int) -> bool:
     """true while the group still has a RUNNING member.
 
     signal 0 checks addressability and delivers nothing, so it succeeds for a group whose only
-    remaining member is a zombie. that is not a hypothetical here: `Dockerfile.worker` runs python
-    directly as pid 1 with no init, so nothing reaps an orphaned EngineCore and it can sit unreaped
-    indefinitely. driving the escalation off addressability alone therefore burned the full drain
+    remaining member is a zombie. that is not a hypothetical here: the container runs python
+    directly with no init, so an orphaned EngineCore is reaped only by this module's own waits and
+    can otherwise sit unreaped indefinitely. driving the escalation off addressability alone
+    therefore burned the full drain
     deadline on every teardown -- delaying the reusable worker even though the cuda context was
     already released -- and nothing stronger than SIGKILL exists to clear it (codex[bot]).
 
@@ -695,10 +741,13 @@ def kill_process_group(proc: subprocess.Popen) -> None:
     group, not off the direct child: the usual shape of this failure is the trainer dying on the term
     while the EngineCore ignores it, so waiting only on the child returns before the survivor is gone.
     """
+    # grpo drives its own subprocess and calls this directly, never through `run_verl_training`, so
+    # the adoption is claimed here too rather than only at the other entry point. idempotent.
+    adopt_orphaned_descendants()
     # collect anything a previous teardown killed but could not drain before its deadline. done on
     # entry rather than on exit because that is when such a process has had the longest to die, and
     # it runs before the early returns below so no path through this function skips it.
-    _reap_stragglers()
+    reap_stragglers()
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:

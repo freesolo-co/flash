@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+from unittest import mock
 
 import pytest
 
@@ -1144,3 +1145,178 @@ def test_every_test_touching_a_linux_only_api_carries_the_platform_guard():
             unguarded.append(f"{node.name} uses {sorted(set(needs))}")
 
     assert not unguarded, "these tests need @_needs_process_teardown:\n  " + "\n  ".join(unguarded)
+
+
+# the container topology, as a program: a stand-in for `/rp_handler.py` (pid 1, adopts orphans, only
+# ever waits on the worker) spawning the flash worker, which spawns the trainer, which spawns an
+# EngineCore and exits. run as a subprocess so the WORKER is not a subreaper unless the code under
+# test makes it one -- the pytest process cannot host this, because the fixture that gives these
+# tests adopted grandchildren manufactures exactly the condition production lacks.
+_TOPOLOGY_PROBE = r"""
+import ctypes, os, signal, sys, time
+sys.path.insert(0, {repo!r})
+from flash.engine.worker.verl_common import _reap, adopt_orphaned_descendants
+
+CLAIM = {claim!r}
+
+
+def state_of(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            data = f.read()
+        return data[data.rindex(")") + 2]
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+# the handler: pid 1 adopts orphans, so ask the kernel for the same. it waits only on the worker.
+ctypes.CDLL("libc.so.6", use_errno=True).prctl(36, 1, 0, 0, 0)
+r_e, w_e = os.pipe()
+r_res, w_res = os.pipe()
+
+worker = os.fork()
+if worker == 0:
+    os.close(r_res)
+    try:
+        if CLAIM:
+            adopt_orphaned_descendants()
+        trainer = os.fork()
+        if trainer == 0:
+            os.close(r_e)
+            os.setsid()                      # start_new_session=True
+            engine = os.fork()
+            if engine == 0:
+                os.close(w_e)
+                signal.pause()
+                os._exit(0)
+            os.write(w_e, str(engine).encode())
+            os._exit(0)                      # the trainer exits, orphaning the EngineCore
+        os.close(w_e)
+        engine = int(os.read(r_e, 32).decode())
+        os.waitpid(trainer, 0)               # Popen reaps its own direct child
+        time.sleep(0.5)                      # let the kernel finish reparenting
+        os.kill(engine, signal.SIGKILL)
+        time.sleep(0.5)
+        claimed = _reap(engine)
+        time.sleep(0.3)
+        os.write(w_res, ("%s|%s" % (claimed, state_of(engine) or "gone")).encode())
+    finally:
+        os._exit(0)
+
+os.close(w_e)
+os.close(w_res)
+print(os.read(r_res, 64).decode(), end="")
+os.waitpid(worker, 0)
+"""
+
+
+def _run_topology_probe(*, claim: bool) -> tuple[str, str]:
+    """(what `_reap` claimed, the orphan's /proc state afterwards) in the real container shape."""
+    done = subprocess.run(
+        [sys.executable, "-c", _TOPOLOGY_PROBE.format(repo=_REPO_ROOT, claim=claim)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert done.returncode == 0, f"probe failed: {done.stderr[-2000:]}"
+    claimed, state = done.stdout.strip().split("|")
+    return claimed, state
+
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@_needs_process_teardown
+def test_an_orphan_is_actually_reaped_in_the_container_process_topology():
+    """The reaping only works if this process ADOPTS the orphan, and it is not pid 1.
+
+    `Dockerfile.worker` runs `/rp_handler.py` as pid 1, and that handler spawns the flash worker as
+    a subprocess (`flash/providers/runpod/train/endpoints.py:539`). So an EngineCore orphaned when
+    the trainer exits reparents past the worker to the HANDLER, `waitpid` raises `ChildProcessError`
+    here, and `_reap` records the zombie as handled while it keeps its pid for the worker's whole
+    life -- the handler waits only on the worker, so nothing else collects it either (codex[bot]).
+
+    Driven in a subprocess because the pytest process cannot show this: the `subreaper` fixture that
+    the teardown tests use manufactures the adoption production does not have, so the defect is
+    invisible from inside it.
+    """
+    claimed, state = _run_topology_probe(claim=True)
+    assert state == "gone", (
+        f"the orphan is still {state!r} after _reap, so the worker never adopted it and every "
+        "wait in this module is a no-op in the container"
+    )
+    assert claimed == "True"
+
+
+@_needs_process_teardown
+def test_without_the_claim_the_orphan_reparents_past_this_process():
+    """The negative control, and the reason the claim exists: identical topology, no claim.
+
+    Asserting the defect is REACHABLE keeps the test above honest. If this ever reports the orphan
+    gone, the probe is being reaped by something other than the code under test and the pass above
+    means nothing.
+    """
+    claimed, state = _run_topology_probe(claim=False)
+    assert state == "Z", "the orphan was collected without the claim, so the test above proves nothing"
+    assert claimed == "True", (
+        "`_reap` reported the zombie as handled, which is what makes this silent"
+    )
+
+
+@_needs_process_teardown
+def test_the_claim_is_made_before_the_trainer_is_spawned():
+    """Order matters: the kernel only reparents to a process that was ALREADY a subreaper.
+
+    Claiming after the child exists leaves any grandchild it has already orphaned parented
+    elsewhere, so the fix would work only for the second job onward on a reused worker.
+    """
+    for fn in (vc.run_verl_training, rl_verl.run_rl_verl):
+        src = " ".join(inspect.getsource(fn).split())
+        assert "adopt_orphaned_descendants()" in src, f"{fn.__name__} never claims its orphans"
+        assert src.index("adopt_orphaned_descendants()") < src.index("subprocess.Popen("), (
+            f"{fn.__name__} claims orphans after spawning, too late for the kernel to reparent"
+        )
+
+
+def test_the_claim_survives_a_kernel_that_refuses_it():
+    """A kernel without PR_SET_CHILD_SUBREAPER (linux < 3.4) must not fail the run.
+
+    A leaked zombie costs a pid; raising here would cost the job.
+    """
+    calls = []
+
+    class _RefusingLibc:
+        def prctl(self, *args):
+            calls.append(args)
+            return -1
+
+    original = vc._ADOPTS_ORPHANS
+    try:
+        vc._ADOPTS_ORPHANS = False
+        with mock.patch.object(vc.ctypes, "CDLL", return_value=_RefusingLibc()):
+            assert vc.adopt_orphaned_descendants() is False
+        assert calls, "the prctl was never attempted"
+        assert vc._ADOPTS_ORPHANS is False, "a refused claim must not be remembered as granted"
+    finally:
+        vc._ADOPTS_ORPHANS = original
+
+
+def test_a_missing_libc_does_not_fail_the_run():
+    original = vc._ADOPTS_ORPHANS
+    try:
+        vc._ADOPTS_ORPHANS = False
+        with mock.patch.object(vc.ctypes, "CDLL", side_effect=OSError("no libc")):
+            assert vc.adopt_orphaned_descendants() is False
+    finally:
+        vc._ADOPTS_ORPHANS = original
+
+
+def test_the_grpo_success_path_drains_stragglers_too():
+    """`kill_process_group` runs on exceptions alone in the grpo loop, so without a drain on the
+    ordinary exit a worker whose later jobs all SUCCEED keeps a straggler zombie for life (cursor).
+    """
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    finally_block = src[src.rindex("finally:") :]
+    assert "reap_stragglers()" in finally_block, (
+        "the grpo teardown collects stragglers only when the run FAILS"
+    )

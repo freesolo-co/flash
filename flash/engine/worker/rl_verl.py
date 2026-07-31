@@ -66,6 +66,7 @@ from flash.engine.worker.sft_train import (
 )
 from flash.engine.worker.verl_common import (
     VERL_REQUIREMENT,
+    adopt_orphaned_descendants,
     agent_loop_workers,
     append_step_metrics,
     clamp_engine_len,
@@ -74,6 +75,7 @@ from flash.engine.worker.verl_common import (
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    reap_stragglers,
     render_wandb_link_shim,
     resolve_verl_loggers,
     resolve_verl_python,
@@ -2559,6 +2561,10 @@ def run_rl_verl():
             fields=lambda: {"metrics_last": list(metrics_last)},
             progress_step=True,
         ):
+            # claimed before the child exists, so a grandchild it orphans reparents here and can be
+            # reaped at teardown. this process is not pid 1 (the runpod handler is), so without it
+            # every wait answers ChildProcessError for a zombie nobody will collect.
+            adopt_orphaned_descendants()
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
                 stdout=subprocess.PIPE,
@@ -2667,6 +2673,12 @@ def run_rl_verl():
         with contextlib.suppress(Exception):
             device_peak_gpu_gb = gpu_sampler.stop_gb()
         server.shutdown()
+        # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions
+        # alone here, so a straggler an earlier teardown SIGKILLed but could not drain in time would
+        # otherwise be collected only by the next FAILING job: a reusable worker running successful
+        # grpo jobs after one late straggler keeps that zombie for life (cursor).
+        with contextlib.suppress(Exception):
+            reap_stragglers()
 
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
     out_dir = f"/tmp/rl_seed{_w.SEED}"
