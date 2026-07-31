@@ -1335,6 +1335,196 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
     assert "hb=" not in progress  # non-numeric ts -> no fabricated age
 
 
+def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
+    """A preemption relaunch rewinds the step counter while the state stays "running", so the
+    follow line must name the attempt or the rewind reads as lost progress with no cause."""
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    # attempts are 0-based, so a first attempt must stay unannotated.
+    first = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
+    }
+    _, progress = _log_follow_progress(first, "unknown")
+    assert "step=455" in progress
+    assert "attempt=" not in progress
+
+    # relaunched on fresh hardware: same state, step back to 0, attempt incremented.
+    relaunched = {
+        "state": "running",
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": "boot", "step": 0, "ts": _time.time(), "attempt": 1},
+    }
+    state, progress = _log_follow_progress(relaunched, "unknown")
+    assert state == "running"
+    assert "step=0" in progress
+    assert "attempt=1" in progress
+
+    malformed = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_step", "ts": _time.time(), "attempt": "two"},
+    }
+    _, progress = _log_follow_progress(malformed, "unknown")
+    assert "attempt=" not in progress  # non-integer attempt -> no fabricated identity
+
+    # the relaunch window this line exists to explain: `remote.attempt` has advanced but the
+    # replacement worker has not published a heartbeat yet, so `last_heartbeat` is still the
+    # superseded attempt's ping. reading the heartbeat here leaves the first preemption entirely
+    # unlabelled (its stale attempt is 0) and names the previous attempt on every later one.
+    mid_relaunch = {
+        "state": "running",
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
+    }
+    _, progress = _log_follow_progress(mid_relaunch, "unknown")
+    assert "attempt=1" in progress
+    # ...and the step it is printed next to belongs to attempt 0, so it must not read as attempt
+    # 1's progress. see test_log_follow_progress_marks_a_stale_heartbeats_fields.
+    assert "(prev attempt)" in progress
+
+    # `remote` is absent on planes that do not surface it, so the heartbeat still has to answer.
+    no_remote = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_step", "step": 12, "ts": _time.time(), "attempt": 2},
+    }
+    _, progress = _log_follow_progress(no_remote, "unknown")
+    assert "attempt=2" in progress
+
+
+@pytest.mark.parametrize("heartbeat_attempt", [0, 1])
+def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
+    heartbeat_attempt: int,
+) -> None:
+    """A supervised retry publishes `remote: null` for its whole allocation window.
+
+    `flash/runner/lifecycle.py` clears `remote` before reserving the replacement attempt and does
+    not persist the new one until the provider handle lands, so throughout that window flash serves
+    a running record whose only attempt identity is the superseded worker's ping. Falling back to it
+    there reintroduced exactly what preferring `remote` was meant to fix: the first retry unlabelled
+    (its stale attempt is 0), later ones naming the *previous* attempt (codex[bot]).
+
+    Both parametrizations are the same window one retry apart, and both must refuse the ping.
+
+    Keyed on an explicit null rather than a missing key, which is what makes it decidable:
+    `on_handle` persists `remote` in the same `_update` that sets `running`, so a running flash
+    record with a heartbeat and no remote is a worker already torn down. An ABSENT `remote` still
+    falls back -- that is a plane which never surfaces the field, covered above.
+    """
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    _, progress = _log_follow_progress(
+        {
+            "state": "running",
+            "remote": None,
+            "last_heartbeat": {
+                "stage": "sft_step",
+                "step": 455,
+                "ts": _time.time(),
+                "attempt": heartbeat_attempt,
+            },
+        },
+        "unknown",
+    )
+    # no identity is claimed: the replacement is not reserved yet, and a wrong number is worse than
+    # none for the one field that exists to explain the rewind.
+    assert "attempt=" not in progress, progress
+    # ...and the ping it did print belongs to the torn-down worker, so it must not read as the
+    # replacement's progress.
+    assert "step=455" in progress, progress
+    assert "(prev attempt)" in progress, progress
+    assert progress.index("step=455") < progress.index("(prev attempt)"), progress
+
+
+def test_log_follow_progress_names_the_attempt_before_the_first_heartbeat() -> None:
+    """The relaunch has to be named while the replacement worker is still cold.
+
+    An attempt preempted before it published a ping leaves `last_heartbeat` absent while
+    `remote.attempt` has already advanced. Resolving the attempt inside the heartbeat block made
+    the line print a bare `running` for the whole cold start -- silent through exactly the window
+    the attempt counter exists to explain, and the window a user is most likely to be watching.
+    """
+    from flash.cli.commands import _log_follow_progress
+
+    state, progress = _log_follow_progress(
+        {"state": "running", "remote": {"attempt": 1}, "last_heartbeat": None},
+        "running",
+    )
+    assert state == "running"
+    assert "attempt=1" in progress, progress
+    # nothing heartbeat-sourced exists to qualify, so the marker would have nothing to cover.
+    assert "(prev attempt)" not in progress, progress
+
+    # still 0-based with no heartbeat: a first attempt stays unannotated.
+    _, first = _log_follow_progress(
+        {"state": "running", "remote": {"attempt": 0}, "last_heartbeat": None},
+        "running",
+    )
+    assert "attempt=" not in first, first
+
+
+def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
+    """stage/step come from the heartbeat, attempt from `remote` -- during a relaunch those differ.
+
+    Printed unqualified, `stage=sft_step step=455 attempt=1` says the replacement worker has run
+    455 steps. It has not: it restarted from zero, and 455 is the superseded worker's last ping.
+    That is the exact rewind the attempt counter was added to explain, reported as if it never
+    happened.
+
+    Marked rather than suppressed: the run did reach step 455, and dropping the fields entirely
+    would read as a worker that has produced nothing.
+    """
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    _, progress = _log_follow_progress(
+        {
+            "state": "running",
+            "remote": {"attempt": 1},
+            "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
+        },
+        "unknown",
+    )
+    assert "step=455" in progress
+    assert "attempt=1" in progress
+    assert "(prev attempt)" in progress, progress
+
+    # the marker's scope is positional, so ordering is the contract: everything before it came
+    # from the superseded ping, everything after is live. `hb=` has to sit inside that span --
+    # the age is the old worker's ping too, so a fresh `hb=<1m` printed past the marker reads as
+    # the replacement worker being alive when nothing has been heard from it at all.
+    assert progress.index("step=455") < progress.index("(prev attempt)"), progress
+    assert progress.index("hb=") < progress.index("(prev attempt)"), progress
+    assert progress.index("(prev attempt)") < progress.index("attempt=1"), progress
+
+    # a heartbeat from the live attempt is not stale, so nothing is marked.
+    _, current = _log_follow_progress(
+        {
+            "state": "running",
+            "remote": {"attempt": 1},
+            "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 1},
+        },
+        "unknown",
+    )
+    assert "step=455" in current
+    assert "(prev attempt)" not in current, current
+
+    # no `remote` means the live attempt is unknown, so staleness is unprovable -- marking there
+    # would label every ordinary heartbeat on a plane that does not surface `remote`.
+    _, no_remote = _log_follow_progress(
+        {
+            "state": "running",
+            "last_heartbeat": {"stage": "sft_step", "step": 12, "ts": _time.time(), "attempt": 2},
+        },
+        "unknown",
+    )
+    assert "(prev attempt)" not in no_remote, no_remote
+
+
 @pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
 def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
     import time as _time
