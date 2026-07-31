@@ -41,10 +41,17 @@ def finite_float(value: str) -> float:
     `float("nan")` and `float("inf")` parse, so argparse took them and every case then spent a
     request the server rejects for being non-finite (`flash/server/routes/serving.py:1429-1432`),
     turning one bad flag into one doomed paid request per case (codex[bot]).
+
+    A negative value is finite and so passed that check, but the OpenAI sampling contract the
+    backend implements requires a nonnegative temperature, so it failed once per case rather than
+    once at the flag (codex[bot]). Same floor training already enforces on its own temperature
+    (`flash/schema/__init__.py`, `minimum=0.0`).
     """
     parsed = float(value)
     if not math.isfinite(parsed):
         raise argparse.ArgumentTypeError(f"must be a finite number, got {value}")
+    if parsed < 0.0:
+        raise argparse.ArgumentTypeError(f"must be at least 0.0, got {value}")
     return parsed
 
 
@@ -215,33 +222,24 @@ _READY_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
 
 
 def _live_deployment(client, run_id: str) -> dict | None:
-    """The revision a bare run id currently serves, whatever step it is on.
+    """The run's deployment record, whatever state it is in, or None when it has none.
 
     `deployment_for` resolves an EXACT revision, so asking it for a bare run id means "the final
     adapter" (step None) and it rejects a run serving `RUN/step-N`. That would report a deployed
     run as undeployed and refuse to evaluate a model `flash chat RUN` talks to happily. Match on
     the run id alone, exactly as `_rollback_record` does for the same reason
-    (flash/cli/commands.py)."""
+    (flash/cli/commands.py).
+
+    The state is left to the caller because only a READY record names the revision that will
+    answer: a busy one is listed with the revision it is rolling OUT to. Whether a predecessor is
+    still serving underneath it cannot be decided here -- `/v1/deployments` passes every record
+    through `public_deployment()`, which drops `previous_deployment` as private rollback state
+    (flash/serve/urls.py). Both a redeploy over a live revision and a first rollout that has never
+    served therefore arrive as the same bare busy record."""
     for entry in client.deployments() or ():
         listed = entry.get("deployment") or {}
         if run_id not in (listed.get("run_id"), entry.get("run_id")):
             continue
-        # a queued replacement is listed with the revision it is rolling OUT to, while the
-        # predecessor under `previous_deployment` is the one still answering requests. taking the
-        # busy record graded a revision that was not serving yet, and reported it as the run's
-        # score -- results attributed to the wrong weights (codex[bot]). `flash chat` reads the
-        # predecessor for exactly this reason (`_previous_ready_deployment`).
-        if listed.get("state") not in _READY_DEPLOYMENT_STATES:
-            previous = listed.get("previous_deployment")
-            if not isinstance(previous, dict) or previous.get("state") not in (
-                _READY_DEPLOYMENT_STATES
-            ):
-                # a first rollout has no predecessor to fall back to, so nothing is serving yet.
-                # returning the busy record anyway handed back the INCOMING revision and graded
-                # weights that were not answering requests (cursor[bot]). the caller reports the
-                # run as undeployed, which is what "still coming up" means to an evaluation.
-                return None
-            listed = previous
         # the listing omits undeployed/dry_run rows, so anything here is servable.
         if not listed.get("run_id") and entry.get("run_id"):
             listed = {**listed, "run_id": entry["run_id"]}
@@ -623,13 +621,23 @@ def cmd_env_eval(args) -> int:
         if deployment is None:
             _err(f"env eval failed: run {args.target} is not deployed")
             return _err("overall: FAIL")
-        candidate = deployment.get("adapter_revision")
-        resolved = parse_adapter_revision(candidate) if isinstance(candidate, str) else None
-        if resolved is None or resolved[0] != run_id:
-            _err(
-                f"env eval failed: deployment for {run_id} has no valid immutable adapter revision"
-            )
-            return _err("overall: FAIL")
+        # a busy record is listed with the revision it is rolling OUT to, so pinning it would file
+        # the scores under weights that were not answering requests (codex[bot]). the predecessor
+        # still serving underneath is stripped from the public listing, so this side cannot name
+        # it either (see `_live_deployment`) -- and refusing outright would fail an evaluation that
+        # `flash chat RUN` serves correctly through that predecessor (codex[bot]). leave the target
+        # as the user wrote it and let the chat route resolve it: it reads the private rollback
+        # state, and answers with a 409 naming the surface to use when nothing is serving at all.
+        resolved = None
+        if deployment.get("state") in _READY_DEPLOYMENT_STATES:
+            candidate = deployment.get("adapter_revision")
+            resolved = parse_adapter_revision(candidate) if isinstance(candidate, str) else None
+            if resolved is None or resolved[0] != run_id:
+                _err(
+                    "env eval failed: deployment for "
+                    f"{run_id} has no valid immutable adapter revision"
+                )
+                return _err("overall: FAIL")
         # `RUN/step-N` is a shorthand, not an identity: the chat route resolves it against the
         # run's whole verified ledger, which can hold several revisions at one step, and picks the
         # deployed one. Forwarding the shorthand therefore graded weights the report could not
@@ -642,7 +650,7 @@ def cmd_env_eval(args) -> int:
         # Refusing would fail an evaluation the server runs correctly, so let the server resolve it;
         # it reads the verified ledger this CLI cannot see, and answers a genuinely ambiguous step
         # with a 409 naming the surface to use instead.
-        if want_step is None or resolved[1] == want_step:
+        if resolved is not None and (want_step is None or resolved[1] == want_step):
             evaluation_target = candidate.strip()
             print(f"resolved evaluation target {args.target} to {evaluation_target}")
 
@@ -652,14 +660,33 @@ def cmd_env_eval(args) -> int:
     thinking = False
     target_run_id = (revision or parsed or (None,))[0]
     if target_run_id:
+        spec = None
         try:
             spec = client.get_run(target_run_id).get("spec")
-            thinking = bool(spec.get("thinking")) if isinstance(spec, dict) else False
-        except Exception as exc:
-            # not fatal: a run whose metadata is unreadable can still be evaluated, and the raw
-            # response is what every eval graded before this. broad, because an unreachable plane
-            # must not turn a working evaluation into a crash. say so rather than grade silently.
+        except ApiError as exc:
+            # a plane that answers, but not about this run: an old build with no such route, or a
+            # run the key cannot see. nothing to retry, and every eval before this lookup existed
+            # graded the raw response, so keep that behavior and say so.
             _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
+        except ClientError as exc:
+            # a plane that did not answer at all -- unreachable, or timed out. the chat requests
+            # that follow may still succeed, and then `thinking` would stay false while every
+            # `<think>...</think>answer` was handed to the scorer raw, uploading a whole paid
+            # suite of false failures (codex[bot]). this is the retryable case, so stop before
+            # buying any generation rather than grade in a normalization state we guessed at.
+            if getattr(args, "debug", False):
+                raise
+            _err(
+                f"env eval failed: could not reach the control plane for {target_run_id}: {exc}. "
+                "retry once it is reachable: grading without its thinking mode would score every "
+                "reasoning response against raw output."
+            )
+            return _err("overall: FAIL")
+        except Exception as exc:
+            # anything else is not a transport fault, so it is not retryable either. broad, so an
+            # unexpected client shape cannot crash a command the user asked for.
+            _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
+        thinking = bool(spec.get("thinking")) if isinstance(spec, dict) else False
 
     reports: list[EvalSuiteReport] = []
     for suite in suites:
