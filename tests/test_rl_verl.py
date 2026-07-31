@@ -4051,10 +4051,80 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     assert "observability.heartbeat_fields()" in hook
     assert "close_generation" not in hook, "the heartbeat drains; the boundary would be bypassed"
 
-    # sealed on the new-step branch, and BEFORE the preview reads `latest` so the logged sample and
-    # the heartbeat describe the same generation.
+    # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
+    # sample and the heartbeat describe the same generation.
     stdout_loop = src[src.index("step_box[0] = int(m.group(1))") :]
     assert "observability.close_generation(step_box[0])" in stdout_loop
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
-        "samp = observability.latest()"
+        "samp = observability.latest_for_step(step_box[0])"
     )
+    # and the preview asks for THIS step's rows. the unchecked accessor answers with whatever was
+    # published last, which on the drop-spend path belongs to an earlier step (cursor).
+    assert "observability.latest()" not in stdout_loop, (
+        "the preview would print older rows under this step number"
+    )
+
+
+def test_a_step_whose_generation_was_dropped_previews_nothing_rather_than_older_text():
+    """The drop-spend path publishes nothing, so the newest rows belong to an EARLIER step.
+
+    `close_generation` spends this step's line on a generation the queue already dropped and
+    publishes nothing. `latest` keeps answering with the previous generation's rows, and the caller
+    -- which cannot see that no publish happened -- prints them under the new step number, so the
+    log claims this step generated text that a different step produced (cursor).
+    """
+    buffer = RewardObservabilityBuffer(generation_size=2)
+    buffer.record("pA", "gen-A-a", 1.0)
+    buffer.record("pA", "gen-A-b", 1.0)
+    buffer.close_generation(10)  # generation A is published under step 10
+
+    # overflow the sealed queue so a later generation is dropped before it was ever named.
+    for gen in range(RewardObservabilityBuffer._SEALED_QUEUE_LIMIT + 2):
+        buffer.record("pB", f"gen-B{gen}-a", 2.0)
+        buffer.record("pB", f"gen-B{gen}-b", 2.0)
+    assert buffer._dropped_unnamed, "the queue never dropped a generation, so the path is untested"
+
+    buffer.close_generation(11)  # spent on the drop: nothing is published for step 11
+
+    assert buffer.latest_for_step(11) is None, (
+        "step 11 previewed rows that belong to an earlier generation"
+    )
+    # the stale reading is still reachable, deliberately: the heartbeat reports it as step 10's.
+    assert buffer.latest()[1] == "gen-A-b"
+
+
+def test_a_step_that_did_publish_still_previews_its_own_rows():
+    # the control: the ordinary path must keep previewing, or the fix above silences every preview.
+    buffer = RewardObservabilityBuffer(generation_size=2)
+    buffer.record("p", "gen1-a", 1.0)
+    buffer.record("p", "gen1-b", 1.0)
+
+    buffer.close_generation(7)
+
+    assert buffer.latest_for_step(7) == ("p", "gen1-b", 1.0)
+
+
+def test_a_late_step_line_previews_the_generation_that_step_named():
+    # the queue's whole purpose, asserted through the step-checked accessor: a late line names the
+    # OLDEST unnamed generation, so that is the one this step may preview.
+    buffer = RewardObservabilityBuffer(generation_size=2)
+    buffer.record("p", "gen1-a", 1.0)
+    buffer.record("p", "gen1-b", 1.0)
+    buffer.record("p", "gen2-a", 9.0)  # generation 2 already scoring
+
+    buffer.close_generation(1)
+
+    assert buffer.latest_for_step(1)[1] == "gen1-b"
+    assert buffer.latest_for_step(2) is None, "step 2 has not been named yet"
+
+
+def test_nothing_is_previewed_for_a_step_before_the_first_boundary():
+    # `latest` falls back to the open generation so an early preview is not blank. that fallback
+    # must NOT leak into the step-checked accessor: those rows have not been named, so no step
+    # number is correct for them.
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "first", 0.5)
+
+    assert buffer.latest() == ("p", "first", 0.5)
+    assert buffer.latest_for_step(0) is None
+    assert buffer.latest_for_step(1) is None

@@ -2789,7 +2789,10 @@ def run_rl_verl():
                             # step's complete output. seal it before the preview reads `latest`, so
                             # both the log line and the heartbeat describe the same generation.
                             observability.close_generation(step_box[0])
-                            samp = observability.latest()
+                            # asks for THIS step's rows, not merely the newest: when the line is
+                            # spent on a generation the queue already dropped, nothing is published
+                            # and the previous generation's text would print under this step.
+                            samp = observability.latest_for_step(step_box[0])
                             if samp:
                                 last_dump_step[0] = step_box[0]
                                 _, completion, reward = samp

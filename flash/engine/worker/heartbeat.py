@@ -518,11 +518,32 @@ class RewardObservabilityBuffer:
 
         Falls back to the open generation only before anything has been published, so a caller that
         previews before the first boundary still sees a rollout instead of nothing.
+
+        Prefer ``latest_for_step`` when the row is about to be labelled with a step number: this
+        answers with rows whose own step may be older, which a caller cannot detect from here.
         """
         with self._lock:
             if self._published:
                 return self._published[-1]
             return self._samples[-1] if self._samples else None
+
+    def latest_for_step(self, step: int) -> tuple[Any, Any, float] | None:
+        """``latest()``, but only when the published rows really were generated at ``step``.
+
+        A preview that prints a row under a step number must not print one that belongs to an older
+        generation. ``close_generation`` publishes nothing when it spends its line on a generation
+        the queue already dropped, so ``latest`` keeps answering with the previous generation's rows
+        -- and the caller, which cannot see that no publish happened, labels them with the new step
+        (cursor). Skipping the preview for that step is right: the rows for the step being named
+        were dropped and no longer exist, so there is nothing truthful left to show.
+
+        The pre-publication fallback is deliberately not offered here. Those rows are from the open
+        generation, which by definition has not been named, so no step number is correct for them.
+        """
+        with self._lock:
+            if self._published and self._published_step == int(step):
+                return self._published[-1]
+            return None
 
     def heartbeat_fields(self) -> dict:
         """The bounded ``reward_metrics`` / ``sampled_completions`` fragment of one heartbeat.
