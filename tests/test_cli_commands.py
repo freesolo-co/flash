@@ -1185,6 +1185,8 @@ def test_env_setup_does_not_add_starter_evaluations_to_a_custom_environment(
 
     assert not (tmp_path / "evaluations.py").exists()
     assert "evaluations.py" not in capsys.readouterr().out
+    # the rest of the scaffold still lands: this is about the suite, not about refusing to run.
+    assert (tmp_path / "configs/rl.toml").is_file()
 
 
 def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path, capsys) -> None:
@@ -1202,7 +1204,11 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     assert "EnvironmentMultiTurn" in env_py  # genuinely a multi-turn scaffold
     evaluations_text = (tmp_path / "evaluations.py").read_text()
     assert "load_evaluations(environment=None)" in evaluations_text
-    assert "self.environment.reward(response, example)" in evaluations_text
+    # the multi-turn scaffold gets its own suite. `reward(response, example)` with no episode state
+    # sends `_score_one` down the single-turn branch (flash/envs/adapter.py:237-243), which grades an
+    # EMPTY transcript -- the arithmetic suite scored this guess-the-number env 1.0 on "12".
+    assert "self.environment.reward(response, example)" not in evaluations_text
+    assert "step_episode" in evaluations_text
     # the docstring documents all three algorithms train off the multi-turn env (no opd carve-out)
     assert "distils EVERY assistant turn" in env_py
     assert "single-turn only" not in env_py
@@ -1270,9 +1276,11 @@ def test_env_setup_multi_turn_flag_scaffolds_multiturn(monkeypatch, tmp_path) ->
 
 
 def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_path) -> None:
-    # the multi-turn scaffold ships the same evaluations.py, and its starter scorer delegates to
-    # the environment. asserting the file exists would not catch a sidecar that raises on every
-    # case, which reads as the model failing rather than as a broken template.
+    # the multi-turn scaffold ships its own evaluations.py, and `env eval` sends one prompt and
+    # grades one reply. so the starter grades the FIRST action's format rather than delegating to
+    # the environment, which with no episode state would score an empty transcript. asserting the
+    # file exists would not catch a sidecar that raises on every case, which reads as the model
+    # failing rather than as a broken template.
     monkeypatch.chdir(tmp_path)
     assert (
         _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
@@ -1287,39 +1295,51 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     suite = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0]
     case = suite.cases()[0]
 
-    scored = suite.score(case, str(case.expected))
+    # a reply `step_episode` can read: a single in-range integer scores full marks.
+    passing = suite.score(case, "50")
+    assert passing.passed is True
+    assert passing.score == 1.0
 
-    # the multi-turn starter grades numerically, so the gold answer scores full marks.
-    assert scored.score == 1.0
-    assert scored.passed is True
+    # and one it cannot is graded, not raised: the template reports why rather than erroring out.
+    failing = suite.score(case, "somewhere in the middle")
+    assert failing.passed is False
+    assert failing.score == 0.0
+    assert "single integer" in failing.reason
 
 
 def test_starter_evaluator_fails_a_near_miss_the_environment_rejects(monkeypatch, tmp_path) -> None:
     """A shaped reward's partial credit is not a pass.
 
-    The generated multi-turn starter pays `closeness * 0.5` with `success=False` for a wrong but
-    close guess. Returning that bare float let `normalize_eval_result` mark every positive score as
-    passed, so an incorrect answer was reported as a passing evaluation case -- a graded failure
-    reading as model success, which is the one thing the suite exists to detect.
+    The starter sidecar delegates to the environment, and a shaped reward pays partial credit for a
+    wrong answer -- the multi-turn starter's `score_episode` scores a near miss as `closeness * 0.5`
+    with `success=False`. Returning that bare float let `normalize_eval_result` mark every positive
+    score as passed, so an incorrect answer was reported as a passing evaluation case: a graded
+    failure reading as model success, which is the one thing the suite exists to detect.
+
+    The scaffolded single-turn environment happens to reward 1.0/0.0, where "positive" and "the
+    environment says this succeeded" coincide -- so the two rules are only distinguishable against
+    an environment that actually shapes its reward, which is what any real one does.
     """
     monkeypatch.chdir(tmp_path)
-    assert (
-        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
-        == 0
-    )
+    assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
     from flash.envs.evaluations import load_evaluation_suites
-    from flash.envs.loader import load_freesolo_environment
 
-    environment = load_freesolo_environment(str(tmp_path / "environment.py"))
-    suite = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0]
+    class ShapedEnvironment:
+        """Pays partial credit for a wrong answer, exactly as the multi-turn starter does."""
+
+        def reward(self, response, example):
+            return 0.5
+
+        def grade(self, response, example):
+            return False
+
+    suite = load_evaluation_suites(tmp_path / "environment.py", environment=ShapedEnvironment())[0]
     case = suite.cases()[0]
-    # one off the gold answer: close enough for shaped credit, still the wrong number.
-    near_miss = str(int(str(case.expected).strip()) + 1)
 
-    scored = suite.score(case, near_miss)
+    scored = suite.score(case, "the wrong answer, but close")
 
-    assert scored.score > 0.0, "the starter environment must pay partial credit for a near miss"
+    assert scored.score == 0.5, "the shaped reward must reach the report unchanged"
     assert scored.passed is False
 
 
