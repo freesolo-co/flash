@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import json
 import os
@@ -21,6 +22,7 @@ import pytest
 
 import flash.engine.worker as W
 from flash.engine.worker import rl, rl_verl, verl_common
+from flash.engine.worker.heartbeat import RewardObservabilityBuffer
 
 
 # ------------------------------- dispatch -------------------------------
@@ -971,6 +973,166 @@ def test_score_single_turn_env_error_is_zero():
     assert s == 0.0
 
 
+class _RaisingProbeEnv:
+    """An env whose `scores_breakdown` ATTRIBUTE LOOKUP raises, not its call.
+
+    Real shapes that do this: a `@property` that touches a closed handle, or a lazy proxy that
+    dials a sidecar on first access. `hasattr` only swallows AttributeError, so anything else
+    propagates out of the probe itself.
+    """
+
+    def __getattr__(self, name):
+        if name == "scores_breakdown":
+            raise RuntimeError("scoring sidecar is gone")
+        raise AttributeError(name)
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_capability_probe_that_raises_scores_zero_and_counts_as_a_failed_grading():
+    """The probe is env code too, so it has to sit inside the guard that turns env faults into 0.0.
+
+    Outside it, the exception escapes into the reward http handler, the verl child reads a bridge
+    failure and aborts the whole run -- over one env's attribute access (codex[bot]).
+
+    The `None` matters just as much as the 0.0: a raising probe is a completion that FAILED to
+    score, and the mean counts None as a zero for every name the other completions reported.
+    Dropping it instead would shrink the denominator and bias every named metric high.
+    """
+    breakdowns: list[dict[str, float] | None] = []
+    s = rl_verl.score_single_turn(
+        _RaisingProbeEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+
+    assert s == 0.0
+    assert breakdowns == [None]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_raising_probe_still_re_raises_for_the_latency_profiler():
+    # raise_on_error is the profiler's way of telling a real 0.0 apart from a broken grader. the
+    # guard must not swallow the probe's fault for that caller either.
+    with pytest.raises(RuntimeError, match="scoring sidecar is gone"):
+        rl_verl.score_single_turn(
+            _RaisingProbeEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+            prompt_opened_thinking=False, think_penalty=0.0, raise_on_error=True,
+        )
+
+
+# --------------------- reward_metrics: per-name breakdown collection ---------------------
+class _NamedBreakdownEnv:
+    def scores_breakdown(self, graded, ex, state):
+        hit = 1.0 if graded.strip() == ex["gt"] else 0.0
+        return {"success": hit, "quality": 0.5, "total": hit}
+
+
+class _CountingBreakdownEnv:
+    """Scores each grading with its own ordinal, so a retained buffer window is identifiable."""
+
+    def __init__(self):
+        self.n = 0
+
+    def scores_breakdown(self, graded, ex, state):
+        n = float(self.n)
+        self.n += 1
+        return {"n": n, "total": n}
+
+
+class _OverflowingBreakdownEnv:
+    """A named component too large to be a float, beside a usable one and a usable total.
+
+    `float()` raises OverflowError on this, NOT ValueError -- a distinction the observability pass
+    has to make because it runs outside the grading error guard."""
+
+    def scores_breakdown(self, graded, ex, state):
+        hit = 1.0 if graded.strip() == ex["gt"] else 0.0
+        return {"success": hit, "enormous": 10**400, "total": hit}
+
+
+class _UnusableComponentEnv:
+    """Emits a component whose value never coerces to a finite float, alongside a usable one."""
+
+    def scores_breakdown(self, graded, ex, state):
+        return {"broken": None, "diverged": float("nan"), "quality": 0.5, "total": 1.0}
+
+
+class _BadTotalEnv:
+    def scores_breakdown(self, graded, ex, state):
+        return {"success": 1.0, "total": "not-a-number"}
+
+
+class _RaisingRewardOnlyEnv:
+    def reward(self, graded, ex, state):
+        raise ValueError("grader is down")
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_score_single_turn_collects_the_named_breakdown_for_reward_metrics():
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _NamedBreakdownEnv(), "7", {"gt": "7"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 1.0
+    assert breakdowns == [{"success": 1.0, "quality": 0.5, "total": 1.0}]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_scalar_reward_env_contributes_no_breakdown_at_all():
+    # appending {} for a scores_breakdown-less env would add a denominator under no numerators:
+    # _mean_named_reward_metrics divides by every scored completion, so an env mixing the two
+    # shapes -- or a run with none at all -- would publish every name shrunk toward 0.
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _RewardOnlyEnv(), "the answer is 7", {"gt": "7"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 2.5
+    assert breakdowns == []
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_scalar_reward_env_contributes_nothing_when_its_grading_fails_either():
+    # the failure path is where the scores_breakdown gate actually bites: without it, a run whose
+    # env has no named components at all would still append None per failed completion, and
+    # _latest_named_reward_metrics' outage branch would then republish the LAST run's names as a
+    # flat 0 for an env that never reported them.
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _RaisingRewardOnlyEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 0.0
+    assert breakdowns == []
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_failed_grading_records_none_so_it_counts_as_a_zero():
+    # trl's contract: a completion that failed to grade still scored 0.0, and must pull the mean of
+    # every name the OTHER completions reported down with it. dropping it silently would report the
+    # surviving completions' average as if the whole generation had earned it.
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _RaisingEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 0.0
+    assert breakdowns == [None]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_an_unusable_total_records_no_named_components():
+    # float(total) raising IS a failed grading -- the completion scores 0.0. crediting its named
+    # components would report metrics for a completion that earned nothing.
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _BadTotalEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 0.0
+    assert breakdowns == [None]
+
+
 # ------------------------------- reward rpc bridge -------------------------------
 def test_reward_server_round_trip():
     server, url = rl_verl.start_reward_server(
@@ -1293,6 +1455,164 @@ def test_structured_outputs_shim_refuses_to_wrap_itself_twice():
     source = rl_verl.render_structured_outputs_shim({"json": {"type": "object"}})
     assert '"_flash_so_patched", False' in source
     assert "_flash_so_patched = True" in source
+
+
+def _load_kl_ref_engine():
+    """exec the kl-reference shim against a stub verl engine and hand back the patched class.
+
+    the shim rebinds FSDPEngine._build_lora_module and .disable_adapter on import, so a stub that
+    stands in for verl's real class is enough to exercise both halves without a gpu.
+    """
+    import sys
+    from types import ModuleType
+
+    class _FSDPEngine:
+        def __init__(self, module):
+            self.module = module
+
+        def _build_lora_module(self, module):
+            return module
+
+        def disable_adapter(self):
+            raise AssertionError("the shim must replace disable_adapter, not defer to it")
+
+    impl = ModuleType("verl.workers.engine.fsdp.transformer_impl")
+    impl.FSDPEngine = _FSDPEngine
+    fsdp_pkg = ModuleType("verl.workers.engine.fsdp")
+    fsdp_pkg.transformer_impl = impl
+    stubs = {
+        "verl": ModuleType("verl"),
+        "verl.workers": ModuleType("verl.workers"),
+        "verl.workers.engine": ModuleType("verl.workers.engine"),
+        "verl.workers.engine.fsdp": fsdp_pkg,
+        "verl.workers.engine.fsdp.transformer_impl": impl,
+    }
+    for name, module in stubs.items():
+        sys.modules[name] = module
+    try:
+        source = rl_verl.render_kl_ref_adapter_shim(True)
+        exec(compile(source, "sitecustomize.py", "exec"), {})
+    finally:
+        for name in stubs:
+            sys.modules.pop(name, None)
+    return impl.FSDPEngine
+
+
+def test_kl_ref_adapter_shim_is_emitted_only_for_a_warm_start():
+    # a fresh-start run has no sft adapter to anchor to, so verl's bare-base reference is already
+    # what flash wants and the patch must stay out of the child's import path.
+    assert rl_verl.render_kl_ref_adapter_shim(False) == ""
+    source = rl_verl.render_kl_ref_adapter_shim(True)
+    assert source
+    assert rl_verl._KL_REF_ADAPTER_MARKER in source
+
+
+def test_kl_ref_adapter_shim_is_wired_only_when_warm_start_and_kl_are_both_on():
+    # with kl off no reference logprob is ever consumed, so patching disable_adapter would add a
+    # failure mode and buy nothing. both conditions have to gate the renderer, not just warm start.
+    source = inspect.getsource(rl_verl.run_rl_verl)
+    assert "render_kl_ref_adapter_shim(" in source
+    assert 'bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0' in source
+    combined = rl_verl.render_exact_save_steps_shim((7, 13), 20) + rl_verl.render_kl_ref_adapter_shim(
+        True
+    )
+    compile(combined, "sitecustomize.py", "exec")
+
+
+def test_kl_ref_adapter_shim_anchors_the_reference_to_the_warm_start_adapter():
+    # the defect this removes: verl sets ref_in_actor whenever lora is active (always, on flash) and
+    # marks the reference pass no_lora_adapter=True, which engine_workers turns into
+    # engine.disable_adapter() -- the BARE BASE. on a warm-started run the kl term would then pull
+    # the policy away from the sft adapter the run was told to continue. asserting on the rendered
+    # source cannot catch that; only running the patched engine and comparing the three forwards
+    # (sft / base / trained policy) can.
+    torch = pytest.importorskip("torch")
+    peft = pytest.importorskip("peft")
+
+    class _Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(8, 8, bias=False)
+
+        def forward(self, x):
+            return self.q_proj(x)
+
+    torch.manual_seed(0)
+    config = peft.LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj"])
+    model = peft.get_peft_model(_Tiny(), config)
+    # lora_B initializes to zeros, which makes a fresh adapter a no-op EQUAL to the base -- a
+    # fixture left that way could not tell "anchored to sft" from "anchored to base" at all.
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if "lora_B" in name:
+                param.copy_(torch.randn_like(param) * 0.1)
+
+    x = torch.randn(2, 8)
+    with torch.no_grad():
+        sft_out = model(x).clone()
+        with model.disable_adapter():
+            base_out = model(x).clone()
+    assert not torch.allclose(sft_out, base_out), "fixture cannot discriminate sft from base"
+
+    params_before = set(dict(model.named_parameters()))
+    state_before = set(model.state_dict())
+    engine = _load_kl_ref_engine()(model)
+    engine._build_lora_module(model)
+
+    with torch.no_grad():
+        # a training step moves only the trainable default adapter; the frozen snapshot must not
+        # follow it, or the anchor drifts with the policy and constrains nothing.
+        for name, param in model.named_parameters():
+            if ".default." in name and "lora_B" in name:
+                param.add_(torch.randn_like(param) * 0.5)
+        trained_out = model(x).clone()
+        with engine.disable_adapter():
+            ref_out = model(x).clone()
+        after_out = model(x).clone()
+
+    assert torch.allclose(ref_out, sft_out), "kl reference is not the warm-start adapter"
+    assert not torch.allclose(ref_out, base_out), "kl reference fell back to the bare base"
+    assert not torch.allclose(ref_out, trained_out), "kl reference drifted with the policy"
+    # the policy forward has to come back bit-exact: the reference pass runs inside training.
+    assert torch.equal(after_out, trained_out), "policy forward not restored after the reference"
+    # non-persistent buffers, not a second adapter's parameters. new named_parameters would be
+    # flattened by fsdp and trained by the optimizer; new state_dict keys would reach verl's merger,
+    # which hand-builds the shipped adapter from every "lora_" key and derives target_modules from
+    # key.split(".")[-3] -- a second adapter's keys resolve to lora_A/lora_B there.
+    assert not set(dict(model.named_parameters())) - params_before
+    assert not set(model.state_dict()) - state_before
+
+
+def test_kl_ref_adapter_shim_refuses_to_run_without_a_snapshot():
+    # both guards exist because the alternative is silent: an unpatched or half-applied snapshot
+    # would leave the reference on the bare base, and the run would look completely healthy while
+    # training against the wrong anchor. they must raise, never fall back.
+    pytest.importorskip("torch")
+    import torch
+
+    engine_cls = _load_kl_ref_engine()
+
+    class _NoAdapterWeights(torch.nn.Module):
+        # peft-shaped, but no ModuleDict holds the snapshot's leaves: nothing gets demoted.
+        def __init__(self):
+            super().__init__()
+            self.peft_config = {"default": SimpleNamespace(r=4)}
+            self.active_adapter = "default"
+
+        def add_adapter(self, name, config):
+            self.peft_config[name] = config
+
+    module = _NoAdapterWeights()
+    with pytest.raises(RuntimeError, match="no adapter weights to freeze"):
+        engine_cls(module)._build_lora_module(module)
+
+    class _NoSnapshot(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.peft_config = {"default": SimpleNamespace(r=4)}
+
+    with pytest.raises(RuntimeError, match="flash kl reference adapter missing"):
+        engine_cls(_NoSnapshot()).disable_adapter()
 
 
 def test_reasoning_parser_override_needs_both_thinking_and_a_constraint():
@@ -2336,20 +2656,27 @@ def test_text_env_resolves_without_building_a_processor(monkeypatch):
     assert inp["image_pad_token_id"] is None
 
 
-def test_capability_guard_rejects_kl_anchored_warm_start(monkeypatch):
-    # verl computes its kl reference with adapters DISABLED, so under init_from_adapter the
-    # reference is the bare base model and the penalty drags the policy away from the sft start -
-    # the opposite of what the knob asks for. must raise until verl can hold a reference adapter.
-    # the kl coefficient arrives through grpo_overrides, so it must go through the helper: patching
-    # it separately gets clobbered by the helper's own patch and the test then fails on the adapter
-    # download instead, passing a bare raises() while proving nothing about this guard.
-    with pytest.raises(RuntimeError, match="kl_penalty_coef"):
-        _capability_resolve(
-            monkeypatch,
-            _capability_env(),
-            train={"init_from_adapter": "org/some-sft-adapter"},
-            overrides={"kl_penalty_coef": 0.1},
-        )
+def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
+    # verl's kl reference is the bare base whenever lora is active, so warm-start + kl used to be
+    # refused: the penalty would drag the policy away from the sft adapter the run was told to
+    # continue. render_kl_ref_adapter_shim anchors the reference to that adapter instead, so the
+    # combination now resolves. the kl coefficient arrives through grpo_overrides, so it must go
+    # through the helper rather than being patched separately.
+    import flash.engine.worker.adapter as _adapter_mod
+
+    adapter_dir = tmp_path / "warmstart"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32}))
+    monkeypatch.setattr(_adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
+
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(),
+        train={"init_from_adapter": "org/some-sft-adapter"},
+        overrides={"kl_penalty_coef": 0.1},
+    )
+    assert inp["warmstart_adapter"]
+    assert inp["kl_coef"] == pytest.approx(0.1)
 
 
 def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch, capsys):
@@ -2516,16 +2843,26 @@ def test_the_run_body_puts_the_shim_dir_on_the_child_path_for_multi_turn():
 class _BridgeEnv:
     """the four calls MultiTurnBridge drives, recording what it was asked."""
 
-    def __init__(self, *, replies=None, done_after=1, episode=1.0, max_episode_turns=None):
+    def __init__(
+        self, *, replies=None, done_after=1, episode=1.0, max_episode_turns=None, prompt=None
+    ):
         self.replies = replies if replies is not None else [{"role": "user", "content": "next"}]
         self.done_after = done_after
         self.episode = episode
         self.max_episode_turns = max_episode_turns
+        self.prompt = list(prompt or ())
         self.recorded: list[str] = []
         self.scored: list[dict] = []
 
     def new_rollout_state(self, example):
-        state: dict = {"messages": [], "example": example}
+        # `messages` starts as a COPY of `prompt` and turns are appended onto it, matching
+        # flash.envs.adapter.new_rollout_state. anything reading the transcript has to account
+        # for that seeding rather than treating `messages` as turns-only.
+        state: dict = {
+            "example": example,
+            "prompt": list(self.prompt),
+            "messages": [dict(message) for message in self.prompt],
+        }
         if self.max_episode_turns is not None:
             state["max_episode_turns"] = self.max_episode_turns
         return state
@@ -2686,6 +3023,177 @@ def test_bridge_score_converts_a_non_finite_episode_to_zero():
         assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
 
 
+def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
+    # multi-turn has no per-completion breakdown -- the env scores a whole episode to a scalar --
+    # so the transcript IS the only thing this path can publish for `flash runs log`.
+    recorded: list[tuple] = []
+    env = _BridgeEnv(episode=0.75)
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    assert len(recorded) == 1
+    prompt, transcript, reward = recorded[0]
+    assert reward == 0.75
+    # the whole accumulated transcript, not just the last turn.
+    assert [m["content"] for m in transcript] == ["answer"]
+    assert prompt == []  # _BridgeEnv seeds no prompt; the shape is what matters here
+
+
+def test_the_recorded_transcript_excludes_the_prompt_it_was_seeded_from():
+    """`messages` starts as a copy of `prompt`, so it is not the transcript -- it CONTAINS it.
+
+    Publishing the whole list repeats the prompt inside `completion` when it already rides the
+    sample as `prompt_tail`: the reader sees it twice, and the doubled text eats the payload budget
+    a long episode needs for its actual turns (codex[bot]).
+    """
+    recorded: list[tuple] = []
+    prompt = [
+        {"role": "system", "content": "be terse"},
+        {"role": "user", "content": "what is 3+4"},
+    ]
+    env = _BridgeEnv(episode=0.75, prompt=prompt)
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "7"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    published_prompt, transcript, _ = recorded[0]
+    assert published_prompt == prompt
+    assert [m["content"] for m in transcript] == ["7"]
+
+
+def test_the_transcript_slice_keeps_a_turn_that_merely_looks_like_a_prompt_message():
+    """Slice by LENGTH, not by equality.
+
+    An env may legitimately produce a turn identical to a prompt message -- an echo env, a
+    re-issued instruction, a two-token action space. Dropping matches instead of the seeded prefix
+    would silently truncate exactly those episodes, and the sample would understate the turn count
+    that the reward was computed over.
+    """
+    recorded: list[tuple] = []
+    prompt = [{"role": "user", "content": "repeat after me: go"}]
+    env = _BridgeEnv(episode=1.0, done_after=99, prompt=prompt)
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    # the env replies with the prompt message verbatim, then the model answers.
+    env.replies = [dict(prompt[0])]
+    bridge.step({"session_id": "a", "completion_text": "go"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    transcript = recorded[0][1]
+    assert [m["content"] for m in transcript] == ["go", "repeat after me: go"]
+
+
+def test_the_recorded_episode_is_the_zeroed_reward_not_the_raw_nan():
+    # the sample carries the reward the rollout actually trained on. publishing nan here would show
+    # a reward in the log that no advantage was ever computed from.
+    recorded: list[tuple] = []
+    bridge = rl_verl.MultiTurnBridge(
+        _BridgeEnv(episode=float("nan")), [{"index": 0}], max_turns=4,
+        on_episode_scored=lambda *row: recorded.append(row),
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    assert [row[2] for row in recorded] == [0.0]
+
+
+def test_the_recorded_transcript_is_a_snapshot_that_later_turns_cannot_mutate():
+    # `step` appends to state["messages"] IN PLACE. handing the live list to the recorder would let
+    # a concurrent episode's turn appear inside an already-published sample.
+    recorded: list[tuple] = []
+    env = _BridgeEnv(done_after=99)
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "first"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+    snapshot = list(recorded[0][1])
+    bridge.step({"session_id": "a", "completion_text": "second"})
+
+    assert list(recorded[0][1]) == snapshot
+    assert "second" not in [m.get("content") for m in recorded[0][1]]
+
+
+def test_the_episode_recorder_runs_outside_the_session_lock():
+    # the recorder is the caller's sample buffer, which has its own lock. taking it while holding
+    # the session lock inverts the single-turn path's order (buffer lock only, never nested) and
+    # any grading that touches both deadlocks.
+    observed: list[bool] = []
+    env = _BridgeEnv()
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4,
+        on_episode_scored=lambda *_: observed.append(bridge._lock.acquire(blocking=False)),
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    assert observed == [True], "the session lock was still held when the recorder ran"
+    bridge._lock.release()
+
+
+def test_a_bridge_without_a_recorder_still_scores():
+    # single-turn jobs build no bridge, but the recorder stays optional so the bridge is usable
+    # (and testable) without a sample buffer behind it.
+    bridge = _bridge(_BridgeEnv(episode=0.5))
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.5}
+
+
+@pytest.mark.parametrize(
+    "abort", [{"truncated": True}, {"skip_reason": "length"}], ids=["truncated", "skipped"]
+)
+def test_a_first_turn_abort_is_still_shown_in_the_sample(abort):
+    """The turn the episode DIED on is the one worth reading, and it is trained on either way.
+
+    `step` keeps an unusable turn out of `messages` so the env never scores it. Building the sample
+    from that state alone therefore publishes an empty completion for a first-turn truncation --
+    a model that generated right up to its token limit reads as a model that generated nothing
+    (codex[bot])."""
+    recorded: list[tuple] = []
+    env = _BridgeEnv(done_after=99)
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    assert bridge.step({"session_id": "a", "completion_text": "ran out of ro", **abort}) == {
+        "terminal": True,
+        "messages": [],
+    }
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    assert env.recorded == [], "the env was shown a turn it must never score"
+    assert [m.get("content") for m in recorded[0][1]] == ["ran out of ro"]
+
+
+def test_the_env_never_scores_the_aborted_turn_it_is_shown_in_the_sample():
+    # the two sides are separate on purpose: the sample gains the turn, the scored state does not.
+    # asserting only on the sample would pass an implementation that also appended it to `messages`,
+    # which is the truncated-text-gets-graded bug the abort branch exists to prevent.
+    env = _BridgeEnv(done_after=99)
+    bridge = rl_verl.MultiTurnBridge(env, [{"index": 0}], max_turns=4)
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "good turn"})
+    bridge.step({"session_id": "a", "completion_text": "cut off", "truncated": True})
+    bridge.score({"session_id": "a", "turn_count": 2})
+
+    scored = [m.get("content") for m in env.scored[0]["messages"]]
+    assert "cut off" not in scored, "the truncated turn reached the env's scoring state"
+    assert "good turn" in scored
+
+
 def test_bridge_close_releases_the_session():
     # every in-flight episode holds env state. a leak here grows for the whole run, and the child
     # closes in a finally precisely so a failed episode still frees it -- so close must tolerate a
@@ -2731,12 +3239,17 @@ def test_bridge_routes_are_served_alongside_single_turn_scoring():
 def test_the_bridge_is_built_only_for_multi_turn_jobs():
     # a bridge on a single-turn job would expose episode routes with no episode state behind them,
     # and mounting it costs a lock the single-turn scoring path already has.
-    src = inspect.getsource(rl_verl.run_rl_verl)
+    # whitespace-normalized: the construction spans several lines, and what is under test is the
+    # guard around it, not how the formatter wrapped the call.
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    assert src.count("MultiTurnBridge(") == 1
     assert (
-        "MultiTurnBridge(env, rollout_examples, message_prompts, "
-        'max_turns=int(inp["max_turns"]))' in src
+        "MultiTurnBridge( env, rollout_examples, message_prompts, "
+        'max_turns=int(inp["max_turns"]), '
+        'per_turn_credit=bool(inp["per_turn_credit"]), '
+        "on_episode_scored=observability.record, )" in src
     )
-    assert 'if inp["multi_turn"]\n        else None' in src
+    assert 'if inp["multi_turn"] else None' in src
 
 
 # ---------------------- multi-turn review fixes ----------------------
@@ -3378,3 +3891,1177 @@ def test_the_reward_profiler_is_skipped_on_multi_turn():
     profile_call = src[src.index("reward_profile = ") : src.index("multi_turn_bridge = ")]
     assert 'if inp["multi_turn"]' in profile_call, "the profiler is not gated off multi-turn"
     assert "None" in profile_call, "multi-turn must record no profile rather than a wrong one"
+
+
+# ---------------- reward observability: the buffer and the heartbeat drain ----------------
+def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
+    """`_score`'s grade-then-record pair, against a real buffer and fake env.
+
+    `_score` itself is a local of a body that needs a model, a dataset and a verl interpreter to
+    reach, so the two calls it makes are made here directly; the wiring that they ARE what `_score`
+    does is asserted separately below, on its source.
+
+    `generation_size` defaults to 0 -- the boundary stays caller-driven -- so a test that only cares
+    about grading never trips the counted seal.
+    """
+    buffer = RewardObservabilityBuffer(generation_size=generation_size)
+    rollout_examples = examples if examples is not None else [{"gt": "7"}]
+    message_prompts = prompts if prompts is not None else ["prompt-0"]
+
+    def score(index: int, solution_str: str) -> float:
+        breakdowns: list[dict[str, float] | None] = []
+        value = rl_verl.score_single_turn(
+            env,
+            solution_str,
+            rollout_examples[int(index)],
+            tok=None,
+            thinking=False,
+            prompt_opened_thinking=False,
+            think_penalty=0.0,
+            breakdowns=breakdowns,
+        )
+        buffer.record(message_prompts[int(index)], solution_str, value, breakdowns)
+        return value
+
+    return score, buffer
+
+
+def test_score_grades_before_it_records():
+    """Grading calls user code and can block on i/o for seconds while verl scores many rollouts.
+
+    `record` takes the buffer's lock, so calling it around the grading rather than after it would
+    serialize every grading in the run behind the slowest one -- the whole reward wall.
+    """
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    body = src[src.index("def _score(index: int") :]
+    body = body[: body.index("def _score_for_profile")]
+
+    assert body.count("observability.record(") == 1
+    assert body.index("score = score_single_turn(") < body.index("observability.record(")
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_buffer_keeps_the_rollout_sample_and_its_named_breakdown():
+    score, buffer = _score_buffer(_NamedBreakdownEnv())
+
+    assert score(0, "7") == 1.0
+    assert buffer.latest() == ("prompt-0", "7", 1.0)
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_buffers_are_bounded_when_the_generation_never_closes():
+    # nothing bounds how many completions arrive before a boundary. the sample buffer evicts; the
+    # metric accumulator must not GROW instead -- this process is already memory-tight.
+    score, buffer = _score_buffer(_NamedBreakdownEnv())
+    for _ in range(5000):
+        score(0, "7")
+
+    assert len(buffer._samples) == RewardObservabilityBuffer._SAMPLE_BUFFER_LIMIT
+    # one float per NAME, whatever the completion count: the env reports two.
+    assert set(buffer._pending_totals) == {"success", "quality"}
+    assert buffer._pending_count == 5000
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_every_completion_counts_toward_the_mean_however_large_the_generation():
+    """A generation is ``batch_size * group_size`` completions, both unbounded, so no retention cap
+    can hold one. Dropping the overflow biases the published mean toward whichever completions were
+    graded last -- here, a run that succeeded early and failed late would report a flat 0
+    (codex[bot])."""
+    score, buffer = _score_buffer(
+        _CountingBreakdownEnv(),
+        prompts=["prompt-0"],
+        examples=[{"gt": "7"}],
+    )
+    total = 5000
+    for _ in range(total):
+        score(0, "7")
+    buffer.close_generation(1)
+
+    # the env numbers each grading, so the true mean of `n` is the mean of 0..total-1.
+    assert buffer.heartbeat_fields()["reward_metrics"]["n"] == (total - 1) / 2
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_eviction_drops_the_oldest_rollouts_and_keeps_the_newest():
+    """Over the limit, what SURVIVES has to be the recent end: samples answer "what is the model
+    doing now", so evicting the newest would pin a stalled run's diagnostics to its oldest
+    gradings. A length-only assertion passes either way -- this reads the retained values."""
+    score, buffer = _score_buffer(
+        _CountingBreakdownEnv(),
+        prompts=["prompt-0"],
+        examples=[{"gt": "7"}],
+    )
+    total = RewardObservabilityBuffer._SAMPLE_BUFFER_LIMIT + 50
+    for _ in range(total):
+        score(0, "7")
+
+    assert buffer.latest()[2] == float(total - 1)
+    assert [row[2] for row in buffer._samples] == [
+        float(n) for n in range(total - RewardObservabilityBuffer._SAMPLE_BUFFER_LIMIT, total)
+    ]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_run_with_no_rollouts_yet_omits_sampled_completions():
+    # symmetric with the reward_metrics case below: an empty list on the wire reads as "this step
+    # produced no rollouts", which is a different claim from "none have been scored yet".
+    buffer = RewardObservabilityBuffer()
+
+    assert "sampled_completions" not in buffer.heartbeat_fields()
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_both_signals_pass_their_wire_bounds_before_publication():
+    """The bounds are what make a payload safe to commit, and both are applied HERE -- the caller
+    publishes whatever this returns. Asserted through the buffer rather than on the helpers (which
+    have their own tests) so dropping either call from the publisher fails.
+
+    The sample side asserts on neutralization and the cap together, because on this path both come
+    from `select_rollout_samples` itself rather than from a second bounding pass.
+    """
+    buffer = RewardObservabilityBuffer()
+    buffer.record("prompt-0", "done\x1b[2Jcleared", 1.0)
+    for i in range(1, 5):  # distinct prompts, so dedup can't stand in for the cap
+        buffer.record(f"prompt-{i}", f"completion-{i}", float(i))
+    buffer.close_generation(1)
+    with buffer._lock:  # 13 names, over the 12-metric cap
+        buffer._latest_metrics.update({f"m{i}": 1.0 for i in range(13)})
+
+    fields = buffer.heartbeat_fields()
+
+    assert len(fields["reward_metrics"]) == 12
+    assert len(fields["sampled_completions"]) == 3
+    # a raw escape would let a rollout repaint the terminal of whoever runs `flash runs log`.
+    assert "\x1b" not in fields["sampled_completions"][0]["completion"]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_reward_that_is_not_a_float_is_coerced_at_the_boundary():
+    # rewards arrive from user grading code and go out as json. coercing on the way IN keeps a
+    # numpy scalar or a bool from reaching the serializer a heartbeat away from the call site.
+    buffer = RewardObservabilityBuffer()
+    buffer.record("prompt-0", "completion-0", np.float32(0.25))
+
+    reward = buffer.latest()[2]
+    assert type(reward) is float
+    assert reward == 0.25
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_scalar_reward_run_publishes_no_named_metrics_at_all():
+    # end to end for the empty case: a scores_breakdown-less env must reach the wire with the key
+    # ABSENT, not with every name flattened to 0 by an empty-dict denominator.
+    score, buffer = _score_buffer(_RewardOnlyEnv())
+    score(0, "the answer is 7")
+    buffer.close_generation(1)
+
+    fields = buffer.heartbeat_fields()
+    assert "reward_metrics" not in fields
+    assert len(fields["sampled_completions"]) == 1
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(),
+        prompts=["p0", "p1", "p2", "p3"],
+        examples=[{"gt": "7"}, {"gt": "7"}, {"gt": "9"}, {"gt": "9"}],
+    )
+    for index, completion in enumerate(["7", "7", "7", "7"]):
+        score(index, completion)
+
+    buffer.close_generation(5)
+    fields = buffer.heartbeat_fields()
+
+    # two of four completions matched their gt, so success averages 0.5 across the generation.
+    assert fields["reward_metrics"] == {"success": 0.5, "quality": 0.5}
+    assert len(fields["sampled_completions"]) == 3  # hard cap, four rollouts buffered
+    assert {s["generated_at_step"] for s in fields["sampled_completions"]} == {5}
+    assert [s["reward"] for s in fields["sampled_completions"]] == [1.0, 1.0, 0.0]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one():
+    """A 30s liveness tick is not a generation boundary, and publishing on it is latency-biased.
+
+    The completions that finish first are the fast ones -- short outputs, cache hits, envs that
+    grade without i/o. A drain on the heartbeat cadence therefore reports THAT subset's mean as the
+    step's reward, systematically over-representing whatever is cheap to produce. The reading has to
+    stay pinned to the last whole generation until the next boundary seals a new one (codex[bot]).
+    """
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(),
+        prompts=["p0", "p1"],
+        examples=[{"gt": "7"}, {"gt": "7"}],
+    )
+    score(0, "7")  # the fast completion: success 1.0
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 1.0
+
+    # generation 2 is under way and only its fast half has been graded.
+    score(1, "wrong")  # success 0.0
+
+    mid = buffer.heartbeat_fields()
+    assert mid["reward_metrics"]["success"] == 1.0, "published a partial generation's mean"
+    assert [s["reward"] for s in mid["sampled_completions"]] == [1.0]
+
+    # the slow half lands, then the boundary: now the whole generation publishes at once.
+    score(0, "7")
+    buffer.close_generation(2)
+    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 0.5
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_next_generation_cannot_be_sealed_into_the_step_line_that_is_still_in_flight():
+    """The child's stdout is delivered asynchronously, so `step:N` can reach the parent AFTER
+    generation N+1 has started scoring. A boundary taken at that moment seals both generations
+    under step N and leaves N+1 with nothing of its own to publish (codex[bot]).
+
+    Counting closes the generation on the scoring thread that finishes it, so the in-flight line
+    only names what was already sealed."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score(0, "7")
+    score(0, "7")  # generation 1 is complete here, whatever stdout is doing
+    score(0, "wrong")  # generation 2 begins while `step:1` is still in the pipe
+
+    buffer.close_generation(1)
+    first = buffer.heartbeat_fields()
+    assert first["reward_metrics"]["success"] == 1.0, "next generation leaked into this mean"
+    assert [s["completion"] for s in first["sampled_completions"]] == ["7", "7"]
+    assert {s["generated_at_step"] for s in first["sampled_completions"]} == {1}
+
+    score(0, "wrong")
+    buffer.close_generation(2)
+    second = buffer.heartbeat_fields()
+    assert second["reward_metrics"]["success"] == 0.0, "step 2 republished step 1"
+    assert {s["generated_at_step"] for s in second["sampled_completions"]} == {2}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_generation_that_completes_before_the_previous_step_line_is_not_lost():
+    """Stdout can fall a WHOLE generation behind, not just part of one.
+
+    A single "already sealed" flag only remembers one unacknowledged generation, so the second seal
+    overwrites the first: generation 1 is dropped and generation 2 publishes under step 1, leaving
+    every later step misaligned. Small generations make that window ordinary (cursor, codex[bot])."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score(0, "7")
+    score(0, "7")  # generation 1 complete: success 1.0
+    score(0, "wrong")
+    score(0, "wrong")  # generation 2 complete too, and NEITHER step line has arrived
+
+    buffer.close_generation(1)
+    first = buffer.heartbeat_fields()
+    assert first["reward_metrics"]["success"] == 1.0, "generation 1 was overwritten before it published"
+    assert [s["completion"] for s in first["sampled_completions"]] == ["7", "7"]
+    assert {s["generated_at_step"] for s in first["sampled_completions"]} == {1}
+
+    buffer.close_generation(2)
+    second = buffer.heartbeat_fields()
+    assert second["reward_metrics"]["success"] == 0.0
+    assert [s["completion"] for s in second["sampled_completions"]] == ["wrong", "wrong"]
+    assert {s["generated_at_step"] for s in second["sampled_completions"]} == {2}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_queue_of_unnamed_generations_is_bounded():
+    # the queue holds whole generations, each retaining up to _SAMPLE_BUFFER_LIMIT completions. a
+    # child that stops printing step lines never drains it, and this process is already memory-tight.
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    for _ in range(4 * RewardObservabilityBuffer._SEALED_QUEUE_LIMIT):
+        score(0, "7")
+
+    assert len(buffer._sealed_by_count) == RewardObservabilityBuffer._SEALED_QUEUE_LIMIT
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_an_eviction_does_not_shift_every_later_step_onto_the_wrong_generation():
+    """Dropping the oldest queued generation is not enough: its `step:N` line still arrives.
+
+    Handing that line to the oldest SURVIVOR consumes a generation whose own line is still coming,
+    so the offset never closes -- every step for the rest of the run publishes the next generation's
+    output under the previous step's number. One eviction, permanently wrong diagnostics (cursor,
+    codex[bot]).
+    """
+    limit = RewardObservabilityBuffer._SEALED_QUEUE_LIMIT
+    buffer = RewardObservabilityBuffer(generation_size=1)
+    for i in range(limit + 1):  # one more than the queue holds: generation 0 is evicted
+        buffer.record(f"prompt-{i}", f"gen-{i}", float(i))
+
+    assert len(buffer._sealed_by_count) == limit
+
+    # stdout catches up and names them in order. the line for the evicted generation is spent on it.
+    published = []
+    for step in range(1, limit + 2):
+        buffer.close_generation(step)
+        published.append(buffer._published[-1][1] if buffer._published else None)
+
+    # step 1's generation is genuinely gone, so its reading is stale rather than another
+    # generation's. every step after it is matched to the generation that actually produced it.
+    assert published[0] is None
+    assert published[1:] == [f"gen-{i}" for i in range(1, limit + 1)]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_step_preview_reads_the_generation_that_step_published():
+    """The caller closes the generation and then previews it under that same step number.
+
+    A late `step:N` line arrives with generation N+1 already scoring, so the newest recorded sample
+    belongs to N+1. Previewing that labels N+1's completion as step N -- the mislabelling the queue
+    exists to prevent, reintroduced one line later, and disagreeing with the heartbeat about the
+    very same step (codex[bot]).
+    """
+    buffer = RewardObservabilityBuffer(generation_size=2)
+    buffer.record("p", "gen1-a", 1.0)
+    buffer.record("p", "gen1-b", 1.0)  # generation 1 sealed by count
+    buffer.record("p", "gen2-a", 9.0)  # generation 2 already scoring; `step:1` still in the pipe
+
+    buffer.close_generation(1)
+
+    assert buffer.latest()[1] == "gen1-b", "the preview labelled the next generation as this step"
+    # and the heartbeat agrees with it, which is the point of reading the published generation.
+    fields = buffer.heartbeat_fields()
+    assert [s["completion"] for s in fields["sampled_completions"]] == ["gen1-a", "gen1-b"]
+
+
+def test_a_preview_before_the_first_boundary_still_shows_a_rollout():
+    # the fallback direction: with nothing published yet, the open generation is all there is, and
+    # blanking the preview would read as "no rollouts" rather than "no boundary yet".
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "first", 0.5)
+
+    assert buffer.latest() == ("p", "first", 0.5)
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request():
+    """`record` runs OUTSIDE `score_single_turn`'s error guard, so anything it raises 400s the
+    reward request and aborts the run. An int larger than a float can hold raises OverflowError,
+    which is neither TypeError nor ValueError (codex[bot])."""
+    score, buffer = _score_buffer(_OverflowingBreakdownEnv())
+
+    assert score(0, "7") == 1.0  # the total graded fine; only the diagnostic component is unusable
+    buffer.close_generation(1)
+    metrics = buffer.heartbeat_fields()["reward_metrics"]
+    assert metrics["success"] == 1.0, "a usable component was dropped with the unusable one"
+    assert metrics["enormous"] == 0.0
+
+
+def test_the_published_metric_bound_survives_a_value_too_large_to_be_a_float():
+    # the same coercion runs again on the publish side, on the heartbeat thread, over a dict the
+    # trl callback takes from its caller. escaping there kills liveness reporting for the whole run.
+    from flash.engine.worker.heartbeat import _bounded_reward_metrics
+
+    assert _bounded_reward_metrics({"huge": 10**400, "fine": 0.25}) == {"fine": 0.25}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_step_line_names_the_generation_the_count_already_sealed():
+    """A counted seal publishes under the buffer's OWN ordinal, which is only a guess at what verl
+    logged -- it counts from 1 and assumes no skipped or resumed steps. The arriving line carries
+    the real number, so dropping the relabel would stamp every sample with a step the run never
+    logged, and a reader correlating samples against the loss curve would line them up wrong."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score(0, "7")
+    score(0, "7")
+
+    # verl resumed from a checkpoint: its first logged step is 41, not the buffer's internal 1.
+    buffer.close_generation(41)
+
+    assert {
+        s["generated_at_step"] for s in buffer.heartbeat_fields()["sampled_completions"]
+    } == {41}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_counted_seal_does_not_disarm_the_boundary_for_later_generations():
+    """`_sealed_by_count` holds the generations the count sealed, waiting to be named. A step line
+    that names one without taking it off the queue turns every later `close_generation` into a
+    relabel of the same entry, so from the second generation on the buffer publishes nothing new --
+    metrics frozen at generation 1 while the run continues."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    for _ in range(2):
+        score(0, "7")
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 1.0
+
+    for _ in range(2):
+        score(0, "wrong")
+    buffer.close_generation(2)
+
+    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 0.0, "boundary went dead"
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_generation_short_of_its_count_is_still_sealed_by_the_step_line():
+    """The count seals a FULL generation; the step line is what seals a short one. If a named
+    generation stays on `_sealed_by_count`, the next `close_generation` relabels it instead of
+    sealing what is open -- so a generation that lost a completion (a `_score` that raised before
+    reaching the bridge) republishes the PREVIOUS generation's numbers under the new step, and
+    carries its samples forward. The run reads as healthy at exactly the step where grading broke."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    for _ in range(2):
+        score(0, "7")
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 1.0
+
+    # one of the two completions never reached the bridge, so the count cannot fire
+    score(0, "wrong")
+    buffer.close_generation(2)
+
+    fields = buffer.heartbeat_fields()
+    assert fields["reward_metrics"]["success"] == 0.0, "stale generation republished as step 2"
+    assert len(fields["sampled_completions"]) == 1, "generation 1's samples leaked into 2"
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_completion_that_failed_scoring_still_counts_toward_the_denominator():
+    """A completion the env could not grade contributes no breakdown but is still part of the
+    generation. Counting only the ones that produced a dict would divide by the scored subset --
+    biasing every named metric HIGH exactly when scoring is degraded, so a half-broken env reports
+    the same number as a healthy one."""
+    buffer = RewardObservabilityBuffer()
+    buffer.record("prompt-0", "a", 1.0, [{"success": 1.0, "total": 1.0}])
+    buffer.record("prompt-0", "b", 0.0, [None])
+    buffer.close_generation(1)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 0.5}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_component_whose_values_are_all_unusable_is_reported_as_zero_not_dropped():
+    """Registering a name only once one of its values coerces would delete the component from the
+    payload entirely -- and an env whose component is broken for the WHOLE generation is exactly
+    when someone needs to see it. A flat 0 reads as "this scored nothing"; absence is
+    indistinguishable from "this env has no such component"."""
+    score, buffer = _score_buffer(_UnusableComponentEnv())
+    score(0, "7")
+    buffer.close_generation(1)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {
+        "broken": 0.0,
+        "diverged": 0.0,
+        "quality": 0.5,
+    }
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_generation_that_reports_no_components_at_all_leaves_the_metrics_standing():
+    """"No breakdowns" and "breakdowns that all failed" look the same at the seal but mean opposite
+    things. A multi-turn episode grades to a scalar and never reports components, so zeroing the
+    known metrics for it would publish a scoring outage the env never had -- and the two record
+    paths share one buffer, so a run that scores some rows per-completion and some per-episode
+    would flip its metrics to 0 on every episode generation."""
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "a", 1.0, [{"success": 1.0, "total": 1.0}])
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}
+
+    buffer.record("p", "b", 1.0)  # a scored episode, no per-completion breakdown to report
+    buffer.close_generation(2)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}, "read as an outage"
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_one_non_finite_score_cannot_poison_a_whole_components_mean():
+    """Summing a NaN in makes the running total NaN forever: every later completion adds to it and
+    the name publishes NaN for the rest of the generation. One diverged grading would take out a
+    component that scored fine on every other completion -- and `json.dumps` writes bare `NaN`,
+    which is not JSON, so a strict reader rejects the whole heartbeat over it."""
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "a", 1.0, [{"quality": 1.0, "total": 1.0}])
+    buffer.record("p", "b", 1.0, [{"quality": float("nan"), "total": 1.0}])
+    buffer.record("p", "c", 1.0, [{"quality": 1.0, "total": 1.0}])
+    buffer.close_generation(1)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"quality": 2.0 / 3.0}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_published_payload_is_read_under_one_acquisition():
+    """Both fields describe the same generation, so reading them under separate acquisitions lets a
+    seal land between the two and the payload tears: metrics from generation N+1 shipped beside
+    samples from N. Asserted on the source because reproducing the interleave needs a scoring
+    thread to win a specific race -- a test that passes when it loses proves nothing."""
+    body = inspect.getsource(RewardObservabilityBuffer.heartbeat_fields)
+    snapshot = body[body.index("with self._lock:") : body.index("fields: dict = {}")]
+
+    assert snapshot.count("with self._lock:") == 1, "the two reads can straddle a seal"
+    assert "self._latest_metrics" in snapshot
+    assert "self._published" in snapshot
+
+
+def test_the_generation_size_is_the_configured_rollout_count():
+    # the counted boundary is only correct if it counts a whole generation. verl runs with
+    # test_freq=-1 and val_before_train=False, so every completion reaching the bridge is one of
+    # these -- a validation pass would desynchronize the count from the step lines.
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    construction = src[src.index("RewardObservabilityBuffer(") :]
+    construction = construction[: construction.index("wandb_link")]
+    assert 'generation_size=int(inp["prompts_per_step"]) * int(inp["group_size"])' in construction
+    overrides = rl_verl.build_verl_overrides(_overrides_cfg())
+    assert "trainer.test_freq=-1" in overrides
+    assert "trainer.val_before_train=False" in overrides
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_samples_carry_the_step_they_were_generated_at_not_the_current_one():
+    """`generated_at_step` names the generation that PRODUCED the completion.
+
+    The buffer is rolling, so a drain that stamps everything in it with the current step
+    re-publishes older rollouts as if the model had just produced them -- a reader watching for
+    behaviour change sees old text under a new step number (codex[bot]).
+    """
+    score, buffer = _score_buffer(_NamedBreakdownEnv())
+    score(0, "7")
+    buffer.close_generation(4)
+
+    # steps 5 and 6 generate nothing (the run is stalled, or verl logged without new rollouts).
+    buffer.close_generation(5)
+    buffer.close_generation(6)
+
+    fields = buffer.heartbeat_fields()
+    assert {s["generated_at_step"] for s in fields["sampled_completions"]} == {4}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_drain_clears_pending_breakdowns_and_then_repeats_the_last_reading():
+    # the drain CLEARS the pending list. between generations there is nothing new to average, and
+    # reporting {} there would blank the metric on every heartbeat that lands mid-generation rather
+    # than holding the last real reading.
+    score, buffer = _score_buffer(_NamedBreakdownEnv())
+    score(0, "7")
+    buffer.close_generation(1)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+    assert buffer._pending_totals == {}
+    assert buffer._pending_count == 0
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+
+    score(0, "wrong")
+    buffer.close_generation(2)
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 0.0, "quality": 0.5}
+
+
+class _ReleaseHookedLock:
+    """The buffer's lock, with a callback fired the instant it is released.
+
+    Landing a grading at that exact moment is what makes the atomicity test deterministic: a real
+    thread race can't be, because lock handoff is barging-prone and a sleep long enough to make the
+    interleave reliable is a sleep the correct code also passes.
+    """
+
+    def __init__(self, lock, on_release):
+        self._lock = lock
+        self._on_release = on_release
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc):
+        released = self._lock.__exit__(*exc)
+        self._on_release()
+        return released
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_metrics_and_samples_in_one_payload_describe_the_same_gradings():
+    """The boundary's drain and sample seal must be ONE acquisition, or a payload tears.
+
+    A grading landing between them is not lost -- it just belongs to the NEXT generation. What
+    breaks is agreement: its sample would ride this generation's publication while its reward
+    doesn't reach this generation's metrics, so `sampled_completions` and `reward_metrics` describe
+    different gradings and a reader diagnosing a reward drop sees a sample the numbers next to it
+    never scored.
+    """
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(),
+        prompts=["prompt-0", "prompt-1"],  # distinct: both survive the per-prompt dedup
+        examples=[{"gt": "7"}, {"gt": "7"}],
+    )
+    score(0, "7")  # success 1.0
+
+    landed = []
+
+    def _land_a_grading_the_instant_the_lock_drops():
+        if landed:
+            return  # record() takes the same lock; don't recurse into it
+        landed.append(True)
+        score(1, "wrong")  # success 0.0
+
+    buffer._lock = _ReleaseHookedLock(buffer._lock, _land_a_grading_the_instant_the_lock_drops)
+    buffer.close_generation(1)
+    fields = buffer.heartbeat_fields()
+
+    assert landed, "the hook never fired, so this asserts nothing about atomicity"
+    # the second grading landed after the whole section, so NEITHER signal carries it.
+    assert fields["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+    assert [sample["reward"] for sample in fields["sampled_completions"]] == [1.0]
+
+
+def test_the_first_sample_bearing_heartbeat_is_forced():
+    # the liveness daemon can claim a step before the stdout loop reaches it, and a step-gated stage
+    # drops a second payload at an already-committed step. without force, the first heartbeat
+    # carrying samples is exactly the one most likely to be suppressed.
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    forced = src[src.index("if not sent_first_metrics:") :]
+    forced = forced[: forced.index("gpu=gpu_diagnostics")]
+    assert "force=True" in forced
+    assert "**_reward_observability()" in forced
+
+
+def test_the_liveness_fields_hook_carries_reward_observability():
+    # the rl_step liveness wrap is what publishes between stdout lines. without the fields hook
+    # merging it, samples would only ever reach the wire on the one forced first-metrics heartbeat.
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    assert 'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in src
+
+
+def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():
+    """The boundary is verl's step line, and it is the ONLY drain.
+
+    Both halves are load-bearing and neither is reachable from a unit test -- `_reward_observability`
+    is a local of a body that needs a model, a dataset and a verl interpreter. If the heartbeat
+    drained as well, a 30s tick landing mid-generation would publish the subset of completions that
+    had finished by then. If the step line did not close the generation, nothing ever would, and the
+    buffer would report its first generation for the whole run.
+    """
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+
+    hook = src[src.index("def _reward_observability()") :]
+    hook = hook[: hook.index("with liveness_heartbeat(")]
+    assert "observability.heartbeat_fields()" in hook
+    assert "close_generation" not in hook, "the heartbeat drains; the boundary would be bypassed"
+
+    # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
+    # sample and the heartbeat describe the same generation.
+    stdout_loop = src[src.index("step_box[0] = int(m.group(1))") :]
+    assert "observability.close_generation(step_box[0])" in stdout_loop
+    assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
+        "samp = observability.latest_for_step(step_box[0])"
+    )
+    # and the preview asks for THIS step's rows. the unchecked accessor answers with whatever was
+    # published last, which on the drop-spend path belongs to an earlier step (cursor).
+    assert "observability.latest()" not in stdout_loop, (
+        "the preview would print older rows under this step number"
+    )
+
+
+def test_a_step_whose_generation_was_dropped_previews_nothing_rather_than_older_text():
+    """The drop-spend path publishes nothing, so the newest rows belong to an EARLIER step.
+
+    `close_generation` spends this step's line on a generation the queue already dropped and
+    publishes nothing. `latest` keeps answering with the previous generation's rows, and the caller
+    -- which cannot see that no publish happened -- prints them under the new step number, so the
+    log claims this step generated text that a different step produced (cursor).
+    """
+    buffer = RewardObservabilityBuffer(generation_size=2)
+    buffer.record("pA", "gen-A-a", 1.0)
+    buffer.record("pA", "gen-A-b", 1.0)
+    buffer.close_generation(10)  # generation A is published under step 10
+
+    # overflow the sealed queue so a later generation is dropped before it was ever named.
+    for gen in range(RewardObservabilityBuffer._SEALED_QUEUE_LIMIT + 2):
+        buffer.record("pB", f"gen-B{gen}-a", 2.0)
+        buffer.record("pB", f"gen-B{gen}-b", 2.0)
+    assert buffer._dropped_unnamed, "the queue never dropped a generation, so the path is untested"
+
+    buffer.close_generation(11)  # spent on the drop: nothing is published for step 11
+
+    assert buffer.latest_for_step(11) is None, (
+        "step 11 previewed rows that belong to an earlier generation"
+    )
+    # the stale reading is still reachable, deliberately: the heartbeat reports it as step 10's.
+    assert buffer.latest()[1] == "gen-A-b"
+
+
+def test_a_step_that_did_publish_still_previews_its_own_rows():
+    # the control: the ordinary path must keep previewing, or the fix above silences every preview.
+    buffer = RewardObservabilityBuffer(generation_size=2)
+    buffer.record("p", "gen1-a", 1.0)
+    buffer.record("p", "gen1-b", 1.0)
+
+    buffer.close_generation(7)
+
+    assert buffer.latest_for_step(7) == ("p", "gen1-b", 1.0)
+
+
+def test_a_late_step_line_previews_the_generation_that_step_named():
+    # the queue's whole purpose, asserted through the step-checked accessor: a late line names the
+    # OLDEST unnamed generation, so that is the one this step may preview.
+    buffer = RewardObservabilityBuffer(generation_size=2)
+    buffer.record("p", "gen1-a", 1.0)
+    buffer.record("p", "gen1-b", 1.0)
+    buffer.record("p", "gen2-a", 9.0)  # generation 2 already scoring
+
+    buffer.close_generation(1)
+
+    assert buffer.latest_for_step(1)[1] == "gen1-b"
+    assert buffer.latest_for_step(2) is None, "step 2 has not been named yet"
+
+
+def test_nothing_is_previewed_for_a_step_before_the_first_boundary():
+    # `latest` falls back to the open generation so an early preview is not blank. that fallback
+    # must NOT leak into the step-checked accessor: those rows have not been named, so no step
+    # number is correct for them.
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "first", 0.5)
+
+    assert buffer.latest() == ("p", "first", 0.5)
+    assert buffer.latest_for_step(0) is None
+    assert buffer.latest_for_step(1) is None
+
+
+def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
+    """execute the rendered shim against a stub verl and return the advantages it writes.
+
+    executing the source is the only test that can fail for the right reason: the shim's whole job
+    is to replace a module-global that verl calls by name, and a string assertion would pass just
+    as happily on a shim that never installed itself.
+    """
+    import sys
+    from types import ModuleType
+    from types import SimpleNamespace as NS
+
+    batch_size = len(uids)
+    width = episode_advantages.shape[1]
+    spans = np.empty(batch_size, dtype=object)
+    turns = np.empty(batch_size, dtype=object)
+    for row_index, row in enumerate(rows):
+        spans[row_index] = None if row is None else list(row[0])
+        turns[row_index] = None if row is None else list(row[1])
+
+    batch = {"advantages": episode_advantages}
+    if response_mask is not None:
+        batch["response_mask"] = response_mask
+    data = NS(
+        batch=batch,
+        non_tensor_batch={
+            "uid": np.array(uids, dtype=object),
+            "flash_turn_spans": spans,
+            "flash_turn_rewards": turns,
+        },
+    )
+
+    ray_trainer = ModuleType("verl.trainer.ppo.ray_trainer")
+    # stock grpo's contribution: the shim must call through to it and build on what it returns.
+    ray_trainer.compute_advantage = lambda payload, *args, **kwargs: payload
+    ppo = ModuleType("verl.trainer.ppo")
+    ppo.ray_trainer = ray_trainer
+    stubs = {
+        "verl": ModuleType("verl"),
+        "verl.trainer": ModuleType("verl.trainer"),
+        "verl.trainer.ppo": ppo,
+        "verl.trainer.ppo.ray_trainer": ray_trainer,
+    }
+    for name, module in stubs.items():
+        sys.modules[name] = module
+    try:
+        exec(compile(rl_verl.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        # call the module global by name, exactly as ray_trainer.fit does at its call site.
+        out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
+    finally:
+        for name in stubs:
+            sys.modules.pop(name, None)
+    return out.batch["advantages"]
+
+
+def test_per_turn_credit_shim_is_emitted_only_when_per_turn_credit_is_requested():
+    # the default path must put nothing on the child's import path: this shim replaces the
+    # advantage computation itself, so emitting it unconditionally would put every episode-credit
+    # run through a rewrite it never asked for.
+    assert rl_verl.render_per_turn_credit_shim(False) == ""
+    source = rl_verl.render_per_turn_credit_shim(True)
+    assert source
+    assert "_flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage" in source
+
+
+def test_per_turn_credit_shim_centres_each_turn_against_its_group_sibling():
+    pytest.importorskip("torch")
+    import torch
+
+    # two rollouts of the same prompt, two turns each, spans [0,2) and [2,4).
+    # turn 0: 1.0 vs 0.0 -> baseline 0.5 -> +0.5 / -0.5
+    # turn 1: 0.0 vs 1.0 -> baseline 0.5 -> -0.5 / +0.5
+    # the second rollout is the WORSE episode overall on turn 0 yet must still earn positive credit
+    # on turn 1; that inversion is the entire point of per-turn credit and episode credit cannot
+    # produce it.
+    rows = [
+        (((0, 2), (2, 4)), (1.0, 0.0)),
+        (((0, 2), (2, 4)), (0.0, 1.0)),
+    ]
+    advantages = _run_per_turn_shim(
+        rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32)
+    )
+    assert advantages[0].tolist() == [0.5, 0.5, -0.5, -0.5]
+    assert advantages[1].tolist() == [-0.5, -0.5, 0.5, 0.5]
+
+
+def test_per_turn_credit_shim_matches_trl_per_turn_advantages():
+    # the two backends must produce the SAME advantages for the same rollouts, which is what makes
+    # this a port rather than a second implementation. trl's builder is the reference oracle.
+    pytest.importorskip("torch")
+    import torch
+
+    from flash.engine.worker.grpo_perturn_trainer import build_per_turn_advantages
+
+    spans = [[(0, 3), (3, 5)], [(0, 2), (2, 6)]]
+    turns = [[0.25, 0.75], [1.0, 0.5]]
+    expected = build_per_turn_advantages(
+        spans,
+        turns,
+        num_generations=2,
+        completion_len=6,
+        # trl centres the episode itself; per-turn rows never read this, so its value is
+        # irrelevant to the comparison and any finite tensor proves the same thing.
+        episode_advantages=torch.zeros(2, dtype=torch.float32),
+    )
+    got = _run_per_turn_shim(
+        [(tuple(map(tuple, spans[0])), tuple(turns[0])),
+         (tuple(map(tuple, spans[1])), tuple(turns[1]))],
+        ["p0", "p0"],
+        torch.zeros((2, 6), dtype=torch.float32),
+    )
+    assert torch.allclose(got, expected)
+
+
+def test_per_turn_credit_shim_drops_a_whole_group_when_one_row_is_unusable():
+    pytest.importorskip("torch")
+    import torch
+
+    # an unscorable row (bridge returned turns=None) must not leave its group centred on a smaller
+    # sample: the surviving rows would be compared against a baseline built from a different
+    # population than grpo's own. the whole group keeps stock grpo's tensor untouched.
+    episode = torch.tensor([[0.3, 0.3, 0.3, 0.3], [-0.3, -0.3, -0.3, -0.3]], dtype=torch.float32)
+    advantages = _run_per_turn_shim(
+        [(((0, 2), (2, 4)), (1.0, 0.0)), None], ["p0", "p0"], episode.clone()
+    )
+    assert torch.equal(advantages, episode)
+
+
+def test_per_turn_credit_shim_leaves_other_groups_on_episode_credit():
+    pytest.importorskip("torch")
+    import torch
+
+    # the fallback is per group, not per batch: one broken group must not cost every other prompt
+    # in the step its per-turn credit.
+    episode = torch.zeros((4, 4), dtype=torch.float32)
+    episode[2] = 0.7
+    episode[3] = -0.7
+    rows = [
+        (((0, 2), (2, 4)), (1.0, 0.0)),
+        (((0, 2), (2, 4)), (0.0, 1.0)),
+        (((0, 2), (2, 4)), (1.0, 0.0)),
+        None,
+    ]
+    advantages = _run_per_turn_shim(rows, ["p0", "p0", "p1", "p1"], episode.clone())
+    assert advantages[0].tolist() == [0.5, 0.5, -0.5, -0.5]
+    # the broken group kept exactly what stock grpo produced. compared against the input tensor
+    # rather than a literal: 0.7 has no exact float32 representation, so a literal would compare
+    # the shim's output against a value grpo never actually held.
+    assert torch.equal(advantages[2], episode[2])
+    assert torch.equal(advantages[3], episode[3])
+
+
+def test_per_turn_credit_shim_ignores_a_turn_no_group_member_emitted():
+    pytest.importorskip("torch")
+    import torch
+
+    # a zero-width span is a turn the model never produced. it must be excluded from the BASELINE,
+    # not merely written nowhere: one sibling emits turn 1 and the other does not, so the emitting
+    # row is the only member and its advantage is 0.0. counting the absent member would centre it
+    # against a reward for tokens that do not exist -- here (2.0 - (2.0 + 8.0) / 2) = -3.0, a large
+    # negative signal on a turn the model actually produced.
+    rows = [
+        (((0, 2), (2, 4)), (1.0, 2.0)),
+        (((0, 2), (2, 2)), (0.0, 8.0)),
+    ]
+    advantages = _run_per_turn_shim(
+        rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32)
+    )
+    assert advantages[0].tolist() == [0.5, 0.5, 0.0, 0.0]
+    assert advantages[1].tolist() == [-0.5, -0.5, 0.0, 0.0]
+
+
+def test_per_turn_credit_shim_keeps_glue_tokens_out_of_the_gradient():
+    pytest.importorskip("torch")
+    import torch
+
+    # environment replies sit inside the transcript with response_mask 0. a turn span that reaches
+    # over one must not hand it advantage -- the model did not generate those tokens.
+    mask = torch.tensor([[1, 1, 0, 1], [1, 1, 0, 1]], dtype=torch.float32)
+    rows = [
+        (((0, 2), (2, 4)), (1.0, 0.0)),
+        (((0, 2), (2, 4)), (0.0, 1.0)),
+    ]
+    advantages = _run_per_turn_shim(
+        rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32), response_mask=mask
+    )
+    assert advantages[0].tolist() == [0.5, 0.5, 0.0, -0.5]
+    assert advantages[1].tolist() == [-0.5, -0.5, 0.0, 0.5]
+
+
+def test_per_turn_credit_shim_rejects_a_span_past_the_response_width():
+    pytest.importorskip("torch")
+    import torch
+
+    # a span beyond the tensor would silently write nothing (python slicing clamps), training on
+    # episode credit while the logs claim per-turn. fail loudly instead.
+    rows = [(((0, 2), (2, 99)), (1.0, 0.0)), (((0, 2), (2, 4)), (0.0, 1.0))]
+    with pytest.raises(ValueError, match="exceeds the response width"):
+        _run_per_turn_shim(rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32))
+
+
+def test_per_turn_credit_shim_passes_through_a_batch_without_per_turn_metadata():
+    # validation batches and any single-turn rollout carry no spans. the shim must return stock
+    # grpo's tensor untouched rather than zeroing a batch it cannot credit.
+    pytest.importorskip("torch")
+    import sys
+    from types import ModuleType
+    from types import SimpleNamespace as NS
+
+    import torch
+
+    episode = torch.full((2, 3), 0.4, dtype=torch.float32)
+    data = NS(batch={"advantages": episode.clone()}, non_tensor_batch={"uid": np.array(["p0", "p0"], dtype=object)})
+    ray_trainer = ModuleType("verl.trainer.ppo.ray_trainer")
+    ray_trainer.compute_advantage = lambda payload, *args, **kwargs: payload
+    ppo = ModuleType("verl.trainer.ppo")
+    ppo.ray_trainer = ray_trainer
+    stubs = {
+        "verl": ModuleType("verl"),
+        "verl.trainer": ModuleType("verl.trainer"),
+        "verl.trainer.ppo": ppo,
+        "verl.trainer.ppo.ray_trainer": ray_trainer,
+    }
+    for name, module in stubs.items():
+        sys.modules[name] = module
+    try:
+        exec(compile(rl_verl.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
+    finally:
+        for name in stubs:
+            sys.modules.pop(name, None)
+    assert torch.equal(out.batch["advantages"], episode)
+
+
+def test_per_turn_credit_is_resolved_only_for_multi_turn_and_reaches_the_bridge():
+    # single-turn envs cannot express per-turn credit (there is one turn), and trl says so while
+    # accepting the key. the verl resolver must match that, and must no longer REJECT multi-turn.
+    source = inspect.getsource(rl_verl._resolve_grpo_inputs)
+    assert "not supported for multi-turn environments" not in source
+    assert '"per_turn_credit": per_turn_credit' in source
+    run_source = inspect.getsource(rl_verl.run_rl_verl)
+    assert 'render_per_turn_credit_shim(inp["per_turn_credit"])' in run_source
+    assert 'per_turn_credit=bool(inp["per_turn_credit"])' in run_source
+
+
+def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
+    # the loop keys off the presence of `turns`, so an episode-credit run must not send the key at
+    # all: sending it would put every ordinary multi-turn run through the per-turn rewrite.
+    class _Env:
+        max_turns = 2
+
+        def new_rollout_state(self, example):
+            return {"prompt": [], "messages": []}
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            return [RolloutReward(episode=1.0, turns=(0.25, 0.75)) for _ in items]
+
+    examples = [{"question": "q"}]
+    episode_only = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2)
+    per_turn = rl_verl.MultiTurnBridge(_Env(), examples, max_turns=2, per_turn_credit=True)
+    for bridge in (episode_only, per_turn):
+        bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
+    assert episode_only.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0}
+    assert per_turn.score({"session_id": "s", "turn_count": 2}) == {
+        "score": 1.0,
+        "turns": [0.25, 0.75],
+    }
+
+
+def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
+    # score_rollouts canonicalises a bad vector to None. the bridge must forward that None rather
+    # than a partial list, so the group falls back cleanly.
+    class _Env:
+        max_turns = 2
+
+        def new_rollout_state(self, example):
+            return {"prompt": [], "messages": []}
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            # one reward for two turns: the validator rejects the count and drops to None.
+            return [RolloutReward(episode=1.0, turns=(0.5,)) for _ in items]
+
+    bridge = rl_verl.MultiTurnBridge(_Env(), [{"question": "q"}], max_turns=2, per_turn_credit=True)
+    bridge.start({"index": 0, "session_id": "s", "prompt_ids": []})
+    assert bridge.score({"session_id": "s", "turn_count": 2}) == {"score": 1.0, "turns": None}
+
+
+def _drive_multi_turn_episode(
+    *, stop_reasons, env, per_turn_credit=True, max_turns=4, monkeypatch=None
+):
+    """run the real child loop end to end against a real bridge, returning its agent loop output.
+
+    the loop is the thing under test here: it is what appends turn_spans and what tells the bridge
+    how many turns to score. a hand-built bridge conversation would restate that bookkeeping
+    instead of exercising it.
+    """
+    from flash.engine.worker import grpo_multiturn
+
+    monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
+    monkeypatch.setenv("FLASH_VERL_MAX_TURNS", str(max_turns))
+    monkeypatch.setenv("FLASH_VERL_MAX_MODEL_LEN", "4096")
+
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"question": "q"}], max_turns=max_turns, per_turn_credit=per_turn_credit
+    )
+    routes = bridge.routes()
+
+    def bridge_post(url, path, payload):
+        return routes[path](payload)
+
+    class _Tokenizer:
+        """one codepoint per token, so spans are readable straight off response_ids."""
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(chr(int(i)) for i in ids)
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(c) for c in text]}
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "".join(str(m.get("content") or "") for m in messages)
+
+    class _Base:
+        def __init__(self):
+            self.tokenizer = _Tokenizer()
+            self.rollout_config = SimpleNamespace(response_length=256)
+            self.server_manager = self
+            self._sent = list(stop_reasons)
+
+        async def apply_chat_template(self, messages):
+            return [1, 2, 3]
+
+        async def generate(self, *, request_id, prompt_ids, sampling_params):
+            text, stop_reason = self._sent.pop(0)
+            return SimpleNamespace(
+                token_ids=[ord(c) for c in text],
+                log_probs=[0.0] * len(text),
+                num_preempted=0,
+                stop_reason=stop_reason,
+            )
+
+    captured = {}
+
+    def agent_loop_output(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    loop_class = grpo_multiturn.build_flash_grpo_multi_turn_agent_loop(
+        register=lambda name: lambda cls: cls,
+        agent_loop_base=_Base,
+        agent_loop_output=agent_loop_output,
+        bridge_post=bridge_post,
+    )
+
+    async def _go():
+        instance = loop_class()
+        # the loop offloads the bridge's blocking posts onto this executor, so it has to be the
+        # one actually running the coroutine.
+        instance.loop = asyncio.get_running_loop()
+        await instance.run({}, raw_prompt=[{"role": "user", "content": "go"}], index=0)
+
+    asyncio.run(_go())
+    return captured
+
+
+class _SpanEnv:
+    """an env that returns one reward per turn it was actually told about."""
+
+    max_turns = 4
+
+    def __init__(self):
+        self.recorded: list[str] = []
+
+    def new_rollout_state(self, example):
+        return {"prompt": [], "messages": []}
+
+    def record_model_turn(self, state, text):
+        self.recorded.append(text)
+        state["messages"].append({"role": "assistant", "content": text})
+
+    def rollout_done(self, state, max_turns=None):
+        return False
+
+    def env_reply(self, messages, state):
+        return [{"role": "user", "content": "next"}]
+
+    def rollout_rewards_many(self, items):
+        from flash.envs.base import RolloutReward
+
+        return [RolloutReward(episode=1.0, turns=tuple(0.5 for _ in self.recorded)) for _ in items]
+
+
+def test_a_truncated_final_turn_still_earns_per_turn_credit_for_the_turns_before_it(monkeypatch):
+    # the bridge does not record an aborted turn into env state (MultiTurnBridge.step returns before
+    # record_model_turn), so the env returns no reward for it. the loop must not span it either, or
+    # the vector is one short of the spans, score_rollouts rejects the count, and the row -- and via
+    # the shim its whole group -- silently drops to episode credit (cursor).
+    env = _SpanEnv()
+    out = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed"), ("cd", "aborted")], env=env, monkeypatch=monkeypatch
+    )
+    assert env.recorded == ["ab"], "the aborted turn was recorded into env state"
+    assert len(out["extra_fields"]["flash_turn_spans"]) == 1, "the aborted turn was spanned"
+    assert out["extra_fields"]["flash_turn_rewards"] == [0.5], (
+        "per-turn credit was dropped: the span count disagreed with the env's reward count"
+    )
+    # the truncated tokens are still trained on, they just carry no turn coordinate: the transcript
+    # is turn "ab", the env's "next" glue, then the aborted "cd".
+    assert out["num_turns"] == 2
+    assert out["response_ids"] == [ord(c) for c in "abnextcd"]
+    assert out["response_mask"] == [1, 1, 0, 0, 0, 0, 1, 1]
+
+
+def test_an_unspanned_truncated_turns_tokens_are_still_generated_and_masked_as_model_output(
+    monkeypatch,
+):
+    # the control for the fix above: dropping the SPAN must not drop the TOKENS. if the fix had
+    # skipped the turn entirely, the child would train on a transcript that never contained it.
+    env = _SpanEnv()
+    out = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed"), ("cd", "aborted")], env=env, monkeypatch=monkeypatch
+    )
+    assert out["response_ids"][-2:] == [ord("c"), ord("d")], "the truncated turn's tokens were lost"
+    assert out["response_mask"][-2:] == [1, 1], "the truncated turn's tokens were not model-masked"
+
+
+def test_every_turn_is_spanned_when_none_of_them_abort(monkeypatch):
+    # the negative control: without an abort, spans and rewards are one per turn and per-turn credit
+    # is live. an over-eager skip would show up here as a missing span.
+    env = _SpanEnv()
+    out = _drive_multi_turn_episode(
+        stop_reasons=[
+            ("ab", "completed"),
+            ("cd", "completed"),
+            ("ef", "completed"),
+            ("gh", "completed"),
+        ],
+        env=env,
+        monkeypatch=monkeypatch,
+    )
+    assert env.recorded == ["ab", "cd", "ef", "gh"]
+    assert len(out["extra_fields"]["flash_turn_spans"]) == 4
+    assert out["extra_fields"]["flash_turn_rewards"] == [0.5, 0.5, 0.5, 0.5]
