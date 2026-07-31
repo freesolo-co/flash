@@ -270,9 +270,11 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
             self.deployment_calls = []
             self.targets = []
 
-        def deployment_for(self, run_id):
-            self.deployment_calls.append(run_id)
-            return {"run_id": run_id, "state": "ready", "adapter_revision": revision}
+        def deployments(self):
+            self.deployment_calls.append("deployments")
+            return [
+                {"run_id": "flash-1", "deployment": {"state": "ready", "adapter_revision": revision}}
+            ]
 
         def chat_stream(self, target, messages, **kwargs):
             self.targets.append(target)
@@ -289,7 +291,8 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
         == 0
     )
 
-    assert client.deployment_calls == ["flash-1"]
+    # resolved exactly once, before any case ran: the whole report must come from one revision.
+    assert client.deployment_calls == ["deployments"]
     assert client.targets == [revision, revision]
     assert uploader.calls[0]["model"] == revision
     assert f"resolved evaluation target flash-1 to {revision}" in capsys.readouterr().out
@@ -1119,3 +1122,140 @@ def test_load_evaluations_receives_the_environment_after_other_positional_parame
 
     # the real environment must arrive; None would silently downgrade a scorer that needs it.
     assert suites[0].environment is sentinel
+
+
+def test_env_eval_pins_a_run_serving_a_step_checkpoint(monkeypatch, tmp_path, capsys) -> None:
+    """A bare run id must resolve whatever revision the run serves, not only the final adapter.
+
+    `deployment_for` filters on the requested checkpoint step, and a bare id parses to step None,
+    so a run deployed at `RUN/step-40` came back as absent and `flash env eval RUN` refused to run
+    against a model `flash chat RUN` answers from.
+    """
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'stepped'\n"
+        "    def cases(self): return [EvalCase(id='a', input='a', expected='a')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    revision = "flash-1@step-40." + "b" * 40
+
+    class Client:
+        def __init__(self):
+            self.targets = []
+
+        def deployment_for(self, run_id, timeout=None):
+            raise AssertionError("deployment_for cannot resolve a bare id to a step revision")
+
+        def deployments(self):
+            return [
+                {"run_id": "flash-other", "deployment": {"adapter_revision": "nope"}},
+                {
+                    "run_id": "flash-1",
+                    "deployment": {
+                        "state": "ready",
+                        "checkpoint_step": 40,
+                        "adapter_revision": revision,
+                    },
+                },
+            ]
+
+        def chat_stream(self, target, messages, **kwargs):
+            self.targets.append(target)
+            yield messages[-1]["content"]
+
+    client = Client()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir)]) == 0
+
+    assert client.targets == [revision]
+    assert f"resolved evaluation target flash-1 to {revision}" in capsys.readouterr().out
+
+
+def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> None:
+    """Evaluation must grade the prompt training builds, not the bare case input.
+
+    Every training path renders its prompt through `env.prompt_messages(example)`, which runs the
+    environment's `start_episode` and injects the training contract as the system message. Sending
+    only `case.input` grades the model on a prompt no run ever trains on, so the suite can fail for
+    a missing system contract rather than for anything the model did.
+    """
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'prompted'\n"
+        "    def cases(self): return [EvalCase(id='a', input='2+2', expected='ok')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Environment:
+        def prompt_messages(self, example):
+            return [
+                {"role": "system", "content": "answer as a calculator"},
+                {"role": "user", "content": example["input"]},
+            ]
+
+    sent: list[list[dict]] = []
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            sent.append(messages)
+            yield "ok"
+
+    monkeypatch.setattr(
+        "flash.envs.loader.load_freesolo_environment", lambda _path, **_kwargs: Environment()
+    )
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 0
+
+    assert sent == [
+        [
+            {"role": "system", "content": "answer as a calculator"},
+            {"role": "user", "content": "2+2"},
+        ]
+    ]
+
+
+def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, capsys) -> None:
+    # prompt_messages is user code. a raise on one example must be that case's error, not a
+    # crash that loses every case already graded.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'partial'\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id='good', input='good', expected='good'),\n"
+        "        EvalCase(id='bad', input='bad', expected='bad'),\n"
+        "    ]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Environment:
+        def prompt_messages(self, example):
+            if example["input"] == "bad":
+                raise RuntimeError("no template for this row")
+            return [{"role": "user", "content": example["input"]}]
+
+    class Client:
+        def chat_stream(self, target, messages, **kwargs):
+            yield messages[-1]["content"]
+
+    monkeypatch.setattr(
+        "flash.envs.loader.load_freesolo_environment", lambda _path, **_kwargs: Environment()
+    )
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 1
+
+    output = capsys.readouterr().out
+    assert "case good: PASS" in output
+    assert "case bad: FAIL" in output
+    assert "prompt construction failed: no template for this row" in output
+    # the broken case is an error, not a zero the model earned.
+    assert "errors=1 (excluded from pass_rate and mean_score)" in output

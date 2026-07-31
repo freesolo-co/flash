@@ -107,6 +107,39 @@ def test_push_single_py_module_carries_direct_evaluation_helper_imports(monkeypa
     assert "unrelated.py" not in files
 
 
+def test_push_single_py_module_carries_lazily_imported_evaluation_helpers(monkeypatch, tmp_path):
+    """A helper imported inside cases()/score() ships too.
+
+    The loader deliberately keeps the package dir on sys.path so a sidecar can import its helpers
+    lazily, and `env test` exercises that path successfully. Scanning only top-level nodes omitted
+    those helpers from the package, so the suite passed the offline gate and then failed to import
+    the first time it graded a case against the pushed environment.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "def load_evaluations(environment=None):\n"
+        "    import eval_lazy\n"
+        "    try:\n"
+        "        from eval_guarded import score\n"
+        "    except ImportError:\n"
+        "        score = None\n"
+        "    return []\n"
+    )
+    (tmp_path / "eval_lazy.py").write_text("EXPECTED = '4'\n")
+    (tmp_path / "eval_guarded.py").write_text("def score(value): return True\n")
+    (tmp_path / "unrelated.py").write_text("VALUE = 'do not publish'\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "eval_lazy.py" in files
+    assert "eval_guarded.py" in files
+    # widening to nested imports must not turn the bounded single-file mode into a whole-dir push.
+    assert "unrelated.py" not in files
+
+
 def test_push_dir_infers_entrypoint_ignoring_the_evaluations_sidecar(monkeypatch, tmp_path):
     # a legacy package whose sole module is custom.py resolved fine before evaluations.py
     # existed. counting the sidecar as a candidate entrypoint makes adding one turn that

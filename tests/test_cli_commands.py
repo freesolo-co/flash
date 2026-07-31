@@ -1086,11 +1086,16 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
             assert example["output"] == "12"
             return 0.75
 
+        def grade(self, response, example):
+            return True
+
     from flash.envs.evaluations import load_evaluation_suites
 
     starter_suite = load_evaluation_suites(tmp_path, environment=StarterEnvironment())[0]
     starter_case = starter_suite.cases()[0]
-    assert starter_suite.score(starter_case, "12") == 0.75
+    starter_scored = starter_suite.score(starter_case, "12")
+    assert starter_scored.score == 0.75
+    assert starter_scored.passed is True
 
     dataset = tmp_path / "dataset/train.jsonl"
     assert dataset.is_file()
@@ -1285,7 +1290,37 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     scored = suite.score(case, str(case.expected))
 
     # the multi-turn starter grades numerically, so the gold answer scores full marks.
-    assert scored == 1.0
+    assert scored.score == 1.0
+    assert scored.passed is True
+
+
+def test_starter_evaluator_fails_a_near_miss_the_environment_rejects(monkeypatch, tmp_path) -> None:
+    """A shaped reward's partial credit is not a pass.
+
+    The generated multi-turn starter pays `closeness * 0.5` with `success=False` for a wrong but
+    close guess. Returning that bare float let `normalize_eval_result` mark every positive score as
+    passed, so an incorrect answer was reported as a passing evaluation case -- a graded failure
+    reading as model success, which is the one thing the suite exists to detect.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert (
+        _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111", "--multi-turn"])
+        == 0
+    )
+
+    from flash.envs.evaluations import load_evaluation_suites
+    from flash.envs.loader import load_freesolo_environment
+
+    environment = load_freesolo_environment(str(tmp_path / "environment.py"))
+    suite = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0]
+    case = suite.cases()[0]
+    # one off the gold answer: close enough for shaped credit, still the wrong number.
+    near_miss = str(int(str(case.expected).strip()) + 1)
+
+    scored = suite.score(case, near_miss)
+
+    assert scored.score > 0.0, "the starter environment must pay partial credit for a near miss"
+    assert scored.passed is False
 
 
 def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp_path) -> None:
