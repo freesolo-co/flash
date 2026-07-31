@@ -979,6 +979,27 @@ def test_unconstrained_thinking_smoke_rejects_a_reconstructed_empty_answer(monke
         _run_smoke(_smoke_spec(thinking=True))
 
 
+def test_thinking_smoke_rejects_a_retained_close_tag_as_the_answer(monkeypatch):
+    """A doubled close tag is not an answer, whichever way it arose.
+
+    A compatibility backend that retains only the sampled `</think>` in `content` gives the fold no
+    answer to place behind the block, so `_balanced_thinking_content` emits `<think>why</think>
+    </think>`. Splitting on the first close then left `</think>` as the answer, which is nonempty and
+    sailed through, activating a checkpoint that answered nothing.
+
+    The fold cannot decide this: those bytes are identical to an adapter whose answer genuinely is
+    the tag, and it also backs the public chat route where the text must survive. Rejecting at the
+    deployment gate is the fail-closed direction, and neither shape answers "what is 2+2".
+    """
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>why</think></think>"),
+    )
+    with pytest.raises(ServingError, match="only a close tag"):
+        _run_smoke(_smoke_spec(thinking=True))
+
+
 def test_thinking_smoke_accepts_a_tagless_answer_only_under_the_open_model_policy(monkeypatch):
     """A model whose template flash cannot verify must not be undeployable for omitting the tag.
 
