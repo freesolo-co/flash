@@ -489,6 +489,86 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     assert worker["gpu"]["network_volume"] == "flash-weights"
 
 
+def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
+    """A pin the lifecycle fallback recovers must survive a control-plane restart.
+
+    Submit's pin is best-effort, so a GitHub blip leaves the run unpinned and
+    `_pin_environment_for_run` resolves it instead. That SHA has to reach
+    `effective_preparation.worker_spec` before provisioning: recovery reloads only the persisted
+    record and calls that helper with `attempt_started=True`, which deliberately refuses to resolve
+    again. A pin held in the lifecycle's local `spec` alone would leave recovery unpinned, so a later
+    attempt could resolve a moved ref to different code while resuming the first attempt's
+    checkpoint (codex[bot]).
+    """
+    from dataclasses import replace
+
+    import flash.catalog as catalog
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import lifecycle
+
+    first_sha = "a" * 40
+    # every resolution AFTER the fallback returns a different commit, standing in for a push landing
+    # mid-run. seeing it anywhere proves something re-resolved a ref that was already pinned.
+    moved_sha = "c" * 40
+    resolutions = []
+    persisted_at_submission = []
+
+    def fake_resolve(_parsed, *_args, **_kwargs):
+        resolutions.append(len(resolutions))
+        if not resolutions[:-1]:
+            raise RuntimeError("github rate limit at submit time")
+        return first_sha if len(resolutions) == 2 else moved_sha
+
+    monkeypatch.setattr(
+        orch, "_resolve_model_revision", lambda spec: replace(spec, model_revision="b" * 40)
+    )
+    monkeypatch.setattr(orch, "resolve_model", lambda model, *a, **k: catalog.MODELS[model])
+
+    def fake_runpod_submit(run_spec, seed, **kwargs):
+        persisted = orch.get_status(run_spec.run_id).effective_preparation["worker_spec"]
+        persisted_at_submission.append(persisted["environment"]["resolved_sha"])
+        return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1})
+
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
+    monkeypatch.setattr(
+        "flash.cost.spec.estimate_for_spec",
+        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    monkeypatch.setattr("flash.providers._worker.upload_code", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "flash_code_prefix", lambda: "code/test/flash")
+    monkeypatch.setattr(orch, "_persist_metrics", lambda *a, **k: 0.0)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "model_revision": "b" * 40,
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        }
+    )
+
+    orch.submit_job(public)
+
+    # the pin must already be persisted when the provider is called, not written back afterwards:
+    # a crash between provisioning and a later write is exactly the window recovery reads in.
+    assert persisted_at_submission == [first_sha]
+
+    # a control-plane restart keeps nothing in memory -- this is the whole recovery input.
+    restarted = orch.get_status(public.run_id)
+    assert (
+        restarted.effective_preparation["worker_spec"]["environment"]["resolved_sha"] == first_sha
+    )
+    recovered = orch.reallocation_spec_from_status(restarted, verify_source=True)
+    assert recovered.environment.resolved_sha == first_sha
+    assert moved_sha not in resolutions
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
