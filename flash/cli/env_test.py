@@ -36,6 +36,8 @@ _CONTROL_CANDIDATES = (
 # built from one of them shares no word with any gold text by construction.
 _SYNTHETIC_CONTROL_ALPHABET = "zqxjkvwy0123456789bcdfghlmnprstu"
 _SYNTHETIC_CONTROL_WIDTH = 64
+# enough fallbacks for the unanimity test below to be reachable; matches the fixed candidate count.
+_SYNTHETIC_CONTROL_COUNT = 3
 _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
 
@@ -232,9 +234,13 @@ def _env_turns_reproduce(env, example: dict, state: dict) -> bool:
 
     Only meaningful when the reference records them: a gold completion of assistant turns alone
     says nothing about what the env replied, so there is nothing to contradict and the replay
-    stands. When it does record them, they must come back in the same order with the same text --
-    a stochastic or externally-sourced observation otherwise reaches the grader as a different
-    episode wearing the reference's assistant strings.
+    stands. When it does record them, they must come back at the same positions with the same
+    text -- a stochastic or externally-sourced observation otherwise reaches the grader as a
+    different episode wearing the reference's assistant strings.
+
+    The reference covers the completion only, so it is compared as a prefix of what followed the
+    prompt. Whatever the env replied past the reference's last recorded turn is outside what the
+    trajectory claims and is not evidence either way.
     """
     reference = [
         _message_text(message["content"])
@@ -243,14 +249,28 @@ def _env_turns_reproduce(env, example: dict, state: dict) -> bool:
     ]
     if not reference:
         return True
+    # the same role filter on both sides. dropping system turns from the driven side alone made an
+    # env whose env_reply emits one look unreproduced on an exact replay, since the reference keeps
+    # it (codex[bot]). the opening prompt is excluded by position below instead.
     driven = [
         _message_text(message.get("content"))
         for message in state.get("messages") or []
-        if str(message.get("role", "")).strip().lower() not in ("assistant", "system")
+        if str(message.get("role", "")).strip().lower() != "assistant"
     ]
-    # the prompt's own user turn opens the driven transcript and is not part of the completion, so
-    # compare against the tail. a reference longer than what was driven cannot match either way.
-    return driven[-len(reference) :] == reference
+    # align on where the completion begins, not on where the transcript ends. the prompt's own
+    # turns open the driven transcript and are not part of the completion, so they are dropped by
+    # count; what follows is compared positionally, as a prefix. the turn loop appends one more
+    # env_reply after the final assistant turn, so anchoring on the tail instead would shift every
+    # observation by that trailing reply -- marking a faithful replay unreproduced, and letting a
+    # coincidental trailing match hide a divergence earlier in the trajectory (cursor).
+    prompt_turns = sum(
+        1
+        for message in _check_messages(state.get("prompt") or [], "prompt")
+        if str(message.get("role", "")).strip().lower() != "assistant"
+    )
+    completion = driven[prompt_turns:]
+    # a reference longer than what was driven cannot match either way.
+    return completion[: len(reference)] == reference
 
 
 def _preview(value: object) -> str:
@@ -383,7 +403,7 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
 
     # the terminal rollout, kept unscored: the caller batches it with the control rollouts so a
     # listwise grader ranks them together, exactly as the worker submits them (codex[bot]).
-    # _grade_gold_if_unscored covers the episodes that batch never runs.
+    # _grade_unscored_gold covers the episodes that batch never runs.
     record["rollout"] = (example, state, len(responses))
 
 
@@ -405,16 +425,22 @@ def _control_is_disjoint(control: str, reference: str) -> bool:
     return not any(word in lowered for word in gold.split())
 
 
-def _synthetic_control(references: list[str]) -> str | None:
-    """Build a wrong answer for gold text that collides with every fixed control, or None.
+def _synthetic_controls(references: list[str]) -> list[str]:
+    """Build wrong answers for gold text that collides with every fixed control.
 
-    Repeats a single character the gold answers never use. That character cannot appear in any gold
-    word, so `_control_is_disjoint` holds by construction rather than by luck, and the repetition
-    keeps the control long enough to be an implausible answer for an open-ended task. Returns None
-    when the references between them use the whole alphabet, so the caller still excludes an episode
-    it cannot control rather than inventing evidence.
+    Each repeats a single character the gold answers never use. That character cannot appear in any
+    gold word, so `_control_is_disjoint` holds by construction rather than by luck, and the
+    repetition keeps the control long enough to be an implausible answer for an open-ended task.
+
+    Several are built rather than one, from distinct characters, because the inversion verdict reads
+    unanimity across controls drawing on mutually exclusive alphabets. A lone fallback could never
+    reach that bar, so an inverted grader passed unexamined for any gold text that disqualified the
+    whole fixed set -- "answer z 0" being enough to do it (codex[bot]). Returns an empty list when
+    the references between them use the whole alphabet, so the caller still excludes an episode it
+    cannot control rather than inventing evidence.
     """
     used = {character for reference in references for character in reference.casefold()}
+    controls = []
     for character in _SYNTHETIC_CONTROL_ALPHABET:
         if character in used:
             continue
@@ -422,8 +448,10 @@ def _synthetic_control(references: list[str]) -> str | None:
         # cheap belt-and-braces: the caller's own disjointness rule is the contract, so ask it
         # rather than trusting the construction to stay equivalent to it.
         if all(_control_is_disjoint(control, reference) for reference in references):
-            return control
-    return None
+            controls.append(control)
+        if len(controls) == _SYNTHETIC_CONTROL_COUNT:
+            break
+    return controls
 
 
 def _grade_single_turn(env, completion: str, example: dict) -> float:
@@ -472,7 +500,7 @@ def _grade_rollouts(env, rollouts: list[tuple[dict, dict, int]]) -> list[_Score]
     ]
 
 
-def _score_single_turn_control(env, example: dict, control: str) -> _Score:
+def _score_single_turn_control(env, example: dict, control: str) -> _Score | None:
     """Score one deliberately wrong single-turn answer the way training would score it.
 
     For single-turn GRPO a grader that raises is not inconclusive: ``reward_fn`` catches exactly
@@ -484,22 +512,23 @@ def _score_single_turn_control(env, example: dict, control: str) -> _Score:
     exits on an unexpected completion kills training rather than scoring it zero -- and the gold
     replay is already failed for exactly that (codex[bot]).
 
-    Raises ValueError when the grader returns a non-finite score, which is the same contract
-    violation the gold answer is already failed for: the policy reaches this scorer with completions
-    no more expected than these, and NaN or infinity there yields unusable samples.
+    Returns None for a NaN score. NaN is the trainer's supported unscorable marker -- trl excludes
+    such a row from the group baseline and zeroes its advantage -- so a grammar-constrained scorer
+    marking a synthetic control unscorable is behaving as designed, and the row it produces earns no
+    advantage to be evidence of. Infinity is NOT that marker: it is not recognized as unscorable and
+    reaches the group as a real number, contaminating every advantage in it, so it still raises
+    (codex[bot]).
     """
     try:
         score = _Score(episode=_grade_single_turn(env, control, example))
     except Exception:
         # mirrors reward_fn's own except branch: the run would score this 0.0 and carry on.
         score = _Score(episode=0.0)
-    _require_finite_control(score)
-    return score
-
-
-def _require_finite_control(score: _Score) -> None:
+    if math.isnan(score.episode):
+        return None
     if not score.is_finite():
         raise ValueError(f"reward is not finite for a non-reference completion: {score.episode}")
+    return score
 
 
 def _score_multi_turn_episode(
@@ -569,24 +598,32 @@ def _usable_controls(references: list[str]) -> list[str] | None:
     # and returning None there excludes the episode, letting even a constant grader pass unexamined.
     # so synthesize a control from a character the gold answer does not use (codex[bot]).
     if not usable:
-        synthetic = _synthetic_control(scorable)
-        if synthetic is not None:
-            usable = [synthetic]
+        usable = _synthetic_controls(scorable)
     return usable or None
 
 
-def _grade_gold_if_unscored(env, record: dict) -> None:
-    """Score the gold rollout on its own when no batched control call produced its reward.
+def _grade_unscored_gold(env, records: list[dict]) -> None:
+    """Score every gold rollout no batched control call reached, in one batch.
 
     Multi-turn gold is normally scored inside ``_score_multi_turn_episode``, in the same request
     list as the controls. Episodes that never reach that batch -- an echo policy, a partial replay,
     no provably wrong control, or a control whose scorer raised under the never-grades exemption --
-    still need a reward to report, and scoring them here keeps the batched episodes to exactly one
-    grader call. Grading gold both alone and in the batch would show a stateful or listwise grader a
-    rollout the real run never submits.
+    still need a reward to report. They are collected across episodes and submitted together rather
+    than one call each: the worker submits its whole rollout list to ``score_rollouts`` at once
+    (flash/engine/multiturn_rollout.py), so a listwise ``rollout_rewards_many`` that cannot score a
+    singleton would work under GRPO and fail its contract check here (codex[bot]).
+
+    Gold is graded either here or in the control batch, never both: showing a stateful or listwise
+    grader a rollout the real run never submits is the thing this avoids.
     """
-    if record["reward"] is None and record["rollout"] is not None:
-        record["reward"] = _grade_rollouts(env, [record["rollout"]])[0]
+    pending = [
+        record for record in records if record["reward"] is None and record["rollout"] is not None
+    ]
+    if not pending:
+        return
+    scores = _grade_rollouts(env, [record["rollout"] for record in pending])
+    for record, score in zip(pending, scores, strict=True):
+        record["reward"] = score
 
 
 def _controlled_scores(env, example: dict, record: dict) -> list[_Score] | None:
@@ -605,7 +642,10 @@ def _controlled_scores(env, example: dict, record: dict) -> list[_Score] | None:
     if controls is None:
         return None
     if not env.multi_turn:
-        return [_score_single_turn_control(env, example, control) for control in controls]
+        # an unscorable control is dropped, exactly as on the multi-turn path: it earns no
+        # advantage, so it is evidence of neither ranking nor flatness.
+        scored = [_score_single_turn_control(env, example, control) for control in controls]
+        return [score for score in scored if score is not None]
     gold, control_scores = _score_multi_turn_episode(env, example, record["rollout"], controls)
     record["reward"] = gold
     return control_scores
@@ -708,10 +748,14 @@ def cmd_env_test(args) -> int:
     scored_flat = 0
     inverted = 0
     control_errors: list[str] = []
+    # driven first, reported second. the gold rollouts no control batch reached are graded together
+    # between the two passes, in the batch shape the worker submits (see _grade_unscored_gold), so
+    # nothing here shows the grader a singleton request the real run never makes (codex[bot]).
+    episodes: list[tuple[int, dict, str | None, list[_Score] | None]] = []
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
         failure: str | None = None
-        controls: list[float] | None = None
+        controls: list[_Score] | None = None
         try:
             if env.multi_turn:
                 _drive_multi_turn(env, example, record)
@@ -741,21 +785,31 @@ def cmd_env_test(args) -> int:
                         raise
                     control_errors.append(str(exc) or exc.__class__.__name__)
                     controls = None
-            # multi-turn gold gets its reward from the batch above when one ran; this covers every
-            # other path. a gold reward that only goes non-finite in a batch is the same contract
-            # violation as one that does alone -- it reaches training identically -- so the check
-            # sits outside the control-error exemption, which covers facts about the CONTROL rather
-            # than about the replayed episode.
-            _grade_gold_if_unscored(env, record)
-            reward = record["reward"]
-            if reward is None or not reward.is_finite():
-                raise ValueError(
-                    f"reward is not finite: {reward if reward is None else reward.episode}"
-                )
         except (Exception, SystemExit) as exc:
             failure = str(exc) or exc.__class__.__name__
+        episodes.append((index, record, failure, controls))
 
+    # multi-turn gold gets its reward from the control batch when one ran; this covers every other
+    # path. the call is one batch over every episode that needs it, so a listwise grader sees the
+    # request shape training submits. a raise here belongs to all of them: production makes exactly
+    # this one call, and it would abort the run.
+    try:
+        _grade_unscored_gold(env, [record for _, record, failure, _ in episodes if not failure])
+        batch_failure = None
+    except (Exception, SystemExit) as exc:
+        batch_failure = str(exc) or exc.__class__.__name__
+
+    for index, record, failure, controls in episodes:
         reward = record["reward"]
+        if not failure:
+            # a gold reward that only goes non-finite in a batch is the same contract violation as
+            # one that does alone -- it reaches training identically -- so the check sits outside
+            # the control-error exemption, which covers facts about the CONTROL rather than about
+            # the replayed episode.
+            if batch_failure and reward is None:
+                failure = batch_failure
+            elif reward is None or not reward.is_finite():
+                failure = f"reward is not finite: {reward if reward is None else reward.episode}"
         reward_text = "n/a" if reward is None else f"{reward.episode:.6f}"
         print(
             f"episode {index}: policy={record['policy']} "
