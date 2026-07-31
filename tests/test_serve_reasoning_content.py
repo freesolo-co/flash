@@ -581,3 +581,115 @@ def test_a_duplicated_inline_block_is_matched_past_its_trailing_newline():
         deploy._balanced_thinking_content(message, thinking=True)
         == "<think>reasoned\n</think>answer"
     )
+
+
+def test_a_repeated_empty_reasoning_field_does_not_reopen_the_block():
+    # a backend whose stream schema serializes the empty field on every delta reaches the open
+    # branch again after the first answer delta closed the block. opening a second one streamed
+    # `<think></think>a<think></think>b` for what the non-streaming path folds to one pair
+    # (codex[bot]). the reasoning phase happens once, so the block does too.
+    lines = _sse(
+        {"reasoning_content": "", "content": "a"}, {"reasoning_content": "", "content": "b"}
+    )
+    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "<think></think>ab"
+
+
+def test_late_nonempty_reasoning_still_opens_a_block_of_its_own():
+    # the guard above is scoped to the EMPTY field on purpose. reasoning that arrives after the
+    # answer began still carries text, and suppressing its tags would stream that text as answer.
+    lines = _sse({"reasoning_content": "why"}, {"content": "a"}, {"reasoning_content": "more"})
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+        == "<think>why</think>a<think>more</think>"
+    )
+
+
+def test_a_streamed_block_repeated_inline_is_emitted_once():
+    """The streaming twin of `test_content_that_repeats_reasoning_inline_keeps_one_block`.
+
+    A compatibility build can send the reasoning on the field AND repeat it inline WITH its opener.
+    Reading only the bare repeat left the prefix unrecognised, so the streamed text carried the
+    reasoning and its tags twice while the non-streaming path folded it to one of each (cursor).
+    """
+    lines = _sse({"reasoning_content": "why"}, {"content": "<think>why</think>answer"})
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+        == "<think>why</think>answer"
+    )
+
+
+def test_a_repeated_inline_block_split_across_deltas_is_still_emitted_once():
+    # the repeat is subject to the same arbitrary delta boundaries as the bare tag, so the buffer
+    # has to hold across a split inside it rather than releasing the head as answer.
+    lines = _sse({"reasoning_content": "why"}, {"content": "<think>why<"}, {"content": "/think>a"})
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == "<think>why</think>a"
+    )
+
+
+def test_an_answer_that_is_exactly_the_close_tag_survives():
+    # a `choice` constraint whose value is the literal tag arrives as `content: "</think>"`, which is
+    # byte-identical to a compatibility build's retained delimiter. stripping it rewrote the response
+    # to reasoning-only content, and the smoke then rejected a checkpoint that had answered its
+    # grammar correctly (codex[bot]). what separates them is whether anything follows.
+    message = {"content": "</think>", "reasoning_content": "why"}
+    assert deploy._balanced_thinking_content(message, thinking=True) == "<think>why</think></think>"
+
+
+def test_a_streamed_answer_that_is_exactly_the_close_tag_survives():
+    # the streaming twin, and it cannot decide on sight: the answer may still be arriving. it holds
+    # the tag and the end of stream settles it, where nothing more can arrive.
+    lines = _sse({"reasoning_content": "why"}, {"content": "</think>"})
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+        == "<think>why</think></think>"
+    )
+
+
+def test_a_retained_delimiter_is_still_stripped_when_the_answer_follows_it_late():
+    # the shape the strip exists for, with the answer in a later delta than the tag. holding for the
+    # answer must not turn into keeping a delimiter that really was retained.
+    lines = _sse({"reasoning_content": "why"}, {"content": "</think>"}, {"content": "answer"})
+    assert (
+        "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+        == "<think>why</think>answer"
+    )
+
+
+def test_the_held_stream_does_not_rescan_its_whole_buffer_per_delta():
+    """A legacy inline stream with no early close holds every delta, and used to rescan them all.
+
+    Token-sized deltas made the search quadratic in the completion length, and the public chat route
+    caps no `max_tokens`, so a long generation burned that time before streaming a byte (codex[bot]).
+
+    Asserted as characters scanned rather than wall-clock, which would be a flaky way to ask the same
+    question. Counting `str.find` calls alone would not fail either -- the old code called it once
+    per delta too. What changed is how much each call reads, so that is what is measured: from a
+    cursor it is the new delta, and quadratic growth in the total is what regressing reintroduces.
+    """
+    scanned = 0
+    real_find_delimiter = deploy._find_delimiter
+
+    def _counting_find(buffer: str, start: int) -> int:
+        # measured through the source's own named seam, because instrumenting the buffer is not
+        # possible from here: the loop coerces each delta with `str()` before appending it, so a
+        # `str` subclass never survives into the buffer being searched.
+        nonlocal scanned
+        scanned += max(0, len(buffer) - start)
+        return real_find_delimiter(buffer, start)
+
+    def _scan_for(deltas: int) -> int:
+        nonlocal scanned
+        scanned = 0
+        lines = _sse(*({"content": "tok "} for _ in range(deltas)))
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(deploy, "_find_delimiter", _counting_find)
+            out = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+        assert out == "tok " * deltas
+        return scanned
+
+    small = _scan_for(500)
+    large = _scan_for(1000)
+    # linear: twice the deltas scans about twice the characters. quadratic would be about four
+    # times, so the midpoint separates them with room for the tail rescan on either side.
+    assert large < small * 3, f"{small} -> {large} chars scanned looks quadratic"
