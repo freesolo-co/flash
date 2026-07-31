@@ -207,6 +207,43 @@ def test_trainer_noops_when_all_turn_rewards_are_none(monkeypatch):
     assert output["advantages"].shape == (2,)
 
 
+def test_trainer_warns_when_no_row_carries_per_turn_rewards(
+    monkeypatch, reset_fallback_warning, capsys
+):
+    """The whole-batch miss must warn too, not just the per-group one.
+
+    This is the common AS-028 shape: the environment emits no per_turn_rewards at all. The trainer
+    returns at the all-None check before build_per_turn_advantages() is ever called, so a warning
+    that lives only in that helper stays silent for exactly the configuration it exists to report.
+    """
+    from trl import GRPOTrainer
+
+    inputs = [
+        {"turn_spans": [(0, 1)], "turn_rewards": None},
+        {"turn_spans": [(0, 1)], "turn_rewards": None},
+    ]
+    monkeypatch.setattr(
+        GRPOTrainer,
+        "_generate_and_score_completions",
+        lambda self, rows: {
+            "completion_ids": torch.zeros((2, 1), dtype=torch.long),
+            "advantages": torch.zeros(2),
+        },
+    )
+    trainer = object.__new__(GRPOPerTurnTrainer)
+
+    trainer._generate_and_score_completions(inputs)
+    # a second batch keeps hitting the same environment, so the latch must hold across calls or the
+    # log fills with one copy per step.
+    trainer._generate_and_score_completions(inputs)
+
+    out = capsys.readouterr().out
+    assert out.count("[grpo][warn]") == 1
+    assert "per_turn" in out
+    assert "episode credit" in out
+    assert "per_turn_rewards" in out
+
+
 def test_trainer_replaces_scalar_advantages_in_output_row_order(monkeypatch):
     from trl import GRPOTrainer
 
@@ -429,3 +466,65 @@ def test_per_turn_extracts_signal_that_per_episode_discards(tmp_path):
     assert float(per_episode.abs().max()) < 1e-4
     # the +/-0.5 per-turn magnitude is exactly the turn-level signal per-episode discards
     assert float(per_turn.abs().max()) > 0.4
+
+
+# --------------------------------------------------------------------------- AS-028
+
+
+@pytest.fixture
+def reset_fallback_warning(monkeypatch):
+    """The warn-once latch is module state; isolate it so tests do not mask each other."""
+    monkeypatch.setattr(
+        "flash.engine.worker.grpo_perturn_trainer._WARNED_EPISODE_FALLBACK",
+        False,
+        raising=False,
+    )
+
+
+def test_missing_per_turn_rewards_warns_instead_of_silently_using_episode_credit(
+    reset_fallback_warning, capsys
+):
+    """per_turn is accepted and echoed in status; falling back to episode credit must not be silent."""
+    spans = [[(0, 1)], [(0, 1)]]
+    scalar = torch.tensor([1.0, -1.0], dtype=torch.float64)
+
+    build_per_turn_advantages(
+        spans,
+        [None, None],  # environment emitted no per_turn_rewards
+        num_generations=2,
+        completion_len=2,
+        episode_advantages=scalar,
+    )
+
+    out = capsys.readouterr().out
+    assert "per_turn" in out
+    assert "episode credit" in out
+    assert "per_turn_rewards" in out
+
+
+def test_episode_fallback_warning_is_emitted_once_per_run(reset_fallback_warning, capsys):
+    # the condition is a property of the environment, so a per-group warning would flood the log.
+    spans = [[(0, 1)], [(0, 1)]]
+    scalar = torch.tensor([1.0, -1.0], dtype=torch.float64)
+    for _ in range(3):
+        build_per_turn_advantages(
+            spans,
+            [None, None],
+            num_generations=2,
+            completion_len=2,
+            episode_advantages=scalar,
+        )
+    assert capsys.readouterr().out.count("[grpo][warn]") == 1
+
+
+def test_complete_per_turn_rewards_do_not_warn(reset_fallback_warning, capsys):
+    spans = [[(0, 1)], [(0, 1)]]
+    scalar = torch.tensor([1.0, -1.0], dtype=torch.float64)
+    build_per_turn_advantages(
+        spans,
+        [[1.0], [3.0]],
+        num_generations=2,
+        completion_len=2,
+        episode_advantages=scalar,
+    )
+    assert "[grpo][warn]" not in capsys.readouterr().out
