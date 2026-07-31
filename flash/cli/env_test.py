@@ -297,7 +297,7 @@ def _turn_is_representable(message: dict) -> bool:
     return content is None
 
 
-def _reference_turns(env, example: dict) -> tuple[list[str], bool]:
+def _reference_turns(env, example: dict) -> tuple[list[str], bool, list[dict]]:
     # the sft_completion gold answer stands in for the missing policy model. validate its
     # envelope like the prompt so a malformed completion (scalar content, missing role)
     # fails the episode instead of silently falling back to echo. text is extracted the
@@ -313,7 +313,13 @@ def _reference_turns(env, example: dict) -> tuple[list[str], bool]:
     # keep text-free turns positionally (empty string) so multi-turn replay stays aligned. the second
     # element reports whether any turn lost content in that flattening; see _turn_is_representable.
     partial = any(not _turn_is_representable(m) for m in assistant)
-    return [_message_text(m["content"]) for m in assistant], partial
+    # the messages are returned alongside the replay text so the observation check can reuse THIS
+    # snapshot. calling sft_completion again for the same episode asks a second time for something
+    # an env is free to answer differently -- one that samples a stored trajectory or consumes an
+    # iterator returns a different completion, and the driven rollout would then be compared against
+    # observations belonging to a trajectory it never replayed, marking an exact replay
+    # `partial_replay` and dropping it from the control gate (codex[bot]).
+    return [_message_text(m["content"]) for m in assistant], partial, messages
 
 
 def _resolve_policy(reference_turns: list[str]) -> str:
@@ -365,7 +371,7 @@ def _observation_blocks(
     return tuple(blocks)
 
 
-def _env_turns_reproduce(env, example: dict, state: dict, prompt: list[dict]) -> bool:
+def _env_turns_reproduce(reference_messages: list[dict], state: dict, prompt: list[dict]) -> bool:
     """Whether the driven rollout's environment-side turns match the reference trajectory's.
 
     Only meaningful when the reference records them: a gold completion of assistant turns alone
@@ -390,11 +396,17 @@ def _env_turns_reproduce(env, example: dict, state: dict, prompt: list[dict]) ->
     recovered from `state` afterwards: an env that keeps its transcript under `messages` with no
     separate `prompt` key has by then appended every driven turn to that same list, so there is
     nothing left to distinguish the opening from the completion.
+
+    `reference_messages` is the SAME snapshot `_reference_turns` took the replayed assistant strings
+    from, threaded in rather than re-read. `sft_completion` is not required to be pure -- one that
+    samples a stored trajectory or consumes an iterator answers differently each call -- so asking
+    it again here compared the driven rollout against observations from a trajectory it never
+    replayed (codex[bot]).
     """
     # the same role filter on both sides. dropping system turns from the driven side alone made an
     # env whose env_reply emits one look unreproduced on an exact replay, since the reference keeps
     # it (codex[bot]). the opening prompt is excluded by position below instead.
-    reference = _observation_blocks(_check_messages(env.sft_completion(example), "sft_completion"))
+    reference = _observation_blocks(reference_messages)
     if not any(reference):
         return True
     # align on where the completion begins, not on where the transcript ends. the prompt opens the
@@ -457,13 +469,18 @@ def _new_record() -> dict:
         "control_rollouts": None,
         # the control scores, once that batch has run. None means the episode carries no evidence.
         "control_scores": None,
+        # controls that were graded but earn no advantage. not evidence, but still group members,
+        # so they decide whether the group takes the per-turn path (see the flat-reward gate).
+        "unscorable_controls": (),
     }
 
 
 def _drive_single_turn(env, example: dict, record: dict) -> None:
     prompt = _check_messages(env.prompt_messages(example), "prompt")
     record["prompt"] = prompt
-    reference_turns, record["partial_replay"] = _reference_turns(env, example)
+    # single-turn drives one assistant reply and never checks observations, so the snapshot the
+    # multi-turn path threads through has no second reader here.
+    reference_turns, record["partial_replay"], _ = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
     response = (
@@ -534,7 +551,7 @@ def _run_rollout(env, example: dict, turn_content) -> tuple[dict, list[str], lis
 
 
 def _drive_multi_turn(env, example: dict, record: dict) -> None:
-    reference_turns, record["partial_replay"] = _reference_turns(env, example)
+    reference_turns, record["partial_replay"], reference_messages = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
 
@@ -562,7 +579,7 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
     # under the same assistant strings, so a correct grader scores this "gold" rollout like the
     # controls and the gate reports a flat grader for an env that ranks fine (codex[bot]). the
     # reference records what the env replied last time, so compare against it where it does.
-    if policy == "replay" and not _env_turns_reproduce(env, example, state, prompt):
+    if policy == "replay" and not _env_turns_reproduce(reference_messages, state, prompt):
         record["partial_replay"] = True
 
     # the terminal rollout, kept unscored: the whole run's rollouts are scored in one batch so a
@@ -810,7 +827,13 @@ def _score_multi_turn_rollouts(env, records: list[dict]) -> None:
             continue
         # an unscorable control earns no advantage, so it is evidence of neither ranking nor
         # flatness. keeping it would compare gold against a number the trainer never acts on.
-        record["control_scores"] = [score for score in scores[control_slice] if score.is_finite()]
+        graded = list(scores[control_slice])
+        record["control_scores"] = [score for score in graded if score.is_finite()]
+        # the dropped ones are still group MEMBERS, and one without a turn vector demotes the whole
+        # group to episode scalars in the trainer. so they are carried rather than discarded: they
+        # decide which reward path the group actually takes, even though they are evidence of
+        # nothing themselves (codex[bot]).
+        record["unscorable_controls"] = [score for score in graded if not score.is_finite()]
 
 
 def _prepare_controls(env, example: dict, record: dict) -> list[_Score] | None:
@@ -1006,6 +1029,9 @@ def cmd_env_test(args) -> int:
         # multi-turn controls are scored in that batch rather than inline, so they arrive here.
         if controls is None:
             controls = record["control_scores"]
+        # graded, earn no advantage, and are excluded from every comparison -- but still members of
+        # the group whose reward path is chosen below.
+        unscorable = record["unscorable_controls"] or ()
         reward = record["reward"]
         if not failure:
             # a gold reward that only goes non-finite in a batch is the same contract violation as
@@ -1038,8 +1064,15 @@ def cmd_env_test(args) -> int:
             # falls back to episode advantages for the WHOLE group as soon as one member lacks a
             # vector. so the vectors decide only when every member has one; otherwise the episode
             # scalar is what trains, exactly as in the default credit-assignment mode.
+            # `unscorable` are the controls dropped for earning no advantage. they are excluded from
+            # every comparison below, but they are still MEMBERS of the group the trainer builds,
+            # and `build_per_turn_advantages` demotes the whole group to episode scalars as soon as
+            # one member has no turn vector (grpo_perturn_trainer.py:59-63). a non-finite control is
+            # represented `episode=NaN, turns=None`, so judging the path on the survivors alone read
+            # per_turn where production falls back to the tied scalars and produces no learning
+            # signal (codex[bot]).
             group_per_turn = per_turn and all(
-                score.turns is not None for score in (reward, *controls)
+                score.turns is not None for score in (reward, *controls, *unscorable)
             )
             # every control outranking gold is worth reporting, but it does NOT establish an
             # inverted grader, so it is reported and never failed on. the controls are disjoint from
