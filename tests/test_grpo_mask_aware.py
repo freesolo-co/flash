@@ -33,16 +33,26 @@ def _make_fake_loss(record):
     # result); normalizer is constant (mirrors dr_grpo's B * max_completion_length, not seq length).
     NORM = 7.0
 
-    def fake_loss(*, _input, lin_weight, selected_token_ids, attention_mask, advantages,
-                  old_per_token_logps=None, ref_per_token_logps=None, vllm_is_ratio=None, **_):
+    def fake_loss(
+        *,
+        _input,
+        lin_weight,
+        selected_token_ids,
+        attention_mask,
+        advantages,
+        old_per_token_logps=None,
+        ref_per_token_logps=None,
+        vllm_is_ratio=None,
+        **_,
+    ):
         record["T"] = int(selected_token_ids.size(1))
         record["ratio_T"] = None if vllm_is_ratio is None else int(vllm_is_ratio.size(1))
         per_token = (
-            selected_token_ids.float() * _input.sum(-1)
-            + old_per_token_logps
-            - ref_per_token_logps
+            selected_token_ids.float() * _input.sum(-1) + old_per_token_logps - ref_per_token_logps
         )
-        if vllm_is_ratio is not None:  # 2-D ratio is per-token -> must be gathered with the same index
+        if (
+            vllm_is_ratio is not None
+        ):  # 2-D ratio is per-token -> must be gathered with the same index
             per_token = per_token * vllm_is_ratio
         loss = (per_token * attention_mask).sum() / NORM
         return loss, {"reward": advantages.mean()}

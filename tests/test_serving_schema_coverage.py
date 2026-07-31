@@ -144,9 +144,7 @@ def _install_context(monkeypatch, *, outcome=None, eof=False, start_error=None):
 
 def test_validate_json_schema_reports_process_start_failure(monkeypatch) -> None:
     """A child start failure must close both pipe ends and expose a safe serving error."""
-    receive, send, process = _install_context(
-        monkeypatch, start_error=RuntimeError("spawn denied")
-    )
+    receive, send, process = _install_context(monkeypatch, start_error=RuntimeError("spawn denied"))
 
     with pytest.raises(ServingError, match="could not start isolated JSON schema validation"):
         serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
