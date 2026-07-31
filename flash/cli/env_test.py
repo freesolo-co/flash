@@ -38,11 +38,14 @@ _TOML_SCALAR_LEADING_CHARS = frozenset("0123456789+-.")
 # the TOML booleans, which are written as bare words rather than starting with a digit or sign and
 # are therefore the blind spot of _TOML_SCALAR_LEADING_CHARS. TOML spells them in lowercase only, so
 # a case variant is a malformed literal rather than prose and must not forward as a string.
-#
-# only the booleans: `inf`/`nan` are the other bare-word scalars, but they are not JSON-serializable
-# and _reject_unsubmittable_param turns the lowercase spelling away regardless -- so pointing a user
-# at `nan` would be handing them a remedy that fails one step later.
 _TOML_BOOLEAN_WORDS = frozenset({"true", "false"})
+# the non-finite floats, the other bare-word family, spelled lowercase only and optionally signed.
+# lowercase `nan` parses and _reject_unsubmittable_param then turns it away for not being JSON, but a
+# case variant never reaches that check: it fails the TOML parse and falls through the bare-word test
+# as the literal STRING "NaN". the offline gate then validates a str where the config would hold a
+# float -- or an environment coercing it back gets the non-finite value the lowercase spelling was
+# rejected for (codex[bot]). so a case variant is malformed, not prose, either way.
+_TOML_NON_FINITE_WORDS = frozenset({"inf", "nan"})
 
 
 def _check_messages(messages: object, label: str) -> list[dict]:
@@ -255,6 +258,16 @@ def _parse_param_value(key: str, raw: str) -> object:
                     f"{value.lower()} in lowercase; write --param {key}={value.lower()} for the "
                     f"boolean, or --param '{key}=\"{value}\"' to pass it as text"
                 ) from exc
+            # the non-finite floats are the same blind spot, minus their optional sign -- `-Inf`
+            # does start with one of the leading characters, but the message that test raises talks
+            # about numbers and dates and would not name what is actually wrong.
+            if value.lstrip("+-").lower() in _TOML_NON_FINITE_WORDS:
+                raise ValueError(
+                    f"--param {key} is not a valid TOML value: {exc}. TOML spells the non-finite "
+                    f"floats in lowercase, and [environment.params] could not submit one anyway "
+                    f"since it is not JSON; pass a finite number, or "
+                    f"--param '{key}=\"{value}\"' to pass it as text"
+                ) from exc
             if value[0] not in _TOML_SCALAR_LEADING_CHARS:
                 return value
             # quoting is the escape hatch, and it is the same spelling the config needs -- a
@@ -297,46 +310,57 @@ def _key_is_expressible_in_toml(key: str) -> bool:
     return True
 
 
-def _reject_unmirrorable_param_key(key: str) -> None:
-    """Reject a ``--param`` name ``[environment.params]`` could not carry with the same meaning.
+def _literal_param_key(key: str) -> str:
+    """Resolve one ``--param`` name to the literal name ``[environment.params]`` would produce.
 
-    Two ways that happens: a spelling that denotes structure rather than itself, and a name TOML
-    has no unquoted spelling for at all.
-
-    The left side of a `[environment.params]` entry is a TOML key, not a literal name: dotted and
-    quoted spellings denote structure. `difficulty.level = 3` in a config is
+    The left side of a `[environment.params]` entry is a TOML key, not a literal name, so the
+    spelling and the name can differ. `difficulty.level = 3` in a config is
     ``{"difficulty": {"level": 3}}``, but taking the source spelling literally forwarded
     ``{"difficulty.level": 3}`` instead -- a different call, which an environment accepting
     ``**kwargs`` swallows without ever exercising the nested parameter the run trains on. The gate
     then passes on input it never actually tested (codex[bot]).
 
-    Rejected rather than mirrored. Params are splatted as keyword arguments
-    (``load_freesolo_environment(..., **params)``, flash/envs/registry.py), so a nested table is
-    not expressible as one `--param` in the first place: `difficulty` would have to arrive as a
-    whole dict. `--param difficulty={level = 3}` already says that exactly, and is what the error
-    points at, so mirroring here would add a second spelling for something the flag can already
-    express faithfully.
+    So a structural spelling is resolved through tomllib rather than guessed at, and that also
+    supplies the escape for a name that CONTAINS a dot: `"release.channel" = 3` is a quoted key and
+    yields the flat ``{"release.channel": 3}``. Classifying dots and quotes as structure outright
+    left that valid config with no `--param` spelling at all (codex[bot]) -- the quoted form is
+    both the remedy and the same text the config needs.
+
+    A genuinely nested table is still rejected. Params are splatted as keyword arguments
+    (``load_freesolo_environment(..., **params)``, flash/envs/registry.py), so `difficulty` would
+    have to arrive as a whole dict; `--param difficulty={level = 3}` already says that exactly, and
+    is what the error points at.
     """
+    name = key
     if set(key) & _TOML_KEY_STRUCTURAL_CHARS:
-        outer = key.split(".", 1)[0].strip("\"'") or key
-        raise ValueError(
-            f"--param {key} uses TOML key syntax that denotes structure, which this flag cannot "
-            f"forward faithfully. pass the containing table as one value instead, for example "
-            f"--param {outer}='{{ level = 3 }}'"
-        )
-    # dots and quotes are the spellings that mean something OTHER than themselves. everything else
-    # is a question of whether the config can hold the name at all, and the answer is almost always
-    # yes: a QUOTED key carries `bad key`, `a/b`, `café` and the rest, and the schema loader takes
-    # it, so those are configs a run really can receive. an earlier guard here rejected anything
-    # outside the BARE-key grammar, which blocked validating a working config while claiming the
-    # config could not hold the name (cursor).
-    #
-    # what is left is the names a UTF-8 config file cannot physically contain.
-    if not _key_is_expressible_in_toml(key):
+        try:
+            document = tomllib.loads(f"{key} = 0")
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(
+                f"--param {key} is not a valid TOML key: {exc}. [environment.params] would reject "
+                f"this spelling too; quote the name (--param '\"{key}\"=...') to pass it literally"
+            ) from exc
+        # one assignment yields one top-level entry, whatever the spelling. it is nested exactly
+        # when the dots were read as structure, which is the case this flag cannot forward.
+        ((name, resolved),) = document.items()
+        if isinstance(resolved, dict):
+            raise ValueError(
+                f"--param {key} uses TOML key syntax that denotes structure, which this flag "
+                f"cannot forward faithfully. pass the containing table as one value instead, for "
+                f"example --param {name}='{{ level = 3 }}', or quote the name "
+                f"(--param '\"{key}\"=...') if the dot is part of it"
+            )
+    # whether the config can hold the name at all. almost always yes: a QUOTED key carries
+    # `bad key`, `a/b`, `café` and the rest, and the schema loader takes it, so those are configs a
+    # run really can receive. an earlier guard here rejected anything outside the BARE-key grammar,
+    # which blocked validating a working config while claiming the config could not hold the name
+    # (cursor). what is left is the names a UTF-8 config file cannot physically contain.
+    if not _key_is_expressible_in_toml(name):
         raise ValueError(
             f"--param {key!r} is not valid UTF-8, so no config file could carry it and the run "
             f"would never receive this parameter"
         )
+    return name
 
 
 def _env_params(args) -> dict:
@@ -352,8 +376,7 @@ def _env_params(args) -> dict:
         key = key.strip()
         if not sep or not key:
             raise ValueError(f"--param must be KEY=VALUE (got {item!r})")
-        _reject_unmirrorable_param_key(key)
-        params[key] = _parse_param_value(key, raw)
+        params[_literal_param_key(key)] = _parse_param_value(key, raw)
     split = getattr(args, "split", None)
     if split is not None:
         # distinguish "not passed" from "passed empty". `--split "$SPLIT"` with an unset variable

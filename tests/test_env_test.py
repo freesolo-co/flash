@@ -559,7 +559,26 @@ def test_env_test_non_finite_param_floats_are_rejected(monkeypatch, tmp_path, ca
     assert "not JSON-serializable" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("value", ["difficulty.level=3", '"weird key"=1', "a.b.c=1"])
+@pytest.mark.parametrize(
+    "value", ["threshold=NaN", "threshold=Inf", "threshold=-Inf", "threshold=NAN", "threshold=INF"]
+)
+def test_a_case_variant_of_a_non_finite_float_is_not_forwarded_as_text(
+    monkeypatch, tmp_path, capsys, value
+):
+    # TOML spells the non-finite floats lowercase only, so a case variant fails the parse and used
+    # to fall through the bare-word test as the literal STRING "NaN" -- never reaching the
+    # JSON check that turns the lowercase spelling away. the gate then validated a str where the
+    # config holds a float, or an env coercing it back got the very value that check exists to
+    # reject (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 1
+    assert "kwargs" not in seen
+    assert "non-finite floats in lowercase" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["difficulty.level=3", "a.b.c=1"])
 def test_env_test_param_keys_that_denote_toml_structure_are_rejected(
     monkeypatch, tmp_path, capsys, value
 ):
@@ -573,6 +592,34 @@ def test_env_test_param_keys_that_denote_toml_structure_are_rejected(
     assert cmd_env_test(_args(env_dir, param=[value])) == 1
     assert "kwargs" not in seen
     assert "TOML key syntax" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("value", "name"),
+    [('"release.channel"=3', "release.channel"), ('"weird key"=1', "weird key")],
+)
+def test_a_quoted_param_key_names_itself_rather_than_nesting(monkeypatch, tmp_path, value, name):
+    # a dot only nests when it is BARE: `"release.channel" = 3` is a quoted key and produces the
+    # flat {"release.channel": 3}. classifying dots and quotes as structure outright left that
+    # valid config with no --param spelling at all, so the command could not mirror it (codex[bot]).
+    # quoting is also exactly the text the config needs, so the flag and the config stay in step.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=[value])) == 0
+    assert name in seen["kwargs"]
+
+
+def test_a_malformed_param_key_spelling_is_rejected(monkeypatch, tmp_path, capsys):
+    # resolving the spelling through tomllib means an unterminated quote is a key TOML cannot read
+    # at all, not a name. [environment.params] would reject it too, so forwarding it literally
+    # would validate against a parameter no config could deliver.
+    env_dir = _environment_dir(tmp_path)
+    seen = _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir, param=['unclosed"=1'])) == 1
+    assert "kwargs" not in seen
+    assert "not a valid TOML key" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("value", ["bad key=1", "a/b=1", "a@b=1", "k(x)=1", "café=1", "a😀b=1"])
