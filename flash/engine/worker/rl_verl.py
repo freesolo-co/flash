@@ -1393,7 +1393,15 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         "        _URL.rstrip('/') + '/score', data=body, headers={'Content-Type': 'application/json'}\n"
         "    )\n"
         "    try:\n"
-        "        with urllib.request.urlopen(req, timeout=120) as r:\n"
+        # NO client deadline. verl fans this call out hard: RewardLoopManager builds
+        # reward.num_workers (8) ray workers unconditionally on the grpo path
+        # (ray_trainer.py:901-910), and each one asyncio.gathers every row in its chunk
+        # (reward_loop.py:138-143). start_reward_server serializes them behind one lock, so a
+        # per-request timeout would bound QUEUE WAIT, not the env call -- the Nth caller in line
+        # fails for the crime of arriving Nth, and a slow-but-healthy judge fails the whole run.
+        # a wedged env is caught by the training stall watchdog instead (STALL_AFTER_S=1500s in
+        # providers/_poll.py), which measures training progress rather than one request.
+        "        with urllib.request.urlopen(req) as r:\n"
         "            payload = json.loads(r.read().decode())\n"
         "            return float(payload['score'])\n"
         "    except urllib.error.URLError as exc:\n"
@@ -1799,8 +1807,12 @@ def start_reward_server(score_by_index, *, example_count: int, multi_turn_bridge
     done. single-turn scoring lives at ``<base_url>/score``; when ``multi_turn_bridge`` is given,
     its four episode routes are served alongside it from the same thread pool.
     """
-    # serialize scoring so the flash env sees sequential calls, matching the retired trl reward path's
-    # contract; verl's reward manager may otherwise call the reward with several workers at once.
+    # serialize scoring so the flash env sees sequential calls: a flash env is a plain python object
+    # with no concurrency contract, and the retired trl path only ever called it from one thread.
+    # verl does NOT: RewardLoopManager spawns reward.num_workers (8) ray workers unconditionally
+    # (ray_trainer.py:901-910) and each asyncio.gathers its whole chunk (reward_loop.py:138-143), so
+    # without this lock a batch arrives as dozens of simultaneous calls. the queue this creates is
+    # why the generated client carries no deadline -- see render_reward_module.
     score_lock = threading.Lock()
 
     def _score_route(payload: dict) -> dict:
