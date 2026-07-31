@@ -39,6 +39,7 @@ FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
 FREESOLO_PROJECTS_PATH = "/api/projects"
 FREESOLO_TRACE_PROJECTS_PATH = "/api/traces/projects"
 FREESOLO_TRACES_EXPORT_PATH = "/api/traces/export"
+FREESOLO_EVAL_RUNS_PATH = "/api/evals/runs"
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
@@ -129,6 +130,11 @@ def _freesolo_request(
                 "(or set FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+    # a socket timeout surfaces as a bare TimeoutError rather than a URLError, so without this
+    # it escapes as an unexpected exception. callers catch ClientError to report a failure
+    # without changing their own verdict; a traceback instead would lose that.
+    except TimeoutError as exc:
+        raise RequestTimeoutError(f"request to {base}{path} timed out after {timeout}s") from exc
     except urllib.error.URLError as exc:
         raise ClientError(
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "
@@ -231,6 +237,47 @@ def export_trace_records(
     return _freesolo_get(path, api_key, base_url, timeout=300.0)
 
 
+def upload_eval_run(
+    *,
+    project_id: str,
+    suite_name: str,
+    environment_reference: str,
+    model: str | None,
+    status: str,
+    error: str | None,
+    started_at: str | None,
+    cases: list[dict[str, Any]],
+    api_key: str,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """Record one `flash env eval` suite run against one explicit Freesolo project.
+
+    The project id is required and never inferred: an API key identifies an org, not a
+    project, and picking a default here would file results under a project the caller
+    never named."""
+    try:
+        project_id = require_project_id(project_id)
+    except (TypeError, ValueError) as exc:
+        raise ClientError(str(exc).replace("project", "project id", 1)) from exc
+    body: dict[str, Any] = {
+        "project_id": project_id,
+        "suite_name": suite_name,
+        "environment_reference": environment_reference,
+        "model": model,
+        "status": status,
+        "error": error,
+        "started_at": started_at,
+        "cases": cases,
+    }
+    # a large suite is a bigger write than a normal control-plane call; give it room.
+    payload = _freesolo_request(
+        "POST", FREESOLO_EVAL_RUNS_PATH, api_key, base_url, body=body, timeout=300.0
+    )
+    if not isinstance(payload, dict):
+        raise ClientError("freesolo returned an invalid eval run response")
+    return payload
+
+
 class _ProgressReader:
     """File-like wrapper over in-memory bytes that fires a progress callback on each read()."""
 
@@ -330,6 +377,7 @@ class ApiClient:
         self.api_key = api_key
         self.timeout = timeout
         self.key_source = key_source
+        self._chat_step_selector_available = False
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key:
@@ -430,6 +478,12 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     def _require_chat_step_selector(self) -> None:
+        # cached after it first succeeds: this is a property of the control plane, not of the
+        # request. `env eval` sends one chat per case, so re-checking each time doubled the
+        # request count and let a single transient /v1/health blip fail an arbitrary case while
+        # the chat endpoint was healthy (codex[bot]).
+        if self._chat_step_selector_available:
+            return
         capabilities = self.health().get("capabilities")
         if not isinstance(capabilities, list) or _CHAT_STEP_SELECTOR_CAPABILITY not in capabilities:
             raise ClientError(
@@ -437,6 +491,10 @@ class ApiClient:
                 f"{_CHAT_STEP_SELECTOR_CAPABILITY}; use a full immutable adapter revision or "
                 "upgrade the control plane"
             )
+        # only a successful capability check is cached, so a transient failure remains visible and
+        # retryable. concurrent first calls may make the same benign request twice; a lock would add
+        # coordination to every client solely to optimize that one startup race.
+        self._chat_step_selector_available = True
 
     def publish_env(
         self,

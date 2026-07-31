@@ -255,6 +255,135 @@ def test_env_test_single_turn_replays_reference_and_passes(monkeypatch, tmp_path
     assert "overall: PASS" in out
 
 
+def test_env_test_without_evaluations_keeps_output_byte_identical(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "episode 1: policy=replay turns=1 reward=1.000000\n"
+        "  prompt: user: what is 2 + 2?\n"
+        "  response: 4\n"
+        "1/1 episodes passed contract checks\n"
+        "overall: PASS\n"
+    )
+    assert captured.err == ""
+
+
+def test_env_test_validates_evaluation_sidecar_offline(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'held-out'\n"
+        "    def cases(self): return [EvalCase(input='what is 2 + 2?', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    output = capsys.readouterr().out
+    assert (
+        "evaluation suite held-out: 1/1 cases passed contract checks mean_score=1.000000" in output
+    )
+    assert "overall: PASS" in output
+
+
+def test_env_test_rejects_an_empty_evaluation_suite(monkeypatch, tmp_path, capsys):
+    # approving 0/0 contract checks makes the offline gate pass a sidecar that env eval refuses
+    # to run, so the first online use fails after setup already declared the package valid.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'empty'\n"
+        "    def cases(self): return []\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "evaluation suite empty failed contract checks: suite produced no cases" in captured.err
+    assert "0/0 cases passed contract checks" not in captured.out
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_fails_when_a_scorer_reports_an_error(monkeypatch, tmp_path, capsys):
+    # a scorer that returned an error graded nothing. `flash env eval` counts those as errors
+    # and fails the suite, so approving them offline would greenlight exactly the sidecar the
+    # online command refuses -- the gate passing is what hides it.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'judged'\n"
+        "    def cases(self): return [EvalCase(id='a', input='what is 2 + 2?', expected='4')]\n"
+        "    def score(self, case, response_text):\n"
+        "        return EvalResult(case_id='a', passed=False, score=0.0, response=response_text,\n"
+        "                          error='judge unavailable')\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "1/1 case(s) reported a scoring error" in captured.err
+    assert "judge unavailable" in captured.err
+    assert "cases passed contract checks" not in captured.out
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_fails_when_a_held_out_case_breaks_prompt_construction(
+    monkeypatch, tmp_path, capsys
+):
+    """The offline gate builds each case's prompt, because `flash env eval` will.
+
+    prompt_messages() runs against the held-out case, not the dataset row, so an env that raises
+    for a case's input printed `overall: PASS` here while `flash env eval` recorded a
+    prompt-construction error for every case of the same suite.
+    """
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'held-out'\n"
+        "    def cases(self): return [EvalCase(id='a', input='held-out only', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class _PickyPrompt(_SingleTurnEnv):
+        def prompt_messages(self, example):
+            if example["input"] != "what is 2 + 2?":
+                raise KeyError("no template for this input")
+            return super().prompt_messages(example)
+
+    _patch_loader(monkeypatch, _PickyPrompt())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "evaluation suite held-out failed contract checks" in captured.err
+    assert "no template for this input" in captured.err
+    assert "cases passed contract checks" not in captured.out
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_malformed_evaluation_sidecar_fails(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    sidecar = env_dir / "evaluations.py"
+    sidecar.write_text("EVALUATIONS = [object()]\n")
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert str(sidecar) in captured.err
+    assert "non-empty string name" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_test_auto_falls_back_to_echo_for_empty_reference(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "say anything", "output": ""}], reward=0.0)
