@@ -113,6 +113,14 @@ def build_verl_dataset_rows(
     those placeholders back into content blocks (``_build_messages``) and asserts the placeholder
     count equals ``len(images)``, so the two must be produced together. this is the same contract
     the sft and opd verl paths already write.
+
+    ``<image>``, ``<video>`` and ``<audio>`` are therefore reserved substrings, not ordinary text,
+    on every row of a multimodal job -- including a text-only row in a mixed dataset, because verl
+    splits on all three whenever ANY modality column is non-empty for that row. a prompt that merely
+    talks about one of these tokens would be re-expanded as real media and abort dataset loading
+    inside verl with a bare offset assertion (and for video/audio we never write a column at all, so
+    a single literal occurrence asserts against an empty list). reject it here instead, where the
+    message is still attributable to its example.
     """
     if not (len(message_prompts) == len(example_indices) == len(ground_truths)):
         raise ValueError("message_prompts / example_indices / ground_truths length mismatch")
@@ -122,19 +130,34 @@ def build_verl_dataset_rows(
     for position, (messages, idx, gt) in enumerate(
         zip(message_prompts, example_indices, ground_truths, strict=True)
     ):
+        prompt: list[dict] | list
+        if image_uris is None:
+            prompt = messages
+        else:
+            prompt = [
+                {
+                    "role": str(message.get("role") or ""),
+                    "content": _verl_image_message_content(message.get("content")),
+                }
+                for message in messages
+            ]
+            placeholders = sum(str(message["content"]).count("<image>") for message in prompt)
+            if placeholders != len(image_uris[position]):
+                raise ValueError(
+                    f"multimodal prompt for example {int(idx)} has {placeholders} <image> "
+                    f"placeholder(s) but {len(image_uris[position])} image(s); a literal "
+                    "'<image>' in prompt text is reserved by verl's dataset loader"
+                )
+            for reserved in ("<video>", "<audio>"):
+                if any(reserved in str(message["content"]) for message in prompt):
+                    raise ValueError(
+                        f"multimodal prompt for example {int(idx)} contains a literal "
+                        f"'{reserved}', which verl's dataset loader reserves as a media "
+                        "placeholder; flash writes no such column"
+                    )
         row = {
             "data_source": DATA_SOURCE,
-            "prompt": (
-                [
-                    {
-                        "role": str(message.get("role") or ""),
-                        "content": _verl_image_message_content(message.get("content")),
-                    }
-                    for message in messages
-                ]
-                if image_uris is not None
-                else messages
-            ),
+            "prompt": prompt,
             "ability": "flash",
             "reward_model": {"style": "rule", "ground_truth": str(gt)},
             # verl's example index is the flash rollout_examples index; the reward bridge keys on it.

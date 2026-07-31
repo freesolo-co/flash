@@ -114,6 +114,78 @@ def test_multimodal_rows_reject_a_mismatched_uri_list():
         )
 
 
+def test_multimodal_rows_reject_a_literal_image_placeholder_in_text():
+    # verl splits prompt text on "<image>" and re-expands each hit into a real image block, so a
+    # prompt that merely TALKS about the token consumes an image the row does not have. verl would
+    # abort dataset loading with a bare offset assertion; catching it here names the example.
+    with pytest.raises(ValueError, match="reserved by verl"):
+        rl_verl.build_verl_dataset_rows(
+            [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "the <image> token marks an image"},
+                            {"type": "image"},
+                        ],
+                    }
+                ]
+            ],
+            [7],
+            ["a"],
+            image_uris=[["file:///w/0-0.png"]],
+        )
+
+
+def test_text_only_row_of_a_mixed_job_rejects_a_literal_placeholder():
+    # the row itself has no images, but verl's split is driven by the row's OWN modality columns and
+    # a mixed job writes an images column on every row -- so a text row with a literal "<image>"
+    # asserts against its empty list. this is the case a per-job (rather than per-row) check misses.
+    with pytest.raises(ValueError, match="reserved by verl"):
+        rl_verl.build_verl_dataset_rows(
+            [
+                [{"role": "user", "content": [{"type": "text", "text": "describe <image> please"}]}],
+                [{"role": "user", "content": [{"type": "image"}]}],
+            ],
+            [0, 1],
+            ["a", "b"],
+            image_uris=[[], ["file:///w/1-0.png"]],
+        )
+
+
+@pytest.mark.parametrize("reserved", ["<video>", "<audio>"])
+def test_multimodal_rows_reject_other_reserved_media_placeholders(reserved):
+    # _build_messages splits on all three markers. flash never writes a videos/audios column, so a
+    # single literal occurrence asserts against an empty list -- the count check on <image> alone
+    # would pass this row straight through.
+    with pytest.raises(ValueError, match="reserves as a media placeholder"):
+        rl_verl.build_verl_dataset_rows(
+            [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"a {reserved} marker"},
+                            {"type": "image"},
+                        ],
+                    }
+                ]
+            ],
+            [3],
+            ["a"],
+            image_uris=[["file:///w/0-0.png"]],
+        )
+
+
+def test_text_job_does_not_police_reserved_placeholders():
+    # the control: without an images column verl never splits, so "<image>" is ordinary text and
+    # rejecting it would break text jobs that legitimately discuss the token.
+    rows = rl_verl.build_verl_dataset_rows(
+        [[{"role": "user", "content": "what does <image> mean?"}]], [0], ["a"]
+    )
+    assert rows[0]["prompt"] == [{"role": "user", "content": "what does <image> mean?"}]
+
+
 def test_mixed_job_parquet_round_trips_the_images_column(tmp_path):
     # Dataset.from_list infers ONE type per column across all rows. in a mixed job the text rows
     # have an empty images list, and inference on an all-empty-or-partly-empty column can land on a
