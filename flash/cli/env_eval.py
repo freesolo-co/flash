@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,21 +34,23 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def finite_float(value: str) -> float:
+    """A temperature the chat route will accept.
+
+    `float("nan")` and `float("inf")` parse, so argparse took them and every case then spent a
+    request the server rejects for being non-finite (`flash/server/routes/serving.py:1429-1432`),
+    turning one bad flag into one doomed paid request per case (codex[bot]).
+    """
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {value}")
+    return parsed
+
+
 def bounded_concurrency(value: str) -> int:
     parsed = positive_int(value)
     if parsed > _MAX_CONCURRENCY:
         raise argparse.ArgumentTypeError(f"must be at most {_MAX_CONCURRENCY}")
-    return parsed
-
-
-def finite_float(value: str) -> float:
-    """Reject nan/inf, which the chat route refuses per request.
-
-    Without this, every case submits the invalid value and comes back a generation
-    failure, so one malformed flag reads as the model failing the whole suite."""
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise argparse.ArgumentTypeError("must be a finite number")
     return parsed
 
 
@@ -108,15 +111,15 @@ def _generate_response(client, target: str, messages: list[dict], args) -> str:
     return response
 
 
-def _generate_case(client, target: str, messages: list[dict], args) -> tuple[str, str | None]:
-    """Generate one response. Returns (response, error); only this half runs off-thread.
+def _generate_case(client, target: str, messages: list[dict], args) -> str | _GenerationFailure:
+    """The case's response text, or the reason generation failed. This half runs off-thread.
 
     SystemExit derives from BaseException, so an environment or client that calls sys.exit()
     would otherwise tear down the whole suite mid-run and lose every case already graded."""
     try:
-        return _generate_response(client, target, messages, args), None
+        return _generate_response(client, target, messages, args)
     except (Exception, SystemExit) as exc:
-        return "", f"generation failed: {str(exc) or exc.__class__.__name__}"
+        return _GenerationFailure(f"generation failed: {str(exc) or exc.__class__.__name__}")
 
 
 def _score_case(suite, case: EvalCase, case_id: str, response: str) -> EvalResult:
@@ -137,13 +140,6 @@ def _score_case(suite, case: EvalCase, case_id: str, response: str) -> EvalResul
             response=response,
             error=f"scoring failed: {str(exc) or exc.__class__.__name__}",
         )
-
-
-def _resolve_case(suite, case: EvalCase, case_id: str, generated: tuple[str, str | None]):
-    response, error = generated
-    if error is not None:
-        return _generation_error(case_id, error)
-    return _score_case(suite, case, case_id, response)
 
 
 def _live_deployment(client, run_id: str) -> dict | None:
@@ -169,84 +165,110 @@ def _case_ids(cases: list[EvalCase]) -> list[str]:
     """Stable per-case ids, disambiguating sidecars that reuse one id across cases.
 
     Two cases sharing an id would collide in the uploaded payload and in the printed
-    report, silently reporting one graded case where two ran."""
+    report, silently reporting one graded case where two ran.
+
+    The suffix is retried until it is genuinely free, because the disambiguated form is
+    itself a legal explicit id: cases `a`, `a`, `a#2` resolved to `a`, `a#2`, `a#2` and
+    reintroduced the collision this function exists to remove."""
     ids: list[str] = []
     seen: dict[str, int] = {}
-    # a disambiguated id can itself collide with a raw id: cases "x", "x", "x#2" resolve to
-    # "x", "x#2", "x#2" if the suffix is not re-checked, putting the collision back. taken
-    # holds every id already handed out, so the suffix advances until it is actually free.
     taken: set[str] = set()
     for index, case in enumerate(cases, start=1):
         case_id = case.id or str(index)
         count = seen.get(case_id, 0)
-        seen[case_id] = count + 1
         resolved = case_id if count == 0 else f"{case_id}#{count + 1}"
         while resolved in taken:
             count += 1
-            seen[case_id] = count + 1
             resolved = f"{case_id}#{count + 1}"
+        seen[case_id] = count + 1
         taken.add(resolved)
         ids.append(resolved)
     return ids
 
 
-def _build_messages(environment, case: EvalCase) -> tuple[list[dict], str | None]:
-    """Render one case's prompt on the caller's thread, reporting failure as that case's error.
+def _build_messages(environment, case: EvalCase) -> list[dict] | _GenerationFailure:
+    """One case's prompt, or the reason it could not be built.
 
-    Built here rather than inside the worker for the same reason scoring is: prompt_messages
-    runs the environment's own `start_episode`, which is user code. A raise must fail its own
-    case, not the whole suite."""
+    Rendered on the caller's thread for the same reason scoring is: prompt_messages runs the
+    environment's own `start_episode`, which is user code. A raise must fail its own case, not
+    the whole suite."""
     try:
-        return _case_messages(environment, case), None
+        return _case_messages(environment, case)
     except (Exception, SystemExit) as exc:
         reason = str(exc) or exc.__class__.__name__
-        return [], f"prompt construction failed: {reason}"
+        return _GenerationFailure(f"prompt construction failed: {reason}")
 
 
 def _run_cases(
     client, target: str, suite, cases: list[EvalCase], args, environment=None
 ) -> tuple[EvalResult, ...]:
+    """Generate concurrently, score serially on this thread.
+
+    Only generation is parallel. `suite.score()` always runs here, in case order: a lock
+    prevents overlap but not thread affinity, and a scorer holding a resource created while
+    the suite was loaded -- a sqlite connection, a tokenizer bound to its creating thread --
+    failed every case from a worker even though nothing was concurrent (codex[bot])."""
     case_ids = _case_ids(cases)
     prompts = [_build_messages(environment, case) for case in cases]
     if args.concurrency == 1 or len(cases) <= 1:
-        return tuple(
-            _resolve_case(
-                suite,
-                case,
-                case_id,
-                (("", error) if error else _generate_case(client, target, messages, args)),
-            )
-            for case, case_id, (messages, error) in zip(cases, case_ids, prompts, strict=True)
-        )
+        responses = [_generate(client, target, prompt, args) for prompt in prompts]
+    else:
+        responses = _generate_concurrently(client, target, prompts, args)
+    return tuple(
+        _generation_error(case_id, response.error)
+        if isinstance(response, _GenerationFailure)
+        else _score_case(suite, case, case_id, response)
+        for case, case_id, response in zip(cases, case_ids, responses, strict=True)
+    )
 
-    generated: list[tuple[str, str | None] | None] = [
-        ("", error) if error else None for _messages, error in prompts
+
+@dataclass(frozen=True)
+class _GenerationFailure:
+    """Why one case never produced a response. Carries no case id: the caller pairs by index."""
+
+    error: str
+
+
+def _generate(
+    client, target: str, prompt: list[dict] | _GenerationFailure, args
+) -> str | _GenerationFailure:
+    """The case's response text, or the reason it never got one.
+
+    A case whose prompt could not be built arrives already failed and is passed straight
+    through, so a broken prompt never buys a generation."""
+    if isinstance(prompt, _GenerationFailure):
+        return prompt
+    return _generate_case(client, target, prompt, args)
+
+
+def _generate_concurrently(
+    client, target: str, prompts: list[list[dict] | _GenerationFailure], args
+) -> list[str | _GenerationFailure]:
+    responses: list[str | _GenerationFailure | None] = [
+        prompt if isinstance(prompt, _GenerationFailure) else None for prompt in prompts
     ]
-    # cancel_futures drops everything still queued on Ctrl-C. without it the interrupt is
-    # only raised after every already-submitted request drains, so a --concurrency 32 run
-    # over hundreds of cases keeps buying generations for minutes after the user stopped it.
-    pool = ThreadPoolExecutor(max_workers=min(args.concurrency, len(cases)))
+    pool = ThreadPoolExecutor(max_workers=min(args.concurrency, len(prompts)))
     try:
         futures = {
-            pool.submit(_generate_case, client, target, messages, args): index
-            for index, (messages, error) in enumerate(prompts)
-            if error is None
+            pool.submit(_generate_case, client, target, prompt, args): index
+            for index, prompt in enumerate(prompts)
+            if not isinstance(prompt, _GenerationFailure)
         }
         for future in as_completed(futures):
-            generated[futures[future]] = future.result()
-    except BaseException:
+            responses[futures[future]] = future.result()
+    finally:
+        # not `with`: ThreadPoolExecutor.__exit__ shuts down with wait=True, so Ctrl-C joined
+        # every in-flight request before the root handler ever saw the KeyboardInterrupt. a
+        # chat_stream call may block for up to 30 minutes, so an aborted eval looked hung for
+        # that long (codex[bot]). cancel_futures drops queued cases immediately; requests already
+        # in flight are not interruptible from here, so we do not pretend to wait for them.
         pool.shutdown(wait=False, cancel_futures=True)
-        raise
-    pool.shutdown(wait=True)
-
-    # scoring happens here, on the caller's thread, in case order: suites are user objects
-    # that may hold mutable state or install signal handlers, neither of which survives a
-    # worker thread.
-    return tuple(
-        _resolve_case(suite, case, case_id, item)
-        for case, case_id, item in zip(cases, case_ids, generated, strict=True)
-        if item is not None
-    )
+    # a slot is still None only when the abort above dropped a queued case, which is the one
+    # path that returns before every future resolved.
+    return [
+        response if response is not None else _GenerationFailure("generation did not run")
+        for response in responses
+    ]
 
 
 def _case_payload(case: EvalCase | None, result: EvalResult) -> dict:
@@ -385,9 +407,10 @@ def cmd_env_eval(args) -> int:
     try:
         _, _, entrypoint, _ = _resolve_local_env_entrypoint(Path(args.path))
         entrypoint = entrypoint.resolve()
-        # the same params a run submits under [environment.params]. an environment whose
-        # load_environment() requires one would fail to load here, and one that merely
-        # branches on it would be graded on a different dataset or split than it trains on.
+        # the same kwargs `env test` builds from --split/--param, so a held-out suite grades the
+        # environment the run is actually configured with. loading parameterless rejected an env
+        # whose load_environment() requires a setting, and silently built a differently-configured
+        # scorer for one that merely defaults (codex[bot]).
         environment = load_freesolo_environment(str(entrypoint), **params)
         suites = load_evaluation_suites(entrypoint, environment=environment)
     except (Exception, SystemExit) as exc:
@@ -493,6 +516,11 @@ def cmd_env_eval(args) -> int:
         report = EvalSuiteReport(name=suite.name, results=results)
         _print_report(report)
         reports.append(report)
+        # every report uploads, including the ones that never graded a case. skipping them
+        # left the dashboard showing the earlier suites as a completed run with the failing
+        # suite simply absent -- a green-looking evaluation whose CLI exit code was 1
+        # (codex[bot]). `_case_payload` tolerates a missing case, so a load failure records
+        # its error rather than nothing.
         if args.upload:
             _upload_report(
                 report,

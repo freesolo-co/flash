@@ -327,6 +327,9 @@ def cmd_env_delete(args) -> int:
 
 
 _ENV_ENTRYPOINT = "environment.py"
+# the held-out evaluation sidecar (flash/envs/evaluations.py). a known filename beside the
+# entrypoint rather than an environment module: never an entrypoint candidate, and carried
+# alongside the entrypoint on a single-file push the way its docs and dataset are.
 _ENV_EVALUATIONS_SIDECAR = "evaluations.py"
 _ENV_SYSPATH_BOOTSTRAP = (
     "import os as _flash_os, sys as _flash_sys\n"
