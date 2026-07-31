@@ -268,6 +268,63 @@ def test_env_test_auto_falls_back_to_echo_for_empty_reference(monkeypatch, tmp_p
     assert "warning:" not in captured.err
 
 
+def test_env_test_fails_when_every_replayed_gold_answer_scores_zero(monkeypatch, tmp_path, capsys):
+    # LS-005: the command warned per episode and passed anyway, so an environment whose reward
+    # function cannot recognize its own reference answers reached a gpu where it could only ever
+    # see flat-zero reward.
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[{"input": "what is 2 + 2?", "output": "4"}, {"input": "2 + 3?", "output": "5"}],
+        reward=0.0,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    # the episodes themselves are contract-clean; it is the run-wide signature that fails.
+    assert "2/2 episodes passed contract checks" in captured.out
+    assert "all 2 replayed gold answer(s) scored zero" in captured.err
+    assert "overall: FAIL" in captured.err
+    assert "overall: PASS" not in captured.out
+
+
+def test_env_test_partial_zero_gold_answers_warn_but_pass(monkeypatch, tmp_path, capsys):
+    # deliberately narrow: a strict reward function with some hard rows is legitimate and must not
+    # be blocked. only every replayed answer scoring zero is the broken-grader signature.
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[{"input": "what is 2 + 2?", "output": "4"}, {"input": "2 + 3?", "output": "5"}]
+    )
+    rewards = iter([0.0, 1.0])
+    monkeypatch.setattr(env, "reward", lambda completion, example, state=None: next(rewards))
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "replay gold answer scored low" in captured.err
+    assert "scored zero" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_negative_reward_scale_is_not_a_zero_reward_grader(monkeypatch, tmp_path, capsys):
+    # a grader scaled -1 for a correct reference and -2 for an incorrect completion still separates
+    # them, which is all GRPO's relative advantage needs. counting every non-positive reward as a
+    # zero made the gate reject those environments outright (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[{"input": "what is 2 + 2?", "output": "4"}, {"input": "2 + 3?", "output": "5"}],
+        reward=-1.0,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    # the advisory warning still fires -- it only advises -- but the run-wide gate does not.
+    assert "replay gold answer scored low (reward=-1.000000)" in captured.err
+    assert "scored zero" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
 def test_env_test_non_text_sft_completion_uses_echo(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     env = _NonTextSftEnv()
@@ -478,17 +535,19 @@ def test_env_test_multi_turn_stops_on_empty_env_reply(monkeypatch, tmp_path, cap
     assert "overall: PASS" in out
 
 
-def test_env_test_replay_low_reward_warns_but_passes(monkeypatch, tmp_path, capsys):
+def test_env_test_replay_low_reward_warns_per_episode(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0))
 
-    assert cmd_env_test(_args(env_dir)) == 0
+    # the per-episode warning still names the row, and with this the run's ONLY replayed answer,
+    # the whole-run gate below it fails the command (see the all-zero test above).
+    assert cmd_env_test(_args(env_dir)) == 1
     captured = capsys.readouterr()
     assert "episode 1: policy=replay turns=1 reward=0.000000" in captured.out
     assert "1/1 episodes passed contract checks" in captured.out
-    assert "overall: PASS" in captured.out
     assert "warning:" in captured.err
     assert "check the reward function" in captured.err
+    assert "overall: FAIL" in captured.err
 
 
 def test_env_test_systemexit_from_reward_fails_contract(monkeypatch, tmp_path, capsys):
