@@ -971,6 +971,90 @@ def test_score_single_turn_env_error_is_zero():
     assert s == 0.0
 
 
+# --------------------- reward_metrics: per-name breakdown collection ---------------------
+class _NamedBreakdownEnv:
+    def scores_breakdown(self, graded, ex, state):
+        hit = 1.0 if graded.strip() == ex["gt"] else 0.0
+        return {"success": hit, "quality": 0.5, "total": hit}
+
+
+class _BadTotalEnv:
+    def scores_breakdown(self, graded, ex, state):
+        return {"success": 1.0, "total": "not-a-number"}
+
+
+class _RaisingRewardOnlyEnv:
+    def reward(self, graded, ex, state):
+        raise ValueError("grader is down")
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_score_single_turn_collects_the_named_breakdown_for_reward_metrics():
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _NamedBreakdownEnv(), "7", {"gt": "7"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 1.0
+    assert breakdowns == [{"success": 1.0, "quality": 0.5, "total": 1.0}]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_scalar_reward_env_contributes_no_breakdown_at_all():
+    # appending {} for a scores_breakdown-less env would add a denominator under no numerators:
+    # _mean_named_reward_metrics divides by every scored completion, so an env mixing the two
+    # shapes -- or a run with none at all -- would publish every name shrunk toward 0.
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _RewardOnlyEnv(), "the answer is 7", {"gt": "7"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 2.5
+    assert breakdowns == []
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_scalar_reward_env_contributes_nothing_when_its_grading_fails_either():
+    # the failure path is where the scores_breakdown gate actually bites: without it, a run whose
+    # env has no named components at all would still append None per failed completion, and
+    # _latest_named_reward_metrics' outage branch would then republish the LAST run's names as a
+    # flat 0 for an env that never reported them.
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _RaisingRewardOnlyEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 0.0
+    assert breakdowns == []
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_failed_grading_records_none_so_it_counts_as_a_zero():
+    # trl's contract: a completion that failed to grade still scored 0.0, and must pull the mean of
+    # every name the OTHER completions reported down with it. dropping it silently would report the
+    # surviving completions' average as if the whole generation had earned it.
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _RaisingEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 0.0
+    assert breakdowns == [None]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_an_unusable_total_records_no_named_components():
+    # float(total) raising IS a failed grading -- the completion scores 0.0. crediting its named
+    # components would report metrics for a completion that earned nothing.
+    breakdowns: list[dict | None] = []
+    score = rl_verl.score_single_turn(
+        _BadTotalEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+    )
+    assert score == 0.0
+    assert breakdowns == [None]
+
+
 # ------------------------------- reward rpc bridge -------------------------------
 def test_reward_server_round_trip():
     server, url = rl_verl.start_reward_server(
@@ -2842,6 +2926,86 @@ def test_bridge_score_converts_a_non_finite_episode_to_zero():
         assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
 
 
+def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
+    # multi-turn has no per-completion breakdown -- the env scores a whole episode to a scalar --
+    # so the transcript IS the only thing this path can publish for `flash runs log`.
+    recorded: list[tuple] = []
+    env = _BridgeEnv(episode=0.75)
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    assert len(recorded) == 1
+    prompt, transcript, reward = recorded[0]
+    assert reward == 0.75
+    # the whole accumulated transcript, not just the last turn.
+    assert [m["content"] for m in transcript] == ["answer"]
+    assert prompt == []  # _BridgeEnv seeds no prompt; the shape is what matters here
+
+
+def test_the_recorded_episode_is_the_zeroed_reward_not_the_raw_nan():
+    # the sample carries the reward the rollout actually trained on. publishing nan here would show
+    # a reward in the log that no advantage was ever computed from.
+    recorded: list[tuple] = []
+    bridge = rl_verl.MultiTurnBridge(
+        _BridgeEnv(episode=float("nan")), [{"index": 0}], max_turns=4,
+        on_episode_scored=lambda *row: recorded.append(row),
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    assert [row[2] for row in recorded] == [0.0]
+
+
+def test_the_recorded_transcript_is_a_snapshot_that_later_turns_cannot_mutate():
+    # `step` appends to state["messages"] IN PLACE. handing the live list to the recorder would let
+    # a concurrent episode's turn appear inside an already-published sample.
+    recorded: list[tuple] = []
+    env = _BridgeEnv(done_after=99)
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4, on_episode_scored=lambda *row: recorded.append(row)
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "first"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+    snapshot = list(recorded[0][1])
+    bridge.step({"session_id": "a", "completion_text": "second"})
+
+    assert list(recorded[0][1]) == snapshot
+    assert "second" not in [m.get("content") for m in recorded[0][1]]
+
+
+def test_the_episode_recorder_runs_outside_the_session_lock():
+    # the recorder is the caller's sample buffer, which has its own lock. taking it while holding
+    # the session lock inverts the single-turn path's order (buffer lock only, never nested) and
+    # any grading that touches both deadlocks.
+    observed: list[bool] = []
+    env = _BridgeEnv()
+    bridge = rl_verl.MultiTurnBridge(
+        env, [{"index": 0}], max_turns=4,
+        on_episode_scored=lambda *_: observed.append(bridge._lock.acquire(blocking=False)),
+    )
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    bridge.score({"session_id": "a", "turn_count": 1})
+
+    assert observed == [True], "the session lock was still held when the recorder ran"
+    bridge._lock.release()
+
+
+def test_a_bridge_without_a_recorder_still_scores():
+    # single-turn jobs build no bridge, but the recorder stays optional so the bridge is usable
+    # (and testable) without a sample buffer behind it.
+    bridge = _bridge(_BridgeEnv(episode=0.5))
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.5}
+
+
 def test_bridge_close_releases_the_session():
     # every in-flight episode holds env state. a leak here grows for the whole run, and the child
     # closes in a finally precisely so a failed episode still frees it -- so close must tolerate a
@@ -2884,9 +3048,12 @@ def test_bridge_routes_are_served_alongside_single_turn_scoring():
 def test_the_bridge_is_built_only_for_multi_turn_jobs():
     # a bridge on a single-turn job would expose episode routes with no episode state behind them,
     # and mounting it costs a lock the single-turn scoring path already has.
-    src = inspect.getsource(rl_verl.run_rl_verl)
-    assert 'MultiTurnBridge(env, rollout_examples, max_turns=int(inp["max_turns"]))' in src
-    assert 'if inp["multi_turn"]\n        else None' in src
+    # whitespace-normalized: the construction spans several lines, and what is under test is the
+    # guard around it, not how the formatter wrapped the call.
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    assert src.count("MultiTurnBridge(") == 1
+    assert 'MultiTurnBridge( env, rollout_examples, max_turns=int(inp["max_turns"]),' in src
+    assert 'if inp["multi_turn"] else None' in src
 
 
 # ---------------------- multi-turn response tensor width ----------------------
@@ -3201,3 +3368,184 @@ def test_the_reward_profiler_is_skipped_on_multi_turn():
     profile_call = src[src.index("reward_profile = ") : src.index("multi_turn_bridge = ")]
     assert 'if inp["multi_turn"]' in profile_call, "the profiler is not gated off multi-turn"
     assert "None" in profile_call, "multi-turn must record no profile rather than a wrong one"
+
+
+# ---------------- reward observability: the buffers and the heartbeat drain ----------------
+def _closure_namespace(name: str, namespace: dict):
+    """Compile one closure out of run_rl_verl and return it bound to `namespace`.
+
+    `_score` and `_reward_observability` are locals of a body that needs a model, a dataset and a
+    verl interpreter to reach, so they are lifted out and run against fakes -- the same technique
+    the trl `reward_fn` tests use. What executes is the shipped source, not a restatement of it.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
+    node = next(
+        item
+        for item in ast.walk(tree)
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+    exec(compile(module, f"<{name}>", "exec"), namespace)
+    return namespace[name]
+
+
+def _score_namespace(env, *, prompts=None, examples=None):
+    namespace = {
+        "env": env,
+        "rollout_examples": examples if examples is not None else [{"gt": "7"}],
+        "message_prompts": prompts if prompts is not None else ["prompt-0"],
+        "recent_samples": [],
+        "pending_named_breakdowns": [],
+        "_samples_lock": threading.Lock(),
+        "_MAX_PENDING_BREAKDOWNS": rl_verl._MAX_PENDING_BREAKDOWNS,
+        "score_single_turn": rl_verl.score_single_turn,
+        "tok": None,
+        "inp": {"prompt_opened_thinking": False, "think_penalty": 0.0},
+        "_w": SimpleNamespace(THINKING=False),
+    }
+    return _closure_namespace("_score", namespace), namespace
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_score_buffers_the_rollout_sample_and_its_named_breakdown():
+    score, ns = _score_namespace(_NamedBreakdownEnv())
+
+    assert score(0, "7") == 1.0
+    assert ns["recent_samples"] == [("prompt-0", "7", 1.0)]
+    assert ns["pending_named_breakdowns"] == [{"success": 1.0, "quality": 0.5, "total": 1.0}]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_breakdown_buffer_is_bounded_when_the_heartbeat_stops_draining():
+    # one generation is bounded, but nothing bounds how many generations pass between drains. an
+    # unbounded list here grows for the whole run in a process that is already memory-tight.
+    score, ns = _score_namespace(_NamedBreakdownEnv())
+    for _ in range(rl_verl._MAX_PENDING_BREAKDOWNS + 50):
+        score(0, "7")
+
+    assert len(ns["pending_named_breakdowns"]) == rl_verl._MAX_PENDING_BREAKDOWNS
+    assert len(ns["recent_samples"]) == 64  # the sample buffer keeps its own rolling bound
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_score_grades_outside_the_buffer_lock():
+    # grading calls user code and can block on i/o for seconds while verl scores many rollouts at
+    # once. holding the buffer lock across it serializes every grading in the run behind the
+    # slowest one, which on a slow grader is the whole reward wall.
+    held: list[bool] = []
+
+    class _Env:
+        def reward(self, graded, ex, state):
+            held.append(ns["_samples_lock"].acquire(blocking=False))
+            if held[-1]:
+                ns["_samples_lock"].release()
+            return 1.0
+
+    score, ns = _score_namespace(_Env())
+    score(0, "x")
+
+    assert held == [True], "the buffer lock was held across env grading"
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_scalar_reward_run_publishes_no_named_metrics_at_all():
+    # end to end for the empty case: a scores_breakdown-less env must reach the wire with the key
+    # ABSENT, not with every name flattened to 0 by an empty-dict denominator.
+    score, ns = _score_namespace(_RewardOnlyEnv(), examples=[{"gt": "7"}])
+    score(0, "the answer is 7")
+
+    assert ns["pending_named_breakdowns"] == []
+    observability = _observability_namespace(ns)()
+    assert "reward_metrics" not in observability
+    assert len(observability["sampled_completions"]) == 1
+
+
+def _observability_namespace(score_ns: dict, *, step: int = 5):
+    from flash.engine.worker.heartbeat import (
+        _latest_named_reward_metrics,
+        reward_observability_fields,
+    )
+    from flash.engine.worker.rollout_samples import select_rollout_samples
+
+    namespace = dict(score_ns)
+    namespace.update(
+        {
+            "latest_named_metrics": score_ns.get("latest_named_metrics", {}),
+            "step_box": [step],
+            "_latest_named_reward_metrics": _latest_named_reward_metrics,
+            "select_rollout_samples": select_rollout_samples,
+            "reward_observability_fields": reward_observability_fields,
+        }
+    )
+    return _closure_namespace("_reward_observability", namespace)
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
+    score, ns = _score_namespace(
+        _NamedBreakdownEnv(),
+        prompts=["p0", "p1", "p2", "p3"],
+        examples=[{"gt": "7"}, {"gt": "7"}, {"gt": "9"}, {"gt": "9"}],
+    )
+    for index, completion in enumerate(["7", "7", "7", "7"]):
+        score(index, completion)
+
+    fields = _observability_namespace(ns)()
+
+    # two of four completions matched their gt, so success averages 0.5 across the generation.
+    assert fields["reward_metrics"] == {"success": 0.5, "quality": 0.5}
+    assert len(fields["sampled_completions"]) == 3  # hard cap, four rollouts buffered
+    assert {s["generated_at_step"] for s in fields["sampled_completions"]} == {5}
+    assert [s["reward"] for s in fields["sampled_completions"]] == [1.0, 1.0, 0.0]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_drain_clears_pending_breakdowns_and_then_repeats_the_last_reading():
+    # _latest_named_reward_metrics CLEARS the pending list. between generations there is nothing new
+    # to average, and reporting {} there would blank the metric on every heartbeat that lands
+    # mid-generation rather than holding the last real reading.
+    score, ns = _score_namespace(_NamedBreakdownEnv())
+    score(0, "7")
+    observability = _observability_namespace(ns)
+
+    assert observability()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+    assert ns["pending_named_breakdowns"] == []
+    assert observability()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+
+    score(0, "wrong")
+    assert observability()["reward_metrics"] == {"success": 0.0, "quality": 0.5}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_drain_and_the_sample_read_share_one_lock_acquisition():
+    """The drain CLEARS the pending list, so it and the sample read must be one atomic section.
+
+    Asserted on the closure's own source: reproducing the interleave needs a grading to land
+    between the clear and the read, and a test that merely calls the closure passes with the lock
+    split in two.
+    """
+    body = textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl))
+    body = body[body.index("def _reward_observability") :]
+    body = body[: body.index("return reward_observability_fields")]
+
+    assert body.count("with _samples_lock:") == 1
+    assert body.index("with _samples_lock:") < body.index("_latest_named_reward_metrics(")
+    assert body.index("_latest_named_reward_metrics(") < body.index("select_rollout_samples(")
+
+
+def test_the_first_sample_bearing_heartbeat_is_forced():
+    # the liveness daemon can claim a step before the stdout loop reaches it, and a step-gated stage
+    # drops a second payload at an already-committed step. without force, the first heartbeat
+    # carrying samples is exactly the one most likely to be suppressed.
+    src = inspect.getsource(rl_verl.run_rl_verl)
+    forced = src[src.index("if not sent_first_metrics:") :]
+    forced = forced[: forced.index("gpu=gpu_diagnostics")]
+    assert "force=True" in forced
+    assert "**_reward_observability()" in forced
+
+
+def test_the_liveness_fields_hook_carries_reward_observability():
+    # the rl_step liveness wrap is what publishes between stdout lines. without the fields hook
+    # merging it, samples would only ever reach the wire on the one forced first-metrics heartbeat.
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    assert 'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in src

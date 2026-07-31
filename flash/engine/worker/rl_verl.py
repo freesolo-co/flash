@@ -49,14 +49,20 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
+    _latest_named_reward_metrics,
     liveness_heartbeat,
+    reward_observability_fields,
 )
 from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.multiturn_glue import validate_glue_template
 from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
-from flash.engine.worker.rollout_samples import sanitize_rollout_text
+from flash.engine.worker.rollout_samples import (
+    sample_completion_text,
+    sanitize_rollout_text,
+    select_rollout_samples,
+)
 from flash.engine.worker.sft_train import (
     _hydra_val,
     _materialize_verl_images,
@@ -1185,6 +1191,7 @@ def score_single_turn(
     prompt_opened_thinking: bool,
     think_penalty: float,
     raise_on_error: bool = False,
+    breakdowns: list[dict[str, float] | None] | None = None,
 ) -> float:
     """score one single-turn text completion exactly as the trl reward path does.
 
@@ -1195,7 +1202,15 @@ def score_single_turn(
     ``raise_on_error`` re-raises instead, for callers that must tell a real 0.0 score apart from a
     failed grading. training never sets it; the latency profiler does, because a swallowed error
     turns a grader that is failing on every call into a fast, confident, wrong reading.
+
+    ``breakdowns`` collects this completion's per-name reward components for the ``reward_metrics``
+    heartbeat field. appended to only when the env actually exposes ``scores_breakdown`` -- an env
+    with a plain scalar ``reward`` has no components, and appending an empty dict for it would put a
+    real denominator under no numerators and publish a flat 0 for a run that simply has no named
+    metrics. a failed grading appends ``None``, which the mean counts as a zero for every name the
+    other completions did report, exactly as trl does; the caller owns the list's lock and bound.
     """
+    collect_breakdown = breakdowns is not None and hasattr(env, "scores_breakdown")
     try:
         graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
         state = (
@@ -1210,12 +1225,19 @@ def score_single_turn(
             else None
         )
         if hasattr(env, "scores_breakdown"):
-            r = float(env.scores_breakdown(graded, ex, state).get("total", 0.0))
+            breakdown = env.scores_breakdown(graded, ex, state)
+            # convert total FIRST: a breakdown whose total is not a number is a failed grading, and
+            # recording its named components would credit metrics to a completion that scored 0.0.
+            r = float(breakdown.get("total", 0.0))
+            if collect_breakdown:
+                breakdowns.append(breakdown)
         else:
             r = float(env.reward(graded, ex, state))
     except Exception as exc:  # env scoring must not kill the run
         if raise_on_error:
             raise
+        if collect_breakdown:
+            breakdowns.append(None)
         print(
             f"[rl-verl] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0", flush=True
         )
@@ -1226,6 +1248,12 @@ def score_single_turn(
         )
     return float(r)
 
+
+# how many per-completion reward breakdowns may queue between heartbeat drains. one generation is
+# prompts_per_step * group_size completions, and the drain runs on the heartbeat cadence, so this
+# holds several generations' worth -- enough that a normal drain never truncates, while a run whose
+# heartbeat has stopped draining cannot grow the buffer without limit.
+_MAX_PENDING_BREAKDOWNS = 4096
 
 # the total startup delay this hook is allowed to add, covering reference extraction AND timing.
 # both call user code, so one shared ceiling is the only number that means anything to a caller.
@@ -1346,12 +1374,25 @@ class MultiTurnBridge:
     episode, keyed by the id the child mints. the env's own rollout state is the source of truth
     for turn budget, doneness, and the terminal episode that gets scored -- exactly the state the
     trl driver accumulates, so both backends score the same object.
+
+    ``on_episode_scored(prompt, transcript, reward)`` receives each scored episode so the caller can
+    surface it as a rollout sample. multi-turn has no per-completion breakdown to report -- the env
+    scores a whole episode through ``rollout_rewards_many``, which returns a scalar -- so only the
+    sample side of the reward observability pair applies here, exactly as on the trl path.
     """
 
-    def __init__(self, env, examples: list[dict], *, max_turns: int) -> None:
+    def __init__(
+        self,
+        env,
+        examples: list[dict],
+        *,
+        max_turns: int,
+        on_episode_scored: Callable[[object, object, float], None] | None = None,
+    ) -> None:
         self._env = env
         self._examples = examples
         self._max_turns = int(max_turns)
+        self._on_episode_scored = on_episode_scored
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every env touch below happens under this lock, matching the single-turn path's contract.
         self._lock = threading.Lock()
@@ -1416,16 +1457,21 @@ class MultiTurnBridge:
         turn_count = int(payload["turn_count"])
         with self._lock:
             session = self._session(payload)
+            state = session["state"]
             reward = score_rollouts(
                 self._env,
                 [
                     RolloutScoreRequest(
                         example=session["example"],
-                        state=session["state"],
+                        state=state,
                         turn_count=turn_count,
                     )
                 ],
             )[0]
+            # snapshot under the same lock that guards the session: `step` mutates this list in
+            # place, and a concurrent episode's turn would otherwise be read mid-append.
+            prompt = list(state.get("prompt") or ())
+            transcript = list(state.get("messages") or ())
         # per-turn credit is a separate invariant (it needs a custom verl advantage estimator), so
         # only the episode reward crosses back. nan is score_rollouts' unscorable marker; verl has
         # no equivalent, and a nan would propagate into the group baseline and poison every other
@@ -1435,6 +1481,10 @@ class MultiTurnBridge:
         if not math.isfinite(episode):
             print("[rl-verl] multi-turn episode unscorable; scoring 0.0", flush=True)
             episode = 0.0
+        if self._on_episode_scored is not None:
+            # outside the lock: the callback is the caller's buffer, which has its own lock, and
+            # nesting them in this order would invert the single-turn path's acquisition order.
+            self._on_episode_scored(prompt, transcript, episode)
         return {"score": episode}
 
     def close(self, payload: dict) -> dict:
@@ -2464,15 +2514,25 @@ def run_rl_verl():
         copy_multi_turn_child_modules(shim_dir)
 
     # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. also keep a
-    # rolling buffer of recent (completion, score) so the training loop can dump one sample per step
-    # to the flash log, matching the trl path's #607 per-step completion dump.
-    recent_samples: list[tuple[str, float]] = []
+    # rolling buffer of recent (prompt, completion, score) so the training loop can dump one sample
+    # per step to the flash log and publish `sampled_completions`, matching the trl path's #607
+    # per-step completion dump and its reward heartbeat callback.
+    recent_samples: list[tuple[object, str, float]] = []
+    # per-name reward components for the `reward_metrics` heartbeat field. trl aggregates these in a
+    # TrainerCallback, which verl cannot host (its trainer is out of process), so the bridge collects
+    # them as it scores and the heartbeat thread drains them -- see the publisher below.
+    pending_named_breakdowns: list[dict[str, float] | None] = []
+    latest_named_metrics: dict[str, float] = {}
     # filled from the child's marker line; stays empty when wandb is off (see render_wandb_link_shim).
     wandb_link: dict[str, str | None] = {}
     _samples_lock = threading.Lock()
 
     def _score(index: int, solution_str: str) -> float:
         ex = rollout_examples[int(index)]
+        # scored OUTSIDE the lock: grading calls user code and can block on i/o for seconds, and
+        # verl scores many rollouts concurrently. holding the buffer lock across it would serialize
+        # every grading in the run behind the slowest one.
+        breakdowns: list[dict[str, float] | None] = []
         score = score_single_turn(
             env,
             solution_str,
@@ -2481,10 +2541,16 @@ def run_rl_verl():
             thinking=bool(_w.THINKING),
             prompt_opened_thinking=inp["prompt_opened_thinking"],
             think_penalty=inp["think_penalty"],
+            breakdowns=breakdowns,
         )
         with _samples_lock:
-            recent_samples.append((solution_str, score))
+            recent_samples.append((message_prompts[int(index)], solution_str, score))
             del recent_samples[:-64]
+            pending_named_breakdowns.extend(breakdowns)
+            # a generation is bounded by prompts_per_step * group_size, but nothing bounds how many
+            # generations pass between heartbeat drains. keep the same rolling bound as the sample
+            # buffer so a fast run with a stalled heartbeat cannot grow this without limit.
+            del pending_named_breakdowns[:-_MAX_PENDING_BREAKDOWNS]
         return score
 
     def _score_for_profile(index: int, solution_str: str) -> float:
@@ -2520,8 +2586,18 @@ def run_rl_verl():
         )
     )
 
+    def _record_episode_sample(prompt, transcript, reward: float) -> None:
+        with _samples_lock:
+            recent_samples.append((prompt, transcript, float(reward)))
+            del recent_samples[:-64]
+
     multi_turn_bridge = (
-        MultiTurnBridge(env, rollout_examples, max_turns=int(inp["max_turns"]))
+        MultiTurnBridge(
+            env,
+            rollout_examples,
+            max_turns=int(inp["max_turns"]),
+            on_episode_scored=_record_episode_sample,
+        )
         if inp["multi_turn"]
         else None
     )
@@ -2662,10 +2738,30 @@ def run_rl_verl():
         # below, so mutate it in place (append_step_metrics) rather than rebinding.
         metrics_last: list[dict] = []
         sent_first_metrics = False
+
+        def _reward_observability() -> dict:
+            """the `reward_metrics` / `sampled_completions` fields for one heartbeat emission.
+
+            trl publishes both from a TrainerCallback on the trainer's own thread. verl's trainer is
+            out of process, so this is called from the liveness thread and from the stdout loop
+            instead -- draining the same buffers the reward bridge fills on its server threads.
+            """
+            with _samples_lock:
+                # drained under the lock: _latest_named_reward_metrics CLEARS the pending list, so a
+                # concurrent grading appending between the read and the clear would lose its
+                # breakdown entirely.
+                metrics = _latest_named_reward_metrics(
+                    pending_named_breakdowns, latest_named_metrics
+                )
+                samples = select_rollout_samples(
+                    list(recent_samples), generated_at_step=step_box[0] or None
+                )
+            return reward_observability_fields(metrics, samples)
+
         with liveness_heartbeat(
             "rl_step",
             progress=_progress,
-            fields=lambda: {"metrics_last": list(metrics_last)},
+            fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
             progress_step=True,
         ):
             proc = subprocess.Popen(
@@ -2691,9 +2787,11 @@ def run_rl_verl():
                                 samp = recent_samples[-1] if recent_samples else None
                             if samp:
                                 last_dump_step[0] = step_box[0]
-                                preview = " ".join(sanitize_rollout_text(samp[0])[:300].split())
+                                _, completion, reward = samp
+                                text = sanitize_rollout_text(sample_completion_text(completion))
+                                preview = " ".join(text[:300].split())
                                 print(
-                                    f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
+                                    f"[rl-verl] step {step_box[0]} sample (reward={reward:.3f}): {preview}",
                                     flush=True,
                                 )
                     step_metrics = parse_verl_step_metrics(line)
@@ -2720,6 +2818,7 @@ def run_rl_verl():
                                 force=True,
                                 step=step_metrics["step"],
                                 metrics_last=list(metrics_last),
+                                **_reward_observability(),
                                 gpu=gpu_diagnostics(include_torch=False),
                             )
                         # per-step series for train_meta observability parity. these live on the same

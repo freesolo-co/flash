@@ -1,10 +1,10 @@
 import inspect
 
-from flash.engine.worker.rl import (
+from flash.engine.worker.heartbeat import (
     _latest_named_reward_metrics,
     _mean_named_reward_metrics,
-    run_rl,
 )
+from flash.engine.worker.rl import run_rl
 
 
 def test_named_reward_metrics_are_averaged_across_completions() -> None:

@@ -284,6 +284,65 @@ _REWARD_METRIC_LIMIT = 12
 _REWARD_METRIC_PRIORITY_NAMES = ("success",)
 
 
+def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    denominator = len(breakdowns)
+    for breakdown in breakdowns:
+        if not isinstance(breakdown, dict):
+            continue
+        for name, value in breakdown.items():
+            if name == "total":
+                continue
+            totals.setdefault(name, 0.0)
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(score):
+                totals[name] += score
+    if denominator == 0:
+        return {}
+    return {name: total / denominator for name, total in totals.items()}
+
+
+def _latest_named_reward_metrics(
+    breakdowns: list[dict[str, float] | None], latest: dict[str, float]
+) -> dict[str, float]:
+    if breakdowns:
+        metrics = _mean_named_reward_metrics(breakdowns)
+        breakdowns.clear()
+        if metrics:
+            latest.clear()
+            latest.update(metrics)
+        elif latest:
+            # every completion failed scoring this generation: surface the known metrics as
+            # zeros instead of dropping them, so a full scoring outage shows a flat 0 rather
+            # than hiding behind missing heartbeat fields.
+            latest.update(dict.fromkeys(latest, 0.0))
+    return dict(latest)
+
+
+def reward_observability_fields(reward_metrics, samples) -> dict:
+    """The bounded ``reward_metrics`` / ``sampled_completions`` fragment of a training heartbeat.
+
+    Both signals must pass their bounds before going on the wire (name sanitization and the 12-metric
+    cap; re-sanitization and the 3-sample cap). The trl callback applies them inline because it also
+    keeps the bounded metrics for its own ``latest_fields``; every other producer has no such need
+    and calls this instead, so a payload built off the trainer's thread carries the same guarantees.
+
+    Empty signals are omitted rather than sent as ``{}``/``[]``: a renderer distinguishes "no metrics
+    this step" from "this backend does not report them" by the key's absence.
+    """
+    fields: dict = {}
+    bounded_metrics = _bounded_reward_metrics(reward_metrics)
+    if bounded_metrics:
+        fields["reward_metrics"] = bounded_metrics
+    bounded_samples = _bounded_sampled_completions(samples)
+    if bounded_samples:
+        fields["sampled_completions"] = bounded_samples
+    return fields
+
+
 def _bounded_reward_metrics(metrics) -> dict[str, float]:
     if not isinstance(metrics, dict):
         return {}
