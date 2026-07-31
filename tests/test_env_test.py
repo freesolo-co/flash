@@ -2051,6 +2051,97 @@ def test_a_prompt_ending_in_an_assistant_turn_still_replays_faithfully(
     assert "cannot rank completions" in capsys.readouterr().err
 
 
+def test_an_observation_that_dropped_an_image_is_not_a_faithful_replay(
+    monkeypatch, tmp_path, capsys
+):
+    # _message_text keeps only text blocks, so an observation carrying an image read identically to
+    # one that never had it. the grader reads the whole rollout state, so it saw a transcript the
+    # replay did not reproduce, and the episode was admitted to the control gate as faithful
+    # (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _DroppedImageEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {
+                            "role": "user",
+                            # the gold transcript records an image alongside the text.
+                            "content": [
+                                {"type": "text", "content": None, "text": "continue"},
+                                {"type": "image_url", "image_url": {"url": "https://x.test/a.png"}},
+                            ],
+                        },
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            # the live env replies with the SAME text but no image. identical under (role, text).
+            reply = {"role": "user", "content": [{"type": "text", "text": "continue"}]}
+            messages.append(reply)
+            return [reply]
+
+        def reward(self, completion, example, state=None):
+            return 0.0
+
+    _patch_loader(monkeypatch, _DroppedImageEnv())
+
+    # the replay is not faithful, so the episode must be excluded rather than counted as evidence.
+    # with no controlled episode left, the flat-zero grader is not reported and the run passes.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_a_per_call_tool_id_does_not_make_a_faithful_replay_partial(monkeypatch, tmp_path, capsys):
+    # the opposite direction, pinning what the comparison must NOT read. a fresh tool_call_id per
+    # call is ordinary and two faithful runs of the same env differ in it, so comparing whole
+    # payloads would mark an exact replay partial_replay and drop it from the gate -- the same false
+    # exclusion that let a flat-zero grader pass unreported.
+    env_dir = _environment_dir(tmp_path)
+
+    class _VolatileToolIdEnv(_MultiTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "tool", "content": "42", "tool_call_id": "call_recorded"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            self.calls += 1
+            # same role, same text, same block shape -- a fresh id, as a real tool call issues.
+            reply = {"role": "tool", "content": "42", "tool_call_id": f"call_live_{self.calls}"}
+            messages.append(reply)
+            return [reply]
+
+        def reward(self, completion, example, state=None):
+            return 0.0
+
+    _patch_loader(monkeypatch, _VolatileToolIdEnv())
+
+    # a faithful replay, so the flat-zero grader must still be caught.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
 def test_an_unscorable_control_still_decides_the_groups_reward_path(monkeypatch, tmp_path, capsys):
     # an unscorable control is dropped from the comparisons because it earns no advantage -- but it
     # is still a MEMBER of the group the trainer builds, and build_per_turn_advantages demotes the

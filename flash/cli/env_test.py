@@ -326,21 +326,52 @@ def _resolve_policy(reference_turns: list[str]) -> str:
     return "replay" if "".join(reference_turns).strip() else "echo"
 
 
-def _observation(message: dict) -> tuple[str, str]:
-    """One environment-side turn as the replay check compares it: its role and its text.
+# role, replay text, and the kinds of content block the turn was built from. see _observation.
+_Observation = tuple[str, str, tuple[str, ...]]
+
+
+def _content_shape(content: object) -> tuple[str, ...]:
+    """The kinds of block a message's content is built from, in order.
+
+    Text-only content flattens to ``()``, so a plain string and a lone text block compare equal --
+    they carry the same payload and reach the grader the same way.
+    """
+    if not isinstance(content, list):
+        return ()
+    return tuple(str(block.get("type")) for block in content if isinstance(block, dict))
+
+
+def _observation(message: dict) -> tuple[str, str, tuple[str, ...]]:
+    """One environment-side turn as the replay check compares it: role, text, and block shape.
 
     The role is carried, not just the text. A reference recording ``{"role": "tool", ...}`` against
     a rollout emitting the same string as ``{"role": "user", ...}`` is a materially different
     transcript -- it renders differently under the chat template and a role-aware grader scores it
     differently -- so reducing both sides to content alone reported a faithful replay for a
     trajectory the grader never saw (codex[bot]).
+
+    The block shape is carried for the same reason one step further out. ``_message_text`` keeps only
+    text blocks, so an observation carrying an image read identically to one that never had it, and
+    a grader reading the whole rollout state scored a transcript the replay did not reproduce
+    (codex[bot]).
+
+    What is deliberately NOT compared is the rest of the payload -- ``tool_call_id``, ``name``, and
+    anything else keyed per call. Those are free to differ between two faithful runs of the same
+    env: a fresh id per tool call is ordinary, and comparing it would mark an exact replay
+    ``partial_replay`` and drop it from the control gate, which is the same false exclusion that let
+    a flat-zero grader pass unreported. Shape distinguishes a dropped image; it does not read
+    anything a rerun is entitled to change.
     """
-    return str(message.get("role", "")).strip().lower(), _message_text(message.get("content"))
+    return (
+        str(message.get("role", "")).strip().lower(),
+        _message_text(message.get("content")),
+        _content_shape(message.get("content")),
+    )
 
 
 def _observation_blocks(
     messages: list[dict], *, skip_messages: int = 0
-) -> tuple[tuple[tuple[str, str], ...], ...]:
+) -> tuple[tuple[_Observation, ...], ...]:
     """The environment-side turns, grouped by the assistant turn each block follows.
 
     Grouping is what makes an extra observation visible. Flattened, an env emitting one unexpected
@@ -356,8 +387,8 @@ def _observation_blocks(
     shifting every reference block by one and marking a faithful replay `partial_replay`
     (codex[bot]).
     """
-    blocks: list[tuple[tuple[str, str], ...]] = []
-    current: list[tuple[str, str]] = []
+    blocks: list[tuple[_Observation, ...]] = []
+    current: list[_Observation] = []
     for message in messages[skip_messages:]:
         if str(message.get("role", "")).strip().lower() == "assistant":
             blocks.append(tuple(current))
