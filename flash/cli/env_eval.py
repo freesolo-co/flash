@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -334,24 +335,70 @@ def _generate_concurrently(
     responses: list[str | _GenerationFailure | None] = [
         prompt if isinstance(prompt, _GenerationFailure) else None for prompt in prompts
     ]
-    pool = ThreadPoolExecutor(max_workers=min(args.concurrency, len(prompts)))
-    try:
-        futures = {
-            pool.submit(_generate_case, client, target, prompt, args): index
-            for index, prompt in enumerate(prompts)
-            if not isinstance(prompt, _GenerationFailure)
-        }
-        for future in as_completed(futures):
-            responses[futures[future]] = future.result()
-    finally:
-        # not `with`: ThreadPoolExecutor.__exit__ shuts down with wait=True, so Ctrl-C joined
-        # every in-flight request before the root handler ever saw the KeyboardInterrupt. a
-        # chat_stream call may block for up to 30 minutes, so an aborted eval looked hung for
-        # that long (codex[bot]). cancel_futures drops queued cases immediately; requests already
-        # in flight are not interruptible from here, so we do not pretend to wait for them.
-        pool.shutdown(wait=False, cancel_futures=True)
-    # a slot is still None only when the abort above dropped a queued case, which is the one
-    # path that returns before every future resolved.
+    pending: queue.SimpleQueue = queue.SimpleQueue()
+    for index, prompt in enumerate(prompts):
+        if not isinstance(prompt, _GenerationFailure):
+            pending.put((index, prompt))
+    outstanding = pending.qsize()
+    if outstanding:
+        finished: queue.SimpleQueue = queue.SimpleQueue()
+        aborted = threading.Event()
+        abort_lock = threading.Lock()
+        abort_error: BaseException | None = None
+
+        def _run_cases() -> None:
+            nonlocal abort_error
+            # `aborted` is the cancel_futures half of the old shutdown: a case still queued when
+            # the eval is abandoned must never buy a generation.
+            while not aborted.is_set():
+                try:
+                    index, prompt = pending.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    responses[index] = _generate_case(client, target, prompt, args)
+                except BaseException as exc:
+                    # _generate_case absorbs Exception and SystemExit itself, so anything arriving
+                    # here -- KeyboardInterrupt, in practice -- ends the whole eval. carry it to
+                    # the caller's thread, which is what `future.result()` used to do: raised in a
+                    # worker it would simply kill that thread, and the CLI would grade the run as
+                    # if the user had never pressed Ctrl-C.
+                    with abort_lock:
+                        if abort_error is None:
+                            abort_error = exc
+                    aborted.set()
+                    finished.put(index)
+                    return
+                finished.put(index)
+
+        # deliberately NOT a ThreadPoolExecutor. Its shutdown(wait=False) only postpones the
+        # wait: concurrent.futures registers an interpreter-exit hook that joins every worker
+        # thread, so after `main()` reported `aborted` the process still hung until the in-flight
+        # chat_stream hit its 30-minute timeout (codex[bot]). Daemon threads carry no such hook --
+        # Ctrl-C propagates out of the wait below and the interpreter exits without joining them.
+        workers = [
+            threading.Thread(target=_run_cases, daemon=True)
+            for _ in range(min(args.concurrency, outstanding))
+        ]
+        for worker in workers:
+            worker.start()
+        # poll rather than block forever: a worker killed by something its `finally` cannot
+        # observe would otherwise strand this wait with no case left to complete it.
+        completed = 0
+        while completed < outstanding and not aborted.is_set():
+            try:
+                finished.get(timeout=0.1)
+            except queue.Empty:
+                if not any(worker.is_alive() for worker in workers):
+                    break
+                continue
+            completed += 1
+        if abort_error is not None:
+            # the surviving workers are daemons: they are abandoned rather than joined, so the
+            # abort reaches the CLI's handler at once instead of after a 30-minute chat_stream.
+            raise abort_error.with_traceback(abort_error.__traceback__)
+    # a slot is still None only when a case never ran, which is the one path that returns
+    # before every request resolved.
     return [
         response if response is not None else _GenerationFailure("generation did not run")
         for response in responses
