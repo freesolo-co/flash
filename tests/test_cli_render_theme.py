@@ -178,6 +178,25 @@ def test_train_submitted_note(monkeypatch) -> None:
     assert "--follow" in out  # tells the user how to re-attach after Ctrl-C
 
 
+def test_train_submitted_note_names_this_channel_executable(monkeypatch) -> None:
+    """The hand-off must name the executable the user actually has installed.
+
+    On the dev channel the console script is `flash-dev` and CLI_NAME is rewritten to match, so a
+    hardcoded `flash runs cancel ...` hands out a command that does not exist on that install --
+    and the command it hands out is the one that stops the billing.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    # stand in for the dev channel. asserting against the real CLI_NAME would pass on the release
+    # channel even if the name were hardcoded, since there it is literally "flash".
+    monkeypatch.setattr(render, "CLI_NAME", "flash-dev")
+
+    out = render.submitted("flash-xyz")
+
+    assert "`flash-dev runs log flash-xyz --follow`" in out
+    assert "`flash-dev runs cancel flash-xyz`" in out
+
+
 def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
     # On an ASCII / non-UTF-8 stdout, the themed renderers (which use em dashes, bullets, etc.)
     # must degrade rather than raise UnicodeEncodeError once styling is forced on.
