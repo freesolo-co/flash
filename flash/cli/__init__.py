@@ -14,7 +14,6 @@ from flash import __version__
 from flash._channel import CLI_NAME
 from flash._logging import configure_logging
 from flash._update_check import emit_update_notice, maybe_start_update_check
-from flash.catalog import ALGORITHMS
 from flash.cli import render
 
 # package-level command imports remain available through flash.cli.
@@ -54,7 +53,6 @@ from flash.cli.traces import (
     cmd_traces_export,
 )
 from flash.client.config import shadowed_login_warning
-from flash.spec import CREDIT_ASSIGNMENTS, DEFAULT_CREDIT_ASSIGNMENT
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -342,34 +340,6 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=".",
         help="local environment directory or environment.py path",
-    )
-    env_test.add_argument(
-        "--algorithm",
-        default=None,
-        help=(
-            "algorithm the environment is for, matching [train] algorithm "
-            f"({', '.join(ALGORITHMS)}). only the reward-consuming ones check that the grader "
-            "can rank completions; sft never calls reward()"
-        ),
-    )
-    env_test.add_argument(
-        "--credit-assignment",
-        default=None,
-        choices=CREDIT_ASSIGNMENTS,
-        help=(
-            "credit assignment the run will use, matching [train] credit_assignment "
-            f"(default {DEFAULT_CREDIT_ASSIGNMENT}). only per_turn reads an environment's per-turn "
-            "reward vectors, so only there do they count as the grader separating completions"
-        ),
-    )
-    env_test.add_argument(
-        "--thinking",
-        action="store_true",
-        help=(
-            "the run enables thinking, matching [train] thinking (default off). the grader is then "
-            "handed the answer with its <think> span removed, plus the raw/completion/thinking "
-            "state the worker builds, so a scorer that reads that state is checked as it runs"
-        ),
     )
     env_test.add_argument(
         "--split",
