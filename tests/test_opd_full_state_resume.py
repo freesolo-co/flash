@@ -200,7 +200,13 @@ def test_complete_checkpoint_is_recognized():
     assert opd_resume_checkpoint_complete((*_COMPLETE, "tokenizer.json", "special_tokens_map.json"))
     # either adapter weight format satisfies the adapter requirement.
     assert opd_resume_checkpoint_complete(
-        ("adapter_config.json", "adapter_model.bin", "optimizer.pt", "rng_state.pth", "opd_state.json")
+        (
+            "adapter_config.json",
+            "adapter_model.bin",
+            "optimizer.pt",
+            "rng_state.pth",
+            "opd_state.json",
+        )
     )
 
 
@@ -321,9 +327,7 @@ def test_save_is_best_effort_on_upload_failure(monkeypatch, tmp_path):
     def _boom(step, d):
         raise TimeoutError("hf upload outage")
 
-    monkeypatch.setattr(
-        opd, "_w", types.SimpleNamespace(SEED=42, upload_resume_checkpoint=_boom)
-    )
+    monkeypatch.setattr(opd, "_w", types.SimpleNamespace(SEED=42, upload_resume_checkpoint=_boom))
     # a transient periodic upload failure must not propagate; the next save boundary retries.
     opd._save_opd_resume_checkpoint(
         model=_FakeModel(),
@@ -346,9 +350,7 @@ def test_save_is_best_effort_on_upload_failure(monkeypatch, tmp_path):
         opd.RequiredSaveError("checkpoint upload rejected"),
     ],
 )
-def test_nonrequired_save_suppresses_upload_contract_errors(
-    monkeypatch, tmp_path, failure
-):
+def test_nonrequired_save_suppresses_upload_contract_errors(monkeypatch, tmp_path, failure):
     def _fail_upload(*_args, **_kwargs):
         raise failure
 
@@ -401,7 +403,9 @@ def test_required_save_raises_when_upload_returns_false(monkeypatch, tmp_path):
         types.SimpleNamespace(SEED=42, upload_resume_checkpoint=lambda *_args: False),
     )
 
-    with pytest.raises(opd.RetriableInfraError, match="required opd full-state checkpoint upload failed"):
+    with pytest.raises(
+        opd.RetriableInfraError, match="required opd full-state checkpoint upload failed"
+    ):
         opd._save_opd_resume_checkpoint(
             model=_FakeModel(),
             tok=_FakeTok(),
@@ -782,7 +786,9 @@ def _assert_restore_untouched(order, optimizer, torch):
 
 def test_restore_rejects_incomplete_dir(monkeypatch, tmp_path):
     ckpt = _write_state_dir(
-        tmp_path / "checkpoint-3", state=_valid_state(), filenames=[f for f in _COMPLETE if f != "optimizer.pt"]
+        tmp_path / "checkpoint-3",
+        state=_valid_state(),
+        filenames=[f for f in _COMPLETE if f != "optimizer.pt"],
     )
     result, order, optimizer, torch = _restore_expecting_none(monkeypatch, ckpt)
     assert result is None
@@ -891,9 +897,7 @@ def test_restore_rejects_noncanonical_checkpoint_suffix(monkeypatch, tmp_path):
 
 def test_restore_rejects_opt_steps_above_max(monkeypatch, tmp_path):
     ckpt = _write_state_dir(tmp_path / "checkpoint-3", state=_valid_state())
-    result, order, optimizer, torch = _restore_expecting_none(
-        monkeypatch, ckpt, max_opt_steps=2
-    )
+    result, order, optimizer, torch = _restore_expecting_none(monkeypatch, ckpt, max_opt_steps=2)
     assert result is None
     _assert_restore_untouched(order, optimizer, torch)
 
@@ -962,9 +966,7 @@ def test_restore_rejects_non_string_nested_keys(monkeypatch, tmp_path, field):
 
 
 def test_restore_rejects_negative_accounting_counter(monkeypatch, tmp_path):
-    ckpt = _write_state_dir(
-        tmp_path / "checkpoint-3", state=_valid_state(generated_tokens=-1)
-    )
+    ckpt = _write_state_dir(tmp_path / "checkpoint-3", state=_valid_state(generated_tokens=-1))
     result, order, optimizer, torch = _restore_expecting_none(monkeypatch, ckpt)
     assert result is None
     _assert_restore_untouched(order, optimizer, torch)

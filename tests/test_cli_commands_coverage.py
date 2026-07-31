@@ -50,7 +50,9 @@ def test_env_list_filters_non_environments_and_uses_styled_renderer(
     monkeypatch.chdir(tmp_path)
     seen = []
     monkeypatch.setattr(commands.render, "styled", lambda: True)
-    monkeypatch.setattr(commands.render, "env_list", lambda paths: seen.extend(paths) or "styled-envs")
+    monkeypatch.setattr(
+        commands.render, "env_list", lambda paths: seen.extend(paths) or "styled-envs"
+    )
 
     assert commands.cmd_env_list(SimpleNamespace()) == 0
 
@@ -109,7 +111,9 @@ def test_checkpoints_empty_and_styled_paths(monkeypatch, capsys) -> None:
     assert capsys.readouterr().out == "empty-checkpoints\n"
 
     client._checkpoints = [{"step": 12}]
-    monkeypatch.setattr(commands.render, "checkpoints_table", lambda run_id, rows: "checkpoint-table")
+    monkeypatch.setattr(
+        commands.render, "checkpoints_table", lambda run_id, rows: "checkpoint-table"
+    )
     assert commands.cmd_checkpoints(SimpleNamespace(run_id="flash-1")) == 0
     assert capsys.readouterr().out == "checkpoint-table\n"
 
@@ -192,6 +196,7 @@ def test_chat_rejects_invalid_target_without_constructing_a_client(monkeypatch, 
 
 def test_chat_prints_styled_label_before_streaming(monkeypatch, capsys) -> None:
     """Styled chat must label assistant output while preserving streamed content."""
+
     class ChatClient:
         def chat_stream(self, run_id, messages, **kwargs):
             assert run_id == "flash-1"

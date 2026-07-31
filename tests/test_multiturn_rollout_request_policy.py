@@ -271,7 +271,7 @@ def test_submit_failure_best_effort_aborts_attempted_id():
             active_env=_Env(),
             render=_render,
             submit=lambda *args: (_ for _ in ()).throw(RuntimeError("submit failed")),
-            poll=lambda: [],
+            poll=list,
             busy=lambda: False,
             abort=lambda request_ids: aborted.extend(request_ids),
             env_glue=_env_glue,

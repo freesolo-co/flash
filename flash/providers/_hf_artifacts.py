@@ -80,9 +80,13 @@ def verify_opd_replacement_safe(
         attempt_count = _attempt_int(next_attempt)
         if attempt_count is None:
             raise ValueError("next attempt identity is invalid")
-        paths = [opd_optimizer_start_marker_path(run_id, attempt) for attempt in range(attempt_count)]
+        paths = [
+            opd_optimizer_start_marker_path(run_id, attempt) for attempt in range(attempt_count)
+        ]
     except Exception as exc:
-        raise RuntimeError("opd retry evidence contract is invalid; replacement is blocked") from exc
+        raise RuntimeError(
+            "opd retry evidence contract is invalid; replacement is blocked"
+        ) from exc
     if not paths:
         return None
     if not isinstance(hf_repo, str) or not hf_repo.strip():
@@ -104,7 +108,9 @@ def verify_opd_replacement_safe(
             revision=revision,
         )
     except Exception as exc:
-        raise RuntimeError("opd retry evidence could not be listed; replacement is blocked") from exc
+        raise RuntimeError(
+            "opd retry evidence could not be listed; replacement is blocked"
+        ) from exc
     expected_paths = set(paths)
     present: dict[str, object] = {}
     try:
@@ -114,7 +120,9 @@ def verify_opd_replacement_safe(
                 raise ValueError("HF returned ambiguous optimizer-start marker evidence")
             present[path] = info
     except Exception as exc:
-        raise RuntimeError("opd retry evidence listing is malformed; replacement is blocked") from exc
+        raise RuntimeError(
+            "opd retry evidence listing is malformed; replacement is blocked"
+        ) from exc
     if not present:
         return None
     mutated = False
@@ -142,7 +150,9 @@ def verify_opd_replacement_safe(
                 version=version,
             )
         except Exception as exc:
-            raise RuntimeError("opd retry evidence is unverifiable; replacement is blocked") from exc
+            raise RuntimeError(
+                "opd retry evidence is unverifiable; replacement is blocked"
+            ) from exc
         # one validated marker proves mutation; keep validating every present marker.
         mutated = True
     if not mutated:
@@ -159,9 +169,7 @@ def verify_opd_replacement_safe(
             "opd optimizer state may have mutated and no complete resume checkpoint is available; "
             "replacement is blocked"
         )
-    state_path = (
-        f"{phase}/{run_id}/checkpoint/checkpoint-{checkpoint_step}/opd_state.json"
-    )
+    state_path = f"{phase}/{run_id}/checkpoint/checkpoint-{checkpoint_step}/opd_state.json"
     try:
         from huggingface_hub import hf_hub_download
 

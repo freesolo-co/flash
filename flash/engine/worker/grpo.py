@@ -109,9 +109,7 @@ def rl_per_device_comps(
                     _RL_ACT_SEQ_SCALE_CEIL,
                     max(_RL_ACT_SEQ_SCALE_FLOOR, (seq_len or _RL_ACT_SEQ_REF) / _RL_ACT_SEQ_REF),
                 )
-                vram_cap = max(
-                    1, int(vram_gb / (_RL_ACT_DIVISOR * (width / 1.41) * seq_scale))
-                )
+                vram_cap = max(1, int(vram_gb / (_RL_ACT_DIVISOR * (width / 1.41) * seq_scale)))
         except Exception as e:
             print("rl_per_device_comps colocate cap probe failed (keeping logits cap):", e)
 
