@@ -724,9 +724,10 @@ _ORG_BINDING_COMMANDS = frozenset(
         # wrong org is already scaffolded in by then.
         cmd_traces_export,
         cmd_env_setup,
-        # only `--upload` reaches an organization, but the warning has to fire before the run:
-        # by the time the upload is rejected, every paid request has already been made against
-        # whichever org the ambient key belongs to.
+        # every case makes an authenticated `chat_stream` request against the ambient key, whether
+        # or not results are uploaded, and access to the target is resolved from that key. so the
+        # warning has to fire before the run either way: by the time a wrong-org target is reported
+        # inaccessible, every paid request has already been spent against the other organization.
         cmd_env_eval,
     }
 )
@@ -739,10 +740,6 @@ def _warn_if_login_shadowed(args) -> None:
     # `train --cost` is catalog-only: it never loads credentials or reaches an organization, so a
     # warning that names the environment key's org would describe a request this command never makes.
     if getattr(args, "cost", False):
-        return
-    # `env eval` is local unless --upload: only the upload picks an org, so warning on a plain
-    # local eval would name an org that run never touches.
-    if getattr(args, "func", None) is cmd_env_eval and not getattr(args, "upload", False):
         return
     message = shadowed_login_warning()
     if not message:
