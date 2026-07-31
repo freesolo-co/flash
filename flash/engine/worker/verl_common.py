@@ -218,7 +218,30 @@ def resolve_verl_loggers(python_bin: str) -> list[str]:
     return ["console", "wandb"]
 
 
-def resolve_rollout_enforce_eager(python_bin: str) -> bool:
+def resolve_verl_device_capability(python_bin: str) -> tuple[int, int] | None:
+    """device 0's ``(major, minor)`` cuda capability as the VERL interpreter sees it, or None.
+
+    probed in verl's interpreter rather than flash's because verl owns the rollout engine and pins
+    its own torch/vllm stack, and both callers below are deciding what that stack can do. None means
+    the probe could not answer -- no cuda, no torch, a hung import -- and every caller must read it
+    as "leave the default alone" rather than guessing a workaround onto an unknown card.
+    """
+    probe = (
+        "import torch;"
+        "print(tuple(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else ())"
+    )
+    try:
+        out = subprocess.run(
+            [python_bin, "-c", probe], capture_output=True, text=True, timeout=120
+        )
+        cc = ast.literal_eval((out.stdout or "").strip().splitlines()[-1])
+        return (int(cc[0]), int(cc[1]))
+    except Exception as e:
+        print(f"[verl] device capability probe skipped: {e}")
+        return None
+
+
+def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
     """whether this GPU must run the rollout eagerly instead of capturing cuda graphs.
 
     vllm 0.19.1 is pinned on BOTH the baked verl venv and the fallback interpreter, so its
@@ -243,23 +266,12 @@ def resolve_rollout_enforce_eager(python_bin: str) -> bool:
     B200 (sm100) is deliberately NOT eager -- the trl path returned early there and kept vllm's own
     default, and the b200 rollout work depends on graphs.
 
-    Probed in the VERL interpreter for the same reason the Blackwell probe is: verl owns the rollout
-    engine and pins its own stack. A probe that cannot answer returns False, leaving verl's default
-    in place rather than guessing eager onto an unknown card.
+    An unanswerable probe (``cc is None``) leaves verl's default in place rather than guessing eager
+    onto an unknown card.
     """
-    probe = (
-        "import torch;"
-        "print(tuple(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else ())"
-    )
-    try:
-        out = subprocess.run(
-            [python_bin, "-c", probe], capture_output=True, text=True, timeout=120
-        )
-        cc = ast.literal_eval((out.stdout or "").strip().splitlines()[-1])
-        major, minor = int(cc[0]), int(cc[1])
-    except Exception as e:  # no cuda / probe failure -> leave verl's default alone
-        print(f"[verl] rollout graph-capture probe skipped: {e}")
+    if cc is None:
         return False
+    major, minor = cc
     if (major, minor) in {(8, 0), (9, 0)} or major in (10, 12):
         return False
     print(
@@ -269,7 +281,9 @@ def resolve_rollout_enforce_eager(python_bin: str) -> bool:
     return True
 
 
-def resolve_blackwell_attention_backends(python_bin: str) -> tuple[str | None, str | None]:
+def resolve_blackwell_attention_backends(
+    python_bin: str, cc: tuple[int, int] | None
+) -> tuple[str | None, str | None]:
     """the rollout ``(attention_backend, mm_encoder_attn_backend)`` this GPU needs, or ``(None, None)``.
 
     vLLM 0.19.1 picks both by capability, and on Blackwell both defaults are wrong:
@@ -293,24 +307,16 @@ def resolve_blackwell_attention_backends(python_bin: str) -> tuple[str | None, s
       TORCH_SDPA is a supported ViT backend on cc>=8.0, so pinning it sidesteps the CUTE import. The
       decoder attention is unaffected -- that is chosen separately, above.
 
-    Probed in the VERL interpreter, not flash's: verl owns the rollout engine and pins its own vllm
-    stack, so flash's ``import flashinfer`` would answer for the wrong environment. A probe failure
-    degrades to TRITON_ATTN rather than leaving the fragile default in place.
+    The flashinfer probe runs in the VERL interpreter, not flash's: verl owns the rollout engine and
+    pins its own vllm stack, so flash's ``import flashinfer`` would answer for the wrong
+    environment. A failed flashinfer probe degrades to TRITON_ATTN rather than leaving the fragile
+    default in place; an unanswerable capability probe (``cc is None``) leaves vllm's defaults alone.
 
     Returns ``(None, None)`` off Blackwell, where vLLM's own defaults are correct.
     """
-    probe = (
-        "import torch;"
-        "print(torch.cuda.get_device_capability(0)[0] if torch.cuda.is_available() else -1)"
-    )
-    try:
-        out = subprocess.run(
-            [python_bin, "-c", probe], capture_output=True, text=True, timeout=120
-        )
-        major = int((out.stdout or "").strip().splitlines()[-1])
-    except Exception as e:  # no cuda / probe failure -> leave vllm's defaults alone
-        print(f"[verl] Blackwell attention probe skipped: {e}")
+    if cc is None:
         return (None, None)
+    major = cc[0]
     if major not in (10, 12):
         return (None, None)
     try:
