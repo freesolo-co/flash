@@ -1491,7 +1491,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
         project="11111111-1111-4111-8111-111111111111",
         environment=EnvironmentSpec(id="owner/env"),
     )
-    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.2.60"]
+    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.4.0"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
