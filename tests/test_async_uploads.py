@@ -32,9 +32,7 @@ def upload_worker(monkeypatch, tmp_path):
     import flash.engine.worker as worker
     from flash.engine.worker import hf as worker_hf
 
-    monkeypatch.setattr(
-        worker_hf, "_OPTIONAL_CHECKPOINT_UPLOADER", worker_hf._SingleSlotUploader()
-    )
+    monkeypatch.setattr(worker_hf, "_OPTIONAL_CHECKPOINT_UPLOADER", worker_hf._SingleSlotUploader())
     monkeypatch.setattr(worker_hf, "_OPTIONAL_AUX_UPLOADER", worker_hf._SingleSlotUploader())
     monkeypatch.setattr(worker_hf, "_OPTIONAL_DEPLOYABLE_UPLOADER", worker_hf._FifoUploader())
     monkeypatch.setattr(worker_hf, "_OPTIONAL_UPLOAD_STAGE_ROOT", str(tmp_path / "staged"))
@@ -462,7 +460,9 @@ def test_coalesced_optional_resume_still_publishes_every_deployable(
 
     _checkpoint(output_dir, 2)
     callback.on_save(
-        SimpleNamespace(output_dir=str(output_dir)), SimpleNamespace(global_step=2), SimpleNamespace()
+        SimpleNamespace(output_dir=str(output_dir)),
+        SimpleNamespace(global_step=2),
+        SimpleNamespace(),
     )
     assert api.started.wait(1)  # step-2 uploads are in-flight and blocked
     for step in (4, 6):  # step-4's resume enqueues pending; step-6 coalesces it away
@@ -498,6 +498,8 @@ def test_optional_staging_failure_is_surfaced(
     _checkpoint(output_dir, 4)
     callback = worker.make_checkpoint_upload_callback()
     callback.on_save(
-        SimpleNamespace(output_dir=str(output_dir)), SimpleNamespace(global_step=4), SimpleNamespace()
+        SimpleNamespace(output_dir=str(output_dir)),
+        SimpleNamespace(global_step=4),
+        SimpleNamespace(),
     )
     assert "not published" in capsys.readouterr().out

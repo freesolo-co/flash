@@ -133,7 +133,7 @@ def make_client(tmp_path, monkeypatch):
     import flash.server.projects as projects_mod
     import flash.server.run_registry as run_registry
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(environment_registry, "require_environment_project", lambda **_kwargs: None)
     monkeypatch.setattr(
         projects_mod,

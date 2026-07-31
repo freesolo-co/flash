@@ -21,7 +21,9 @@ def test_catalog_model_resolves_normally():
 
 
 def test_allow_policy_accepts_fitting_model(monkeypatch):
-    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 1.2, raising=True)
+    monkeypatch.setattr(
+        "flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 1.2, raising=True
+    )
     info = resolve_model("acme/tiny-1b", "grpo", policy="allow", gpu="RTX 4090")
     assert info.thinking == "unknown"
     assert "open-model policy" in info.notes

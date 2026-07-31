@@ -54,6 +54,7 @@ def test_wandb_run_info_returns_populated_metadata(monkeypatch) -> None:
 
 def test_wandb_run_info_swallows_import_or_attribute_failures(monkeypatch) -> None:
     """A partially broken W&B module must never interrupt worker status persistence."""
+
     class BrokenModule(types.ModuleType):
         def __getattr__(self, name):
             raise RuntimeError("broken module")

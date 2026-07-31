@@ -452,9 +452,7 @@ def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) 
     )
 
 
-def hf_resume_checkpoint(
-    fail_closed: bool = False, revision: str | None = None
-) -> str | None:
+def hf_resume_checkpoint(fail_closed: bool = False, revision: str | None = None) -> str | None:
     """Download the latest streamed trainer checkpoint for this run, or return none."""
     required = bool(revision)
     strict = bool(fail_closed or required)
@@ -510,9 +508,7 @@ def hf_resume_checkpoint(
         if strict:
             if isinstance(e, RetriableInfraError):
                 raise
-            raise RetriableInfraError(
-                f"required resume checkpoint fetch failed: {e}"
-            ) from e
+            raise RetriableInfraError(f"required resume checkpoint fetch failed: {e}") from e
         return None
 
 
@@ -625,9 +621,7 @@ def _prefetch_error_is_retriable(exc: BaseException) -> bool:
         status = getattr(resp, "status_code", None)
         if status in {401, 403, 404}:
             return False
-        return status is None or status == 429 or (
-            isinstance(status, int) and 500 <= status <= 599
-        )
+        return status is None or status == 429 or (isinstance(status, int) and 500 <= status <= 599)
     return False
 
 
@@ -698,6 +692,7 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
     with liveness_heartbeat(
         "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
     ):
+
         def _download() -> None:
             _require_hf_deadline_allowance()
             snapshot_download(
@@ -715,9 +710,7 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
             except Exception as e:
                 if _prefetch_error_is_retriable(e):
                     detail = sanitize_diagnostic(e, limit=500)
-                    raise RetriableInfraError(
-                        f"pinned model prefetch failed: {detail}"
-                    ) from e
+                    raise RetriableInfraError(f"pinned model prefetch failed: {detail}") from e
                 raise
         else:
             try:
@@ -1085,9 +1078,7 @@ def make_checkpoint_upload_callback(save_at_steps=()):
         _OPTIONAL_CHECKPOINT_UPLOADER.enqueue(
             f"checkpoint step {step}",
             staged_dir,
-            lambda: _upload(
-                step, staged_checkpoint, provenance_ready=True, emit_heartbeat=False
-            ),
+            lambda: _upload(step, staged_checkpoint, provenance_ready=True, emit_heartbeat=False),
             on_coalesce=_publish_coalesced_deployable,
         )
 

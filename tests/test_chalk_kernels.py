@@ -155,4 +155,6 @@ def test_kernels_match_real_chalk_signature():
     accepted = set(inspect.signature(apply_chalk_kernel_to_qwen35).parameters)
     passed = {k for k, _ in _KERNELS}
     stray = passed - accepted
-    assert not stray, f"_KERNELS passes keys chalk rejects (would TypeError -> no-op -> eager): {sorted(stray)}"
+    assert not stray, (
+        f"_KERNELS passes keys chalk rejects (would TypeError -> no-op -> eager): {sorted(stray)}"
+    )

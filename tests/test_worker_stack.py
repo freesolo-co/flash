@@ -192,7 +192,7 @@ def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
     )
     monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
     monkeypatch.setattr(hf, "_hf_cache_bytes", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(hf, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
     monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
 
     assert hf.load_tokenizer("org/model", revision="refs/pr/123") is not None
@@ -933,8 +933,10 @@ def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
     monkeypatch.setattr(worker, "require_active_env", lambda: SimpleNamespace(id="org/env"))
     monkeypatch.setattr(worker, "hf_upload_file", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(worker, "_finalize", lambda metrics, **kwargs: captured.append((metrics, kwargs)))
-    monkeypatch.setattr(finalize, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(
+        worker, "_finalize", lambda metrics, **kwargs: captured.append((metrics, kwargs))
+    )
+    monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
 
     finalize.write_train_meta(
         phase="sft",
@@ -963,13 +965,15 @@ def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
     monkeypatch.setattr(worker, "THINKING", False)
     monkeypatch.setattr(worker, "require_active_env", lambda: SimpleNamespace(id="org/env"))
     monkeypatch.setattr(worker, "hf_upload_file", lambda *args, **kwargs: None)
-    monkeypatch.setattr(worker, "heartbeat", lambda stage, **kwargs: emitted.append((stage, kwargs)))
+    monkeypatch.setattr(
+        worker, "heartbeat", lambda stage, **kwargs: emitted.append((stage, kwargs))
+    )
     monkeypatch.setattr(
         worker,
         "_finalize",
         lambda metrics, **kwargs: finalized.append((metrics, kwargs)),
     )
-    monkeypatch.setattr(finalize, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
 
     finalize.write_train_meta(
         phase="rl",
@@ -998,8 +1002,10 @@ def test_finalize_preserves_terminal_heartbeat_fields(monkeypatch):
     metrics_last = [{"step": 4, "reward": 0.75}]
     monkeypatch.setattr(RunMetrics, "save", lambda self, path: None)
     monkeypatch.setattr(worker, "hf_upload_file", lambda *args, **kwargs: None)
-    monkeypatch.setattr(worker, "heartbeat", lambda stage, **kwargs: emitted.append((stage, kwargs)))
-    monkeypatch.setattr(worker, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(
+        worker, "heartbeat", lambda stage, **kwargs: emitted.append((stage, kwargs))
+    )
+    monkeypatch.setattr(worker, "gpu_diagnostics", dict)
     monkeypatch.setattr("builtins.open", mock_open())
 
     worker._finalize(RunMetrics(phase="rl"), heartbeat_fields={"metrics_last": metrics_last})

@@ -475,7 +475,9 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
     )
 
 
-def _projected_retry_class(candidates, failed_providers, tried_classes, chosen, *, cache_drop: bool):
+def _projected_retry_class(
+    candidates, failed_providers, tried_classes, chosen, *, cache_drop: bool
+):
     """The class the NEXT attempt is expected to select, given the failure this one records.
 
     Mirrors the bookkeeping at the bottom of the retry loop: a cache-drop retry leaves both sets
