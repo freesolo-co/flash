@@ -2051,6 +2051,127 @@ def test_a_prompt_ending_in_an_assistant_turn_still_replays_faithfully(
     assert "cannot rank completions" in capsys.readouterr().err
 
 
+def test_the_same_text_split_into_blocks_is_still_a_faithful_replay(monkeypatch, tmp_path, capsys):
+    # _message_text joins text blocks, so the text is already carried. counting them in the shape
+    # too marked a faithful replay partial_replay purely for expressing the same string differently,
+    # dropping it from the control gate and letting a flat-zero grader pass unreported (cursor).
+    env_dir = _environment_dir(tmp_path)
+
+    class _SplitTextEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        # the gold transcript records the observation as ONE plain string.
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            # the live env emits the same string split across two text blocks. same payload, same
+            # extracted text, and nothing an image-aware check should object to.
+            reply = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "cont"},
+                    {"type": "text", "text": "inue"},
+                ],
+            }
+            messages.append(reply)
+            return [reply]
+
+        def reward(self, completion, example, state=None):
+            return 0.0
+
+    _patch_loader(monkeypatch, _SplitTextEnv())
+
+    # a faithful replay, so the flat-zero grader must still be caught.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
+def test_a_function_call_turn_is_not_a_faithful_replay(monkeypatch, tmp_path, capsys):
+    # function_call is the older shape of the same payload tool_calls carries, and both are live in
+    # the openai schema. checking only the newer name marked such a turn representable, replayed it
+    # as its empty content string, and admitted the mutilated rollout to the gate (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _FunctionCallEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "function_call": {"name": "calc", "arguments": '{"a": 1}'},
+                        },
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def reward(self, completion, example, state=None):
+            return 0.0
+
+    _patch_loader(monkeypatch, _FunctionCallEnv())
+
+    # the structured call cannot be replayed as text, so the episode is excluded rather than
+    # counted as evidence -- leaving nothing controlled and no flat grader to report.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_an_extra_message_beside_the_recorded_final_observation_is_not_faithful(
+    monkeypatch, tmp_path, capsys
+):
+    # the gold transcript's last block states what the env replied after its final assistant turn,
+    # and one env_reply call produced it. accepting the driven block as a mere PREFIX let an env
+    # slip an unexpected message in alongside that reply, though the grader scores the complete
+    # state and could score the supposed gold rollout like the controls (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _ExtraFinalMessageEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        # recorded final block: exactly one observation.
+                        {"role": "user", "content": "continue"},
+                    ],
+                }
+            ]
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 1
+            # the recorded reply, plus one the transcript never claimed.
+            replies = [
+                {"role": "user", "content": "continue"},
+                {"role": "system", "content": "unexpected"},
+            ]
+            messages.extend(replies)
+            return replies
+
+        def reward(self, completion, example, state=None):
+            return 0.0
+
+    _patch_loader(monkeypatch, _ExtraFinalMessageEnv())
+
+    # not a faithful replay, so the episode is excluded and the flat-zero grader is not reported.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
 def test_an_observation_that_dropped_an_image_is_not_a_faithful_replay(
     monkeypatch, tmp_path, capsys
 ):
