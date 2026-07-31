@@ -555,6 +555,12 @@ def _thinking_answer(content: str, *, require_tag: bool = True) -> str:
     answer = content[closed + len("</think>") :].strip()
     if not answer:
         raise ServingError("smoke generation returned no answer after </think>")
+    if answer == "</think>":
+        # a compatibility backend that retains only the sampled close leaves the fold no answer to
+        # place behind the block, so it emits the delimiter twice. that shape is indistinguishable
+        # at the source from an adapter whose answer IS the tag, and folding deliberately defers the
+        # call to here. neither is an answer to the smoke prompt, so reject both.
+        raise ServingError("smoke generation returned only a close tag after </think>")
     return answer
 
 
