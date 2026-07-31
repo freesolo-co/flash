@@ -12,6 +12,8 @@ from flash.cli.env_test import (
     _CONTROL_CANDIDATES,
     _SYNTHETIC_CONTROL_ALPHABET,
     _control_is_disjoint,
+    _fmt_credited_turns,
+    _group_separates,
     _Score,
     _synthetic_controls,
     cmd_env_test,
@@ -489,6 +491,66 @@ def test_env_test_grader_that_cannot_rank_completions_fails(monkeypatch, tmp_pat
     assert "overall: PASS" not in captured.out
     assert "all 1 replayed episode(s) scored every deliberately wrong answer" in captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_a_tie_above_zero_is_reported_without_failing(monkeypatch, tmp_path, capsys):
+    # a healthy grader can legitimately tie gold with every control: a safety scorer awarding 1 to
+    # any response without a prohibited phrase does exactly that, while sampled unsafe completions
+    # score 0 and give real advantages. the controls are only LEXICALLY disjoint from gold, so
+    # nothing here establishes them as known-negative and the tie must not be failed on
+    # (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv(reward=1.0, wrong_reward=1.0))
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "overall: FAIL" not in captured.err
+    assert "cannot rank completions" in captured.err
+    assert "not failed on" in captured.err
+
+
+def test_a_tie_at_zero_is_still_conclusive(monkeypatch, tmp_path, capsys):
+    # the LS-005 signature this gate exists for. a grader returning nothing for its own reference
+    # answer is broken or missing a dependency however the reward is shaped, so unlike a non-zero
+    # tie it stays a verdict.
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0, wrong_reward=0.0))
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "overall: FAIL" in capsys.readouterr().err
+
+
+def test_controls_separating_only_from_each_other_are_not_flat(monkeypatch, tmp_path, capsys):
+    # at a turn gold emitted nothing, the per-turn trainer drops gold and centres the CONTROLS
+    # against one another, so controls scoring differently there earn real advantages. comparing
+    # each control only against gold missed that: `_overlap` removes the coordinate from every gold
+    # pairing, leaving the group falsely flat (codex[bot]).
+    gold = _Score(episode=0.5, turns=(1.0, 1.0), emitted=(False, True))
+    spread = [
+        _Score(episode=0.5, turns=(1.0, 1.0), emitted=(True, True)),
+        _Score(episode=0.5, turns=(0.0, 1.0), emitted=(True, True)),
+    ]
+
+    # gold is excluded at turn 0 and ties at turn 1, so no control separates from GOLD...
+    assert not any(control.separates_from(gold, per_turn=True) for control in spread)
+    # ...yet the controls differ where the trainer centres them, so the group is not flat.
+    assert _group_separates(gold, spread, per_turn=True)
+
+    tied = [
+        _Score(episode=0.5, turns=(1.0, 1.0), emitted=(True, True)),
+        _Score(episode=0.5, turns=(1.0, 1.0), emitted=(True, True)),
+    ]
+    assert not _group_separates(gold, tied, per_turn=True)
+
+
+def test_the_flat_warning_prints_only_the_turns_it_compared(monkeypatch, tmp_path, capsys):
+    # the raw vectors differ at a turn no member emitted at, which the comparison already dropped.
+    # printing them claimed rewards were identical where they visibly differ (cursor).
+    gold = _Score(episode=0.5, turns=(9.0, 1.0), emitted=(False, True))
+    controls = [_Score(episode=0.5, turns=(3.0, 1.0), emitted=(False, True))]
+
+    assert _fmt_credited_turns(gold, controls) == "(1.000000)"
 
 
 def test_env_test_substring_grader_gold_inside_a_control_still_passes(
@@ -1155,11 +1217,13 @@ def test_env_test_text_free_gold_turn_still_reaches_the_reward_gate(monkeypatch,
     env = _TextFreeMultiTurnEnv()
     _patch_loader(monkeypatch, env)
 
-    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    # reported, not failed on: the tie sits at a non-zero value, which a grader rewarding a
+    # property these lexically-disjoint controls happen to share would also produce.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     captured = capsys.readouterr()
     assert "1/1 episodes passed contract checks" in captured.out
     assert "cannot rank completions" in captured.err
-    assert "overall: FAIL" in captured.err
+    assert "overall: FAIL" not in captured.err
 
 
 def test_env_test_per_turn_credit_separates_a_flat_episode_score(monkeypatch, tmp_path, capsys):
@@ -1232,10 +1296,12 @@ def test_env_test_per_turn_vectors_do_not_rescue_a_flat_run_by_default(
 
     _patch_loader(monkeypatch, _PerTurnCreditEnv())
 
-    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    # the vectors are still not read, so the finding stands -- but the constant is 0.5, not zero,
+    # so it is reported rather than failed on.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     captured = capsys.readouterr()
     assert "cannot rank completions" in captured.err
-    assert "overall: FAIL" in captured.err
+    assert "overall: FAIL" not in captured.err
 
 
 def test_env_test_thinking_reference_is_excluded_from_the_reward_gate(
@@ -1457,8 +1523,10 @@ def test_env_test_gold_answer_colliding_with_every_fixed_control_is_still_contro
 
     # every fixed candidate is unusable for this gold answer...
     assert not any(_control_is_disjoint(c, "answer z 0") for c in _CONTROL_CANDIDATES)
-    # ...so without a fallback the episode carried no control at all and the constant grader passed.
-    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    # ...so without a fallback the episode carried no control at all and the constant grader was
+    # never examined. it is examined now; the constant is 1.0, so the finding is reported without
+    # failing, and the report is the evidence the episode reached the gate.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     captured = capsys.readouterr()
     assert "cannot rank completions" in captured.err
 
@@ -1822,7 +1890,9 @@ def test_env_turn_reproduction_is_judged_by_position_not_by_the_transcript_tail(
     # trailing "observation-2" is past everything the reference claims. the episode belongs in the
     # gate, so the flat grader above must still be reported.
     _patch_loader(monkeypatch, _RecordedObservationEnv())
-    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    # the finding is what proves the episode reached the gate. the flat 0.5 is non-zero, so it is
+    # reported rather than failed on; an excluded episode would be silent instead.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     assert "cannot rank completions" in capsys.readouterr().err
 
     class _LateMatchEnv(_RecordedObservationEnv):
@@ -1886,8 +1956,53 @@ def test_a_system_turn_in_the_reference_is_compared_on_both_sides(monkeypatch, t
             return 0.5
 
     _patch_loader(monkeypatch, _SystemObservationEnv())
-    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    # as above: the report is the evidence the episode was not silently dropped, and the non-zero
+    # constant keeps it a warning.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     assert "cannot rank completions" in capsys.readouterr().err
+
+
+def test_an_extra_environment_turn_is_not_a_faithful_replay(monkeypatch, tmp_path, capsys):
+    # comparing the driven side as a flat prefix accepted an env that interleaved a message the
+    # reference never recorded: reference a1/x/a2 against a driven a1/x/<extra>/a2 matched, though
+    # the grader received a materially different episode (codex[bot]). the episode must be excluded
+    # from the flat gate rather than counted as gold.
+    env_dir = _environment_dir(tmp_path)
+
+    class _InterleavingEnv(_MultiTurnEnv):
+        """Emits an unrecorded tool message ahead of the observation the reference records."""
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "user", "content": "observation-1"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            replies = [
+                {"role": "user", "content": "observation-1"},
+                # never recorded in the reference above
+                {"role": "tool", "content": "retrying upstream call"},
+            ]
+            messages.extend(replies)
+            return replies
+
+        def reward(self, completion, example, state=None):
+            # flat, so the gate would report it were this episode counted. the exclusion is what
+            # keeps the run silent.
+            return 0.5
+
+    _patch_loader(monkeypatch, _InterleavingEnv())
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert "cannot rank completions" not in capsys.readouterr().err
 
 
 def test_an_unscorable_multi_turn_control_is_dropped_rather_than_failed(
