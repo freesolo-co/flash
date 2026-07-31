@@ -625,25 +625,36 @@ def _process_group_alive(pgid: int) -> bool:
 
     So the group is alive only while some member is not a zombie. Membership is read from /proc
     rather than tracked, since the survivors are grandchildren this process never spawned.
+
+    A drained verdict is only returned when TWO consecutive walks agree on it, because a single walk
+    cannot distinguish a drained group from one it read too early. /proc can be listed while the
+    leader is still present, and the leader can then fork and exit before its status is inspected:
+    the snapshot is nonempty and zombie-only, yet the child that inherited the group is alive,
+    unlisted, and never received the earlier signal -- so teardown returns without SIGKILL and it
+    keeps its cuda context (codex[bot]). Rechecking addressability cannot settle it either, since a
+    zombie holds the group id: that answers True for a group that really has drained, which is the
+    burn-both-deadlines failure this function exists to avoid. A second walk can, because the fork
+    it missed is published by then.
     """
     if not _process_group_addressable(pgid):
         return False
-    members = _process_group_members(pgid)
-    if members is None:
-        # /proc could not be enumerated, so fall back to what signal 0 already established. it
-        # over-reports rather than returning early on a live process still holding the gpu.
-        return True
-    if any(not _process_is_zombie(pid) for pid in members):
-        return True
-    if not members:
-        # the kernel just said this group exists and the walk found nobody in it. that contradiction
-        # is exactly what one snapshot cannot settle: /proc can be listed just before a fork
-        # publishes a new child, and the member that WAS there can exit inside the same window --
-        # leaving a child that inherited the group and never received the earlier signal, still
-        # holding the gpu (codex[bot]). so re-ask the kernel rather than trusting the walk: if the
-        # group has gone the walk was merely late, and if it is still addressable the walk missed a
-        # member.
-        return _process_group_addressable(pgid)
+    for scan in range(2):
+        members = _process_group_members(pgid)
+        if members is None:
+            # /proc could not be enumerated, so fall back to what signal 0 already established. it
+            # over-reports rather than returning early on a live process still holding the gpu.
+            return True
+        if any(not _process_is_zombie(pid) for pid in members):
+            return True
+        if scan == 0:
+            # this walk says drained. it is only believed if a second one, taken after any fork it
+            # could have raced, still says so.
+            continue
+        if not members:
+            # the kernel says this group exists and two walks found nobody in it. that contradiction
+            # outlives the fork window, so it is the /proc walk that is wrong rather than late: fall
+            # back to what signal 0 established rather than reporting a drain the kernel denies.
+            return _process_group_addressable(pgid)
     return False
 
 

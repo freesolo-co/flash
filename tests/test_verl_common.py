@@ -549,6 +549,46 @@ _needs_process_teardown = pytest.mark.skipif(
 )
 
 
+# PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER, from linux/prctl.h.
+_PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
+
+
+def _child_subreaper_setting() -> int:
+    """This process's current subreaper flag, skipping the test where prctl cannot answer."""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    current = ctypes.c_int(0)
+    if libc.prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(current), 0, 0, 0) != 0:
+        pytest.skip("PR_GET_CHILD_SUBREAPER unavailable")  # pragma: no cover - linux 3.4+
+    return current.value
+
+
+@contextlib.contextmanager
+def _child_subreaper_enabled():
+    """Adopt orphaned grandchildren for the duration, then restore the previous setting.
+
+    pid 1 in `Dockerfile.worker` adopts them for free; a shared pytest process does not, so these
+    tests ask for the same behaviour explicitly. Leaving it set would change subprocess semantics for
+    every LATER test in the process -- they would adopt orphans they never reap, accumulating
+    zombies and making failures order-dependent (codex[bot]).
+    """
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    previous = _child_subreaper_setting()
+    if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        pytest.skip("PR_SET_CHILD_SUBREAPER unavailable")  # pragma: no cover - linux 3.4+
+    try:
+        yield
+    finally:
+        libc.prctl(_PR_SET_CHILD_SUBREAPER, previous, 0, 0, 0)
+
+
+@pytest.fixture
+def subreaper():
+    """`_child_subreaper_enabled` as a fixture, for the tests that need adopted grandchildren."""
+    with _child_subreaper_enabled():
+        yield
+
+
 @pytest.fixture
 def quick_teardown_grace(monkeypatch):
     """shorten the escalation grace so a test that deliberately ignores SIGTERM stays fast.
@@ -782,6 +822,97 @@ def test_an_empty_group_snapshot_is_rechecked_against_the_kernel(monkeypatch):
         child.wait(timeout=10)
 
 
+@_needs_process_teardown
+def test_a_zombie_only_snapshot_taken_before_a_fork_is_not_a_drain(subreaper):
+    """The same race the empty snapshot has, one member later: /proc is listed with the leader
+    present, and the leader forks and exits before its status is inspected. The walk is then
+    nonempty and zombie-only while the child that inherited the group is alive and unlisted, so a
+    verdict taken from it skips SIGKILL and leaves the gpu held (codex[bot])."""
+    leader = os.fork()
+    if leader == 0:  # pragma: no cover - runs only in the forked child
+        os.setpgid(0, 0)
+        if os.fork() == 0:
+            time.sleep(300)
+            os._exit(0)
+        os._exit(0)  # the leader exits at once; its child keeps the group
+    child = None
+    try:
+        os.setpgid(leader, leader)
+        deadline = time.monotonic() + 10
+        while not vc._process_is_zombie(leader):
+            assert time.monotonic() < deadline, "the leader never exited"
+            time.sleep(0.01)
+        child = next(p for p in vc._process_group_members(leader) or () if p != leader)
+
+        # the stale walk: taken before the fork was published, so it sees only the leader.
+        scans = [[leader]]
+        real = vc._process_group_members
+        vc._process_group_members = lambda pgid: scans.pop(0) if scans else real(pgid)
+        try:
+            assert vc._process_group_alive(leader), (
+                "a zombie-only walk taken mid-fork was read as a drain, so SIGKILL is skipped"
+            )
+        finally:
+            vc._process_group_members = real
+    finally:
+        if child is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(child, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(child, 0)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(leader, 0)
+
+
+@_needs_process_teardown
+def test_a_group_that_really_is_zombie_only_still_drains(subreaper):
+    # and the recheck must not make the drain unreachable. a zombie holds the group id, so signal 0
+    # keeps answering for one -- the escalation would burn both deadlines on every teardown, which
+    # is the defect `_process_group_alive` exists to prevent.
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs only in the forked child
+        os.setpgid(0, 0)
+        os._exit(0)
+    try:
+        os.setpgid(pid, pid)
+        deadline = time.monotonic() + 10
+        while not vc._process_is_zombie(pid):
+            assert time.monotonic() < deadline, "the member never exited"
+            time.sleep(0.01)
+        assert vc._process_group_addressable(pid), "a zombie must still hold the group id"
+        assert not vc._process_group_alive(pid), (
+            "a settled zombie-only group is drained; reporting it alive burns both deadlines"
+        )
+    finally:
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
+def test_the_subreaper_setting_does_not_outlive_the_test_that_enabled_it():
+    """Both halves in one test rather than across two: a later test asserting the flag is back to 0
+    also passes when it happens to run FIRST, so it would prove nothing under random ordering.
+
+    The restore is exercised from a 0 setting AND from a 1 setting. Only the first is what the suite
+    actually runs, but a `finally` that never fires is indistinguishable from a correct one there --
+    both end at 1 while the block is open and 0 is where the process already was. Entering with the
+    flag set is the case that separates them.
+    """
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    entered = _child_subreaper_setting()
+    try:
+        for previous in (0, 1):
+            libc.prctl(_PR_SET_CHILD_SUBREAPER, previous, 0, 0, 0)
+            with _child_subreaper_enabled():
+                assert _child_subreaper_setting() == 1, (
+                    "adoption was never enabled, so the teardown tests above prove nothing"
+                )
+            assert _child_subreaper_setting() == previous, (
+                "PR_SET_CHILD_SUBREAPER leaked out, so later tests adopt orphans they never reap"
+            )
+    finally:
+        libc.prctl(_PR_SET_CHILD_SUBREAPER, entered, 0, 0, 0)
+
+
 def test_an_empty_snapshot_of_a_gone_group_is_still_drained():
     # and the recheck must not make teardown unfailable: when the group is genuinely gone, the walk
     # being empty has to stay an answer or every teardown burns both deadlines.
@@ -795,14 +926,13 @@ def test_an_empty_snapshot_of_a_gone_group_is_still_drained():
 
 
 @_needs_process_teardown
-def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie(quick_teardown_grace):
+def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie(
+    quick_teardown_grace, subreaper
+):
     # pid 1 has no init in Dockerfile.worker, so an EngineCore orphaned when the trainer exits is
     # reparented onto the worker. SIGKILL turns it into a zombie that no signal can clear -- only a
     # wait can -- so leaving it costs one permanent process-table entry per failed or cancelled run
-    # (codex[bot]). PR_SET_CHILD_SUBREAPER reproduces that adoption inside this test process.
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    if libc.prctl(36, 1, 0, 0, 0) != 0:  # pragma: no cover - PR_SET_CHILD_SUBREAPER is linux 3.4+
-        pytest.skip("PR_SET_CHILD_SUBREAPER unavailable")
+    # (codex[bot]). the `subreaper` fixture reproduces that adoption inside this test process.
     leader_src = (
         "import subprocess, sys, time\n"
         "g = subprocess.Popen([sys.executable, '-c',\n"
@@ -846,14 +976,13 @@ def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie(quick
 
 
 @_needs_process_teardown
-def test_a_straggler_that_dies_after_the_deadline_is_reaped_by_the_next_teardown(monkeypatch):
+def test_a_straggler_that_dies_after_the_deadline_is_reaped_by_the_next_teardown(
+    monkeypatch, subreaper
+):
     # SIGKILL cannot be refused, but it also cannot be DELIVERED to a process in uninterruptible
     # sleep. such a member can outlast the drain deadline and turn into a zombie afterwards -- past
     # the last wait its own teardown performs -- so with no record no future wait is ever scheduled
     # and the entry is permanent on a pid-1 worker (codex[bot]).
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    if libc.prctl(36, 1, 0, 0, 0) != 0:  # pragma: no cover - PR_SET_CHILD_SUBREAPER is linux 3.4+
-        pytest.skip("PR_SET_CHILD_SUBREAPER unavailable")
     monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
 
     pid = os.fork()
