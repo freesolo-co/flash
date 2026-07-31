@@ -55,7 +55,9 @@ def test_charge_usd_for_spec_prorates_sft_cancel_by_tokens(monkeypatch):
     monkeypatch.setattr(cost_spec, "runconfig_from_spec", lambda spec: cfg)
 
     full = float(estimate_cost(cfg).total_usd)  # the 20-step / full-token quote
-    naive = float(estimate_cost(replace(cfg, steps=10)).total_usd)  # steps lowered, tokens NOT scaled
+    naive = float(
+        estimate_cost(replace(cfg, steps=10)).total_usd
+    )  # steps lowered, tokens NOT scaled
     half = runner.charge_usd_for_spec(object(), steps=10)  # cancelled at 10 of 20 steps
     assert 0 < half < full
     # the token scaling is what prorates SFT: a steps-only replace (naive) barely moves the price.
@@ -87,7 +89,9 @@ def test_actual_steps_run_reads_last_heartbeat_step():
     # A completed OPD run's final pre-DONE heartbeats (opd_trained / opd_train_done) are NOT training
     # stages, so a STEPLESS one floors a cancel-between-publish-and-DONE to 0 -- re-pricing a fully
     # trained run as $0. opd.py/finalize.py attach step=opt_steps so the true count bills (codex[bot]).
-    assert runner.actual_steps_run(st({"stage": "opd_trained"})) == 0  # the bug the step guards against
+    assert (
+        runner.actual_steps_run(st({"stage": "opd_trained"})) == 0
+    )  # the bug the step guards against
     assert runner.actual_steps_run(st({"stage": "opd_train_done"})) == 0
     assert runner.actual_steps_run(st({"stage": "opd_trained", "step": 12})) == 12
     assert runner.actual_steps_run(st({"stage": "opd_train_done", "step": 12})) == 12

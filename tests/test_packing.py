@@ -50,16 +50,20 @@ def test_tokenize_for_packing_eos_and_bos_parity():
 
 def test_tokenize_for_packing_truncates_and_handles_no_eos():
     # BOS-inclusive truncation to max_length
-    assert tokenize_for_packing(["abcdef"], _FakeTok("!"), max_length=3) == [[1, ord("a"), ord("b")]]
+    assert tokenize_for_packing(["abcdef"], _FakeTok("!"), max_length=3) == [
+        [1, ord("a"), ord("b")]
+    ]
     # eos_token None -> no append, no crash (BOS still added)
-    assert tokenize_for_packing(["ab"], _FakeTok(eos=None), max_length=100) == [[1, ord("a"), ord("b")]]
+    assert tokenize_for_packing(["ab"], _FakeTok(eos=None), max_length=100) == [
+        [1, ord("a"), ord("b")]
+    ]
 
 
 def _split_by_lengths(ids: list[int], lengths: list[int]) -> list[list[int]]:
     """Recover the per-example token lists from a packed block (input_ids + seq_lengths)."""
     out, start = [], 0
     for length in lengths:
-        out.append(list(ids[start:start + length]))
+        out.append(list(ids[start : start + length]))
         start += length
     return out
 
@@ -144,7 +148,9 @@ def test_probe_failure_is_safe_false(monkeypatch):
 
 # --------------------------------------------------------------------- GDN (Qwen3.5/3.6) gate
 def test_gdn_hybrid_detected_by_layer_types(monkeypatch):
-    _patch_cfg(monkeypatch, types.SimpleNamespace(layer_types=["linear_attention", "full_attention"]))
+    _patch_cfg(
+        monkeypatch, types.SimpleNamespace(layer_types=["linear_attention", "full_attention"])
+    )
     assert model_is_gdn_hybrid("Qwen/Qwen3.5-4B") is True
 
 
@@ -156,7 +162,9 @@ def test_gdn_hybrid_detected_by_linear_dims(monkeypatch):
 def test_gdn_hybrid_false_for_pure_and_sliding(monkeypatch):
     _patch_cfg(monkeypatch, types.SimpleNamespace())  # plain dense -> not GDN
     assert model_is_gdn_hybrid("any/dense") is False
-    _patch_cfg(monkeypatch, types.SimpleNamespace(layer_types=["sliding_attention", "full_attention"]))
+    _patch_cfg(
+        monkeypatch, types.SimpleNamespace(layer_types=["sliding_attention", "full_attention"])
+    )
     assert model_is_gdn_hybrid("any/sliding") is False  # sliding != linear_attention
 
 
@@ -180,7 +188,9 @@ def test_gdn_packing_available_false_when_either_kernel_missing(monkeypatch):
     import transformers.utils.import_utils as iu
 
     for fla, conv in [(False, True), (True, False), (False, False)]:
-        monkeypatch.setattr(iu, "is_flash_linear_attention_available", lambda fla=fla: fla, raising=False)
+        monkeypatch.setattr(
+            iu, "is_flash_linear_attention_available", lambda fla=fla: fla, raising=False
+        )
         monkeypatch.setattr(iu, "is_causal_conv1d_available", lambda conv=conv: conv, raising=False)
         assert gdn_packing_available() is False
 
@@ -205,7 +215,7 @@ def test_packer_conserves_tokens_and_never_splits():
 
 def test_packer_preserves_legacy_ffd_order_and_is_deterministic():
     sequences = [
-        list(range(0, 10)),
+        list(range(10)),
         list(range(10, 16)),
         list(range(16, 21)),
         list(range(21, 25)),
@@ -222,7 +232,7 @@ def test_packer_preserves_legacy_ffd_order_and_is_deterministic():
         return [index % 2 for length in lengths for index in range(length)]
 
     expected = [
-        {"input_ids": list(range(0, 8)), "seq_lengths": [8], "completion_mask": alternating(8)},
+        {"input_ids": list(range(8)), "seq_lengths": [8], "completion_mask": alternating(8)},
         {
             "input_ids": [*range(10, 16), *range(31, 33)],
             "seq_lengths": [6, 2],
@@ -262,9 +272,7 @@ def test_packer_preserves_legacy_ffd_order_and_is_deterministic():
         for pair in zip(sequence[:8], mask[:8], strict=True)
     )
     packed_pairs = Counter(
-        pair
-        for row in first
-        for pair in zip(row["input_ids"], row["completion_mask"], strict=True)
+        pair for row in first for pair in zip(row["input_ids"], row["completion_mask"], strict=True)
     )
     assert packed_pairs == expected_pairs
 
@@ -378,15 +386,25 @@ def test_packed_forward_matches_separate(arch):
     torch.manual_seed(0)
     if arch == "qwen3":
         cfg = transformers.Qwen3Config(
-            vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-            num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
             attn_implementation="sdpa",
         )
         model = transformers.Qwen3ForCausalLM(cfg).eval()
     else:  # uncataloged plain-attention llama architecture
         cfg = transformers.LlamaConfig(
-            vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-            num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
             attn_implementation="sdpa",
         )
         model = transformers.LlamaForCausalLM(cfg).eval()
@@ -408,8 +426,12 @@ def test_packed_forward_matches_separate(arch):
         ).logits[0]
         # ground truth: each example standalone, positions from 0, plain causal
         sep = torch.cat(
-            [model(input_ids=torch.tensor([e]), position_ids=torch.arange(len(e))[None]).logits[0]
-             for e in packed_examples],
+            [
+                model(input_ids=torch.tensor([e]), position_ids=torch.arange(len(e))[None]).logits[
+                    0
+                ]
+                for e in packed_examples
+            ],
             dim=0,
         )
 
@@ -431,8 +453,13 @@ def test_packed_loss_matches_unpacked():
     transformers = pytest.importorskip("transformers")
     torch.manual_seed(0)
     cfg = transformers.Qwen3Config(
-        vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
         attn_implementation="sdpa",
     )
     model = transformers.Qwen3ForCausalLM(cfg).eval()
@@ -443,8 +470,10 @@ def test_packed_loss_matches_unpacked():
 
     with torch.no_grad():
         packed_loss = model(
-            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-            position_ids=batch["position_ids"], labels=batch["labels"],
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            labels=batch["labels"],
         ).loss.item()
         # token-weighted mean of the separate per-example losses (each example's labels = its own
         # ids; HF's internal shift already drops each first token, so no extra masking needed).
@@ -469,8 +498,13 @@ def test_leaky_plain_causal_would_differ():
     transformers = pytest.importorskip("transformers")
     torch.manual_seed(0)
     cfg = transformers.Qwen3Config(
-        vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
         attn_implementation="sdpa",
     )
     model = transformers.Qwen3ForCausalLM(cfg).eval()
@@ -481,8 +515,12 @@ def test_leaky_plain_causal_would_differ():
     n_real = sum(len(e) for e in packed_examples)
     with torch.no_grad():
         sep = torch.cat(
-            [model(input_ids=torch.tensor([e]), position_ids=torch.arange(len(e))[None]).logits[0]
-             for e in packed_examples],
+            [
+                model(input_ids=torch.tensor([e]), position_ids=torch.arange(len(e))[None]).logits[
+                    0
+                ]
+                for e in packed_examples
+            ],
             dim=0,
         )
         T = batch["input_ids"].shape[1]
@@ -569,7 +607,10 @@ def test_pretokenize_drops_content_free_completion():
 
     tok = _TokWithSpecials(eos="!")
     texts = [
-        {"text": "AB", "prompt_text": "AB"},  # full [1,A,B,!]; prompt [1,A,B] -> completion=[!] (EOS) -> dropped
+        {
+            "text": "AB",
+            "prompt_text": "AB",
+        },  # full [1,A,B,!]; prompt [1,A,B] -> completion=[!] (EOS) -> dropped
         {"text": "ABx", "prompt_text": "AB"},  # completion=[x,!] has real token x -> kept
     ]
     kept_texts, _pretok, n_dropped = _pretokenize_completion_only(texts, tok, max_length=100)
@@ -673,7 +714,9 @@ def test_collator_rejects_misaligned_completion_mask():
     pytest.importorskip("torch")
     col = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=1)
     with pytest.raises(ValueError, match="completion_mask length"):
-        col([{"input_ids": [5, 6, 7, 8], "seq_lengths": [4], "completion_mask": [0, 1]}])  # len 2 != 4
+        col(
+            [{"input_ids": [5, 6, 7, 8], "seq_lengths": [4], "completion_mask": [0, 1]}]
+        )  # len 2 != 4
 
 
 def test_packed_completion_loss_matches_unpacked():
@@ -684,8 +727,13 @@ def test_packed_completion_loss_matches_unpacked():
     transformers = pytest.importorskip("transformers")
     torch.manual_seed(0)
     cfg = transformers.Qwen3Config(
-        vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
         attn_implementation="sdpa",
     )
     model = transformers.Qwen3ForCausalLM(cfg).eval()
@@ -698,8 +746,10 @@ def test_packed_completion_loss_matches_unpacked():
 
     with torch.no_grad():
         packed_loss = model(
-            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-            position_ids=batch["position_ids"], labels=batch["labels"],
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            labels=batch["labels"],
         ).loss.item()
         total, n = 0.0, 0
         for e, m in zip(packed_examples, packed_cmasks, strict=True):
@@ -720,8 +770,13 @@ def test_packed_completion_loss_matches_unpacked():
 def _tiny(arch, transformers):
     """Tiny qwen3 and uncataloged plain-attention llama models for packing parity coverage."""
     common = {
-        "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
-        "num_attention_heads": 4, "num_key_value_heads": 2, "max_position_embeddings": 64,
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 64,
         "attn_implementation": "sdpa",
     }
     if arch == "qwen3":
@@ -741,9 +796,9 @@ def test_e2e_completion_only_packing_per_arch(arch):
 
     # examples = [prompt_len tokens (masked) || completion tokens (trained)]
     raw = [
-        ([5, 6, 7], [8, 9, 10, 11]),        # 3-token prompt, 4-token completion
-        ([12, 13], [14, 15, 16]),           # 2-token prompt
-        ([17, 18, 19, 20], [21, 22]),       # 4-token prompt
+        ([5, 6, 7], [8, 9, 10, 11]),  # 3-token prompt, 4-token completion
+        ([12, 13], [14, 15, 16]),  # 2-token prompt
+        ([17, 18, 19, 20], [21, 22]),  # 4-token prompt
     ]
     seqs = [p + c for p, c in raw]
     cmasks = [[0] * len(p) + [1] * len(c) for p, c in raw]
@@ -756,12 +811,17 @@ def test_e2e_completion_only_packing_per_arch(arch):
     # (1) ISOLATION: packed per-token logits == each example run standalone (no cross-contamination).
     with torch.no_grad():
         packed_logits = model(
-            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
             position_ids=batch["position_ids"],
         ).logits[0]
         sep = torch.cat(
-            [model(input_ids=torch.tensor([e]), position_ids=torch.arange(len(e))[None]).logits[0]
-             for e in packed_examples],
+            [
+                model(input_ids=torch.tensor([e]), position_ids=torch.arange(len(e))[None]).logits[
+                    0
+                ]
+                for e in packed_examples
+            ],
             dim=0,
         )
     n_real = sum(len(e) for e in packed_examples)
@@ -770,8 +830,10 @@ def test_e2e_completion_only_packing_per_arch(arch):
     # (2) COMPLETION-ONLY LOSS == token-weighted per-example completion-only loss.
     with torch.no_grad():
         packed_loss = model(
-            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-            position_ids=batch["position_ids"], labels=batch["labels"],
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            labels=batch["labels"],
         ).loss.item()
         total, n = 0.0, 0
         for e, m in zip(packed_examples, packed_cmasks, strict=True):
@@ -791,22 +853,32 @@ def test_e2e_completion_only_packing_per_arch(arch):
     full_labels[pad & (batch["position_ids"] == 0)] = -100
     with torch.no_grad():
         full_loss = model(
-            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-            position_ids=batch["position_ids"], labels=full_labels,
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            labels=full_labels,
         ).loss.item()
-    assert abs(full_loss - packed_loss) > 1e-4, f"{arch}: completion mask had no effect vs full-seq loss"
+    assert abs(full_loss - packed_loss) > 1e-4, (
+        f"{arch}: completion mask had no effect vs full-seq loss"
+    )
 
     # (4) TRAINS: a few SGD steps reduce the completion-only loss on this batch.
     opt = torch.optim.SGD(model.parameters(), lr=0.5)
     losses = []
     for _ in range(5):
         opt.zero_grad(set_to_none=True)
-        out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-                    position_ids=batch["position_ids"], labels=batch["labels"])
+        out = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            labels=batch["labels"],
+        )
         out.loss.backward()
         opt.step()
         losses.append(out.loss.item())
-    assert losses[-1] < losses[0], f"{arch}: loss did not decrease ({losses[0]:.3f} -> {losses[-1]:.3f})"
+    assert losses[-1] < losses[0], (
+        f"{arch}: loss did not decrease ({losses[0]:.3f} -> {losses[-1]:.3f})"
+    )
 
 
 @pytest.mark.parametrize("arch", ["qwen3", "llama"])
@@ -825,8 +897,11 @@ def test_e2e_masked_prompt_positions_get_zero_gradient(arch):
     batch = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=8)(rows)
 
     # Forward to logits, then CE against our labels, and inspect d(loss)/d(logits) per position.
-    out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-                position_ids=batch["position_ids"])
+    out = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        position_ids=batch["position_ids"],
+    )
     logits = out.logits
     logits.retain_grad()
     # HF shift: logits[:, :-1] predict labels[:, 1:]
@@ -842,4 +917,6 @@ def test_e2e_masked_prompt_positions_get_zero_gradient(arch):
         if target_kept:
             assert gnorm[i] > 0, f"{arch}: completion position {i} should have gradient"
         else:
-            assert gnorm[i].item() == pytest.approx(0.0, abs=1e-9), f"{arch}: masked position {i} leaked gradient"
+            assert gnorm[i].item() == pytest.approx(0.0, abs=1e-9), (
+                f"{arch}: masked position {i} leaked gradient"
+            )

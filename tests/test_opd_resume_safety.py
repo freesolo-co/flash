@@ -142,9 +142,9 @@ def test_marker_path_and_canonical_exact_schema():
     assert opd_optimizer_start_marker_path("run-1", 3) == (
         "_opd_retry/run-1/attempts/attempt-3/optimizer-start.v1.json"
     )
-    assert decode_opd_optimizer_start_json(
-        raw, run_id="run-1", attempt=3, seed=42
-    ) == json.loads(raw)
+    assert decode_opd_optimizer_start_json(raw, run_id="run-1", attempt=3, seed=42) == json.loads(
+        raw
+    )
 
 
 @pytest.mark.parametrize(
@@ -155,8 +155,7 @@ def test_marker_path_and_canonical_exact_schema():
         b'"run_id":"run-1","seed":42,"version":1,"extra":0}',
         b'{"attempt":true,"contract":"flash.opd.optimizer-start","phase":"opd",'
         b'"run_id":"run-1","seed":42,"version":1}',
-        b'{"attempt":3,"contract":"wrong","phase":"opd","run_id":"run-1",'
-        b'"seed":42,"version":1}',
+        b'{"attempt":3,"contract":"wrong","phase":"opd","run_id":"run-1","seed":42,"version":1}',
         b'{"attempt":3,"attempt":3,"contract":"flash.opd.optimizer-start",'
         b'"phase":"opd","run_id":"run-1","seed":42,"version":1}',
         b'{"attempt": 3, "contract": "flash.opd.optimizer-start", "phase": "opd", '
@@ -195,9 +194,7 @@ def test_optimizer_update_orders_marker_before_mutation_exactly_once(monkeypatch
     monkeypatch.setattr(
         opd,
         "_w",
-        SimpleNamespace(
-            publish_opd_optimizer_start_marker=lambda: events.append(("marker", None))
-        ),
+        SimpleNamespace(publish_opd_optimizer_start_marker=lambda: events.append(("marker", None))),
     )
 
     opt_steps = opd._apply_opd_optimizer_update(
@@ -235,13 +232,11 @@ def test_no_signal_does_not_publish_or_mutate(monkeypatch):
     monkeypatch.setattr(
         opd,
         "_w",
-        SimpleNamespace(
-            publish_opd_optimizer_start_marker=lambda: events.append("marker")
-        ),
+        SimpleNamespace(publish_opd_optimizer_start_marker=lambda: events.append("marker")),
     )
     with pytest.raises(ValueError, match="positive sequence counts"):
         opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=lambda: []),
+            model=SimpleNamespace(parameters=list),
             optimizer=SimpleNamespace(step=lambda: events.append("step")),
             torch=SimpleNamespace(),
             opt_steps=0,
@@ -288,7 +283,7 @@ def test_marker_upload_failure_prevents_optimizer_step_and_preserves_retriable(m
     )
     with pytest.raises(RetriableInfraError) as caught:
         opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=lambda: []),
+            model=SimpleNamespace(parameters=list),
             optimizer=SimpleNamespace(step=lambda: events.append("step")),
             torch=torch,
             opt_steps=0,
@@ -346,7 +341,7 @@ def test_ambiguous_marker_upload_is_not_retried_or_applied(monkeypatch):
 
     with pytest.raises(RetriableInfraError) as caught:
         opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=lambda: []),
+            model=SimpleNamespace(parameters=list),
             optimizer=SimpleNamespace(step=lambda: events.append("step")),
             torch=torch,
             opt_steps=0,
@@ -356,9 +351,10 @@ def test_ambiguous_marker_upload_is_not_retried_or_applied(monkeypatch):
 
     assert isinstance(caught.value.__cause__, TimeoutError)
     assert "marker-secret" not in str(caught.value)
-    assert len(str(caught.value)) <= len(
-        "RETRIABLE_INFRA_GPU: required upload of OPD optimizer-start marker failed: "
-    ) + 500
+    assert (
+        len(str(caught.value))
+        <= len("RETRIABLE_INFRA_GPU: required upload of OPD optimizer-start marker failed: ") + 500
+    )
     assert len(api.uploads) == 1
     assert api.committed == canonical_opd_optimizer_start_json(
         run_id="run-ambiguous", attempt=2, seed=42
@@ -506,9 +502,7 @@ def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, t
     def download(**kwargs):
         calls.append(("download", kwargs))
         path = tmp_path / "marker.json"
-        path.write_bytes(
-            canonical_opd_optimizer_start_json(run_id="run-1", attempt=1, seed=42)
-        )
+        path.write_bytes(canonical_opd_optimizer_start_json(run_id="run-1", attempt=1, seed=42))
         return str(path)
 
     _install_hf_reader(monkeypatch, Api(), download)
@@ -676,9 +670,7 @@ def test_next_attempt_cas_race_blocks_opd_reservation(monkeypatch, tmp_path):
     assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 1
 
 
-def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(
-    monkeypatch, tmp_path
-):
+def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.providers.allocator as allocator
     import flash.runner as runner
@@ -741,9 +733,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(
     assert provider.events.index(("cancel", 0)) < retry_submit
     assert provider.events.index(("destroy", 0)) < retry_submit
     assert [name for name, _kwargs in private_hf.calls] == ["repo_info", "get_paths_info"]
-    assert private_hf.calls[1][1]["paths"] == [
-        opd_optimizer_start_marker_path(spec.run_id, 0)
-    ]
+    assert private_hf.calls[1][1]["paths"] == [opd_optimizer_start_marker_path(spec.run_id, 0)]
 
 
 def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch, tmp_path):
@@ -831,9 +821,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     assert provider.worker_envs[1][OPD_RESUME_REVISION_ENV] == "private-pinned-sha"
 
 
-def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(
-    monkeypatch, tmp_path
-):
+def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.runner as runner
     from flash.providers.base import PollResult
@@ -899,7 +887,7 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     monkeypatch.setattr(runner, "_run_job_background", lambda *_args: started.append(True))
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(_runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
-    monkeypatch.setattr(providers, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers, "configured_providers", list)
 
     _runtime.recover_runs()
 
@@ -950,7 +938,7 @@ def test_ambiguous_marker_upload_prevents_step_and_blocks_replacement(monkeypatc
 
     with pytest.raises(RetriableInfraError, match="required upload"):
         opd._apply_opd_optimizer_update(
-            model=SimpleNamespace(parameters=lambda: []),
+            model=SimpleNamespace(parameters=list),
             optimizer=SimpleNamespace(step=lambda: events.append("step")),
             torch=torch,
             opt_steps=0,
@@ -1037,9 +1025,7 @@ def _install_marker_gate(
         seen["downloads"].append(kwargs)
         if kwargs["filename"] == present_path:
             path = tmp_path / "marker.json"
-            path.write_bytes(
-                canonical_opd_optimizer_start_json(run_id="run-1", attempt=1, seed=42)
-            )
+            path.write_bytes(canonical_opd_optimizer_start_json(run_id="run-1", attempt=1, seed=42))
             return str(path)
         if state_download_error is not None:
             raise state_download_error
@@ -1073,9 +1059,7 @@ def test_gate_allows_replacement_when_marker_paired_with_valid_metadata(monkeypa
     assert seen["list_revision"] == "pinned-sha"
     metadata_download = seen["downloads"][-1]
     assert metadata_download["revision"] == "pinned-sha"
-    assert metadata_download["filename"] == (
-        "opd/run-1/checkpoint/checkpoint-40/opd_state.json"
-    )
+    assert metadata_download["filename"] == ("opd/run-1/checkpoint/checkpoint-40/opd_state.json")
 
 
 @pytest.mark.parametrize(
@@ -1152,9 +1136,7 @@ def test_gate_validates_every_present_marker(monkeypatch, tmp_path):
     def download(**kwargs):
         path = tmp_path / f"marker-{kwargs['filename'].split('attempt-')[1].split('/')[0]}.json"
         if kwargs["filename"] == paths[0]:
-            path.write_bytes(
-                canonical_opd_optimizer_start_json(run_id="run-1", attempt=0, seed=42)
-            )
+            path.write_bytes(canonical_opd_optimizer_start_json(run_id="run-1", attempt=0, seed=42))
         else:
             path.write_text("{}")
         return str(path)

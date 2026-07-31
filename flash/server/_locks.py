@@ -34,7 +34,9 @@ class _RunLock:
             from flash.runner import RUNS_DIR, runs_file_path
 
             os.makedirs(RUNS_DIR, exist_ok=True)
-            fd = os.open(runs_file_path(self._run_id, ".deploy.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+            fd = os.open(
+                runs_file_path(self._run_id, ".deploy.lock"), os.O_CREAT | os.O_RDWR, 0o600
+            )
             operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
             fcntl.flock(fd, operation)
         except BlockingIOError:

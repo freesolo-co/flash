@@ -30,7 +30,9 @@ def test_resolve_params_b_zero_falls_through_to_hf_not_string(monkeypatch):
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda mid: calls.append(mid) or 7.0)
     # 7.0 from the HF fetch, NOT 6.5 from the display string (which is now ignored).
     assert vram.resolve_params_b("acme/with-string") == 7.0
-    assert calls == ["acme/with-string"]  # the HF fetch IS consulted (string no longer short-circuits)
+    assert calls == [
+        "acme/with-string"
+    ]  # the HF fetch IS consulted (string no longer short-circuits)
 
 
 def test_resolve_params_b_open_model_uses_hf_metadata(monkeypatch):
