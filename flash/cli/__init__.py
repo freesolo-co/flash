@@ -41,6 +41,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
+from flash.cli.env_eval import _MAX_CONCURRENCY, bounded_concurrency, cmd_env_eval, positive_int
 from flash.cli.env_setup import cmd_env_setup
 from flash.cli.env_test import cmd_env_test
 from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
@@ -80,6 +81,7 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("env setup", "scaffold a starter Freesolo environment"),
             ("env list", "list local environment sources"),
             ("env test", "validate a local environment offline"),
+            ("env eval", "score held-out suites against a deployed model"),
             ("env push", "upload a local environment"),
             ("env pull", "download a published environment or file"),
             ("env delete", "delete a published environment"),
@@ -316,6 +318,40 @@ def _build_parser() -> argparse.ArgumentParser:
         help="local environment directory or environment.py path",
     )
     env_test.set_defaults(func=cmd_env_test)
+
+    env_eval = env_sub.add_parser(
+        "eval",
+        help="score held-out environment suites against a deployed model",
+        description="score held-out environment suites against a deployed model",
+    )
+    env_eval.add_argument(
+        "target",
+        metavar="TARGET",
+        help="a bare RUN_ID, RUN_ID/step-N, or full immutable adapter revision",
+    )
+    env_eval.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="local environment directory or environment.py path",
+    )
+    env_eval.add_argument("--suite", help="run only the named evaluation suite")
+    env_eval.add_argument(
+        "--max-cases",
+        type=positive_int,
+        metavar="N",
+        help="run at most N cases from each selected suite",
+    )
+    env_eval.add_argument("--temperature", type=float, default=0.0)
+    env_eval.add_argument("--max-tokens", type=positive_int, default=512, metavar="N")
+    env_eval.add_argument(
+        "--concurrency",
+        type=bounded_concurrency,
+        default=1,
+        metavar="N",
+        help=f"parallel model requests (1-{_MAX_CONCURRENCY})",
+    )
+    env_eval.set_defaults(func=cmd_env_eval)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
     env_push.add_argument(
