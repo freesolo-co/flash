@@ -561,7 +561,7 @@ def _stub_serving(monkeypatch, message: dict) -> None:
             return _Resp()
 
     monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
-    monkeypatch.setattr(deploy, "_internal_key_header", lambda: {})
+    monkeypatch.setattr(deploy, "_internal_key_header", dict)
     monkeypatch.setattr(deploy, "_chat_http_client", lambda: _Client())
 
 

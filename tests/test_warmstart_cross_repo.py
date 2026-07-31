@@ -546,7 +546,7 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
             cleaned.append(spec)
 
     monkeypatch.setattr(providers, "get_provider", lambda name: Provider())
-    monkeypatch.setattr(providers, "available_providers", lambda: [])
+    monkeypatch.setattr(providers, "available_providers", list)
     R._gc_run_endpoints(public)
 
     assert [spec.gpu.type for spec in cleaned] == ["RTX 5090"]

@@ -67,9 +67,7 @@ def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dic
         "baseModel": spec.get("model"),
         "repoId": first.get("repo_id"),
         "repoType": first.get("repo_type", "dataset"),
-        "checkpoints": [
-            {"step": c["step"], "subfolder": c["subfolder"]} for c in checkpoints
-        ],
+        "checkpoints": [{"step": c["step"], "subfolder": c["subfolder"]} for c in checkpoints],
     }
     return _post_checkpoints(token=internal_key, body=body)
 
@@ -101,9 +99,7 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
     if not checkpoints:
         return 0
     try:
-        register_run_checkpoints(
-            internal_key=token, status=status, checkpoints=checkpoints
-        )
+        register_run_checkpoints(internal_key=token, status=status, checkpoints=checkpoints)
     except (ValueError, OSError) as exc:
         _log(f"[ckpt] backend register warn ({status.run_id}): {exc}")
         return 0
