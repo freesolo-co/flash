@@ -39,6 +39,10 @@ _SYNTHETIC_CONTROL_ALPHABET = "zqxjkvwy0123456789bcdfghlmnprstu"
 _SYNTHETIC_CONTROL_WIDTH = 64
 # enough fallbacks for the unanimity test below to be reachable; matches the fixed candidate count.
 _SYNTHETIC_CONTROL_COUNT = 3
+# the assistant fields that carry a structured call the text-only driver cannot replay. both names
+# are live in the openai schema -- `function_call` is the older shape of the same payload -- and a
+# turn holding either reaches the grader stripped of it. see _turn_is_representable.
+_ASSISTANT_CALL_FIELDS = ("tool_calls", "function_call")
 _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
 
@@ -271,8 +275,14 @@ def _turn_is_representable(message: dict) -> bool:
     empty turn stripped of the payload the reference actually carried. A grader that correctly
     rejects that mutilated transcript scores zero, which is a property of the replay, not of the
     reward function -- so such episodes must not feed the flat-reward grader gate.
+
+    Every structured call field counts, not just ``tool_calls``. The older ``function_call`` shape
+    is still accepted by the openai schema and carries exactly the same payload, so checking only
+    the newer name marked such a turn representable, replayed it as its (usually empty) content
+    string, and admitted the mutilated rollout to the gate -- where a payload-aware grader scoring
+    it like the controls reads as a flat reward function (codex[bot]).
     """
-    if message.get("tool_calls"):
+    if any(message.get(field) for field in _ASSISTANT_CALL_FIELDS):
         return False
     content = message.get("content")
     if isinstance(content, str):
@@ -292,8 +302,8 @@ def _turn_is_representable(message: dict) -> bool:
             and "</think>" not in str(block.get("text") or "")
             for block in content
         )
-    # bare null content with no tool_calls carries no payload at all, so replaying it as the
-    # empty string loses nothing. only a null that stands in for tool_calls (above) is lossy.
+    # bare null content with no structured call carries no payload at all, so replaying it as the
+    # empty string loses nothing. only a null standing in for a call (above) is lossy.
     return content is None
 
 
@@ -326,19 +336,30 @@ def _resolve_policy(reference_turns: list[str]) -> str:
     return "replay" if "".join(reference_turns).strip() else "echo"
 
 
-# role, replay text, and the kinds of content block the turn was built from. see _observation.
+# role, replay text, and the kinds of non-text content block the turn carries. see _observation.
 _Observation = tuple[str, str, tuple[str, ...]]
 
 
 def _content_shape(content: object) -> tuple[str, ...]:
-    """The kinds of block a message's content is built from, in order.
+    """The kinds of NON-TEXT block a message's content carries, in order.
 
-    Text-only content flattens to ``()``, so a plain string and a lone text block compare equal --
-    they carry the same payload and reach the grader the same way.
+    Text blocks are left out, so text-only content flattens to ``()`` however it is expressed: a
+    plain string and a lone text block compare equal, and so do two text blocks against the one
+    string that concatenates to the same thing. ``_message_text`` already carries that text, and it
+    joins the blocks, so counting them here would report a faithful replay as `partial_replay`
+    purely for splitting its text differently -- dropping it from the control gate and letting a
+    flat-zero grader pass unreported (cursor).
+
+    What is left is exactly what ``_message_text`` discards: an image, audio, or any other block
+    whose payload no amount of extracted text represents.
     """
     if not isinstance(content, list):
         return ()
-    return tuple(str(block.get("type")) for block in content if isinstance(block, dict))
+    return tuple(
+        str(block.get("type"))
+        for block in content
+        if isinstance(block, dict) and block.get("type") != "text"
+    )
 
 
 def _observation(message: dict) -> tuple[str, str, tuple[str, ...]]:
@@ -353,7 +374,8 @@ def _observation(message: dict) -> tuple[str, str, tuple[str, ...]]:
     The block shape is carried for the same reason one step further out. ``_message_text`` keeps only
     text blocks, so an observation carrying an image read identically to one that never had it, and
     a grader reading the whole rollout state scored a transcript the replay did not reproduce
-    (codex[bot]).
+    (codex[bot]). Shape holds only the blocks that text extraction drops, so it adds what
+    ``_message_text`` cannot see without re-reading what it already carries.
 
     What is deliberately NOT compared is the rest of the payload -- ``tool_call_id``, ``name``, and
     anything else keyed per call. Those are free to differ between two faithful runs of the same
@@ -451,14 +473,22 @@ def _env_turns_reproduce(reference_messages: list[dict], state: dict, prompt: li
     # a reference recording more turns than were driven cannot match either way.
     if len(completion) < len(reference):
         return False
-    # every block the reference closed with an assistant turn must come back whole, extras
-    # included. its LAST block is the one recording stopped inside, so it is compared as a prefix:
-    # the loop appends one more env_reply after the final assistant turn, past anything the gold
-    # transcript claims.
+    # every block the reference closed with an assistant turn must come back whole, extras included.
     if completion[: len(reference) - 1] != reference[:-1]:
         return False
     tail = reference[-1]
-    return completion[len(reference) - 1][: len(tail)] == tail
+    if not tail:
+        # the gold transcript ended on an assistant turn and recorded nothing after it. the loop
+        # appends one more env_reply there, past anything the transcript claims, so whatever came
+        # back is outside the trajectory and is not evidence either way.
+        return True
+    # a non-empty tail is the gold transcript stating what the env replied after its last assistant
+    # turn, and one env_reply call produced it -- the loop records at most one per block. so the
+    # driven block must equal it, extras included. accepting it as a mere PREFIX passed an env that
+    # emitted an unexpected system or tool message alongside the recorded reply, though the grader
+    # scores the complete state and could score that "gold" rollout like the controls, failing a
+    # working reward function as flat (codex[bot]).
+    return completion[len(reference) - 1] == tail
 
 
 def _preview(value: object) -> str:
