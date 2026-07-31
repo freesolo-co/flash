@@ -54,7 +54,6 @@ from flash.engine.worker.perf.memory import (
     enable_multimodal_input_require_grads,
     fused_optim_name,
     grad_checkpointing_on,
-    grpo_sleep_mode,
     grpo_use_reentrant,
     make_multimodal_input_require_grads_callback,
 )
@@ -487,7 +486,6 @@ __all__ = [
     "fused_optim_name",
     "gpu_diagnostics",
     "grad_checkpointing_on",
-    "grpo_sleep_mode",
     "grpo_use_reentrant",
     "is_cuda_oom",
     "liger_on",

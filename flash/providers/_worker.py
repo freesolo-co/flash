@@ -16,10 +16,7 @@ from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.spec import (
     RESERVED_WORKER_ENV_KEYS,
-    VERL_ONLY_PHASES,
     JobSpec,
-    backend_env_key,
-    effective_backend,
     require_matching_seed,
     validate_worker_env_reserved,
 )
@@ -34,14 +31,13 @@ logger = get_logger("flash.providers.runpod.train")
 WORKER_DEPS = [
     "torch==2.10.0",
     "transformers>=5.6,<5.13",
-    "trl>=1.6,<1.7",
     "peft>=0.19",
     "vllm==0.19.1",
     # FlashInfer: vLLM's Blackwell-native attention backend. vllm 0.19.1 pins flashinfer-python==0.6.6
     # but treats it as an OPTIONAL extra (the plain `vllm` install does not pull it), so a consumer-
     # Blackwell (sm120) / B200 rollout would silently fall back to a PTX-fragile default attention
     # without it. Pin the matching 0.6.6 so the worker image carries the FLASHINFER attention backend
-    # (force_vllm_backend_for_sm120). No-op on non-Blackwell archs.
+    # (resolve_blackwell_attention_backends picks FLASHINFER when it imports). No-op elsewhere.
     "flashinfer-python==0.6.6",
     "bitsandbytes>=0.49",
     # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
@@ -225,32 +221,6 @@ def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict
     return env
 
 
-def _resolved_backend(spec: JobSpec, runtime_secrets: dict[str, str] | None) -> str:
-    """The backend the worker will read, including one supplied out-of-band as a runtime secret.
-
-    ``effective_backend`` sees only the spec, but a spec may DECLARE its phase backend key in
-    ``[environment].secrets`` and have the value delivered at launch, which this function then exports
-    over the spec value. The allocator conf is chosen before that export, so reading the spec alone
-    picks an allocator for a backend that is not the one about to run -- a secret-supplied ``verl``
-    would take the expandable conf and crash its vLLM rollout on the CuMemAllocator assert
-    (codex[bot]). Resolve against the same precedence the export uses: secret wins, else the spec.
-
-    A phase whose worker has no selector left (sft, opd) is not overridable at all: the secret would
-    still be exported, but run_sft/run_opd delegate to verl unconditionally and never read it, so
-    honoring it here would pick an allocator for a backend that cannot run.
-    """
-    backend = effective_backend(spec)
-    if spec.phase in VERL_ONLY_PHASES:
-        return backend
-    key = backend_env_key(spec)
-    if key.upper() in RESERVED_WORKER_ENV_KEYS:
-        return backend
-    override = (runtime_secrets or {}).get(key)
-    if override and key in set(spec.environment.secrets):
-        return str(override).strip().lower()
-    return backend
-
-
 def build_worker_env(
     spec: JobSpec,
     seed: int,
@@ -259,34 +229,19 @@ def build_worker_env(
     """Per-run env passed to the worker (platform creds + recipe overrides)."""
     canonical_seed = require_matching_seed(spec, seed)
     validate_worker_env_reserved(spec.worker_env)
-    # grpo uses a non-expandable alloc conf: expandable_segments crashes the vllm sleep-mode engine.
-    # The worker upgrades RL to expandable when it resolves sleep=OFF (finalize_alloc_conf_for_sleep).
-    # SFT and OPD on the TRL backend have NO vLLM sleep engine and allocate large HF generate/logit
-    # tensors, so both take the anti-fragmentation expandable allocator up front: OPD was previously
-    # lumped in with RL here (`not in ("sft",)`) and ran non-expandable despite having no sleep engine,
-    # so a long-completion / large-vocab OPD job fragmented and OOM'd on a GPU the VRAM estimate said
-    # would fit (codex[bot]).
+    # GRPO and OPD run a verl vLLM rollout (`actor_rollout_ref.rollout.name=vllm`), and verl leaves
+    # rollout.enable_sleep_mode defaulted True, so the engine always builds a CuMemAllocator -- which
+    # asserts outright on "expandable_segments:True" (vllm/device_allocator/cumem.py:132,
+    # pytorch#147851). Both therefore take the non-expandable conf.
     #
-    # verl's GRPO and OPD trainers are the exception. Both run a vLLM rollout
-    # (`actor_rollout_ref.rollout.name=vllm`) and verl leaves rollout.enable_sleep_mode defaulted True,
-    # so the engine always builds a CuMemAllocator -- which asserts outright on
-    # "expandable_segments:True" (vllm/device_allocator/cumem.py:132, pytorch#147851). Selecting on the
-    # algorithm alone sent verl OPD an allocator conf that crashes it before the first step.
-    #
-    # verl SFT does NOT qualify: verl.trainer.sft_trainer is a pure FSDP trainer with no rollout, no
-    # vLLM engine, and no CuMemAllocator, so it keeps the expandable allocator its large-tensor path
-    # needs. The predicate is therefore "generates through verl", not "runs on verl" (codex[bot]).
-    _verl_rollout = _resolved_backend(spec, runtime_secrets) == "verl" and str(
-        getattr(spec, "algorithm", "")
-    ).lower() in ("grpo", "opd")
-    _needs_nonexpandable = _verl_rollout or str(getattr(spec, "algorithm", "")).lower() not in (
-        "sft",
-        "opd",
-    )
+    # SFT does NOT qualify: verl.trainer.sft_trainer is a pure FSDP trainer with no rollout, no vLLM
+    # engine, and no CuMemAllocator, so it keeps the expandable allocator its large generate/logit
+    # tensors need against fragmentation. The predicate is "generates through verl", not "runs on
+    # verl" (codex[bot]).
     _alloc_conf = (
-        "garbage_collection_threshold:0.8,max_split_size_mb:256"
-        if _needs_nonexpandable
-        else "expandable_segments:True"
+        "expandable_segments:True"
+        if str(getattr(spec, "algorithm", "")).lower() == "sft"
+        else "garbage_collection_threshold:0.8,max_split_size_mb:256"
     )
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,

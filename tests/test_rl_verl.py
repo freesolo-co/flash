@@ -26,20 +26,21 @@ from flash.engine.worker.heartbeat import RewardObservabilityBuffer
 
 
 # ------------------------------- dispatch -------------------------------
-def test_run_rl_delegates_to_verl_backend(monkeypatch):
-    """FLASH_RL_BACKEND=verl delegates to run_rl_verl without touching the trl body."""
+@pytest.mark.parametrize("stale", [None, "verl", "trl", "megatron"])
+def test_run_rl_always_delegates_to_verl(monkeypatch, stale):
+    """run_rl delegates to run_rl_verl unconditionally -- no env key selects a backend.
+
+    verl is the only trainer, so a stale FLASH_RL_BACKEND left in a config must be inert rather than
+    routing anywhere else or raising.
+    """
     called = []
     monkeypatch.setattr(rl_verl, "run_rl_verl", lambda: called.append(True))
-    monkeypatch.setenv("FLASH_RL_BACKEND", "verl")
-    # if the trl body ran instead of delegating, it would fail hard before returning.
+    if stale is None:
+        monkeypatch.delenv("FLASH_RL_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("FLASH_RL_BACKEND", stale)
     rl.run_rl()
     assert called == [True]
-
-
-def test_run_rl_rejects_unknown_backend(monkeypatch):
-    monkeypatch.setenv("FLASH_RL_BACKEND", "megatron")
-    with pytest.raises(RuntimeError, match="not a known grpo backend"):
-        rl.run_rl()
 
 
 # ------------------------------- data conversion -------------------------------
@@ -366,6 +367,24 @@ def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():
             assert [o for o in one if o.startswith(key)] == [o for o in many if o.startswith(key)]
 
 
+def test_one_optimizer_step_consumes_exactly_the_requested_unique_prompts():
+    # the invariant the old trl batching helper existed to protect: an optimizer step must optimize
+    # prompts_per_step UNIQUE PROMPTS, not prompts_per_step COMPLETIONS. trl sized batches in
+    # completions, so it needed group_size folded into grad-accum or a step silently optimized
+    # prompts_per_step/group_size prompts. verl sizes in prompts and expands group_size itself via
+    # rollout.n, so the guard here is that flash never pre-divides or pre-multiplies by the group:
+    # train_batch_size (prompts drawn) and ppo_mini_batch_size (prompts per update) both stay the
+    # raw request, and rollout.n carries the group. off-by-a-group here is silent -- the run trains,
+    # just on 1/group_size of the intended data.
+    for prompts, group in ((64, 8), (5, 8), (2, 2), (1, 6)):
+        o = rl_verl.build_verl_overrides(
+            _overrides_cfg(prompts_per_step=prompts, group_size=group)
+        )
+        assert f"data.train_batch_size={prompts}" in o
+        assert f"actor_rollout_ref.actor.ppo_mini_batch_size={prompts}" in o
+        assert f"actor_rollout_ref.rollout.n={group}" in o
+
+
 def test_build_verl_overrides_sets_truncation_mask_when_enabled():
     o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=True))
     # `++` (append-or-override), because the key exists in the fork's rollout.yaml but not stock's.
@@ -377,6 +396,29 @@ def test_build_verl_overrides_omits_truncation_mask_when_disabled():
     # behavior, so emitting `=false` would break stock runs while changing nothing.
     o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=False))
     assert not any("mask_truncated_completions" in override for override in o)
+
+
+def test_build_verl_overrides_pins_both_blackwell_attention_backends():
+    o = rl_verl.build_verl_overrides(
+        _overrides_cfg(attention_backend="FLASHINFER", mm_encoder_attn_backend="TORCH_SDPA")
+    )
+    # verl spreads engine_kwargs.vllm straight into AsyncEngineArgs, where both are real fields in
+    # the pinned vllm 0.19.1. `+` appends under the existing struct, as kv_cache_dtype does.
+    assert (
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHINFER" in o
+    )
+    assert (
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend=TORCH_SDPA" in o
+    )
+
+
+def test_build_verl_overrides_leaves_attention_backends_to_vllm_off_blackwell():
+    # off blackwell vllm's own capability-ordered defaults are correct, and pinning a backend there
+    # would override a working choice. the resolver returns None/None, so nothing may be emitted.
+    o = rl_verl.build_verl_overrides(
+        _overrides_cfg(attention_backend=None, mm_encoder_attn_backend=None)
+    )
+    assert not any("attention_backend" in override for override in o)
 
 
 def test_build_verl_overrides_sizes_engine_to_the_job_not_the_architecture():
@@ -457,6 +499,46 @@ def test_build_verl_training_cfg_carries_the_multimodal_flag():
     assert '"multimodal": bool(inp.get("multimodal"))' in source
 
 
+def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
+    """VERL-091: a model whose vLLM wake HANGS must never be offloaded between steps.
+
+    verl defaults free_cache_engine and enable_sleep_mode BOTH True and sleeps the rollout engine at
+    every step boundary, so without an explicit override a catalog model flagged sleep_unsupported
+    wedges on the first wake instead of failing fast. The flag comes from the catalog, so assert
+    against a real flagged entry rather than a fabricated one.
+    """
+    from flash.catalog import MODELS
+
+    flagged = [m for m, i in MODELS.items() if getattr(i, "sleep_unsupported", False)]
+    assert flagged, "no catalog model is sleep_unsupported; this guard now has no subject"
+
+    def _argv(model_id):
+        inp = {
+            "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
+            "prompts_per_step": 16, "mask_truncated_completions": True,
+            "max_prompt_len": 3072, "max_completion": 1024, "max_response_len": 1024,
+            "multi_turn": False, "engine_len": 4096, "temperature": 1.0, "top_p": 0.95,
+            "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (),
+            "structured_outputs": None, "seed": 42, "ppo_epochs": 1, "steps": 60,
+            "warmstart_adapter": "", "model_id": model_id, "verl_total_epochs": 2,
+            "save_freq": 20, "ckpt_to_keep": 1,
+        }
+        # go through the real builder so the flag cannot drift out of the cfg it emits.
+        cfg = rl_verl._build_verl_training_cfg(
+            inp, train_files="/w/t.parquet", val_files="/w/v.parquet", model_id="/w/model",
+            thinking=False, loggers="console", fp8_kv=False,
+            attention_backend=None, mm_encoder_attn_backend=None, reward_path="/w/r.py",
+            local_dir="/w/ckpt", project_name="flash", experiment_name="flash-rl-run123",
+        )
+        return rl_verl.build_verl_overrides(cfg)
+
+    for key in ("free_cache_engine", "enable_sleep_mode"):
+        assert f"actor_rollout_ref.rollout.{key}=false" in _argv(flagged[0])
+        # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
+        # what lets a large rollout fit alongside the training weights.
+        assert not [a for a in _argv("Qwen/Qwen3-4B") if key in a]
+
+
 def test_build_verl_training_cfg_derives_engine_len_and_budget():
     inp = {
         "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
@@ -465,11 +547,12 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "multi_turn": False, "engine_len": 4096,
         "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (), "structured_outputs": None, "seed": 42,
         "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
-        "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
+        "model_id": "Qwen/Qwen3-4B", "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
     }
     common = {
         "train_files": "/w/t.parquet", "val_files": "/w/v.parquet", "model_id": "Qwen/Qwen3-4B",
         "thinking": False, "loggers": "console", "fp8_kv": False,
+        "attention_backend": None, "mm_encoder_attn_backend": None,
         "reward_path": "/w/r.py", "local_dir": "/w/ckpt",
         "project_name": "flash", "experiment_name": "flash-rl-run123",
     }
@@ -560,6 +643,8 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
         project_name="flash",
@@ -761,6 +846,8 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
         project_name="flash",
@@ -1653,6 +1740,29 @@ def test_model_revision_resolves_pinned_snapshot_for_verl():
     assert 'revision=inp["model_revision"]' in run_src
 
 
+def test_pinned_snapshot_dir_is_what_reaches_verl_model_path():
+    # resolving the pinned snapshot is only half the invariant: the RESOLVED path has to be the value
+    # verl gets as actor_rollout_ref.model.path. passing inp["model_id"] here would resolve the cached
+    # "main" ref offline and silently train the wrong commit, with every other assertion still green.
+    # read the call with ast, not a substring: the argument list is multi-line and reformats.
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_build_verl_training_cfg"
+    ]
+    assert len(calls) == 1
+    model_id = next(k for k in calls[0].keywords if k.arg == "model_id")
+    assert isinstance(model_id.value, ast.Name)
+    assert model_id.value.id == "model_path_for_verl"
+
+
 def test_resolve_verl_loggers_console_when_no_api_key(monkeypatch):
     # no WANDB_API_KEY -> console only, and no wandb probe of the verl interpreter.
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
@@ -1844,10 +1954,9 @@ def test_run_rl_verl_wires_the_gradient_check_into_the_publish_path():
     # a helper nothing calls is not a guard. assert the training path actually invokes it, and that
     # it does so before the adapter export rather than after a publish has already happened.
     source = inspect.getsource(rl_verl.run_rl_verl)
-    assert (
-        "_check_grpo_had_a_gradient(reward_history, adv_spread_history, resumed=bool(resume_step))"
-        in source
-    )
+    assert "_check_grpo_had_a_gradient(" in source
+    assert "resumed=bool(resume_step)," in source
+    assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in source
     assert source.index("_check_grpo_had_a_gradient") < source.index("_export_peft_adapter")
     # and that the spread series it passes is actually collected from the child's output.
     assert 'parse_verl_metric(line, "critic/advantages/max")' in source
@@ -1869,6 +1978,23 @@ def test_grpo_gradient_check_abstains_for_a_resumed_run():
     # about the resume boundary, not a weakening of the guard.
     with pytest.raises(RuntimeError, match="zero advantage spread"):
         rl_verl._check_grpo_had_a_gradient([1.0], [0.0], resumed=False)
+
+
+def test_grpo_gradient_check_accepts_a_resume_that_is_already_complete():
+    # a resume whose checkpoint ALREADY sits at the target runs zero steps: verl computes
+    # current_epoch = global_steps // len(dataloader), the epoch range comes out empty, and the child
+    # exits 0 having emitted no metric lines. both histories are therefore empty for a policy that is
+    # fully trained -- which the empty-history branch would report as a reward-bridge wiring
+    # regression, failing a complete run. (trl exempted exactly this via
+    # _grpo_resume_already_complete; the port dropped the exemption.)
+    rl_verl._check_grpo_had_a_gradient([], [], resumed=True, already_complete=True)
+
+    # the exemption is ONLY for the zero-step case. a resume that ran steps and produced no metrics
+    # is still a wiring regression, and a fresh run can never claim it.
+    with pytest.raises(RuntimeError, match="never consulted"):
+        rl_verl._check_grpo_had_a_gradient([], [], resumed=True, already_complete=False)
+    with pytest.raises(RuntimeError, match="never consulted"):
+        rl_verl._check_grpo_had_a_gradient([], [], resumed=False)
 
 
 def test_resume_uploader_withholds_deployables_until_spread_appears():
@@ -2254,8 +2380,12 @@ def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, mon
     with pytest.raises(RuntimeError, match="required saves were not durably published"):
         uploader.raise_if_incomplete()
     # ordering is asserted at the call site: the verdict precedes stop()/raise_if_incomplete().
+    # match on the call name alone -- the argument list spans several lines, so pinning an argument
+    # would make this fail on a reformat rather than on a reordering, which is the real invariant.
     source = inspect.getsource(rl_verl.run_rl_verl)
-    verdict = source.index("_check_grpo_had_a_gradient(reward_history")
+    assert source.count("_check_grpo_had_a_gradient(") == 1
+    assert source.count("resume_uploader.raise_if_incomplete()") == 1
+    verdict = source.index("_check_grpo_had_a_gradient(")
     completeness = source.index("resume_uploader.raise_if_incomplete()")
     assert verdict < completeness
 
@@ -2281,7 +2411,7 @@ def _notes_inp():
         "temperature": 1.0,
         "top_p": 1.0,
         "ppo_epochs": 1,
-        "verl_total_epochs": 3,
+        "model_id": "Qwen/Qwen3-4B", "verl_total_epochs": 3,
         "seed": 7,
         "max_completion": 512,
         "prompts_per_step": 8,
@@ -2558,6 +2688,8 @@ def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
         project_name="flash",
@@ -3275,6 +3407,8 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
         thinking=False,
         loggers="console",
         fp8_kv=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
         reward_path="/w/reward.py",
         local_dir="/w/ckpt",
         project_name="flash",
@@ -3598,6 +3732,51 @@ def test_score_grades_before_it_records():
 
     assert body.count("observability.record(") == 1
     assert body.index("score = score_single_turn(") < body.index("observability.record(")
+
+
+def test_the_recorded_prompt_is_the_one_the_completion_was_graded_against():
+    """A sample pairs a prompt with a completion, so the two must come from the SAME index.
+
+    `_score` receives an index and a completion; the prompt is looked up, and looking it up under
+    anything but that index publishes a rollout whose `prompt_tail` belongs to a different example.
+    Nothing downstream can detect it -- the pair is well-formed, just not a pair -- and every
+    reader of `flash runs log` is then reading the model answering a question it was never asked.
+    `_score_buffer` below reimplements these two calls, so it cannot catch this; read the call.
+
+    Asserted with ast: the lookup is one subscript expression, and a substring needle would fail on
+    a reformat rather than on the re-indexing that is the actual invariant.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
+    score = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_score"
+    )
+    index_arg, completion_arg = (a.arg for a in score.args.args[:2])
+    calls = [
+        node
+        for node in ast.walk(score)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "record"
+    ]
+    assert len(calls) == 1
+    prompt, completion = calls[0].args[:2]
+    # the completion is passed straight through, unindexed: it IS the graded text.
+    assert isinstance(completion, ast.Name)
+    assert completion.id == completion_arg
+    # the prompt is subscripted by _score's own index argument, not by a separate cursor.
+    assert isinstance(prompt, ast.Subscript)
+    assert ast.unparse(prompt.slice) in (index_arg, f"int({index_arg})")
+    # and it is the same list the grading example comes from -- one dataset order for both.
+    graded = next(
+        node
+        for node in ast.walk(score)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "rollout_examples"
+    )
+    assert ast.unparse(graded.slice) == ast.unparse(prompt.slice)
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -4361,29 +4540,35 @@ def test_per_turn_credit_shim_centres_each_turn_against_its_group_sibling():
     assert advantages[1].tolist() == [-0.5, -0.5, 0.5, 0.5]
 
 
-def test_per_turn_credit_shim_matches_trl_per_turn_advantages():
-    # the two backends must produce the SAME advantages for the same rollouts, which is what makes
-    # this a port rather than a second implementation. trl's builder is the reference oracle.
+def test_per_turn_credit_shim_reproduces_the_reference_advantages():
+    # the port's defining property: for the same rollouts it must produce the SAME advantages the
+    # original per-turn builder did, which is what makes it a port rather than a second
+    # implementation.
+    #
+    # the reference values below were computed from that builder before it was deleted with the trl
+    # backend. they are pinned as literals deliberately: an oracle that no longer ships cannot be
+    # imported, and re-deriving them from the shim under test would make this assert on itself.
+    #
+    # by hand, for spans [(0,3),(3,5)] / [(0,2),(2,6)] and turn rewards [.25,.75] / [1.0,.5]:
+    # turn 0 group mean is (0.25+1.0)/2 = 0.625, so its centred credits are -0.375 and +0.375;
+    # turn 1 group mean is (0.75+0.5)/2 = 0.625, giving +0.125 and -0.125. each credit is broadcast
+    # across its own token span, and index 5 of row 0 lies past its last span, so it stays 0.
     pytest.importorskip("torch")
     import torch
 
-    from flash.engine.worker.grpo_perturn_trainer import build_per_turn_advantages
-
     spans = [[(0, 3), (3, 5)], [(0, 2), (2, 6)]]
     turns = [[0.25, 0.75], [1.0, 0.5]]
-    expected = build_per_turn_advantages(
-        spans,
-        turns,
-        num_generations=2,
-        completion_len=6,
-        # trl centres the episode itself; per-turn rows never read this, so its value is
-        # irrelevant to the comparison and any finite tensor proves the same thing.
-        episode_advantages=torch.zeros(2, dtype=torch.float32),
+    expected = torch.tensor(
+        [[-0.375, -0.375, -0.375, 0.125, 0.125, 0.0],
+         [0.375, 0.375, -0.125, -0.125, -0.125, -0.125]],
+        dtype=torch.float32,
     )
     got = _run_per_turn_shim(
         [(tuple(map(tuple, spans[0])), tuple(turns[0])),
          (tuple(map(tuple, spans[1])), tuple(turns[1]))],
         ["p0", "p0"],
+        # the episode tensor is what per-turn credit REPLACES, so its value cannot affect the
+        # result; zeros make an accidental passthrough visible as a row of zeros.
         torch.zeros((2, 6), dtype=torch.float32),
     )
     assert torch.allclose(got, expected)

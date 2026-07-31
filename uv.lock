@@ -1025,7 +1025,7 @@ wheels = [
 
 [[package]]
 name = "freesolo-flash"
-version = "1.0.59"
+version = "1.0.60"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1055,7 +1055,6 @@ gpu = [
     { name = "peft" },
     { name = "torch" },
     { name = "transformers" },
-    { name = "trl" },
     { name = "uv" },
     { name = "vllm" },
 ]
@@ -1117,7 +1116,6 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'dev'", specifier = ">=5.6,<5.11" },
     { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.11" },
     { name = "transformers", marker = "extra == 'server'", specifier = ">=5.6,<5.11" },
-    { name = "trl", marker = "extra == 'gpu'", specifier = ">=1.6,<1.7" },
     { name = "uv", marker = "extra == 'gpu'", specifier = ">=0.5" },
     { name = "uvicorn", marker = "extra == 'dev'" },
     { name = "uvicorn", marker = "extra == 'server'" },
@@ -3806,22 +3804,6 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e0/12/b05ba554d2c623bffa59922b94b0775673de251f468a9609bc9e45de95e9/triton-3.6.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e8e323d608e3a9bfcc2d9efcc90ceefb764a82b99dea12a86d643c72539ad5d3", size = 188214640, upload-time = "2026-01-20T16:00:35.869Z" },
     { url = "https://files.pythonhosted.org/packages/ab/a8/cdf8b3e4c98132f965f88c2313a4b493266832ad47fb52f23d14d4f86bb5/triton-3.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:74caf5e34b66d9f3a429af689c1c7128daba1d8208df60e81106b115c00d6fca", size = 188266850, upload-time = "2026-01-20T16:00:43.041Z" },
-]
-
-[[package]]
-name = "trl"
-version = "1.6.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "accelerate" },
-    { name = "datasets" },
-    { name = "jinja2" },
-    { name = "packaging" },
-    { name = "transformers" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/15/71/053cfddac9ec13a444b48167180e8c6c7dbd9d7b02dcfc6ad400b11e8274/trl-1.6.0.tar.gz", hash = "sha256:c24692f6436eb0ee8666965f37513b198b828eb76690cd330446bce67182a029", size = 673487, upload-time = "2026-06-11T21:45:34.256Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ae/55/9779cb8a5fd066afa719531f740018078a4ca4c83406f2d68bda2b4b26e6/trl-1.6.0-py3-none-any.whl", hash = "sha256:78023ee1e8ba11e9b7eaa9077c8d37b3581ff7c7ddf32fbe1f19a22fe2c76360", size = 825130, upload-time = "2026-06-11T21:45:32.526Z" },
 ]
 
 [[package]]

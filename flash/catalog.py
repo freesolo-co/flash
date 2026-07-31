@@ -99,8 +99,9 @@ class ModelInfo:
     # the fragmented non-expandable allocator sleep forces -- live-confirmed on the 35B-A3B, every
     # attempt stalled). So this model is RESIDENT-ONLY: a config that doesn't fit resident must be
     # REJECTED (model_required_vram_gb sizes it on the resident peak) rather than routed to the hanging
-    # sleep path. grpo_sleep_mode raises for it instead of ever returning True. Dense/small models that
-    # sleep cleanly leave this False.
+    # sleep path. the verl launcher also pins the rollout resident for a flagged model
+    # (free_cache_engine=false) so verl's own per-step offload can't reach the hang. Dense/small
+    # models that sleep cleanly leave this False.
     sleep_unsupported: bool = False
     notes: str = ""
     # 0 = platform default (64 GB) suffices. Runner raises gpu.disk_gb to at least this.

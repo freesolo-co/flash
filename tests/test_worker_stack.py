@@ -44,7 +44,6 @@ def test_worker_stack_pins_qwen35_capable_versions():
     joined = " ".join(WORKER_DEPS)
     assert "vllm==0.19" in joined  # first transformers-5-compatible vllm line
     assert "transformers>=5" in joined  # qwen3_5 model types need transformers 5.x
-    assert "trl>=1.6" in joined  # 1.6 adds the GRPO tools=/rollout_func multi-turn hooks
     assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
 
 
@@ -302,50 +301,6 @@ def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", _no_bnb)
     assert worker.loraplus_optimizer_cls("paged_adamw_8bit")[0] is adamw
-
-
-def test_grpo_no_op_failure_empty_reward_no_resume(monkeypatch):
-    """Empty reward_history with no resume = the rollout scored nothing -> fail loudly (no-op run)."""
-    worker = _import_worker(monkeypatch)
-    assert (
-        worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
-    )
-
-
-def test_grpo_no_op_ok_when_rewards_present(monkeypatch):
-    """A non-empty reward_history means the reward path ran -> never a no-op failure."""
-    worker = _import_worker(monkeypatch)
-    assert (
-        worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10)
-        is False
-    )
-    # An all-zero history (env returned all-zero rewards) still counts as real training.
-    assert (
-        worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0)
-        is False
-    )
-
-
-def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
-    """A resume that already reached target steps has an empty fresh history but a trained policy."""
-    worker = _import_worker(monkeypatch)
-    assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=10) is True
-    # Empty history is tolerated -> NOT a no-op failure (finalize the completed policy).
-    assert (
-        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12)
-        is False
-    )
-
-
-def test_grpo_no_op_failure_resume_did_not_reach_target(monkeypatch):
-    """A resume that did NOT reach the target steps with no reward is still a genuine no-op -> fail."""
-    worker = _import_worker(monkeypatch)
-    assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=3) is False
-    assert (
-        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
-    )
-    # No target steps configured can never count as a complete resume.
-    assert worker._grpo_resume_already_complete("ckpt", target_steps=0, steps_run=0) is False
 
 
 def test_heartbeat_commit_is_throttled(monkeypatch):
@@ -905,23 +860,6 @@ def test_warmstart_base_loader_forwards_model_revision(monkeypatch):
     ]
 
 
-def test_rl_wires_vl_full_lora_base_loader():
-    # SFT is not covered here any more: verl loads the base itself in its trainer subprocess from
-    # model.path, so there is no in-process model for the worker to hand over. The SFT-side half of
-    # this invariant -- that the resolved lora_rank and target_modules actually reach verl instead of
-    # falling back to its defaults -- is covered by the override-map assertion in test_sft_train.py.
-    import inspect
-
-    from flash.engine.worker import rl
-
-    rl_src = inspect.getsource(rl.run_rl)
-
-    assert "trainer_model = _w.prepare_fresh_lora_base(" in rl_src
-    assert 'model_init_kwargs["device_map"] = None' in rl_src
-    assert 'device_map", "auto"' not in rl_src
-    assert "model=trainer_model" in rl_src
-
-
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
     import flash.engine.worker as worker
     from flash.engine.worker import finalize
@@ -1007,98 +945,6 @@ def test_finalize_preserves_terminal_heartbeat_fields(monkeypatch):
 
     assert emitted[-1][0] == "done"
     assert emitted[-1][1]["metrics_last"] == metrics_last
-
-
-def test_grpo_colocate_vllm_patch_forwards_nonempty_revision(monkeypatch):
-    import flash.engine.worker.gpu_setup as gpu_setup
-
-    captured = {}
-
-    class _FakeLLM:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    for name in ("trl", "trl.generation"):
-        pkg = types.ModuleType(name)
-        pkg.__path__ = []
-        monkeypatch.setitem(sys.modules, name, pkg)
-    module = types.ModuleType("trl.generation.vllm_generation")
-    module.LLM = _FakeLLM
-    monkeypatch.setitem(sys.modules, "trl.generation.vllm_generation", module)
-
-    assert gpu_setup.patch_trl_colocate_llm_kwargs(revision="refs/pr/123")
-    module.LLM(model="org/model")
-
-    assert captured["revision"] == "refs/pr/123"
-
-
-def test_force_vllm_backend_for_sm120(monkeypatch):
-    """RTX 5090 / sm120 -> FLASHINFER pinned (PTX-independent rollout); deterministic, no operator
-    override. Codex MsOqv: on the pinned vLLM 0.19.1 the VLLM_ATTENTION_BACKEND env was DROPPED from
-    the registry (setting it is a no-op), so the backend must be injected as the colocate LLM(...)
-    `attention_backend` kwarg via patch_trl_colocate_llm_kwargs — assert THAT, not the dead env. A
-    non-sm120 GPU pins nothing. Regression for the empty-5090-rollout."""
-    import sys
-    import types
-
-    worker = _import_worker(monkeypatch)
-
-    def _fake_torch(major):
-        t = types.ModuleType("torch")
-        t.cuda = types.SimpleNamespace(
-            is_available=lambda: True,
-            get_device_capability=lambda *a: (major, 0),
-        )
-        return t
-
-    captured: dict = {}
-
-    def _fresh_vg():
-        """A throwaway trl.generation.vllm_generation whose LLM records its construction kwargs, so we
-        can assert the attention backend reaches the colocate engine. Fresh per call (no carried patch
-        state) so each scenario's injected kwarg is observed in isolation."""
-
-        class _FakeLLM:
-            def __init__(self, *a, **kw):
-                captured.clear()
-                captured.update(kw)
-
-        mod = types.ModuleType("trl.generation.vllm_generation")
-        mod.LLM = _FakeLLM
-        for name in ("trl", "trl.generation"):
-            pkg = types.ModuleType(name)
-            pkg.__path__ = []
-            monkeypatch.setitem(sys.modules, name, pkg)
-        monkeypatch.setitem(sys.modules, "trl.generation.vllm_generation", mod)
-        return mod
-
-    def _backend_injected(vg):
-        """Construct via the (now-patched) colocate LLM symbol and return the attention_backend it got."""
-        vg.LLM(model="m")
-        return captured.get("attention_backend")
-
-    # sm120, flashinfer importable -> FLASHINFER is forced (as an LLM kwarg, not an env var)
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch(12))
-    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
-    vg = _fresh_vg()
-    assert worker.force_vllm_backend_for_sm120() == "FLASHINFER"
-    assert _backend_injected(vg) == "FLASHINFER"
-
-    # Codex MsPFr/MsZa4: sm120 with an ABI-broken/absent flashinfer must NOT ship a silently-broken
-    # FLASHINFER backend (it would crash at the first engine init), and the fallback must be a
-    # REGISTERED decoder backend — TRITON_ATTN (PTX-independent), NOT TORCH_SDPA (ViT-only on vllm
-    # 0.19.1, would raise at backend validation). A None entry in sys.modules makes `import flashinfer`
-    # raise ImportError — the same shape as an ABI-broken wheel.
-    monkeypatch.setitem(sys.modules, "flashinfer", None)
-    vg = _fresh_vg()
-    assert worker.force_vllm_backend_for_sm120() == "TRITON_ATTN"
-    assert _backend_injected(vg) == "TRITON_ATTN"
-
-    # non-sm120 (sm90 Hopper) -> nothing pinned (the colocate engine gets no attention_backend kwarg)
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch(9))
-    vg = _fresh_vg()
-    assert worker.force_vllm_backend_for_sm120() is None
-    assert _backend_injected(vg) is None
 
 
 # ---------------------------------------------------------------------------

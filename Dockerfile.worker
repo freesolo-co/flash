@@ -49,7 +49,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 # The pinned worker stack (torch already in the base image, version-matched so pip skips it).
 RUN pip install --no-cache-dir \
     "transformers>=5.6,<5.13" \
-    "trl>=1.6,<1.7" \
     "peft>=0.19" \
     "vllm==0.19.1" \
     "flashinfer-python==0.6.6" \
@@ -201,7 +200,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # is imported optionally here: a missing FA must NOT abort the build, or the SDPA-fallback image
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
-import torch, transformers, trl, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
+import torch, transformers, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
 fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
 import importlib; \
 fa_ok = False; \
@@ -213,7 +212,7 @@ exec('try:\n import flashinfer\n fi_ok = True\nexcept Exception:\n fi_ok = False
 cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into torch'; \
 ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)', '| flashinfer', 'present (B200 MoE/attn)' if fi_ok else 'ABSENT (Triton fused-MoE fallback)'); \
-[print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
+[print('  ', d, ver(d)) for d in ['transformers','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
 'accelerate','wandb','flash-linear-attention','bitsandbytes', \
 'hf-transfer','freesolo','runpod']]"
 
@@ -223,7 +222,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # verl's dependency set CONFLICTS with the worker stack above. verl and TransferQueue declare
 # numpy<2.0.0 while this image's stack resolves numpy>=2, and verl's structured-OPD gate pins
 # xgrammar to exactly 0.1.25 against vLLM's declared >=0.1.32 floor. Resolving verl into the main
-# interpreter would move shared pins under every other worker path (trl/peft/transformers/vllm all
+# interpreter would move shared pins under every other worker path (peft/transformers/vllm all
 # live there), so verl gets its own venv and flash launches it out-of-process via FLASH_VERL_PYTHON.
 # The venv deliberately re-resolves its own numpy independent of the base interpreter's.
 #
