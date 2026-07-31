@@ -38,6 +38,14 @@ VERL_REQUIREMENT_URL = (
 # installed.
 VERL_REQUIREMENT = f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}"
 
+# the FA2 wheel the verl interpreter needs, kept byte-identical to Dockerfile.worker's
+# ARG FLASH_ATTN_SPEC default so the fallback venv and /opt/verl-venv resolve the same build.
+# prebuilt for cu128/torch2.10/cp312; installed --no-build-isolation, never source-built here.
+FLASH_ATTN_SPEC = (
+    "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/"
+    "v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl"
+)
+
 
 def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
     """the engine length verl will accept: the job's context, capped at the model's own limit.
@@ -195,6 +203,23 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "xgrammar==0.1.25",
                 "tqdm",
                 "pyarrow",
+            ],
+            check=True,
+        )
+        # a SEPARATE install, exactly as Dockerfile.worker:295 runs it: the wheel is prebuilt against
+        # torch 2.10, so it needs --no-build-isolation, and that flag must not apply to the resolve
+        # above. required, not best-effort -- all three backends hard-enable remove-padding and verl's
+        # cuda path imports flash_attn.bert_padding unguarded with no sdpa fallback, so a venv without
+        # it dies at the first training batch on a paid gpu rather than degrading.
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                py,
+                "--no-build-isolation",
+                FLASH_ATTN_SPEC,
             ],
             check=True,
         )

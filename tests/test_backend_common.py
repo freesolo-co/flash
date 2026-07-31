@@ -196,7 +196,10 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "xgrammar==0.1.25" in install
     assert "tqdm" in install
     assert "pyarrow" in install
-    assert len(calls) == 2
+    # venv, the resolve above, then the prebuilt flash_attn wheel on its own --no-build-isolation
+    # line. nothing else: a fourth call would be an unbudgeted install on a paid pod.
+    assert len(calls) == 3
+    assert calls[2][:3] == ["uv", "pip", "install"]
     # the stamp is written only after a successful install, so a crashed install is never reused.
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_REQUIREMENT
@@ -250,6 +253,38 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
     assert "TransferQueue==0.1.7" in install
 
 
+def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatch, tmp_path):
+    # all three backends hard-enable remove-padding (sft_train.py:164, rl_train.py:339,
+    # opd_train.py:1505) and verl's cuda remove-padding path imports flash_attn.bert_padding
+    # UNGUARDED (verl/utils/attention_utils.py:30, torch_functional.py:627). there is no sdpa
+    # fallback on that path, so a venv without the wheel dies at the first training batch on a paid
+    # gpu. Dockerfile.worker:288-297 already treats it as REQUIRED in /opt/verl-venv; this fallback
+    # provisions the same interpreter and must carry the same wheel.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    flat = [arg for command in calls for arg in command]
+    assert vc.FLASH_ATTN_SPEC in flat, (
+        "verl's remove-padding path imports flash_attn unguarded; the provisioned venv must hold it"
+    )
+    # the wheel is prebuilt, so it must skip build isolation exactly as the image install does --
+    # a source build here would compile for minutes on a paid pod.
+    install = next(c for c in calls if vc.FLASH_ATTN_SPEC in c)
+    assert "--no-build-isolation" in install
+
+
+def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
+    # the fallback venv and /opt/verl-venv must resolve the same wheel: a run that lands on the
+    # no-image path otherwise trains against a different flash_attn than every baked-image run.
+    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+    assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in dockerfile.read_text(), (
+        "Dockerfile.worker's FLASH_ATTN_SPEC default drifted from backend_common.FLASH_ATTN_SPEC"
+    )
+
+
 def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_path):
     # the stamp gates rebuilds. if it recorded the extra-bearing spec while VERL_REQUIREMENT stayed
     # bare, every later call would see a mismatch and rebuild the venv from scratch on a paid pod.
@@ -259,10 +294,11 @@ def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_
 
     vc.resolve_verl_python(str(tmp_path))
     assert (tmp_path / "verl-venv" / "flash-verl-requirement").read_text() == vc.VERL_REQUIREMENT
+    built = len(calls)
 
     (tmp_path / "verl-venv" / "bin" / "python").write_text("")
     vc.resolve_verl_python(str(tmp_path))
-    assert len(calls) == 2, "a venv built from the current pin must not be rebuilt"
+    assert len(calls) == built, "a venv built from the current pin must not be rebuilt"
 
 
 def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatch, tmp_path):
@@ -293,7 +329,7 @@ def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
 
     vc.resolve_verl_python(str(tmp_path))
 
-    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"]]
+    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"]]
     assert not (venv / "marker").exists()
 
 
@@ -311,7 +347,7 @@ def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkey
     vc.resolve_verl_python(str(tmp_path))
 
     assert not (venv / "pyvenv.cfg").exists()
-    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"]]
+    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"]]
 
 
 def test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork():
@@ -347,7 +383,9 @@ def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypat
     vc.resolve_verl_python(str(tmp_path), install_wandb=True)
 
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1][0])
-    assert calls[2] == (
+    # wandb is the LAST call: it follows the flash_attn wheel install, and unlike every install
+    # before it, it is best-effort (check=False) so a wandb outage cannot fail a training run.
+    assert calls[3] == (
         ["uv", "pip", "install", "--python", str(tmp_path / "verl-venv/bin/python"), "wandb"],
         False,
     )
