@@ -4,7 +4,7 @@ from flash.engine.worker.heartbeat import (
     _latest_named_reward_metrics,
     _mean_named_reward_metrics,
 )
-from flash.engine.worker.rl_verl import run_rl_verl, score_single_turn
+from flash.engine.worker.rl_train import run_rl_train, score_single_turn
 
 
 def test_named_reward_metrics_are_averaged_across_completions() -> None:
@@ -76,7 +76,7 @@ def test_scoring_validates_total_before_aggregating_breakdown() -> None:
 def test_reward_metrics_reach_the_step_heartbeat() -> None:
     """verl's trainer is out of process and cannot host trl's TrainerCallback, so the per-name
     breakdowns travel through the reward-observability buffer into the rl_step liveness fields."""
-    source = inspect.getsource(run_rl_verl)
+    source = inspect.getsource(run_rl_train)
 
     assert "breakdowns=breakdowns" in source
     assert "observability.record(" in source

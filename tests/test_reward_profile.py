@@ -247,7 +247,7 @@ def test_worker_hook_profiles_against_reference_completions_and_never_raises(cap
     reference completions (not blank text, which would profile as degenerate and teach us
     nothing), reports the per-step cost, and swallows a scorer that explodes.
     """
-    from flash.engine.worker.rl_verl import _log_reward_profile
+    from flash.engine.worker.rl_train import _log_reward_profile
 
     class Env:
         def sft_completion(self, example):
@@ -290,7 +290,7 @@ def test_worker_hook_skips_an_env_whose_scorer_is_not_thread_safe(capsys):
     quota or warm a cache before the first rollout, changing the rewards training then receives.
     A measurement that moves the thing it measures is worse than a missing measurement.
     """
-    from flash.engine.worker.rl_verl import _log_reward_profile
+    from flash.engine.worker.rl_train import _log_reward_profile
 
     class StatefulEnv:
         reward_thread_safe = False
@@ -321,7 +321,7 @@ def test_worker_hook_uses_the_envs_assistant_text_semantics(capsys):
     (`[{"type": "text", "text": "4"}]`) stringify into a python repr, and non-assistant turns get
     concatenated into the graded text. Both hand the grader something no rollout would produce.
     """
-    from flash.engine.worker.rl_verl import _log_reward_profile
+    from flash.engine.worker.rl_train import _log_reward_profile
 
     class BlockEnv:
         def sft_completion(self, example):
@@ -350,9 +350,9 @@ def test_a_hung_sft_completion_cannot_outlast_the_hook_budget(monkeypatch):
     leaves the startup delay this hook adds unbounded -- the ceiling would be advertised but not
     held. The budget is patched down so the test costs a fraction of a second rather than 30.
     """
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
-    monkeypatch.setattr(rl_verl, "_PROFILE_BUDGET_S", 0.15)
+    monkeypatch.setattr(rl_train, "_PROFILE_BUDGET_S", 0.15)
     release = threading.Event()
 
     class HangingEnv:
@@ -365,7 +365,7 @@ def test_a_hung_sft_completion_cannot_outlast_the_hook_budget(monkeypatch):
 
     started = time.perf_counter()
     try:
-        rl_verl._log_reward_profile(HangingEnv(), score_one, [{"id": i} for i in range(4)], 32)
+        rl_train._log_reward_profile(HangingEnv(), score_one, [{"id": i} for i in range(4)], 32)
         elapsed = time.perf_counter() - started
         assert elapsed < 2.0, f"extraction ran outside the budget ({elapsed:.1f}s)"
     finally:
@@ -379,16 +379,16 @@ def test_profiling_does_not_pollute_the_training_sample_buffer():
     through it would seed the training log with gradings that never came from a rollout.
 
     Asserted against the worker's SOURCE rather than by calling it. Both closures live inside
-    run_rl_verl, which needs a model, a dataset and a verl interpreter to reach -- and the obvious
+    run_rl_train, which needs a model, a dataset and a verl interpreter to reach -- and the obvious
     alternative (build a fake scorer in the test and check it left a local list empty) is
     unfailable: it asserts on a fixture the test itself wrote, and passes with the bug restored.
     This is the weaker kind of test, so it is scoped to the one line that decides the wiring.
     """
     import inspect
 
-    from flash.engine.worker.rl_verl import run_rl_verl
+    from flash.engine.worker.rl_train import run_rl_train
 
-    source = inspect.getsource(run_rl_verl)
+    source = inspect.getsource(run_rl_train)
     call = source[source.index("_log_reward_profile(") :]
     call = call[: call.index(")")]
     assert "_score_for_profile" in call, call
@@ -402,7 +402,7 @@ def test_score_single_turn_can_propagate_errors_for_the_profiler():
     profiler needs the opposite: if every grading raises and it sees 0.0 returned quickly, it
     reports a fast, confident latency for a grader that is entirely down.
     """
-    from flash.engine.worker.rl_verl import score_single_turn
+    from flash.engine.worker.rl_train import score_single_turn
 
     class Env:
         def reward(self, graded, ex, state):
@@ -595,9 +595,9 @@ def test_hook_timeout_message_reports_references_already_gathered(monkeypatch, c
     reason. A reader told "no reference completion could be gathered" goes looking for an env that
     returns nothing, when the real fault is a hook that returned twice and then stalled.
     """
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
-    monkeypatch.setattr(rl_verl, "_PROFILE_BUDGET_S", 0.3)
+    monkeypatch.setattr(rl_train, "_PROFILE_BUDGET_S", 0.3)
     release = threading.Event()
     calls = {"n": 0}
 
@@ -612,7 +612,7 @@ def test_hook_timeout_message_reports_references_already_gathered(monkeypatch, c
         return 1.0
 
     try:
-        rl_verl._log_reward_profile(SlowThirdEnv(), score_one, [{"id": i} for i in range(4)], 32)
+        rl_train._log_reward_profile(SlowThirdEnv(), score_one, [{"id": i} for i in range(4)], 32)
         out = capsys.readouterr().out
         assert "did not return within" in out, out
         assert "2 usable reference completion(s) gathered" in out, out
@@ -629,9 +629,9 @@ def test_hook_timeout_message_does_not_count_failed_references(monkeypatch, caps
     as misleading as the "no reference could be gathered" message this replaced, in the opposite
     direction.
     """
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
-    monkeypatch.setattr(rl_verl, "_PROFILE_BUDGET_S", 0.3)
+    monkeypatch.setattr(rl_train, "_PROFILE_BUDGET_S", 0.3)
     release = threading.Event()
     calls = {"n": 0}
 
@@ -646,7 +646,7 @@ def test_hook_timeout_message_does_not_count_failed_references(monkeypatch, caps
         return 1.0
 
     try:
-        rl_verl._log_reward_profile(
+        rl_train._log_reward_profile(
             FailsThenStallsEnv(), score_one, [{"id": i} for i in range(4)], 32
         )
         out = capsys.readouterr().out
@@ -663,9 +663,9 @@ def test_hook_timeout_message_does_not_count_blank_references(monkeypatch, capsy
     the early return, not the grader. A count that admitted them would name a reference the profiler
     would have discarded, sending a reader after the wrong hook.
     """
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
-    monkeypatch.setattr(rl_verl, "_PROFILE_BUDGET_S", 0.3)
+    monkeypatch.setattr(rl_train, "_PROFILE_BUDGET_S", 0.3)
     release = threading.Event()
     calls = {"n": 0}
 
@@ -680,7 +680,7 @@ def test_hook_timeout_message_does_not_count_blank_references(monkeypatch, capsy
         return 1.0
 
     try:
-        rl_verl._log_reward_profile(
+        rl_train._log_reward_profile(
             BlankThenStallsEnv(), score_one, [{"id": i} for i in range(4)], 32
         )
         out = capsys.readouterr().out

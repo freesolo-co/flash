@@ -88,7 +88,7 @@ def test_thinking_budget_selection(monkeypatch):
     # this CPU dry-run doesn't load the Freesolo env. We only exercise THINKING resolution here.
     # (the per-device micro-batch half of this test went with trl: verl bounds the backward pass by
     # TOKENS via use_dynamic_bsz + ppo_max_token_len_per_gpu, so there is no per-device sequence
-    # count to select. see test_rl_verl's batch-shape and token-budget coverage.)
+    # count to select. see test_rl_train's batch-shape and token-budget coverage.)
     monkeypatch.setattr("flash.envs.registry.load_environment", lambda *a, **k: object())
     saved = _set_thinking_worker_env()
     import flash.engine.worker as ne

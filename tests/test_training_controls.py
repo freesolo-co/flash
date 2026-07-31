@@ -609,7 +609,7 @@ def test_sft_under_ran_only_fails_a_genuine_under_run():
 
 
 def test_grpo_under_ran_only_fails_a_genuine_under_run():
-    # verl has no grpo_under_ran helper: run_rl_verl compares the checkpoint dir's step count to
+    # verl has no grpo_under_ran helper: run_rl_train compares the checkpoint dir's step count to
     # expected_steps inline. same invariant, so assert on the comparison rather than a symbol --
     # STRICTLY less-than, so a resume that overshoots a lowered horizon (12 >= 10) still finalizes
     # instead of failing a fully-trained policy.
@@ -617,9 +617,9 @@ def test_grpo_under_ran_only_fails_a_genuine_under_run():
     import inspect
     import textwrap
 
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
     compares = [
         node
         for node in ast.walk(tree)

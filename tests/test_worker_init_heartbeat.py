@@ -338,9 +338,9 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     import ast
     import textwrap
 
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
     terminal_calls = [
         node
         for node in ast.walk(tree)
@@ -354,7 +354,7 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     assert len(terminal_calls) == 1
     terminal_keywords = {keyword.arg: keyword.value for keyword in terminal_calls[0].keywords}
     assert "metrics_last" in terminal_keywords
-    # the value must be a COPY of the live accumulator, not the bare name: run_rl_verl keeps appending
+    # the value must be a COPY of the live accumulator, not the bare name: run_rl_train keeps appending
     # to metrics_last while heartbeats are in flight, and the heartbeat payload is serialized
     # asynchronously, so passing the list itself would let the snapshot mutate after it was taken.
     assert ast.unparse(terminal_keywords["metrics_last"]) == "list(metrics_last)"
@@ -968,7 +968,7 @@ def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatc
 @pytest.mark.parametrize(
     ("modname", "outer", "stage"),
     [
-        ("flash.engine.worker.rl_verl", "run_rl_verl", "rl_step"),
+        ("flash.engine.worker.rl_train", "run_rl_train", "rl_step"),
         ("flash.engine.worker.sft_train", "run_sft_train", "sft_step"),
     ],
 )
@@ -1010,8 +1010,8 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
             ("sft_data_loading", "sft_finalizing"),
         ),
         (
-            "flash.engine.worker.rl_verl",
-            "run_rl_verl",
+            "flash.engine.worker.rl_train",
+            "run_rl_train",
             ("rl_data_loading", "rl_finalizing"),
         ),
     ],
@@ -1032,9 +1032,9 @@ def test_quiet_phases_are_wrapped_in_liveness_heartbeat(modname, outer, stages):
 def test_rl_warmstart_adapter_download_is_wrapped_in_liveness_heartbeat():
     """The warm-start adapter pull is multi-GB and lives in the input resolver rather than the
     entry point, so it carries its own wrap; the sibling test above cannot see it."""
-    from flash.engine.worker import rl_verl
+    from flash.engine.worker import rl_train
 
-    src = inspect.getsource(rl_verl._resolve_grpo_inputs)
+    src = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert 'liveness_heartbeat("rl_adapter_loading")' in src, (
         "the multi-GB warm-start adapter download must keep the heartbeat fresh"
     )
