@@ -367,14 +367,25 @@ def cmd_train(args) -> int:
             raise ApiError(exc.status, detail) from exc
         compatibility = status.pop("train_schema_compatibility", None)
         _print_train_schema_compatibility(compatibility)
+        # the server fails open on a billing-infra problem, so "cost" is only in the validated list
+        # when it was actually checked. absent key = a server that predates the signal, which is
+        # equally not a verification -- so treat anything but an explicit True as unverified.
+        affordability_verified = status.pop("affordability_verified", None) is True
+        cost = "and cost" if affordability_verified else "but NOT cost"
         print(
             "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
-            "runtime-secret presence, warm-start source, serving context cap, and cost. it did NOT "
+            f"runtime-secret presence, warm-start source, serving context cap, {cost}. it did NOT "
             "import or run your environment.py; dataset loading, start_episode/episode shapes, "
             "reward/scorer, worker imports, model load, and gpu/training are first exercised on the "
             "worker after cold-start.",
             file=sys.stderr,
         )
+        if not affordability_verified:
+            print(
+                "affordability was NOT verified (billing check unavailable); this run can still be "
+                "rejected for insufficient balance when you submit it for real.",
+                file=sys.stderr,
+            )
         if render.styled():
             print(
                 render.object_panel(
