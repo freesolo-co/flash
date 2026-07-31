@@ -27,9 +27,14 @@ from collections.abc import Callable
 # base: the opd plugin patches 0.8.0 internals and imports verl.trainer.main_ppo_sync, which verl
 # deleted after 0.8.0, and opd's exact-version gate reads the version file this branch pins to the
 # release value.
-VERL_REQUIREMENT = (
-    "verl @ git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
+VERL_REQUIREMENT_NAME = "verl"
+VERL_REQUIREMENT_URL = (
+    "git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
 )
+# the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
+# same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
+# installed.
+VERL_REQUIREMENT = f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}"
 
 
 def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
@@ -150,7 +155,25 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "install",
                 "--python",
                 py,
-                VERL_REQUIREMENT,
+                # the [vllm] extra, matching Dockerfile.worker's VERL_SPEC. verl's bare
+                # install_requires omits vllm, and every entrypoint flash launches needs it:
+                # main_ppo/main_ppo_sync set rollout.name=vllm. the extra's own ceiling is
+                # vllm<=0.12.0, so the exact pin below overrides it the same way the image's
+                # --override file does -- flash needs 0.19.1 for the Qwen3.5 archs.
+                f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
+                "vllm==0.19.1",
+                # NOT transitively guaranteed: verl imports these at MODULE level on the launch path
+                # (main_ppo -> ppo.ray_trainer -> rollout.llm_server imports cachetools, and
+                # rollout.utils imports uvicorn + fastapi), yet declares none of them. vllm happens
+                # to pull cachetools and fastapi today, but that is vllm's dependency choice, not a
+                # contract verl states -- name them so a vllm respin cannot silently break launch.
+                "cachetools",
+                "uvicorn",
+                "fastapi",
+                # opd's entrypoint calls tq.init()/tq.close(); absent from verl's setup.py.
+                "TransferQueue==0.1.7",
+                # older raises AttributeError on PyArrow PyExtensionType.
+                "datasets>=4.7,<6",
                 "liger-kernel",
                 "bitsandbytes>=0.49",
                 "qwen-vl-utils",

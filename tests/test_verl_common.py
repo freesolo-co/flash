@@ -112,7 +112,7 @@ def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_pa
     python_bin = vc.resolve_verl_python(str(tmp_path))
 
     assert python_bin.endswith("/verl-venv/bin/python")
-    assert vc.VERL_REQUIREMENT in calls[1]
+    assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1])
 
 
 def test_worker_env_remedies_are_copy_pasteable_toml():
@@ -173,7 +173,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert vc.VERL_REQUIREMENT == (
         "verl @ git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
     )
-    assert vc.VERL_REQUIREMENT in install
+    assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     assert "liger-kernel" in install
     assert "bitsandbytes>=0.49" in install
     assert "qwen-vl-utils" in install
@@ -185,6 +185,44 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     # the stamp is written only after a successful install, so a crashed install is never reused.
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_REQUIREMENT
+
+
+def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch, tmp_path):
+    # grpo used to stay in flash's own interpreter, so this fallback only ever had to satisfy sft and
+    # opd. now every backend routes through it, and Dockerfile.worker records what a verl-only install
+    # yields: `main_ppo` dies on ModuleNotFoundError cachetools, `main_ppo_sync` on uvicorn. verl
+    # declares none of vllm/cachetools/uvicorn/fastapi yet imports them at module level on the launch
+    # path, so an install of VERL_REQUIREMENT alone provisions an interpreter that cannot launch.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    install = calls[1]
+    # the [vllm] extra, as Dockerfile.worker's VERL_SPEC asks for it, on the same commit.
+    assert f"verl[vllm] @ {vc.VERL_REQUIREMENT_URL}" in install
+    # the extra's own ceiling is vllm<=0.12.0, which registers neither Qwen3.5 arch. pin past it.
+    assert "vllm==0.19.1" in install
+    for module in ("cachetools", "uvicorn", "fastapi"):
+        assert module in install, f"verl imports {module} at module level but never declares it"
+    # opd's entrypoint calls tq.init()/tq.close() and verl's setup.py omits TransferQueue.
+    assert "TransferQueue==0.1.7" in install
+
+
+def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_path):
+    # the stamp gates rebuilds. if it recorded the extra-bearing spec while VERL_REQUIREMENT stayed
+    # bare, every later call would see a mismatch and rebuild the venv from scratch on a paid pod.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+    assert (tmp_path / "verl-venv" / "flash-verl-requirement").read_text() == vc.VERL_REQUIREMENT
+
+    (tmp_path / "verl-venv" / "bin" / "python").write_text("")
+    vc.resolve_verl_python(str(tmp_path))
+    assert len(calls) == 2, "a venv built from the current pin must not be rebuilt"
 
 
 def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatch, tmp_path):
@@ -266,7 +304,7 @@ def test_resolve_verl_python_installs_wandb_best_effort_when_requested(
 
     vc.resolve_verl_python(str(tmp_path), install_wandb=True)
 
-    assert vc.VERL_REQUIREMENT in calls[1][0]
+    assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1][0])
     assert calls[2] == (
         ["uv", "pip", "install", "--python", str(tmp_path / "verl-venv/bin/python"), "wandb"],
         False,
