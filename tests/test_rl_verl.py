@@ -1048,6 +1048,13 @@ class _OverflowingBreakdownEnv:
         return {"success": hit, "enormous": 10**400, "total": hit}
 
 
+class _UnusableComponentEnv:
+    """Emits a component whose value never coerces to a finite float, alongside a usable one."""
+
+    def scores_breakdown(self, graded, ex, state):
+        return {"broken": None, "diverged": float("nan"), "quality": 0.5, "total": 1.0}
+
+
 class _BadTotalEnv:
     def scores_breakdown(self, graded, ex, state):
         return {"success": 1.0, "total": "not-a-number"}
@@ -3907,6 +3914,143 @@ def test_the_published_metric_bound_survives_a_value_too_large_to_be_a_float():
     from flash.engine.worker.heartbeat import _bounded_reward_metrics
 
     assert _bounded_reward_metrics({"huge": 10**400, "fine": 0.25}) == {"fine": 0.25}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_step_line_names_the_generation_the_count_already_sealed():
+    """A counted seal publishes under the buffer's OWN ordinal, which is only a guess at what verl
+    logged -- it counts from 1 and assumes no skipped or resumed steps. The arriving line carries
+    the real number, so dropping the relabel would stamp every sample with a step the run never
+    logged, and a reader correlating samples against the loss curve would line them up wrong."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score(0, "7")
+    score(0, "7")
+
+    # verl resumed from a checkpoint: its first logged step is 41, not the buffer's internal 1.
+    buffer.close_generation(41)
+
+    assert {
+        s["generated_at_step"] for s in buffer.heartbeat_fields()["sampled_completions"]
+    } == {41}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_counted_seal_does_not_disarm_the_boundary_for_later_generations():
+    """`_sealed_by_count` holds the generations the count sealed, waiting to be named. A step line
+    that names one without taking it off the queue turns every later `close_generation` into a
+    relabel of the same entry, so from the second generation on the buffer publishes nothing new --
+    metrics frozen at generation 1 while the run continues."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    for _ in range(2):
+        score(0, "7")
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 1.0
+
+    for _ in range(2):
+        score(0, "wrong")
+    buffer.close_generation(2)
+
+    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 0.0, "boundary went dead"
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_generation_short_of_its_count_is_still_sealed_by_the_step_line():
+    """The count seals a FULL generation; the step line is what seals a short one. If a named
+    generation stays on `_sealed_by_count`, the next `close_generation` relabels it instead of
+    sealing what is open -- so a generation that lost a completion (a `_score` that raised before
+    reaching the bridge) republishes the PREVIOUS generation's numbers under the new step, and
+    carries its samples forward. The run reads as healthy at exactly the step where grading broke."""
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    for _ in range(2):
+        score(0, "7")
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 1.0
+
+    # one of the two completions never reached the bridge, so the count cannot fire
+    score(0, "wrong")
+    buffer.close_generation(2)
+
+    fields = buffer.heartbeat_fields()
+    assert fields["reward_metrics"]["success"] == 0.0, "stale generation republished as step 2"
+    assert len(fields["sampled_completions"]) == 1, "generation 1's samples leaked into 2"
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_completion_that_failed_scoring_still_counts_toward_the_denominator():
+    """A completion the env could not grade contributes no breakdown but is still part of the
+    generation. Counting only the ones that produced a dict would divide by the scored subset --
+    biasing every named metric HIGH exactly when scoring is degraded, so a half-broken env reports
+    the same number as a healthy one."""
+    buffer = RewardObservabilityBuffer()
+    buffer.record("prompt-0", "a", 1.0, [{"success": 1.0, "total": 1.0}])
+    buffer.record("prompt-0", "b", 0.0, [None])
+    buffer.close_generation(1)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 0.5}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_component_whose_values_are_all_unusable_is_reported_as_zero_not_dropped():
+    """Registering a name only once one of its values coerces would delete the component from the
+    payload entirely -- and an env whose component is broken for the WHOLE generation is exactly
+    when someone needs to see it. A flat 0 reads as "this scored nothing"; absence is
+    indistinguishable from "this env has no such component"."""
+    score, buffer = _score_buffer(_UnusableComponentEnv())
+    score(0, "7")
+    buffer.close_generation(1)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {
+        "broken": 0.0,
+        "diverged": 0.0,
+        "quality": 0.5,
+    }
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_generation_that_reports_no_components_at_all_leaves_the_metrics_standing():
+    """"No breakdowns" and "breakdowns that all failed" look the same at the seal but mean opposite
+    things. A multi-turn episode grades to a scalar and never reports components, so zeroing the
+    known metrics for it would publish a scoring outage the env never had -- and the two record
+    paths share one buffer, so a run that scores some rows per-completion and some per-episode
+    would flip its metrics to 0 on every episode generation."""
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "a", 1.0, [{"success": 1.0, "total": 1.0}])
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}
+
+    buffer.record("p", "b", 1.0)  # a scored episode, no per-completion breakdown to report
+    buffer.close_generation(2)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}, "read as an outage"
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_one_non_finite_score_cannot_poison_a_whole_components_mean():
+    """Summing a NaN in makes the running total NaN forever: every later completion adds to it and
+    the name publishes NaN for the rest of the generation. One diverged grading would take out a
+    component that scored fine on every other completion -- and `json.dumps` writes bare `NaN`,
+    which is not JSON, so a strict reader rejects the whole heartbeat over it."""
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "a", 1.0, [{"quality": 1.0, "total": 1.0}])
+    buffer.record("p", "b", 1.0, [{"quality": float("nan"), "total": 1.0}])
+    buffer.record("p", "c", 1.0, [{"quality": 1.0, "total": 1.0}])
+    buffer.close_generation(1)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"quality": 2.0 / 3.0}
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_the_published_payload_is_read_under_one_acquisition():
+    """Both fields describe the same generation, so reading them under separate acquisitions lets a
+    seal land between the two and the payload tears: metrics from generation N+1 shipped beside
+    samples from N. Asserted on the source because reproducing the interleave needs a scoring
+    thread to win a specific race -- a test that passes when it loses proves nothing."""
+    body = inspect.getsource(RewardObservabilityBuffer.heartbeat_fields)
+    snapshot = body[body.index("with self._lock:") : body.index("fields: dict = {}")]
+
+    assert snapshot.count("with self._lock:") == 1, "the two reads can straddle a seal"
+    assert "self._latest_metrics" in snapshot
+    assert "self._published" in snapshot
 
 
 def test_the_generation_size_is_the_configured_rollout_count():
