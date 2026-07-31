@@ -341,25 +341,34 @@ _Observation = tuple[str, str, tuple[str, ...]]
 
 
 def _content_shape(content: object) -> tuple[str, ...]:
-    """The kinds of NON-TEXT block a message's content carries, in order.
+    """The kinds of NON-TEXT block a message's content carries, with adjacent text collapsed to one
+    marker so their POSITIONS survive.
 
-    Text blocks are left out, so text-only content flattens to ``()`` however it is expressed: a
-    plain string and a lone text block compare equal, and so do two text blocks against the one
-    string that concatenates to the same thing. ``_message_text`` already carries that text, and it
-    joins the blocks, so counting them here would report a faithful replay as `partial_replay`
-    purely for splitting its text differently -- dropping it from the control gate and letting a
-    flat-zero grader pass unreported (cursor).
+    Runs of text are normalized rather than dropped. Dropping them entirely made ``[image, text]``
+    and ``[text, image]`` both read as ``("image_url",)``, so an env that reorders an image relative
+    to its caption admitted a materially different transcript to the control gate -- an order-aware
+    grader scores that "gold" rollout like the controls and reports a working env as flat
+    (codex[bot]). Collapsing instead keeps the two distinguishable as ``("image_url", "text")`` and
+    ``("text", "image_url")``.
 
-    What is left is exactly what ``_message_text`` discards: an image, audio, or any other block
-    whose payload no amount of extracted text represents.
+    Collapsing is what keeps the earlier invariant: text-only content is ``("text",)`` however it is
+    expressed, so a plain string, a lone text block, and two blocks that concatenate to the same
+    thing all compare equal. ``_message_text`` already carries that text and joins the blocks, so
+    counting them here would report a faithful replay as `partial_replay` purely for splitting its
+    text differently (cursor).
     """
     if not isinstance(content, list):
-        return ()
-    return tuple(
-        str(block.get("type"))
-        for block in content
-        if isinstance(block, dict) and block.get("type") != "text"
-    )
+        # a plain string is one run of text, and reads the same as content expressing it as blocks.
+        return ("text",) if str(content or "") else ()
+    shape: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = "text" if block.get("type") == "text" else str(block.get("type"))
+        if kind == "text" and shape and shape[-1] == "text":
+            continue  # one marker per RUN, so splitting the same text differently reads the same
+        shape.append(kind)
+    return tuple(shape)
 
 
 def _observation(message: dict) -> tuple[str, str, tuple[str, ...]]:
@@ -424,6 +433,27 @@ def _observation_blocks(
     return tuple(blocks)
 
 
+def _prompt_prefix_length(driven: list[dict], prompt: list[dict]) -> int:
+    """How many leading messages of ``driven`` are the prompt: ``len(prompt)`` or 0.
+
+    The adapter seeds its transcript from the prompt (flash/envs/adapter.py:392), so for that shape
+    the opening is exactly the first ``len(prompt)`` entries. But the production driver accepts a
+    state whose ``messages`` holds only the recorded turns, taking the opening from a separate
+    ``prompt`` key instead (flash/engine/multiturn_rollout.py:171-175). Skipping unconditionally
+    there removed real completion messages, shifting every block and marking an exact replay
+    `partial_replay` -- which drops it from the control gate and lets a flat-zero grader pass
+    unreported (codex[bot]).
+
+    So the prefix is verified rather than assumed, and only by what ``_observation`` compares: role,
+    text, and block shape. Comparing whole dicts would fail on any per-call key the env is free to
+    regenerate, reintroducing the same false exclusion one level down.
+    """
+    if len(driven) < len(prompt):
+        return 0
+    opening = [_observation(m) for m in driven[: len(prompt)]]
+    return len(prompt) if opening == [_observation(m) for m in prompt] else 0
+
+
 def _env_turns_reproduce(reference_messages: list[dict], state: dict, prompt: list[dict]) -> bool:
     """Whether the driven rollout's environment-side turns match the reference trajectory's.
 
@@ -469,7 +499,7 @@ def _env_turns_reproduce(reference_messages: list[dict], state: dict, prompt: li
     # trailing reply -- marking a faithful replay unreproduced, and letting a coincidental trailing
     # match hide a divergence earlier in the trajectory (cursor).
     driven = state.get("messages") or []
-    completion = _observation_blocks(driven, skip_messages=len(prompt))
+    completion = _observation_blocks(driven, skip_messages=_prompt_prefix_length(driven, prompt))
     # a reference recording more turns than were driven cannot match either way.
     if len(completion) < len(reference):
         return False

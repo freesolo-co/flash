@@ -2220,6 +2220,141 @@ def test_an_observation_that_dropped_an_image_is_not_a_faithful_replay(
     assert "cannot rank completions" not in capsys.readouterr().err
 
 
+def test_a_reordered_image_is_not_a_faithful_replay(monkeypatch, tmp_path, capsys):
+    # one step past the dropped-image case: filtering every text block out of the shape also erased
+    # WHERE the non-text blocks sat, so [image, text] and [text, image] both read as
+    # ("image_url",). an env that reorders an image relative to its caption then admitted a
+    # materially different transcript to the control gate, where an order-aware grader scores the
+    # supposed gold replay like the controls and reports a working env as flat (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _ReorderedImageEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {
+                            "role": "user",
+                            # the gold records the image BEFORE its caption.
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": "https://x.test/a.png"}},
+                                {"type": "text", "text": "continue"},
+                            ],
+                        },
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            # the live env emits the same blocks in the opposite order: identical text, identical
+            # set of block kinds, different transcript.
+            reply = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "continue"},
+                    {"type": "image_url", "image_url": {"url": "https://x.test/a.png"}},
+                ],
+            }
+            messages.append(reply)
+            return [reply]
+
+        def reward(self, completion, example, state=None):
+            return 0.0
+
+    _patch_loader(monkeypatch, _ReorderedImageEnv())
+
+    # excluded rather than counted as evidence, so the flat-zero grader is not reported against it.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_a_completion_only_message_list_is_aligned_without_skipping_real_turns(
+    monkeypatch, tmp_path, capsys
+):
+    # the production driver takes the opening from `prompt` when it is present and does NOT require
+    # `messages` to duplicate it (flash/engine/multiturn_rollout.py:171-175). skipping len(prompt)
+    # unconditionally therefore removed real completion messages from such a state, shifting every
+    # block and marking an exact replay partial_replay -- dropping it from the control gate, where a
+    # flat-zero grader then passes unreported (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _CompletionOnlyStateEnv(_MultiTurnEnv):
+        def new_rollout_state(self, example):
+            state = super().new_rollout_state(example)
+            state["messages"] = []  # `prompt` carries the opening; `messages` records turns only
+            return state
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def reward(self, completion, example, state=None):
+            # flat: the run must REPORT this, which it can only do if the replay was admitted.
+            return 0.0
+
+    _patch_loader(monkeypatch, _CompletionOnlyStateEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
+def test_the_prompt_prefix_is_recognized_through_a_regenerated_per_call_key(
+    monkeypatch, tmp_path, capsys
+):
+    # the prefix check must read the prompt the same way the rest of the comparison does: role, text,
+    # and block shape. comparing whole dicts would fail on any per-call key the env regenerates when
+    # it seeds its transcript -- the prefix would then go unrecognized, no messages would be skipped,
+    # and the prompt itself would be compared against the reference's observations, marking an exact
+    # replay partial_replay. that is the same false exclusion `tool_call_id` already caused one level
+    # up, and it drops the episode from the control gate.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ReseededPromptEnv(_MultiTurnEnv):
+        def new_rollout_state(self, example):
+            state = super().new_rollout_state(example)
+            # the transcript is seeded from the prompt but stamped afresh, exactly as an env that
+            # mints an id per rollout would. identical under (role, text, shape); not `==`.
+            state["messages"] = [
+                {**dict(message), "request_id": f"req-{index}"}
+                for index, message in enumerate(state["prompt"])
+            ]
+            return state
+
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "first"},
+                        {"role": "user", "content": "continue"},
+                        {"role": "assistant", "content": "second"},
+                    ],
+                }
+            ]
+
+        def reward(self, completion, example, state=None):
+            # flat, so it is only REPORTED if the replay was admitted to the gate.
+            return 0.0
+
+    _patch_loader(monkeypatch, _ReseededPromptEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    assert "cannot rank completions" in capsys.readouterr().err
+
+
 def test_a_per_call_tool_id_does_not_make_a_faithful_replay_partial(monkeypatch, tmp_path, capsys):
     # the opposite direction, pinning what the comparison must NOT read. a fresh tool_call_id per
     # call is ordinary and two faithful runs of the same env differ in it, so comparing whole
