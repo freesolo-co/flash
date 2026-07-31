@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import ClassVar
 
+import pytest
+
 import flash.serve.deploy as deploy
 
 
@@ -54,8 +56,9 @@ def test_an_explicitly_empty_reasoning_string_still_gets_a_balanced_pair():
     the model having answered correctly.
     """
     assert (
-        deploy._balanced_thinking_content({"content": "plain", "reasoning_content": ""},
-                                          thinking=True)
+        deploy._balanced_thinking_content(
+            {"content": "plain", "reasoning_content": ""}, thinking=True
+        )
         == "<think></think>plain"
     )
 
@@ -66,7 +69,9 @@ def test_content_that_already_closes_a_block_is_not_nested_again():
     # string verbatim, which left `reasoned</think>answer`: a close with nothing opening it, i.e.
     # exactly the malformed completion this helper exists to repair.
     message = {"content": "reasoned</think>answer", "reasoning_content": "reasoned"}
-    assert deploy._balanced_thinking_content(message, thinking=True) == "<think>reasoned</think>answer"
+    assert (
+        deploy._balanced_thinking_content(message, thinking=True) == "<think>reasoned</think>answer"
+    )
 
 
 def test_a_bare_inline_close_is_reopened_rather_than_treated_as_balanced():
@@ -340,6 +345,95 @@ def test_a_legacy_inline_stream_delimiter_split_across_deltas_is_still_found():
         "".join(deploy._openai_stream_content(iter(lines), thinking=True))
         == "<think>reasoned</think>answer"
     )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ["</think>answer"],
+        ["</th", "ink>answer"],
+        ["<", "/think>", "answer"],
+    ],
+    ids=["whole", "split-once", "split-twice"],
+)
+def test_a_whitespace_delta_keeps_buffering_until_the_close_arrives(tail):
+    """Whitespace ahead of the retained close is part of the delimiter, on its own delta too.
+
+    The model samples the close on its own line, and a backend may put that newline in a delta by
+    itself. An empty `strip()` failed the "could this still be the tag" test, so the newline was
+    released as answer text and every following piece treated as answer, yielding
+    `<think>reasoned</think>\\n</think>answer` -- both previously fixed shapes combined
+    (codex[bot]).
+    """
+    lines = _sse(
+        {"reasoning_content": "reasoned"}, {"content": "\n"}, *({"content": t} for t in tail)
+    )
+    out = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+
+    assert out == "<think>reasoned</think>answer"
+    assert out.count("</think>") == 1
+
+
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        ["reasoned</think>answer"],
+        ["reas", "oned</think>", "answer"],
+        ["reasoned\n</think>answer"],
+        ["reasoned", "\n", "</think>", "answer"],
+    ],
+    ids=["whole", "split-body", "sampled-newline", "split-everywhere"],
+)
+def test_streamed_reasoning_repeated_inline_is_kept_once(deltas):
+    """The duplicate-reasoning shape the non-streaming path already folds.
+
+    A compatibility build emits the reasoning on the field AND repeats it inline ahead of the
+    retained close. `_is_sampled_delimiter` recognises that prefix, but the streaming helper only
+    recognised whitespace, so it returned the content whole and the caller received the reasoning
+    twice and the close twice (codex[bot]).
+    """
+    lines = _sse({"reasoning_content": "reasoned"}, *({"content": d} for d in deltas))
+    out = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+
+    assert out == "<think>reasoned</think>answer"
+    assert out.count("reasoned") == 1
+    assert out.count("</think>") == 1
+
+
+def test_an_answer_that_merely_starts_like_the_reasoning_is_not_stripped():
+    # the duplicate rule keys on the reasoning being repeated BEFORE the close, so an answer that
+    # happens to share a prefix with it must still arrive whole -- and must not be held waiting for
+    # a delimiter that is not coming.
+    lines = _sse({"reasoning_content": "rea"}, {"content": "reactor design"})
+
+    assert "".join(deploy._openai_stream_content(iter(lines), thinking=True)) == (
+        "<think>rea</think>reactor design"
+    )
+
+
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        ["reasoned</think>answer <think>x</think> more"],
+        ["reasoned</think>answer <think>x", "</think> more"],
+    ],
+)
+def test_a_legacy_close_is_reopened_even_when_the_answer_holds_its_own_pair(deltas):
+    """A pair further down the answer must not disarm the re-open.
+
+    The guard asks whether the close it found is already matched, and any pair anywhere answered
+    yes. So `reasoned</think>answer <think>x</think> more` streamed with its leading close still
+    unopened -- exactly the skew the re-open exists for, switched off by an answer-side pair
+    (cursor).
+    """
+    lines = _sse(*({"content": d} for d in deltas))
+    joined = "".join(deltas)
+    streamed = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+
+    assert streamed == "<think>reasoned</think>answer <think>x</think> more"
+    assert streamed.count("<think>") == streamed.count("</think>")
+    # the two paths must keep agreeing on this shape, which is the invariant the re-open was for.
+    assert streamed == deploy._balanced_thinking_content({"content": joined}, thinking=True)
 
 
 def test_a_thinking_stream_that_never_closes_is_not_wrapped():
