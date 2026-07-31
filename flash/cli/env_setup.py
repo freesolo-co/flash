@@ -85,7 +85,7 @@ published beside environment.py by `flash env push --project PROJECT_UUID --name
 
 from __future__ import annotations
 
-from flash.envs.evaluations import BaseEvalSuite, EvalCase
+from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult
 
 
 class StarterEvaluationSuite(BaseEvalSuite):
@@ -102,7 +102,19 @@ class StarterEvaluationSuite(BaseEvalSuite):
             return super().score(case, response)
         example = dict(case.metadata or {})
         example.update(input=case.input, output=case.expected)
-        return self.environment.reward(response, example)
+        # pass/fail comes from grade(), the environment's own success decision, not from the
+        # reward being positive. a shaped reward pays partial credit for a wrong answer -- the
+        # multi-turn starter scores a near miss as closeness * 0.5 with success=False -- and
+        # returning the bare float would report every such case as passing.
+        #
+        # this scores the response twice. if your scorer calls a judge or any other paid
+        # service, score once and build the EvalResult from that single result instead.
+        return EvalResult(
+            case_id=case.id or "case",
+            passed=self.environment.grade(response, example),
+            score=float(self.environment.reward(response, example)),
+            response=response,
+        )
 
 
 def load_evaluations(environment=None):

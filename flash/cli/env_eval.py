@@ -20,7 +20,7 @@ from flash.envs.evaluations import (
 )
 
 from . import render
-from .env_test import _env_params
+from .env_test import _env_params, _evaluation_example
 from .envpush import _err, _resolve_local_env_entrypoint
 
 _MAX_CONCURRENCY = 32
@@ -61,11 +61,37 @@ def _generation_error(case_id: str, message: str) -> EvalResult:
     )
 
 
-def _generate_response(client, target: str, case: EvalCase, args) -> str:
+def _case_messages(environment, case: EvalCase) -> list[dict]:
+    """The chat messages one case is evaluated on.
+
+    Training never sends the raw input: every path goes through `env.prompt_messages(example)`,
+    which runs the environment's own `start_episode` and injects the training contract as the
+    system prompt (flash/envs/adapter.py). Sending only `case.input` would grade the model on a
+    prompt no run ever trains on, so a suite could fail purely because the system instructions
+    the model was trained under were absent."""
+    build = getattr(environment, "prompt_messages", None)
+    if not callable(build):
+        return [{"role": "user", "content": case.input}]
+    messages = build(_evaluation_example(case))
+    if not isinstance(messages, list) or not messages:
+        raise TypeError(
+            f"environment prompt_messages() returned {type(messages).__name__}, "
+            "expected a non-empty list of chat messages"
+        )
+    for message in messages:
+        if not isinstance(message, dict):
+            raise TypeError(
+                f"environment prompt_messages() returned a {type(message).__name__} message, "
+                "expected dicts with role and content"
+            )
+    return [dict(message) for message in messages]
+
+
+def _generate_response(client, target: str, messages: list[dict], args) -> str:
     chunks: list[str] = []
     for chunk in client.chat_stream(
         target,
-        messages=[{"role": "user", "content": case.input}],
+        messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
     ):
@@ -82,13 +108,13 @@ def _generate_response(client, target: str, case: EvalCase, args) -> str:
     return response
 
 
-def _generate_case(client, target: str, case: EvalCase, args) -> tuple[str, str | None]:
+def _generate_case(client, target: str, messages: list[dict], args) -> tuple[str, str | None]:
     """Generate one response. Returns (response, error); only this half runs off-thread.
 
     SystemExit derives from BaseException, so an environment or client that calls sys.exit()
     would otherwise tear down the whole suite mid-run and lose every case already graded."""
     try:
-        return _generate_response(client, target, case, args), None
+        return _generate_response(client, target, messages, args), None
     except (Exception, SystemExit) as exc:
         return "", f"generation failed: {str(exc) or exc.__class__.__name__}"
 
@@ -120,6 +146,25 @@ def _resolve_case(suite, case: EvalCase, case_id: str, generated: tuple[str, str
     return _score_case(suite, case, case_id, response)
 
 
+def _live_deployment(client, run_id: str) -> dict | None:
+    """The revision a bare run id currently serves, whatever step it is on.
+
+    `deployment_for` resolves an EXACT revision, so asking it for a bare run id means "the final
+    adapter" (step None) and it rejects a run serving `RUN/step-N`. That would report a deployed
+    run as undeployed and refuse to evaluate a model `flash chat RUN` talks to happily. Match on
+    the run id alone, exactly as `_rollback_record` does for the same reason
+    (flash/cli/commands.py)."""
+    for entry in client.deployments() or ():
+        listed = entry.get("deployment") or {}
+        if run_id not in (listed.get("run_id"), entry.get("run_id")):
+            continue
+        # the listing omits undeployed/dry_run rows, so anything here is servable.
+        if not listed.get("run_id") and entry.get("run_id"):
+            listed = {**listed, "run_id": entry["run_id"]}
+        return listed
+    return None
+
+
 def _case_ids(cases: list[EvalCase]) -> list[str]:
     """Stable per-case ids, disambiguating sidecars that reuse one id across cases.
 
@@ -145,23 +190,47 @@ def _case_ids(cases: list[EvalCase]) -> list[str]:
     return ids
 
 
-def _run_cases(client, target: str, suite, cases: list[EvalCase], args) -> tuple[EvalResult, ...]:
+def _build_messages(environment, case: EvalCase) -> tuple[list[dict], str | None]:
+    """Render one case's prompt on the caller's thread, reporting failure as that case's error.
+
+    Built here rather than inside the worker for the same reason scoring is: prompt_messages
+    runs the environment's own `start_episode`, which is user code. A raise must fail its own
+    case, not the whole suite."""
+    try:
+        return _case_messages(environment, case), None
+    except (Exception, SystemExit) as exc:
+        reason = str(exc) or exc.__class__.__name__
+        return [], f"prompt construction failed: {reason}"
+
+
+def _run_cases(
+    client, target: str, suite, cases: list[EvalCase], args, environment=None
+) -> tuple[EvalResult, ...]:
     case_ids = _case_ids(cases)
+    prompts = [_build_messages(environment, case) for case in cases]
     if args.concurrency == 1 or len(cases) <= 1:
         return tuple(
-            _resolve_case(suite, case, case_id, _generate_case(client, target, case, args))
-            for case, case_id in zip(cases, case_ids, strict=True)
+            _resolve_case(
+                suite,
+                case,
+                case_id,
+                (("", error) if error else _generate_case(client, target, messages, args)),
+            )
+            for case, case_id, (messages, error) in zip(cases, case_ids, prompts, strict=True)
         )
 
-    generated: list[tuple[str, str | None] | None] = [None] * len(cases)
+    generated: list[tuple[str, str | None] | None] = [
+        ("", error) if error else None for _messages, error in prompts
+    ]
     # cancel_futures drops everything still queued on Ctrl-C. without it the interrupt is
     # only raised after every already-submitted request drains, so a --concurrency 32 run
     # over hundreds of cases keeps buying generations for minutes after the user stopped it.
     pool = ThreadPoolExecutor(max_workers=min(args.concurrency, len(cases)))
     try:
         futures = {
-            pool.submit(_generate_case, client, target, case, args): index
-            for index, case in enumerate(cases)
+            pool.submit(_generate_case, client, target, messages, args): index
+            for index, (messages, error) in enumerate(prompts)
+            if error is None
         }
         for future in as_completed(futures):
             generated[futures[future]] = future.result()
@@ -342,7 +411,7 @@ def cmd_env_eval(args) -> int:
     if revision is None and parsed is not None and parsed[1] is None:
         run_id = parsed[0]
         try:
-            deployment = client.deployment_for(run_id)
+            deployment = _live_deployment(client, run_id)
         except (ApiError, ClientError) as exc:
             if getattr(args, "debug", False):
                 raise
@@ -418,7 +487,7 @@ def cmd_env_eval(args) -> int:
             continue
         if args.max_cases is not None:
             cases = cases[: args.max_cases]
-        results = _run_cases(client, evaluation_target, suite, cases, args)
+        results = _run_cases(client, evaluation_target, suite, cases, args, environment)
         for result in results:
             _print_case(result)
         report = EvalSuiteReport(name=suite.name, results=results)
