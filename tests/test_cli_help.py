@@ -86,6 +86,15 @@ def test_grouped_command_argparse_contracts() -> None:
     assert args.message == "hello"
     assert args.func is cli.cmd_chat
 
+    args = parser.parse_args(
+        ["env", "eval", "run-1", "./my-env", "--suite", "math", "--concurrency", "4"]
+    )
+    assert args.target == "run-1"
+    assert args.path == "./my-env"
+    assert args.suite == "math"
+    assert args.concurrency == 4
+    assert args.func is cli.cmd_env_eval
+
     args = parser.parse_args(["projects", "list"])
     assert args.func is cli.cmd_projects_list
 

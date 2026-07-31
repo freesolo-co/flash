@@ -14,9 +14,7 @@ class _SingleTurnEnv:
     max_turns = 8
 
     def __init__(self, *, rows=None, reward=1.0):
-        self.rows = (
-            [{"input": "what is 2 + 2?", "output": "4"}] if rows is None else rows
-        )
+        self.rows = [{"input": "what is 2 + 2?", "output": "4"}] if rows is None else rows
         self.reward_value = reward
         self.completions: list[str] = []
 
@@ -251,9 +249,57 @@ def test_env_test_single_turn_replays_reference_and_passes(monkeypatch, tmp_path
     assert "overall: PASS" in out
 
 
-def test_env_test_auto_falls_back_to_echo_for_empty_reference(
-    monkeypatch, tmp_path, capsys
-):
+def test_env_test_without_evaluations_keeps_output_byte_identical(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "episode 1: policy=replay turns=1 reward=1.000000\n"
+        "  prompt: user: what is 2 + 2?\n"
+        "  response: 4\n"
+        "1/1 episodes passed contract checks\n"
+        "overall: PASS\n"
+    )
+    assert captured.err == ""
+
+
+def test_env_test_validates_evaluation_sidecar_offline(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'held-out'\n"
+        "    def cases(self): return [EvalCase(input='what is 2 + 2?', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    output = capsys.readouterr().out
+    assert (
+        "evaluation suite held-out: 1/1 cases passed contract checks mean_score=1.000000" in output
+    )
+    assert "overall: PASS" in output
+
+
+def test_env_test_malformed_evaluation_sidecar_fails(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    sidecar = env_dir / "evaluations.py"
+    sidecar.write_text("EVALUATIONS = [object()]\n")
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    assert str(sidecar) in captured.err
+    assert "non-empty string name" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_auto_falls_back_to_echo_for_empty_reference(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "say anything", "output": ""}], reward=0.0)
     _patch_loader(monkeypatch, env)
@@ -345,9 +391,7 @@ def test_env_test_multi_turn_terminates_and_scores(monkeypatch, tmp_path, capsys
     assert "1/1 episodes passed contract checks" in out
 
 
-def test_env_test_multi_turn_replays_text_free_turn_positionally(
-    monkeypatch, tmp_path, capsys
-):
+def test_env_test_multi_turn_replays_text_free_turn_positionally(monkeypatch, tmp_path, capsys):
     # dropping the null tool-call turn would shift "third" into its slot and misgrade; the
     # driver must replay ["first", "", "third"] positionally.
     env_dir = _environment_dir(tmp_path)
@@ -450,9 +494,7 @@ def test_env_test_malformed_prompt_fails_contract(monkeypatch, tmp_path, capsys)
     assert "overall: FAIL" in captured.err
 
 
-def test_env_test_multi_turn_malformed_env_reply_fails_contract(
-    monkeypatch, tmp_path, capsys
-):
+def test_env_test_multi_turn_malformed_env_reply_fails_contract(monkeypatch, tmp_path, capsys):
     # a non-empty but malformed env reply must fail the episode: those messages become
     # chat-template input for the next turn in the real rollout and would break remotely
     env_dir = _environment_dir(tmp_path)

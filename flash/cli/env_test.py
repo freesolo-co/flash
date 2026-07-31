@@ -21,9 +21,7 @@ def _check_messages(messages: object, label: str) -> list[dict]:
         raise ValueError(f"{label} is not well-formed: {label} must be a non-empty list")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
-            raise ValueError(
-                f"{label} is not well-formed: {label} message {index} must be a dict"
-            )
+            raise ValueError(f"{label} is not well-formed: {label} message {index} must be a dict")
         role = message.get("role")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(
@@ -32,8 +30,7 @@ def _check_messages(messages: object, label: str) -> list[dict]:
             )
         if role.strip().lower() not in _ALLOWED_ROLES:
             raise ValueError(
-                f"{label} is not well-formed: {label} message {index} "
-                f"has unsupported role {role!r}"
+                f"{label} is not well-formed: {label} message {index} has unsupported role {role!r}"
             )
         if "content" not in message:
             raise ValueError(
@@ -182,6 +179,73 @@ def _load_failure(reason: str) -> int:
     return _err("overall: FAIL")
 
 
+def _evaluation_example(case) -> dict:
+    example = dict(case.metadata or {})
+    example["input"] = case.input
+    example["output"] = case.expected
+    if case.id is not None:
+        example["id"] = case.id
+    return example
+
+
+def _evaluation_response(env, case) -> tuple[str, str]:
+    reference_turns = _reference_turns(env, _evaluation_example(case))
+    policy = _resolve_policy(reference_turns)
+    response = (
+        "\n".join(turn for turn in reference_turns if turn)
+        if policy == "replay"
+        else _ECHO_RESPONSE
+    )
+    return policy, response
+
+
+def _check_evaluation_suites(entrypoint: Path, env) -> bool:
+    from flash.envs.evaluations import (
+        _DEFAULT_EVALUATIONS_PATH,
+        EvalSuiteReport,
+        has_evaluations,
+        load_evaluation_suites,
+        normalize_eval_result,
+        validate_evaluation_cases,
+    )
+
+    if not has_evaluations(entrypoint):
+        return True
+    source = entrypoint.parent / _DEFAULT_EVALUATIONS_PATH
+    try:
+        suites = load_evaluation_suites(entrypoint, environment=env)
+    except (Exception, SystemExit) as exc:
+        reason = str(exc) or exc.__class__.__name__
+        _err(f"evaluation checks failed: {reason}")
+        return False
+
+    all_valid = True
+    for suite in suites:
+        results = []
+        try:
+            cases = validate_evaluation_cases(suite, source=source)
+            for index, case in enumerate(cases, start=1):
+                _policy, response = _evaluation_response(env, case)
+                scored = suite.score(case, response)
+                result = normalize_eval_result(
+                    case,
+                    response,
+                    scored,
+                    case_id=case.id or str(index),
+                )
+                results.append(result)
+            report = EvalSuiteReport(name=suite.name, results=tuple(results))
+            print(
+                f"evaluation suite {suite.name}: {report.total}/{report.total} cases "
+                f"passed contract checks mean_score={report.mean_score:.6f}"
+            )
+        except (Exception, SystemExit) as exc:
+            all_valid = False
+            reason = str(exc) or exc.__class__.__name__
+            _err(f"evaluation suite {suite.name} failed contract checks: {reason}")
+    return all_valid
+
+
 def cmd_env_test(args) -> int:
     """Load a local environment and drive deterministic offline contract checks.
 
@@ -242,8 +306,7 @@ def cmd_env_test(args) -> int:
         passed += 1
         if record["policy"] == "replay" and reward is not None and reward <= 0.0:
             message = (
-                f"replay gold answer scored low (reward={reward:.6f}); "
-                "check the reward function"
+                f"replay gold answer scored low (reward={reward:.6f}); check the reward function"
             )
             print(
                 render.warn(message) if render.styled() else f"warning: {message}",
@@ -252,6 +315,8 @@ def cmd_env_test(args) -> int:
 
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
+        return _err("overall: FAIL")
+    if not _check_evaluation_suites(entrypoint, env):
         return _err("overall: FAIL")
     print(render.ok("overall: PASS") if render.styled() else "overall: PASS")
     return 0
