@@ -245,9 +245,14 @@ def _load_active_env():
             "(a Freesolo environment id like 'your-name/your-env', returned by "
             "`flash env push --project <project-uuid> --name <name>`)."
         )
-    return load_environment(
+    env = load_environment(
         env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
     )
+    # tell the env whether this run samples <think> blocks, so the multi-turn scoring path strips
+    # reasoning exactly like the single-turn path does (see FreesoloEnvironment.record_model_turn).
+    if hasattr(env, "thinking"):
+        env.thinking = bool(JOB_SPEC.thinking)
+    return env
 
 
 ACTIVE_ENV = None
