@@ -327,6 +327,9 @@ def cmd_env_delete(args) -> int:
 
 
 _ENV_ENTRYPOINT = "environment.py"
+# the held-out evaluation sidecar (flash/envs/evaluations.py). a known filename beside the
+# entrypoint rather than an environment module: never an entrypoint candidate, and carried
+# alongside the entrypoint on a single-file push the way its docs and dataset are.
 _ENV_EVALUATIONS_SIDECAR = "evaluations.py"
 _ENV_SYSPATH_BOOTSTRAP = (
     "import os as _flash_os, sys as _flash_sys\n"
@@ -486,10 +489,14 @@ def _iter_env_sidecar_files(
 
     roots = [env_root]
     if not include_full_tree:
-        # a single-file push carries only the entrypoint, its dataset sidecars, and its own
-        # docs. ship user-authored docs so the synthesized stub readme does not stand in for
-        # real training guidance the user shipped next to the module.
-        for doc_name in ("README.md", "TRAINING.md"):
+        # a single-file push carries only the entrypoint, its dataset sidecars, its own docs,
+        # and its evaluations. ship user-authored docs so the synthesized stub readme does not
+        # stand in for real training guidance the user shipped next to the module.
+        #
+        # evaluations.py rides along for the same reason: `env eval TARGET ./environment.py`
+        # loads the sibling sidecar, so omitting it here published a package whose evaluation
+        # suite passed locally and was simply gone once uploaded (codex[bot]).
+        for doc_name in ("README.md", "TRAINING.md", _ENV_EVALUATIONS_SIDECAR):
             doc = env_root / doc_name
             if doc.is_file() and not _ignore_env_push_path(
                 doc, env_root=env_root, entrypoint=entrypoint
