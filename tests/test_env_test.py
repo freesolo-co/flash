@@ -2782,3 +2782,205 @@ def test_a_reward_coordinate_for_a_turn_that_emitted_text_still_separates(
     args = _args(env_dir, algorithm="grpo", credit_assignment="per_turn")
     assert cmd_env_test(args) == 0, capsys.readouterr().err
     assert "cannot rank completions" not in capsys.readouterr().err
+
+
+def test_a_reward_returning_a_non_number_fails_rather_than_scoring_zero(
+    monkeypatch, tmp_path, capsys
+):
+    # the worker's guard covers the env CALL raising -- it scores that 0.0 and carries on. it does
+    # NOT coerce what reward() returns (flash/engine/worker/rl.py:460-471), so a non-numeric value
+    # is appended to the reward list as-is and aborts the run in trl. catching the conversion error
+    # here as a valid 0.0 control passed an exact-match grader that returns 1.0 for gold and an
+    # accidental string for everything else, which breaks on its first sampled completion
+    # (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _BadReturnEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            return 1.0 if completion == example.get("output") else "oops"
+
+    _patch_loader(monkeypatch, _BadReturnEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "is not a number" in captured.err
+    assert "overall: FAIL" in captured.err
+    assert "overall: PASS" not in captured.out
+
+
+def test_a_reward_raising_is_still_scored_zero_rather_than_failed(monkeypatch, tmp_path, capsys):
+    # the control for the test above, and the behaviour that must survive it. an env that RAISES on
+    # an arbitrary completion is scored 0.0 by the worker and keeps training, so the control is real
+    # evidence of separation and the episode must still pass.
+    env_dir = _environment_dir(tmp_path)
+
+    class _RaisingControlEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            if completion != example.get("output"):
+                raise RuntimeError("no parse")
+            return 1.0
+
+    _patch_loader(monkeypatch, _RaisingControlEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "is not a number" not in captured.err
+
+
+def test_a_non_numeric_breakdown_total_is_still_scored_zero(monkeypatch, tmp_path, capsys):
+    # the asymmetry is deliberate and mirrors the worker: it coerces the breakdown total INSIDE its
+    # own guard, so a bad total there really is scored 0.0 and the run continues. only the plain
+    # reward() return reaches trl uncoerced.
+    env_dir = _environment_dir(tmp_path)
+
+    class _BadBreakdownEnv(_SingleTurnEnv):
+        def scores_breakdown(self, completion, example, state=None):
+            self.completions.append(completion)
+            return {"total": 1.0 if completion == example.get("output") else "oops"}
+
+    _patch_loader(monkeypatch, _BadBreakdownEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "is not a number" not in captured.err
+
+
+def test_a_thinking_run_grades_the_state_the_worker_would_build(monkeypatch, tmp_path, capsys):
+    # with thinking on, the worker strips the reasoning span before grading and passes a
+    # raw/completion/thinking dict alongside it (flash/engine/worker/rl.py:444-461). passing None
+    # and the unprocessed text graded a contract the run does not use, so a scorer reading its state
+    # looked flat here while ranking correctly in production -- the wrong verdict either way
+    # (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _StateReadingEnv(_SingleTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.states: list[dict | None] = []
+
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            self.states.append(state)
+            # only ranks when handed the production state shape.
+            if not isinstance(state, dict):
+                return 0.0
+            return 1.0 if completion == example.get("output") else 0.0
+
+    env = _StateReadingEnv()
+    _patch_loader(monkeypatch, env)
+    args = cli._build_parser().parse_args(["env", "test", str(env_dir), "--algorithm", "grpo", "--thinking"])
+
+    assert args.func(args) == 0, capsys.readouterr().err
+    assert "overall: PASS" in capsys.readouterr().out
+    assert env.states
+    assert all(isinstance(state, dict) for state in env.states)
+    assert set(env.states[0]) == {"raw", "completion", "thinking"}
+
+
+def test_the_graded_text_of_a_thinking_run_has_its_reasoning_removed(monkeypatch, tmp_path, capsys):
+    # the state is only half of it: the worker grades the answer with the <think> span stripped, so
+    # a gold reference carrying reasoning must reach the scorer as its answer alone.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ThinkingGoldEnv(_SingleTurnEnv):
+        def sft_completion(self, example):
+            return [{"role": "assistant", "content": "<think>weighing it up</think>4"}]
+
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            self.last_state = state
+            return 1.0 if completion == "4" else 0.0
+
+    env = _ThinkingGoldEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 0
+    assert env.replayed[0] == "4"
+    assert env.last_state["raw"] == "<think>weighing it up</think>4"
+    assert env.last_state["thinking"] == "weighing it up"
+
+
+def test_a_run_without_thinking_still_grades_the_raw_text_with_no_state(
+    monkeypatch, tmp_path, capsys
+):
+    # the control for the two above. thinking is off by default and the worker then passes None and
+    # grades the completion verbatim, so the flag must change nothing unless it is set.
+    env_dir = _environment_dir(tmp_path)
+
+    class _StateRecordingEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            self.completions.append(completion)
+            self.last_state = state
+            return super().reward(completion, example, state)
+
+    env = _StateRecordingEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert env.last_state is None
+
+
+def test_per_turn_credit_is_refused_for_a_native_tool_environment(monkeypatch, tmp_path, capsys):
+    # a tool env exposing tools is driven through trl's tool loop rather than a rollout_func
+    # (flash/engine/worker/rl.py:814-827), and select_grpo_trainer refuses per-turn credit on that
+    # path. reporting the per-turn reward vectors as evidence passed an environment for a run that
+    # raises before its first step (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _ToolEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            return [lambda x: x]
+
+    _patch_loader(monkeypatch, _ToolEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", credit_assignment="per_turn")) == 1
+    captured = capsys.readouterr()
+    assert "is not supported for tool-calling" in captured.err
+    assert "overall: FAIL" in captured.err
+    # refused before any episode runs: there is no reward evidence worth gathering for a
+    # configuration that cannot reach a first training step.
+    assert "episode 1:" not in captured.out
+
+
+def test_a_tool_environment_on_per_episode_credit_is_not_refused(monkeypatch, tmp_path, capsys):
+    # the control: the refusal is about the per-turn COMBINATION, not about tool envs. the default
+    # mode trains fine on that path and must still be tested.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ToolEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            return [lambda x: x]
+
+    _patch_loader(monkeypatch, _ToolEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", credit_assignment="per_episode")) == 0
+    captured = capsys.readouterr()
+    assert "is not supported for tool-calling" not in captured.err
+    assert "episode 1:" in captured.out
+
+
+def test_a_tool_environment_exposing_no_tools_still_allows_per_turn_credit(
+    monkeypatch, tmp_path, capsys
+):
+    # the other control, and the reason this checks tools() rather than the is_tool_env flag alone:
+    # a tool env with no tools degrades to the rollout_func path, which supports per-turn credit.
+    env_dir = _environment_dir(tmp_path)
+
+    class _ToollessToolEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def tools(self):
+            return []
+
+    _patch_loader(monkeypatch, _ToollessToolEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", credit_assignment="per_turn")) == 0
+    assert "is not supported for tool-calling" not in capsys.readouterr().err

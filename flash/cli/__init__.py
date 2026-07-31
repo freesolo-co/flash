@@ -336,6 +336,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "reward vectors, so only there do they count as the grader separating completions"
         ),
     )
+    env_test.add_argument(
+        "--thinking",
+        action="store_true",
+        help=(
+            "the run enables thinking, matching [train] thinking (default off). the grader is then "
+            "handed the answer with its <think> span removed, plus the raw/completion/thinking "
+            "state the worker builds, so a scorer that reads that state is checked as it runs"
+        ),
+    )
     env_test.set_defaults(func=cmd_env_test)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
