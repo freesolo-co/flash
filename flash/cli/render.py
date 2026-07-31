@@ -90,12 +90,19 @@ def _dim(s: str) -> str:
     return _style("2", s)
 
 
-def format_identity(me: dict) -> str:
-    """Render the stored key's identity as an aligned card (not raw JSON)."""
+def format_identity(me: dict, key_source: str | None = None) -> str:
+    """Render the stored key's identity as an aligned card (not raw JSON).
+
+    ``key_source`` names where the key came from. The org shown here is whichever org that key
+    belongs to, so an ambient ``FREESOLO_API_KEY`` can point every command at a different org than
+    the saved login without any authentication failure. Naming the source makes that visible.
+    """
     rows = [(label, str(me[field])) for field, label in _ROWS if me.get(field)]
     prefix = me.get("key_prefix")
     kind = _KIND_LABEL.get(me.get("kind", ""), me.get("kind") or "api key")
     rows.append(("key", f"{prefix}{_glyph('…', '...')} {_dim(f'({kind})')}" if prefix else kind))
+    if key_source:
+        rows.append(("from", key_source))
     width = max(len(label) for label, _ in rows)
     return "\n".join(f"  {_dim(label.ljust(width))}  {value}" for label, value in rows)
 
@@ -109,8 +116,8 @@ def login_ok(me: dict | None) -> str:
     return _safe(f"{head}\n\n{format_identity(me)}")
 
 
-def whoami(me: dict) -> str:
-    return _safe(f"{_bold('logged in to flash')}\n\n{format_identity(me)}")
+def whoami(me: dict, key_source: str | None = None) -> str:
+    return _safe(f"{_bold('logged in to flash')}\n\n{format_identity(me, key_source)}")
 
 
 def login_failed(reason: str) -> str:
