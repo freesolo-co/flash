@@ -76,6 +76,12 @@ class _MultiTurnEnv:
     def sft_completion(self, example):
         return example["output"]
 
+    def prompt_messages(self, example):
+        # every real env has one: BaseEnvironment defines it (flash/envs/base.py:45) and the grpo
+        # path calls it unconditionally (rl.py:237), so a multi_turn env that also scores natively
+        # is reached through it.
+        return [{"role": "user", "content": example["input"]}]
+
     def new_rollout_state(self, example):
         prompt = [{"role": "user", "content": example["input"]}]
         return {"prompt": prompt, "messages": list(prompt), "done": False, "turn": 0}
@@ -90,7 +96,7 @@ class _MultiTurnEnv:
         state["turn"] += 1
         state["done"] = state["turn"] >= 2
         reply = {"role": "user", "content": "continue"}
-        messages.append(reply)
+        state.setdefault("messages", []).append(reply)
         return [reply]
 
     def rollout_done(self, state, max_turns=None):
@@ -129,7 +135,7 @@ class _TextFreeMultiTurnEnv(_MultiTurnEnv):
         state["turn"] += 1
         state["done"] = state["turn"] >= 3
         reply = {"role": "user", "content": "continue"}
-        messages.append(reply)
+        state.setdefault("messages", []).append(reply)
         return [reply]
 
 
@@ -149,7 +155,7 @@ class _PerExampleCapMultiTurnEnv(_MultiTurnEnv):
     def env_reply(self, messages, state):
         state["turn"] += 1
         reply = {"role": "user", "content": "continue"}
-        messages.append(reply)
+        state.setdefault("messages", []).append(reply)
         return [reply]
 
     def rollout_done(self, state, max_turns=None):
@@ -205,7 +211,7 @@ class _MalformedReplyMultiTurnEnv(_MultiTurnEnv):
         # template on the next turn, so the driver must fail the episode, not pass on it
         state["turn"] += 1
         reply = {"role": "user", "content": 123}
-        messages.append(reply)
+        state.setdefault("messages", []).append(reply)
         return [reply]
 
 
@@ -1805,7 +1811,7 @@ def test_env_turns_that_do_not_reproduce_exclude_the_episode_from_the_gate(
             state["turn"] += 1
             state["done"] = state["turn"] >= 2
             reply = {"role": "user", "content": self.observation}
-            messages.append(reply)
+            state.setdefault("messages", []).append(reply)
             return [reply]
 
         def reward(self, completion, example, state=None):
@@ -1879,7 +1885,7 @@ def test_env_turn_reproduction_is_judged_by_position_not_by_the_transcript_tail(
             state["done"] = state["turn"] >= 2
             reply = {"role": "user", "content": self.replies[self.replied]}
             self.replied += 1
-            messages.append(reply)
+            state.setdefault("messages", []).append(reply)
             return [reply]
 
         def reward(self, completion, example, state=None):
@@ -1946,7 +1952,7 @@ def test_a_system_turn_in_the_reference_is_compared_on_both_sides(monkeypatch, t
                 {"role": "system", "content": "tool budget exceeded"},
                 {"role": "user", "content": "observation-1"},
             ]
-            messages.extend(replies)
+            state.setdefault("messages", []).extend(replies)
             return replies
 
         def reward(self, completion, example, state=None):
@@ -1992,7 +1998,7 @@ def test_an_extra_environment_turn_is_not_a_faithful_replay(monkeypatch, tmp_pat
                 # never recorded in the reference above
                 {"role": "tool", "content": "retrying upstream call"},
             ]
-            messages.extend(replies)
+            state.setdefault("messages", []).extend(replies)
             return replies
 
         def reward(self, completion, example, state=None):
@@ -2083,7 +2089,7 @@ def test_the_same_text_split_into_blocks_is_still_a_faithful_replay(monkeypatch,
                     {"type": "text", "text": "inue"},
                 ],
             }
-            messages.append(reply)
+            state.setdefault("messages", []).append(reply)
             return [reply]
 
         def reward(self, completion, example, state=None):
@@ -2159,7 +2165,7 @@ def test_an_extra_message_beside_the_recorded_final_observation_is_not_faithful(
                 {"role": "user", "content": "continue"},
                 {"role": "system", "content": "unexpected"},
             ]
-            messages.extend(replies)
+            state.setdefault("messages", []).extend(replies)
             return replies
 
         def reward(self, completion, example, state=None):
@@ -2206,7 +2212,7 @@ def test_an_observation_that_dropped_an_image_is_not_a_faithful_replay(
             state["done"] = state["turn"] >= 2
             # the live env replies with the SAME text but no image. identical under (role, text).
             reply = {"role": "user", "content": [{"type": "text", "text": "continue"}]}
-            messages.append(reply)
+            state.setdefault("messages", []).append(reply)
             return [reply]
 
         def reward(self, completion, example, state=None):
@@ -2260,7 +2266,7 @@ def test_a_reordered_image_is_not_a_faithful_replay(monkeypatch, tmp_path, capsy
                     {"type": "image_url", "image_url": {"url": "https://x.test/a.png"}},
                 ],
             }
-            messages.append(reply)
+            state.setdefault("messages", []).append(reply)
             return [reply]
 
         def reward(self, completion, example, state=None):
@@ -2385,7 +2391,7 @@ def test_a_per_call_tool_id_does_not_make_a_faithful_replay_partial(monkeypatch,
             self.calls += 1
             # same role, same text, same block shape -- a fresh id, as a real tool call issues.
             reply = {"role": "tool", "content": "42", "tool_call_id": f"call_live_{self.calls}"}
-            messages.append(reply)
+            state.setdefault("messages", []).append(reply)
             return [reply]
 
         def reward(self, completion, example, state=None):
@@ -2579,7 +2585,7 @@ def test_replay_fidelity_compares_the_role_of_an_observation_not_only_its_text(
             state["turn"] += 1
             state["done"] = state["turn"] >= 2
             reply = {"role": self.reply_role, "content": "observation-1"}
-            messages.append(reply)
+            state.setdefault("messages", []).append(reply)
             return [reply]
 
         def reward(self, completion, example, state=None):
@@ -3443,3 +3449,159 @@ def test_the_scorer_dispatch_reuses_the_validated_tools_snapshot(monkeypatch, tm
     )
     assert env.native_graded, "the second snapshot rerouted scoring away from the native grader"
     assert "cannot rank completions" in capsys.readouterr().err
+
+
+def test_a_native_tool_environment_never_reaches_the_rollout_hooks(monkeypatch, tmp_path, capsys):
+    # `use_rollout_func = is_multi_turn and not (is_tool_env and tools)` (rl.py:820): a multi-turn
+    # tool env exposing tools gets use_rollout_func=False and trl drives the tool loop, so
+    # new_rollout_state/record_model_turn/rollout_done/env_reply are never called for it. requiring
+    # them here failed a valid env whose unused rollout hooks simply raise (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _NoRolloutHooksEnv(_MultiTurnEnv):
+        is_tool_env = True
+
+        def __init__(self):
+            super().__init__()
+            self.graded: list[list[dict]] = []
+
+        def tools(self):
+            return [lambda x: x]
+
+        def new_rollout_state(self, example):
+            raise AssertionError("the rollout hooks are unused for a native tool env")
+
+        def reward_from_messages(self, completion, example):
+            self.graded.append([dict(m) for m in completion])
+            # a working native grader: the gold trajectory outranks any wrong answer.
+            said = [m.get("content") for m in completion if m.get("role") == "assistant"]
+            return 1.0 if said == ["first", "second"] else 0.0
+
+    env = _NoRolloutHooksEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    assert env.graded, "the native grader was never called"
+    assert "overall: PASS" in capsys.readouterr().out
+
+
+def test_the_env_reply_transcript_is_built_rather_than_read_from_state(monkeypatch, tmp_path):
+    # production builds its own message list from `state.get("prompt") or state.get("messages")`
+    # and appends each turn and reply to it (flash/engine/multiturn_rollout.py:175-210). reading
+    # `state["messages"]` instead raised KeyError for an env keeping only `prompt`, and handed a
+    # promptless transcript to one using `messages` for completion-only state (codex[bot]).
+    env_dir = _environment_dir(tmp_path)
+
+    class _PromptOnlyStateEnv(_MultiTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.seen: list[list[dict]] = []
+
+        def new_rollout_state(self, example):
+            # no `messages` key at all: the opening lives under `prompt` and the env tracks its
+            # own turns. reading state["messages"] raises KeyError here.
+            return {
+                "prompt": [{"role": "user", "content": example["input"]}],
+                "done": False,
+                "turn": 0,
+                "said": [],
+            }
+
+        def record_model_turn(self, state, content):
+            state["said"].append(content)
+            state["response_text"] = content
+            return {"role": "assistant", "content": content}
+
+        def env_reply(self, messages, state):
+            self.seen.append([dict(m) for m in messages])
+            state["turn"] += 1
+            state["done"] = state["turn"] >= 2
+            return [{"role": "user", "content": "continue"}]
+
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            return [
+                RolloutReward(
+                    episode=1.0 if state["said"] == ["first", "second"] else 0.0, turns=None
+                )
+                for _example, state in items
+            ]
+
+    env = _PromptOnlyStateEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert env.seen, "env_reply was never called"
+    # the transcript opens with the prompt and grows by the assistant turn, exactly as production
+    # assembles it -- not the completion-only list the state happens to keep.
+    assert env.seen[0] == [
+        {"role": "user", "content": "finish the exchange"},
+        {"role": "assistant", "content": "first"},
+    ], env.seen[0]
+
+
+def test_a_listwise_grader_is_not_failed_on_a_group_smaller_than_the_run_uses(
+    monkeypatch, tmp_path, capsys
+):
+    # production groups `group_size` completions per prompt (num_generations = group_size, default
+    # 8: flash/engine/recipe.py:133, flash/engine/worker/rl.py:199,567). the group here is the gold
+    # replay plus the two or three controls provably wrong for it, so a scorer reading its group
+    # can answer differently for that reason alone (codex[bot]). the tie is ABOVE zero: that is the
+    # band this note speaks for. a tie AT zero is the grader scoring its own reference answer
+    # nothing, which no group shape explains, and the test below holds it failing.
+    env_dir = _environment_dir(tmp_path)
+
+    class _GroupSizeReadingEnv(_MultiTurnEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            # ranks fine at the run's group size and ties at anything smaller.
+            episode = 1.0 if len(items) >= 8 else 0.5
+            return [RolloutReward(episode=episode, turns=None) for _ in items]
+
+    _patch_loader(monkeypatch, _GroupSizeReadingEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0, capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "scores rollouts listwise" in captured.err, captured.err
+    assert "group_size (default 8)" in captured.err, captured.err
+
+
+def test_a_listwise_grader_tied_at_zero_is_still_failed(monkeypatch, tmp_path, capsys):
+    # the negative control on that note: scoring listwise explains a tie ABOVE zero, never a tie AT
+    # it. a grader that scores its own gold replay nothing has failed at a ranking no group shape
+    # asks it to make, so the note is attached and the failure stands.
+    env_dir = _environment_dir(tmp_path)
+
+    class _FlatListwiseEnv(_MultiTurnEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.base import RolloutReward
+
+            return [RolloutReward(episode=0.0, turns=None) for _ in items]
+
+    _patch_loader(monkeypatch, _FlatListwiseEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "scores rollouts listwise" in captured.err, captured.err
+    assert "overall: FAIL" in captured.err, captured.err
+
+
+def test_the_thinking_ambiguity_warning_is_not_raised_for_a_native_tool_run(
+    monkeypatch, tmp_path, capsys
+):
+    # reward_from_messages is handed the messages whole and never strips reasoning, so no template
+    # reading enters a native score and the warning described a reading that path does not perform
+    # (cursor).
+    env_dir = _environment_dir(tmp_path)
+    rows = [{"input": "think it through", "output": "reasoning about it\n4"}]
+    env = _SingleTurnNativeToolEnv(rows=rows)
+    env.reward_from_messages = lambda completion, example: (
+        1.0 if completion[-1].get("content") == "reasoning about it\n4" else 0.0
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo", thinking=True)) == 0
+    assert "no closing </think>" not in capsys.readouterr().err
