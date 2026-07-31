@@ -49,9 +49,8 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
-    _latest_named_reward_metrics,
+    RewardObservabilityBuffer,
     liveness_heartbeat,
-    reward_observability_fields,
 )
 from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.multiturn_glue import validate_glue_template
@@ -61,7 +60,6 @@ from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import (
     sample_completion_text,
     sanitize_rollout_text,
-    select_rollout_samples,
 )
 from flash.engine.worker.sft_train import (
     _hydra_val,
@@ -1248,12 +1246,6 @@ def score_single_turn(
         )
     return float(r)
 
-
-# how many per-completion reward breakdowns may queue between heartbeat drains. one generation is
-# prompts_per_step * group_size completions, and the drain runs on the heartbeat cadence, so this
-# holds several generations' worth -- enough that a normal drain never truncates, while a run whose
-# heartbeat has stopped draining cannot grow the buffer without limit.
-_MAX_PENDING_BREAKDOWNS = 4096
 
 # the total startup delay this hook is allowed to add, covering reference extraction AND timing.
 # both call user code, so one shared ceiling is the only number that means anything to a caller.
@@ -2513,25 +2505,18 @@ def run_rl_verl():
     if inp["multi_turn"]:
         copy_multi_turn_child_modules(shim_dir)
 
-    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. also keep a
-    # rolling buffer of recent (prompt, completion, score) so the training loop can dump one sample
-    # per step to the flash log and publish `sampled_completions`, matching the trl path's #607
-    # per-step completion dump and its reward heartbeat callback.
-    recent_samples: list[tuple[object, str, float]] = []
-    # per-name reward components for the `reward_metrics` heartbeat field. trl aggregates these in a
-    # TrainerCallback, which verl cannot host (its trainer is out of process), so the bridge collects
-    # them as it scores and the heartbeat thread drains them -- see the publisher below.
-    pending_named_breakdowns: list[dict[str, float] | None] = []
-    latest_named_metrics: dict[str, float] = {}
+    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. the buffer
+    # carries what trl's reward TrainerCallback carries -- recent rollouts for the per-step log dump
+    # and `sampled_completions`, plus per-name components for `reward_metrics` (#607).
+    observability = RewardObservabilityBuffer()
     # filled from the child's marker line; stays empty when wandb is off (see render_wandb_link_shim).
     wandb_link: dict[str, str | None] = {}
-    _samples_lock = threading.Lock()
 
     def _score(index: int, solution_str: str) -> float:
         ex = rollout_examples[int(index)]
-        # scored OUTSIDE the lock: grading calls user code and can block on i/o for seconds, and
-        # verl scores many rollouts concurrently. holding the buffer lock across it would serialize
-        # every grading in the run behind the slowest one.
+        # graded BEFORE the buffer is touched: grading calls user code and can block on i/o for
+        # seconds while verl scores many rollouts at once, and RewardObservabilityBuffer.record
+        # takes a lock every grading in the run would then serialize behind.
         breakdowns: list[dict[str, float] | None] = []
         score = score_single_turn(
             env,
@@ -2543,20 +2528,13 @@ def run_rl_verl():
             think_penalty=inp["think_penalty"],
             breakdowns=breakdowns,
         )
-        with _samples_lock:
-            recent_samples.append((message_prompts[int(index)], solution_str, score))
-            del recent_samples[:-64]
-            pending_named_breakdowns.extend(breakdowns)
-            # a generation is bounded by prompts_per_step * group_size, but nothing bounds how many
-            # generations pass between heartbeat drains. keep the same rolling bound as the sample
-            # buffer so a fast run with a stalled heartbeat cannot grow this without limit.
-            del pending_named_breakdowns[:-_MAX_PENDING_BREAKDOWNS]
+        observability.record(message_prompts[int(index)], solution_str, score, breakdowns)
         return score
 
     def _score_for_profile(index: int, solution_str: str) -> float:
         """the same grading path as _score, minus training's own bookkeeping.
 
-        deliberately NOT _score: that appends to recent_samples, so profiling would seed the
+        deliberately NOT _score: that buffers the rollout, so profiling would seed the
         per-step completion dump with gradings that never came from a rollout. it also propagates
         scoring errors instead of scoring them 0.0, so a grader failing on every call reports as a
         failure rather than as a fast latency.
@@ -2586,17 +2564,12 @@ def run_rl_verl():
         )
     )
 
-    def _record_episode_sample(prompt, transcript, reward: float) -> None:
-        with _samples_lock:
-            recent_samples.append((prompt, transcript, float(reward)))
-            del recent_samples[:-64]
-
     multi_turn_bridge = (
         MultiTurnBridge(
             env,
             rollout_examples,
             max_turns=int(inp["max_turns"]),
-            on_episode_scored=_record_episode_sample,
+            on_episode_scored=observability.record,
         )
         if inp["multi_turn"]
         else None
@@ -2744,19 +2717,9 @@ def run_rl_verl():
 
             trl publishes both from a TrainerCallback on the trainer's own thread. verl's trainer is
             out of process, so this is called from the liveness thread and from the stdout loop
-            instead -- draining the same buffers the reward bridge fills on its server threads.
+            instead -- draining the buffer the reward bridge fills on its server threads.
             """
-            with _samples_lock:
-                # drained under the lock: _latest_named_reward_metrics CLEARS the pending list, so a
-                # concurrent grading appending between the read and the clear would lose its
-                # breakdown entirely.
-                metrics = _latest_named_reward_metrics(
-                    pending_named_breakdowns, latest_named_metrics
-                )
-                samples = select_rollout_samples(
-                    list(recent_samples), generated_at_step=step_box[0] or None
-                )
-            return reward_observability_fields(metrics, samples)
+            return observability.heartbeat_fields(step=step_box[0] or None)
 
         with liveness_heartbeat(
             "rl_step",
@@ -2783,8 +2746,7 @@ def run_rl_verl():
                         step_box[0] = int(m.group(1))
                         # dump one sample completion per new step to the flash log (matches trl #607).
                         if step_box[0] != last_dump_step[0]:
-                            with _samples_lock:
-                                samp = recent_samples[-1] if recent_samples else None
+                            samp = observability.latest()
                             if samp:
                                 last_dump_step[0] = step_box[0]
                                 _, completion, reward = samp

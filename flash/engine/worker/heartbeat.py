@@ -15,10 +15,11 @@ import re
 import sys
 import threading
 import time
+from typing import Any
 
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
-from flash.engine.worker.rollout_samples import sanitize_rollout_text
+from flash.engine.worker.rollout_samples import sanitize_rollout_text, select_rollout_samples
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
@@ -322,25 +323,72 @@ def _latest_named_reward_metrics(
     return dict(latest)
 
 
-def reward_observability_fields(reward_metrics, samples) -> dict:
-    """The bounded ``reward_metrics`` / ``sampled_completions`` fragment of a training heartbeat.
+class RewardObservabilityBuffer:
+    """Rolling rollout samples and per-name reward components for an out-of-process trainer.
 
-    Both signals must pass their bounds before going on the wire (name sanitization and the 12-metric
-    cap; re-sanitization and the 3-sample cap). The trl callback applies them inline because it also
-    keeps the bounded metrics for its own ``latest_fields``; every other producer has no such need
-    and calls this instead, so a payload built off the trainer's thread carries the same guarantees.
-
-    Empty signals are omitted rather than sent as ``{}``/``[]``: a renderer distinguishes "no metrics
-    this step" from "this backend does not report them" by the key's absence.
+    trl publishes both signals from a TrainerCallback running on the trainer's own thread. verl's
+    trainer is a child process, so its reward bridge fills this from the scoring server's threads
+    while the heartbeat drains it from the liveness thread -- the lock below is the whole reason
+    this is an object rather than three locals.
     """
-    fields: dict = {}
-    bounded_metrics = _bounded_reward_metrics(reward_metrics)
-    if bounded_metrics:
-        fields["reward_metrics"] = bounded_metrics
-    bounded_samples = _bounded_sampled_completions(samples)
-    if bounded_samples:
-        fields["sampled_completions"] = bounded_samples
-    return fields
+
+    # how many per-completion breakdowns may queue between drains. one generation is
+    # prompts_per_step * group_size completions and the drain runs on the heartbeat cadence, so this
+    # holds several generations' worth -- a normal drain never truncates, while a run whose
+    # heartbeat has stopped draining cannot grow the buffer without limit.
+    _PENDING_BREAKDOWN_LIMIT = 4096
+    _SAMPLE_BUFFER_LIMIT = 64
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._samples: list[tuple[Any, Any, float]] = []
+        self._pending_breakdowns: list[dict[str, float] | None] = []
+        self._latest_metrics: dict[str, float] = {}
+
+    def record(self, prompt: Any, completion: Any, reward: float, breakdowns=()) -> None:
+        """Buffer one scored rollout. Call AFTER grading: this takes the lock, grading must not.
+
+        ``breakdowns`` is the 0-or-1 element accumulator ``score_single_turn`` filled for this
+        completion, empty for a multi-turn episode (the env scores a whole episode to a scalar).
+        """
+        with self._lock:
+            self._samples.append((prompt, completion, float(reward)))
+            del self._samples[: -self._SAMPLE_BUFFER_LIMIT]
+            self._pending_breakdowns.extend(breakdowns)
+            del self._pending_breakdowns[: -self._PENDING_BREAKDOWN_LIMIT]
+
+    def latest(self) -> tuple[Any, Any, float] | None:
+        """The most recently scored ``(prompt, completion, reward)``, for a per-step log preview."""
+        with self._lock:
+            return self._samples[-1] if self._samples else None
+
+    def heartbeat_fields(self, *, step: int | None = None) -> dict:
+        """The bounded ``reward_metrics`` / ``sampled_completions`` fragment of one heartbeat.
+
+        Metrics are bounded here (name sanitization, 12-metric cap). Samples are not: unlike the trl
+        callback -- which bounds an opaque caller-supplied list -- these come straight from
+        ``select_rollout_samples``, which already sanitizes and caps at three, so
+        ``_bounded_sampled_completions`` would be a no-op over its own output.
+
+        Empty signals are omitted rather than sent as ``{}``/``[]``: a renderer tells "no metrics
+        this step" apart from "this backend does not report them" by the key's absence.
+        """
+        with self._lock:
+            # one acquisition covering both reads, or the payload tears: a grading landing between
+            # the drain and the snapshot rides this payload's samples while its breakdown stays
+            # pending for the next drain, so the two fields would describe different gradings.
+            # only the snapshot is taken here -- building the samples sanitizes full untruncated
+            # text, which must not run while the scoring threads want the lock.
+            metrics = _latest_named_reward_metrics(self._pending_breakdowns, self._latest_metrics)
+            rows = list(self._samples)
+        fields: dict = {}
+        bounded_metrics = _bounded_reward_metrics(metrics)
+        if bounded_metrics:
+            fields["reward_metrics"] = bounded_metrics
+        samples = select_rollout_samples(rows, generated_at_step=step)
+        if samples:
+            fields["sampled_completions"] = samples
+        return fields
 
 
 def _bounded_reward_metrics(metrics) -> dict[str, float]:

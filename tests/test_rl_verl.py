@@ -21,6 +21,7 @@ import pytest
 
 import flash.engine.worker as W
 from flash.engine.worker import rl, rl_verl, verl_common
+from flash.engine.worker.heartbeat import RewardObservabilityBuffer
 
 
 # ------------------------------- dispatch -------------------------------
@@ -976,6 +977,18 @@ class _NamedBreakdownEnv:
     def scores_breakdown(self, graded, ex, state):
         hit = 1.0 if graded.strip() == ex["gt"] else 0.0
         return {"success": hit, "quality": 0.5, "total": hit}
+
+
+class _CountingBreakdownEnv:
+    """Scores each grading with its own ordinal, so a retained buffer window is identifiable."""
+
+    def __init__(self):
+        self.n = 0
+
+    def scores_breakdown(self, graded, ex, state):
+        n = float(self.n)
+        self.n += 1
+        return {"n": n, "total": n}
 
 
 class _BadTotalEnv:
@@ -3052,7 +3065,10 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
     # guard around it, not how the formatter wrapped the call.
     src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
     assert src.count("MultiTurnBridge(") == 1
-    assert 'MultiTurnBridge( env, rollout_examples, max_turns=int(inp["max_turns"]),' in src
+    assert (
+        'MultiTurnBridge( env, rollout_examples, max_turns=int(inp["max_turns"]), '
+        "on_episode_scored=observability.record, )" in src
+    )
     assert 'if inp["multi_turn"] else None' in src
 
 
@@ -3370,119 +3386,154 @@ def test_the_reward_profiler_is_skipped_on_multi_turn():
     assert "None" in profile_call, "multi-turn must record no profile rather than a wrong one"
 
 
-# ---------------- reward observability: the buffers and the heartbeat drain ----------------
-def _closure_namespace(name: str, namespace: dict):
-    """Compile one closure out of run_rl_verl and return it bound to `namespace`.
+# ---------------- reward observability: the buffer and the heartbeat drain ----------------
+def _score_buffer(env, *, prompts=None, examples=None):
+    """`_score`'s grade-then-record pair, against a real buffer and fake env.
 
-    `_score` and `_reward_observability` are locals of a body that needs a model, a dataset and a
-    verl interpreter to reach, so they are lifted out and run against fakes -- the same technique
-    the trl `reward_fn` tests use. What executes is the shipped source, not a restatement of it.
+    `_score` itself is a local of a body that needs a model, a dataset and a verl interpreter to
+    reach, so the two calls it makes are made here directly; the wiring that they ARE what `_score`
+    does is asserted separately below, on its source.
     """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl)))
-    node = next(
-        item
-        for item in ast.walk(tree)
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name
-    )
-    module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
-    exec(compile(module, f"<{name}>", "exec"), namespace)
-    return namespace[name]
+    buffer = RewardObservabilityBuffer()
+    rollout_examples = examples if examples is not None else [{"gt": "7"}]
+    message_prompts = prompts if prompts is not None else ["prompt-0"]
+
+    def score(index: int, solution_str: str) -> float:
+        breakdowns: list[dict[str, float] | None] = []
+        value = rl_verl.score_single_turn(
+            env,
+            solution_str,
+            rollout_examples[int(index)],
+            tok=None,
+            thinking=False,
+            prompt_opened_thinking=False,
+            think_penalty=0.0,
+            breakdowns=breakdowns,
+        )
+        buffer.record(message_prompts[int(index)], solution_str, value, breakdowns)
+        return value
+
+    return score, buffer
 
 
-def _score_namespace(env, *, prompts=None, examples=None):
-    namespace = {
-        "env": env,
-        "rollout_examples": examples if examples is not None else [{"gt": "7"}],
-        "message_prompts": prompts if prompts is not None else ["prompt-0"],
-        "recent_samples": [],
-        "pending_named_breakdowns": [],
-        "_samples_lock": threading.Lock(),
-        "_MAX_PENDING_BREAKDOWNS": rl_verl._MAX_PENDING_BREAKDOWNS,
-        "score_single_turn": rl_verl.score_single_turn,
-        "tok": None,
-        "inp": {"prompt_opened_thinking": False, "think_penalty": 0.0},
-        "_w": SimpleNamespace(THINKING=False),
-    }
-    return _closure_namespace("_score", namespace), namespace
+def test_score_grades_before_it_records():
+    """Grading calls user code and can block on i/o for seconds while verl scores many rollouts.
+
+    `record` takes the buffer's lock, so calling it around the grading rather than after it would
+    serialize every grading in the run behind the slowest one -- the whole reward wall.
+    """
+    src = " ".join(inspect.getsource(rl_verl.run_rl_verl).split())
+    body = src[src.index("def _score(index: int") :]
+    body = body[: body.index("def _score_for_profile")]
+
+    assert body.count("observability.record(") == 1
+    assert body.index("score = score_single_turn(") < body.index("observability.record(")
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_score_buffers_the_rollout_sample_and_its_named_breakdown():
-    score, ns = _score_namespace(_NamedBreakdownEnv())
+def test_the_buffer_keeps_the_rollout_sample_and_its_named_breakdown():
+    score, buffer = _score_buffer(_NamedBreakdownEnv())
 
     assert score(0, "7") == 1.0
-    assert ns["recent_samples"] == [("prompt-0", "7", 1.0)]
-    assert ns["pending_named_breakdowns"] == [{"success": 1.0, "quality": 0.5, "total": 1.0}]
+    assert buffer.latest() == ("prompt-0", "7", 1.0)
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_breakdown_buffer_is_bounded_when_the_heartbeat_stops_draining():
+def test_the_buffers_are_bounded_when_the_heartbeat_stops_draining():
     # one generation is bounded, but nothing bounds how many generations pass between drains. an
     # unbounded list here grows for the whole run in a process that is already memory-tight.
-    score, ns = _score_namespace(_NamedBreakdownEnv())
-    for _ in range(rl_verl._MAX_PENDING_BREAKDOWNS + 50):
+    score, buffer = _score_buffer(_NamedBreakdownEnv())
+    for _ in range(RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT + 50):
         score(0, "7")
 
-    assert len(ns["pending_named_breakdowns"]) == rl_verl._MAX_PENDING_BREAKDOWNS
-    assert len(ns["recent_samples"]) == 64  # the sample buffer keeps its own rolling bound
+    assert len(buffer._pending_breakdowns) == RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT
+    assert len(buffer._samples) == RewardObservabilityBuffer._SAMPLE_BUFFER_LIMIT
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_score_grades_outside_the_buffer_lock():
-    # grading calls user code and can block on i/o for seconds while verl scores many rollouts at
-    # once. holding the buffer lock across it serializes every grading in the run behind the
-    # slowest one, which on a slow grader is the whole reward wall.
-    held: list[bool] = []
+def test_eviction_drops_the_oldest_rollouts_and_keeps_the_newest():
+    """Over the limit, what SURVIVES has to be the recent end: both signals answer "what is the
+    model doing now", so evicting the newest would pin a stalled run's diagnostics to its oldest
+    gradings. A length-only assertion passes either way -- this reads the retained values."""
+    score, buffer = _score_buffer(
+        _CountingBreakdownEnv(),
+        prompts=["prompt-0"],
+        examples=[{"gt": "7"}],
+    )
+    total = RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT + 50
+    for _ in range(total):
+        score(0, "7")
 
-    class _Env:
-        def reward(self, graded, ex, state):
-            held.append(ns["_samples_lock"].acquire(blocking=False))
-            if held[-1]:
-                ns["_samples_lock"].release()
-            return 1.0
+    # the env numbers each grading, so the retained window is identifiable by value.
+    assert buffer.latest()[2] == float(total - 1)
+    assert buffer._pending_breakdowns[-1] == {"n": float(total - 1), "total": float(total - 1)}
+    assert buffer._pending_breakdowns[0] == {
+        "n": float(total - RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT),
+        "total": float(total - RewardObservabilityBuffer._PENDING_BREAKDOWN_LIMIT),
+    }
 
-    score, ns = _score_namespace(_Env())
-    score(0, "x")
 
-    assert held == [True], "the buffer lock was held across env grading"
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_run_with_no_rollouts_yet_omits_sampled_completions():
+    # symmetric with the reward_metrics case below: an empty list on the wire reads as "this step
+    # produced no rollouts", which is a different claim from "none have been scored yet".
+    buffer = RewardObservabilityBuffer()
+
+    assert "sampled_completions" not in buffer.heartbeat_fields()
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_both_signals_pass_their_wire_bounds_before_publication():
+    """The bounds are what make a payload safe to commit, and both are applied HERE -- the caller
+    publishes whatever this returns. Asserted through the buffer rather than on the helpers (which
+    have their own tests) so dropping either call from the publisher fails.
+
+    The sample side asserts on neutralization and the cap together, because on this path both come
+    from `select_rollout_samples` itself rather than from a second bounding pass.
+    """
+    buffer = RewardObservabilityBuffer()
+    buffer.record("prompt-0", "done\x1b[2Jcleared", 1.0)
+    for i in range(1, 5):  # distinct prompts, so dedup can't stand in for the cap
+        buffer.record(f"prompt-{i}", f"completion-{i}", float(i))
+    with buffer._lock:  # 13 names, over the 12-metric cap
+        buffer._latest_metrics.update({f"m{i}": 1.0 for i in range(13)})
+
+    fields = buffer.heartbeat_fields()
+
+    assert len(fields["reward_metrics"]) == 12
+    assert len(fields["sampled_completions"]) == 3
+    # a raw escape would let a rollout repaint the terminal of whoever runs `flash runs log`.
+    assert "\x1b" not in fields["sampled_completions"][0]["completion"]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_a_reward_that_is_not_a_float_is_coerced_at_the_boundary():
+    # rewards arrive from user grading code and go out as json. coercing on the way IN keeps a
+    # numpy scalar or a bool from reaching the serializer a heartbeat away from the call site.
+    buffer = RewardObservabilityBuffer()
+    buffer.record("prompt-0", "completion-0", np.float32(0.25))
+
+    reward = buffer.latest()[2]
+    assert type(reward) is float
+    assert reward == 0.25
 
 
 @pytest.mark.usefixtures("_identity_graded")
 def test_a_scalar_reward_run_publishes_no_named_metrics_at_all():
     # end to end for the empty case: a scores_breakdown-less env must reach the wire with the key
     # ABSENT, not with every name flattened to 0 by an empty-dict denominator.
-    score, ns = _score_namespace(_RewardOnlyEnv(), examples=[{"gt": "7"}])
+    score, buffer = _score_buffer(_RewardOnlyEnv())
     score(0, "the answer is 7")
 
-    assert ns["pending_named_breakdowns"] == []
-    observability = _observability_namespace(ns)()
-    assert "reward_metrics" not in observability
-    assert len(observability["sampled_completions"]) == 1
-
-
-def _observability_namespace(score_ns: dict, *, step: int = 5):
-    from flash.engine.worker.heartbeat import (
-        _latest_named_reward_metrics,
-        reward_observability_fields,
-    )
-    from flash.engine.worker.rollout_samples import select_rollout_samples
-
-    namespace = dict(score_ns)
-    namespace.update(
-        {
-            "latest_named_metrics": score_ns.get("latest_named_metrics", {}),
-            "step_box": [step],
-            "_latest_named_reward_metrics": _latest_named_reward_metrics,
-            "select_rollout_samples": select_rollout_samples,
-            "reward_observability_fields": reward_observability_fields,
-        }
-    )
-    return _closure_namespace("_reward_observability", namespace)
+    fields = buffer.heartbeat_fields()
+    assert "reward_metrics" not in fields
+    assert len(fields["sampled_completions"]) == 1
 
 
 @pytest.mark.usefixtures("_identity_graded")
 def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
-    score, ns = _score_namespace(
+    score, buffer = _score_buffer(
         _NamedBreakdownEnv(),
         prompts=["p0", "p1", "p2", "p3"],
         examples=[{"gt": "7"}, {"gt": "7"}, {"gt": "9"}, {"gt": "9"}],
@@ -3490,7 +3541,7 @@ def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
     for index, completion in enumerate(["7", "7", "7", "7"]):
         score(index, completion)
 
-    fields = _observability_namespace(ns)()
+    fields = buffer.heartbeat_fields(step=5)
 
     # two of four completions matched their gt, so success averages 0.5 across the generation.
     assert fields["reward_metrics"] == {"success": 0.5, "quality": 0.5}
@@ -3501,36 +3552,73 @@ def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
 
 @pytest.mark.usefixtures("_identity_graded")
 def test_the_drain_clears_pending_breakdowns_and_then_repeats_the_last_reading():
-    # _latest_named_reward_metrics CLEARS the pending list. between generations there is nothing new
-    # to average, and reporting {} there would blank the metric on every heartbeat that lands
-    # mid-generation rather than holding the last real reading.
-    score, ns = _score_namespace(_NamedBreakdownEnv())
+    # the drain CLEARS the pending list. between generations there is nothing new to average, and
+    # reporting {} there would blank the metric on every heartbeat that lands mid-generation rather
+    # than holding the last real reading.
+    score, buffer = _score_buffer(_NamedBreakdownEnv())
     score(0, "7")
-    observability = _observability_namespace(ns)
 
-    assert observability()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
-    assert ns["pending_named_breakdowns"] == []
-    assert observability()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+    assert buffer._pending_breakdowns == []
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
 
     score(0, "wrong")
-    assert observability()["reward_metrics"] == {"success": 0.0, "quality": 0.5}
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 0.0, "quality": 0.5}
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_drain_and_the_sample_read_share_one_lock_acquisition():
-    """The drain CLEARS the pending list, so it and the sample read must be one atomic section.
+class _ReleaseHookedLock:
+    """The buffer's lock, with a callback fired the instant it is released.
 
-    Asserted on the closure's own source: reproducing the interleave needs a grading to land
-    between the clear and the read, and a test that merely calls the closure passes with the lock
-    split in two.
+    Landing a grading at that exact moment is what makes the atomicity test deterministic: a real
+    thread race can't be, because lock handoff is barging-prone and a sleep long enough to make the
+    interleave reliable is a sleep the correct code also passes.
     """
-    body = textwrap.dedent(inspect.getsource(rl_verl.run_rl_verl))
-    body = body[body.index("def _reward_observability") :]
-    body = body[: body.index("return reward_observability_fields")]
 
-    assert body.count("with _samples_lock:") == 1
-    assert body.index("with _samples_lock:") < body.index("_latest_named_reward_metrics(")
-    assert body.index("_latest_named_reward_metrics(") < body.index("select_rollout_samples(")
+    def __init__(self, lock, on_release):
+        self._lock = lock
+        self._on_release = on_release
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc):
+        released = self._lock.__exit__(*exc)
+        self._on_release()
+        return released
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_metrics_and_samples_in_one_payload_describe_the_same_gradings():
+    """The drain and the sample snapshot must be ONE acquisition, or a payload tears.
+
+    A grading landing between them is not lost -- its breakdown stays pending for the next drain.
+    What breaks is agreement: its sample rides THIS payload while its reward doesn't reach this
+    payload's metrics, so `sampled_completions` and `reward_metrics` describe different gradings and
+    a reader diagnosing a reward drop sees a sample the numbers next to it never scored.
+    """
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(),
+        prompts=["prompt-0", "prompt-1"],  # distinct: both survive the per-prompt dedup
+        examples=[{"gt": "7"}, {"gt": "7"}],
+    )
+    score(0, "7")  # success 1.0
+
+    landed = []
+
+    def _land_a_grading_the_instant_the_lock_drops():
+        if landed:
+            return  # record() takes the same lock; don't recurse into it
+        landed.append(True)
+        score(1, "wrong")  # success 0.0
+
+    buffer._lock = _ReleaseHookedLock(buffer._lock, _land_a_grading_the_instant_the_lock_drops)
+    fields = buffer.heartbeat_fields()
+
+    assert landed, "the hook never fired, so this asserts nothing about atomicity"
+    # the second grading landed after the whole section, so NEITHER signal carries it.
+    assert fields["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+    assert [sample["reward"] for sample in fields["sampled_completions"]] == [1.0]
 
 
 def test_the_first_sample_bearing_heartbeat_is_forced():
