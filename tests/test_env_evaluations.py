@@ -317,6 +317,42 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
     assert f"resolved evaluation target flash-1 to {revision}" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("deployment", "reason"),
+    [
+        (None, "is not deployed"),
+        ({"state": "ready"}, "has no valid immutable adapter revision"),
+        ({"state": "ready", "adapter_revision": "other-run@final." + "b" * 40},
+         "has no valid immutable adapter revision"),
+    ],
+    ids=["absent", "no-revision", "another-runs-revision"],
+)
+def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
+    monkeypatch, tmp_path, capsys, deployment, reason
+) -> None:
+    # the counterpart to the test above: an alias that resolves to nothing immutable cannot be
+    # evaluated reproducibly. each case has to stop BEFORE generating -- grading against whatever
+    # the alias points at right now spends the whole suite on a model the report cannot name, and
+    # a revision belonging to another run is not this run's model at all.
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def deployment_for(self, run_id, timeout=None):
+            return dict(deployment) if deployment else None
+
+        def chat_stream(self, target, messages, **kwargs):
+            raise AssertionError("no case may generate against an unpinned alias")
+            yield ""
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", "flash-1", str(env_dir)]) == 1
+    captured = capsys.readouterr().err
+    assert reason in captured
+    assert "overall: FAIL" in captured
+
+
 def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
