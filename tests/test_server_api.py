@@ -1255,14 +1255,18 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
 
 
 def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatch):
-    import flash.server.app as app_mod
+    # fail inside adapter resolution itself, which is where an internal storage ref can come from.
+    # stubbing the whole of prepare_job instead would assert something broader than this test's
+    # name: that EVERY submit failure is redacted for a warm-start run, including gpu sizing and
+    # budget, which fail identically for the non-warm-start runs that never redacted them.
+    import flash.runner as runner
 
     internal_ref = "private-owner/private-repo:sft/source-run/checkpoints/step-20"
-    monkeypatch.setattr(
-        app_mod,
-        "prepare_job",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"failed to read {internal_ref}")),
-    )
+
+    def _boom(spec, **kwargs):
+        raise RuntimeError(f"failed to read {internal_ref}")
+
+    monkeypatch.setattr(runner, "_prepare_init_from_adapter_inner", _boom)
     spec = {
         **SPEC,
         "train": {**SPEC["train"], "init_from_adapter": "source-run/step-20"},
@@ -1279,6 +1283,36 @@ def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatc
     assert "source-run/step-20" in detail
     assert "private-owner" not in resp.text
     assert "private-repo" not in resp.text
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, monkeypatch):
+    # the companion direction to the redaction above. a failure raised OUTSIDE adapter resolution
+    # keeps its own message, so a warm-start run told to check its adapter really has an adapter
+    # problem. the previous broad except rewrote every prepare_job failure into the adapter
+    # message, sending users to re-verify a healthy adapter while the real cause never arrived.
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(
+        app_mod,
+        "prepare_job",
+        lambda *a, **k: (_ for _ in ()).throw(ValueError("no configured provider can provision")),
+    )
+    spec = {
+        **SPEC,
+        "train": {**SPEC["train"], "init_from_adapter": "source-run/step-20"},
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec},
+    )
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "no configured provider can provision" in detail
+    assert "could not be prepared" not in detail
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
