@@ -78,6 +78,7 @@ from flash.engine.worker.verl_common import (
     parse_verl_step_metrics,
     parse_wandb_link,
     render_wandb_link_shim,
+    resolve_blackwell_attention_backends,
     resolve_verl_loggers,
     resolve_verl_python,
     verl_supports_rollout_field,
@@ -389,6 +390,22 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         ),
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
+        # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
+        # sleep_unsupported). verl defaults free_cache_engine and enable_sleep_mode BOTH True and
+        # offloads between every step, so without this a flagged model wedges at the first step
+        # boundary instead of failing fast. free_cache_engine is the one that actually gates the
+        # sleep()/wake_up() rpcs (vllm_rollout.resume/release, engine_workers resume path);
+        # enable_sleep_mode is what builds the sleep-capable engine in the first place, so both go.
+        # safe because the parse-time gate sizes a flagged job on its RESIDENT peak and rejects a
+        # config that cannot fit -- staying resident cannot admit an OOM the sleep path avoided.
+        *(
+            [
+                "actor_rollout_ref.rollout.free_cache_engine=false",
+                "actor_rollout_ref.rollout.enable_sleep_mode=false",
+            ]
+            if cfg.get("sleep_unsupported")
+            else []
+        ),
         f"actor_rollout_ref.rollout.gpu_memory_utilization={cfg['gpu_mem_util']}",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg['n_gpus']}",
         f"actor_rollout_ref.rollout.temperature={cfg['temperature']}",
@@ -453,6 +470,20 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
         # engine_kwargs.vllm struct (it is not a default field).
         o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
+    # blackwell attention pins (see resolve_blackwell_attention_backends for why each default is
+    # wrong). both are real AsyncEngineArgs fields in the pinned vllm 0.19.1, and verl spreads
+    # engine_kwargs.vllm straight into them, so a plain override reaches the engine. '+' appends
+    # under the existing engine_kwargs.vllm struct, as kv_cache_dtype does above.
+    if cfg.get("attention_backend"):
+        o.append(
+            "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend="
+            f"{cfg['attention_backend']}"
+        )
+    if cfg.get("mm_encoder_attn_backend"):
+        o.append(
+            "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend="
+            f"{cfg['mm_encoder_attn_backend']}"
+        )
     _reasoning_parser = reasoning_parser_for(
         thinking=bool(cfg.get("thinking", False)),
         structured_outputs=cfg.get("structured_outputs"),
@@ -469,6 +500,20 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     return o
 
 
+def _sleep_unsupported(model_id: str) -> bool:
+    """Whether vLLM's sleep/wake cycle is non-functional for this model.
+
+    A few models HANG on wake/reload rather than erroring (live-confirmed, every attempt), so the
+    catalog flags them and GRPO must keep the rollout engine RESIDENT instead. The parse-time gate in
+    flash.engine.vram already sizes such a job on its resident peak and rejects a config too long to
+    fit, so staying resident cannot admit anything that would OOM.
+    """
+    from flash.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    return bool(info is not None and getattr(info, "sleep_unsupported", False))
+
+
 def _build_verl_training_cfg(
     inp: dict,
     *,
@@ -478,6 +523,8 @@ def _build_verl_training_cfg(
     thinking: bool,
     loggers: str,
     fp8_kv: bool,
+    attention_backend: str | None,
+    mm_encoder_attn_backend: str | None,
     reward_path: str,
     local_dir: str,
     project_name: str,
@@ -524,6 +571,9 @@ def _build_verl_training_cfg(
         "n_gpus": n_gpus,
         "loggers": loggers,
         "fp8_kv": fp8_kv,
+        "attention_backend": attention_backend,
+        "mm_encoder_attn_backend": mm_encoder_attn_backend,
+        "sleep_unsupported": _sleep_unsupported(inp["model_id"]),
         "reward_path": reward_path,
         "reward_name": "compute_score",
         "total_epochs": inp["verl_total_epochs"],
@@ -2081,6 +2131,7 @@ def _check_grpo_had_a_gradient(
     adv_spread_history: list[float],
     *,
     resumed: bool = False,
+    already_complete: bool = False,
 ) -> None:
     """raise unless the run's rewards actually produced a nonzero policy gradient.
 
@@ -2100,7 +2151,18 @@ def _check_grpo_had_a_gradient(
     resumed run lives in the steps a previous worker ran, which is not recoverable from this
     worker's stdout, so the honest move is to abstain rather than guess. the degenerate-environment
     case this guard exists for is unaffected: such a run fails on its first, unresumed attempt.
+
+    ``already_complete`` is the narrower case where the resume checkpoint ALREADY sits at the target
+    step, so verl's loop body never executes: ``current_epoch = global_steps // len(dataloader)``
+    equals total_epochs, the epoch range is empty, and the child exits 0 having emitted no metric
+    lines at all. both histories are then empty for a fully-trained policy, which the empty-history
+    check below would report as a reward-bridge wiring regression. abstain instead -- the steps that
+    trained this policy were observed by an earlier worker, exactly as for ``resumed``.
     """
+    if already_complete:
+        # no step ran, so there is no metric stream to judge and nothing the parse could have
+        # dropped. the restored policy's evidence lives in the worker that produced it.
+        return
     if not reward_history:
         raise RuntimeError(
             "verl reported no reward metrics for the whole run — the flash reward bridge was "
@@ -2256,8 +2318,8 @@ def _resolve_grpo_inputs():
     # non-zero recipe value can never be silently ignored.
     if float(RECIPE.lora.dropout) != 0.0:
         raise RuntimeError(
-            f"RECIPE.lora.dropout={RECIPE.lora.dropout} is not yet wired on the verl backend; "
-            "use the trl backend or add actor_rollout_ref.model.lora_dropout support."
+            f"RECIPE.lora.dropout={RECIPE.lora.dropout} is not wired on the verl backend; "
+            "add actor_rollout_ref.model.lora_dropout support before setting it non-zero."
         )
     gcfg = _w.grpo_overrides()
     prompts_per_step = int(
@@ -2291,7 +2353,10 @@ def _resolve_grpo_inputs():
     if _t and getattr(_t, "init_from_adapter", ""):
         from flash.engine.worker.adapter import _download_adapter
 
-        warmstart_adapter = _download_adapter(_t.init_from_adapter)
+        # a multi-GB adapter pull emits nothing of its own, so it must run under a liveness wrap or
+        # the provider judges the silence as a stall.
+        with liveness_heartbeat("rl_adapter_loading"):
+            warmstart_adapter = _download_adapter(_t.init_from_adapter)
         if not warmstart_adapter:
             raise RuntimeError(
                 "warm-start source adapter could not be downloaded; refusing to start from the base."
@@ -2553,7 +2618,11 @@ def run_rl_verl():
     )
     setup_perf_backends()
 
-    inp = _resolve_grpo_inputs()
+    # env load, prompt render and tokenization run for minutes on a large split and emit nothing of
+    # their own; without the wrap the provider sees silence from rl_start until rl_train_start.
+    # (the warm-start adapter pull nested inside carries its own rl_adapter_loading wrap.)
+    with liveness_heartbeat("rl_data_loading"):
+        inp = _resolve_grpo_inputs()
     env, tok = inp["env"], inp["tok"]
     # what gets saved next to a published adapter. a multimodal adapter is unservable without its
     # image preprocessor, so save the whole processor there; a text run saves the tokenizer alone.
@@ -2798,6 +2867,12 @@ def run_rl_verl():
             )
         except Exception:  # no cuda / probe failure -> conservative bf16 kv
             fp8_kv = False
+        # blackwell needs both rollout attention backends pinned; vllm 0.19.1's own defaults pick
+        # flash-attn, which is PTX-unreliable on sm120 (silent empty rollouts) and routes the ViT
+        # into an unimportable CUTE kernel on sm100/sm120. no-op off blackwell.
+        attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(
+            python_bin
+        )
         cfg = _build_verl_training_cfg(
             inp,
             train_files=train_pq,
@@ -2806,6 +2881,8 @@ def run_rl_verl():
             thinking=bool(_w.THINKING),
             loggers=loggers,
             fp8_kv=fp8_kv,
+            attention_backend=attention_backend,
+            mm_encoder_attn_backend=mm_encoder_attn_backend,
             reward_path=reward_py,
             local_dir=local_dir,
             project_name=project_name,
@@ -3006,7 +3083,15 @@ def run_rl_verl():
         # on artifacts the gate is deliberately holding and report a checkpoint-publication failure
         # -- the symptom -- instead of the constant reward signal that caused it. raising inside the
         # try still runs the finally below, so the reward server and gpu sampler shut down either way.
-        _check_grpo_had_a_gradient(reward_history, adv_spread_history, resumed=bool(resume_step))
+        _check_grpo_had_a_gradient(
+            reward_history,
+            adv_spread_history,
+            resumed=bool(resume_step),
+            # a resume already at the target runs zero steps and emits zero metrics; that is a
+            # complete policy, not a broken reward bridge. steps_run below still has to reach
+            # expected_steps, so this cannot excuse a run that stopped short.
+            already_complete=bool(resume_step) and resume_step >= expected_steps,
+        )
         # training finished cleanly, so a missing required save is a real defect rather than a
         # side effect of a crash. stop here (not in finally, which suppresses) to surface it.
         # only when exact saves were requested: without them the drain stays best-effort, and

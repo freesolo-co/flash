@@ -60,9 +60,9 @@ _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "opd_phase_seconds": "dict",
     "opd_phase_counts": "dict",
 }
-# alignment granularity, accumulated only by the verl worker. the trl worker's granularity lives in
-# the granularity_* slots above; in verl those same slots hold COVERAGE, so verl carries its own pair
-# and both must be validated when present rather than coerced past the fail-closed contract.
+# alignment granularity, accumulated by the verl worker. the granularity_* slots above hold COVERAGE
+# on this path, so alignment carries its own pair and both must be validated when present rather
+# than coerced past the fail-closed contract.
 _OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA = {
     "align_group_sum": "nonneg_number",
     "align_group_n": "nonneg_int",

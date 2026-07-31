@@ -606,11 +606,11 @@ answer or action, so undersizing it can truncate the action and teach the model 
 watch `truncation_rate`, which counts completions not ending in EOS and is not strictly
 `finish_reason=length` when stop sequences or multi-turn rollouts are involved.
 
-For pure multi-turn GRPO, Flash gives each Flash-owned vLLM generation request a managed
-10-to-60-minute absolute deadline and at most two physical attempts. A timed-out request is
-aborted before retry. Enforcement is cooperative between engine polls, and there is no total
-episode elapsed-time cutoff. This policy does not time out OPD, TRL-native tool loops, or
-environment calls.
+Multi-turn GRPO caps each turn by tokens, not by wall clock: every turn is sized against the
+remaining context so a glued environment reply always leaves room to generate. There is no
+per-request absolute deadline and no total episode elapsed-time cutoff, so a rollout is bounded
+by `max_completion_tokens` and the context window rather than by elapsed time. Environment calls
+and OPD are likewise not time-bounded here.
 
 > **The reward-hacking signature:** a smoothed reward rising while mean generated
 > length collapses. Whenever any shortness or format pressure is active, verify the
@@ -712,23 +712,8 @@ count = 4
 # submit names the ones that qualify when it rejects an unpinned multi-gpu spec.
 ```
 
-**GRPO** still defaults to the single-process `trl` backend, which never reads `gpu.count` — so
-raising the count alone would rent n cards and train on one, and submit rejects that rather than
-billing for idle hardware. Select `verl` explicitly to shard a GRPO run:
-
-```toml
-[worker_env]
-FLASH_RL_BACKEND = "verl"   # GRPO only (the key is RL, not GRPO)
-```
-
-The verl worker launches one rank per card with Ulysses sequence parallelism.
-
-The verl GRPO backend covers single-turn, non-tool, non-multimodal runs; multi-turn, tool, and
-image-prompt environments stay on `trl` (which is single-GPU). Warm-starting with
-`init_from_adapter` while `kl_penalty_coef > 0` is also `trl`-only: verl computes its KL
-reference with adapters disabled, so the reference would be the bare base model instead of your
-SFT adapter, pulling the policy back toward base. Every one of these raises at startup rather
-than quietly training on a different contract.
+GRPO, SFT and OPD all shard across `gpu.count` with no backend key to set: the worker launches one
+rank per card with Ulysses sequence parallelism.
 
 OPD has one unsupported combination, and because there is no other backend to fall back to it
 raises at startup: a multi-turn env together with `[train] structured_outputs`. Multi-turn OPD
@@ -739,13 +724,12 @@ CPU, which pins it to xgrammar. These raise at startup even on a single-turn env
 `whitespace_pattern`, `disable_additional_properties` (guidance-backend only), a JSON schema using
 features that need vLLM's guidance fallback, or a model carrying a vLLM Mistral tokenizer.
 
-On either backend, note what a multi-turn structured-output run actually does: one schema is
-applied to EVERY assistant turn, mid-rollout turns included, because the env contract has no
-per-turn schema channel. If your intermediate turns and your final answer have different shapes,
-`trl` will constrain the intermediate ones to the final-answer schema rather than reject the run.
-That is the contract verl declines to guess at, and it is why the fix is a per-turn constraint
-channel rather than simply lifting the verl check. Like the GRPO gaps, verl raises at startup
-rather than training on a contract you did not ask for.
+Note what a multi-turn structured-output run would actually mean: one schema applied to EVERY
+assistant turn, mid-rollout turns included, because the env contract has no per-turn schema
+channel. If your intermediate turns and your final answer have different shapes, that silently
+constrains the intermediate ones to the final-answer schema. That is the contract the worker
+declines to guess at, which is why the fix is a per-turn constraint channel rather than simply
+lifting the check — it raises at startup rather than training on a contract you did not ask for.
 
 ---
 

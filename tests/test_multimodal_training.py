@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import base64
-import copy
 import io
 import json
-import sys
 import urllib.parse
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -398,85 +396,34 @@ def test_total_decoded_budget_is_checked_before_any_image_load_or_conversion(
     assert decode_calls == []
 
 
-def test_sft_collator_decodes_arrow_safe_images_at_batch_time(tmp_path):
-    root, _image = _package(tmp_path)
-    descriptor = mm.normalize_image_source("dataset/red.png", root)
-    observed = {}
+def test_a_row_whose_completion_truncated_away_is_dropped_not_trained_on():
+    """A row that keeps no unmasked, non-special target token teaches nothing and must be dropped.
 
-    def delegate(rows):
-        observed["rows"] = rows
-        return {"labels": [[-100, 7]]}
+    `sft_max_len` truncates from the right, so a long prompt can leave a row whose completion is
+    gone entirely: every position is either prompt (loss_mask 0) or a structural special token.
+    Training on it is not merely wasted -- the row still contributes its prompt to the batch, so the
+    reported mask ratio and token counts describe a dataset the model never learned from, and a
+    dataset that truncates away *every* completion must abort rather than run to completion having
+    learned nothing.
 
-    collator = mm.ArrowSafeVisionCollator(None, 32, root, delegate=delegate)
-    result = collator([{"prompt": [], "completion": [], "images": [descriptor]}])
+    This was `filter_vlm_sft_rows`, which measured the same thing off the vision collator's labels.
+    verl pre-tokenizes to `input_ids`/`loss_mask` instead, so the check moved to `_has_real_target`
+    -- same invariant, different representation, and nothing covered it after the move.
+    """
+    from flash.engine.worker.sft_train import _has_real_target
 
-    assert result == {"labels": [[-100, 7]]}
-    assert observed["rows"][0]["images"][0].size == (2, 2)
-
-
-def test_dataset_transform_decodes_only_when_rows_are_requested(monkeypatch):
-    calls = []
-
-    def fake_decode(values, package_root):
-        calls.append((list(values), package_root))
-        return ["decoded"]
-
-    monkeypatch.setattr(mm, "decode_image_descriptors", fake_decode)
-    transform = mm.lazy_image_dataset_transform("/package")
-    batch = {"prompt": [[{"role": "user", "content": "x"}]], "images": [["descriptor"]]}
-
-    assert calls == []
-    transformed = transform(batch)
-    assert transformed["images"] == [["decoded"]]
-    assert calls == [(["descriptor"], "/package")]
-
-
-def test_vlm_sft_filter_preserves_completion_mask_and_max_context_behavior():
-    rows = [{"id": "kept"}, {"id": "empty"}, {"id": "truncated"}]
-
-    def collator(batch):
-        row = batch[0]
-        if row["id"] == "kept":
-            return {"labels": [[-100, -100, 7, 2]], "attention_mask": [[1, 1, 1, 1]]}
-        if row["id"] == "empty":
-            return {"labels": [[-100, 2]], "attention_mask": [[1, 1]]}
-        return {"labels": [[-100, -100]], "attention_mask": [[1, 1]]}
-
-    kept, dropped, masked, total = mm.filter_vlm_sft_rows(rows, collator, {2})
-    assert kept == [{"id": "kept"}]
-    assert dropped == 2
-    assert masked == 2
-    assert total == 4
-
-
-def test_processor_prompt_count_uses_expanded_vision_tokens(monkeypatch, tmp_path):
-    root, _image = _package(tmp_path)
-    descriptor = mm.normalize_image_source("dataset/red.png", root)
-    observed = {}
-
-    trl_module = ModuleType("trl")
-    data_utils_module = ModuleType("trl.data_utils")
-    data_utils_module.prepare_multimodal_messages = lambda messages, images: [
-        {"role": "user", "content": [{"type": "image", "image": images[0]}]}
-    ]
-    trl_module.data_utils = data_utils_module
-    monkeypatch.setitem(sys.modules, "trl", trl_module)
-    monkeypatch.setitem(sys.modules, "trl.data_utils", data_utils_module)
-
-    class _Processor:
-        def apply_chat_template(self, **kwargs):
-            observed.update(kwargs)
-            return {"input_ids": [[1] * 257]}
-
-    count = mm.processor_prompt_token_count(
-        _Processor(),
-        [{"role": "user", "content": [{"type": "image"}]}],
-        [descriptor],
-        root,
-    )
-    assert count == 257
-    assert observed["tokenize"] is True
-    assert observed["return_dict"] is True
+    eos = 2
+    special = {eos}
+    # a real target: one unmasked token that is not a special.
+    assert _has_real_target({"input_ids": [9, 9, 7, eos], "loss_mask": [0, 0, 1, 1]}, special)
+    # completion truncated away: every unmasked position is prompt.
+    assert not _has_real_target({"input_ids": [9, 9, 7, eos], "loss_mask": [0, 0, 0, 0]}, special)
+    # content-free completion: unmasked, but only the structural end token.
+    assert not _has_real_target({"input_ids": [9, eos], "loss_mask": [0, 1]}, special)
+    # the mask -- not the token -- decides: the same ids masked as prompt are not a target.
+    assert not _has_real_target({"input_ids": [7, 7], "loss_mask": [0, 0]}, special)
+    # and a special id that is NOT registered special still counts as real content.
+    assert _has_real_target({"input_ids": [9, eos], "loss_mask": [0, 1]}, set())
 
 
 def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
@@ -567,117 +514,6 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     )
 
 
-def test_image_content_key_is_stable_and_pixel_sensitive():
-    image_module = pytest.importorskip("PIL.Image")
-    red = image_module.new("RGB", (2, 2), (255, 0, 0))
-    red_copy = copy.deepcopy(red)
-    blue = image_module.new("RGB", (2, 2), (0, 0, 255))
-    wide_red = image_module.new("RGB", (4, 1), (255, 0, 0))
-
-    assert mm.image_content_key(red) == mm.image_content_key(red_copy)
-    assert mm.image_content_key(red) != mm.image_content_key(blue)
-    assert mm.image_content_key(red) != mm.image_content_key(wide_red)
-
-
-def test_multimodal_prompt_key_and_index_distinguish_image_content(monkeypatch):
-    pytest.importorskip("trl")
-    from trl.data_utils import prepare_multimodal_messages
-
-    image_module = pytest.importorskip("PIL.Image")
-    placeholder = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "what color?"},
-                {"type": "image"},
-            ],
-        }
-    ]
-    red_descriptor = mm.normalize_image_source(image_module.new("RGB", (2, 2), (255, 0, 0)), None)
-    blue_descriptor = mm.normalize_image_source(image_module.new("RGB", (2, 2), (0, 0, 255)), None)
-    red_example = {"answer": "red"}
-    blue_example = {"answer": "blue"}
-    prompts = [
-        {"prompt": placeholder, "images": [red_descriptor], "example": red_example},
-        {"prompt": placeholder, "images": [blue_descriptor], "example": blue_example},
-    ]
-
-    decoded_images = 0
-    real_decode = mm.decode_image_descriptors
-
-    def counted_decode(descriptors, package_root):
-        nonlocal decoded_images
-        decoded_images += len(descriptors)
-        return real_decode(descriptors, package_root)
-
-    monkeypatch.setattr(mm, "decode_image_descriptors", counted_decode)
-    index, collisions = mm.build_multimodal_examples_index(prompts, None)
-    assert len(index) == 2
-    assert collisions == 0
-    assert decoded_images == 2
-
-    red_messages = prepare_multimodal_messages(
-        placeholder,
-        images=mm.decode_image_descriptors([red_descriptor], None),
-    )
-    blue_messages = prepare_multimodal_messages(
-        placeholder,
-        images=mm.decode_image_descriptors([blue_descriptor], None),
-    )
-    assert mm.multimodal_prompt_key(red_messages) != mm.multimodal_prompt_key(blue_messages)
-    assert mm.multimodal_prompt_key(copy.deepcopy(red_messages)) == mm.multimodal_prompt_key(
-        red_messages
-    )
-    assert index[mm.multimodal_prompt_key(red_messages)] is red_example
-    assert index[mm.multimodal_prompt_key(blue_messages)] is blue_example
-
-
-def test_multimodal_prompt_key_preserves_message_metadata_in_index():
-    trl_data_utils = pytest.importorskip("trl.data_utils")
-    prepare_multimodal_messages = trl_data_utils.prepare_multimodal_messages
-    image_module = pytest.importorskip("PIL.Image")
-    descriptor = mm.normalize_image_source(image_module.new("RGB", (1, 1), "red"), None)
-    first_example = {"answer": "first"}
-    second_example = {"answer": "second"}
-    first_prompt = [{"role": "user", "name": "first-viewer", "content": [{"type": "image"}]}]
-    second_prompt = [
-        {"role": "user", "name": "second-viewer", "content": [{"type": "image"}]}
-    ]
-    prompts = [
-        {"prompt": first_prompt, "images": [descriptor], "example": first_example},
-        {"prompt": second_prompt, "images": [descriptor], "example": second_example},
-    ]
-
-    index, collisions = mm.build_multimodal_examples_index(prompts, None)
-    images = mm.decode_image_descriptors([descriptor], None)
-    first_messages = prepare_multimodal_messages(first_prompt, images=images)
-    second_messages = prepare_multimodal_messages(second_prompt, images=images)
-    first_key = mm.multimodal_prompt_key(first_messages)
-    second_key = mm.multimodal_prompt_key(second_messages)
-
-    assert first_key != second_key
-    assert collisions == 0
-    assert len(index) == 2
-    assert index[first_key] is first_example
-    assert index[second_key] is second_example
-
-
-def test_multimodal_examples_index_reports_identical_prompt_image_collision():
-    pytest.importorskip("trl")
-    image_module = pytest.importorskip("PIL.Image")
-    placeholder = [{"role": "user", "content": [{"type": "image"}]}]
-    descriptor = mm.normalize_image_source(image_module.new("RGB", (1, 1), "red"), None)
-    prompts = [
-        {"prompt": placeholder, "images": [descriptor], "example": {"answer": "first"}},
-        {"prompt": placeholder, "images": [descriptor], "example": {"answer": "last"}},
-    ]
-
-    index, collisions = mm.build_multimodal_examples_index(prompts, None)
-    assert collisions == 1
-    assert len(index) == 1
-    assert next(iter(index.values())) == {"answer": "last"}
-
-
 def test_image_teacher_prompt_uses_one_media_pad_per_descriptor_in_order():
     messages = [
         {"role": "system", "content": "rules"},
@@ -750,20 +586,19 @@ def test_multimodal_algorithm_validation_rejects_unsupported_modes():
 
 
 def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
+    """An image run must not be able to generate the image-pad token itself. verl generates in its
+    own subprocess, so the ban is injected as a rollout shim rather than a generate kwarg."""
     import inspect
 
-    from flash.engine.worker import rl
+    from flash.engine.worker import rl_verl
 
-    source = inspect.getsource(rl.run_rl)
-    guard = "if multimodal and not is_multi_turn:"
-    suppression = (
-        '_gen_kwargs["logit_bias"] = '
-        "{resolve_image_pad_token_id(processor, tok): -100.0}"
-    )
+    # the shim's own rendering is covered in test_rl_verl.py; what belongs here is the multimodal
+    # wiring -- the pad id comes from the PROCESSOR (a text run resolves none) and reaches the shim.
+    resolver = inspect.getsource(rl_verl._resolve_grpo_inputs)
+    assert "image_pad_token_id = resolve_image_pad_token_id(processor, tok)" in resolver
 
-    assert guard in source
-    assert suppression in source
-    assert source.index(guard) < source.index(suppression)
+    entry = inspect.getsource(rl_verl.run_rl_verl)
+    assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in entry
 
 
 def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_path):

@@ -409,7 +409,7 @@ def colocate_kv_util(
         # long-context run (vLLM's blocks must span vllm_max_model_length), so scale it with the
         # context + group (floored at _KV_CAP for the validated short-context lean point, bounded by
         # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
-        # =False) so grpo_sleep_mode's gate and this budget size the SAME KV.
+        # =False) so the resident-fit gate and this budget size the SAME KV.
         kv_gb = max(
             _KV_CAP,
             _resident_kv_gb(

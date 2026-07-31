@@ -29,7 +29,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import MANAGED_GPU_KEYS, JobSpec, backend_env_key, effective_backend
+from flash.spec import MANAGED_GPU_KEYS, JobSpec, effective_backend
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -1177,48 +1177,23 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     )
 
 
-# backends whose trainer shards one job across gpu.count > 1 cards. the verl workers launch
-# nproc-per-node == gpu.count ranks and set ulysses sequence parallelism; the trl grpo worker is
-# single-process and never reads gpu.count, so a count > 1 trl job would bill n cards to train on 1.
-_MULTI_GPU_BACKENDS: frozenset[str] = frozenset({"verl"})
-
 # providers that actually provision gpu.count cards on ONE machine. runpod forwards gpu_count into
 # its endpoint payload; vast's num_gpus search filter has no caller and every lambda instance type is
 # hardcoded gpu_1x_*, so a count > 1 spec there rents a SINGLE card while the trainer spawns n ranks.
 _MULTI_GPU_PROVIDERS: frozenset[str] = frozenset({"runpod"})
 
 
-# backend_env_key/effective_backend live in flash.spec so the launcher's alloc-conf choice and this
-# gate cannot disagree about which trainer a spec runs. only grpo still resolves through a key, and
-# it defaults SILENTLY: an omitted FLASH_RL_BACKEND selects "trl" without any error, and exporting
-# the variable next to the control plane has no effect on submitted runs. recording the result in
-# effective_preparation makes the choice auditable after the fact instead of only inferable from the
-# [worker_env] table.
-
-
 def _require_supported_gpu_count(spec: JobSpec) -> None:
-    """reject gpu.count > 1 unless this spec's backend shards AND its provider rents n cards.
+    """reject gpu.count > 1 unless the provider actually rents n cards.
 
-    gpu.count provisions and bills n cards, so both halves must hold or the run overbills: the trl
-    grpo backend spawns one process and leaves n-1 cards idle, and vast/lambda ignore the count
-    entirely so an n-rank verl trainer would land on a single rented card and fail or thrash.
+    every backend shards now (the verl workers launch nproc-per-node == gpu.count ranks and set
+    ulysses sequence parallelism), so only the provider half remains: vast/lambda ignore the count
+    entirely, so an n-rank trainer would land on a single rented card and fail or thrash while
+    gpu.count billed for n.
     """
     count = getattr(spec.gpu, "count", 1)
     if count <= 1:
         return
-    backend = effective_backend(spec)
-    if backend not in _MULTI_GPU_BACKENDS:
-        # name the key that actually enables sharding. the backend is selected only through
-        # [worker_env], which no other error or doc mentions, so a message that offers just
-        # "set gpu.count to 1" leaves multi-gpu undiscoverable.
-        key = backend_env_key(spec)
-        sharding = ", ".join(sorted(_MULTI_GPU_BACKENDS))
-        raise ValueError(
-            f"multi-gpu training (gpu.count={count}) is not supported by the {backend!r} backend "
-            f"for algorithm {spec.algorithm!r}; it trains in a single process and would leave "
-            f"{count - 1} rented card(s) idle. set gpu.count to 1, or select a sharding backend "
-            f'with [worker_env] {key} = "{sharding}"'
-        )
     provider = (getattr(spec.gpu, "provider", "") or "").strip().lower()
     if provider not in _MULTI_GPU_PROVIDERS:
         supported = ", ".join(sorted(_MULTI_GPU_PROVIDERS))
