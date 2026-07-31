@@ -269,6 +269,12 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
         results = []
         try:
             cases = validate_evaluation_cases(suite, source=source)
+            if not cases:
+                all_valid = False
+                _err(
+                    f"evaluation suite {suite.name} failed contract checks: suite produced no cases"
+                )
+                continue
             for index, case in enumerate(cases, start=1):
                 _policy, response = _evaluation_response(env, case)
                 scored = suite.score(case, response)
@@ -280,6 +286,18 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
                 )
                 results.append(result)
             report = EvalSuiteReport(name=suite.name, results=tuple(results))
+            # a scorer that reported an error did not grade the case. `flash env eval` counts
+            # those as errors and fails the suite, so approving them here would let the offline
+            # gate greenlight exactly the sidecar the online command refuses.
+            errored = [result for result in results if result.error]
+            if errored:
+                all_valid = False
+                detail = ", ".join(f"{result.case_id}: {result.error}" for result in errored)
+                _err(
+                    f"evaluation suite {suite.name} failed contract checks: "
+                    f"{len(errored)}/{report.total} case(s) reported a scoring error ({detail})"
+                )
+                continue
             print(
                 f"evaluation suite {suite.name}: {report.total}/{report.total} cases "
                 f"passed contract checks mean_score={report.mean_score:.6f}"
