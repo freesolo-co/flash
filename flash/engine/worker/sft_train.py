@@ -40,6 +40,7 @@ from flash.engine.worker.backend_common import (
     resolve_verl_python,
     run_verl_training,
     stamp_adapter_dir_provenance,
+    verl_step_number,
 )
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.packing import completion_mask_from_ids
@@ -56,11 +57,6 @@ from flash.engine.worker.sft import (
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
 _LORAPLUS_READY_MARKER = "FLASH_LORAPLUS_READY"
-# the left edge is "not part of a longer word" rather than "preceded by whitespace" (VERL-134):
-# verl shares its stdout with tqdm, which ends a progress bar with "]" and no newline, so the metric
-# line arrives glued to it. a \s anchor matched step 1 and missed every step after, which returned
-# on_line early and kept the zero-grad guard below from ever arming.
-_VERL_STEP_RE = re.compile(r"(?:^|[^\w/])step:(\d+)(?:\s|$)")
 # consecutive zero-grad-norm steps tolerated before the run is failed as untrainable (GRAD-001).
 # 2 is enough to separate a one-off fully-masked batch from a severed backward graph, and keeps
 # the wasted spend to a couple of steps rather than the whole run.
@@ -1378,8 +1374,7 @@ def run_sft_train(spec=None) -> None:
         link = parse_wandb_link(line)
         if link is not None:
             wandb_link.update(link)
-        step_match = _VERL_STEP_RE.search(line)
-        if step_match is None:
+        if verl_step_number(line) is None:
             return
         if _SFT_LORAPLUS_RATIO > 1 and not loraplus_applied:
             raise RuntimeError(

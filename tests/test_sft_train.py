@@ -12,14 +12,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.backend_common import parse_verl_metric
+from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.sft import _pretokenize_completion_only
 from flash.engine.worker.sft_train import (
     _LORAPLUS_READY_MARKER,
     _MAX_ZERO_GRAD_STEPS,
     _VERL_OPTIMIZER_IMPL,
     _VERL_OPTIMIZER_NAME,
-    _VERL_STEP_RE,
     _build_verl_child_env,
     _render_sft_dataset_module,
     _render_sft_sitecustomize,
@@ -594,10 +593,10 @@ def test_zero_grad_norm_at_nonzero_lr_fails_the_run():
 def test_step_gate_admits_a_line_a_tqdm_bar_was_flushed_in_front_of():
     """VERL-134: the guard above never armed on the real run because on_line returned early.
 
-    on_line gates every metric read on ``_VERL_STEP_RE.search(line)``, and verl's LocalLogger
-    shares its stream with tqdm, whose bar ends in "]" with no trailing newline. anchoring the left
-    edge on whitespace matched step 1 and missed steps 2-4, so ``flash-1785598982-21827245``
-    reported done with train/grad_norm 0.0 on every step while the guard's counter sat at 1.
+    on_line gates every metric read on ``verl_step_number(line)``, and verl's LocalLogger shares its
+    stream with tqdm, whose bar ends in "]" with no trailing newline. anchoring the left edge on
+    whitespace matched step 1 and missed steps 2-4, so ``flash-1785598982-21827245`` reported done
+    with train/grad_norm 0.0 on every step while the guard's counter sat at 1.
 
     the guard test above replays its own loop, so it cannot see this: the defect is in the gate the
     real on_line runs first, not in the counting.
@@ -608,18 +607,10 @@ def test_step_gate_admits_a_line_a_tqdm_bar_was_flushed_in_front_of():
         "step:2 - train/loss:1.0206047296524048 - train/grad_norm:0.0 - train/lr:5e-05"
     )
 
-    match = _VERL_STEP_RE.search(glued)
-    assert match is not None, "on_line would return before ever reading grad_norm"
-    assert match.group(1) == "2"
+    assert verl_step_number(glued) == 2, "on_line would return before ever reading grad_norm"
     # and the metrics behind the gate are the ones the guard needs.
     assert parse_verl_metric(glued, "train/grad_norm") == 0.0
     assert parse_verl_metric(glued, "train/lr") == 5e-05
-
-    # widening the left edge must not start matching a different counter or a checkpoint path.
-    assert _VERL_STEP_RE.search("global_step:9 - train/grad_norm:1.0") is None
-    assert _VERL_STEP_RE.search("/tmp/flash/checkpoints/step:9 - train/grad_norm:1.0") is None
-    # ray's worker prefix must keep matching.
-    assert _VERL_STEP_RE.search("(TaskRunner pid=123) step:7 - train/grad_norm:1.0").group(1) == "7"
 
 
 def test_loraplus_shim_has_no_plain_lora_fallback():

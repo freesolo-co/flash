@@ -45,6 +45,7 @@ from flash.engine.worker.backend_common import (
     rollout_sleep_unsupported,
     run_verl_training,
     stall_tail_fields,
+    verl_step_number,
 )
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.multiturn_glue import (
@@ -88,9 +89,6 @@ from flash.engine.worker.tokenizer_align import (
 )
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resume_state_metadata
 
-# "not part of a longer word" rather than "preceded by whitespace" (VERL-134): verl shares its
-# stdout with tqdm, whose bar ends in "]" with no newline, so a metric line can arrive glued to it.
-_VERL_STEP_RE = re.compile(r"(?:^|[^\w/])step:(\d+)(?:\s|$)")
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 _TEXT_TEACHER_BATCH_SIZE = 8
@@ -2504,8 +2502,8 @@ def run_opd_train(spec=None) -> None:
             link = parse_wandb_link(line)
             if link is not None:
                 wandb_link.update(link)
-            step_match = _VERL_STEP_RE.search(line)
-            if step_match is None:
+            step_number = verl_step_number(line)
+            if step_number is None:
                 return
             # parse_verl_metric, not a local float(): verl aggregates this metric with
             # Metric(SUM) -> np.sum (verl/utils/metric/utils.py), and LocalLogger renders it
@@ -2521,9 +2519,8 @@ def run_opd_train(spec=None) -> None:
                 # skip those rather than killing the run. the end-of-run guard still fails loud
                 # when NO step ever produced a distillation loss.
                 return
-            step = int(step_match.group(1))
             progress["loss"] = loss
-            progress_state.record_step(step, loss, bridge)
+            progress_state.record_step(step_number, loss, bridge)
 
         def on_step(step: int) -> None:
             progress["step"] = step

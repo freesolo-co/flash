@@ -1355,17 +1355,24 @@ def parse_wandb_link(line: str) -> dict | None:
 # optimizer update -- "step:N - key:value - key:value" over every scalar metric -- so the parent
 # reconstructs the same backlog from that line. the payload schema is the CLI's, not verl's: keys
 # below are what flash/cli/commands.py:_FOLLOW_METRIC_FIELDS renders.
+
+# the left edge every verl step pattern shares. "not part of a longer word" rather than start-of-
+# line, because ray tags worker stdout with a "(TaskRunner pid=123) " prefix -- an anchored match
+# would parse nothing at all in production.
 #
-# not anchored at line start: ray tags worker stdout with a "(TaskRunner pid=123) " prefix, so an
-# anchored match would parse nothing at all in production. the existing progress regex in rl_train
-# is unanchored for the same reason.
-#
-# the left edge is "not part of a longer word" rather than "preceded by whitespace" (VERL-134).
-# verl's LocalLogger shares its stream with tqdm, which ends a bar with "]" and no newline, so the
-# metric line arrives glued to it -- "...81.49s/it]step:2 - train/loss:...". a \s anchor matched
-# step 1 and missed every step after it, which froze the sft heartbeat on step 1's metrics and kept
-# the zero-grad guard from ever arming. [^\w/] still refuses "global_step:" and a path's ".../step:".
-_VERL_STEP_RE = re.compile(r"(?:^|[^\w/])step:(\d+) - ")
+# and not "preceded by whitespace" either (VERL-134): verl's LocalLogger shares its stream with
+# tqdm, which ends a bar with "]" and no trailing newline, so the metric line arrives glued to it --
+# "...81.49s/it]step:2 - train/loss:...". a \s edge matched step 1 and missed every step after it,
+# which froze the sft heartbeat on step 1's metrics and kept the zero-grad guard from ever arming.
+# excluding / as well as word characters still refuses "global_step:" and a path's ".../step:".
+_VERL_STEP_LEFT_EDGE = r"(?:^|[^\w/])"
+
+# the gate the trainers share, via verl_step_number below: any step-tagged line.
+_VERL_STEP_GATE_RE = re.compile(_VERL_STEP_LEFT_EDGE + r"step:(\d+)(?:\s|$)")
+
+# the `metrics_last` row pattern additionally requires the " - " metric separator, so a step-tagged
+# line carrying no metrics at all cannot open a row.
+_VERL_STEP_RE = re.compile(_VERL_STEP_LEFT_EDGE + r"step:(\d+) - ")
 
 # verl metric key -> flash `metrics_last` field. verl has no counterpart for trl's
 # frac_reward_zero_std (an advantage-collapse fraction trl computes per group), so that column is
@@ -1409,6 +1416,18 @@ def parse_verl_metric(line: str, verl_key: str) -> float | None:
     """
     hit = re.search(rf"(?:^|[\s-]){re.escape(verl_key)}:(\S+)", line)
     return None if hit is None else _metric_value(hit.group(1))
+
+
+def verl_step_number(line: str) -> int | None:
+    """the optimizer step a verl log line is tagged with, or None when it is not a step line.
+
+    the trainers' stdout callbacks gate every metric read on this: a line with no step carries no
+    step-scoped metric worth recording. it lives here rather than in each trainer because all three
+    verl paths read one stdout format -- VERL-134 was one format change that had to be fixed at
+    three copies at once, and a path whose copy was missed drops steps silently rather than failing.
+    """
+    match = _VERL_STEP_GATE_RE.search(line)
+    return None if match is None else int(match.group(1))
 
 
 def parse_verl_step_metrics(line: str) -> dict | None:
