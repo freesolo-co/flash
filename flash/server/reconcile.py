@@ -116,6 +116,18 @@ def _terminal_ts(status: runner.RunStatus) -> float:
     return float(status.finished_at if status.finished_at is not None else status.updated_at)
 
 
+def _attribution_handle(status: runner.RunStatus) -> dict:
+    """The handle to attribute cost from: the LIVE one, else the persisted snapshot.
+
+    cancel_run tears down the resource and clears ``status.remote`` BEFORE writing the billable
+    ``cancelled`` state, so a cancelled run that burned real GPU time (and IS charged, at the steps it
+    actually ran) would otherwise have nothing to attribute from -- excluded from every sweep, never
+    even marked unattributable, silently pending forever. ``reconcile_remote`` is the never-cleared
+    snapshot kept for exactly this; it is read ONLY here, so teardown/recovery semantics are unchanged.
+    """
+    return status.remote or status.reconcile_remote or {}
+
+
 def _settle_seconds(status: runner.RunStatus) -> float:
     """How long after teardown this run's realized cost can be pulled.
 
@@ -124,7 +136,7 @@ def _settle_seconds(status: runner.RunStatus) -> float:
     settles instantly. Unknown/missing provider falls back to the conservative RunPod delay."""
     from flash.providers import INSTANCE_PROVIDERS
 
-    provider = (status.remote or {}).get("provider")
+    provider = _attribution_handle(status).get("provider")
     return 0.0 if provider in INSTANCE_PROVIDERS else _RUNPOD_SETTLE_SECONDS
 
 
@@ -152,7 +164,7 @@ def _due(status: runner.RunStatus, now: float) -> bool:
     )  # from teardown, not a later updated_at bump (see _terminal_ts)
     if age < _settle_seconds(status):
         return False
-    return bool(status.remote)
+    return bool(_attribution_handle(status))
 
 
 def _fail(run_id: str, reason: str, *, stage: str) -> bool:
@@ -179,16 +191,26 @@ def _deliver(run_id: str, body: dict, *, now: float) -> bool:
     The backend route is an idempotent upsert by runId, so re-delivering a payload a previous attempt
     may have actually landed (a response we never saw) is a safe no-op.
 
+    A successful POST is NOT on its own success: if the local persist then fails, the run is still
+    ``delivering`` with no ``reconciled_at`` and is genuinely still owed work, so reporting True would
+    both over-count the sweep and log "realized cost recorded" for a run that isn't. The persist
+    failure is recorded and False returned; the next sweep re-POSTs the staged payload, which the
+    backend's upsert-by-runId makes a safe no-op.
+
     COST-FIELDS-ONLY: record_realized_cost re-reads the run under the guard and writes only the
     realized-cost columns, never ``state`` -- a caller's snapshot could otherwise REVERT a run that
     advanced since (e.g. to ``deployed``), which the terminal-sticky CAS does not protect against."""
     if not _report(body):
         return _fail(run_id, "backend report failed", stage="report")
-    with contextlib.suppress(Exception):
+    try:
         runner.record_realized_cost(
             run_id,
             realized_cost_usd=float(body.get("realizedCostUsd") or 0.0),
             reconciled_at=now,
+        )
+    except Exception as exc:
+        return _fail(
+            run_id, f"delivered but local persist failed: {type(exc).__name__}", stage="report"
         )
     return True
 
@@ -208,7 +230,7 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     now = time.time() if now is None else now
     if status.reconcile_state == "delivering" and status.reconcile_report:
         return _deliver(status.run_id, dict(status.reconcile_report), now=now)
-    remote = status.remote or {}
+    remote = _attribution_handle(status)
     spec = status.spec or {}
     # raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
     # unknown launch rather than the epoch; falling back to created_at prevents inflated flat-rate
@@ -252,10 +274,17 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     # Stage the attribution BEFORE attempting delivery. From here the cost is ours: a failed POST
     # retries against this persisted payload rather than re-querying the provider, so provider access
     # lapsing during a backend outage can no longer destroy a cost we already computed.
-    with contextlib.suppress(Exception):
-        runner.record_attributed_cost(
+    try:
+        acquired = runner.record_attributed_cost(
             status.run_id, realized_cost_usd=realized.realized_usd, report=body
         )
+    except Exception:
+        return _fail(status.run_id, "could not stage the attributed cost", stage="report")
+    if not acquired:
+        # A concurrent pass already reconciled this run while we were fetching. Our body is stale and
+        # the backend upserts by runId, so delivering it would overwrite a settled row with an older
+        # invoice. Nothing to do -- and nothing failed, so record no attempt.
+        return False
     return _deliver(status.run_id, body, now=now)
 
 

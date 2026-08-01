@@ -432,6 +432,9 @@ class RunStatus:
     # re-POSTs THIS payload instead of re-querying the provider, so credentials rotating (or an
     # endpoint being purged) during a backend outage can no longer destroy a cost we already knew.
     reconcile_report: dict | None = None
+    # Last non-null provider handle, kept purely so cost stays attributable after teardown clears
+    # ``remote`` (see _save_status_unlocked). Read only by reconciliation.
+    reconcile_remote: dict | None = None
     reconcile_error: str | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deploy/reconcile.
     finished_at: float | None = None
@@ -1922,6 +1925,23 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     return True
 
 
+def _freeze_teardown_before_bump(status: RunStatus) -> None:
+    """Backfill ``finished_at`` from the CURRENT ``updated_at`` before a cost write bumps it.
+
+    ``reconcile._terminal_ts`` falls back to ``updated_at`` when ``finished_at`` is None (pre-feature
+    records on disk right now). Bumping ``updated_at`` without freezing it first would make the run's
+    apparent teardown time drift forward on every write -- which both DELAYS settle eligibility and,
+    worse, moves the RunPod billing query's ``run_end`` forward, so a later report could sweep in
+    endpoint spend incurred long after this run actually ended. ``record_billing_state`` already does
+    exactly this; every reconciliation writer must too."""
+    if (
+        status.state in _FINISHED_AT_PRESERVED_STATES
+        and status.finished_at is None
+        and not status.reconciled_at
+    ):
+        status.finished_at = status.updated_at
+
+
 def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
     """Persist reconciliation COGS without touching run state. No-ops if run vanished."""
     with _status_guard(run_id):
@@ -1934,6 +1954,7 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
         status.reconcile_state = "reconciled"
         status.reconcile_error = None
         status.reconcile_report = None  # delivered; drop the staged payload
+        _freeze_teardown_before_bump(status)
         status.updated_at = time.time()
         _save_status_unlocked(status)
     _report_status(status)
@@ -1994,16 +2015,24 @@ def record_reconcile_attempt(
             status.reconcile_attempts = attempts
             status.reconcile_error = error
             status.reconcile_state = "unattributable" if attempts >= max_attempts else "pending"
+        _freeze_teardown_before_bump(status)
         status.updated_at = time.time()
         _save_status_unlocked(status)
     _report_status(status)
 
 
-def record_attributed_cost(run_id: str, *, realized_cost_usd: float, report: dict) -> None:
+def record_attributed_cost(run_id: str, *, realized_cost_usd: float, report: dict) -> bool:
     """Persist a cost the provider HAS returned, before attempting delivery to the backend.
 
-    This is the hinge that makes delivery independent of the provider. Previously a failed POST threw
-    the computed cost away and the next sweep re-queried the provider; if provider access lapsed
+    Returns True when this call ACQUIRED the delivery state, i.e. the caller now owns delivering this
+    payload. Returns False when the run is already ``reconciled`` -- a concurrent pass won while this
+    one was still fetching from the provider, so this pass holds a stale result. The caller MUST NOT
+    deliver on False: the backend upserts by runId, so posting a stale body would overwrite an
+    already-settled row (and record_realized_cost would then overwrite the local value too), which
+    matters whenever the provider invoice changed between the two pulls.
+
+    This is also the hinge that makes delivery independent of the provider. Previously a failed POST
+    threw the computed cost away and the next sweep re-queried the provider; if provider access lapsed
     during a backend outage (rotated credentials, purged endpoint) those later pulls burned the
     attribution budget and the run was marked ``unattributable`` -- discarding a cost we already had.
 
@@ -2014,17 +2043,19 @@ def record_attributed_cost(run_id: str, *, realized_cost_usd: float, report: dic
         try:
             status = get_status(run_id)
         except FileNotFoundError:
-            return
+            return False
         if status.reconcile_state == "reconciled":
-            return  # already delivered; nothing to stage
+            return False  # already delivered; this pass is stale -- caller must not re-post
         status.realized_cost_usd = realized_cost_usd
         status.reconcile_report = dict(report)
         status.reconcile_state = "delivering"
         status.reconcile_attempts = 0
         status.reconcile_error = None
+        _freeze_teardown_before_bump(status)
         status.updated_at = time.time()
         _save_status_unlocked(status)
     _report_status(status)
+    return True
 
 
 _BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
@@ -2343,6 +2374,17 @@ def _save_status_unlocked(
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
+    # Remember the last non-null provider handle for COST ATTRIBUTION ONLY. `remote` is the LIVE
+    # handle and is deliberately cleared once a resource is torn down -- but cancel_run tears down and
+    # clears it BEFORE writing the billable `cancelled` state (deploy._clear_exact_remote), so a run
+    # that burned real GPU time and IS charged would reach reconciliation with nothing to attribute
+    # cost from: never swept, never even marked unattributable, silently pending forever. This
+    # snapshot is never cleared and is read only by reconciliation; recovery/teardown continue to use
+    # `remote` so nothing here can resurrect a torn-down resource.
+    # Tracks the LATEST live handle (not the first): reconciliation attributes from the run's last
+    # persisted handle, so a run that retried across resources must snapshot the one it ended on.
+    if status.remote:
+        status.reconcile_remote = dict(status.remote)
     # write-then-rename so concurrent readers never see a half-written file.
     path = runs_file_path(status.run_id, ".json")
     existing = _load_status_json(status.run_id) if os.path.exists(path) else {}

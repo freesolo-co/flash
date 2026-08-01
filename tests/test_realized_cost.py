@@ -164,6 +164,11 @@ def test_reconcile_run_reports_and_persists(monkeypatch):
     updates: dict = {}
     monkeypatch.setattr(
         runner,
+        "record_attributed_cost",
+        lambda run_id, **kw: True,
+    )
+    monkeypatch.setattr(
+        runner,
         "record_realized_cost",
         lambda run_id, **kw: updates.update(run_id=run_id, **kw),
     )
@@ -210,6 +215,7 @@ def test_reconcile_run_falls_back_to_created_at_when_started_ts_missing_or_zero(
 
     monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
     monkeypatch.setattr(reconcile, "_report", lambda body: True)
+    monkeypatch.setattr(runner, "record_attributed_cost", lambda run_id, **kw: True)
     monkeypatch.setattr(runner, "record_realized_cost", lambda *a, **k: None)
     now = 1_000_000.0
     created = now - 9000.0
@@ -244,6 +250,7 @@ def test_reconcile_uses_finished_at_not_deploy_bumped_updated_at_for_instance(mo
 
     monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
     monkeypatch.setattr(reconcile, "_report", lambda body: True)
+    monkeypatch.setattr(runner, "record_attributed_cost", lambda run_id, **kw: True)
     monkeypatch.setattr(runner, "record_realized_cost", lambda run_id, **kw: None)
 
     status = _status(
@@ -273,6 +280,7 @@ def test_reconcile_falls_back_to_updated_at_when_no_finished_at(monkeypatch):
 
     monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
     monkeypatch.setattr(reconcile, "_report", lambda body: True)
+    monkeypatch.setattr(runner, "record_attributed_cost", lambda run_id, **kw: True)
     monkeypatch.setattr(runner, "record_realized_cost", lambda run_id, **kw: None)
 
     status = _status(
@@ -368,6 +376,7 @@ def test_backend_outage_does_not_consume_the_attribution_budget(monkeypatch):
         "realized_cost_for_remote",
         lambda remote, **kw: realized.RealizedCost(provider="runpod", realized_usd=4.2),
     )
+    monkeypatch.setattr(runner, "record_attributed_cost", lambda run_id, **kw: True)
     monkeypatch.setattr(reconcile, "_report", lambda body: False)
 
     # even far past the budget, a delivery failure never escalates to unattributable
@@ -803,3 +812,118 @@ def test_reconcile_cost_loop_reraises_cancelled(monkeypatch):
     # generic Exception — otherwise shutdown would stall until the next cancellation point.
     with pytest.raises(asyncio.CancelledError):
         _run_reconcile_loop_once(monkeypatch, cancel_once)
+
+
+def test_cancelled_run_stays_attributable_after_teardown_clears_the_handle(tmp_path, monkeypatch):
+    """Regression (Codex P1, round 3): cancel_run tears down the resource and clears `remote` BEFORE
+    writing the billable `cancelled` state. Without a preserved snapshot such a run has nothing to
+    attribute from, so `_due` skips it forever -- never reconciled, never even marked unattributable.
+    A cancelled run IS charged (at the steps it actually ran), so that is a systematic hole in the
+    accuracy dataset, and an invisible one."""
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    handle = {"provider": "vast", "instance_id": 7, "hourly_usd": 0.6, "started_ts": 1_000.0}
+    runner._save_status(
+        runner.RunStatus(
+            run_id="r-cancel",
+            state="running",
+            spec={},
+            created_at=1_000.0,
+            updated_at=1_000.0,
+            remote=handle,
+        )
+    )
+    # teardown clears the live handle, then the run goes terminal+billable
+    st = runner.get_status("r-cancel")
+    st.remote = None
+    st.state = "cancelled"
+    st.finished_at = 2_000.0
+    st.cost_usd = 1.25
+    runner._save_status(st)
+
+    st = runner.get_status("r-cancel")
+    assert st.remote is None  # live handle really is gone
+    assert st.reconcile_remote == handle  # ...but the attribution snapshot survived
+    assert reconcile._attribution_handle(st) == handle
+    assert reconcile._due(st, 1_000_000.0)  # so it is still swept instead of vanishing
+
+
+def test_delivery_that_cannot_persist_locally_is_not_reported_as_success(monkeypatch):
+    """Regression (Cursor, round 3): a successful POST whose local persist fails leaves the run
+    `delivering` with no reconciled_at. Returning True there would over-count the sweep and log
+    "realized cost recorded" for a run that is still owed work."""
+    now = 1_000_000.0
+    status = _status(updated_at=now - 7200, remote={"provider": "runpod", "endpoint_id": "e"})
+    calls = _record_calls(monkeypatch)
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda remote, **kw: realized.RealizedCost(provider="runpod", realized_usd=4.2),
+    )
+    monkeypatch.setattr(runner, "record_attributed_cost", lambda run_id, **kw: True)
+    monkeypatch.setattr(reconcile, "_report", lambda body: True)  # POST lands
+
+    def boom(run_id, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner, "record_realized_cost", boom)
+    assert reconcile.reconcile_run(status, now=now) is False  # NOT counted as reconciled
+    assert calls[-1]["stage"] == "report"
+    assert "local persist failed" in calls[-1]["error"]
+
+
+def test_stale_pass_does_not_overwrite_an_already_settled_backend_row(monkeypatch):
+    """Regression (Codex P2, round 3): when a concurrent pass reconciled the run while this one was
+    still fetching, staging no-ops -- and the caller must honor that rather than POSTing its stale
+    body. The backend upserts by runId, so delivering it would overwrite a settled row with an older
+    invoice."""
+    now = 1_000_000.0
+    status = _status(updated_at=now - 7200, remote={"provider": "runpod", "endpoint_id": "e"})
+    calls = _record_calls(monkeypatch)
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda remote, **kw: realized.RealizedCost(provider="runpod", realized_usd=4.2),
+    )
+    # staging reports it did NOT acquire delivery (a concurrent pass already reconciled the run)
+    monkeypatch.setattr(runner, "record_attributed_cost", lambda run_id, **kw: False)
+    posted: list = []
+    monkeypatch.setattr(reconcile, "_report", lambda body: posted.append(body) or True)
+
+    assert reconcile.reconcile_run(status, now=now) is False
+    assert posted == []  # the stale body was never delivered
+    assert calls == []  # and nothing failed, so no attempt is recorded
+
+
+def test_reconcile_writes_freeze_legacy_teardown_time(tmp_path, monkeypatch):
+    """Regression (Codex P1, round 3): for a pre-feature record with finished_at=None, _terminal_ts
+    falls back to updated_at. A cost write that bumps updated_at without freezing it first makes the
+    run's apparent teardown drift forward on every failure -- delaying eligibility and pushing the
+    RunPod billing query's run_end past the run's real end, so a later report could sweep in endpoint
+    spend from well after this run finished."""
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    runner._save_status(
+        runner.RunStatus(
+            run_id="r-legacy",
+            state="done",
+            spec={},
+            created_at=1_000.0,
+            updated_at=2_000.0,  # legacy record: this IS the teardown time
+            remote={"provider": "runpod", "endpoint_id": "e"},
+        )
+    )
+    assert runner.get_status("r-legacy").finished_at is None
+    before = reconcile._terminal_ts(runner.get_status("r-legacy"))
+
+    runner.record_reconcile_attempt(
+        "r-legacy", error="provider down", stage="attribution", max_attempts=24
+    )
+    st = runner.get_status("r-legacy")
+    assert st.finished_at == 2_000.0  # frozen from the pre-bump updated_at
+    assert st.updated_at > 2_000.0  # the bump still happened
+    assert reconcile._terminal_ts(st) == before  # ...but teardown did NOT drift
+
+    # and it stays frozen across further writes
+    runner.record_reconcile_attempt(
+        "r-legacy", error="provider down again", stage="attribution", max_attempts=24
+    )
+    assert reconcile._terminal_ts(runner.get_status("r-legacy")) == before
