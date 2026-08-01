@@ -105,6 +105,22 @@ _MULTI_TURN_SCORE_BATCH_SIZE = 64
 _MULTI_TURN_SCORE_FLUSH_WAIT_S = 0.1
 _MULTI_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
 
+# the bridge's listen() backlog. verl opens one connection per episode and starts a whole step's
+# episodes at once, so the accept queue sees the entire rollout batch -- prompts_per_step *
+# group_size, 512 on the default 64x8 recipe -- connecting in a burst. socketserver's default of 5
+# overflows there and the kernel RESETS the excess, which surfaces client-side as
+# ConnectionResetError at getresponse() (the connect and send landed in the queue; the reset arrives
+# when the queue is dropped). bridge_post deliberately does not retry, so that reset kills the run.
+# the opd teacher bridge already carries this fix as _TEXT_TEACHER_REQUEST_BACKLOG; a fixed constant
+# would only move the cliff, so size the queue from the burst the caller actually generates.
+# linux caps the effective backlog at somaxconn (4096 here) and silently clamps beyond it.
+_REWARD_BRIDGE_MIN_REQUEST_BACKLOG = 128
+
+
+def reward_bridge_request_backlog(rollout_batch: int) -> int:
+    """listen() backlog for a rollout of ``rollout_batch`` concurrently-started episodes."""
+    return max(_REWARD_BRIDGE_MIN_REQUEST_BACKLOG, int(rollout_batch))
+
 
 # --------------------------------------------------------------------------------------------
 # pure helpers (no verl, no gpu, no network) -- unit tested directly.
@@ -2084,12 +2100,15 @@ def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[
     }
 
 
-def start_reward_server(score_by_index, *, example_count: int, multi_turn_bridge=None):
+def start_reward_server(
+    score_by_index, *, example_count: int, multi_turn_bridge=None, rollout_batch: int = 0
+):
     """start a localhost http reward server. score_by_index(index, solution_str) -> float.
 
     returns (server, base_url). the server runs in a daemon thread; call server.shutdown() when
     done. single-turn scoring lives at ``<base_url>/score``; when ``multi_turn_bridge`` is given,
-    its four episode routes are served alongside it from the same thread pool.
+    its four episode routes are served alongside it from the same thread pool. ``rollout_batch`` is
+    how many episodes verl starts at once (prompts_per_step * group_size) and sizes the accept queue.
     """
     # serialize scoring so the flash env sees sequential calls: a flash env is a plain python object
     # with no concurrency contract, and the retired trl path only ever called it from one thread.
@@ -2136,7 +2155,10 @@ def start_reward_server(score_by_index, *, example_count: int, multi_turn_bridge
             self.end_headers()
             self.wfile.write(body)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    class _RewardBridgeHTTPServer(ThreadingHTTPServer):
+        request_queue_size = reward_bridge_request_backlog(rollout_batch)
+
+    server = _RewardBridgeHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     return server, f"http://127.0.0.1:{port}"
@@ -3172,6 +3194,7 @@ def run_rl_train():
         _score,
         example_count=len(rollout_examples),
         multi_turn_bridge=multi_turn_bridge,
+        rollout_batch=int(inp["prompts_per_step"]) * int(inp["group_size"]),
     )
     # bound before the try so the finally can always ask whether it was started.
     resume_uploader: _VerlResumeUploader | None = None

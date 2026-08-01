@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import textwrap
 import threading
@@ -1200,6 +1201,39 @@ def test_concurrent_scorers_are_serialized_for_the_env():
         assert max(peak) == 1, f"env saw {max(peak)} concurrent calls"
     finally:
         server.shutdown()
+
+
+def test_reward_server_accept_queue_holds_a_whole_rollout_batch():
+    # verl opens one connection per episode and starts a whole step at once, so the accept queue
+    # sees prompts_per_step * group_size connects in a burst. socketserver's default backlog of 5
+    # overflows there and the kernel RESETS the excess, which reaches the client as
+    # ConnectionResetError at getresponse(); bridge_post does not retry, so that kills the run.
+    rollout_batch = 512  # the default 64x8 recipe
+    server, _url = rl_train.start_reward_server(
+        lambda idx, solution: 1.0, example_count=8, rollout_batch=rollout_batch
+    )
+    try:
+        assert server.request_queue_size >= rollout_batch
+        # the constant is only a floor -- assert on what listen() actually applied, since a
+        # class attribute set after server_bind would never reach the socket at all.
+        listening = subprocess.run(
+            ["ss", "-lntH", "sport", f"= :{server.server_address[1]}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert listening, "reward server port is not listening"
+        assert int(listening[2]) >= rollout_batch, f"kernel backlog is {listening[2]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_reward_bridge_backlog_never_falls_below_the_burst():
+    # a fixed constant would only move the cliff, so the queue is sized from the caller's burst.
+    assert rl_train.reward_bridge_request_backlog(0) >= 128  # small/unspecified keeps the floor
+    assert rl_train.reward_bridge_request_backlog(64 * 8) >= 64 * 8  # the default grpo recipe
+    assert rl_train.reward_bridge_request_backlog(2048) >= 2048  # and anything larger
 
 
 # ------------------------------- reward parity -------------------------------
