@@ -394,6 +394,130 @@ def test_push_ships_helpers_named_by_the_keyword_form_of_a_dynamic_import(monkey
     assert "weights.py" in files
 
 
+def test_push_ships_helpers_named_through_an_assignment_bound_dynamic_import(monkeypatch, tmp_path):
+    """`load = importlib.import_module` binds the importer without any `import ... as`.
+
+    The alias walk read import statements, so the from-import spelling was covered and this one --
+    which appears in no import statement at all -- was not (codex[bot]). Same end state either way:
+    the helper stays out of the archive, the suite passes locally because its directory is on
+    sys.path, and the published environment raises ModuleNotFoundError on its first case.
+
+    The chain is two hops deep and declared out of order, so a single pass over the assignments in
+    source order resolves neither `pick` nor the helper it names.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import importlib\n\n"
+        # `pick` is bound from `load` BEFORE `load` itself is bound, so resolving this needs a
+        # fixpoint rather than one ordered sweep.
+        "pick = load\n"
+        "load = importlib.import_module\n"
+        "grab = __import__\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    pick('judge')\n"
+        "    grab('rubric')\n"
+        "    return []\n"
+    )
+    (tmp_path / "judge.py").write_text("import weights\n")
+    (tmp_path / "weights.py").write_text("W = 1\n")
+    (tmp_path / "rubric.py").write_text("RULES = ()\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "judge.py" in files
+    assert "rubric.py" in files
+    # and followed transitively, exactly as a directly named helper is
+    assert "weights.py" in files
+
+
+def test_alias_chains_resolve_without_rescanning_every_binding() -> None:
+    """A long reverse-ordered chain must cost one look per binding, not one sweep per link.
+
+    Re-scanning every assignment per pass resolves exactly one new name per pass when the chain is
+    declared in reverse -- the ordering this walk explicitly supports -- so the cost is quadratic:
+    a generated 5,000-link sidecar spent ~3.4s here, and `env push` walks again while copying, so
+    it paid that twice before any archive limit applied (codex[bot]).
+
+    Counts reads of the bound name on the real function rather than timing it. A wall-clock bound
+    is flaky on a shared runner and would not say why it got slow, whereas the read count separates
+    the two shapes by two orders of magnitude at n=300: ~n for a work queue against ~n**2/2 for
+    repeated sweeps.
+    """
+    import ast
+
+    from flash.cli import envpush
+
+    n = 300
+
+    reads = 0
+
+    class CountingName(ast.Name):
+        """An `ast.Name` that records each time the walk reads the identifier it binds.
+
+        `id` shadows the builtin, but that is the attribute name `ast.Name` itself uses and the
+        walk reads, so counting reads means defining it under exactly that name.
+        """
+
+        def __getattribute__(self, attr):
+            if attr == "id":
+                nonlocal reads
+                reads += 1
+            return object.__getattribute__(self, attr)
+
+    # reverse dependency order: each link names the next and only the last reaches the importer,
+    # so a sweep-based walk resolves one hop per pass and re-reads every other binding meanwhile.
+    src = "\n".join(
+        ["import importlib"]
+        + [f"a{i} = a{i + 1}" for i in range(n - 1)]
+        + [f"a{n - 1} = importlib.import_module"]
+    )
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+            node.value.__class__ = CountingName
+
+    reads = 0
+    names = envpush._dynamic_import_callees(tree)
+
+    # every link resolved, in either declaration order
+    assert {f"a{i}" for i in range(n)} <= set(names)
+    # and each binding's source was read a bounded number of times rather than once per pass. the
+    # quadratic form reads ~n**2/2 = ~45,000 for n=300; a small constant per binding is fine.
+    assert reads <= 4 * n, (
+        f"read bound sources {reads} times for {n} bindings -- "
+        "the walk is rescanning rather than resolving each binding once"
+    )
+
+
+def test_push_does_not_mistake_an_unrelated_callable_for_a_dynamic_import(monkeypatch, tmp_path):
+    """Binding some other function to a plausible name must not make its argument a module.
+
+    The guard against over-matching: `load` is an ordinary name, and a sidecar that binds it to
+    something unrelated calls it with strings that are not module names. Shipping a file per such
+    call would be wrong in the quiet direction -- the archive grows and nothing points at why.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import os.path\n\n"
+        "load = os.path.join\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    load('judge')\n"
+        "    return []\n"
+    )
+    # present on disk, so the assertion is about the walker's judgement rather than the file
+    # simply being absent: a match would package it.
+    (tmp_path / "judge.py").write_text("SHOULD_NOT_SHIP = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    assert "judge.py" not in _members(cap["package_b64"])
+
+
 def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monkeypatch, tmp_path):
     """`from custom import SCORER` must keep resolving after custom.py is published as environment.py.
 
