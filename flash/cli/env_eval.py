@@ -663,25 +663,35 @@ def cmd_env_eval(args) -> int:
         spec = None
         try:
             spec = client.get_run(target_run_id).get("spec")
-        except ApiError as exc:
-            # a plane that answers, but not about this run: an old build with no such route, or a
-            # run the key cannot see. nothing to retry, and every eval before this lookup existed
-            # graded the raw response, so keep that behavior and say so.
-            _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
         except ClientError as exc:
-            # a plane that did not answer at all -- unreachable, or timed out. the chat requests
-            # that follow may still succeed, and then `thinking` would stay false while every
-            # `<think>...</think>answer` was handed to the scorer raw, uploading a whole paid
-            # suite of false failures (codex[bot]). this is the retryable case, so stop before
-            # buying any generation rather than grade in a normalization state we guessed at.
-            if getattr(args, "debug", False):
-                raise
-            _err(
-                f"env eval failed: could not reach the control plane for {target_run_id}: {exc}. "
-                "retry once it is reachable: grading without its thinking mode would score every "
-                "reasoning response against raw output."
+            # one handler, not two: `ApiError` subclasses `ClientError`, so an `except ApiError`
+            # arm would catch 5xx and 429 before the retryable arm ever saw them, and a plane
+            # merely overloaded while chat stays usable would grade the whole suite raw -- the
+            # exact failure the retryable branch exists to stop (cursor[bot]).
+            #
+            # a 4xx is the plane answering, just not about this run: an old build with no such
+            # route, or a run this key cannot see. retrying returns the same answer, and every
+            # eval before this lookup existed graded the raw response, so keep that and say so.
+            answered_definitively = (
+                isinstance(exc, ApiError) and exc.status < 500 and exc.status != 429
             )
-            return _err("overall: FAIL")
+            if answered_definitively:
+                _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
+            else:
+                # the plane did not answer, or answered with a fault that will pass: unreachable,
+                # timed out, overloaded. the chat requests that follow may still succeed, and then
+                # `thinking` would stay false while every `<think>...</think>answer` was handed to
+                # the scorer raw, uploading a whole paid suite of false failures (codex[bot]).
+                # retryable, so stop before buying any generation rather than grade in a
+                # normalization state we guessed at.
+                if getattr(args, "debug", False):
+                    raise
+                _err(
+                    f"env eval failed: could not reach the control plane for {target_run_id}: "
+                    f"{exc}. retry once it is reachable: grading without its thinking mode would "
+                    "score every reasoning response against raw output."
+                )
+                return _err("overall: FAIL")
         except Exception as exc:
             # anything else is not a transport fault, so it is not retryable either. broad, so an
             # unexpected client shape cannot crash a command the user asked for.
