@@ -24,10 +24,16 @@ from flash.providers.runpod.gpus import flash_gpu
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
-# 28 leaves a 2-slot buffer under RunPod's 30-worker account quota. Shared via Postgres when an
+# 58 leaves a 2-slot buffer under RunPod's 60-worker account quota. Shared via Postgres when an
 # internal key is set; falls back to in-process semaphore otherwise. Releases only after the
 # remote endpoint is provably gone.
-RUNPOD_ENDPOINT_SLOT_CAP = 28
+#
+# The plane validates this value against its own cap (`le=RUNPOD_ENDPOINT_SLOT_CAP` on
+# /api/runpod/internal/slots/claim), so a raise here only takes effect once the matching
+# freesolo change is deployed; until then claims 422 and every process silently falls back to
+# the in-process semaphore, which is exactly the N*cap oversubscription the shared store exists
+# to prevent. Deploy freesolo first.
+RUNPOD_ENDPOINT_SLOT_CAP = 58
 _SLOT_QUEUE_WAIT_S = 10.0
 _SLOT_STORE_MAX_ERRORS = 6
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
