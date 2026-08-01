@@ -220,6 +220,13 @@ def _score_case(
 # the server's own names for a record that is serving traffic versus one still coming up
 # (flash/server/routes/serving.py). a busy record's `adapter_revision` is the INCOMING revision.
 _READY_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
+# a busy record may be a redeploy over a live revision, so it can still serve through the
+# predecessor the public listing hides. ready plus busy is therefore the whole set that might
+# answer; `/v1/deployments` excludes only `undeployed`/`dry_run`, so everything else it returns --
+# `failed`, `revocation_failed`, any state a newer plane adds -- reaches this CLI as a record that
+# is neither. `flash models deploy --wait` already fails closed on exactly that split
+# (flash/cli/commands.py).
+_BUSY_DEPLOYMENT_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 
 
 def _live_deployment(client, run_id: str) -> dict | None:
@@ -631,6 +638,17 @@ def cmd_env_eval(args) -> int:
         if deployment is None:
             _err(f"env eval failed: run {args.target} is not deployed")
             return _err("overall: FAIL")
+        deployment_state = deployment.get("state")
+        if deployment_state not in _READY_DEPLOYMENT_STATES | _BUSY_DEPLOYMENT_STATES:
+            # having a record is not having a servable one: the listing keeps terminal states like
+            # `failed` and `revocation_failed`, and the chat route has no ready predecessor to fall
+            # back to for them, so every case 409s. That spends a whole suite of generation
+            # failures to learn what one target error says now (chatgpt-codex-connector).
+            _err(
+                f"env eval failed: run {args.target} deployment is {deployment_state or 'unknown'}"
+                f"; run `{CLI_NAME} models deploy {run_id}` first"
+            )
+            return _err("overall: FAIL")
         # a busy record is listed with the revision it is rolling OUT to, so pinning it would file
         # the scores under weights that were not answering requests (codex[bot]). the predecessor
         # still serving underneath is stripped from the public listing, so this side cannot name
@@ -639,7 +657,7 @@ def cmd_env_eval(args) -> int:
         # as the user wrote it and let the chat route resolve it: it reads the private rollback
         # state, and answers with a 409 naming the surface to use when nothing is serving at all.
         resolved = None
-        if deployment.get("state") in _READY_DEPLOYMENT_STATES:
+        if deployment_state in _READY_DEPLOYMENT_STATES:
             candidate = deployment.get("adapter_revision")
             resolved = parse_adapter_revision(candidate) if isinstance(candidate, str) else None
             if resolved is None or resolved[0] != run_id:
@@ -663,6 +681,29 @@ def cmd_env_eval(args) -> int:
         if resolved is not None and (want_step is None or resolved[1] == want_step):
             evaluation_target = candidate.strip()
             print(f"resolved evaluation target {args.target} to {evaluation_target}")
+        elif args.upload and want_step is not None:
+            # an uploaded report is a permanent record, so it has to name the weights it graded.
+            # `RUN/step-N` names a step but not a revision: the server resolves it against the run's
+            # whole verified ledger, which can hold several revisions at one step
+            # (`_verified_step_index`), and a later rebuild of that step reuses the same shorthand --
+            # so two different sets of weights file as one measurement, and afterwards nothing can
+            # tell them apart (chatgpt-codex-connector).
+            #
+            # This side cannot resolve it: the verified ledger is server-only,
+            # `/v1/runs/{id}/checkpoints` carries no revision, and the chat route never echoes the
+            # revision that answered. So refuse before buying a single generation rather than spend
+            # a whole suite on a result nobody can identify. Both ways out are in the message, and
+            # evaluating without `--upload` still prints the verdict.
+            #
+            # Only when a step was asked for. A bare alias means "whatever serves this run now",
+            # which is what it records, and a busy one deliberately stays unpinned so the run still
+            # evaluates through the predecessor `flash chat RUN` uses (codex[bot], test above).
+            _err(
+                f"env eval failed: cannot upload results for {args.target}: the immutable "
+                "revision that will answer it is not knowable here. re-run with the full "
+                f"revision from `{CLI_NAME} models deployments`, or drop --upload"
+            )
+            return _err("overall: FAIL")
 
     # graders must see what training graded, so the run's own `thinking` decides whether the
     # reasoning is stripped first (see `_scored_response`). read once here rather than per case:
