@@ -33,11 +33,17 @@ _EXPLICIT_TARGET = "flash-1@step-3." + "a" * 40
 class _EvalClient:
     """Base for a double used by an environment evaluation.
 
-    The real client supplies both methods for every target. Full revisions need no step-selector
-    warm-up, while every evaluation now reads the run spec to find its published environment and
-    project. Keeping those ordinary defaults here lets each double stay focused on the behavior its
-    test owns.
+    The real client supplies all three methods for every target. Full revisions need no
+    step-selector warm-up, while every evaluation now reads the run spec to find its published
+    environment and project, then downloads that environment's package through the control plane.
+    Keeping those ordinary defaults here lets each double stay focused on the behavior its test
+    owns.
+
+    `download_env_package` packs whatever directory `_patch_published_env` registered, so a test
+    that never registers one inherits an explicit failure rather than a silently empty environment.
     """
+
+    _env_dir: Path | None = None
 
     def get_run(self, run_id):
         return {
@@ -51,19 +57,45 @@ class _EvalClient:
     def warm_chat_step_selector(self, target):
         return None
 
+    def download_env_package(self, env_id):
+        # packed on download, not on registration: the fixture dir is created first and its
+        # evaluations.py written after, so packing eagerly would publish an environment whose
+        # sidecar the test had not written yet.
+        if self._env_dir is None:
+            raise AssertionError(
+                f"env eval downloaded {env_id} but this test registered no environment; "
+                "call _patch_published_env(monkeypatch, env_dir)"
+            )
+        return _environment_package_bytes(self._env_dir)
+
+
+def _environment_package_bytes(env_dir: Path) -> bytes:
+    """`env_dir` as the tar.gz the control plane's package route returns.
+
+    A real archive rather than a patched resolver: `env eval` downloads the package and extracts it,
+    so packing here leaves both halves live and lets the tests catch a break in either.
+    """
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path in sorted(env_dir.rglob("*")):
+            if path.is_file():
+                archive.add(path, arcname=str(path.relative_to(env_dir)))
+    return buffer.getvalue()
+
 
 def _patch_published_env(monkeypatch, env_dir: Path) -> None:
-    """Resolve the canonical published slug onto a local fixture dir, with no network.
+    """Serve `env_dir` as the published slug's package, with no network.
 
-    `_resolve_environment_reference` is the single seam both the loader and the sidecar resolution
-    go through, and both import it inside the function body, so one patch redirects the whole
-    published-environment path onto tmp_path.
+    The control plane is the single seam the whole published-environment path now goes through:
+    `env eval` downloads the package, extracts it to a temp dir, and grades the environment, the
+    suites, and the sidecar from that one extracted copy. Packing the fixture into the archive the
+    client returns therefore redirects all of it, and -- unlike patching the resolver -- leaves the
+    download, the extraction, and the slug-vs-local-path resolution running for real.
     """
-    entrypoint = env_dir / "environment.py"
-    monkeypatch.setattr(
-        "flash.envs.loader._resolve_environment_reference",
-        lambda env_ref, pinned_sha=None: str(entrypoint),
-    )
+    monkeypatch.setattr(_EvalClient, "_env_dir", env_dir)
 
 
 def _environment_dir(tmp_path: Path, *, monkeypatch: pytest.MonkeyPatch | None = None) -> Path:
@@ -533,7 +565,7 @@ def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp
     """
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.targets = []
 
@@ -705,7 +737,7 @@ def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
     events: list[str] = []
     lock = threading.Lock()
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
             return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
 
@@ -767,7 +799,7 @@ def test_env_eval_fails_the_target_when_the_capability_prewarm_fails(
     calls = {"warm": 0, "chat": 0}
     lock = threading.Lock()
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
             return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
 
@@ -1087,7 +1119,7 @@ def test_env_eval_no_upload_never_records_anything(monkeypatch, tmp_path) -> Non
     """`--no-upload` is the only way to score without leaving a record."""
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
             return {
                 "spec": {
@@ -1120,7 +1152,7 @@ def test_env_eval_records_under_the_evaluated_runs_own_project(monkeypatch, tmp_
     `flash-1` belongs to, which its own spec already names."""
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
             return {
                 "spec": {
@@ -1150,7 +1182,7 @@ def test_env_eval_project_flag_overrides_the_runs_own_project(monkeypatch, tmp_p
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     other = "22222222-2222-2222-2222-222222222222"
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
             return {
                 "spec": {
@@ -1195,7 +1227,7 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
     # the loader actually parses.
     spec_environment = managed_slug_to_github_ref(expected) if as_github_ref else expected
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
             return {
                 "spec": {
@@ -1240,6 +1272,95 @@ def test_env_eval_refuses_a_run_that_names_no_published_environment(monkeypatch,
     assert cli.main(["env", "eval", _EXPLICIT_TARGET]) == 1
     assert uploader.calls == []
     assert "trains on no published environment" in capsys.readouterr().err
+
+
+def test_env_eval_refuses_a_generic_github_reference(monkeypatch, capsys) -> None:
+    """A reference that is not a hub slug names no environment page, so it cannot be recorded.
+
+    `github:owner/repo@main:path/environment.py` is a supported way to train, and
+    `_spec_environment_id` returns it verbatim because it denotes no hub page. Nonempty was the only
+    guard, so such a run graded and then uploaded a reference the dashboard cannot resolve to
+    anything -- the unlinked provenance this command exists to eliminate, reintroduced through the
+    one reference shape nobody thought to exclude (codex[bot]).
+    """
+
+    class Client(_EvalClient):
+        def get_run(self, run_id):
+            return {
+                "spec": {
+                    "thinking": False,
+                    "project": _PROJECT_ID,
+                    "environment": {"id": "github:acme/envs@main:starter/environment.py"},
+                }
+            }
+
+        def chat_stream(self, target, messages, **kwargs):
+            raise AssertionError("an unpublished reference must not be graded")
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET]) == 1
+    assert uploader.calls == []
+    assert "is not a published environment" in capsys.readouterr().err
+
+
+def test_env_eval_grades_the_hub_package_over_a_same_named_local_directory(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A working copy named like the slug must not supply the suites for the published environment.
+
+    Resolution is not uniform across the two loaders: a managed slug goes straight to the hub, while
+    the sidecar lookup prefers a local path when `namespace/name` exists in the cwd. A developer
+    with a checkout at ./acme/starter therefore graded the published environment with their own
+    uncommitted evaluations.py, and the report named the published slug either way -- a wrong
+    measurement filed under a right-looking provenance (cursor[bot]).
+
+    Downloading once and grading from the extracted copy is what removes the ambiguity, so this test
+    keeps the real resolution running and only fakes the transport.
+    """
+    published = tmp_path / "published"
+    published.mkdir()
+    (published / "environment.py").write_text("def load_environment():\n    return None\n")
+    (published / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'published'\n"
+        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_published_env(monkeypatch, published)
+
+    # the decoy: a directory whose path is exactly the slug, relative to the cwd.
+    local = tmp_path / "cwd" / _PUBLISHED_SLUG
+    local.mkdir(parents=True)
+    (local / "environment.py").write_text("def load_environment():\n    return None\n")
+    (local / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'local-working-copy'\n"
+        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    monkeypatch.chdir(tmp_path / "cwd")
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path, **_k: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 0
+
+    # the hub's suite ran, not the working copy's.
+    assert [call["suite_name"] for call in uploader.calls] == ["published"]
+    assert "local-working-copy" not in capsys.readouterr().out
+    # and the provenance is still the slug, never the path it was graded from.
+    assert uploader.calls[0]["environment_reference"] == _PUBLISHED_SLUG
 
 
 def test_env_eval_upload_sends_every_case_with_the_project_id(monkeypatch, tmp_path) -> None:
@@ -2851,7 +2972,7 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
 
     sent: list[list[dict]] = []
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
             return {"spec": {"environment": {"id": _PUBLISHED_SLUG}}}
 
@@ -3002,7 +3123,7 @@ def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path
         )
         return env_dir
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self, thinking, response):
             self._thinking = thinking
             self._response = response
