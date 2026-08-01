@@ -395,6 +395,64 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     assert all(status.deployment["state"] == "failed" for status in reported)
 
 
+def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(monkeypatch):
+    # a run accepted under an algorithm this build has since dropped keeps a `ready` deployment
+    # record. every serving route parses the persisted spec before inference, so chat raises there
+    # instead of answering -- while `/v1/deployments` still lists the record as active, and only
+    # BUSY states were recovered at startup. the record therefore survived every restart as a
+    # deployment that looks live and can never respond (chatgpt-codex-connector).
+    rows = [{"run_id": "r-retired"}, {"run_id": "r-servable"}]
+    monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
+
+    project = "11111111-1111-4111-8111-111111111111"
+    statuses = {
+        "r-retired": types.SimpleNamespace(
+            run_id="r-retired",
+            state="done",
+            deployment={"state": "ready"},
+            spec={
+                "run_id": "r-retired",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opsd",
+                "project": project,
+            },
+        ),
+        # same ready state, a spec this build still parses: must be left serving, so the check
+        # cannot be passing merely because it fails every ready record it sees.
+        "r-servable": types.SimpleNamespace(
+            run_id="r-servable",
+            state="done",
+            deployment={"state": "ready"},
+            spec={
+                "run_id": "r-servable",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "sft",
+                "project": project,
+            },
+        ),
+    }
+    monkeypatch.setattr(serving._app, "get_status", lambda run_id: statuses[run_id])
+
+    import flash.runner as runner
+
+    marked: list[tuple[str, dict]] = []
+
+    def mark_failed(run_id, failed):
+        marked.append((run_id, failed))
+        return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
+
+    monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
+    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner, "_report_status", lambda status: None)
+
+    assert serving.recover_deployments() == 1
+    assert [run_id for run_id, _failed in marked] == ["r-retired"]
+    failed = marked[0][1]
+    assert failed["state"] == "failed"
+    # the reason names the actual cause, not the restart the busy branch reports.
+    assert "no longer supported" in failed["error"]
+
+
 def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
     import flash.runner as runner
 

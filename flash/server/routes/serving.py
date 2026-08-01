@@ -439,6 +439,19 @@ def _resolve_explicit_chat_revision(
     return None
 
 
+def _spec_is_unservable(status) -> bool:
+    """Whether the serving routes' own `JobSpec.from_dict` would reject this run's persisted spec.
+
+    Asked with the same call the chat and deploy routes make, so the answer cannot drift from what
+    they will actually do with the record.
+    """
+    try:
+        JobSpec.from_dict(status.spec)
+    except Exception:
+        return True
+    return False
+
+
 def recover_deployments() -> int:
     """Clear deployment lifecycle records left busy by a control-plane restart."""
     recovered = 0
@@ -448,13 +461,26 @@ def recover_deployments() -> int:
         except FileNotFoundError:
             continue
         deployment = status.deployment or {}
-        if deployment.get("state") not in _DEPLOYMENT_BUSY_STATES:
+        state = deployment.get("state")
+        if state in _DEPLOYMENT_BUSY_STATES:
+            error = "deployment lifecycle interrupted by control-plane restart"
+            detail = "deployment interrupted; retry `flash models deploy`"
+        elif state == "ready" and _spec_is_unservable(status):
+            # A ready deployment whose persisted spec this build can no longer parse is not
+            # servable: every serving route parses it before inference, so chat raises there
+            # instead of answering, while `/v1/deployments` keeps listing the record as active.
+            # Only busy states were recovered, so such a record survived every restart as a
+            # deployment that looks live and can never respond (chatgpt-codex-connector). Fail it
+            # HERE, at the same startup pass, so the state the API reports matches what it can do.
+            error = "deployment spec is no longer supported by this control plane"
+            detail = "deployment retired: its algorithm was removed; submit a new run to deploy"
+        else:
             continue
         failed = _deployment_state(
             deployment,
             "failed",
-            error="deployment lifecycle interrupted by control-plane restart",
-            detail="deployment interrupted; retry `flash models deploy`",
+            error=error,
+            detail=detail,
             recovered_at=time.time(),
         )
         marked = mark_deployment_failed(status.run_id, failed)
