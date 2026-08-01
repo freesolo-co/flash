@@ -110,6 +110,21 @@ def test_cgroup_cpu_quota_reads_v2_and_reports_none_when_uncapped(tmp_path):
     assert _read("max 100000") is None
 
 
+def test_ray_cpu_floor_clears_what_verl_actually_reserves():
+    # the cap must not create the OPPOSITE failure. verl blocks in ray.get(pg.ready()) with no
+    # timeout, so a cluster with fewer cpus than the placement group wants hangs forever before the
+    # gpu is touched -- the same trap the SimpleStorage override upstream of this guards against.
+    # demand on a 1-gpu pod, read off the verl source rather than guessed: 3 for the worker bundle
+    # (RayClassWithInitArgs max_colocate_count=3, seen as CPU_group_0: [30000] in the raylet dump),
+    # 1 for TaskRunner (main_ppo.py ray.remote(num_cpus=1)), 1 for opd's single storage unit.
+    verl_peak_cpu_demand = 3 + 1 + 1
+    with (
+        mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+    ):
+        assert vc.ray_num_cpus() > verl_peak_cpu_demand
+
+
 def test_every_ray_backed_trainer_constrains_rays_cpu_pool():
     # asserted across BOTH ray entrypoints rather than in one file: ray autodetects the host's cores
     # and eagerly forks one idle worker per core, which killed grpo (fatal raylet fork failure) and
