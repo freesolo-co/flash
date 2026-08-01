@@ -24,10 +24,20 @@ from flash.providers.runpod.gpus import flash_gpu
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
-# 28 leaves a 2-slot buffer under RunPod's 30-worker account quota. Shared via Postgres when an
+# 58 leaves a 2-slot buffer under RunPod's 60-worker account quota. Shared via Postgres when an
 # internal key is set; falls back to in-process semaphore otherwise. Releases only after the
 # remote endpoint is provably gone.
-RUNPOD_ENDPOINT_SLOT_CAP = 28
+#
+# NOTE: nothing enforces this today. The only claim site is `_acquire_endpoint_slot`, reached
+# only from `get_train_endpoint`, which has had no production caller since 3b2689f2 (the
+# multi-account waterfall, 28 minutes after the slot store landed) gave `jobs.py::_deploy_once`
+# its own `Endpoint(...)` path that never claims. flash.runpod_endpoint_slots has 0 rows on prod
+# and dev because nothing has ever leased, not because nothing is leased right now. The startup
+# `reconcile_endpoint_slots()` still runs, but it only deletes rows for endpoints that are gone.
+#
+# So this constant is the intended value, not an enforced one. Wiring the claim into the live
+# deploy path is a separate change: it alters endpoint provisioning, not a number.
+RUNPOD_ENDPOINT_SLOT_CAP = 58
 _SLOT_QUEUE_WAIT_S = 10.0
 _SLOT_STORE_MAX_ERRORS = 6
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
