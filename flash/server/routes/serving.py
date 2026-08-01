@@ -465,13 +465,17 @@ def recover_deployments() -> int:
         if state in _DEPLOYMENT_BUSY_STATES:
             error = "deployment lifecycle interrupted by control-plane restart"
             detail = "deployment interrupted; retry `flash models deploy`"
-        elif state == "ready" and _spec_is_unservable(status):
+        elif state in _DEPLOYMENT_READY_STATES and _spec_is_unservable(status):
             # A ready deployment whose persisted spec this build can no longer parse is not
             # servable: every serving route parses it before inference, so chat raises there
             # instead of answering, while `/v1/deployments` keeps listing the record as active.
             # Only busy states were recovered, so such a record survived every restart as a
             # deployment that looks live and can never respond (chatgpt-codex-connector). Fail it
             # HERE, at the same startup pass, so the state the API reports matches what it can do.
+            #
+            # Both readiness spellings, as everywhere else in this module: this pass reads records
+            # persisted by OTHER builds, which is the whole reason it exists, so the one spelling
+            # this build happens to write is not the set it can encounter (cursor).
             error = "deployment spec is no longer supported by this control plane"
             detail = "deployment retired: its algorithm was removed; submit a new run to deploy"
         else:
