@@ -441,8 +441,20 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
             {"state": "ready", "adapter_revision": "other-run@final." + "b" * 40},
             "has no valid immutable adapter revision",
         ),
+        # `/v1/deployments` excludes only undeployed/dry_run, so a terminal record is still listed
+        # and "has a record" was read as "has a servable one". The chat route has no ready
+        # predecessor for these, so every case 409s: a whole suite of generation failures to say
+        # what one target error says here (chatgpt-codex-connector).
+        ({"state": "failed"}, "deployment is failed"),
+        ({"state": "revocation_failed"}, "deployment is revocation_failed"),
     ],
-    ids=["absent", "no-revision", "another-runs-revision"],
+    ids=[
+        "absent",
+        "no-revision",
+        "another-runs-revision",
+        "failed",
+        "revocation-failed",
+    ],
 )
 def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
     monkeypatch, tmp_path, capsys, deployment, reason
@@ -2305,6 +2317,59 @@ def test_env_eval_keeps_a_step_shorthand_the_live_deployment_has_moved_past(
 
     # the shorthand is forwarded untouched: the step-40 revision must never be substituted for it.
     assert client.targets == ["flash-1/step-3"]
+
+
+def test_env_eval_refuses_to_upload_a_step_it_cannot_name(monkeypatch, tmp_path, capsys) -> None:
+    """An uploaded report must name the weights it graded, so an unpinnable step cannot upload.
+
+    Evaluating it is right (the test above), but recording it is not: `RUN/step-N` is a shorthand
+    the server resolves against a ledger that can hold several revisions at one step, and a later
+    rebuild of that step reuses it -- so two different sets of weights file as one measurement
+    (chatgpt-codex-connector). Only the live revision is visible from here, so refuse before buying
+    any generation rather than upload a result nobody can identify afterwards.
+    """
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'math'\n"
+        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def deployments(self):
+            return [
+                {
+                    "run_id": "flash-1",
+                    "deployment": {
+                        "state": "ready",
+                        "checkpoint_step": 40,
+                        "adapter_revision": "flash-1@step-40." + "b" * 40,
+                    },
+                }
+            ]
+
+        def chat_stream(self, target, messages, **kwargs):
+            raise AssertionError(f"bought a generation for an unrecordable target: {target}")
+
+    def _uploaded(**kwargs):
+        raise AssertionError("uploaded a result whose weights the report cannot name")
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", lambda: Client())
+    monkeypatch.setattr("flash.client.upload_eval_run", _uploaded, raising=False)
+    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
+    monkeypatch.setattr("flash.client.get_project", lambda pid, api_key: {"id": pid}, raising=False)
+
+    args = ["env", "eval", "flash-1/step-3", str(env_dir), "--upload", "--project", _PROJECT_ID]
+    assert cli.main(args) == 1
+
+    # the refusal names both ways out, so it is actionable rather than a dead end.
+    err = capsys.readouterr().err
+    assert "cannot upload results for flash-1/step-3" in err
+    assert "models deployments" in err
+    assert "--upload" in err
 
 
 def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> None:
