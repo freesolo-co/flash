@@ -1229,11 +1229,18 @@ def test_reward_server_accept_queue_holds_a_whole_rollout_batch():
         server.server_close()
 
 
-def test_reward_bridge_backlog_never_falls_below_the_burst():
+@pytest.mark.parametrize("rollout_batch", [0, 32, 64 * 8, 2048])
+def test_reward_bridge_backlog_never_falls_below_the_burst(rollout_batch):
     # a fixed constant would only move the cliff, so the queue is sized from the caller's burst.
-    assert rl_train.reward_bridge_request_backlog(0) >= 128  # small/unspecified keeps the floor
-    assert rl_train.reward_bridge_request_backlog(64 * 8) >= 64 * 8  # the default grpo recipe
-    assert rl_train.reward_bridge_request_backlog(2048) >= 2048  # and anything larger
+    # an unspecified batch still keeps a floor well clear of socketserver's default of 5.
+    server, _url = rl_train.start_reward_server(
+        lambda idx, solution: 1.0, example_count=1, rollout_batch=rollout_batch
+    )
+    try:
+        assert server.request_queue_size >= max(128, rollout_batch)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 # ------------------------------- reward parity -------------------------------

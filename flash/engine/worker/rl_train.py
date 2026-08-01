@@ -117,11 +117,6 @@ _MULTI_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
 _REWARD_BRIDGE_MIN_REQUEST_BACKLOG = 128
 
 
-def reward_bridge_request_backlog(rollout_batch: int) -> int:
-    """listen() backlog for a rollout of ``rollout_batch`` concurrently-started episodes."""
-    return max(_REWARD_BRIDGE_MIN_REQUEST_BACKLOG, int(rollout_batch))
-
-
 # --------------------------------------------------------------------------------------------
 # pure helpers (no verl, no gpu, no network) -- unit tested directly.
 # --------------------------------------------------------------------------------------------
@@ -2156,7 +2151,7 @@ def start_reward_server(
             self.wfile.write(body)
 
     class _RewardBridgeHTTPServer(ThreadingHTTPServer):
-        request_queue_size = reward_bridge_request_backlog(rollout_batch)
+        request_queue_size = max(_REWARD_BRIDGE_MIN_REQUEST_BACKLOG, int(rollout_batch))
 
     server = _RewardBridgeHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
