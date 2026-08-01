@@ -528,6 +528,29 @@ def _worker_artifacts(spec) -> dict[str, str]:
     return out
 
 
+def _teardown_unrecoverable_remote(status) -> None:
+    """Stop the billable worker of a handle-backed run whose spec this build cannot parse.
+
+    The run is already marked failed by the caller; what remains is the rented resource. Teardown
+    runs off the persisted handle alone, so it works for exactly the spec the parse rejected.
+    Best-effort and fully suppressed: recovery must finish for every other run regardless.
+    """
+    from flash.runner import _record_cleanup_remote
+    from flash.runner.lifecycle import _strict_teardown_handle
+
+    remote = dict(status.remote or {})
+    if not remote:
+        return
+    try:
+        deleted = _strict_teardown_handle(remote, status.run_id)
+    except Exception:
+        # unconfirmed deletion: leave it recorded for the cleanup drain rather than dropping it.
+        deleted = False
+    if not deleted:
+        with contextlib.suppress(Exception):
+            _record_cleanup_remote(status.run_id, remote)
+
+
 def recover_runs() -> None:
     """Recover every in-flight run after a restart so a redeploy never loses a training session:
     re-attach to ``running`` jobs, and resubmit ``queued``/``provisioning`` runs that never reached
@@ -578,6 +601,40 @@ def recover_runs() -> None:
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
+            # A spec this build can no longer parse cannot be reattached either: attach_run parses
+            # it before its own except/finally handlers exist, so the daemon thread would die at
+            # that line with the run still non-terminal and its worker still billing. That is a real
+            # upgrade path -- a run accepted under an algorithm this build has since dropped -- so
+            # decide it HERE, where the handle is still in hand, rather than dispatching a thread
+            # that can only crash. Same disposition as the handle-less branch below: fail it
+            # visibly, then tear the worker down. `_strict_teardown_handle` needs only the persisted
+            # handle and the run id, never a parsed spec, so removal does not depend on the parse
+            # that just failed (chatgpt-codex-connector).
+            try:
+                JobSpec.from_dict(status.spec)
+            except Exception as exc:
+                _log.warning(
+                    "marking run %s failed: persisted spec could not be parsed for reattach",
+                    status.run_id,
+                    exc_info=True,
+                )
+                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                with contextlib.suppress(Exception):
+                    _update(status.run_id, "failed", error=detail)
+                with contextlib.suppress(Exception):
+                    _append_run_log(status.run_id, detail)
+                _teardown_unrecoverable_remote(status)
+                # If that teardown could not confirm deletion it records the handle for the cleanup
+                # drain -- but this run's drain was dispatched above and has already taken its
+                # snapshot, of a list that did not yet contain this record (cursor). `_drain_cleanup_
+                # remotes` returns early on an empty snapshot, so nothing would retry it before the
+                # next restart. Dispatch a second drain now that the record exists. A double teardown
+                # of one handle is safe: `_strict_teardown_handle` is idempotent and the record is
+                # removed by compare-and-remove only on a confirmed delete.
+                threading.Thread(
+                    target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
+                ).start()
+                continue
             # Only handle-backed runs are kept by the sweep; a handle-less run is being
             # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
             active.add(status.run_id)

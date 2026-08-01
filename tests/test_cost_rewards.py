@@ -29,11 +29,19 @@ def test_environment_does_not_change_cost():
 
 def test_explicit_override_flows_into_cost():
     fast = RunConfig(
-        "Qwen/Qwen3.5-0.8B", "grpo", 10, batch_size=8, group_size=4,
+        "Qwen/Qwen3.5-0.8B",
+        "grpo",
+        10,
+        batch_size=8,
+        group_size=4,
         reward_seconds_per_completion=0.0,
     )
     slow = RunConfig(
-        "Qwen/Qwen3.5-0.8B", "grpo", 10, batch_size=8, group_size=4,
+        "Qwen/Qwen3.5-0.8B",
+        "grpo",
+        10,
+        batch_size=8,
+        group_size=4,
         reward_seconds_per_completion=5.0,
     )
     assert seconds_per_step(slow, "RTX 5090") > seconds_per_step(fast, "RTX 5090")

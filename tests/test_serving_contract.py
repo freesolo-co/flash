@@ -150,7 +150,9 @@ def test_require_capabilities_thinking_structured_outputs_required_when_used(mon
     from flash.serve.deploy import ServingError
 
     # Backend lacks the deferred thinking/structured-outputs cap -> a thinking+SO deploy is blocked.
-    _stub_healthz(monkeypatch, deploy_mod, ["immutable_adapter_revisions", "alias_compare_and_swap"])
+    _stub_healthz(
+        monkeypatch, deploy_mod, ["immutable_adapter_revisions", "alias_compare_and_swap"]
+    )
     deploy_mod._require_serving_capabilities()  # fine without SO
     with pytest.raises(ServingError):
         deploy_mod._require_serving_capabilities(thinking_structured_outputs=True)
@@ -349,6 +351,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
         return 32
 
     monkeypatch.setattr(deploy, "adapter_artifact_lora_rank", artifact_rank)
+
     def _caps(**_kwargs):
         events.append("capabilities")
         return {
