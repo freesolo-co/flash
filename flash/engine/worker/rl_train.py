@@ -65,6 +65,8 @@ from flash.engine.worker.backend_common import (
     resolve_verl_device_capability,
     resolve_verl_loggers,
     resolve_verl_python,
+    rollout_resident_overrides,
+    rollout_sleep_unsupported,
     verl_supports_rollout_field,
 )
 from flash.engine.worker.heartbeat import (
@@ -407,21 +409,8 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
-        # sleep_unsupported). verl defaults free_cache_engine and enable_sleep_mode BOTH True and
-        # offloads between every step, so without this a flagged model wedges at the first step
-        # boundary instead of failing fast. free_cache_engine is the one that actually gates the
-        # sleep()/wake_up() rpcs (vllm_rollout.resume/release, engine_workers resume path);
-        # enable_sleep_mode is what builds the sleep-capable engine in the first place, so both go.
-        # safe because the parse-time gate sizes a flagged job on its RESIDENT peak and rejects a
-        # config that cannot fit -- staying resident cannot admit an OOM the sleep path avoided.
-        *(
-            [
-                "actor_rollout_ref.rollout.free_cache_engine=false",
-                "actor_rollout_ref.rollout.enable_sleep_mode=false",
-            ]
-            if cfg.get("sleep_unsupported")
-            else []
-        ),
+        # sleep_unsupported). shared with the opd driver, which runs the same verl sleep path.
+        *rollout_resident_overrides(bool(cfg.get("sleep_unsupported"))),
         f"actor_rollout_ref.rollout.gpu_memory_utilization={cfg['gpu_mem_util']}",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg['n_gpus']}",
         f"actor_rollout_ref.rollout.temperature={cfg['temperature']}",
@@ -524,20 +513,6 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     return o
 
 
-def _sleep_unsupported(model_id: str) -> bool:
-    """Whether vLLM's sleep/wake cycle is non-functional for this model.
-
-    A few models HANG on wake/reload rather than erroring (live-confirmed, every attempt), so the
-    catalog flags them and GRPO must keep the rollout engine RESIDENT instead. The parse-time gate in
-    flash.engine.vram already sizes such a job on its resident peak and rejects a config too long to
-    fit, so staying resident cannot admit anything that would OOM.
-    """
-    from flash.catalog import MODELS
-
-    info = MODELS.get(model_id)
-    return bool(info is not None and getattr(info, "sleep_unsupported", False))
-
-
 def _build_verl_training_cfg(
     inp: dict,
     *,
@@ -599,7 +574,7 @@ def _build_verl_training_cfg(
         "enforce_eager": enforce_eager,
         "attention_backend": attention_backend,
         "mm_encoder_attn_backend": mm_encoder_attn_backend,
-        "sleep_unsupported": _sleep_unsupported(inp["model_id"]),
+        "sleep_unsupported": rollout_sleep_unsupported(inp["model_id"]),
         "reward_path": reward_path,
         "reward_name": "compute_score",
         "total_epochs": inp["verl_total_epochs"],
