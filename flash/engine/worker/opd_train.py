@@ -35,6 +35,7 @@ from flash.engine.worker.backend_common import (
     model_max_position_embeddings,
     parse_verl_metric,
     parse_wandb_link,
+    ray_num_cpus,
     render_wandb_link_shim,
     resolve_rollout_enforce_eager,
     resolve_verl_device_capability,
@@ -1570,6 +1571,11 @@ def build_opd_overrides(config: dict) -> list[str]:
         # before a single gpu is touched. one unit is correct for flash's single-node trainer and
         # keeps the reservation satisfiable regardless of how ray sized the cluster.
         "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
+        # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
+        # per core. on a 1x4090 pod that is 48 forks nothing asked for, which oom-killed the actor
+        # that mattered (VERL-123). size the pool to the container instead. this also keeps the
+        # storage-unit reservation above satisfiable, since it stays well under the cpu floor.
+        f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(config['n_gpus_per_node'])}",
         "critic.enable=false",
         "reward.reward_model.enable=false",
         "distillation._target_=flash_opd_plugin.FlashRemoteDistillationConfig",
