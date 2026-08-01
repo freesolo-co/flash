@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import os
+import re
 import sys
 import types
 from types import SimpleNamespace
@@ -559,7 +560,7 @@ def test_zero_grad_norm_at_nonzero_lr_fails_the_run():
         "step:3 - train/loss:0.5474 - train/grad_norm:0.0 - train/lr:0.0001",
         "step:4 - train/loss:0.5444 - train/grad_norm:0.0 - train/lr:0.0001",
     ]
-    with pytest.raises(RuntimeError, match="grad_norm=0.0"):
+    with pytest.raises(RuntimeError, match=re.escape("grad_norm=0.0")):
         replay(broken)
 
     # a healthy run must not trip the guard.
