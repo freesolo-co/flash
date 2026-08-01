@@ -99,14 +99,7 @@ def test_gdn_state_page_and_attention_kv_use_real_geometry():
     gdn = MODELS["Qwen/Qwen3.5-0.8B"]
     gdn_raw = _architecture_kv_raw_gb(gdn, 4096, 8, False)
     attention_expected = (
-        gdn.num_attention_layers
-        * 8
-        * 4096
-        * 2
-        * gdn.num_key_value_heads
-        * gdn.head_dim
-        * 2
-        / 1e9
+        gdn.num_attention_layers * 8 * 4096 * 2 * gdn.num_key_value_heads * gdn.head_dim * 2 / 1e9
     )
     assert gdn_raw is not None
     assert gdn_raw > attention_expected

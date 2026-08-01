@@ -50,7 +50,9 @@ def test_env_list_filters_non_environments_and_uses_styled_renderer(
     monkeypatch.chdir(tmp_path)
     seen = []
     monkeypatch.setattr(commands.render, "styled", lambda: True)
-    monkeypatch.setattr(commands.render, "env_list", lambda paths: seen.extend(paths) or "styled-envs")
+    monkeypatch.setattr(
+        commands.render, "env_list", lambda paths: seen.extend(paths) or "styled-envs"
+    )
 
     assert commands.cmd_env_list(SimpleNamespace()) == 0
 
@@ -109,7 +111,9 @@ def test_checkpoints_empty_and_styled_paths(monkeypatch, capsys) -> None:
     assert capsys.readouterr().out == "empty-checkpoints\n"
 
     client._checkpoints = [{"step": 12}]
-    monkeypatch.setattr(commands.render, "checkpoints_table", lambda run_id, rows: "checkpoint-table")
+    monkeypatch.setattr(
+        commands.render, "checkpoints_table", lambda run_id, rows: "checkpoint-table"
+    )
     assert commands.cmd_checkpoints(SimpleNamespace(run_id="flash-1")) == 0
     assert capsys.readouterr().out == "checkpoint-table\n"
 
@@ -192,6 +196,7 @@ def test_chat_rejects_invalid_target_without_constructing_a_client(monkeypatch, 
 
 def test_chat_prints_styled_label_before_streaming(monkeypatch, capsys) -> None:
     """Styled chat must label assistant output while preserving streamed content."""
+
     class ChatClient:
         def chat_stream(self, run_id, messages, **kwargs):
             assert run_id == "flash-1"
@@ -214,3 +219,137 @@ def test_chat_prints_styled_label_before_streaming(monkeypatch, capsys) -> None:
 
     assert result == 0
     assert capsys.readouterr().out.startswith("assistant-label\nhi")
+
+
+def test_chat_fails_when_the_stream_carries_no_text(monkeypatch, capsys) -> None:
+    """An empty but successful chat stream must fail loudly instead of exiting 0 with no output.
+
+    A serving path that stopped applying the run's chat template returns a well-formed response
+    carrying no assistant text. Exiting 0 there makes that indistinguishable from a model that
+    answered nothing, so the surface cannot be trusted as a health check.
+    """
+
+    class EmptyChatClient:
+        def chat_stream(self, run_id, messages, **kwargs):
+            return iter(())
+
+    monkeypatch.setattr(commands, "client_from_config", EmptyChatClient)
+    monkeypatch.setattr(commands.render, "styled", lambda: False)
+
+    result = commands.cmd_chat(
+        SimpleNamespace(
+            run_id="flash-1",
+            message="hello",
+            system=None,
+            temperature=0.0,
+            max_tokens=32,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert "no response text from flash-1" in captured.err
+
+    # `models list` enumerates supported base models and carries no deployment state, so it cannot
+    # investigate either condition this message names. `models deployments` is the one that can.
+    assert f"{commands.CLI_NAME} models deployments" in captured.err
+    assert "models list" not in captured.err
+
+
+def test_chat_treats_a_whitespace_only_stream_as_no_response(monkeypatch, capsys) -> None:
+    """Blank chunks are the same empty answer as no chunks, and must fail the same way.
+
+    Counting any chunk as text exited 0 here, so a serving path that stopped applying the run's
+    chat template and emitted only whitespace read as a healthy response (Cursor). Spaces are as
+    non-empty as the `assistant` label the test below keeps off stdout, so they must not be
+    printed either -- the contract is exit 1 with empty stdout.
+    """
+
+    class BlankChatClient:
+        def chat_stream(self, run_id, messages, **kwargs):
+            yield "  "
+            yield "\n"
+            yield "\t"
+
+    monkeypatch.setattr(commands, "client_from_config", BlankChatClient)
+    monkeypatch.setattr(commands.render, "styled", lambda: True)
+    monkeypatch.setattr(commands.render, "chat_label", lambda: "assistant-label")
+
+    result = commands.cmd_chat(
+        SimpleNamespace(
+            run_id="flash-1",
+            message="hello",
+            system=None,
+            temperature=0.0,
+            max_tokens=32,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert "no response text from flash-1" in captured.err
+
+
+def test_chat_preserves_leading_whitespace_once_the_stream_has_text(monkeypatch, capsys) -> None:
+    """Holding blank chunks back must not edit a response that turns out to have text.
+
+    A model whose first chunks are whitespace still answered, so the held chunks are released
+    verbatim and the output stays byte-identical to what the stream produced.
+    """
+
+    class LeadingBlankChatClient:
+        def chat_stream(self, run_id, messages, **kwargs):
+            yield "  "
+            yield "hi"
+
+    monkeypatch.setattr(commands, "client_from_config", LeadingBlankChatClient)
+    monkeypatch.setattr(commands.render, "styled", lambda: False)
+
+    result = commands.cmd_chat(
+        SimpleNamespace(
+            run_id="flash-1",
+            message="hello",
+            system=None,
+            temperature=0.0,
+            max_tokens=32,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == "  hi\n"
+
+
+def test_chat_keeps_stdout_empty_when_a_styled_stream_carries_no_text(monkeypatch, capsys) -> None:
+    """The empty-stream contract is "exit 1 with empty stdout", and styling must not break it.
+
+    Styling turns on automatically on a tty and explicitly via FLASH_STYLE=1, so this is the
+    default interactive path, not an edge case. Printing the `assistant` label before the first
+    chunk leaves it on stdout when the stream turns out to be empty, which is precisely what a
+    caller capturing output through a PTY would then have to treat as a response.
+    """
+
+    class EmptyChatClient:
+        def chat_stream(self, run_id, messages, **kwargs):
+            return iter(())
+
+    monkeypatch.setattr(commands, "client_from_config", EmptyChatClient)
+    monkeypatch.setattr(commands.render, "styled", lambda: True)
+    monkeypatch.setattr(commands.render, "chat_label", lambda: "assistant-label")
+
+    result = commands.cmd_chat(
+        SimpleNamespace(
+            run_id="flash-1",
+            message="hello",
+            system=None,
+            temperature=0.0,
+            max_tokens=32,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert "no response text from flash-1" in captured.err

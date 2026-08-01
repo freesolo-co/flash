@@ -17,6 +17,7 @@ import subprocess
 import tarfile
 import time
 import types
+from typing import ClassVar
 
 import pytest
 
@@ -26,6 +27,7 @@ pytest.importorskip("fastapi")
 from fastapi import HTTPException
 
 import flash.server.routes.serving as serving
+from flash.engine.recipe import RECIPE
 from flash.serve.deploy import ServingError
 
 
@@ -413,7 +415,11 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
 def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
     statuses = [
         types.SimpleNamespace(run_id="r-settled", deployment={"state": "queued"}),
-        types.SimpleNamespace(run_id="r-settled", deployment={"state": "ready"}),
+        types.SimpleNamespace(
+            run_id="r-settled",
+            deployment={"state": "ready"},
+            spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-4B", "algorithm": "sft"},
+        ),
     ]
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
     monkeypatch.setattr(serving._app, "get_status", lambda _run_id: statuses.pop(0))
@@ -425,6 +431,79 @@ def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
 
     assert serving.recover_deployments() == 0
     assert statuses == []
+
+
+def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(monkeypatch):
+    # a run accepted under an algorithm this build has since dropped keeps a `ready` deployment
+    # record. every serving route parses the persisted spec before inference, so chat raises there
+    # instead of answering -- while `/v1/deployments` still lists the record as active, and only
+    # BUSY states were recovered at startup. the record therefore survived every restart as a
+    # deployment that looks live and can never respond (chatgpt-codex-connector).
+    #
+    # both readiness spellings are covered: this pass reads records persisted by OTHER builds, so
+    # the one spelling the current build happens to write is not the set it can encounter (cursor).
+    rows = [{"run_id": "r-retired"}, {"run_id": "r-legacy-spelling"}, {"run_id": "r-servable"}]
+    monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
+
+    project = "11111111-1111-4111-8111-111111111111"
+    statuses = {
+        "r-retired": types.SimpleNamespace(
+            run_id="r-retired",
+            state="done",
+            deployment={"state": "ready"},
+            spec={
+                "run_id": "r-retired",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opsd",
+                "project": project,
+            },
+        ),
+        # the same unservable record under the other readiness spelling this module recognizes.
+        "r-legacy-spelling": types.SimpleNamespace(
+            run_id="r-legacy-spelling",
+            state="done",
+            deployment={"state": "deployed"},
+            spec={
+                "run_id": "r-legacy-spelling",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opsd",
+                "project": project,
+            },
+        ),
+        # same ready state, a spec this build still parses: must be left serving, so the check
+        # cannot be passing merely because it fails every ready record it sees.
+        "r-servable": types.SimpleNamespace(
+            run_id="r-servable",
+            state="done",
+            deployment={"state": "ready"},
+            spec={
+                "run_id": "r-servable",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "sft",
+                "project": project,
+            },
+        ),
+    }
+    monkeypatch.setattr(serving._app, "get_status", lambda run_id: statuses[run_id])
+
+    import flash.runner as runner
+
+    marked: list[tuple[str, dict]] = []
+
+    def mark_failed(run_id, failed):
+        marked.append((run_id, failed))
+        return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
+
+    monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
+    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner, "_report_status", lambda status: None)
+
+    assert serving.recover_deployments() == 2
+    assert [run_id for run_id, _failed in marked] == ["r-retired", "r-legacy-spelling"]
+    for _run_id, failed in marked:
+        assert failed["state"] == "failed"
+        # the reason names the actual cause, not the restart the busy branch reports.
+        assert "no longer supported" in failed["error"]
 
 
 def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
@@ -472,7 +551,9 @@ def _smoke_spec(
     thinking: bool,
     constraint: dict | None = None,
     max_completion_tokens: int | None = None,
+    max_context_tokens: int | None = None,
     algorithm: str = "grpo",
+    stop_sequences: tuple[str, ...] = (),
 ):
     return types.SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
@@ -480,7 +561,9 @@ def _smoke_spec(
         thinking=thinking,
         train=types.SimpleNamespace(
             max_completion_tokens=max_completion_tokens,
+            max_context_tokens=max_context_tokens,
             structured_outputs="" if constraint is None else json.dumps(constraint),
+            stop_sequences=stop_sequences,
         ),
     )
 
@@ -570,10 +653,11 @@ def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
         ),
         _smoke_spec(algorithm="grpo", thinking=False, max_completion_tokens=8192),
         _smoke_spec(algorithm="opd", thinking=False, max_completion_tokens=8192),
-        _smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192),
     ],
 )
-def test_run_deployment_smoke_keeps_non_target_paths_at_256(monkeypatch, spec):
+def test_run_deployment_smoke_keeps_non_thinking_paths_at_256(monkeypatch, spec):
+    """A non-thinking adapter emits its answer immediately, so 256 tokens is enough for every
+    algorithm. Only the thinking path needs the run's real budget."""
     calls = []
 
     def fake_serve_chat(**kwargs):
@@ -586,6 +670,175 @@ def test_run_deployment_smoke_keeps_non_target_paths_at_256(monkeypatch, spec):
     assert calls[0]["max_tokens"] == 256
 
 
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        # opd with an explicit budget, no grammar: previously fell to 256 and could not deploy.
+        (_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192), 8192),
+        # grpo thinking with no grammar and no explicit budget -> the thinking recipe default.
+        (_smoke_spec(algorithm="grpo", thinking=True), 1536),
+    ],
+)
+def test_run_deployment_smoke_budgets_thinking_without_structured_outputs(
+    monkeypatch, spec, expected
+):
+    """A thinking adapter spends its budget reasoning BEFORE emitting content, so 256 tokens buys a
+    truncated <think> block and no answer -- the smoke then fails "returned no content
+    (finish_reason='length')" and the deployment is rejected. That is a property of thinking, not of
+    structured_outputs, so a run using stop_sequences instead of a grammar was undeployable: every
+    checkpoint failed the same gate. The larger budget must follow spec.thinking alone."""
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("<think>2+2 is 4</think>The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    out = _run_smoke(spec)
+
+    assert calls[0]["max_tokens"] == expected
+    # every thinking smoke splits on </think> now, grammar or not, so the sample is the answer.
+    assert out["verify_sample"] == "The answer is 4"
+    assert out["thinking_tag"] is True
+
+
+def test_run_deployment_smoke_rejects_truncated_thinking_without_a_grammar(monkeypatch):
+    """Widening the budget must not turn a hard failure into a silent pass. Serving hands the
+    reasoning back in reasoning_content and flash folds it into a balanced block, so a run cut off
+    mid-thought arrives with non-empty content and clears the empty-content check -- the smoke would
+    certify a truncated non-answer as a working deployment. finish_reason='length' on a thinking run
+    is a failure whether or not a grammar is configured."""
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>2 plus 2 is</think>", "length"),
+    )
+
+    with pytest.raises(ServingError, match="smoke generation was truncated at the maximum token"):
+        _run_smoke(_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192))
+
+
+def test_run_deployment_smoke_forwards_configured_stop_sequences(monkeypatch):
+    """A run trained with stop_sequences terminates on its delimiter and need never emit EOS. If the
+    smoke does not forward them, serving generates past the answer to max_tokens and returns
+    finish_reason='length' -- and the truncation guard above then rejects a checkpoint that answered
+    correctly, making every such thinking run undeployable."""
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("<think>2+2 is 4</think><answer>4</answer>")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(
+        _smoke_spec(
+            algorithm="grpo",
+            thinking=True,
+            max_completion_tokens=8192,
+            stop_sequences=("</answer>",),
+        )
+    )
+
+
+def test_run_deployment_smoke_rejects_a_stop_that_fires_while_still_reasoning(monkeypatch):
+    """Forwarding stop_sequences opened a hole the truncation guard cannot cover. A run whose
+    delimiter appears inside its reasoning terminates mid-thought with finish_reason='stop', not
+    'length', so the truncation check passes; serving folds the partial reasoning into a balanced
+    <think> block, so the empty-content check passes too. Without a post-</think> answer
+    requirement on every thinking smoke, that checkpoint activates and then answers nothing on
+    real requests."""
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        # finish_reason="stop": the delimiter fired, so this is NOT caught as truncation.
+        lambda **_k: _smoke_response("<think>2 plus 2 is</think>   ", "stop"),
+    )
+
+    with pytest.raises(ServingError, match="no answer after </think>"):
+        _run_smoke(
+            _smoke_spec(
+                algorithm="grpo",
+                thinking=True,
+                max_completion_tokens=8192,
+                stop_sequences=("</answer>",),
+            )
+        )
+
+
+def test_sft_smoke_budget_ignores_the_rollout_only_completion_knob(monkeypatch):
+    """max_completion_tokens is a rollout knob the SFT worker ignores: it trains one packed
+    prompt+completion block bounded by max_context_tokens. Honouring it for the SFT smoke caps
+    generation below what the run legitimately produces, so a 2048-context thinking SFT run with a
+    leftover max_completion_tokens=320 trains valid long reasoning it can never deploy."""
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("<think>2+2 is 4</think>The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(
+        _smoke_spec(
+            algorithm="sft",
+            thinking=True,
+            max_context_tokens=2048,
+            max_completion_tokens=320,
+        )
+    )
+
+    # the sft thinking recipe default, not the 320 the worker never reads.
+    assert calls[0]["max_tokens"] == RECIPE.sft.max_seq_len_thinking
+    assert calls[0]["max_tokens"] > 320
+
+
+def test_run_deployment_smoke_sends_no_stop_when_none_configured(monkeypatch):
+    """An unconfigured run must not send stop=[]: an empty list is a different request than an
+    absent key on some OpenAI surfaces, and the run never asked for a delimiter."""
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(_smoke_spec(thinking=False))
+
+    assert calls[0]["stop"] is None
+
+
+def test_chat_body_carries_stop_sequences(monkeypatch):
+    """The stop sequences must reach the wire body, not just the flash-side call."""
+    from flash.serve import deploy as _deploy
+
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        headers: ClassVar[dict[str, str]] = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    class _Client:
+        def post(self, url, json=None, headers=None, timeout=None):
+            sent.update(json or {})
+            return _Resp()
+
+    monkeypatch.setattr(_deploy, "serving_openai_base_url", lambda: "https://serving.example/v1")
+    monkeypatch.setattr(_deploy, "_internal_key_header", dict)
+    monkeypatch.setattr(_deploy, "_chat_http_client", _Client)
+
+    _deploy.chat("run-1", [{"role": "user", "content": "hi"}], stop=["</answer>"])
+    assert sent["stop"] == ["</answer>"]
+
+    sent.clear()
+    _deploy.chat("run-1", [{"role": "user", "content": "hi"}])
+    assert "stop" not in sent
+
+
 def test_zero_completion_budget_resolves_to_thinking_recipe_default():
     from flash.serve.preflight import resolve_effective_completion_tokens
 
@@ -596,6 +849,92 @@ def test_zero_completion_budget_resolves_to_thinking_recipe_default():
     )
 
     assert resolve_effective_completion_tokens(spec) == 1536
+
+
+def test_thinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default():
+    from flash.serve.preflight import resolve_smoke_completion_tokens
+
+    spec = _smoke_spec(thinking=True, algorithm="sft")
+
+    # the rl thinking default (1536) is shorter than what sft actually trains, so resolving to it
+    # would truncate the smoke and reject a checkpoint that answered correctly.
+    assert RECIPE.rl.max_completion_len_thinking < RECIPE.sft.max_seq_len_thinking
+    assert resolve_smoke_completion_tokens(spec) == RECIPE.sft.max_seq_len_thinking
+
+
+def test_sft_smoke_budget_follows_an_explicit_context_over_the_recipe_default():
+    from flash.serve.preflight import resolve_smoke_completion_tokens
+
+    # the worker bounds the packed block by max_context_tokens and only falls back to the recipe
+    # when it is unset (flash/engine/worker/sft.py), so the smoke has to resolve the same way.
+    # sizing an 8192-context run at the 2048 recipe default truncated the smoke and rejected a
+    # checkpoint that answered correctly.
+    assert RECIPE.sft.max_seq_len_thinking < 8192
+    spec = _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=8192)
+    assert resolve_smoke_completion_tokens(spec) == 8192
+
+    # a shorter explicit context is honoured too -- the point is that the worker's number wins,
+    # not that the budget only ever grows.
+    short = _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=512)
+    assert resolve_smoke_completion_tokens(short) == 512
+
+    # non-thinking takes the same path.
+    assert (
+        resolve_smoke_completion_tokens(
+            _smoke_spec(thinking=False, algorithm="sft", max_context_tokens=4096)
+        )
+        == 4096
+    )
+
+    # a non-positive value is not a budget, so the recipe default still applies.
+    assert (
+        resolve_smoke_completion_tokens(
+            _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=0)
+        )
+        == RECIPE.sft.max_seq_len_thinking
+    )
+
+
+def test_nonthinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default():
+    from flash.serve.preflight import resolve_smoke_completion_tokens
+
+    spec = _smoke_spec(thinking=False, algorithm="sft")
+
+    assert resolve_smoke_completion_tokens(spec) == RECIPE.sft.max_seq_len
+
+
+def test_sft_contributes_no_completion_budget_to_the_serving_context_guard():
+    from flash.serve.preflight import resolve_effective_completion_tokens
+
+    # max_context_tokens spans prompt AND completion for sft, so handing it to the guard as a
+    # completion budget double-counts the prompt: a 4096-context run that fits a 4096 serving cap
+    # exactly was rejected for exceeding the 4096-256 completion capacity. the guard checks the
+    # context separately, so sft must contribute no completion number at all.
+    assert resolve_effective_completion_tokens(_smoke_spec(thinking=True, algorithm="sft")) is None
+    assert (
+        resolve_effective_completion_tokens(
+            _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=4096)
+        )
+        is None
+    )
+    # the rollout-only knob must not resurrect a budget for sft either.
+    assert (
+        resolve_effective_completion_tokens(
+            _smoke_spec(thinking=True, algorithm="sft", max_completion_tokens=320)
+        )
+        is None
+    )
+
+
+def test_rollout_budget_ignores_context_tokens():
+    from flash.engine.recipe import RECIPE
+    from flash.serve.preflight import resolve_effective_completion_tokens
+
+    # grpo budgets the completion, not the whole rollout, so max_context_tokens must not become
+    # its completion budget the way it does for sft.
+    spec = _smoke_spec(thinking=True, algorithm="grpo", max_context_tokens=4096)
+
+    assert resolve_effective_completion_tokens(spec) == RECIPE.rl.max_completion_len_thinking
 
 
 def test_run_deployment_smoke_retries_recognized_cold_503(monkeypatch):
@@ -687,14 +1026,26 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
     assert out["thinking_tag"] is False
     assert out["verify_latency_s"] >= 0.0
 
+    # a thinking adapter that stops mid-reasoning has answered nothing, so it must not activate.
+    # this used to pass because the </think> requirement was gated on structured outputs; a run
+    # using stop_sequences reaches exactly this shape with finish_reason="stop", which slips past
+    # the truncation guard.
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
         lambda **_k: _smoke_response("<think>still reasoning"),
     )
+    with pytest.raises(ServingError, match="never closed its reasoning"):
+        _run_smoke(_smoke_spec(thinking=True))
+
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>2+2 is 4</think>The answer is 4"),
+    )
     thinking_out = _run_smoke(_smoke_spec(thinking=True))
     assert thinking_out["thinking_tag"] is True
-    assert thinking_out["verify_sample"] == "<think>still reasoning"
+    assert thinking_out["verify_sample"] == "The answer is 4"
 
     monkeypatch.setattr(
         serving._app,
@@ -703,6 +1054,136 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
     )
     with pytest.raises(ServingError, match="no content"):
         _run_smoke(spec)
+
+
+def test_unconstrained_thinking_smoke_rejects_a_reconstructed_empty_answer(monkeypatch):
+    """An answerless thinking generation must not activate a deployment.
+
+    `_smoke_provenance` rejects an empty generation, but flash now folds the split-out
+    `reasoning_content` back into a balanced block before it gets there
+    (flash/serve/deploy.py::_balanced_thinking_content). Reasoning that exhausts the token budget
+    therefore arrives as a NONEMPTY `<think>...</think>` wrapping an empty answer, which sails past
+    the emptiness check. `_thinking_answer` asserts an answer exists for every thinking smoke;
+    before it did, only the grammar-constrained path checked, so an unconstrained deployment could
+    go live on a smoke that produced no answer at all.
+
+    Both ways of arriving answerless are covered, because they are rejected by different guards: a
+    budget exhaustion carries finish_reason "length" and is caught by the truncation check, while a
+    run whose stop_sequence fires mid-reasoning carries "stop" and reaches `_thinking_answer`.
+    """
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>reasoned but ran out of budget</think>", "length"),
+    )
+
+    with pytest.raises(ServingError, match="truncated at the maximum token length"):
+        _run_smoke(_smoke_spec(thinking=True))
+
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>reasoned, then the stop sequence fired</think>"),
+    )
+
+    with pytest.raises(ServingError, match="no answer after"):
+        _run_smoke(_smoke_spec(thinking=True))
+
+
+def test_thinking_smoke_rejects_a_retained_close_tag_as_the_answer(monkeypatch):
+    """A doubled close tag is not an answer, whichever way it arose.
+
+    A compatibility backend that retains only the sampled `</think>` in `content` gives the fold no
+    answer to place behind the block, so `_balanced_thinking_content` emits `<think>why</think>
+    </think>`. Splitting on the first close then left `</think>` as the answer, which is nonempty and
+    sailed through, activating a checkpoint that answered nothing.
+
+    The fold cannot decide this: those bytes are identical to an adapter whose answer genuinely is
+    the tag, and it also backs the public chat route where the text must survive. Rejecting at the
+    deployment gate is the fail-closed direction, and neither shape answers "what is 2+2".
+    """
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>why</think></think>"),
+    )
+    with pytest.raises(ServingError, match="only a close tag"):
+        _run_smoke(_smoke_spec(thinking=True))
+
+
+def test_thinking_smoke_accepts_a_tagless_answer_only_under_the_open_model_policy(monkeypatch):
+    """A model whose template flash cannot verify must not be undeployable for omitting the tag.
+
+    `flash.schema` warns and proceeds when the catalog reports `thinking == "unknown"`, which only
+    the open-model policy produces. Such a run may answer with no `<think>` block at all, so the
+    strict requirement would reject a correct answer and strand the trained adapter. Every catalog
+    model keeps the strict path, since for those the missing tag really does mean the reasoning
+    never closed.
+    """
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
+
+    strict = _smoke_spec(thinking=True)
+    with pytest.raises(ServingError, match="never closed its reasoning"):
+        _run_smoke(strict)
+
+    unknown = _smoke_spec(thinking=True)
+    unknown.model = "some-org/not-in-the-catalog"
+    unknown.model_policy = "allow"
+    out = _run_smoke(unknown)
+    assert out["verify_sample"] == "4"
+    assert out["thinking_tag"] is False
+
+    # the relaxed branch still rejects a run that answered nothing, which is the defect the strict
+    # requirement exists to catch. only the tag demand is lifted, not the answer demand.
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("   "))
+    with pytest.raises(ServingError, match="no content"):
+        _run_smoke(unknown)
+
+
+def test_tagless_open_model_smoke_does_not_depend_on_a_vram_fit(monkeypatch):
+    """Whether the tag is guaranteed is a chat-template question, not a sizing one.
+
+    Resolving the capability through `resolve_model` also ran an open-model VRAM fit against the
+    DEFAULT gpu, which raises for a model too big for it. That exception read as "tag guaranteed",
+    so the model least able to promise a `<think>` block was the one the strict requirement was
+    applied to, and a valid tagless smoke failed over the size of a gpu the run need not be using
+    (cursor[bot]).
+
+    The model below really does exceed the default: it is served on multi-gpu hardware the smoke
+    never consults. A pass here means the decision no longer reaches the estimator at all.
+    """
+    from flash.catalog import DEFAULT_GPU
+    from flash.engine.vram import check_fit
+
+    spec = _smoke_spec(thinking=True)
+    spec.model = "some-org/huge-open-model"
+    spec.model_policy = "allow"
+
+    # the premise: this is a genuine `too_big` for the gpu the resolver would have assumed.
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda *a, **k: 400.0)
+    assert check_fit(spec.model, spec.algorithm, DEFAULT_GPU).verdict == "too_big"
+
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
+    out = _run_smoke(spec)
+    assert out["verify_sample"] == "4"
+    assert out["thinking_tag"] is False
+
+
+def test_unconstrained_thinking_smoke_accepts_an_answer_after_the_block(monkeypatch):
+    # the companion direction: a reconstructed block WITH an answer after it still passes, so the
+    # check above rejects answerlessness rather than reconstruction.
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>reasoned</think>The answer is 4"),
+    )
+
+    out = _run_smoke(_smoke_spec(thinking=True))
+
+    # the sample is the ANSWER, not the whole generation: reasoning is what the deployment must not
+    # be judged on, and it is already reported through thinking_tag.
+    assert out["verify_sample"] == "The answer is 4"
+    assert out["thinking_tag"] is True
 
 
 @pytest.mark.parametrize(
@@ -982,7 +1463,7 @@ def test_structured_json_rejects_nonfinite_constants(monkeypatch, constant, cons
             {"choice": ["4"]},
             "<think>x</think>4",
             "length",
-            "truncated at the maximum token length",
+            "smoke generation was truncated at the maximum token length",
         ),
     ],
 )

@@ -264,7 +264,9 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     assert get_status(rid).to_dict()["adapter_ref"] == rid
 
 
-def test_done_status_with_removed_spec_key_serializes_without_adapter_ref(tmp_path, monkeypatch) -> None:
+def test_done_status_with_removed_spec_key_serializes_without_adapter_ref(
+    tmp_path, monkeypatch
+) -> None:
     # a record written by an OLDER plane can carry a since-removed spec key (gpu.exact_type,
     # pre-#670); strict JobSpec parsing raises on it. the record must still serialize (one bad
     # record must not 500 the whole runs list) -- it just resolves no adapter ref.

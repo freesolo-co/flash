@@ -396,9 +396,9 @@ def test_no_signal_sequence_is_excluded_before_actor_training():
     group_ids = torch.tensor([[0, -1, -1], [-1, -1, -1], [2, 2, -1]])
     response_mask = torch.tensor([[1, 1, 1], [1, 1, 0], [1, 1, 0]], dtype=torch.bool)
     assert _signal_sequences(group_ids, response_mask).tolist() == [True, False, True]
-    full_sequence_ids = torch.tensor(
-        [[-1, -1, 0, -1], [-1, -1, -1, -1], [-1, 2, 2, -1]]
-    ).unsqueeze(-1)
+    full_sequence_ids = torch.tensor([[-1, -1, 0, -1], [-1, -1, -1, -1], [-1, 2, 2, -1]]).unsqueeze(
+        -1
+    )
     assert _full_sequence_signal_sequences(full_sequence_ids).tolist() == [True, False, True]
 
 
@@ -437,9 +437,7 @@ def test_all_no_signal_rollout_dispatches_bounded_usable_replacement():
     assert attempts == [0, 1, 2]
     assert seeds[0] == deterministic_rollout_seed(42, 3, 7, 1)
     assert len(set(seeds)) == 3
-    assert seeds[1] == deterministic_rollout_seed(
-        42, 3, 7, 1, no_signal_attempt_ordinal=1
-    )
+    assert seeds[1] == deterministic_rollout_seed(42, 3, 7, 1, no_signal_attempt_ordinal=1)
     assert cleaned == ["empty-batch-0", "empty-batch-1"]
     assert prepared == [True, True]
     assert resamples == [True, True]
@@ -460,14 +458,13 @@ def test_shifted_group_metadata_uses_verl_prediction_layout():
 def _structured_test_tokenizer():
     import tokenizers
     import transformers
+
     characters = list('{}[]":,0123456789truefalsenullabc xyz')
     vocab = {"[UNK]": 0, "</think>": 1, "<eos>": 2}
     for character in characters:
         if character not in vocab:
             vocab[character] = len(vocab)
-    backend = tokenizers.Tokenizer(
-        tokenizers.models.WordLevel(vocab=vocab, unk_token="[UNK]")
-    )
+    backend = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab, unk_token="[UNK]"))
     backend.pre_tokenizer = tokenizers.pre_tokenizers.Split("", behavior="isolated")
     tokenizer = transformers.PreTrainedTokenizerFast(
         tokenizer_object=backend,
@@ -488,7 +485,16 @@ def _structured_ids(vocab, text: str, *, eos: bool = True) -> list[int]:
 @pytest.mark.parametrize(
     ("spec", "text"),
     [
-        ({"json": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}}, '{"a":"b"}'),
+        (
+            {
+                "json": {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
+                    "required": ["a"],
+                }
+            },
+            '{"a":"b"}',
+        ),
         ({"json_object": True}, '{"a":1}'),
         ({"regex": "[0-9]+"}, "12"),
         ({"choice": ["ab", "ac"]}, "ab"),
@@ -500,9 +506,7 @@ def test_xgrammar_replay_accepts_every_flash_constraint_kind(spec, text):
     replay = StructuredOutputReplay(tokenizer, len(vocab))
     response_ids = _structured_ids(vocab, text)
 
-    forced = replay.forced_mask(
-        [], response_ids, canonical_structured_spec(spec), thinking=False
-    )
+    forced = replay.forced_mask([], response_ids, canonical_structured_spec(spec), thinking=False)
 
     assert len(forced) == len(response_ids)
     assert replay._compile(canonical_structured_spec(spec)) is replay._compile(
@@ -821,11 +825,14 @@ def test_failure_accounting_metadata_uses_canonical_train_meta_contract():
         *metadata["skip_reasons"].values(),
     ]
     assert all(type(counter) is int and math.isfinite(counter) for counter in counters)
-    assert not {
-        "teacher_transient",
-        "teacher_error",
-        "mean_align_granularity",
-    } & metadata.keys()
+    assert (
+        not {
+            "teacher_transient",
+            "teacher_error",
+            "mean_align_granularity",
+        }
+        & metadata.keys()
+    )
 
 
 def test_failure_accounting_metadata_omits_zero_skip_reasons():
@@ -930,9 +937,7 @@ def _text_bridge(teacher, *, mutation_callback=None):
         thinking_prefill="",
         eos_token_ids=frozenset({99}),
         stop_sequences=(),
-        mutation_callback=(
-            mutation_callback if mutation_callback is not None else lambda: None
-        ),
+        mutation_callback=(mutation_callback if mutation_callback is not None else lambda: None),
     )
 
 
@@ -992,10 +997,7 @@ class _BatchingTeacher:
         if self.failure == "malformed_result":
             return [[object()] for _item in items]
         if self.failure == "invalid_offsets":
-            return [
-                [TeacherToken(text="AB", logprob=-1.0, start=0, end=3)]
-                for _item in items
-            ]
+            return [[TeacherToken(text="AB", logprob=-1.0, start=0, end=3)] for _item in items]
         return [
             [
                 TeacherToken(
@@ -1228,9 +1230,7 @@ def test_text_teacher_batcher_deduplicates_exact_pairs_and_scatters_to_all_waite
     finally:
         bridge.close()
 
-    assert teacher.batches == [
-        [("User: same question\nAssistant: ", "AB")]
-    ]
+    assert teacher.batches == [[("User: same question\nAssistant: ", "AB")]]
     assert all(status == "ok" for status, _result in outcomes)
     assert [_teacher_logsum(result) for _status, result in outcomes] == [-1.0] * 8
     assert bridge.score_requests == 8
@@ -1272,10 +1272,7 @@ def test_text_teacher_batch_accepts_positive_rounding_for_every_logical_waiter(m
         bridge.close()
 
     assert teacher.batches
-    assert all(
-        batch == [("User: rounding\nAssistant: ", "AB")]
-        for batch in teacher.batches
-    )
+    assert all(batch == [("User: rounding\nAssistant: ", "AB")] for batch in teacher.batches)
     assert all(status == "ok" for status, _result in outcomes)
     assert [_teacher_logsum(result) for _status, result in outcomes] == [1e-9] * 8
     assert bridge.score_requests == 8
@@ -1301,8 +1298,7 @@ def test_text_teacher_batch_rejects_positive_value_above_tolerance_for_every_wai
 
     assert teacher.batches
     assert all(
-        batch == [("User: invalid rounding\nAssistant: ", "AB")]
-        for batch in teacher.batches
+        batch == [("User: invalid rounding\nAssistant: ", "AB")] for batch in teacher.batches
     )
     assert all(status == "error" for status, _error in outcomes)
     errors = [error for _status, error in outcomes]
@@ -1331,10 +1327,7 @@ def test_text_teacher_batch_transient_failure_recovers_each_logical_sample_once(
 
     assert len(teacher.batches) == 1
     assert all(status == "ok" for status, _result in outcomes)
-    assert all(
-        result["teacher_ids"] == [-1, -1, -1, -1, -1]
-        for _status, result in outcomes
-    )
+    assert all(result["teacher_ids"] == [-1, -1, -1, -1, -1] for _status, result in outcomes)
     assert bridge.score_requests == 8
     assert bridge.teacher_transient == 8
     assert bridge.teacher_ok == 0
@@ -1395,9 +1388,7 @@ def test_text_teacher_batch_mixed_dedup_preserves_logical_accounting(monkeypatch
     assert len(teacher.batches[0]) == 3
     for prompt_text, (status, result) in zip(prompt_texts, outcomes, strict=True):
         assert status == "ok"
-        assert _teacher_logsum(result) == teacher.logprobs[
-            f"User: {prompt_text}\nAssistant: "
-        ]
+        assert _teacher_logsum(result) == teacher.logprobs[f"User: {prompt_text}\nAssistant: "]
     assert bridge.score_requests == 8
     assert bridge.teacher_ok == 8
     assert bridge.teacher_input_tokens == 40
@@ -1459,9 +1450,7 @@ def test_text_teacher_batcher_close_allows_inflight_scatter_within_bound():
     assert teacher.items is not None
     assert len(teacher.items) == 8
     for index, result in enumerate(results):
-        assert result == [
-            TeacherToken(text="AB", logprob=-float(index + 1), start=0, end=2)
-        ]
+        assert result == [TeacherToken(text="AB", logprob=-float(index + 1), start=0, end=2)]
 
 
 def test_text_teacher_batcher_shutdown_cannot_strand_pending_bridge_waiter(monkeypatch):
@@ -1603,9 +1592,7 @@ def test_recovered_transient_lost_response_promotes_transient_terminal_cause():
     assert bridge.teacher_error == 0
 
 
-def test_client_only_score_loss_promotes_recovered_transient_once(
-    monkeypatch, tmp_path
-):
+def test_client_only_score_loss_promotes_recovered_transient_once(monkeypatch, tmp_path):
     from flash.engine.worker.opd_train import _reconcile_score_delivery_failure
     from flash.engine.worker.perf import RetriableInfraError
     from flash.engine.worker.teacher import TeacherError
@@ -1644,9 +1631,7 @@ def test_client_only_score_loss_promotes_recovered_transient_once(
         )
 
 
-def test_client_only_successful_score_loss_is_direct_retriable_once(
-    monkeypatch, tmp_path
-):
+def test_client_only_successful_score_loss_is_direct_retriable_once(monkeypatch, tmp_path):
     from flash.engine.worker.opd_train import _reconcile_score_delivery_failure
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -1677,9 +1662,7 @@ def test_client_only_successful_score_loss_is_direct_retriable_once(
         )
 
 
-def test_client_only_score_loss_preserves_authoritative_permanent_failure(
-    monkeypatch, tmp_path
-):
+def test_client_only_score_loss_preserves_authoritative_permanent_failure(monkeypatch, tmp_path):
     from flash.engine.worker.opd_train import _reconcile_score_delivery_failure
 
     bridge = _text_bridge(_BridgeTeacher())
@@ -1711,9 +1694,7 @@ def test_client_only_score_loss_preserves_authoritative_permanent_failure(
         )
 
 
-def test_malformed_score_success_is_transient_delivery_unknown(
-    monkeypatch, tmp_path
-):
+def test_malformed_score_success_is_transient_delivery_unknown(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import (
         _read_score_delivery_failure_fallback,
@@ -2277,9 +2258,7 @@ def test_multimodal_bridge_rebuilds_teacher_images_in_frozen_order_and_accounts_
                         ],
                     }
                 ],
-                teacher_messages=[
-                    {"role": "user", "content": "<|media_pad|> then <|media_pad|>"}
-                ],
+                teacher_messages=[{"role": "user", "content": "<|media_pad|> then <|media_pad|>"}],
                 prompt_ids=(10, 11),
                 image_descriptors=descriptors,
                 package_root=str(tmp_path),
@@ -2471,9 +2450,7 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
     assert (local_dir / "global_step_2" / "payload.bin").read_bytes() == b"checkpoint"
 
 
-def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(
-    monkeypatch, tmp_path
-):
+def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(monkeypatch, tmp_path):
     import flash.engine.worker as worker
 
     class Api:
@@ -2573,9 +2550,7 @@ def test_all_transient_teacher_samples_exhaust_replacements_as_retriable():
             raise TeacherError("teacher unavailable", permanent=False)
 
     mutations = []
-    bridge = _text_bridge(
-        TransientTeacher(), mutation_callback=lambda: mutations.append(True)
-    )
+    bridge = _text_bridge(TransientTeacher(), mutation_callback=lambda: mutations.append(True))
     bridge.start()
     try:
         with pytest.raises(RuntimeError, match="after 3 rollout attempts"):
@@ -2629,12 +2604,8 @@ def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
                 run_attempt,
                 lambda _batch: None,
                 lambda: None,
-                lambda: _post_json(
-                    bridge.url, bridge.token, "/no-signal/resample", {}
-                ),
-                lambda: _post_json(
-                    bridge.url, bridge.token, "/no-signal/abandoned", {}
-                ),
+                lambda: _post_json(bridge.url, bridge.token, "/no-signal/resample", {}),
+                lambda: _post_json(bridge.url, bridge.token, "/no-signal/abandoned", {}),
             )
         with pytest.raises(RetriableInfraError, match="after bounded retries"):
             _raise_verl_failure(1, bridge.teacher_failure)
@@ -2647,9 +2618,7 @@ def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
     assert bridge.truncated_rollouts == 3
 
 
-def test_abandonment_transport_fallback_promotes_pending_teacher_failure(
-    monkeypatch, tmp_path
-):
+def test_abandonment_transport_fallback_promotes_pending_teacher_failure(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_abandonment_failure_fallback
     from flash.engine.worker.teacher import TeacherError
@@ -2681,9 +2650,7 @@ def test_abandonment_transport_fallback_promotes_pending_teacher_failure(
     assert bridge.no_signal_skipped_steps == 0
 
 
-def test_accepted_abandonment_lost_response_does_not_duplicate_accounting(
-    monkeypatch, tmp_path
-):
+def test_accepted_abandonment_lost_response_does_not_duplicate_accounting(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_abandonment_failure_fallback
     from flash.engine.worker.teacher import TeacherError
@@ -2762,9 +2729,7 @@ def test_resample_transport_failure_before_acceptance_promotes_without_replaceme
     assert replacements == []
 
 
-def test_accepted_resample_lost_response_counts_once_and_promotes(
-    monkeypatch, tmp_path
-):
+def test_accepted_resample_lost_response_counts_once_and_promotes(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_resample_failure_fallback
     from flash.engine.worker.teacher import TeacherError
@@ -2797,9 +2762,7 @@ def test_accepted_resample_lost_response_counts_once_and_promotes(
     assert bridge.no_signal_skipped_steps == 0
 
 
-def test_resample_fallback_without_pending_transient_does_not_promote(
-    monkeypatch, tmp_path
-):
+def test_resample_fallback_without_pending_transient_does_not_promote(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_resample_failure_fallback
 
@@ -2827,9 +2790,7 @@ def test_resample_fallback_without_pending_transient_does_not_promote(
     assert bridge.no_signal_skipped_steps == 0
 
 
-def test_successful_teacher_signal_suppresses_resample_fallback_promotion(
-    monkeypatch, tmp_path
-):
+def test_successful_teacher_signal_suppresses_resample_fallback_promotion(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_resample_failure_fallback
     from flash.engine.worker.teacher import TeacherError
@@ -2869,9 +2830,7 @@ def test_successful_teacher_signal_suppresses_resample_fallback_promotion(
     assert bridge.teacher_ok == 1
 
 
-def test_successful_resample_creates_no_marker_and_prepares_replacement(
-    monkeypatch, tmp_path
-):
+def test_successful_resample_creates_no_marker_and_prepares_replacement(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_resample_failure_fallback
 
@@ -3025,9 +2984,7 @@ def test_malformed_accepted_no_signal_notification_is_transient_once(
     )
 
 
-def test_malformed_accepted_cycle_commit_exhaustion_is_transient(
-    monkeypatch, tmp_path
-):
+def test_malformed_accepted_cycle_commit_exhaustion_is_transient(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
@@ -3237,9 +3194,7 @@ def test_successful_cycle_commit_allows_next_transient_cycle_to_promote():
     assert bridge.teacher_failure == ("transient", "teacher unavailable")
 
 
-def test_lost_cycle_commit_response_retries_without_mutation_failure(
-    monkeypatch, tmp_path
-):
+def test_lost_cycle_commit_response_retries_without_mutation_failure(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.teacher import TeacherError
 
@@ -3364,9 +3319,7 @@ def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback
     assert bridge.teacher_failure == ("transient", "teacher unavailable")
 
 
-def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(
-    monkeypatch, tmp_path
-):
+def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
@@ -3403,9 +3356,7 @@ def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(
         _raise_verl_failure(1, None, cycle_commit_failure=fallback)
 
 
-def test_explicit_cycle_commit_rejection_aborts_before_actor_update(
-    monkeypatch, tmp_path
-):
+def test_explicit_cycle_commit_rejection_aborts_before_actor_update(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
 
@@ -3440,9 +3391,7 @@ def test_explicit_cycle_commit_rejection_aborts_before_actor_update(
         _raise_verl_failure(1, None, cycle_commit_failure=fallback)
 
 
-def test_persistent_cycle_commit_failure_aborts_before_actor_update(
-    monkeypatch, tmp_path
-):
+def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
@@ -3517,9 +3466,7 @@ def test_persistent_cycle_commit_failure_aborts_before_actor_update(
         "surrogateescape",
     ],
 )
-def test_failure_fallback_serialization_is_valid_and_within_reader_limit(
-    tmp_path, message
-):
+def test_failure_fallback_serialization_is_valid_and_within_reader_limit(tmp_path, message):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
 
@@ -3543,9 +3490,7 @@ def test_failure_fallback_serialization_is_valid_and_within_reader_limit(
     )
 
 
-def test_cycle_commit_fallback_reader_ignores_incomplete_records(
-    monkeypatch, tmp_path
-):
+def test_cycle_commit_fallback_reader_ignores_incomplete_records(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
 
@@ -3649,9 +3594,7 @@ def test_multiturn_transient_bridge_failure_latches_terminal_cause():
     assert bridge.teacher_transient == 1
 
 
-def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(
-    monkeypatch, tmp_path
-):
+def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_multiturn import _post_multiturn_score
     from flash.engine.worker.opd_train import (
@@ -3791,9 +3734,7 @@ def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_statu
         _raise_verl_failure(1, None, mutation_failure)
 
 
-def test_mutation_failure_fallback_publishes_one_atomic_record_per_process(
-    monkeypatch, tmp_path
-):
+def test_mutation_failure_fallback_publishes_one_atomic_record_per_process(monkeypatch, tmp_path):
     from flash.engine.worker.opd_train import _read_mutation_failure_fallback
 
     failure_path = str(tmp_path / "mutation-failure")
@@ -3818,18 +3759,14 @@ def test_mutation_failure_fallback_publishes_one_atomic_record_per_process(
 
     records = sorted(tmp_path.glob("mutation-failure.*.transient.json"))
     assert len(records) == len(messages)
-    assert {
-        json.loads(record.read_text())["message"] for record in records
-    } == set(messages)
+    assert {json.loads(record.read_text())["message"] for record in records} == set(messages)
     selected = _read_mutation_failure_fallback(failure_path)
     expected_message = json.loads(records[0].read_text())["message"]
     assert selected == ("transient", expected_message)
     assert not [path for path in tmp_path.iterdir() if path.name.endswith(".tmp")]
 
 
-def test_mutation_failure_fallback_removes_temp_when_publication_fails(
-    monkeypatch, tmp_path
-):
+def test_mutation_failure_fallback_removes_temp_when_publication_fails(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
 
     failure_path = str(tmp_path / "mutation-failure")
@@ -4020,9 +3957,7 @@ def test_each_optimizer_rank_acknowledges_marker_while_parent_publishes_once(
     bridge.start()
     try:
         optimizers = [
-            plugin._wrap_optimizer_with_mutation_notice(
-                Optimizer(rank), bridge.url, bridge.token
-            )
+            plugin._wrap_optimizer_with_mutation_notice(Optimizer(rank), bridge.url, bridge.token)
             for rank in range(2)
         ]
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -4040,9 +3975,7 @@ def test_each_optimizer_rank_acknowledges_marker_while_parent_publishes_once(
     callback_index = next(
         index for index, event in enumerate(world.events) if event[0] == "callback"
     )
-    first_step_index = next(
-        index for index, event in enumerate(world.events) if event[0] == "step"
-    )
+    first_step_index = next(index for index, event in enumerate(world.events) if event[0] == "step")
     assert len(readiness) == 2
     assert len(confirmation) == 2
     assert callback_calls == [True]
@@ -4085,9 +4018,7 @@ def test_failed_rank_readiness_prevents_marker_callback_and_optimizer_steps(
         lambda _url, _token: callbacks.append(True),
         raising=False,
     )
-    optimizer = plugin._wrap_optimizer_with_mutation_notice(
-        Optimizer(), "http://bridge", "token"
-    )
+    optimizer = plugin._wrap_optimizer_with_mutation_notice(Optimizer(), "http://bridge", "token")
 
     with pytest.raises(RuntimeError, match="readiness failed"):
         optimizer.step()
@@ -4127,9 +4058,7 @@ def test_marker_publication_failure_reaches_all_ranks_before_optimizer_step(
         raising=False,
     )
     optimizers = [
-        plugin._wrap_optimizer_with_mutation_notice(
-            Optimizer(rank), "http://bridge", "token"
-        )
+        plugin._wrap_optimizer_with_mutation_notice(Optimizer(rank), "http://bridge", "token")
         for rank in range(2)
     ]
 
@@ -4272,9 +4201,7 @@ def test_mutation_failure_preserves_permanent_precedence(classifications):
 
 def test_mutation_success_response_disconnect_does_not_latch_marker_failure():
     callback_calls = []
-    bridge = _text_bridge(
-        _BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True)
-    )
+    bridge = _text_bridge(_BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True))
     bridge.start()
     handler = bridge._server.RequestHandlerClass
 
@@ -4301,9 +4228,7 @@ def test_mutation_lost_success_response_retries_once_without_republishing_marker
 
     callback_calls = []
     optimizer_steps = []
-    bridge = _text_bridge(
-        _BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True)
-    )
+    bridge = _text_bridge(_BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True))
     failure_path = str(tmp_path / "mutation-failure")
     monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
 
@@ -4346,9 +4271,7 @@ def test_incomplete_mutation_response_retries_once_without_republishing_marker(
 
     callback_calls = []
     optimizer_steps = []
-    bridge = _text_bridge(
-        _BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True)
-    )
+    bridge = _text_bridge(_BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True))
     failure_path = str(tmp_path / "mutation-failure")
     monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
 
@@ -4392,9 +4315,7 @@ def test_persistent_incomplete_mutation_response_fails_closed_after_one_retry(
 
     callback_calls = []
     optimizer_steps = []
-    bridge = _text_bridge(
-        _BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True)
-    )
+    bridge = _text_bridge(_BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True))
     failure_path = str(tmp_path / "mutation-failure")
     monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
     bridge.start()
@@ -4439,9 +4360,7 @@ def test_persistent_mutation_response_loss_writes_fallback_without_optimizer_ste
 
     callback_calls = []
     optimizer_steps = []
-    bridge = _text_bridge(
-        _BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True)
-    )
+    bridge = _text_bridge(_BridgeTeacher(), mutation_callback=lambda: callback_calls.append(True))
     failure_path = str(tmp_path / "mutation-failure")
     monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
     bridge.start()
@@ -4575,9 +4494,7 @@ def test_sitecustomize_saves_only_exact_required_steps(monkeypatch):
     modules["verl.utils.checkpoint.checkpoint_handler"] = types.ModuleType(
         "verl.utils.checkpoint.checkpoint_handler"
     )
-    modules["verl.utils.checkpoint.checkpoint_handler"].CheckpointHandler = (
-        FakeCheckpointHandler
-    )
+    modules["verl.utils.checkpoint.checkpoint_handler"].CheckpointHandler = FakeCheckpointHandler
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
@@ -4627,9 +4544,7 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
 
     multi_turn_overrides = dict(
         value.split("=", 1)
-        for value in build_opd_overrides(
-            _config(multi_turn=True, max_sequence_length=1536)
-        )
+        for value in build_opd_overrides(_config(multi_turn=True, max_sequence_length=1536))
     )
     assert (
         multi_turn_overrides["actor_rollout_ref.rollout.agent.default_agent_loop"]
@@ -4673,10 +4588,9 @@ def test_overrides_size_the_engine_to_the_job_not_a_hardcoded_context():
     assert overrides["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"] == "65536"
     assert overrides["actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu"] == "65536"
     # and the prompt filter's budget is carved out of the engine, never larger than it.
-    assert (
-        int(overrides["data.max_prompt_length"]) + int(overrides["data.max_response_length"])
-        == int(overrides["actor_rollout_ref.rollout.max_model_len"])
-    )
+    assert int(overrides["data.max_prompt_length"]) + int(
+        overrides["data.max_response_length"]
+    ) == int(overrides["actor_rollout_ref.rollout.max_model_len"])
 
 
 def test_overrides_require_an_explicit_sequence_length():
@@ -4799,9 +4713,7 @@ def test_agent_loops_are_registered_under_an_importable_qualname():
 
     sources = {
         "flash_single_turn": inspect.getsource(opd_plugin._install_verl_extensions),
-        "flash_multi_turn": inspect.getsource(
-            opd_multiturn.build_flash_multi_turn_agent_loop
-        ),
+        "flash_multi_turn": inspect.getsource(opd_multiturn.build_flash_multi_turn_agent_loop),
     }
 
     for agent_name, source in sources.items():
@@ -4867,9 +4779,7 @@ def test_structured_overrides_pin_xgrammar_and_thinking_parser():
     )
 
     assert (
-        overrides[
-            "+actor_rollout_ref.rollout.engine_kwargs.vllm.structured_outputs_config"
-        ]
+        overrides["+actor_rollout_ref.rollout.engine_kwargs.vllm.structured_outputs_config"]
         == "{backend:xgrammar,disable_any_whitespace:false,reasoning_parser:deepseek_r1}"
     )
 
@@ -4937,15 +4847,9 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
     assert child["FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH"] == str(
         tmp_path / "score-delivery-failure"
     )
-    assert child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] == str(
-        tmp_path / "abandonment-failure"
-    )
-    assert child["FLASH_OPD_RESAMPLE_FAILURE_PATH"] == str(
-        tmp_path / "resample-failure"
-    )
-    assert child["FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH"] == str(
-        tmp_path / "cycle-commit-failure"
-    )
+    assert child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] == str(tmp_path / "abandonment-failure")
+    assert child["FLASH_OPD_RESAMPLE_FAILURE_PATH"] == str(tmp_path / "resample-failure")
+    assert child["FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH"] == str(tmp_path / "cycle-commit-failure")
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "FIREWORKS_API_KEY" not in child
@@ -5002,12 +4906,6 @@ def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path)
     assert "FIREWORKS_API_KEY" not in child
 
 
-
-
-
-
-
-
 def test_structured_validator_rejects_vllm_mistral_tokenizer_models(monkeypatch):
     from flash import opd_validation
 
@@ -5043,8 +4941,6 @@ def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
 
     assert result.constraint is None
     assert result.model_vocab_size == 0
-
-
 
 
 def test_structured_runtime_rejects_vllm_below_minimum(monkeypatch):
@@ -5100,30 +4996,23 @@ def test_plugin_initialization_checks_structured_versions_before_verl_install(mo
     importlib_module.reload(plugin)
 
 
-
-
-
-
-
-
-
-
 def test_deterministic_seed_uses_every_rollout_identity_component():
     baseline = deterministic_rollout_seed(42, 3, 7, 1)
     assert baseline == deterministic_rollout_seed(42, 3, 7, 1)
-    assert len(
-        {
-            baseline,
-            deterministic_rollout_seed(43, 3, 7, 1),
-            deterministic_rollout_seed(42, 4, 7, 1),
-            deterministic_rollout_seed(42, 3, 8, 1),
-            deterministic_rollout_seed(42, 3, 7, 2),
-            deterministic_rollout_seed(42, 3, 7, 1, no_signal_attempt_ordinal=1),
-        }
-    ) == 6
+    assert (
+        len(
+            {
+                baseline,
+                deterministic_rollout_seed(43, 3, 7, 1),
+                deterministic_rollout_seed(42, 4, 7, 1),
+                deterministic_rollout_seed(42, 3, 8, 1),
+                deterministic_rollout_seed(42, 3, 7, 2),
+                deterministic_rollout_seed(42, 3, 7, 1, no_signal_attempt_ordinal=1),
+            }
+        )
+        == 6
+    )
     assert 0 <= baseline < 2**63
-
-
 
 
 def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
@@ -5203,9 +5092,7 @@ def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
         "                    else None\n"
         "                ),"
     ) in notes
-    assert (
-        '"opd_teacher_workers": 1 if not multimodal and not multi_turn else None,'
-    ) in notes
+    assert ('"opd_teacher_workers": 1 if not multimodal and not multi_turn else None,') in notes
     # the engine length handed to vllm, not a hardcoded default: prompt filtering is carved out of
     # this same number, so a fabricated one would disagree with the budget the run actually used.
     assert '"vllm_max_model_len": max_model_len,' in notes
@@ -5259,9 +5146,7 @@ def test_worker_structured_validator_runs_before_model_download():
     from flash.engine.worker.opd_train import run_opd_train
 
     source = inspect.getsource(run_opd_train)
-    assert source.index("validate_opd_structured_outputs(") < source.index(
-        "_w.prefetch_model("
-    )
+    assert source.index("validate_opd_structured_outputs(") < source.index("_w.prefetch_model(")
     assert "resolve_vocab_size" not in source
 
 
@@ -5271,10 +5156,10 @@ def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     import flash.engine.worker.opd_plugin as plugin
 
     source = inspect.getsource(plugin)
-    assert '@register_distillation_loss(' in source
+    assert "@register_distillation_loss(" in source
     assert 'names=["flash_groupwise_reverse_kl"]' in source
-    assert 'main_ppo_sync.TaskRunner = FlashTaskRunner' in source
-    assert 'resource_pool_spec = {' in source
+    assert "main_ppo_sync.TaskRunner = FlashTaskRunner" in source
+    assert "resource_pool_spec = {" in source
     assert '"global_pool"' in source
     assert "teacher_pool" not in source
     assert "Role.TeacherModel" not in source
@@ -5293,9 +5178,7 @@ def test_plugin_identifiers_remain_provider_neutral():
     import flash.engine.worker.opd_structured as structured
 
     source = (
-        inspect.getsource(plugin)
-        + inspect.getsource(structured)
-        + inspect.getsource(multiturn)
+        inspect.getsource(plugin) + inspect.getsource(structured) + inspect.getsource(multiturn)
     ).lower()
     forbidden = ("parasail", "fireworks")
     for name in forbidden:
@@ -5381,7 +5264,9 @@ def test_worker_fails_closed_on_tool_env(monkeypatch):
         multi_turn = False
 
     monkeypatch.setattr(ov._w, "require_active_env", lambda: FakeEnv())
-    with pytest.raises(RuntimeError, match="native tool-calling OPD environments are not supported"):
+    with pytest.raises(
+        RuntimeError, match="native tool-calling OPD environments are not supported"
+    ):
         ov.run_opd_train(spec=object())
 
 
@@ -5400,9 +5285,15 @@ def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints()
     ray_prefixed = "(TaskRunner pid=3125) step:4 - actor/distillation/loss:np.float64(0.6421)"
     assert ov.parse_verl_metric(ray_prefixed, "actor/distillation/loss") == 0.6421
     # the unprefixed numpy-1 spelling verl's own pin produces still parses.
-    assert ov.parse_verl_metric("step:4 - actor/distillation/loss:0.6421", "actor/distillation/loss") == 0.6421
+    assert (
+        ov.parse_verl_metric("step:4 - actor/distillation/loss:0.6421", "actor/distillation/loss")
+        == 0.6421
+    )
     # the un-namespaced fallback key the handler tries second.
-    assert ov.parse_verl_metric("step:4 - distillation/loss:np.float32(0.25)", "distillation/loss") == 0.25
+    assert (
+        ov.parse_verl_metric("step:4 - distillation/loss:np.float32(0.25)", "distillation/loss")
+        == 0.25
+    )
 
 
 def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
@@ -5516,7 +5407,7 @@ def test_ray_resource_probe_never_raises_on_the_timeout_path(monkeypatch):
 
     stub = types.ModuleType("ray")
     stub.cluster_resources = lambda: (_ for _ in ()).throw(RuntimeError("ray is gone"))
-    stub.available_resources = lambda: {}
+    stub.available_resources = dict
     monkeypatch.setitem(sys.modules, "ray", stub)
     assert "ray resources unreadable" in plugin._describe_ray_resources()
 

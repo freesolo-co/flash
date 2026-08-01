@@ -96,6 +96,17 @@ class FreesoloEnvironment(BaseEnvironment):
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
+        # whether this run samples <think> blocks. the worker sets it from the JobSpec once the
+        # env is loaded; off by default so a CLI-side load (flash env test) grades raw text, which
+        # is what an echo/replay harness feeds it.
+        self.thinking = False
+        # whether the chat template pre-opens an unclosed <think> in every assistant generation
+        # prompt (Qwen with enable_thinking does). the worker derives this from a REAL rendered
+        # prompt, never from the thinking flag, and sets it alongside .thinking -- a template that
+        # ignores enable_thinking must not have its tagless answers read as unterminated reasoning.
+        # both parsers need it or a turn truncated before </think> grades as the whole ramble here
+        # while the single-turn path correctly grades it empty.
+        self.prompt_opens_thinking = False
 
     @property
     def max_turns(self) -> int:
@@ -397,18 +408,48 @@ class FreesoloEnvironment(BaseEnvironment):
             "turns": [],
             "done": False,
             "response_text": "",
+            "raw_response_text": "",
             "turn": 0,
             "max_episode_turns": episode_turns,
         }
 
     def record_model_turn(self, state: dict, content: str) -> dict:
+        # the transcript keeps the raw turn -- it is what the model actually emitted, and what the
+        # next turn must be conditioned on. the text handed to the scorer is answer-only, matching
+        # what the single-turn path grades. without this the two modes give a grader different shapes
+        # of the same completion, so an env can score correctly in one mode and silently mis-grade in
+        # the other.
         msg = {"role": "assistant", "content": content}
         state.setdefault("messages", []).append(msg)
         state.setdefault("turns", []).append(
             self._EnvironmentTurn(role="assistant", content=content)
         )
-        state["response_text"] = content
+        state["response_text"] = self._scored_turn_text(content)
+        # step_episode drives the episode, it does not grade it: it parses the action, and often
+        # requires assistant_response to equal messages[-1]["content"]. that message is raw, so
+        # handing it the stripped text would step the env on something the model never emitted.
+        state["raw_response_text"] = content
         return msg
+
+    def _scored_turn_text(self, content: str):
+        """The assistant turn as the scorer should see it: answer-only, reasoning available.
+
+        Both parsers get ``prompt_opens_thinking``, exactly as the single-turn path forwards its
+        own ``_prompt_opens_thinking`` (flash/engine/worker/rl.py). Without it a turn truncated
+        before ``</think>`` is tagless reasoning that ``strip_think`` returns whole as the answer,
+        so the rollout can be rewarded for unfinished thinking that single-turn grading scores 0.
+        """
+        if not self.thinking:
+            return content
+        from flash.thinking import strip_think, thinking_text
+
+        opened = self.prompt_opens_thinking
+        answer = strip_think(content, prompt_opened_thinking=opened)
+        return _ScoredResponseText(
+            answer if isinstance(answer, str) else content,
+            raw=content,
+            thinking=thinking_text(content, prompt_opened_thinking=opened),
+        )
 
     def env_reply(self, messages: list[dict], state: dict) -> list[dict]:
         if not self.multi_turn:
@@ -416,11 +457,45 @@ class FreesoloEnvironment(BaseEnvironment):
         task = state.get("task")
         if task is None:
             raise RuntimeError("missing Freesolo rollout task state")
-        assistant_response = str(state.get("response_text") or "")
-        step = self._env.step_episode(task, list(messages), assistant_response)
+        # the raw turn, not the scored one: see record_model_turn. falls back to response_text for a
+        # state built by something other than record_model_turn (where the two are the same text).
+        raw = state.get("raw_response_text")
+        if not isinstance(raw, str):
+            raw = str(state.get("response_text") or "")
+        step = self._env.step_episode(task, list(messages), raw)
         state["done"] = bool(step.done)
         if step.final_response_text is not None:
-            state["response_text"] = step.final_response_text
+            # the env overrode the episode's answer, so it is already the text to grade -- do not
+            # strip it. keep the raw view in step with it for any later turn.
+            final = str(step.final_response_text)
+            # wrap rather than assign the bare string: a plain str has no .raw/.thinking, so a
+            # thinking-aware score_episode would lose the model's reasoning on exactly the episodes
+            # an env terminates by overriding (the scaffolded StarterMultiTurnEnv does this on a
+            # correct guess). the override text is the answer, so .completion is it; .thinking and
+            # .raw stay the model's own from this turn, which the override replaced but did not
+            # produce.
+            #
+            # .raw is documented as the ORIGINAL RAW MODEL OUTPUT (flash/cli/training_doc.py), so
+            # the override does not belong in it: a scorer reaching for .raw wants the text the
+            # model emitted, and is the one scorer that cannot recover it from anywhere else --
+            # .completion and str() are both the override already. assigning it here also left the
+            # object internally inconsistent, pairing an env-authored .raw with the model's own
+            # .thinking, so .raw did not contain the reasoning .thinking was taken from (codex[bot]).
+            #
+            # `raw` is this turn's model emission: the adapter passed it to step_episode above as
+            # what the model said. state["raw_response_text"] below is deliberately NOT this -- it
+            # carries the override so a later turn steps the env on the answer it substituted.
+            previous = state.get("response_text")
+            state["response_text"] = (
+                _ScoredResponseText(
+                    final,
+                    raw=raw,
+                    thinking=getattr(previous, "thinking", None),
+                )
+                if self.thinking
+                else final
+            )
+            state["raw_response_text"] = final
         state["turn"] = int(state.get("turn", 0)) + 1
         if step.metadata:
             state.setdefault("step_metadata", []).append(step.metadata)
@@ -447,9 +522,12 @@ class FreesoloEnvironment(BaseEnvironment):
         return cap is not None and int(state.get("turn", 0)) >= int(cap)
 
     def _episode_from_state(self, state: dict):
+        # not str(): response_text may be a _ScoredResponseText carrying .raw/.thinking, and str()
+        # on a str subclass drops back to a plain str, losing the structured views.
+        response_text = state.get("response_text")
         return self._EnvironmentEpisode(
             messages=tuple(state.get("messages") or ()),
-            response_text=str(state.get("response_text") or ""),
+            response_text="" if response_text is None else response_text,
             turns=tuple(state.get("turns") or ()),
             metadata={"steps": state.get("step_metadata", [])}
             if state.get("step_metadata")
@@ -465,14 +543,15 @@ class FreesoloEnvironment(BaseEnvironment):
         self, completion_msgs: list[dict], example: dict, prompt_msgs: list[dict] | None = None
     ) -> float:
         messages = [*(prompt_msgs or []), *completion_msgs]
-        response_text = ""
+        response_text: object = ""
         turns = []
         for message in completion_msgs:
             content = str(message.get("content", ""))
             role = str(message.get("role", ""))
             turns.append(self._EnvironmentTurn(role=role, content=content))
             if role == "assistant":
-                response_text = content
+                # same shape the single-turn path grades; see record_model_turn.
+                response_text = self._scored_turn_text(content)
         episode = self._EnvironmentEpisode(
             messages=tuple(dict(m) for m in messages),
             response_text=response_text,

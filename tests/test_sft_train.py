@@ -141,11 +141,7 @@ def test_sft_engine_strategy_stays_fsdp2():
 
 
 def test_optimizer_eps_merges_into_override_config():
-    overrides = _as_map(
-        build_sft_overrides(
-            _cfg(optimizer_kwargs={"amsgrad": True}, eps=1e-6)
-        )
-    )
+    overrides = _as_map(build_sft_overrides(_cfg(optimizer_kwargs={"amsgrad": True}, eps=1e-6)))
     assert overrides["optim.override_optimizer_config"] == "{amsgrad:true,eps:0.000001}"
 
 
@@ -409,10 +405,9 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
     scheduler_calls = []
     fake_transformers = _module(
         "transformers",
-        get_linear_schedule_with_warmup=lambda optimizer, **kwargs: scheduler_calls.append(
-            (optimizer, kwargs)
-        )
-        or "linear",
+        get_linear_schedule_with_warmup=lambda optimizer, **kwargs: (
+            scheduler_calls.append((optimizer, kwargs)) or "linear"
+        ),
     )
     fake_sft_module = _module(
         "verl.trainer.sft_trainer",
@@ -480,9 +475,7 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
     assert _LORAPLUS_READY_MARKER in capsys.readouterr().out
     assert optimizer_calls[0]["optimizer_kwargs"]["eps"] == 1e-8
     assert engine._build_lr_scheduler("optimizer") == "linear"
-    assert scheduler_calls == [
-        ("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})
-    ]
+    assert scheduler_calls == [("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})]
 
 
 def test_loraplus_shim_has_no_plain_lora_fallback():
@@ -726,9 +719,7 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     monkeypatch.setattr(
         worker,
         "hf_upload_folder",
-        lambda local, remote, required=False: captured["uploads"].append(
-            (local, remote, required)
-        ),
+        lambda local, remote, required=False: captured["uploads"].append((local, remote, required)),
     )
     monkeypatch.setattr(
         worker,
@@ -745,7 +736,11 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
         "liveness_heartbeat",
         lambda *args, **kwargs: contextlib.nullcontext(),
     )
-    monkeypatch.setattr(sft_train, "_probe_gpu_in_subprocess", lambda *args, **kwargs: {"memory_gb": 24, "capability": [8, 9]})
+    monkeypatch.setattr(
+        sft_train,
+        "_probe_gpu_in_subprocess",
+        lambda *args, **kwargs: {"memory_gb": 24, "capability": [8, 9]},
+    )
     monkeypatch.setattr(sft_train, "_model_arch_dims", lambda *args, **kwargs: (1024, 24))
     monkeypatch.setattr(sft_train, "resolve_verl_python", lambda *a, **k: "/venv/bin/python")
     monkeypatch.setattr(sft_train, "resolve_verl_loggers", lambda python_bin: ["console"])
