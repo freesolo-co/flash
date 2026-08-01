@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 import queue
 import threading
@@ -339,6 +340,15 @@ def _generate_concurrently(
             pending.put((index, prompt))
     outstanding = pending.qsize()
     if outstanding:
+        # settle the control plane's step-selector capability HERE, on one thread, before any worker
+        # starts. the client caches the answer only after it succeeds, so N workers racing from cold
+        # each fire their own /v1/health -- one eval's worth of duplicate requests for a fact about
+        # the plane that cannot differ between them (codex[bot]). warming it costs one call and needs
+        # no lock in the client, where it would put coordination on every caller for this one race.
+        # a `RUN/step-N` target is what makes the check run at all; anything else skips it, and a
+        # genuine capability failure still surfaces from the first case rather than being swallowed.
+        with contextlib.suppress(Exception):
+            client.warm_chat_step_selector(target)
         finished: queue.SimpleQueue = queue.SimpleQueue()
         aborted = threading.Event()
         abort_lock = threading.Lock()
