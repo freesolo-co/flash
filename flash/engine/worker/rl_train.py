@@ -1229,14 +1229,20 @@ def render_reentrant_checkpointing_shim(reentrant: bool, *, multimodal: bool = F
     engines whose config may legitimately have checkpointing off, and enabling it there would turn
     on a feature verl chose to leave off.
 
-    on a MULTIMODAL run the same hook also restores vision input gradients. reentrant recompute
-    drops the backward for a checkpointed block when none of that block's inputs require grad, and
-    the vision tower's patch embeddings are exactly that case: the pixels are frozen inputs, so
-    without a forward hook marking the patch-embed output as requiring grad the visual modules
-    silently receive nothing while the language side trains normally and the run reports success
-    (``tests/test_multimodal_input_grads.py``). the retired trl path installed the same hook via a
-    trainer callback; verl has no callback surface, so it rides this shim instead -- and only here,
-    because non-reentrant recompute does not have the behaviour that makes it necessary
+    reentrant recompute drops the backward for a checkpointed block when none of that block's
+    inputs require grad. that hits the LANGUAGE side on every lora run: lora freezes the
+    embeddings, so the hidden states entering the first checkpointed decoder layer have
+    ``requires_grad=False`` and the whole segment -- containing every lora parameter -- receives no
+    gradient, while the run reports success and bills (GRAD-001). ``enable_input_require_grads()``
+    is what prevents it, and it is unconditional here because every flash rl run is lora.
+
+    on a MULTIMODAL run the same hook additionally restores VISION input gradients. the vision
+    tower's patch embeddings are the same failure in a place the language-side call does not
+    reach: the pixels are frozen inputs, so without a forward hook marking the patch-embed output
+    as requiring grad the visual modules silently receive nothing while the language side trains
+    normally (``tests/test_multimodal_input_grads.py``). the retired trl path installed that hook
+    via a trainer callback; verl has no callback surface, so it rides this shim instead -- and only
+    here, because non-reentrant recompute does not have the behaviour that makes it necessary
     (codex[bot]).
     """
     if not reentrant:
@@ -1290,6 +1296,13 @@ def _flash_reentrant_build_module(self):
     # only when verl actually enabled checkpointing: calling gradient_checkpointing_enable on a
     # model verl deliberately left uncheckpointed would turn it ON and change the memory profile.
     if getattr(self.model_config, "enable_gradient_checkpointing", False):
+        # the LANGUAGE-side counterpart of the vision hook below, and required for the same
+        # reason (GRAD-001): lora freezes the embeddings, so nothing entering the first
+        # checkpointed decoder layer requires grad and reentrant recompute drops the backward
+        # for the whole segment -- where every lora parameter lives. the vision hook only ever
+        # covered the patch embeddings on multimodal runs; text-only runs had no hook at all and
+        # trained nothing while reporting success.
+        module.enable_input_require_grads()
         module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={{"use_reentrant": True}}){vision_hook}
         print("[rl-verl] reentrant gradient checkpointing is active", flush=True)
     return module
