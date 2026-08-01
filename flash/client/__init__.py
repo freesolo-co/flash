@@ -12,6 +12,7 @@ from .http import (
     get_project,
     list_projects,
     list_trace_projects,
+    upload_eval_run,
     verify_freesolo_key,
 )
 
@@ -28,5 +29,6 @@ __all__ = [
     "list_trace_projects",
     "load_credentials",
     "save_credentials",
+    "upload_eval_run",
     "verify_freesolo_key",
 ]

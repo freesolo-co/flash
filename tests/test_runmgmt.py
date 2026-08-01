@@ -370,9 +370,7 @@ def test_status_sanitizer_preserves_metric_backlog_and_bounds_other_lists():
     import flash.runner as runner
 
     metrics = [{"step": step, "reward": step / 1025} for step in range(1025)]
-    sanitized = runner._sanitize_status_value(
-        {"metrics_last": metrics, "other": list(range(32))}
-    )
+    sanitized = runner._sanitize_status_value({"metrics_last": metrics, "other": list(range(32))})
 
     assert len(sanitized["metrics_last"]) == 1024
     assert sanitized["metrics_last"][0]["step"] == 1
@@ -1984,7 +1982,7 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(runner, "_mark_warmstart_source", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner, "effective_spec_from_status", lambda _status, **_kwargs: spec)
-    monkeypatch.setattr(providers, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers, "configured_providers", list)
     monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
     resubmit_attempted = {"value": False}
@@ -2019,8 +2017,158 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     # recover_runs) so a slow/outage-hit provider teardown can't block the startup path; check
     # for the resubmit-loop thread specifically rather than asserting the full thread list.
     assert (runtime._deferred_resubmit_loop, (spec,), True) in started
-    drain_calls = [args for target, args, _daemon in started if target.__name__ == "_drain_cleanup_remotes_bg"]
+    drain_calls = [
+        args for target, args, _daemon in started if target.__name__ == "_drain_cleanup_remotes_bg"
+    ]
     assert drain_calls == [(spec.run_id,)]
+
+
+def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses(
+    monkeypatch, tmp_path
+):
+    # an algorithm dropped from the catalog while one of its runs is still nonterminal: the
+    # persisted spec stops parsing on the new build. attach_run parses before its except/finally
+    # exist, so dispatching it would kill the daemon thread with the run still `running` and the
+    # rented worker still billing. recovery has to decide this itself -- fail the run and remove
+    # the resource -- which is the disposition the handle-less branch already applies.
+    import flash.providers as providers
+    import flash.runner as runner
+    import flash.server._runtime as runtime
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    remote = {"provider": "runpod", "endpoint_id": "ep-stale", "attempt": 0}
+    runner._save_status(
+        runner.RunStatus(
+            run_id="recover-unparseable",
+            state="running",
+            spec=JobSpec(
+                run_id="recover-unparseable", model="Qwen/Qwen3.5-4B", algorithm="sft"
+            ).to_dict(),
+            remote=dict(remote),
+        )
+    )
+    # the record has to be written the way an upgrade produces one: the OLD build persisted a spec
+    # it accepted, and only the new build rejects it. _save_status parses on the way in, so it can
+    # never store this -- edit the stored json in place, which is what "the algorithm was dropped
+    # from the catalog underneath a live run" actually looks like on disk.
+    stored_path = runner.runs_file_path("recover-unparseable", ".json")
+    with open(stored_path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["algorithm"] = "retired-algorithm"
+    with open(stored_path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+    with pytest.raises(ValueError, match="unsupported algorithm"):
+        JobSpec.from_dict(stored["spec"])  # premise: this build cannot parse it
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "recover-unparseable"}])
+    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(providers, "configured_providers", list)
+    torn: list[tuple[dict, str]] = []
+
+    def fake_teardown(handle, run_id):
+        torn.append((dict(handle), run_id))
+        return True
+
+    monkeypatch.setattr("flash.runner.lifecycle._strict_teardown_handle", fake_teardown)
+    attached: list[str] = []
+    # recover_runs imports attach_run from flash.runner inside the function, so patch it there.
+    monkeypatch.setattr(runner, "attach_run", lambda rid: attached.append(rid))
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            # only the cleanup drain is backgrounded here; attach_run must never be dispatched.
+            self._target(*self._args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    assert attached == []
+    assert torn == [(remote, "recover-unparseable")]
+    status = runner.get_status("recover-unparseable")
+    assert status.state == "failed"
+    assert "persisted spec is malformed" in (status.error or "")
+
+
+def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
+    # when `_strict_teardown_handle` cannot confirm the delete, the handle is recorded for the
+    # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
+    # snapshotted an empty list, and it returns early on empty (cursor). so the record sat there
+    # with nothing scheduled to retry it, and the worker kept billing until the next restart.
+    import flash.providers as providers
+    import flash.runner as runner
+    import flash.server._runtime as runtime
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    # a COMPLETE handle: `_record_cleanup_remote` drops anything it cannot resolve to an exact
+    # provider resource identity, so a partial one would make this test pass for the wrong reason.
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "ep-unconfirmed",
+        "endpoint_name": "flash-recover-unconfirmed",
+        "key_fingerprint": "rpk-0123456789ab",
+        "attempt": 0,
+        "started_ts": 1.0,
+    }
+    assert runner._remote_resource_identity(remote) is not None
+    runner._save_status(
+        runner.RunStatus(
+            run_id="recover-unconfirmed",
+            state="running",
+            spec=JobSpec(
+                run_id="recover-unconfirmed", model="Qwen/Qwen3.5-4B", algorithm="sft"
+            ).to_dict(),
+            remote=dict(remote),
+        )
+    )
+    stored_path = runner.runs_file_path("recover-unconfirmed", ".json")
+    with open(stored_path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["algorithm"] = "retired-algorithm"
+    with open(stored_path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "recover-unconfirmed"}])
+    monkeypatch.setattr(providers, "configured_providers", list)
+
+    torn: list[str] = []
+
+    def fake_teardown(handle, run_id):
+        # the direct teardown is handed the raw dict; the drain rebuilds a JobHandle from the
+        # persisted record, so the two call sites are distinguishable here.
+        torn.append("drain" if hasattr(handle, "provider") else "direct")
+        return False  # unconfirmed, both times: this is the case that records for the drain
+
+    monkeypatch.setattr("flash.runner.lifecycle._strict_teardown_handle", fake_teardown)
+    monkeypatch.setattr(runner, "attach_run", lambda rid: None)
+    # persisting a cleanup record reports the new status, which blocks on its reporter thread. that
+    # thread is real in production; here the fake below would stand in for it and never run.
+    monkeypatch.setattr(runner, "_report_status", lambda status: None)
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    # patch the ATTRIBUTE recover_runs reads, not threading.Thread globally: the module-wide patch
+    # also replaced the status reporter's own worker thread, so nothing serviced its queue.
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    # the drain runs twice: once before the teardown (nothing recorded yet, so it tears down
+    # nothing) and once after, which is the retry. without the second dispatch the sequence is
+    # ["direct"] and the recorded resource is never attempted at all.
+    assert torn == ["direct", "drain"]
+    # and it is still recorded, because the retry did not confirm the delete either -- so the next
+    # restart's drain will find it and try again, rather than the record being dropped unconfirmed.
+    with open(stored_path, encoding="utf-8") as handle:
+        assert json.load(handle)["cleanup_remotes"] == [remote]
 
 
 def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypatch, tmp_path):
@@ -2221,6 +2369,7 @@ def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypat
         return read
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+
     def call():
         return lifecycle._completed_attempt_metrics(
             spec,
@@ -2229,6 +2378,7 @@ def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypat
             launch_floor=100.0,
             deadline_at=200.0,
         )
+
     if pending:
         with pytest.raises(lifecycle._CompletedAttemptPending, match=r"metrics\.json"):
             call()

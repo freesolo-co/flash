@@ -9,6 +9,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
+import flash.runner as _runner
+from flash.multimodal import preflight_validate_image_opd
 from flash.runner import (
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
@@ -85,14 +87,19 @@ def _client_train_schema(payload: dict) -> dict | None:
     }
 
 
-def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> None:
-    """Reject an unaffordable prepared run before recording or allocating it."""
+def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> bool:
+    """Reject an unaffordable prepared run before recording or allocating it.
+
+    Returns whether affordability was actually VERIFIED. The two fail-open paths below deliberately
+    let the run through on a billing-infra problem, but a caller that reports the outcome must be
+    able to tell that apart from a real pass: an unverified run can still be rejected 402 later.
+    """
     from flash.server._internal_client import internal_key as _internal_key
 
     key = _internal_key()
     if not key:
         # internal reporting is off -> no completion billing either, so there is nothing to gate.
-        return
+        return False
     try:
         from flash.server.billing import precheck_training_run
 
@@ -103,6 +110,8 @@ def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) 
         if isinstance(exc, BillingError) and exc.status_code == 402:
             raise HTTPException(status_code=402, detail=exc.detail) from exc
         _LOG.warning("budget precheck skipped for %s (billing service error): %s", run_id, exc)
+        return False
+    return True
 
 
 @router.post("/v1/runs")
@@ -172,14 +181,18 @@ def create_run(
         )
     runtime_secrets = _runtime_secrets(payload, spec)
     affordability_org_id = str(key.get("org_id") or "").strip()
-    bill_on_completion = not dry_run and key.get("auth_kind") != "internal"
+    billable_key = key.get("auth_kind") != "internal"
+    bill_on_completion = not dry_run and billable_key
     billing_context = None
+    # the org requirement is a property of the KEY, not of the mode: a dry run whose org cannot be
+    # resolved would otherwise skip the affordability check and answer 200, while submitting the very
+    # same spec for real is rejected 400 here -- the preview contradicting the launch it previews.
+    if billable_key and not affordability_org_id:
+        raise HTTPException(
+            status_code=400,
+            detail="org id is required to bill a completed training run",
+        )
     if bill_on_completion:
-        if not affordability_org_id:
-            raise HTTPException(
-                status_code=400,
-                detail="org id is required to bill a completed training run",
-            )
         billing_context = {"org_id": affordability_org_id}
     platform_context = {
         field: value
@@ -192,6 +205,7 @@ def create_run(
         if value
     }
     run_id = spec.run_id
+    affordability_verified = False
     try:
         try:
             prepared = _app.prepare_job(
@@ -202,26 +216,38 @@ def create_run(
             )
         except ServingPreflightError:
             raise
-        except Exception as exc:
+        # resolve the class off the module rather than binding it at import: flash.runner is
+        # reloaded (tests, and any reimport), which rebinds the class to a new object, and a
+        # bound name would silently stop matching the error the runner actually raises.
+        except _runner.WarmStartPreparationError as exc:
+            # only failures raised while resolving the warm-start source reach here, so the adapter
+            # really is the cause. the reason itself stays out of the response on purpose: it can
+            # name internal storage paths and source-run internals. it is logged instead.
             source_ref = spec.train.init_from_adapter
-            if source_ref:
-                _LOG.warning(
-                    "warm-start preparation failed for %s from %s",
-                    run_id,
-                    source_ref,
-                    exc_info=True,
-                )
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"train.init_from_adapter source {source_ref!r} could not be prepared; "
-                        "verify that the source adapter is complete, compatible, and unchanged"
-                    ),
-                ) from exc
-            raise
+            _LOG.warning(
+                "warm-start preparation failed for %s from %s", run_id, source_ref, exc_info=True
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"train.init_from_adapter source {source_ref!r} could not be prepared; "
+                    "verify that the source adapter is complete, compatible, and unchanged"
+                ),
+            ) from exc
         run_id = prepared.public_spec.run_id
-        if bill_on_completion:
-            _precheck_budget_or_block(
+        # validate the spec BEFORE charging affordability against it. submit_job runs these same
+        # read-only gates, but it runs them after this point, so an unsupported spec would be told
+        # "insufficient balance" (402) for a run it can never launch at any balance -- sending the
+        # user to top up instead of to the real defect. both are pure and raise ValueError, which the
+        # handler below turns into the 400 submit_job would have produced.
+        _runner._require_supported_gpu_count(prepared.public_spec)
+        _runner._require_supported_gpu_count(prepared.worker_spec)
+        preflight_validate_image_opd(prepared.worker_spec)
+        # run the affordability check for dry runs too. it is verify-only (moves no money), so a
+        # `--dry-run` that passes now also proves the org can cover the estimate, instead of the run
+        # being validated here and rejected 402 only on real submission.
+        if bill_on_completion or (dry_run and billable_key):
+            affordability_verified = _precheck_budget_or_block(
                 run_id=run_id,
                 estimate_usd=prepared.estimated_cost_usd,
                 org_id=affordability_org_id,
@@ -262,6 +288,11 @@ def create_run(
     response = status.to_dict()
     if dry_run and schema is not None:
         response["train_schema_compatibility"] = schema["compatibility"]
+    if dry_run:
+        # say whether the affordability check actually RAN. it fails open on a billing-infra
+        # problem, so a silent 200 would claim the dry run validated cost when it did not -- and
+        # the identical spec can still be rejected 402 once the backend recovers.
+        response["affordability_verified"] = affordability_verified
     return response
 
 

@@ -8,7 +8,7 @@ import flash.server._locks as locks
 
 
 def test_nonblocking_file_lock_failure_closes_descriptor_and_releases_thread_lock(
-    monkeypatch
+    monkeypatch,
 ) -> None:
     """A contended process lock must close its descriptor and leave the local mutex reusable."""
     closed = []

@@ -35,8 +35,11 @@ from flash.engine.accounting import RunMetrics
 # The `notes` dicts engine/worker.py write_train_meta() is called with, mirrored from
 # the SFT (worker.py ~L1293) and RL (worker.py ~L1942) finalize blocks. wandb_run_info()
 # spreads {wandb_url, wandb_id, wandb_project} into notes when W&B is active.
-_WANDB_NOTES = {"wandb_url": "https://wandb.ai/org/proj/runs/abc", "wandb_id": "abc",
-                "wandb_project": "proj"}
+_WANDB_NOTES = {
+    "wandb_url": "https://wandb.ai/org/proj/runs/abc",
+    "wandb_id": "abc",
+    "wandb_project": "proj",
+}
 
 _SFT_NOTES = {
     "epochs": 2,
