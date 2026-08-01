@@ -172,7 +172,7 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         # chunks instead. torch backend = numerically exact CE, no extra deps.
         "model.use_fused_kernels=true",
         "model.fused_kernel_options.impl_backend=torch",
-        f"model.use_liger={_hydra_val(cfg.get('use_liger', True))}",
+        f"model.use_liger={_hydra_val(cfg.get('use_liger', False))}",
         f"model.enable_gradient_checkpointing={_hydra_val(cfg.get('gradient_checkpointing', True))}",
         f"engine.strategy={_hydra_val(cfg.get('strategy', 'fsdp2'))}",
         "engine.model_dtype=bfloat16",
@@ -1301,7 +1301,13 @@ def run_sft_train(spec=None) -> None:
         "experiment_name": experiment_name,
         "loop_epochs": loop_epochs,
         "loggers": loggers,
-        "use_liger": True,
+        # liger zeroes the lora gradient under this fsdp2 + peft + gradient-checkpointing
+        # composition: a matched a/b on qwen3.5-9b (identical loss to 4 decimals) measured
+        # grad_norm 0.0 with liger on and 7.02 with it off. the grpo path never enables it,
+        # which is why only sft was affected. verl already disables liger's fused linear ce
+        # (it conflicts with verl's forward patching) and flash gets fused ce from
+        # use_fused_kernels + impl_backend=torch, so nothing of value is lost here.
+        "use_liger": False,
         "gradient_checkpointing": gradient_checkpointing and not reentrant_gradient_checkpointing,
         "total_training_steps": update_horizon if max_steps > 0 else None,
         "total_epochs": epochs if max_steps <= 0 else None,
