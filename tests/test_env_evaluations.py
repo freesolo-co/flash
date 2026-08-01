@@ -23,30 +23,55 @@ from flash.envs.evaluations import (
 
 # an explicit --project is validated before spending anything, so tests must pass a real UUID.
 _PROJECT_ID = "11111111-1111-1111-1111-111111111111"
+_PUBLISHED_SLUG = "acme/starter"
 # a full immutable revision: the one target shape that needs no resolution, so a test about
 # anything else does not have to stub `deployments()`. `RUN/step-N` is a shorthand the CLI now
 # pins first, which is its own contract (`test_env_eval_pins_a_step_shorthand_...`).
 _EXPLICIT_TARGET = "flash-1@step-3." + "a" * 40
 
 
-class _ConcurrentClient:
-    """Base for a double a concurrent eval fans out through.
+class _EvalClient:
+    """Base for a double used by an environment evaluation.
 
-    The real client always has `warm_chat_step_selector` (there is one `ApiClient`), and for the
-    full-revision targets these doubles use it is a no-op -- only `RUN/step-N` needs the
-    capability. A double that omitted it was fine only while the call site suppressed the
-    resulting AttributeError; now that a failed prewarm ends the eval (as it must), the no-op
-    belongs here rather than repeated in each double.
+    The real client supplies both methods for every target. Full revisions need no step-selector
+    warm-up, while every evaluation now reads the run spec to find its published environment and
+    project. Keeping those ordinary defaults here lets each double stay focused on the behavior its
+    test owns.
     """
+
+    def get_run(self, run_id):
+        return {
+            "spec": {
+                "thinking": False,
+                "project": _PROJECT_ID,
+                "environment": {"id": _PUBLISHED_SLUG},
+            }
+        }
 
     def warm_chat_step_selector(self, target):
         return None
 
 
-def _environment_dir(tmp_path: Path) -> Path:
+def _patch_published_env(monkeypatch, env_dir: Path) -> None:
+    """Resolve the canonical published slug onto a local fixture dir, with no network.
+
+    `_resolve_environment_reference` is the single seam both the loader and the sidecar resolution
+    go through, and both import it inside the function body, so one patch redirects the whole
+    published-environment path onto tmp_path.
+    """
+    entrypoint = env_dir / "environment.py"
+    monkeypatch.setattr(
+        "flash.envs.loader._resolve_environment_reference",
+        lambda env_ref, pinned_sha=None: str(entrypoint),
+    )
+
+
+def _environment_dir(tmp_path: Path, *, monkeypatch: pytest.MonkeyPatch | None = None) -> Path:
     env_dir = tmp_path / "environment"
     env_dir.mkdir()
     (env_dir / "environment.py").write_text("def load_environment():\n    return None\n")
+    if monkeypatch is not None:
+        _patch_published_env(monkeypatch, env_dir)
     return env_dir
 
 
@@ -307,7 +332,7 @@ def test_eval_suite_report_excludes_transport_errors_from_metrics() -> None:
 
 
 def test_env_eval_reports_error_count_and_fails_overall(monkeypatch, tmp_path, capsys) -> None:
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -319,7 +344,7 @@ def test_env_eval_reports_error_count_and_fails_overall(monkeypatch, tmp_path, c
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class PartialClient:
+    class PartialClient(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             if messages[0]["content"] == "dead":
                 raise ConnectionError("connection reset")
@@ -328,7 +353,7 @@ def test_env_eval_reports_error_count_and_fails_overall(monkeypatch, tmp_path, c
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", PartialClient)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
 
     captured = capsys.readouterr()
     # the one case that actually ran passed, so the rate must be 100% over real measurements...
@@ -344,7 +369,7 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
     The shorthands -- a bare run id and `RUN/step-N` -- each name something the CLI must pin to a
     revision first, which is their own contract (`test_env_eval_pins_...`).
     """
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -353,7 +378,7 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.calls = []
 
@@ -370,7 +395,6 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
             "env",
             "eval",
             _EXPLICIT_TARGET,
-            str(env_dir),
             "--temperature",
             "0.2",
             "--max-tokens",
@@ -398,7 +422,7 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
 ) -> None:
     # a bare run id is a mutable deployment alias. resolving it once prevents later cases from
     # reaching a replacement adapter while one report claims every score came from one model.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -411,7 +435,7 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
     )
     revision = "flash-1@final." + "a" * 40
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.deployment_calls = []
             self.targets = []
@@ -435,7 +459,7 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 0
 
     # resolved exactly once, before any case ran: the whole report must come from one revision.
     assert client.deployment_calls == ["deployments"]
@@ -475,9 +499,9 @@ def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
     # evaluated reproducibly. each case has to stop BEFORE generating -- grading against whatever
     # the alias points at right now spends the whole suite on a model the report cannot name, and
     # a revision belonging to another run is not this run's model at all.
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def deployments(self):
             if deployment is None:
                 return []
@@ -490,7 +514,7 @@ def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert cli.main(["env", "eval", "flash-1", str(env_dir)]) == 1
+    assert cli.main(["env", "eval", "flash-1"]) == 1
     captured = capsys.readouterr().err
     assert reason in captured
     assert "overall: FAIL" in captured
@@ -507,14 +531,14 @@ def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp
     before a LATER deploy failed still answers 200, and refusing it here failed an evaluation the
     server runs correctly (Cursor).
     """
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     class Client:
         def __init__(self):
             self.targets = []
 
         def get_run(self, run_id):
-            return {"spec": {"thinking": False}}
+            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
 
         def deployments(self):
             # the newest attempt failed; step-3 was verified by an earlier, successful one.
@@ -531,7 +555,7 @@ def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
-    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir), "--no-upload"]) == 0
+    assert cli.main(["env", "eval", "flash-1/step-3", "--no-upload"]) == 0
     # forwarded as written: the ledger the server resolves it against is not readable from here.
     assert client.targets == ["flash-1/step-3"]
 
@@ -547,14 +571,14 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
     generation failures this check exists to avoid. Exempting every terminal state for a pinned step
     let `revocation_failed` through (Cursor).
     """
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     class Client:
         def __init__(self):
             self.targets = []
 
         def get_run(self, run_id):
-            return {"spec": {"thinking": False}}
+            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
 
         def deployments(self):
             return [{"run_id": "flash-1", "deployment": {"state": "revocation_failed"}}]
@@ -570,7 +594,7 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
-    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir)]) == 1
+    assert cli.main(["env", "eval", "flash-1/step-3"]) == 1
     captured = capsys.readouterr()
     assert "deployment is revocation_failed" in captured.err
     # one failure up front, not one per case: no generation was attempted.
@@ -588,10 +612,10 @@ def test_env_eval_never_pins_the_revision_a_rollout_is_heading_to(
     body omits it) -- so the run id is forwarded and the chat route resolves it, exactly as
     `flash chat RUN` does through the same predecessor.
     """
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     incoming = "flash-1@final." + "b" * 40
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.targets = []
 
@@ -615,7 +639,7 @@ def test_env_eval_never_pins_the_revision_a_rollout_is_heading_to(
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 0
     # the run id is forwarded untouched: the incoming revision must never be substituted for it,
     # in generation or in the uploaded report.
     assert client.targets == ["flash-1"]
@@ -624,7 +648,7 @@ def test_env_eval_never_pins_the_revision_a_rollout_is_heading_to(
 
 
 def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys) -> None:
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -637,7 +661,7 @@ def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys
     )
     second_started = threading.Event()
 
-    class Client(_ConcurrentClient):
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             prompt = messages[0]["content"]
             if prompt == "first":
@@ -649,12 +673,7 @@ def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert (
-        cli.main(
-            ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--concurrency", "2", "--no-upload"]
-        )
-        == 0
-    )
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "2", "--no-upload"]) == 0
 
     output = capsys.readouterr().out
     assert output.index("case first: PASS") < output.index("case second: PASS")
@@ -673,7 +692,7 @@ def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
     # shorthand whose live deployment is at that same step is pinned to the revision before
     # generation -- so the case under test is the one the CLI deliberately forwards unpinned:
     # asked for step-3 while step-20 is deployed, the server resolves it against its ledger.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -688,7 +707,7 @@ def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
 
     class Client:
         def get_run(self, run_id):
-            return {"spec": {"thinking": False}}
+            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
 
         def deployments(self):
             # step-20 is live, so the requested step-3 shorthand is NOT pinned to a revision and
@@ -716,12 +735,7 @@ def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert (
-        cli.main(
-            ["env", "eval", "flash-1/step-3", str(env_dir), "--concurrency", "4", "--no-upload"]
-        )
-        == 0
-    )
+    assert cli.main(["env", "eval", "flash-1/step-3", "--concurrency", "4", "--no-upload"]) == 0
 
     # exactly one warm-up, and it precedes every chat -- a per-worker check would interleave.
     assert events == ["warm:flash-1/step-3"] + ["chat"] * 6
@@ -738,7 +752,7 @@ def test_env_eval_fails_the_target_when_the_capability_prewarm_fails(
     that names the real cause (chatgpt-codex-connector). So assert the cascade is gone: nothing
     is generated, and the cause is stated once at target level.
     """
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -755,7 +769,7 @@ def test_env_eval_fails_the_target_when_the_capability_prewarm_fails(
 
     class Client:
         def get_run(self, run_id):
-            return {"spec": {"thinking": False}}
+            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
 
         def deployments(self):
             # step-20 is live, so the requested step-3 keeps its selector into the fan-out.
@@ -792,12 +806,7 @@ def test_env_eval_fails_the_target_when_the_capability_prewarm_fails(
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert (
-        cli.main(
-            ["env", "eval", "flash-1/step-3", str(env_dir), "--concurrency", "4", "--no-upload"]
-        )
-        == 1
-    )
+    assert cli.main(["env", "eval", "flash-1/step-3", "--concurrency", "4", "--no-upload"]) == 1
 
     # settled once and never retried per worker, and no case bought a generation behind it.
     assert calls == {"warm": 1, "chat": 0}
@@ -817,9 +826,72 @@ def test_env_eval_rejects_invalid_target_before_loading(monkeypatch, capsys) -> 
     assert "invalid evaluation target" in capsys.readouterr().err
 
 
-def _upload_env_dir(tmp_path: Path, *, dead_case: bool = False) -> Path:
-    """An env whose suite has one passing case, optionally plus one that never generates."""
+def test_env_eval_rejects_a_local_directory_positional(tmp_path, capsys) -> None:
+    """The evaluated run now supplies the environment, so a second positional is a usage error."""
     env_dir = _environment_dir(tmp_path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)])
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr().err
+    assert "unrecognized arguments" in captured
+    assert str(env_dir) in captured
+
+
+def test_env_eval_no_upload_still_requires_a_published_environment(monkeypatch, capsys) -> None:
+    """Opting out of recording does not invent the environment whose suites should be graded."""
+
+    class Client:
+        def __init__(self):
+            self.generated = 0
+
+        def get_run(self, run_id):
+            return {"spec": {"thinking": False, "project": _PROJECT_ID}}
+
+        def chat_stream(self, target, messages, **kwargs):
+            self.generated += 1
+            yield "4"
+
+    client = Client()
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
+    assert client.generated == 0
+    assert uploader.calls == []
+    assert "trains on no published environment" in capsys.readouterr().err
+
+
+def test_env_eval_refuses_a_published_environment_without_a_sidecar(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A published environment must carry the held-out suites that define its evaluation."""
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            raise AssertionError("a missing sidecar must fail before generation")
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
+    assert (
+        "no evaluations.py sidecar found beside the environment entrypoint"
+        in capsys.readouterr().err
+    )
+
+
+def _upload_env_dir(
+    tmp_path: Path,
+    *,
+    monkeypatch: pytest.MonkeyPatch | None = None,
+    dead_case: bool = False,
+) -> Path:
+    """An env whose suite has one passing case, optionally plus one that never generates."""
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     extra = "        EvalCase(id='dead', input='dead', expected='dead'),\n" if dead_case else ""
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
@@ -854,51 +926,45 @@ def _patch_upload(monkeypatch, uploader) -> None:
     )
 
 
-def test_env_eval_records_the_exact_entrypoint_it_graded(monkeypatch, tmp_path) -> None:
-    """Two environments in one package must not upload the same provenance.
+def test_env_eval_records_the_published_environment_it_graded(monkeypatch, tmp_path) -> None:
+    """Two published environments must not upload the same provenance.
 
-    Recording only the parent directory made `/env/easy.py` and `/env/hard.py` indistinguishable in
-    the dashboard, even though a different environment supplied the scorer for each -- and the
-    directory alone cannot be resolved back to either module.
+    The report identifies the published environment that supplied the scorer. Distinct slugs must
+    stay distinct even when both resolve onto local test fixtures, or the dashboard would merge two
+    different measurements under one environment.
     """
-    env_dir = tmp_path / "environment"
-    env_dir.mkdir()
-    (env_dir / "easy.py").write_text("def load_environment(**k):\n    return None\n")
-    (env_dir / "hard.py").write_text("def load_environment(**k):\n    return None\n")
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'math'\n"
-        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
 
-    class Client:
+    class Client(_EvalClient):
+        def __init__(self, slug):
+            self.slug = slug
+
+        def get_run(self, run_id):
+            return {
+                "spec": {
+                    "thinking": False,
+                    "project": _PROJECT_ID,
+                    "environment": {"id": self.slug},
+                }
+            }
+
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
     uploader = _RecordingUpload()
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    for module in ("easy.py", "hard.py"):
-        assert (
-            cli.main(
-                [
-                    "env",
-                    "eval",
-                    _EXPLICIT_TARGET,
-                    str(env_dir / module),
-                    "--project",
-                    _PROJECT_ID,
-                ]
-            )
-            == 0
-        )
+    slugs = ["acme/easy", "acme/hard"]
+    for slug in slugs:
+        root = tmp_path / slug.rsplit("/", 1)[-1]
+        root.mkdir()
+        env_dir = _upload_env_dir(root)
+        _patch_published_env(monkeypatch, env_dir)
+        monkeypatch.setattr("flash.client.client_from_config", lambda slug=slug: Client(slug))
 
-    references = [call["environment_reference"] for call in uploader.calls]
-    assert references == [str(env_dir / "easy.py"), str(env_dir / "hard.py")]
+        assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 0
+
+    assert [call["environment_reference"] for call in uploader.calls] == slugs
 
 
 def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
@@ -910,11 +976,11 @@ def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
     either, there is no correct place to file a permanent result -- and picking a first, sole, or
     example project would file it somewhere the user never chose. Refuse before any paid work, and
     name both ways out."""
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     class Client:
         def get_run(self, run_id):
-            return {"spec": {"thinking": False}}
+            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
 
         def warm_chat_step_selector(self, target):
             return None
@@ -928,7 +994,7 @@ def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET]) == 1
     captured = capsys.readouterr().err
     assert "its project is unknown" in captured
     assert "--project" in captured
@@ -946,9 +1012,9 @@ def test_env_eval_upload_rejects_a_non_uuid_project_before_paying(
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
     )
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--project", "proj-9"]) == 1
+    assert cli.main(["env", "eval", "flash-1", "--project", "proj-9"]) == 1
     captured = capsys.readouterr().err
     assert "--project must be a valid PROJECT_ID" in captured
     assert "valid UUID" in captured
@@ -977,9 +1043,9 @@ def test_env_eval_upload_rejects_an_inaccessible_project_before_paying(
         raise ApiError(status, "denied")
 
     monkeypatch.setattr("flash.client.get_project", _denied, raising=False)
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--project", _PROJECT_ID]) == 1
+    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 1
     captured = capsys.readouterr().err
     assert "--project must be a valid PROJECT_ID" in captured
     assert "is not accessible" in captured
@@ -999,32 +1065,37 @@ def test_env_eval_upload_requires_credentials_before_paying(monkeypatch, tmp_pat
         ),
         raising=False,
     )
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--project", _PROJECT_ID]) == 1
+    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 1
     assert "not logged in" in capsys.readouterr().err
 
 
-def test_env_eval_project_with_no_upload_is_rejected(monkeypatch, tmp_path, capsys) -> None:
+def test_env_eval_project_with_no_upload_is_rejected(monkeypatch, capsys) -> None:
     """Naming a project while opting out of recording asks for two contradictory things."""
     monkeypatch.setattr(
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
     )
-    env_dir = _upload_env_dir(tmp_path)
 
-    args = ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID, "--no-upload"]
+    args = ["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID, "--no-upload"]
     assert cli.main(args) == 1
     assert "--project cannot be combined with --no-upload" in capsys.readouterr().err
 
 
 def test_env_eval_no_upload_never_records_anything(monkeypatch, tmp_path) -> None:
     """`--no-upload` is the only way to score without leaving a record."""
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     class Client:
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "project": _PROJECT_ID}}
+            return {
+                "spec": {
+                    "thinking": False,
+                    "project": _PROJECT_ID,
+                    "environment": {"id": _PUBLISHED_SLUG},
+                }
+            }
 
         def warm_chat_step_selector(self, target):
             return None
@@ -1037,7 +1108,7 @@ def test_env_eval_no_upload_never_records_anything(monkeypatch, tmp_path) -> Non
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
     # opting out is explicit and total: not even a run the spec could file goes anywhere.
     assert uploader.calls == []
 
@@ -1047,11 +1118,17 @@ def test_env_eval_records_under_the_evaluated_runs_own_project(monkeypatch, tmp_
 
     Not a chosen project and not a fallback: an evaluation of `flash-1` belongs to whatever project
     `flash-1` belongs to, which its own spec already names."""
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     class Client:
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "project": _PROJECT_ID}}
+            return {
+                "spec": {
+                    "thinking": False,
+                    "project": _PROJECT_ID,
+                    "environment": {"id": _PUBLISHED_SLUG},
+                }
+            }
 
         def warm_chat_step_selector(self, target):
             return None
@@ -1064,18 +1141,24 @@ def test_env_eval_records_under_the_evaluated_runs_own_project(monkeypatch, tmp_
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET]) == 0
     assert [call["project_id"] for call in uploader.calls] == [_PROJECT_ID]
 
 
 def test_env_eval_project_flag_overrides_the_runs_own_project(monkeypatch, tmp_path) -> None:
     """An explicit `--project` files the results somewhere else on purpose."""
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     other = "22222222-2222-2222-2222-222222222222"
 
     class Client:
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "project": _PROJECT_ID}}
+            return {
+                "spec": {
+                    "thinking": False,
+                    "project": _PROJECT_ID,
+                    "environment": {"id": _PUBLISHED_SLUG},
+                }
+            }
 
         def warm_chat_step_selector(self, target):
             return None
@@ -1088,7 +1171,7 @@ def test_env_eval_project_flag_overrides_the_runs_own_project(monkeypatch, tmp_p
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", other]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", other]) == 0
     assert [call["project_id"] for call in uploader.calls] == [other]
 
 
@@ -1106,7 +1189,7 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
     """
     from flash.envs.loader import managed_slug_to_github_ref
 
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     expected = "acme/starter"
     # built by the library rather than hand-written, so the fixture cannot drift from the ref format
     # the loader actually parses.
@@ -1133,19 +1216,12 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET]) == 0
     assert [call["environment_reference"] for call in uploader.calls] == [expected]
 
 
-def test_env_eval_records_the_entrypoint_when_the_run_names_no_environment(
-    monkeypatch, tmp_path
-) -> None:
-    """With no hub environment to name, the report still says where it was scored from.
-
-    Dropping the provenance entirely would leave a permanent result that cannot be traced to
-    anything at all, which is strictly worse than a path.
-    """
-    env_dir = _upload_env_dir(tmp_path)
+def test_env_eval_refuses_a_run_that_names_no_published_environment(monkeypatch, capsys) -> None:
+    """An evaluation with nothing published to name is refused rather than recorded against a path."""
 
     class Client:
         def get_run(self, run_id):
@@ -1155,22 +1231,21 @@ def test_env_eval_records_the_entrypoint_when_the_run_names_no_environment(
             return None
 
         def chat_stream(self, target, messages, **kwargs):
-            yield "4"
+            raise AssertionError("a run without a published environment must not be graded")
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir)]) == 0
-    references = [call["environment_reference"] for call in uploader.calls]
-    assert references == [str((env_dir / "environment.py").resolve())]
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET]) == 1
+    assert uploader.calls == []
+    assert "trains on no published environment" in capsys.readouterr().err
 
 
 def test_env_eval_upload_sends_every_case_with_the_project_id(monkeypatch, tmp_path) -> None:
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
@@ -1179,7 +1254,7 @@ def test_env_eval_upload_sends_every_case_with_the_project_id(monkeypatch, tmp_p
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 0
 
     assert len(uploader.calls) == 1
     call = uploader.calls[0]
@@ -1210,8 +1285,9 @@ def test_env_eval_upload_keeps_duplicate_id_cases_distinct(monkeypatch, tmp_path
         "    ]\n"
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
+    _patch_published_env(monkeypatch, env_dir)
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             # answer each prompt correctly, so a dropped case cannot hide behind a failure
             yield "6" if "3+3" in str(messages) else "4"
@@ -1227,7 +1303,6 @@ def test_env_eval_upload_keeps_duplicate_id_cases_distinct(monkeypatch, tmp_path
                 "env",
                 "eval",
                 _EXPLICIT_TARGET,
-                str(env_dir),
                 "--project",
                 _PROJECT_ID,
             ]
@@ -1243,9 +1318,9 @@ def test_env_eval_upload_keeps_duplicate_id_cases_distinct(monkeypatch, tmp_path
 
 
 def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path) -> None:
-    env_dir = _upload_env_dir(tmp_path, dead_case=True)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch, dead_case=True)
 
-    class PartialClient:
+    class PartialClient(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             if messages[0]["content"] == "dead":
                 raise ConnectionError("connection reset")
@@ -1257,7 +1332,7 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
     _patch_upload(monkeypatch, uploader)
 
     # the suite fails overall because one case never generated...
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 1
 
     # ...but both cases are still uploaded, and the failure carries its error rather than
     # arriving as a silent zero the server would average in as real model behaviour.
@@ -1276,9 +1351,9 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
 def test_env_eval_upload_records_a_clean_suite_as_completed(monkeypatch, tmp_path) -> None:
     # the mirror of the case above: deriving status from report.errors must not relabel a suite
     # that graded every case, which is the state the dashboard reads as a real measurement.
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
@@ -1287,7 +1362,7 @@ def test_env_eval_upload_records_a_clean_suite_as_completed(monkeypatch, tmp_pat
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 0
 
     assert uploader.calls[0]["status"] == "completed"
     assert uploader.calls[0]["error"] is None
@@ -1296,7 +1371,7 @@ def test_env_eval_upload_records_a_clean_suite_as_completed(monkeypatch, tmp_pat
 def test_env_eval_upload_records_suites_that_cannot_load_cases(monkeypatch, tmp_path) -> None:
     # a failed or empty cases() result is the suite verdict, so omitting it from the record leaves
     # the dashboard with a partial run that hides the exact failure responsible for the cli exit.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite\n"
         "class BrokenSuite(BaseEvalSuite):\n"
@@ -1308,7 +1383,7 @@ def test_env_eval_upload_records_suites_that_cannot_load_cases(monkeypatch, tmp_
         "def load_evaluations(environment=None): return [BrokenSuite(), EmptySuite()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError("case loading failures must not generate")
 
@@ -1317,7 +1392,7 @@ def test_env_eval_upload_records_suites_that_cannot_load_cases(monkeypatch, tmp_
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 1
 
     assert [(call["suite_name"], call["status"]) for call in uploader.calls] == [
         ("broken", "failed"),
@@ -1341,9 +1416,9 @@ def test_env_eval_rejects_a_malformed_project_before_generating(
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
     )
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", "not-a-uuid"]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", "not-a-uuid"]) == 1
     assert "must be a valid UUID" in capsys.readouterr().err
 
 
@@ -1353,7 +1428,7 @@ def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
     # results carry the disambiguated id (`same#2`), so a payload keyed on the raw `case.id`
     # both drops the second case and hands the first result the *second* case's input and
     # expected value. that uploads a graded case describing a question it never answered.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -1365,7 +1440,7 @@ def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield messages[0]["content"]
 
@@ -1374,7 +1449,7 @@ def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 0
 
     cases = {case["case_id"]: case for case in uploader.calls[0]["cases"]}
     assert set(cases) == {"same", "same#2"}
@@ -1387,9 +1462,9 @@ def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
 def test_env_eval_upload_failure_does_not_relabel_a_passing_suite(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
@@ -1404,7 +1479,7 @@ def test_env_eval_upload_failure_does_not_relabel_a_passing_suite(
 
     # the suite genuinely passed; a failed upload is reported but must not turn it into a
     # FAIL, which would read as the model having gotten the answer wrong.
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 0
     captured = capsys.readouterr()
     assert "upload failed" in captured.err
     assert "overall: PASS" in captured.out
@@ -1420,9 +1495,9 @@ def test_env_eval_upload_reports_a_key_lost_after_the_suite_ran(
     a rewritten config, a cleared env var. That is a genuine after-the-fact failure like any
     network fault, so it must not relabel a suite that actually passed as failing.
     """
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
@@ -1441,14 +1516,14 @@ def test_env_eval_upload_reports_a_key_lost_after_the_suite_ran(
     )
     monkeypatch.setattr("flash.client.config.load_credentials", _load_credentials)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 0
     assert "not logged in" in capsys.readouterr().err
     # no key means no request was attempted at all.
     assert uploader.calls == []
 
 
 def test_env_eval_blank_stream_errors_without_scoring(monkeypatch, tmp_path, capsys) -> None:
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -1458,14 +1533,14 @@ def test_env_eval_blank_stream_errors_without_scoring(monkeypatch, tmp_path, cap
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class BlankClient:
+    class BlankClient(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield "   "
 
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", BlankClient)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
 
     captured = capsys.readouterr()
     assert "case one: FAIL score=0.000000" in captured.out
@@ -1489,7 +1564,7 @@ def test_base_eval_suite_can_match_a_falsy_expected_answer() -> None:
 def test_env_eval_scoring_that_exits_fails_only_its_own_case(monkeypatch, tmp_path, capsys) -> None:
     # sys.exit() inside score() raises SystemExit, which is not an Exception. Catching only
     # Exception would abort the run and discard every case already graded.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "import sys\n"
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
@@ -1505,14 +1580,14 @@ def test_env_eval_scoring_that_exits_fails_only_its_own_case(monkeypatch, tmp_pa
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield messages[0]["content"]
 
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
 
     captured = capsys.readouterr()
     # the case that exited is recorded as a scoring error...
@@ -1526,7 +1601,7 @@ def test_env_eval_scoring_that_exits_fails_only_its_own_case(monkeypatch, tmp_pa
 def test_env_eval_serializes_scoring_across_worker_threads(monkeypatch, tmp_path, capsys) -> None:
     # a suite is one user object shared by every worker. a scorer holding mutable state that
     # is raced produces silently wrong scores, which is worse than scoring serially.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     witness = tmp_path / "max_inside.txt"
     # the sidecar records the peak overlap to a file: the suite object that actually ran
     # lives inside the command, and reloading the module would build a fresh one.
@@ -1554,7 +1629,7 @@ def test_env_eval_serializes_scoring_across_worker_threads(monkeypatch, tmp_path
 
     generating = threading.Barrier(6, timeout=5)
 
-    class Client(_ConcurrentClient):
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             # force all six generations to be genuinely in flight together, so any
             # unserialized scoring really would overlap.
@@ -1564,12 +1639,7 @@ def test_env_eval_serializes_scoring_across_worker_threads(monkeypatch, tmp_path
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert (
-        cli.main(
-            ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--concurrency", "6", "--no-upload"]
-        )
-        == 0
-    )
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "6", "--no-upload"]) == 0
 
     # never more than one scorer in flight, despite six concurrent generations.
     assert witness.read_text() == "1"
@@ -1579,7 +1649,7 @@ def test_env_eval_serializes_scoring_across_worker_threads(monkeypatch, tmp_path
 def test_env_eval_empty_suite_is_not_a_pass(monkeypatch, tmp_path, capsys) -> None:
     # 0/0 graded is not a green suite. reporting PASS here hides a sidecar whose cases()
     # silently returned nothing.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite\n"
         "class Suite(BaseEvalSuite):\n"
@@ -1588,14 +1658,14 @@ def test_env_eval_empty_suite_is_not_a_pass(monkeypatch, tmp_path, capsys) -> No
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError("no cases means no generation")
 
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
 
     captured = capsys.readouterr()
     assert "suite empty has no cases to run" in captured.err
@@ -1606,7 +1676,7 @@ def test_env_eval_empty_suite_is_not_a_pass(monkeypatch, tmp_path, capsys) -> No
 def test_env_eval_disambiguates_duplicate_case_ids(monkeypatch, tmp_path, capsys) -> None:
     # two cases sharing an id would collide in the report and in the uploaded payload,
     # showing one graded case where two ran.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -1618,14 +1688,14 @@ def test_env_eval_disambiguates_duplicate_case_ids(monkeypatch, tmp_path, capsys
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield messages[0]["content"]
 
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
 
     output = capsys.readouterr().out
     assert "case same: PASS" in output
@@ -1636,12 +1706,13 @@ def test_env_eval_disambiguates_duplicate_case_ids(monkeypatch, tmp_path, capsys
 def test_env_eval_debug_surfaces_the_load_traceback(monkeypatch, tmp_path) -> None:
     # a broken sidecar is a bug, and --debug asked for its traceback. swallowing it into a
     # one-line message leaves nothing to debug with.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text("raise RuntimeError('sidecar exploded')\n")
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", _EvalClient)
 
     with pytest.raises(RuntimeError, match="sidecar exploded"):
-        cli.main(["--debug", "env", "eval", _EXPLICIT_TARGET, str(env_dir)])
+        cli.main(["--debug", "env", "eval", _EXPLICIT_TARGET, "--no-upload"])
 
 
 def test_evaluation_sidecar_can_import_helpers_lazily(tmp_path) -> None:
@@ -1916,7 +1987,7 @@ def test_env_eval_forwards_split_and_params_to_the_environment(monkeypatch, tmp_
     # an env whose load_environment() REQUIRES a setting could not be evaluated at all, and one
     # that merely defaults built a differently-configured scorer than the run trains on, with no
     # --param/--split path to correct it (codex[bot]).
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     loaded: list[dict] = []
 
     def _load(path, *args, **kwargs):
@@ -1926,7 +1997,7 @@ def test_env_eval_forwards_split_and_params_to_the_environment(monkeypatch, tmp_
         loaded.append(kwargs)
         return object()
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
@@ -1939,7 +2010,6 @@ def test_env_eval_forwards_split_and_params_to_the_environment(monkeypatch, tmp_
                 "env",
                 "eval",
                 _EXPLICIT_TARGET,
-                str(env_dir),
                 "--param",
                 "difficulty=3",
                 "--split",
@@ -1967,10 +2037,10 @@ def test_env_eval_is_an_org_binding_command(monkeypatch, tmp_path, capsys) -> No
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
     )
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     # the warning lands even on the run that fails its preflight: it precedes every request.
-    cli.main(["env", "eval", "flash-1", str(env_dir), "--project", "proj-9"])
+    cli.main(["env", "eval", "flash-1", "--project", "proj-9"])
     assert "key belongs to other-org" in capsys.readouterr().err
 
 
@@ -1979,7 +2049,7 @@ def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_pat
     # ThreadPoolExecutor(...)` the implicit shutdown(wait=True) joined every in-flight request
     # first, and a chat_stream call may block for up to 30 minutes -- so an aborted eval looked
     # hung for that long (codex[bot]).
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -1993,7 +2063,7 @@ def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_pat
     release_slow_case = threading.Event()
     slow_case_started = threading.Event()
 
-    class Client(_ConcurrentClient):
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             if messages[0]["content"] == "blocks":
                 # stands in for a generation still streaming when the user aborts.
@@ -2012,10 +2082,7 @@ def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_pat
     def _abort() -> None:
         # 130 is the CLI's own KeyboardInterrupt exit code.
         assert (
-            cli.main(
-                ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--concurrency", "2", "--no-upload"]
-            )
-            == 130
+            cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "2", "--no-upload"]) == 130
         )
         returned.set()
 
@@ -2098,7 +2165,7 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
     # the suite was loaded -- a sqlite connection, a tokenizer bound to its creating thread --
     # failed every case from a worker even though nothing was concurrent (codex[bot]). only
     # generation is parallel; score() always runs on the thread that ran the command.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     witness = tmp_path / "scoring_threads.txt"
     (env_dir / "evaluations.py").write_text(
         "import threading\n"
@@ -2120,7 +2187,7 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
     generating = threading.Barrier(6, timeout=5)
     generation_threads: set[str] = set()
 
-    class Client(_ConcurrentClient):
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             # all six really are in flight together, so generation is genuinely concurrent and
             # the assertion below is about where scoring runs, not about a serial fallback.
@@ -2131,12 +2198,7 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert (
-        cli.main(
-            ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--concurrency", "6", "--no-upload"]
-        )
-        == 0
-    )
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "6", "--no-upload"]) == 0
 
     scored_on = witness.read_text().split()
     assert len(scored_on) == 6
@@ -2177,7 +2239,7 @@ def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, cap
     # skipping the upload for a suite that never graded a case left the dashboard showing the
     # earlier suites as a completed run with the failing suite simply absent -- a green-looking
     # evaluation whose CLI exit code was 1 (codex[bot]).
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Good(BaseEvalSuite):\n"
@@ -2189,7 +2251,7 @@ def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, cap
         "def load_evaluations(environment=None): return [Good(), Broken()]\n"
     )
 
-    class Client(_ConcurrentClient):
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
@@ -2204,7 +2266,6 @@ def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, cap
                 "env",
                 "eval",
                 _EXPLICIT_TARGET,
-                str(env_dir),
                 "--project",
                 _PROJECT_ID,
             ]
@@ -2226,7 +2287,7 @@ def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -
     # generation completes out of order under --concurrency. pairing results with case ids by
     # completion order rather than submission index would hand each result another case's id,
     # mislabelling every graded case in the report and the upload.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
         "class Suite(BaseEvalSuite):\n"
@@ -2239,7 +2300,7 @@ def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class SlowFirstClient(_ConcurrentClient):
+    class SlowFirstClient(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             content = messages[0]["content"]
             # case 0 finishes last, so completion order is the reverse of submission order.
@@ -2249,12 +2310,7 @@ def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", SlowFirstClient)
 
-    assert (
-        cli.main(
-            ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--concurrency", "6", "--no-upload"]
-        )
-        == 0
-    )
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "6", "--no-upload"]) == 0
 
 
 @pytest.mark.parametrize("bad", ["nan", "inf", "Infinity", "1e999"])
@@ -2263,9 +2319,9 @@ def test_env_eval_rejects_a_non_finite_temperature_before_paying(monkeypatch, tm
     # spent a request the serving route rejects for being non-finite -- one bad flag turned into
     # one doomed paid request per case, the whole evaluation billed and nothing graded
     # (codex[bot]). the environment loads fine here: reaching generation at all is the defect.
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError(f"paid request issued with temperature={kwargs['temperature']}")
             yield ""  # pragma: no cover - generator protocol only
@@ -2274,7 +2330,7 @@ def test_env_eval_rejects_a_non_finite_temperature_before_paying(monkeypatch, tm
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--temperature", bad])
+        cli.main(["env", "eval", "flash-1", "--temperature", bad])
 
     # argparse's own usage error, which is exit 2 rather than the CLI's 1
     assert excinfo.value.code == 2
@@ -2286,9 +2342,9 @@ def test_env_eval_rejects_a_negative_temperature_before_paying(monkeypatch, tmp_
     # spent a request the OpenAI sampling contract rejects -- one bad flag recorded as one
     # generation failure per case rather than one usage error (codex[bot]). training already
     # enforces this floor on its own temperature (`flash/schema/__init__.py`, `minimum=0.0`).
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError(f"paid request issued with temperature={kwargs['temperature']}")
             yield ""  # pragma: no cover - generator protocol only
@@ -2297,7 +2353,7 @@ def test_env_eval_rejects_a_negative_temperature_before_paying(monkeypatch, tmp_
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["env", "eval", "flash-1", str(env_dir), "--temperature", bad])
+        cli.main(["env", "eval", "flash-1", "--temperature", bad])
 
     # argparse's own usage error, which is exit 2 rather than the CLI's 1
     assert excinfo.value.code == 2
@@ -2305,10 +2361,10 @@ def test_env_eval_rejects_a_negative_temperature_before_paying(monkeypatch, tmp_
 
 def test_env_eval_still_accepts_an_ordinary_temperature(monkeypatch, tmp_path) -> None:
     # the control: rejecting non-finite values must not narrow the flag's real range.
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     seen: list[float] = []
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             seen.append(kwargs["temperature"])
             yield "4"
@@ -2316,12 +2372,7 @@ def test_env_eval_still_accepts_an_ordinary_temperature(monkeypatch, tmp_path) -
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert (
-        cli.main(
-            ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--temperature", "0.7", "--no-upload"]
-        )
-        == 0
-    )
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--temperature", "0.7", "--no-upload"]) == 0
     assert seen == [0.7]
 
 
@@ -2344,7 +2395,7 @@ def test_env_eval_rejects_non_finite_temperature(monkeypatch, capsys) -> None:
 def test_env_eval_uploads_each_suite_with_its_own_start_time(monkeypatch, tmp_path) -> None:
     # every suite uploads as its own run. sharing one timestamp backdates each later run to
     # before the earlier suites ran and inflates its dashboard duration with their work.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class First(BaseEvalSuite):\n"
@@ -2356,7 +2407,7 @@ def test_env_eval_uploads_each_suite_with_its_own_start_time(monkeypatch, tmp_pa
         "def load_evaluations(environment=None): return [First(), Second()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             time.sleep(0.01)
             yield messages[0]["content"]
@@ -2366,7 +2417,7 @@ def test_env_eval_uploads_each_suite_with_its_own_start_time(monkeypatch, tmp_pa
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 0
 
     starts = [call["started_at"] for call in uploader.calls]
     assert len(starts) == 2
@@ -2379,9 +2430,9 @@ def test_env_eval_reports_upload_timeout_without_a_traceback(monkeypatch, tmp_pa
     # the upload handler after the whole paid evaluation ran, replacing the promised nonfatal
     # message and final verdict with a traceback. the real upload path runs here, so the socket
     # is what fails -- patching upload_eval_run itself would skip the translation being tested.
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
@@ -2398,7 +2449,7 @@ def test_env_eval_reports_upload_timeout_without_a_traceback(monkeypatch, tmp_pa
     )
     monkeypatch.setattr("urllib.request.urlopen", _timeout)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 0
 
     captured = capsys.readouterr()
     assert "upload failed" in captured.err
@@ -2477,7 +2528,7 @@ def test_env_eval_pins_a_run_serving_a_step_checkpoint(monkeypatch, tmp_path, ca
     so a run deployed at `RUN/step-40` came back as absent and `flash env eval RUN` refused to run
     against a model `flash chat RUN` answers from.
     """
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -2487,7 +2538,7 @@ def test_env_eval_pins_a_run_serving_a_step_checkpoint(monkeypatch, tmp_path, ca
     )
     revision = "flash-1@step-40." + "b" * 40
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.targets = []
 
@@ -2515,7 +2566,7 @@ def test_env_eval_pins_a_run_serving_a_step_checkpoint(monkeypatch, tmp_path, ca
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
-    assert cli.main(["env", "eval", "flash-1", str(env_dir), "--no-upload"]) == 0
+    assert cli.main(["env", "eval", "flash-1", "--no-upload"]) == 0
 
     assert client.targets == [revision]
     assert f"resolved evaluation target flash-1 to {revision}" in capsys.readouterr().out
@@ -2531,11 +2582,11 @@ def test_env_eval_pins_a_step_shorthand_to_its_immutable_revision(
     the shorthand therefore graded weights the report could not name, and a later rebuild of the
     same step read as the same measurement (codex[bot]).
     """
-    env_dir = _upload_env_dir(tmp_path)
+    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     shorthand = "flash-1/step-3"
     revision = "flash-1@step-3." + "a" * 40
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.targets = []
 
@@ -2561,7 +2612,7 @@ def test_env_eval_pins_a_step_shorthand_to_its_immutable_revision(
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", shorthand, str(env_dir), "--project", _PROJECT_ID]) == 0
+    assert cli.main(["env", "eval", shorthand, "--project", _PROJECT_ID]) == 0
 
     # both halves matter: generation must reach the immutable weights, and the uploaded report
     # must name them, or the dashboard records a step whose contents can change underneath it.
@@ -2581,7 +2632,7 @@ def test_env_eval_keeps_a_step_shorthand_the_live_deployment_has_moved_past(
     here, so anything else stays the shorthand for the server to resolve -- refusing would fail an
     evaluation that runs correctly, and the server answers a genuinely ambiguous step with a 409.
     """
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -2590,7 +2641,7 @@ def test_env_eval_keeps_a_step_shorthand_the_live_deployment_has_moved_past(
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.targets = []
 
@@ -2614,13 +2665,13 @@ def test_env_eval_keeps_a_step_shorthand_the_live_deployment_has_moved_past(
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
-    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir), "--no-upload"]) == 0
+    assert cli.main(["env", "eval", "flash-1/step-3", "--no-upload"]) == 0
 
     # the shorthand is forwarded untouched: the step-40 revision must never be substituted for it.
     assert client.targets == ["flash-1/step-3"]
 
 
-def test_env_eval_refuses_to_upload_a_step_it_cannot_name(monkeypatch, tmp_path, capsys) -> None:
+def test_env_eval_refuses_to_upload_a_step_it_cannot_name(monkeypatch, capsys) -> None:
     """An uploaded report must name the weights it graded, so an unpinnable step cannot upload.
 
     Evaluating it is right (the test above), but recording it is not: `RUN/step-N` is a shorthand
@@ -2629,16 +2680,8 @@ def test_env_eval_refuses_to_upload_a_step_it_cannot_name(monkeypatch, tmp_path,
     (chatgpt-codex-connector). Only the live revision is visible from here, so refuse before buying
     any generation rather than upload a result nobody can identify afterwards.
     """
-    env_dir = _environment_dir(tmp_path)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'math'\n"
-        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
 
-    class Client:
+    class Client(_EvalClient):
         def deployments(self):
             return [
                 {
@@ -2663,7 +2706,7 @@ def test_env_eval_refuses_to_upload_a_step_it_cannot_name(monkeypatch, tmp_path,
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
     monkeypatch.setattr("flash.client.get_project", lambda pid, api_key: {"id": pid}, raising=False)
 
-    args = ["env", "eval", "flash-1/step-3", str(env_dir), "--project", _PROJECT_ID]
+    args = ["env", "eval", "flash-1/step-3", "--project", _PROJECT_ID]
     assert cli.main(args) == 1
 
     # the refusal names both ways out, so it is actionable rather than a dead end.
@@ -2681,7 +2724,7 @@ def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> No
     only `case.input` grades the model on a prompt no run ever trains on, so the suite can fail for
     a missing system contract rather than for anything the model did.
     """
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -2699,7 +2742,7 @@ def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> No
 
     sent: list[list[dict]] = []
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             sent.append(messages)
             yield "ok"
@@ -2709,7 +2752,7 @@ def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> No
     )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
 
     assert sent == [
         [
@@ -2722,7 +2765,7 @@ def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> No
 def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, capsys) -> None:
     # prompt_messages is user code. a raise on one example must be that case's error, not a
     # crash that loses every case already graded.
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -2740,7 +2783,7 @@ def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, 
                 raise RuntimeError("no template for this row")
             return [{"role": "user", "content": example["input"]}]
 
-    class Client:
+    class Client(_EvalClient):
         def chat_stream(self, target, messages, **kwargs):
             yield messages[-1]["content"]
 
@@ -2749,7 +2792,7 @@ def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, 
     )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
 
     output = capsys.readouterr().out
     assert "case good: PASS" in output
@@ -2777,7 +2820,7 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
     dataset.mkdir(parents=True)
     image_module.new("RGB", (2, 2), (255, 0, 0)).save(dataset / "cat.png", format="PNG")
 
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -2810,7 +2853,7 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
 
     class Client:
         def get_run(self, run_id):
-            return {"spec": {}}
+            return {"spec": {"environment": {"id": _PUBLISHED_SLUG}}}
 
         def chat_stream(self, target, messages, **kwargs):
             sent.append(messages)
@@ -2821,7 +2864,7 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
     )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 0
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
 
     assert len(sent) == 2
     for messages in sent:
@@ -2942,7 +2985,7 @@ def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path
     def _suite(name: str, expected: str) -> Path:
         root = tmp_path / name
         root.mkdir()
-        env_dir = _environment_dir(root)
+        env_dir = _environment_dir(root, monkeypatch=monkeypatch)
         (env_dir / "evaluations.py").write_text(
             "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
             f"EXPECTED = {expected!r}\n"
@@ -2965,7 +3008,12 @@ def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path
             self._response = response
 
         def get_run(self, run_id):
-            return {"spec": {"thinking": self._thinking}}
+            return {
+                "spec": {
+                    "thinking": self._thinking,
+                    "environment": {"id": _PUBLISHED_SLUG},
+                }
+            }
 
         def chat_stream(self, target, messages, **kwargs):
             yield self._response
@@ -2977,19 +3025,15 @@ def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path
     monkeypatch.setattr(
         "flash.client.client_from_config", lambda: Client(True, "<think>2+2 is 4</think>4")
     )
-    assert (
-        cli.main(["env", "eval", _EXPLICIT_TARGET, str(_suite("thinking", "4")), "--no-upload"])
-        == 0
-    )
+    _suite("thinking", "4")
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
 
     # a non-thinking run answering *about* the tag: `strip_think` would cut at the bare mention and
     # leave "answer: ", so stripping here would fail a correct response.
     mention = "answer: <think> is a reasoning tag"
     monkeypatch.setattr("flash.client.client_from_config", lambda: Client(False, mention))
-    assert (
-        cli.main(["env", "eval", _EXPLICIT_TARGET, str(_suite("plain", mention)), "--no-upload"])
-        == 0
-    )
+    _suite("plain", mention)
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
 
     assert capsys.readouterr().out.count("case sum: PASS") == 2
 
@@ -3005,7 +3049,7 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
     """
     from flash.client import ClientError
 
-    env_dir = _environment_dir(tmp_path)
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
@@ -3031,7 +3075,7 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 1
     # it stops BEFORE generation: nothing is bought, and no false failure is filed.
     assert client.generated == 0
     assert uploader.calls == []
@@ -3041,30 +3085,23 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
 
 
 @pytest.mark.parametrize(
-    ("status", "retryable"),
-    [(503, True), (429, True), (500, True), (404, False), (403, False)],
+    ("status", "message"),
+    [
+        (503, "could not reach the control plane"),
+        (429, "could not reach the control plane"),
+        (500, "could not reach the control plane"),
+        (404, "could not read the target run flash-1"),
+        (403, "could not read the target run flash-1"),
+    ],
 )
-def test_env_eval_stops_on_a_thinking_lookup_fault_that_will_pass(
-    monkeypatch, tmp_path, capsys, status, retryable
-) -> None:
-    """A transient status must take the retryable path, not the "nothing to retry" one.
+def test_env_eval_refuses_on_run_spec_api_error(monkeypatch, capsys, status, message) -> None:
+    """Both API error classes stop grading, while their messages preserve retry guidance.
 
-    `ApiError` subclasses `ClientError`, so an `except ApiError` arm ahead of the retryable one
-    swallows 5xx and 429 too -- and an overloaded plane whose chat route still answers would then
-    grade the whole paid suite raw, which is the failure the retryable branch was added to stop.
-    A 4xx is different in kind: the plane answered about this run, retrying says the same thing,
-    so that one still warns and grades.
+    `ApiError` subclasses `ClientError`, so the ordering still matters: 5xx and 429 mean the plane
+    may recover, while a definitive 4xx answered about this run. Neither can proceed because the
+    unreadable spec is what names the published environment and its suites.
     """
     from flash.client import ApiError
-
-    env_dir = _environment_dir(tmp_path)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'reasoning'\n"
-        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
 
     class Client:
         def __init__(self):
@@ -3074,60 +3111,47 @@ def test_env_eval_stops_on_a_thinking_lookup_fault_that_will_pass(
             raise ApiError(status, f"plane returned {status}")
 
         def chat_stream(self, target, messages, **kwargs):
-            # chat still works: that is the whole point. the lookup being down is not evidence
-            # that generation is, so nothing stops the suite from being bought and mis-graded.
             self.generated += 1
             yield "<think>2 plus 2</think>4"
 
     client = Client()
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
-    exit_code = cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--project", _PROJECT_ID])
-    captured = capsys.readouterr()
-
-    if retryable:
-        assert exit_code == 1
-        # nothing bought and nothing filed: the suite is refused, not failed after paying for it.
-        assert client.generated == 0
-        assert uploader.calls == []
-        assert "could not reach the control plane" in captured.err
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 1
+    assert client.generated == 0
+    assert uploader.calls == []
+    captured = capsys.readouterr().err
+    assert message in captured
+    if status < 500 and status != 429:
+        assert "published environment is what supplies the suites to score" in captured
     else:
-        assert exit_code == 0
-        assert client.generated == 1
-        assert "could not read the target run flash-1" in captured.err
+        assert "retry once it is reachable" in captured
 
 
-def test_env_eval_grades_raw_when_the_run_spec_is_unreadable(monkeypatch, tmp_path, capsys) -> None:
-    """An unreadable run must not turn a working evaluation into a crash.
-
-    The lookup is a convenience over the plane, and every eval before it graded the raw response.
-    A client that cannot answer -- an old plane with no such route, a network fault -- keeps that
-    behavior and says so, rather than failing the command the user asked for.
-    """
-    env_dir = _environment_dir(tmp_path)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'reasoning'\n"
-        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
+def test_env_eval_refuses_when_the_run_spec_is_unreadable(monkeypatch, capsys) -> None:
+    """An unreadable spec cannot supply the published environment, so grading is refused."""
 
     class Client:
+        def __init__(self):
+            self.generated = 0
+
         def get_run(self, run_id):
             raise RuntimeError("run metadata is unavailable")
 
         def chat_stream(self, target, messages, **kwargs):
+            self.generated += 1
             yield "4"
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", Client)
+    client = Client()
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+    _patch_upload(monkeypatch, uploader)
 
-    assert cli.main(["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--no-upload"]) == 0
-
-    captured = capsys.readouterr()
-    assert "could not read the target run flash-1" in captured.err
-    assert "case sum: PASS" in captured.out
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
+    assert client.generated == 0
+    assert uploader.calls == []
+    captured = capsys.readouterr().err
+    assert "could not read the target run flash-1" in captured
+    assert "overall: FAIL" in captured
