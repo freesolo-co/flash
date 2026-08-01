@@ -2611,6 +2611,68 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
     assert "overall: FAIL" in captured.err
 
 
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [(503, True), (429, True), (500, True), (404, False), (403, False)],
+)
+def test_env_eval_stops_on_a_thinking_lookup_fault_that_will_pass(
+    monkeypatch, tmp_path, capsys, status, retryable
+) -> None:
+    """A transient status must take the retryable path, not the "nothing to retry" one.
+
+    `ApiError` subclasses `ClientError`, so an `except ApiError` arm ahead of the retryable one
+    swallows 5xx and 429 too -- and an overloaded plane whose chat route still answers would then
+    grade the whole paid suite raw, which is the failure the retryable branch was added to stop.
+    A 4xx is different in kind: the plane answered about this run, retrying says the same thing,
+    so that one still warns and grades.
+    """
+    from flash.client import ApiError
+
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'reasoning'\n"
+        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client:
+        def __init__(self):
+            self.generated = 0
+
+        def get_run(self, run_id):
+            raise ApiError(status, f"plane returned {status}")
+
+        def chat_stream(self, target, messages, **kwargs):
+            # chat still works: that is the whole point. the lookup being down is not evidence
+            # that generation is, so nothing stops the suite from being bought and mis-graded.
+            self.generated += 1
+            yield "<think>2 plus 2</think>4"
+
+    client = Client()
+    uploader = _RecordingUpload()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+    _patch_upload(monkeypatch, uploader)
+
+    exit_code = cli.main(
+        ["env", "eval", _EXPLICIT_TARGET, str(env_dir), "--upload", "--project", _PROJECT_ID]
+    )
+    captured = capsys.readouterr()
+
+    if retryable:
+        assert exit_code == 1
+        # nothing bought and nothing filed: the suite is refused, not failed after paying for it.
+        assert client.generated == 0
+        assert uploader.calls == []
+        assert "could not reach the control plane" in captured.err
+    else:
+        assert exit_code == 0
+        assert client.generated == 1
+        assert "could not read thinking mode for flash-1" in captured.err
+
+
 def test_env_eval_grades_raw_when_the_run_spec_is_unreadable(monkeypatch, tmp_path, capsys) -> None:
     """An unreadable run must not turn a working evaluation into a crash.
 
