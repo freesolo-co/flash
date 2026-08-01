@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.backend_common import parse_verl_metric
+from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.sft import _pretokenize_completion_only
 from flash.engine.worker.sft_train import (
     _LORAPLUS_READY_MARKER,
@@ -588,6 +588,29 @@ def test_zero_grad_norm_at_nonzero_lr_fails_the_run():
             "step:3 - train/loss:0.5 - train/grad_norm:0.0 - train/lr:0.0",
         ]
     )
+
+
+def test_step_gate_admits_a_line_a_tqdm_bar_was_flushed_in_front_of():
+    """VERL-134: the guard above never armed on the real run because on_line returned early.
+
+    on_line gates every metric read on ``verl_step_number(line)``, and verl's LocalLogger shares its
+    stream with tqdm, whose bar ends in "]" with no trailing newline. anchoring the left edge on
+    whitespace matched step 1 and missed steps 2-4, so ``flash-1785598982-21827245`` reported done
+    with train/grad_norm 0.0 on every step while the guard's counter sat at 1.
+
+    the guard test above replays its own loop, so it cannot see this: the defect is in the gate the
+    real on_line runs first, not in the counting.
+    """
+    # verbatim from the run log, tqdm prefix included.
+    glued = (
+        "Epoch 1/1:  25%|##        | 1/4 [01:21<04:04, 81.49s/it]"
+        "step:2 - train/loss:1.0206047296524048 - train/grad_norm:0.0 - train/lr:5e-05"
+    )
+
+    assert verl_step_number(glued) == 2, "on_line would return before ever reading grad_norm"
+    # and the metrics behind the gate are the ones the guard needs.
+    assert parse_verl_metric(glued, "train/grad_norm") == 0.0
+    assert parse_verl_metric(glued, "train/lr") == 5e-05
 
 
 def test_loraplus_shim_has_no_plain_lora_fallback():

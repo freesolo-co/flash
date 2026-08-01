@@ -16,6 +16,7 @@ from flash.engine.worker.backend_common import (
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
+    verl_step_number,
 )
 
 # a realistic verl step line: ray tags worker stdout with a pid prefix, and reduce_metrics returns
@@ -87,6 +88,35 @@ def test_non_step_lines_are_ignored():
         "step:not-a-number - critic/rewards/mean:0.5",
     ):
         assert parse_verl_step_metrics(line) is None
+
+
+def test_step_line_is_parsed_when_a_tqdm_bar_is_flushed_in_front_of_it():
+    # VERL-134. verl's LocalLogger shares its stream with tqdm, which ends a bar with "]" and no
+    # trailing newline, so the metric line arrives glued to it. anchoring the left edge on
+    # whitespace matched step 1 and missed every step after it: the sft heartbeat froze on step 1's
+    # metrics and the zero-grad guard never armed, so a run that trained nothing reported done.
+    line = (
+        "Epoch 1/1:  25%|##        | 1/4 [01:21<04:04, 81.49s/it]"
+        "step:2 - critic/rewards/mean:0.5 - actor/grad_norm:0.0"
+    )
+
+    assert parse_verl_step_metrics(line) == {"step": 2, "reward": 0.5, "grad_norm": 0.0}
+
+
+def test_step_key_does_not_match_a_longer_word_or_a_path():
+    # the left edge is widened to "not part of a longer word", not dropped: global_step: is a
+    # different counter and a checkpoint path ending in step: is not a metric line at all. asserted
+    # on both patterns because they share that edge -- the trainers gate on verl_step_number and the
+    # metrics row on parse_verl_step_metrics.
+    for line in (
+        "global_step:9 - critic/rewards/mean:0.5",
+        "/tmp/flash/checkpoints/step:9 - critic/rewards/mean:0.5",
+    ):
+        assert parse_verl_step_metrics(line) is None
+        assert verl_step_number(line) is None
+
+    # ray tags worker stdout with a pid prefix, so the edge must stay permissive enough for it.
+    assert verl_step_number("(TaskRunner pid=123) step:7 - actor/grad_norm:1.0") == 7
 
 
 def test_validation_only_record_yields_no_row():
