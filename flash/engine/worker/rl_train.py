@@ -57,6 +57,7 @@ from flash.engine.worker.backend_common import (
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    ray_num_cpus,
     reap_stragglers,
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
@@ -82,6 +83,7 @@ from flash.engine.worker.rollout_samples import (
     sanitize_rollout_text,
 )
 from flash.engine.worker.sft_train import (
+    _cached_model_path,
     _hydra_val,
     _materialize_verl_images,
     _multimodal_messages_with_images,
@@ -441,6 +443,10 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # is migrated in the main process but not visible to the RewardLoopWorker actor); emit both.
         f"reward.custom_reward_function.path={cfg['reward_path']}",
         f"reward.custom_reward_function.name={cfg['reward_name']}",
+        # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
+        # per core, which has killed real runs two ways (host-ram oom, and a fatal raylet fork
+        # failure that takes every actor with it). size the pool to the container instead.
+        f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(cfg['n_gpus'])}",
         f"trainer.n_gpus_per_node={cfg['n_gpus']}",
         "trainer.nnodes=1",
         f"trainer.total_epochs={cfg['total_epochs']}",
@@ -2996,31 +3002,19 @@ def run_rl_train():
     # cache the base model before launching verl, then run verl fully offline so its vllm /
     # transformers never hit hf's (rate-limited) api. flash already owns model prefetch; the verl
     # subprocess simply reuses that cache.
-    model_path_for_verl = inp["model_id"]
     if inp["model_revision"]:
         download_seconds = _w.prefetch_model(inp["model_id"], revision=inp["model_revision"])
-        # verl resolves model.path offline against the HF cache; a bare repo id would pick the
-        # cached "main" ref, not the pin. hand verl the pinned revision's snapshot dir instead.
-        from huggingface_hub import snapshot_download as _snap
-
-        from flash.engine.worker.hf import _shared_weight_cache_dir
-
-        # prefetch_model lands pinned weights on the shared volume when attached; resolve from the
-        # same cache_dir it used, else fall back to the ephemeral default cache.
-        _shared = _shared_weight_cache_dir()
-        try:
-            model_path_for_verl = _snap(
-                inp["model_id"],
-                revision=inp["model_revision"],
-                cache_dir=_shared,
-                local_files_only=True,
-            )
-        except Exception:
-            model_path_for_verl = _snap(
-                inp["model_id"], revision=inp["model_revision"], local_files_only=True
-            )
     else:
         download_seconds = _w.prefetch_model(inp["model_id"])
+    # verl resolves model.path offline (HF_HUB_OFFLINE=1), so hand it a real snapshot dir rather
+    # than a repo id. a pinned revision needs it because a bare id resolves the cached "main" ref
+    # and not the pin; an UNPINNED one needs it too, because offline resolution of a bare id
+    # depends on cache symlinks that are only best-effort here -- when they do not land, verl dies
+    # with "does not appear to have a file named pytorch_model.bin or model.safetensors" AFTER the
+    # gpu is already rented, as a permanent OSError. _cached_model_path is what sft and opd already
+    # call: it resolves both cases and raises RetriableInfraError instead, so the run relands on a
+    # healthy worker rather than charging the user for a dead one.
+    model_path_for_verl = _cached_model_path(inp["model_id"], inp["model_revision"])
 
     # stable int index -> rollout example, exactly as the retired trl path (reward maps back via this).
     ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
