@@ -493,8 +493,19 @@ class ApiClient:
             )
         # only a successful capability check is cached, so a transient failure remains visible and
         # retryable. concurrent first calls may make the same benign request twice; a lock would add
-        # coordination to every client solely to optimize that one startup race.
+        # coordination to every client solely to optimize that one startup race, so a caller about to
+        # fan out settles it up front instead (see `warm_chat_step_selector`).
         self._chat_step_selector_available = True
+
+    def warm_chat_step_selector(self, target: str) -> None:
+        """Settle the step-selector capability now, so concurrent callers inherit the cached answer.
+
+        A caller about to run many chats in parallel would otherwise have every worker miss the cold
+        cache at once and fire its own /v1/health (codex[bot]). Only a `RUN/step-N` target needs the
+        capability, so anything else is a no-op. Raises exactly what the per-request check raises.
+        """
+        if _parse_chat_target(target)[2] is not None:
+            self._require_chat_step_selector()
 
     def publish_env(
         self,
