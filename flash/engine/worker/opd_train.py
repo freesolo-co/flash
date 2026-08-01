@@ -41,6 +41,8 @@ from flash.engine.worker.backend_common import (
     resolve_verl_device_capability,
     resolve_verl_loggers,
     resolve_verl_python,
+    rollout_resident_overrides,
+    rollout_sleep_unsupported,
     run_verl_training,
     stall_tail_fields,
 )
@@ -1543,6 +1545,12 @@ def build_opd_overrides(config: dict) -> list[str]:
         # rollout.enforce_eager is a real verl field, so this is a plain override, not a '+' append.
         # the caller resolves it from the device capability; absent/false keeps verl's default.
         *(["actor_rollout_ref.rollout.enforce_eager=True"] if config.get("enforce_eager") else []),
+        # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
+        # sleep_unsupported), exactly as the grpo path does. opd is NOT exempt: main_ppo_sync calls
+        # checkpoint_manager.sleep_replicas() during init_workers and again around validation, which
+        # lands in the same vllm_async_server sleep(). the flagged model declares algos including
+        # opd and the parse-time gate admits it, so without this an opd run on it wedges.
+        *rollout_resident_overrides(bool(config.get("sleep_unsupported"))),
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={_hydra_val(config['n_gpus_per_node'])}",
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
         # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
@@ -2446,6 +2454,7 @@ def run_opd_train(spec=None) -> None:
             "structured_outputs": structured_outputs,
             "fp8_kv": fp8_kv,
             "enforce_eager": enforce_eager,
+            "sleep_unsupported": rollout_sleep_unsupported(model_id),
             "loggers": loggers,
         }
         overrides = build_opd_overrides(config)

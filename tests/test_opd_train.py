@@ -4658,6 +4658,51 @@ def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
         assert "resolve_verl_device_capability(python_bin)" in source, module
 
 
+def test_overrides_pin_the_rollout_resident_for_sleep_unsupported_models():
+    off = build_opd_overrides(_config())
+    assert not any("free_cache_engine" in value for value in off)
+    assert not any("enable_sleep_mode" in value for value in off)
+    on = build_opd_overrides(_config(sleep_unsupported=True))
+    # both knobs, not one: free_cache_engine gates the sleep()/wake_up() rpcs
+    # (vllm_async_server.py:626), enable_sleep_mode is what builds the sleep-capable engine (:265).
+    assert "actor_rollout_ref.rollout.free_cache_engine=false" in on
+    assert "actor_rollout_ref.rollout.enable_sleep_mode=false" in on
+
+
+def test_the_resolved_sleep_flag_reaches_the_opd_verl_config():
+    # the assertions above pass against a resolver whose answer never reaches the config, which is
+    # the exact shape of the bug this fixes. pin the wiring, not just the string.
+    built = inspect.getsource(opd_train.run_opd_train)
+    assert '"sleep_unsupported": rollout_sleep_unsupported(model_id),' in built
+
+
+def test_both_ray_rollouts_honor_sleep_unsupported_from_the_same_catalog_flag():
+    # opd is NOT exempt from verl's sleep path: main_ppo_sync.py:740 calls sleep_replicas() during
+    # init_workers and again around validation, landing in the same vllm_async_server sleep(). the
+    # flagged model declares algos including opd and the parse-time gate ADMITS it (routes to b200),
+    # so a driver that ignores the flag wedges on wake. asserted across BOTH trainers because
+    # one-trainer-only is precisely how the eager defect above reached production.
+    for module, source in (
+        ("rl_train", inspect.getsource(rl_train)),
+        ("opd_train", inspect.getsource(opd_train)),
+    ):
+        assert "rollout_resident_overrides(" in source, module
+        assert "rollout_sleep_unsupported(" in source, module
+
+
+def test_a_flagged_model_is_actually_reachable_under_opd():
+    # the guard above is only meaningful while some catalog model is both sleep_unsupported and
+    # opd-capable. if that stops being true this test fails loudly rather than leaving a guard with
+    # no subject silently passing forever.
+    from flash.catalog import MODELS
+
+    flagged = [m for m, i in MODELS.items() if getattr(i, "sleep_unsupported", False)]
+    assert flagged, "no catalog model is sleep_unsupported; this guard now has no subject"
+    assert any("opd" in (MODELS[m].algos or ()) for m in flagged), (
+        "no sleep_unsupported model allows opd; the opd resident pin now has no subject"
+    )
+
+
 def test_overrides_size_the_engine_to_the_job_not_a_hardcoded_context():
     # regression: single-turn opd hardcoded rollout.max_model_len=32768 while the prompt budget was
     # carved out of the job's own max_context_tokens. above 32768 the prompt filter admitted prompts
