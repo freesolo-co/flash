@@ -410,21 +410,32 @@ def test_record_reconcile_attempt_decides_terminality_under_the_lock(tmp_path, m
     assert not reconcile._due(st, 1_000_000.0)
 
 
-def test_report_failures_never_strand_a_run_as_pending_at_the_limit(tmp_path, monkeypatch):
-    """The two counters are independent: delivery failures accumulate without ever pushing the run
-    past the attribution budget, so it stays due and retryable."""
+def _persist(tmp_path, monkeypatch, run_id, **kw) -> None:
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    base = {
+        "run_id": run_id,
+        "state": "done",
+        "spec": {},
+        "created_at": 1_000.0,
+        "updated_at": 1_000.0,
+        "finished_at": 1_000.0,
+        "remote": {"provider": "runpod", "endpoint_id": "e"},
+    }
+    base.update(kw)
+    runner._save_status(runner.RunStatus(**base))
+
+
+def test_report_failures_never_strand_a_delivering_run(tmp_path, monkeypatch):
+    """Delivery failures accumulate on a `delivering` run without ever touching the attribution
+    budget, so it stays due and retryable however long the backend is down."""
     limit = reconcile._MAX_RECONCILE_ATTEMPTS
-    runner._save_status(
-        runner.RunStatus(
-            run_id="r-outage",
-            state="done",
-            spec={},
-            created_at=1_000.0,
-            updated_at=1_000.0,
-            finished_at=1_000.0,
-            remote={"provider": "runpod", "endpoint_id": "e"},
-        )
+    _persist(
+        tmp_path,
+        monkeypatch,
+        "r-outage",
+        reconcile_state="delivering",
+        reconcile_report={"runId": "r-outage", "realizedCostUsd": 4.2},
+        realized_cost_usd=4.2,
     )
     for _ in range(limit + 5):
         runner.record_reconcile_attempt(
@@ -434,8 +445,131 @@ def test_report_failures_never_strand_a_run_as_pending_at_the_limit(tmp_path, mo
     st = runner.get_status("r-outage")
     assert st.reconcile_report_failures == limit + 5
     assert st.reconcile_attempts == 0  # attribution budget untouched
-    assert st.reconcile_state == "pending"
+    assert st.reconcile_state == "delivering"
     assert reconcile._due(st, 1_000_000.0)  # still retryable once the backend returns
+
+
+def test_report_failure_never_downgrades_an_unattributable_run(tmp_path, monkeypatch):
+    """Regression (Cursor + Codex P2, round 2): a late report failure from a stale pass must not
+    overwrite a terminal `unattributable` with a retryable state. Doing so left the run at the
+    exhausted budget but no longer terminal -- rejected by _due and invisible all over again."""
+    limit = reconcile._MAX_RECONCILE_ATTEMPTS
+    _persist(
+        tmp_path,
+        monkeypatch,
+        "r-term",
+        reconcile_state="unattributable",
+        reconcile_attempts=limit,
+    )
+    runner.record_reconcile_attempt(
+        "r-term", error="backend report failed", stage="report", max_attempts=limit
+    )
+
+    st = runner.get_status("r-term")
+    assert st.reconcile_state == "unattributable"  # NOT downgraded
+    assert st.reconcile_report_failures == 0
+    assert not reconcile._due(st, 1_000_000.0)  # still a visible terminal gap, not a stranded run
+
+
+def test_stale_attribution_failure_cannot_undo_a_staged_cost(tmp_path, monkeypatch):
+    """Once a cost is attributed, a stale attribution failure from a concurrent pass is meaningless
+    and must not consume the budget or knock the run out of `delivering`."""
+    _persist(
+        tmp_path,
+        monkeypatch,
+        "r-staged",
+        reconcile_state="delivering",
+        reconcile_report={"runId": "r-staged", "realizedCostUsd": 4.2},
+        realized_cost_usd=4.2,
+    )
+    runner.record_reconcile_attempt(
+        "r-staged", error="provider down", stage="attribution", max_attempts=24
+    )
+
+    st = runner.get_status("r-staged")
+    assert st.reconcile_state == "delivering"
+    assert st.reconcile_attempts == 0
+
+
+def test_attribution_success_rescues_a_stale_unattributable_run(tmp_path, monkeypatch):
+    """Recording an attributed cost proves the run IS attributable, so it clears the budget and
+    overrides an `unattributable` a racing pass had already written."""
+    _persist(
+        tmp_path,
+        monkeypatch,
+        "r-rescue",
+        reconcile_state="unattributable",
+        reconcile_attempts=reconcile._MAX_RECONCILE_ATTEMPTS,
+    )
+    runner.record_attributed_cost(
+        "r-rescue", realized_cost_usd=4.2, report={"runId": "r-rescue", "realizedCostUsd": 4.2}
+    )
+
+    st = runner.get_status("r-rescue")
+    assert st.reconcile_state == "delivering"
+    assert st.reconcile_attempts == 0
+    assert reconcile._due(st, 1_000_000.0)
+
+
+def test_delivery_retry_does_not_touch_the_provider(tmp_path, monkeypatch):
+    """Regression (Codex P1, round 2): a `delivering` run re-POSTs its STAGED payload and must never
+    re-query the provider. Otherwise credentials rotating during a backend outage would burn the
+    attribution budget and discard a cost we already had."""
+    _persist(
+        tmp_path,
+        monkeypatch,
+        "r-deliver",
+        reconcile_state="delivering",
+        reconcile_report={"runId": "r-deliver", "realizedCostUsd": 4.2, "provider": "runpod"},
+        realized_cost_usd=4.2,
+    )
+
+    def must_not_be_called(*a, **kw):  # pragma: no cover - the assertion is that it never runs
+        raise AssertionError("delivery retry must not query the provider")
+
+    monkeypatch.setattr(reconcile, "realized_cost_for_remote", must_not_be_called)
+
+    # backend still down -> recorded as a delivery failure, provider untouched, run stays due
+    monkeypatch.setattr(reconcile, "_report", lambda body: False)
+    assert reconcile.reconcile_run(runner.get_status("r-deliver"), now=2_000.0) is False
+    st = runner.get_status("r-deliver")
+    assert st.reconcile_state == "delivering"
+    assert st.reconcile_attempts == 0
+    assert st.reconcile_report_failures == 1
+
+    # backend returns -> the staged payload is delivered from local state alone
+    posted: dict = {}
+    monkeypatch.setattr(reconcile, "_report", lambda body: posted.update(body) or True)
+    assert reconcile.reconcile_run(runner.get_status("r-deliver"), now=2_000.0) is True
+    st = runner.get_status("r-deliver")
+    assert st.reconcile_state == "reconciled"
+    assert st.realized_cost_usd == 4.2
+    assert st.reconciled_at == 2_000.0
+    assert st.reconcile_report is None  # staged payload dropped once delivered
+    assert posted["runId"] == "r-deliver"
+
+
+def test_failed_delivery_stages_the_cost_for_a_provider_free_retry(tmp_path, monkeypatch):
+    """The fresh-pull path must persist the attribution BEFORE delivering, so a POST failure leaves a
+    run that can be retried with no provider involvement at all."""
+    _persist(tmp_path, monkeypatch, "r-stage")
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda remote, **kw: realized.RealizedCost(
+            provider="runpod", realized_usd=7.5, by_resource={"gpu": 7.5}
+        ),
+    )
+    monkeypatch.setattr(reconcile, "_report", lambda body: False)
+    assert reconcile.reconcile_run(runner.get_status("r-stage"), now=2_000.0) is False
+
+    st = runner.get_status("r-stage")
+    assert st.reconcile_state == "delivering"
+    assert st.realized_cost_usd == 7.5
+    assert st.reconcile_report["realizedCostUsd"] == 7.5
+    assert st.reconcile_attempts == 0  # a delivery failure is not an attribution failure
+    assert st.reconcile_report_failures == 1
+    assert reconcile._due(st, 1_000_000.0)
 
 
 def test_reconcile_attempt_never_downgrades_a_reconciled_run(tmp_path, monkeypatch):
