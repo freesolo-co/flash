@@ -88,7 +88,9 @@ from flash.engine.worker.tokenizer_align import (
 )
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resume_state_metadata
 
-_VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
+# "not part of a longer word" rather than "preceded by whitespace" (VERL-134): verl shares its
+# stdout with tqdm, whose bar ends in "]" with no newline, so a metric line can arrive glued to it.
+_VERL_STEP_RE = re.compile(r"(?:^|[^\w/])step:(\d+)(?:\s|$)")
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 _TEXT_TEACHER_BATCH_SIZE = 8

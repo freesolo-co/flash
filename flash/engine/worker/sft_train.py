@@ -56,7 +56,11 @@ from flash.engine.worker.sft import (
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
 _LORAPLUS_READY_MARKER = "FLASH_LORAPLUS_READY"
-_VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
+# the left edge is "not part of a longer word" rather than "preceded by whitespace" (VERL-134):
+# verl shares its stdout with tqdm, which ends a progress bar with "]" and no newline, so the metric
+# line arrives glued to it. a \s anchor matched step 1 and missed every step after, which returned
+# on_line early and kept the zero-grad guard below from ever arming.
+_VERL_STEP_RE = re.compile(r"(?:^|[^\w/])step:(\d+)(?:\s|$)")
 # consecutive zero-grad-norm steps tolerated before the run is failed as untrainable (GRAD-001).
 # 2 is enough to separate a one-off fully-masked batch from a severed backward graph, and keeps
 # the wasted spend to a couple of steps rather than the whole run.

@@ -1359,7 +1359,13 @@ def parse_wandb_link(line: str) -> dict | None:
 # not anchored at line start: ray tags worker stdout with a "(TaskRunner pid=123) " prefix, so an
 # anchored match would parse nothing at all in production. the existing progress regex in rl_train
 # is unanchored for the same reason.
-_VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+) - ")
+#
+# the left edge is "not part of a longer word" rather than "preceded by whitespace" (VERL-134).
+# verl's LocalLogger shares its stream with tqdm, which ends a bar with "]" and no newline, so the
+# metric line arrives glued to it -- "...81.49s/it]step:2 - train/loss:...". a \s anchor matched
+# step 1 and missed every step after it, which froze the sft heartbeat on step 1's metrics and kept
+# the zero-grad guard from ever arming. [^\w/] still refuses "global_step:" and a path's ".../step:".
+_VERL_STEP_RE = re.compile(r"(?:^|[^\w/])step:(\d+) - ")
 
 # verl metric key -> flash `metrics_last` field. verl has no counterpart for trl's
 # frac_reward_zero_std (an advantage-collapse fraction trl computes per group), so that column is

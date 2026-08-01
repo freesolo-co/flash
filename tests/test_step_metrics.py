@@ -89,6 +89,29 @@ def test_non_step_lines_are_ignored():
         assert parse_verl_step_metrics(line) is None
 
 
+def test_step_line_is_parsed_when_a_tqdm_bar_is_flushed_in_front_of_it():
+    # VERL-134. verl's LocalLogger shares its stream with tqdm, which ends a bar with "]" and no
+    # trailing newline, so the metric line arrives glued to it. anchoring the left edge on
+    # whitespace matched step 1 and missed every step after it: the sft heartbeat froze on step 1's
+    # metrics and the zero-grad guard never armed, so a run that trained nothing reported done.
+    line = (
+        "Epoch 1/1:  25%|##        | 1/4 [01:21<04:04, 81.49s/it]"
+        "step:2 - critic/rewards/mean:0.5 - actor/grad_norm:0.0"
+    )
+
+    assert parse_verl_step_metrics(line) == {"step": 2, "reward": 0.5, "grad_norm": 0.0}
+
+
+def test_step_key_does_not_match_a_longer_word_or_a_path():
+    # the left edge is widened to "not part of a longer word", not dropped: global_step: is a
+    # different counter and a checkpoint path ending in step: is not a metric line at all.
+    for line in (
+        "global_step:9 - critic/rewards/mean:0.5",
+        "/tmp/flash/checkpoints/step:9 - critic/rewards/mean:0.5",
+    ):
+        assert parse_verl_step_metrics(line) is None
+
+
 def test_validation_only_record_yields_no_row():
     # verl logs its pre-training validation pass as its own record at the current step counter
     # (ray_trainer.py `logger.log(data=val_metrics, step=self.global_steps)`), and every key on it
