@@ -92,9 +92,7 @@ def test_default_spec_has_no_volume():
 
 def test_stale_datacenter_key_rejected():
     with pytest.raises(ValueError, match=r"gpu has unknown key\(s\): datacenter"):
-        JobSpec.from_dict(
-            {"model": "m", "gpu": {"datacenter": "EU-RO-1", "network_volume": "v"}}
-        )
+        JobSpec.from_dict({"model": "m", "gpu": {"datacenter": "EU-RO-1", "network_volume": "v"}})
 
 
 def test_network_volume_gb_tolerant_of_bad_values():
@@ -418,7 +416,7 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(ephemeral_hub))
-    monkeypatch.setattr(hf, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
     monkeypatch.setattr(hf._w, "heartbeat", lambda *a, **k: None)
     return hf, calls
 
@@ -1123,7 +1121,7 @@ def test_teardown_weight_cache_no_runpod_key_is_noop(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("RunpodRestClient must not be constructed without a key")
 
-    monkeypatch.setattr(rp_keys, "keys", lambda: [])  # empty pool == RUNPOD_API_KEY unset
+    monkeypatch.setattr(rp_keys, "keys", list)  # empty pool == RUNPOD_API_KEY unset
     monkeypatch.setattr(rp_api, "RunpodRestClient", _boom)
     assert preload.teardown_weight_cache(["US-CA-2"]) == []
 
@@ -1366,8 +1364,9 @@ def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
     monkeypatch.setattr(
         lambda_api,
         "ensure_filesystem",
-        lambda name, region, deadline_at=None: ensured.append((name, region))
-        or f"/lambda/nfs/{name}",
+        lambda name, region, deadline_at=None: (
+            ensured.append((name, region)) or f"/lambda/nfs/{name}"
+        ),
     )
     out = preload.provision_lambda_filesystems()
     # one create-if-absent per region, with the managed cache name
@@ -1458,11 +1457,18 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
     deleted = []
     monkeypatch.setattr(preload, "deploy_train_endpoint", fake_deploy)
     monkeypatch.setattr(preload.runpod_api, "submit_job", fake_submit)
-    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda eid, _fingerprint: deleted.append(eid))
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda eid, _fingerprint: deleted.append(eid),
+    )
     monkeypatch.setattr(
         preload.runpod_api,
         "job_status",
-        lambda eid, jid, **_kw: {"status": "COMPLETED", "output": {"preloaded": ["Qwen/Qwen3.5-0.8B"]}},
+        lambda eid, jid, **_kw: {
+            "status": "COMPLETED",
+            "output": {"preloaded": ["Qwen/Qwen3.5-0.8B"]},
+        },
     )
 
     out = preload._preload_one_dc(
@@ -1507,7 +1513,11 @@ def test_preload_one_dc_tears_down_on_failure(monkeypatch):
         lambda *a, **k: ("ep-9", "name-9", _RUNPOD_FINGERPRINT),
     )
     monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, payload, **_kw: "job-9")
-    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda eid, _fingerprint: deleted.append(eid))
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda eid, _fingerprint: deleted.append(eid),
+    )
     monkeypatch.setattr(
         preload.runpod_api,
         "job_status",
@@ -2302,10 +2312,13 @@ def test_warm_reports_timeouts_and_partials_as_not_warmed(monkeypatch):
     # pass and then times out, whatever else reads the clock.
     clock = {"t": 0.0}
     monkeypatch.setattr(
-        preload, "time",
-        types.SimpleNamespace(time=lambda: clock["t"],
-                              sleep=lambda s: clock.__setitem__("t", clock["t"] + 1e9),
-                              monotonic=real_time.monotonic),
+        preload,
+        "time",
+        types.SimpleNamespace(
+            time=lambda: clock["t"],
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + 1e9),
+            monotonic=real_time.monotonic,
+        ),
     )
     res = preload.warm_instances(models=["a/b"], timeout_s=1, poll_interval_s=0.0)
 
@@ -2336,7 +2349,9 @@ def test_warm_falls_back_to_a_pricier_class_when_the_cheap_one_is_rejected(monke
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
     assert tried == ["A10", "A100 SXM 40GB"], "must try the next class after a rejection"
-    assert [(r["region"], r["gpu"], r["status"]) for r in res] == [("us-east-1", "A100 SXM 40GB", "ok")]
+    assert [(r["region"], r["gpu"], r["status"]) for r in res] == [
+        ("us-east-1", "A100 SXM 40GB", "ok")
+    ]
 
 
 def test_warm_stops_the_ladder_on_an_ambiguous_create(monkeypatch):
@@ -2385,11 +2400,13 @@ def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeyp
     ensured, tried = [], []
     # already provisioned, which is the steady state once `--provision` has run
     monkeypatch.setattr(
-        lambda_api, "list_filesystems",
+        lambda_api,
+        "list_filesystems",
         lambda **k: [{"name": "flash-weights", "region": {"name": "us-east-1"}}],
     )
     monkeypatch.setattr(
-        lambda_api, "ensure_filesystem",
+        lambda_api,
+        "ensure_filesystem",
         lambda name, region, **k: ensured.append((name, region)) or f"/lambda/nfs/{name}",
     )
 
@@ -2429,12 +2446,15 @@ def test_warm_skips_a_region_whose_created_filesystem_is_not_yet_listed(monkeypa
         lambda_api, "ensure_filesystem", lambda name, region, **k: f"/lambda/nfs/{name}"
     )
     monkeypatch.setattr(
-        lj, "launch_and_submit",
+        lj,
+        "launch_and_submit",
         lambda spec, seed, instances, **k: tried.append(instances[0].gpu),
     )
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
-    assert tried == [], "an unlisted filesystem must not launch: the launcher would create a duplicate"
+    assert tried == [], (
+        "an unlisted filesystem must not launch: the launcher would create a duplicate"
+    )
     assert [(r["region"], r["status"]) for r in res] == [("us-east-1", "error")]
 
 
@@ -2466,7 +2486,8 @@ def test_warm_does_not_launch_while_the_filesystem_is_unconfirmed(monkeypatch):
 
     monkeypatch.setattr(lambda_api, "list_filesystems", boom)
     monkeypatch.setattr(
-        lj, "launch_and_submit",
+        lj,
+        "launch_and_submit",
         lambda spec, seed, instances, **k: tried.append(instances[0].gpu),
     )
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
@@ -2754,9 +2775,7 @@ def test_warm_cli_prints_regions_with_no_capacity(monkeypatch, capsys):
         monkeypatch, {"preloaded": [model], "already_cached": [], "failed": {}}
     )
     monkeypatch.setattr(lj, "usable_instances", _stocked(A10=["us-east-1"]))
-    monkeypatch.setattr(
-        preload, "_lambda_provisioned_regions", lambda: {"us-east-1", "us-south-2"}
-    )
+    monkeypatch.setattr(preload, "_lambda_provisioned_regions", lambda: {"us-east-1", "us-south-2"})
     rc = preload.main(["--warm-instances", "--models", model])
     out = capsys.readouterr()
     combined = out.out + out.err
@@ -2808,7 +2827,8 @@ def test_warm_cli_prints_the_gpu_class_each_region_used(monkeypatch, capsys):
     from flash.providers import weight_cache_preload as preload
 
     monkeypatch.setattr(
-        preload, "warm_instances",
+        preload,
+        "warm_instances",
         lambda **k: [{"provider": "lambda", "region": "us-west-3", "gpu": "H100", "status": "ok"}],
     )
     preload.main(["--warm-instances"])
@@ -2891,9 +2911,7 @@ def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
 
     preload._ensure_status_repo("token")
     spec = preload._preload_instance_spec("A10", "preload-test")
-    result = preload._warm_one_lambda_instance(
-        jobs_mod, [_cand("us-east-1")], ["a/b"], 5, 0.0
-    )
+    result = preload._warm_one_lambda_instance(jobs_mod, [_cand("us-east-1")], ["a/b"], 5, 0.0)
 
     assert managed_repo == preload._PRELOAD_STATUS_REPO
     assert created == [
@@ -3534,8 +3552,10 @@ def test_every_preload_timeout_default_reads_the_shared_constant():
 
     defaults = {
         name: inspect.signature(fn).parameters["timeout_s"].default
-        for name, fn in (("warm_weight_cache", preload.warm_weight_cache),
-                         ("warm_instances", preload.warm_instances))
+        for name, fn in (
+            ("warm_weight_cache", preload.warm_weight_cache),
+            ("warm_instances", preload.warm_instances),
+        )
     }
     stale = {k: v for k, v in defaults.items() if v != preload._PRELOAD_TIMEOUT_S}
     assert not stale, f"these carry a literal instead of _PRELOAD_TIMEOUT_S: {stale}"
@@ -3576,7 +3596,7 @@ def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):
     from flash.providers import weight_cache_preload as preload
 
     monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1", "m2"])
-    monkeypatch.setattr(preload, "weight_cache_datacenters", lambda: [])
+    monkeypatch.setattr(preload, "weight_cache_datacenters", list)
     monkeypatch.setattr(
         preload,
         "_preload_one_dc",
@@ -3603,7 +3623,7 @@ def test_ok_datacenter_logs_no_per_model_failures(monkeypatch, caplog):
     from flash.providers import weight_cache_preload as preload
 
     monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1"])
-    monkeypatch.setattr(preload, "weight_cache_datacenters", lambda: [])
+    monkeypatch.setattr(preload, "weight_cache_datacenters", list)
     monkeypatch.setattr(
         preload,
         "_preload_one_dc",
@@ -3688,9 +3708,18 @@ def test_grow_tolerates_a_volume_listing_without_usable_sizes(monkeypatch):
             return {}
 
     monkeypatch.setattr(api, "_CLIENT", _Client())
-    grown = api.grow_network_volumes_for_key("k", dict.fromkeys(
-        ["flash-weights-us-ca-2", "flash-weights-eu-ro-1",
-         "flash-weights-us-tx-3", "flash-weights-us-ks-2"], 250))
+    grown = api.grow_network_volumes_for_key(
+        "k",
+        dict.fromkeys(
+            [
+                "flash-weights-us-ca-2",
+                "flash-weights-eu-ro-1",
+                "flash-weights-us-tx-3",
+                "flash-weights-us-ks-2",
+            ],
+            250,
+        ),
+    )
 
     assert grown == {"flash-weights-us-ks-2": 250}  # only the one complete, under-sized row
     assert patched == [f"{api.REST_BASE}/networkvolumes/v-4"]
@@ -3720,8 +3749,7 @@ def test_one_stalling_volume_cannot_starve_the_rest_of_the_fleet(monkeypatch):
         def request_with_retries_for_key(self, key, target, **kwargs):
             if target.endswith("/networkvolumes"):
                 return [
-                    {"id": f"v-{i}", "name": f"flash-weights-dc-{i}", "size": 100}
-                    for i in range(4)
+                    {"id": f"v-{i}", "name": f"flash-weights-dc-{i}", "size": 100} for i in range(4)
                 ]
             budget = kwargs["deadline_at"] - clock["t"]
             granted.append(round(budget, 1))
@@ -3812,16 +3840,18 @@ def test_assign_refreshes_a_stale_shared_cache_size():
     from flash.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
-    spec = JobSpec.from_dict({
-        "model": info.id,
-        "run_id": "r",
-        "model_policy": "catalog",
-        "gpu": {
-            "type": "H100",
-            "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
-            "network_volume_gb": 100,
-        },
-    })
+    spec = JobSpec.from_dict(
+        {
+            "model": info.id,
+            "run_id": "r",
+            "model_policy": "catalog",
+            "gpu": {
+                "type": "H100",
+                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume_gb": 100,
+            },
+        }
+    )
     out = runner._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME
     assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB
@@ -3837,12 +3867,14 @@ def test_assign_leaves_a_custom_volume_size_alone():
     from flash.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
-    spec = JobSpec.from_dict({
-        "model": info.id,
-        "run_id": "r",
-        "model_policy": "catalog",
-        "gpu": {"type": "H100", "network_volume": "my-org-cache", "network_volume_gb": 100},
-    })
+    spec = JobSpec.from_dict(
+        {
+            "model": info.id,
+            "run_id": "r",
+            "model_policy": "catalog",
+            "gpu": {"type": "H100", "network_volume": "my-org-cache", "network_volume_gb": 100},
+        }
+    )
     out = runner._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "my-org-cache"
     assert out.gpu.network_volume_gb == 100
@@ -4313,7 +4345,7 @@ def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             deadline_at=deadline,
             cache_volumes={"flash-weights-us-ca-2": 250},
         )
@@ -4382,7 +4414,7 @@ def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch)
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             deadline_at=deadline,
             cache_volumes={"flash-weights-us-ca-2": 250},
         )
@@ -4439,7 +4471,7 @@ def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             deadline_at=clock["t"] + 90.0,
             cache_volumes=None,
         )
@@ -4486,7 +4518,7 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             cache_volumes={"flash-weights-us-ca-2": 250},
         )
 
@@ -4539,7 +4571,7 @@ def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             deadline_at=clock["t"] + 90.0,
         )
 
@@ -4593,7 +4625,7 @@ def test_the_grow_reserve_still_caps_what_a_create_may_spend(monkeypatch):
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             deadline_at=clock["t"] + 900.0,
         )
 
@@ -4656,7 +4688,7 @@ def test_the_post_grow_recheck_does_not_recharge_a_paid_slice(monkeypatch):
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             deadline_at=deadline,
         )
 
@@ -4733,7 +4765,7 @@ def test_admission_is_rejudged_with_the_key_the_attempt_lands_on(monkeypatch):
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             deadline_at=deadline,
         )
 
@@ -4791,7 +4823,7 @@ def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             deadline_at=clock["t"] + 90.0,
         )
 
@@ -4864,9 +4896,7 @@ def test_a_mixed_unhealthy_and_throttled_endpoint_still_gives_up(monkeypatch):
     clock = {"now": 1000.0}
     monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
     monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(
-        preload, "_worker_counts", lambda *a, **kw: dict(mixed)
-    )
+    monkeypatch.setattr(preload, "_worker_counts", lambda *a, **kw: dict(mixed))
 
     def _status(*a, **kw):
         clock["now"] += preload._THROTTLED_GRACE_S + 1.0
@@ -4932,7 +4962,7 @@ def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
         jobs.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
-            endpoint_kwargs=lambda: {},
+            endpoint_kwargs=dict,
             cache_volumes={"flash-weights-us-ca-2": 250},
         )
 

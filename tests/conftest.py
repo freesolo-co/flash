@@ -45,7 +45,7 @@ def _offline(monkeypatch):
     # so a sweep never reaches the real API; sweep tests monkeypatch it after this fixture.
     import flash.providers.runpod.api as runpod_api
 
-    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [], raising=False)
+    monkeypatch.setattr(runpod_api, "list_endpoints", list, raising=False)
 
     # Credential scrubbing. Importing ``runpod_flash`` runs ``load_dotenv(find_dotenv(usecwd=True))``
     # at module scope, which walks UP out of the repo and loads whatever .env it finds -- so on an
@@ -71,6 +71,16 @@ def _offline(monkeypatch):
     for _key in {"RUNPOD_API_KEY", "LAMBDA_API_KEY", "VAST_API_KEY"} | set(
         DEFAULT_RUNTIME_SECRET_KEYS
     ):
+        monkeypatch.delenv(_key, raising=False)
+
+    # Same hazard, one layer up: the client discovers runtime secrets from the process env at submit
+    # time, so an operator shell that exports WANDB_API_KEY makes every dry-run test assert against
+    # that real value instead of the fixture's. CI has no such key and passes; the box that does have
+    # one fails, which reads as a broken test rather than a leaked env. Drive the scrub off the real
+    # constant so a new default key cannot reintroduce the gap. A test that wants one sets it back.
+    from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+
+    for _key in DEFAULT_RUNTIME_SECRET_KEYS:
         monkeypatch.delenv(_key, raising=False)
 
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing

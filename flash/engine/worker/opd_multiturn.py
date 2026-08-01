@@ -91,9 +91,7 @@ def build_flash_multi_turn_agent_loop(
                     else permanent_teacher_exit
                 )
                 exit_process(exit_code)
-                raise AssertionError(
-                    "multi-turn OPD process exit returned unexpectedly"
-                ) from error
+                raise AssertionError("multi-turn OPD process exit returned unexpectedly") from error
 
         async def _run(self, sampling_params: dict[str, Any], **kwargs):
             raw_prompt = validate_transcript_messages(
@@ -109,9 +107,7 @@ def build_flash_multi_turn_agent_loop(
             no_signal_attempt_ordinal = int(kwargs.get("flash_no_signal_attempt", 0))
             max_turns = int(os.environ["FLASH_OPD_MAX_TURNS"])
             max_model_len = int(os.environ["FLASH_OPD_MAX_MODEL_LEN"])
-            capabilities = set(
-                json.loads(os.environ.get("FLASH_OPD_ENV_CAPABILITIES", "[]"))
-            )
+            capabilities = set(json.loads(os.environ.get("FLASH_OPD_ENV_CAPABILITIES", "[]")))
             required_capabilities = {
                 "new_rollout_state",
                 "record_model_turn",
@@ -152,7 +148,9 @@ def build_flash_multi_turn_agent_loop(
                 )
                 turn_limit = int(start["max_turns"])
                 if turn_limit <= 0 or turn_limit > max_turns:
-                    raise RuntimeError("multi-turn bridge returned an invalid per-example turn limit")
+                    raise RuntimeError(
+                        "multi-turn bridge returned an invalid per-example turn limit"
+                    )
                 prefix_ids = list(prompt_ids)
                 for turn_ordinal in range(turn_limit):
                     remaining = max_model_len - len(prefix_ids)
@@ -198,23 +196,25 @@ def build_flash_multi_turn_agent_loop(
                         response_logprobs = list(response_logprobs[: len(response_ids)])
                     step = await run_executor_call(
                         self.loop,
-                        lambda turn_ordinal=turn_ordinal, prefix_ids=list(prefix_ids), turn=dict(turn): post_json(
-                            bridge_url,
-                            bridge_token,
-                            "/multiturn/step",
-                            {
-                                "session_id": session_id,
-                                "turn_ordinal": turn_ordinal,
-                                "accepted_prefix": prefix_ids,
-                                "raw_response_ids": turn["raw_response_ids"],
-                                "response_ids": turn["response_ids"],
-                                "completion_text": turn["completion_text"],
-                                "termination": turn["termination"],
-                                "stop_reason": turn["stop_reason"],
-                                "max_tokens": turn["max_tokens"],
-                                "truncated": turn["truncated"],
-                                "skip_reason": turn["skip_reason"],
-                            },
+                        lambda turn_ordinal=turn_ordinal, prefix_ids=list(prefix_ids), turn=dict(turn): (
+                            post_json(
+                                bridge_url,
+                                bridge_token,
+                                "/multiturn/step",
+                                {
+                                    "session_id": session_id,
+                                    "turn_ordinal": turn_ordinal,
+                                    "accepted_prefix": prefix_ids,
+                                    "raw_response_ids": turn["raw_response_ids"],
+                                    "response_ids": turn["response_ids"],
+                                    "completion_text": turn["completion_text"],
+                                    "termination": turn["termination"],
+                                    "stop_reason": turn["stop_reason"],
+                                    "max_tokens": turn["max_tokens"],
+                                    "truncated": turn["truncated"],
+                                    "skip_reason": turn["skip_reason"],
+                                },
+                            )
                         ),
                     )
                     outputs.append(
@@ -241,9 +241,7 @@ def build_flash_multi_turn_agent_loop(
                     )
                     if not env_messages:
                         break
-                    glue_ids = dedup_seam_terminator(
-                        response_ids, glue_tokenizer(env_messages)
-                    )
+                    glue_ids = dedup_seam_terminator(response_ids, glue_tokenizer(env_messages))
                     # stop while at least a minimal generation window remains: gluing right up to
                     # max_model_len leaves the next turn zero tokens to generate (the engine would
                     # immediately truncate), so reserve a small slack for the next model turn.
@@ -262,11 +260,15 @@ def build_flash_multi_turn_agent_loop(
                 )
                 scored_turns = score_payload["turns"]
                 if len(scored_turns) != len(outputs):
-                    raise RuntimeError("multi-turn bridge returned the wrong number of teacher rows")
+                    raise RuntimeError(
+                        "multi-turn bridge returned the wrong number of teacher rows"
+                    )
                 import torch
 
                 for output, scored in zip(outputs, scored_turns, strict=True):
-                    teacher_ids = torch.tensor(scored["teacher_ids"], dtype=torch.int32).unsqueeze(-1)
+                    teacher_ids = torch.tensor(scored["teacher_ids"], dtype=torch.int32).unsqueeze(
+                        -1
+                    )
                     teacher_logprobs = torch.tensor(
                         scored["teacher_logprobs"], dtype=torch.float32
                     ).unsqueeze(-1)

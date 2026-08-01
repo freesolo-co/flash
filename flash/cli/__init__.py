@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import math
 import re
 import shlex
 import sys
@@ -13,6 +14,7 @@ from flash import __version__
 from flash._channel import CLI_NAME
 from flash._logging import configure_logging
 from flash._update_check import emit_update_notice, maybe_start_update_check
+from flash.catalog import ALGORITHMS
 from flash.cli import render
 
 # package-level command imports remain available through flash.cli.
@@ -41,6 +43,13 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
+from flash.cli.env_eval import (
+    _MAX_CONCURRENCY,
+    bounded_concurrency,
+    cmd_env_eval,
+    finite_float,
+    positive_int,
+)
 from flash.cli.env_setup import cmd_env_setup
 from flash.cli.env_test import cmd_env_test
 from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
@@ -51,6 +60,7 @@ from flash.cli.traces import (
     RECORDS_FORMAT,
     cmd_traces_export,
 )
+from flash.client.config import shadowed_login_warning
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -80,6 +90,7 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("env setup", "scaffold a starter Freesolo environment"),
             ("env list", "list local environment sources"),
             ("env test", "validate a local environment offline"),
+            ("env eval", "score held-out suites against a deployed model"),
             ("env push", "upload a local environment"),
             ("env pull", "download a published environment or file"),
             ("env delete", "delete a published environment"),
@@ -115,6 +126,30 @@ _HELP_OPTIONS: list[tuple[str, str]] = [
     ("--debug", "show full tracebacks on error"),
     ("-v, --verbose", "increase log verbosity (-v info, -vv debug)"),
 ]
+
+
+def _wait_seconds(value: str) -> float:
+    """Parse a --wait timeout, rejecting the values that would never time out.
+
+    bare `float` accepts `nan` and `inf`. a nan deadline makes every `remaining <= 0` comparison
+    false, so the poll loop runs forever while the user believes they set a bound. reject both, and
+    reject negatives, at parse time rather than letting the wait path inherit an unusable deadline.
+    """
+    try:
+        seconds = float(value)
+    except ValueError:
+        # `--wait` takes an OPTIONAL value, so `deploy --wait RUN_ID` hands the run id here rather
+        # than leaving it for the positional. argparse cannot give the token back, so name the real
+        # cause: "invalid float value: 'flash-1'" reads like the run id was mistyped.
+        raise argparse.ArgumentTypeError(
+            f"expected a number of seconds, got {value!r}. if {value!r} is the run id, put it "
+            f"before the flag (`deploy {value} --wait`) or give --wait an explicit timeout"
+        ) from None
+    if not math.isfinite(seconds):
+        raise argparse.ArgumentTypeError(f"--wait needs a finite number of seconds, got {value!r}")
+    if seconds < 0:
+        raise argparse.ArgumentTypeError(f"--wait cannot be negative, got {value!r}")
+    return seconds
 
 
 def _friendly_message(message: str) -> str:
@@ -316,7 +351,100 @@ def _build_parser() -> argparse.ArgumentParser:
         default=".",
         help="local environment directory or environment.py path",
     )
+    env_test.add_argument(
+        "--split",
+        default=None,
+        help=(
+            "dataset split to validate, matching [environment.params] split (default: train). "
+            "use the split the run actually trains on, e.g. --split train_sft"
+        ),
+    )
+    env_test.add_argument(
+        "--algorithm",
+        default="grpo",
+        choices=ALGORITHMS,
+        help=(
+            "algorithm the environment is for, matching [train] algorithm (default: grpo). "
+            "only grpo trains from the environment reward, so sft and opd skip the reward gate"
+        ),
+    )
+    env_test.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "extra load_environment() kwarg, as in [environment.params] (repeatable). "
+            'values parse as TOML scalars, so 1/true/"x" keep their types'
+        ),
+    )
     env_test.set_defaults(func=cmd_env_test)
+
+    env_eval = env_sub.add_parser(
+        "eval",
+        help="score held-out environment suites against a deployed model",
+        description="score held-out environment suites against a deployed model",
+    )
+    env_eval.add_argument(
+        "target",
+        metavar="TARGET",
+        help="a bare RUN_ID, RUN_ID/step-N, or full immutable adapter revision",
+    )
+    env_eval.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="local environment directory or environment.py path",
+    )
+    # the same two knobs `env test` exposes, and for the same reason: an env whose
+    # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated
+    # at all without them, and a held-out suite scored against a differently-configured
+    # environment than the run trains on is not measuring the run (codex[bot]).
+    env_eval.add_argument(
+        "--split",
+        default=None,
+        help=(
+            "dataset split to evaluate against, matching [environment.params] split "
+            "(default: train)"
+        ),
+    )
+    env_eval.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "extra load_environment() kwarg, as in [environment.params] (repeatable). "
+            'values parse as TOML scalars, so 1/true/"x" keep their types'
+        ),
+    )
+    env_eval.add_argument("--suite", help="run only the named evaluation suite")
+    env_eval.add_argument(
+        "--max-cases",
+        type=positive_int,
+        metavar="N",
+        help="run at most N cases from each selected suite",
+    )
+    env_eval.add_argument("--temperature", type=finite_float, default=0.0)
+    env_eval.add_argument("--max-tokens", type=positive_int, default=512, metavar="N")
+    env_eval.add_argument(
+        "--concurrency",
+        type=bounded_concurrency,
+        default=1,
+        metavar="N",
+        help=f"parallel model requests (1-{_MAX_CONCURRENCY})",
+    )
+    env_eval.add_argument(
+        "--upload",
+        action="store_true",
+        help="record the results under a project so they show in the dashboard",
+    )
+    env_eval.add_argument(
+        "--project",
+        metavar="PROJECT_ID",
+        help="project id to record results under (required with --upload)",
+    )
+    env_eval.set_defaults(func=cmd_env_eval)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
     env_push.add_argument(
@@ -485,6 +613,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
     )
     deploy.add_argument("--dry-run", action="store_true")
+    deploy.add_argument(
+        "--wait",
+        nargs="?",
+        type=_wait_seconds,
+        const=1800.0,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "block until the requested revision is ready or failed (default timeout 1800s). "
+            "without it, deploy returns while the revision is still queued"
+        ),
+    )
     deploy.set_defaults(func=cmd_deploy)
 
     undeploy = models_sub.add_parser("undeploy", help="tear down a run's serving endpoint")
@@ -550,6 +690,49 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# commands that bind work to an organization: either they write to it, or they resolve a project
+# with the ambient key and bake it into local artifacts that later writes inherit. a shadowed login
+# silently binds these to the wrong org, so they warn. commands whose only effect is output the user
+# reads stay quiet, and `flash whoami` already shows the key source in its own output.
+_ORG_BINDING_COMMANDS = frozenset(
+    {
+        cmd_train,
+        cmd_deploy,
+        cmd_undeploy,
+        cmd_export,
+        cmd_cancel,
+        cmd_projects_create,
+        cmd_env_push,
+        cmd_env_delete,
+        # remotely read-only, but both pick a project from the ambient key and write it into the
+        # working tree: `traces export` fills dataset/train.jsonl, `env setup` embeds the project
+        # uuid in the generated configs. warning only at the later `train` is too late, because the
+        # wrong org is already scaffolded in by then.
+        cmd_traces_export,
+        cmd_env_setup,
+        # every case makes an authenticated `chat_stream` request against the ambient key, whether
+        # or not results are uploaded, and access to the target is resolved from that key. so the
+        # warning has to fire before the run either way: by the time a wrong-org target is reported
+        # inaccessible, every paid request has already been spent against the other organization.
+        cmd_env_eval,
+    }
+)
+
+
+def _warn_if_login_shadowed(args) -> None:
+    """Surface an ambient FREESOLO_API_KEY that binds a command to another org."""
+    if getattr(args, "func", None) not in _ORG_BINDING_COMMANDS:
+        return
+    # `train --cost` is catalog-only: it never loads credentials or reaches an organization, so a
+    # warning that names the environment key's org would describe a request this command never makes.
+    if getattr(args, "cost", False):
+        return
+    message = shadowed_login_warning()
+    if not message:
+        return
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
@@ -557,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
     update_check = maybe_start_update_check()
+    _warn_if_login_shadowed(args)
     try:
         return args.func(args)
     except _USER_ERRORS as exc:

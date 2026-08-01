@@ -126,11 +126,7 @@ def _flash_groupwise_reverse_kl_values(
             group_length = group_mask.sum().to(dtype=student_logprobs.dtype)
             student_logsum = student_logprobs[row][group_mask].detach().sum()
             teacher_logsum = teacher_logsums[row][group_mask][0]
-            coefficient = (
-                float(kl_penalty_coef)
-                * (student_logsum - teacher_logsum)
-                / group_length
-            )
+            coefficient = float(kl_penalty_coef) * (student_logsum - teacher_logsum) / group_length
             values[row][group_mask] = coefficient * student_logprobs[row][group_mask]
         values[row][selected] *= response_count / selected_count
     return values
@@ -289,7 +285,13 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
             details = payload["error"]
             classification = str(details["classification"])
             message = str(details["message"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as decode_error:
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as decode_error:
             raise FlashTeacherBridgeError(
                 f"flash OPD bridge returned unclassified HTTP {error.code}",
                 classification="permanent",
@@ -431,9 +433,7 @@ def _exit_for_score_failure(error: FlashTeacherBridgeError) -> None:
     if error.delivery_unknown:
         _write_score_delivery_failure_fallback(classification, str(error))
     exit_code = (
-        _PERMANENT_TEACHER_EXIT
-        if classification == "permanent"
-        else _TRANSIENT_TEACHER_EXIT
+        _PERMANENT_TEACHER_EXIT if classification == "permanent" else _TRANSIENT_TEACHER_EXIT
     )
     os._exit(exit_code)
 
@@ -446,9 +446,7 @@ def _exit_for_mutation_failure(
     if write_fallback:
         _write_mutation_failure_fallback(error.classification, str(error))
     exit_code = (
-        _PERMANENT_TEACHER_EXIT
-        if error.classification == "permanent"
-        else _TRANSIENT_TEACHER_EXIT
+        _PERMANENT_TEACHER_EXIT if error.classification == "permanent" else _TRANSIENT_TEACHER_EXIT
     )
     os._exit(exit_code)
 
@@ -657,12 +655,16 @@ def _describe_stalled_thread(ident: int | None, depth: int = 4) -> str:
         if frame is None:
             return "stack unavailable"
         frames = traceback.extract_stack(frame)[-depth:]
-        return " <- ".join(f"{f.name} ({f.filename.rsplit('/', 1)[-1]}:{f.lineno})" for f in reversed(frames))
+        return " <- ".join(
+            f"{f.name} ({f.filename.rsplit('/', 1)[-1]}:{f.lineno})" for f in reversed(frames)
+        )
     except Exception as error:  # pragma: no cover - defensive, the thread is alive by construction
         return f"stack unreadable: {type(error).__name__}: {error}"
 
 
-def _init_transfer_queue(init: Callable[[Any], Any], conf: Any, timeout_s: float = _TQ_INIT_TIMEOUT_S) -> None:
+def _init_transfer_queue(
+    init: Callable[[Any], Any], conf: Any, timeout_s: float = _TQ_INIT_TIMEOUT_S
+) -> None:
     """run verl's transfer-queue init under a deadline, reporting the resource state on timeout.
 
     verl force-enables TransferQueue on the opd entry point (main_ppo_sync.main sets
@@ -882,15 +884,16 @@ def _install_verl_extensions() -> None:
                     canonical_structured_spec(json.loads(structured_spec)),
                     thinking=os.environ.get("FLASH_OPD_THINKING") == "1",
                 )
-            teacher_ids, teacher_logprobs = (
-                await self.teacher_server_manager.compute_teacher_logprobs_single(
-                    prompt_ids=prompt_ids,
-                    response_ids=response_ids,
-                    multi_modal_data=output.multi_modal_data,
-                    mm_processor_kwargs=output.mm_processor_kwargs,
-                    routing_key=routing_key,
-                    forced=forced,
-                )
+            (
+                teacher_ids,
+                teacher_logprobs,
+            ) = await self.teacher_server_manager.compute_teacher_logprobs_single(
+                prompt_ids=prompt_ids,
+                response_ids=response_ids,
+                multi_modal_data=output.multi_modal_data,
+                mm_processor_kwargs=output.mm_processor_kwargs,
+                routing_key=routing_key,
+                forced=forced,
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
@@ -1047,7 +1050,9 @@ def _install_verl_extensions() -> None:
         def _get_required_batch_multiple(self, dp_size: int) -> int:
             return dp_size
 
-        def _balance_batch(self, batch, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+        def _balance_batch(
+            self, batch, metrics, logging_prefix="global_seqlen", keep_minibatch=False
+        ):
             return super()._balance_batch(
                 filter_signal_batch(batch),
                 metrics,
@@ -1092,8 +1097,14 @@ def _install_verl_extensions() -> None:
             lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
             if lora_rank <= 0:
                 lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-            ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-            role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+            ref_in_actor = (
+                lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+            )
+            role = (
+                Role.ActorRolloutRef
+                if need_reference_policy(config) and not ref_in_actor
+                else Role.ActorRollout
+            )
             self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
             self.mapping[role] = "global_pool"
 

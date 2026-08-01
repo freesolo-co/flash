@@ -89,7 +89,11 @@ def test_multimodal_rows_match_verl_placeholder_assertion():
             [
                 {
                     "role": "user",
-                    "content": [{"type": "image"}, {"type": "image"}, {"type": "text", "text": "q1"}],
+                    "content": [
+                        {"type": "image"},
+                        {"type": "image"},
+                        {"type": "text", "text": "q1"},
+                    ],
                 }
             ],
         ],
@@ -153,7 +157,12 @@ def test_text_only_row_of_a_mixed_job_rejects_a_literal_placeholder():
     with pytest.raises(ValueError, match="reserved by verl"):
         rl_train.build_verl_dataset_rows(
             [
-                [{"role": "user", "content": [{"type": "text", "text": "describe <image> please"}]}],
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "describe <image> please"}],
+                    }
+                ],
                 [{"role": "user", "content": [{"type": "image"}]}],
             ],
             [0, 1],
@@ -245,24 +254,48 @@ def test_text_only_parquet_does_not_pin_the_multimodal_schema(tmp_path):
 # ------------------------------- override generation -------------------------------
 def _overrides_cfg(**over):
     cfg = {
-        "train_files": "/w/train.parquet", "val_files": "/w/val.parquet",
-        "model_id": "Qwen/Qwen3-4B", "lora_rank": 32, "lora_alpha": 64,
-        "target_modules": "all-linear", "lr": 1e-5, "group_size": 8,
-        "prompts_per_step": 16, "max_prompt_len": 2048,
-        "max_model_len": 2368, "max_token_len_per_gpu": 2368,
+        "train_files": "/w/train.parquet",
+        "val_files": "/w/val.parquet",
+        "model_id": "Qwen/Qwen3-4B",
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "target_modules": "all-linear",
+        "lr": 1e-5,
+        "group_size": 8,
+        "prompts_per_step": 16,
+        "max_prompt_len": 2048,
+        "max_model_len": 2368,
+        "max_token_len_per_gpu": 2368,
         # single-turn: the response tensor holds one completion, so it is max_completion wide.
-        "max_completion": 320, "max_response_len": 320, "multi_turn": False,
-        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
+        "max_completion": 320,
+        "max_response_len": 320,
+        "multi_turn": False,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "kl_coef": 0.0,
         "entropy_quantile": None,
         "stop_sequences": (),
-        "structured_outputs": None, "thinking": False,
-        "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "ppo_epochs": 1,
-        "steps": 60, "gpu_mem_util": 0.5, "n_gpus": 1, "loggers": "console", "fp8_kv": False,
+        "structured_outputs": None,
+        "thinking": False,
+        "loss_agg_mode": "seq-mean-token-sum-norm",
+        "seed": 42,
+        "ppo_epochs": 1,
+        "steps": 60,
+        "gpu_mem_util": 0.5,
+        "n_gpus": 1,
+        "loggers": "console",
+        "fp8_kv": False,
         "enforce_eager": False,
-        "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
+        "warmstart_adapter": "",
+        "reward_path": "/w/reward.py",
+        "reward_name": "compute_score",
         "mask_truncated_completions": True,
-        "total_epochs": 1, "save_freq": 20, "ckpt_to_keep": 1, "local_dir": "/w/ckpt",
-        "project_name": "flash", "experiment_name": "flash-rl-run123",
+        "total_epochs": 1,
+        "save_freq": 20,
+        "ckpt_to_keep": 1,
+        "local_dir": "/w/ckpt",
+        "project_name": "flash",
+        "experiment_name": "flash-rl-run123",
     }
     cfg.update(over)
     return cfg
@@ -409,12 +442,8 @@ def test_build_verl_overrides_pins_both_blackwell_attention_backends():
     )
     # verl spreads engine_kwargs.vllm straight into AsyncEngineArgs, where both are real fields in
     # the pinned vllm 0.19.1. `+` appends under the existing struct, as kv_cache_dtype does.
-    assert (
-        "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHINFER" in o
-    )
-    assert (
-        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend=TORCH_SDPA" in o
-    )
+    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHINFER" in o
+    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend=TORCH_SDPA" in o
 
 
 def test_build_verl_overrides_leaves_attention_backends_to_vllm_off_blackwell():
@@ -519,21 +548,48 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
 
     def _argv(model_id):
         inp = {
-            "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
-            "prompts_per_step": 16, "mask_truncated_completions": True,
-            "max_prompt_len": 3072, "max_completion": 1024, "max_response_len": 1024,
-            "multi_turn": False, "engine_len": 4096, "temperature": 1.0, "top_p": 0.95,
-            "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (),
-            "structured_outputs": None, "seed": 42, "ppo_epochs": 1, "steps": 60,
-            "warmstart_adapter": "", "model_id": model_id, "verl_total_epochs": 2,
-            "save_freq": 20, "ckpt_to_keep": 1,
+            "lora_rank": 32,
+            "lora_alpha": 64,
+            "lr": 1e-5,
+            "group_size": 8,
+            "prompts_per_step": 16,
+            "mask_truncated_completions": True,
+            "max_prompt_len": 3072,
+            "max_completion": 1024,
+            "max_response_len": 1024,
+            "multi_turn": False,
+            "engine_len": 4096,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "kl_coef": 0.0,
+            "entropy_quantile": None,
+            "stop_sequences": (),
+            "structured_outputs": None,
+            "seed": 42,
+            "ppo_epochs": 1,
+            "steps": 60,
+            "warmstart_adapter": "",
+            "model_id": model_id,
+            "verl_total_epochs": 2,
+            "save_freq": 20,
+            "ckpt_to_keep": 1,
         }
         # go through the real builder so the flag cannot drift out of the cfg it emits.
         cfg = rl_train._build_verl_training_cfg(
-            inp, train_files="/w/t.parquet", val_files="/w/v.parquet", model_id="/w/model",
-            thinking=False, loggers="console", fp8_kv=False, enforce_eager=False,
-            attention_backend=None, mm_encoder_attn_backend=None, reward_path="/w/r.py",
-            local_dir="/w/ckpt", project_name="flash", experiment_name="flash-rl-run123",
+            inp,
+            train_files="/w/t.parquet",
+            val_files="/w/v.parquet",
+            model_id="/w/model",
+            thinking=False,
+            loggers="console",
+            fp8_kv=False,
+            enforce_eager=False,
+            attention_backend=None,
+            mm_encoder_attn_backend=None,
+            reward_path="/w/r.py",
+            local_dir="/w/ckpt",
+            project_name="flash",
+            experiment_name="flash-rl-run123",
         )
         return rl_train.build_verl_overrides(cfg)
 
@@ -546,21 +602,46 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
 
 def test_build_verl_training_cfg_derives_engine_len_and_budget():
     inp = {
-        "lora_rank": 32, "lora_alpha": 64, "lr": 1e-5, "group_size": 8,
-        "prompts_per_step": 16, "mask_truncated_completions": True,
-        "max_prompt_len": 3072, "max_completion": 1024, "max_response_len": 1024,
-        "multi_turn": False, "engine_len": 4096,
-        "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0, "entropy_quantile": None, "stop_sequences": (), "structured_outputs": None, "seed": 42,
-        "ppo_epochs": 1, "steps": 60, "warmstart_adapter": "",
-        "model_id": "Qwen/Qwen3-4B", "verl_total_epochs": 2, "save_freq": 20, "ckpt_to_keep": 1,
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "lr": 1e-5,
+        "group_size": 8,
+        "prompts_per_step": 16,
+        "mask_truncated_completions": True,
+        "max_prompt_len": 3072,
+        "max_completion": 1024,
+        "max_response_len": 1024,
+        "multi_turn": False,
+        "engine_len": 4096,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "kl_coef": 0.0,
+        "entropy_quantile": None,
+        "stop_sequences": (),
+        "structured_outputs": None,
+        "seed": 42,
+        "ppo_epochs": 1,
+        "steps": 60,
+        "warmstart_adapter": "",
+        "model_id": "Qwen/Qwen3-4B",
+        "verl_total_epochs": 2,
+        "save_freq": 20,
+        "ckpt_to_keep": 1,
     }
     common = {
-        "train_files": "/w/t.parquet", "val_files": "/w/v.parquet", "model_id": "Qwen/Qwen3-4B",
-        "thinking": False, "loggers": "console", "fp8_kv": False,
+        "train_files": "/w/t.parquet",
+        "val_files": "/w/v.parquet",
+        "model_id": "Qwen/Qwen3-4B",
+        "thinking": False,
+        "loggers": "console",
+        "fp8_kv": False,
         "enforce_eager": False,
-        "attention_backend": None, "mm_encoder_attn_backend": None,
-        "reward_path": "/w/r.py", "local_dir": "/w/ckpt",
-        "project_name": "flash", "experiment_name": "flash-rl-run123",
+        "attention_backend": None,
+        "mm_encoder_attn_backend": None,
+        "reward_path": "/w/r.py",
+        "local_dir": "/w/ckpt",
+        "project_name": "flash",
+        "experiment_name": "flash-rl-run123",
     }
     cfg = rl_train._build_verl_training_cfg(inp, **common)
     # the engine gets the full prompt+completion length, not the prompt budget alone, and the token
@@ -570,7 +651,14 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
 
 
 @pytest.mark.parametrize(
-    ("prompt_count", "prompts_per_step", "epochs", "max_steps", "expected_steps", "expected_epochs"),
+    (
+        "prompt_count",
+        "prompts_per_step",
+        "epochs",
+        "max_steps",
+        "expected_steps",
+        "expected_epochs",
+    ),
     [
         pytest.param(33, 16, 2, None, 5, 3, id="partial-batch-derived-horizon"),
         pytest.param(32, 16, 2, 7, 7, 4, id="explicit-horizon-beyond-derived"),
@@ -604,9 +692,7 @@ def test_verl_epoch_capacity_reaches_update_horizon(
         pytest.param(5, 16, "prompt_count must be at least", id="batch-exceeds-prompts"),
     ],
 )
-def test_verl_epoch_capacity_rejects_invalid_batch_inputs(
-    prompt_count, prompts_per_step, message
-):
+def test_verl_epoch_capacity_rejects_invalid_batch_inputs(prompt_count, prompts_per_step, message):
     with pytest.raises(ValueError, match=message):
         rl_train._verl_epochs_for_horizon(
             epochs=2,
@@ -718,8 +804,12 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
         lambda d, s, **kw: published.append((d, s, kw.get("required", False))),
         raising=False,
     )
-    monkeypatch.setattr(rl_train._w, "upload_resume_checkpoint", lambda *a, **kw: True, raising=False)
-    monkeypatch.setattr(rl_train._w, "write_base_model_provenance", lambda *a, **kw: None, raising=False)
+    monkeypatch.setattr(
+        rl_train._w, "upload_resume_checkpoint", lambda *a, **kw: True, raising=False
+    )
+    monkeypatch.setattr(
+        rl_train._w, "write_base_model_provenance", lambda *a, **kw: None, raising=False
+    )
     monkeypatch.setattr(rl_train, "_export_peft_adapter", lambda *a, **kw: None)
     monkeypatch.setattr(rl_train, "_stamp_adapter_dir_provenance", lambda *a, **kw: None)
 
@@ -837,7 +927,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
     monkeypatch.setattr(W, "SEED", 42, raising=False)
     monkeypatch.setattr(W, "THINKING", False, raising=False)
     monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
+    monkeypatch.setattr(W, "grpo_overrides", dict, raising=False)
     monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
     monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
     monkeypatch.setattr(rl_train, "seed_training_rngs", lambda seed: None)
@@ -917,7 +1007,9 @@ def test_the_resolved_eager_flag_reaches_the_verl_config():
     assert "enforce_eager=enforce_eager," in built
     # and the capability it decides from is the one probe both rollout decisions share.
     assert "verl_cc = resolve_verl_device_capability(python_bin)" in built
-    assert "resolve_blackwell_attention_backends(\n            python_bin, verl_cc\n        )" in built
+    assert (
+        "resolve_blackwell_attention_backends(\n            python_bin, verl_cc\n        )" in built
+    )
     cfg = inspect.getsource(rl_train._build_verl_training_cfg)
     assert '"enforce_eager": enforce_eager,' in cfg
 
@@ -1009,7 +1101,9 @@ def test_render_reward_module_missing_index_raises():
 def test_render_reward_module_rejects_invalid_index(monkeypatch, index):
     monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", "http://unused")
     ns: dict = {}
-    exec(compile(rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns)
+    exec(
+        compile(rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns
+    )
     monkeypatch.setattr(
         ns["urllib"].request,
         "urlopen",
@@ -1030,10 +1124,15 @@ def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
     try:
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
         ns: dict = {}
-        exec(compile(rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns)
-        assert ns["compute_score"](
-            "flash_env", "answer", "unused", extra_info={"index": index}
-        ) == 3.0
+        exec(
+            compile(
+                rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"
+            ),
+            ns,
+        )
+        assert (
+            ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": index}) == 3.0
+        )
         assert scored == [(1, "answer")]
     finally:
         server.shutdown()
@@ -1129,13 +1228,23 @@ def _identity_graded(monkeypatch):
 @pytest.mark.usefixtures("_identity_graded")
 def test_score_single_turn_breakdown_and_reward_env():
     s = rl_train.score_single_turn(
-        _BreakdownEnv(), "7", {"gt": "7"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0,
+        _BreakdownEnv(),
+        "7",
+        {"gt": "7"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
     )
     assert s == 1.0
     s2 = rl_train.score_single_turn(
-        _RewardOnlyEnv(), "the answer is 7", {"gt": "7"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0,
+        _RewardOnlyEnv(),
+        "the answer is 7",
+        {"gt": "7"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
     )
     assert s2 == 2.5
 
@@ -1144,8 +1253,13 @@ def test_score_single_turn_breakdown_and_reward_env():
 def test_score_single_turn_applies_thinking_penalty():
     # base reward 1.0 minus think_penalty(0.1) * think_token_count(3) = 0.7
     s = rl_train.score_single_turn(
-        _BreakdownEnv(), "7", {"gt": "7"}, tok=object(), thinking=True,
-        prompt_opened_thinking=True, think_penalty=0.1,
+        _BreakdownEnv(),
+        "7",
+        {"gt": "7"},
+        tok=object(),
+        thinking=True,
+        prompt_opened_thinking=True,
+        think_penalty=0.1,
     )
     assert abs(s - 0.7) < 1e-9
 
@@ -1153,8 +1267,13 @@ def test_score_single_turn_applies_thinking_penalty():
 @pytest.mark.usefixtures("_identity_graded")
 def test_score_single_turn_env_error_is_zero():
     s = rl_train.score_single_turn(
-        _RaisingEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0,
+        _RaisingEnv(),
+        "x",
+        {"gt": "1"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
     )
     assert s == 0.0
 
@@ -1184,8 +1303,14 @@ def test_an_unscorable_reward_is_masked_before_it_reaches_verl(env):
     """
     breakdowns: list[dict[str, float] | None] = []
     s = rl_train.score_single_turn(
-        env, "x", {"gt": "1"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+        env,
+        "x",
+        {"gt": "1"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+        breakdowns=breakdowns,
     )
     assert s == 0.0
     assert math.isfinite(s)
@@ -1202,8 +1327,13 @@ def test_an_infinite_reward_is_masked_too_even_with_a_penalty_applied():
             return float("inf")
 
     s = rl_train.score_single_turn(
-        _InfEnv(), "x", {"gt": "1"}, tok=object(), thinking=True,
-        prompt_opened_thinking=True, think_penalty=0.1,
+        _InfEnv(),
+        "x",
+        {"gt": "1"},
+        tok=object(),
+        thinking=True,
+        prompt_opened_thinking=True,
+        think_penalty=0.1,
     )
     assert s == 0.0
 
@@ -1214,8 +1344,14 @@ def test_an_unscorable_reward_still_re_raises_for_the_latency_profiler():
     # is not returning a usable number, or it reports a broken grader as fast and confident.
     with pytest.raises(ValueError, match="non-finite"):
         rl_train.score_single_turn(
-            _UnscorableRewardEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
-            prompt_opened_thinking=False, think_penalty=0.0, raise_on_error=True,
+            _UnscorableRewardEnv(),
+            "x",
+            {"gt": "1"},
+            tok=None,
+            thinking=False,
+            prompt_opened_thinking=False,
+            think_penalty=0.0,
+            raise_on_error=True,
         )
 
 
@@ -1246,8 +1382,14 @@ def test_a_capability_probe_that_raises_scores_zero_and_counts_as_a_failed_gradi
     """
     breakdowns: list[dict[str, float] | None] = []
     s = rl_train.score_single_turn(
-        _RaisingProbeEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+        _RaisingProbeEnv(),
+        "x",
+        {"gt": "1"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+        breakdowns=breakdowns,
     )
 
     assert s == 0.0
@@ -1260,8 +1402,14 @@ def test_a_raising_probe_still_re_raises_for_the_latency_profiler():
     # guard must not swallow the probe's fault for that caller either.
     with pytest.raises(RuntimeError, match="scoring sidecar is gone"):
         rl_train.score_single_turn(
-            _RaisingProbeEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
-            prompt_opened_thinking=False, think_penalty=0.0, raise_on_error=True,
+            _RaisingProbeEnv(),
+            "x",
+            {"gt": "1"},
+            tok=None,
+            thinking=False,
+            prompt_opened_thinking=False,
+            think_penalty=0.0,
+            raise_on_error=True,
         )
 
 
@@ -1316,8 +1464,14 @@ class _RaisingRewardOnlyEnv:
 def test_score_single_turn_collects_the_named_breakdown_for_reward_metrics():
     breakdowns: list[dict | None] = []
     score = rl_train.score_single_turn(
-        _NamedBreakdownEnv(), "7", {"gt": "7"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+        _NamedBreakdownEnv(),
+        "7",
+        {"gt": "7"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+        breakdowns=breakdowns,
     )
     assert score == 1.0
     assert breakdowns == [{"success": 1.0, "quality": 0.5, "total": 1.0}]
@@ -1330,8 +1484,14 @@ def test_a_scalar_reward_env_contributes_no_breakdown_at_all():
     # shapes -- or a run with none at all -- would publish every name shrunk toward 0.
     breakdowns: list[dict | None] = []
     score = rl_train.score_single_turn(
-        _RewardOnlyEnv(), "the answer is 7", {"gt": "7"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+        _RewardOnlyEnv(),
+        "the answer is 7",
+        {"gt": "7"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+        breakdowns=breakdowns,
     )
     assert score == 2.5
     assert breakdowns == []
@@ -1345,8 +1505,14 @@ def test_a_scalar_reward_env_contributes_nothing_when_its_grading_fails_either()
     # flat 0 for an env that never reported them.
     breakdowns: list[dict | None] = []
     score = rl_train.score_single_turn(
-        _RaisingRewardOnlyEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+        _RaisingRewardOnlyEnv(),
+        "x",
+        {"gt": "1"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+        breakdowns=breakdowns,
     )
     assert score == 0.0
     assert breakdowns == []
@@ -1359,8 +1525,14 @@ def test_a_failed_grading_records_none_so_it_counts_as_a_zero():
     # surviving completions' average as if the whole generation had earned it.
     breakdowns: list[dict | None] = []
     score = rl_train.score_single_turn(
-        _RaisingEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+        _RaisingEnv(),
+        "x",
+        {"gt": "1"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+        breakdowns=breakdowns,
     )
     assert score == 0.0
     assert breakdowns == [None]
@@ -1372,8 +1544,14 @@ def test_an_unusable_total_records_no_named_components():
     # components would report metrics for a completion that earned nothing.
     breakdowns: list[dict | None] = []
     score = rl_train.score_single_turn(
-        _BadTotalEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
-        prompt_opened_thinking=False, think_penalty=0.0, breakdowns=breakdowns,
+        _BadTotalEnv(),
+        "x",
+        {"gt": "1"},
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+        breakdowns=breakdowns,
     )
     assert score == 0.0
     assert breakdowns == [None]
@@ -1381,9 +1559,7 @@ def test_an_unusable_total_records_no_named_components():
 
 # ------------------------------- reward rpc bridge -------------------------------
 def test_reward_server_round_trip():
-    server, url = rl_train.start_reward_server(
-        lambda idx, s: float(idx) + len(s), example_count=4
-    )
+    server, url = rl_train.start_reward_server(lambda idx, s: float(idx) + len(s), example_count=4)
     try:
         body = json.dumps({"index": 3, "solution_str": "abcd"}).encode()
         req = urllib.request.Request(
@@ -1816,9 +1992,9 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
         "verl.experimental.agent_loop": package,
         "verl.experimental.agent_loop.agent_loop": agent_loop_module,
     }
-    source = rl_train.render_stop_sequences_shim(("</answer>",)) + rl_train.render_image_pad_ban_shim(
-        151655
-    )
+    source = rl_train.render_stop_sequences_shim(
+        ("</answer>",)
+    ) + rl_train.render_image_pad_ban_shim(151655)
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
@@ -1837,9 +2013,9 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
 def test_image_pad_ban_shim_is_composed_into_the_sitecustomize(monkeypatch):
     source = inspect.getsource(rl_train.run_rl_train)
     assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in source
-    combined = rl_train.render_stop_sequences_shim(("</answer>",)) + rl_train.render_image_pad_ban_shim(
-        151655
-    )
+    combined = rl_train.render_stop_sequences_shim(
+        ("</answer>",)
+    ) + rl_train.render_image_pad_ban_shim(151655)
     compile(combined, "sitecustomize.py", "exec")
 
 
@@ -1849,9 +2025,7 @@ def test_stop_sequences_gate_off_truncated_completion_masking():
     # re-derive it.
     source = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert "_w.grpo_mask_truncated_completions(_t)" in source
-    assert not W.grpo_mask_truncated_completions(
-        SimpleNamespace(stop_sequences=("</answer>",))
-    )
+    assert not W.grpo_mask_truncated_completions(SimpleNamespace(stop_sequences=("</answer>",)))
     assert W.grpo_mask_truncated_completions(SimpleNamespace(stop_sequences=()))
 
 
@@ -1888,9 +2062,7 @@ def test_exact_save_steps_shim_keeps_required_steps_and_the_final_step():
     source = rl_train.render_exact_save_steps_shim((7, 13), 20)
     assert "_flash_required_save_steps = frozenset((7, 13))" in source
     assert "_flash_total_steps = 20" in source
-    assert (
-        "if step not in _flash_required_save_steps and step != _flash_total_steps:" in source
-    )
+    assert "if step not in _flash_required_save_steps and step != _flash_total_steps:" in source
     # it reads the step off the instance: verl's _save_checkpoint takes no step argument.
     assert "step = int(self.global_steps)" in source
 
@@ -1989,9 +2161,9 @@ def test_kl_ref_adapter_shim_is_wired_only_when_warm_start_and_kl_are_both_on():
     source = inspect.getsource(rl_train.run_rl_train)
     assert "render_kl_ref_adapter_shim(" in source
     assert 'bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0' in source
-    combined = rl_train.render_exact_save_steps_shim((7, 13), 20) + rl_train.render_kl_ref_adapter_shim(
-        True
-    )
+    combined = rl_train.render_exact_save_steps_shim(
+        (7, 13), 20
+    ) + rl_train.render_kl_ref_adapter_shim(True)
     compile(combined, "sitecustomize.py", "exec")
 
 
@@ -2105,7 +2277,9 @@ def test_reasoning_parser_override_needs_both_thinking_and_a_constraint():
         {"thinking": True, "structured_outputs": None},
     ):
         assert not [
-            o for o in rl_train.build_verl_overrides(_overrides_cfg(**off)) if "reasoning_parser" in o
+            o
+            for o in rl_train.build_verl_overrides(_overrides_cfg(**off))
+            if "reasoning_parser" in o
         ]
 
 
@@ -2156,7 +2330,8 @@ def test_resolve_verl_loggers_console_when_no_api_key(monkeypatch):
     # no WANDB_API_KEY -> console only, and no wandb probe of the verl interpreter.
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     monkeypatch.setattr(
-        rl_train.subprocess, "run",
+        rl_train.subprocess,
+        "run",
         lambda *a, **k: pytest.fail("must not probe verl env without an api key"),
     )
     assert rl_train._resolve_verl_loggers("/verl/bin/python") == "console"
@@ -2332,9 +2507,9 @@ def test_advantage_spread_is_parsed_from_a_real_verl_step_line():
     varied = line.replace("critic/advantages/max:0.0", "critic/advantages/max:0.67").replace(
         "critic/advantages/min:0.0", "critic/advantages/min:-0.33"
     )
-    spread = backend_common.parse_verl_metric(varied, "critic/advantages/max") - backend_common.parse_verl_metric(
-        varied, "critic/advantages/min"
-    )
+    spread = backend_common.parse_verl_metric(
+        varied, "critic/advantages/max"
+    ) - backend_common.parse_verl_metric(varied, "critic/advantages/min")
     assert spread > 0.0
     rl_train._check_grpo_had_a_gradient([0.5], [spread])
 
@@ -2424,7 +2599,9 @@ def test_run_rl_train_gates_midtraining_deployables_and_exempts_resumes():
     assert "if resume_step" in source.split("had_gradient=(")[1].split(")")[0] + ")"
     # the spread series must be declared before the uploader closes over it, or the closure raises
     # NameError the first time the drain thread consults it.
-    assert source.index("adv_spread_history: list[float] = []") < source.index("_VerlResumeUploader(")
+    assert source.index("adv_spread_history: list[float] = []") < source.index(
+        "_VerlResumeUploader("
+    )
 
 
 def _patch_stage_and_publish(monkeypatch, staged: list[int], published: list[int]) -> None:
@@ -2460,13 +2637,17 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
     published: list[int] = []
     spread: list[float] = []
     monkeypatch.setattr(
-        rl_train._w, "upload_resume_checkpoint",
-        lambda step, path, **k: uploaded.append(int(step)), raising=False,
+        rl_train._w,
+        "upload_resume_checkpoint",
+        lambda step, path, **k: uploaded.append(int(step)),
+        raising=False,
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 3)
     uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(3,),
+        str(local_dir),
+        resume_step=0,
+        required_steps=(3,),
         had_gradient=lambda: any(s > 0.0 for s in spread),
     )
     uploader.start()
@@ -2649,6 +2830,7 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
     monkeypatch.setattr(
         rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
+
     def _stage_requiring_its_source(self, step, path):
         # the real _stage_deployable runs model_merger over <path>/actor, so it cannot succeed once
         # verl has pruned that directory. asserting it here is what makes this test fail on the
@@ -2800,7 +2982,8 @@ def _notes_inp():
         "temperature": 1.0,
         "top_p": 1.0,
         "ppo_epochs": 1,
-        "model_id": "Qwen/Qwen3-4B", "verl_total_epochs": 3,
+        "model_id": "Qwen/Qwen3-4B",
+        "verl_total_epochs": 3,
         "seed": 7,
         "max_completion": 512,
         "prompts_per_step": 8,
@@ -3142,9 +3325,7 @@ def test_multimodal_prompts_carry_descriptors_and_rendered_text(monkeypatch):
     # the parquet writer needs each prompt's image DESCRIPTORS and the thinking probe needs the
     # RENDERED text. both are produced only on the multimodal branch, so a branch that returned
     # bare messages would break the writer downstream rather than here.
-    inp = _capability_resolve(
-        monkeypatch, _capability_env(image_uri=_capability_image_uri())
-    )
+    inp = _capability_resolve(monkeypatch, _capability_env(image_uri=_capability_image_uri()))
     first = inp["prompts"][0]
     assert len(first["images"]) == 1
     assert first["rendered"] == "prompt"
@@ -3263,7 +3444,9 @@ def test_multi_turn_child_env_carries_every_variable_the_loop_reads():
         _multi_turn_inp(), reward_url="http://127.0.0.1:9/", thinking=False
     )
     read_by_child = set(
-        re.findall(r"os\.environ(?:\.get)?[\[(]\"(FLASH_VERL_[A-Z_]+)\"", inspect.getsource(grpo_multiturn))
+        re.findall(
+            r"os\.environ(?:\.get)?[\[(]\"(FLASH_VERL_[A-Z_]+)\"", inspect.getsource(grpo_multiturn)
+        )
     )
     assert read_by_child, "the loop reads no FLASH_VERL_* variable; this test found nothing to pin"
     assert read_by_child <= set(emitted), (
@@ -3916,9 +4099,7 @@ def test_a_failing_batch_fails_every_episode_in_it_rather_than_hanging_them():
     first.start()
     assert entered.wait(timeout=30), "the scorer never reached the env"
 
-    rest = [
-        threading.Thread(target=lambda i=i: _record(f"s{i}"), daemon=True) for i in range(1, 5)
-    ]
+    rest = [threading.Thread(target=lambda i=i: _record(f"s{i}"), daemon=True) for i in range(1, 5)]
     for thread in rest:
         thread.start()
 
@@ -4026,6 +4207,7 @@ def test_bridge_routes_are_served_alongside_single_turn_scoring():
         lambda index, text: 1.0, example_count=2, multi_turn_bridge=bridge
     )
     try:
+
         def _post(path, payload):
             request = urllib.request.Request(
                 url + path,
@@ -4053,7 +4235,7 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
     assert src.count("MultiTurnBridge(") == 1
     assert (
         "MultiTurnBridge( env, rollout_examples, "
-        '# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. '
+        "# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. "
         'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
         'per_turn_credit=bool(inp["per_turn_credit"]), '
         "on_episode_scored=observability.record, )" in src
@@ -4105,7 +4287,9 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
         project_name="flash",
         experiment_name="flash-rl-run123",
     )
-    assert f"data.max_response_length={inp['max_response_len']}" in rl_train.build_verl_overrides(cfg)
+    assert f"data.max_response_length={inp['max_response_len']}" in rl_train.build_verl_overrides(
+        cfg
+    )
 
 
 # ---------------------- measured reward latency in train_meta ----------------------
@@ -4149,7 +4333,7 @@ def _resolved_inputs_for_notes(monkeypatch):
     monkeypatch.setattr(W, "SEED", 42, raising=False)
     monkeypatch.setattr(W, "THINKING", False, raising=False)
     monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", lambda: {}, raising=False)
+    monkeypatch.setattr(W, "grpo_overrides", dict, raising=False)
     monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
     monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
     monkeypatch.setattr(rl_train, "seed_training_rngs", lambda seed: None)
@@ -4685,7 +4869,9 @@ def test_a_generation_that_completes_before_the_previous_step_line_is_not_lost()
 
     buffer.close_generation(1)
     first = buffer.heartbeat_fields()
-    assert first["reward_metrics"]["success"] == 1.0, "generation 1 was overwritten before it published"
+    assert first["reward_metrics"]["success"] == 1.0, (
+        "generation 1 was overwritten before it published"
+    )
     assert [s["completion"] for s in first["sampled_completions"]] == ["7", "7"]
     assert {s["generated_at_step"] for s in first["sampled_completions"]} == {1}
 
@@ -4801,9 +4987,9 @@ def test_the_step_line_names_the_generation_the_count_already_sealed():
     # verl resumed from a checkpoint: its first logged step is 41, not the buffer's internal 1.
     buffer.close_generation(41)
 
-    assert {
-        s["generated_at_step"] for s in buffer.heartbeat_fields()["sampled_completions"]
-    } == {41}
+    assert {s["generated_at_step"] for s in buffer.heartbeat_fields()["sampled_completions"]} == {
+        41
+    }
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -4880,7 +5066,7 @@ def test_a_component_whose_values_are_all_unusable_is_reported_as_zero_not_dropp
 
 @pytest.mark.usefixtures("_identity_graded")
 def test_a_generation_that_reports_no_components_at_all_leaves_the_metrics_standing():
-    """"No breakdowns" and "breakdowns that all failed" look the same at the seal but mean opposite
+    """ "No breakdowns" and "breakdowns that all failed" look the same at the seal but mean opposite
     things. A multi-turn episode grades to a scalar and never reports components, so zeroing the
     known metrics for it would publish a scoring outage the env never had -- and the two record
     paths share one buffer, so a run that scores some rows per-completion and some per-episode
@@ -5154,8 +5340,7 @@ def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
     as happily on a shim that never installed itself.
     """
     import sys
-    from types import ModuleType
-    from types import SimpleNamespace as NS
+    from types import ModuleType, SimpleNamespace
 
     batch_size = len(uids)
     width = episode_advantages.shape[1]
@@ -5168,7 +5353,7 @@ def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
     batch = {"advantages": episode_advantages}
     if response_mask is not None:
         batch["response_mask"] = response_mask
-    data = NS(
+    data = SimpleNamespace(
         batch=batch,
         non_tensor_batch={
             "uid": np.array(uids, dtype=object),
@@ -5224,9 +5409,7 @@ def test_per_turn_credit_shim_centres_each_turn_against_its_group_sibling():
         (((0, 2), (2, 4)), (1.0, 0.0)),
         (((0, 2), (2, 4)), (0.0, 1.0)),
     ]
-    advantages = _run_per_turn_shim(
-        rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32)
-    )
+    advantages = _run_per_turn_shim(rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32))
     assert advantages[0].tolist() == [0.5, 0.5, -0.5, -0.5]
     assert advantages[1].tolist() == [-0.5, -0.5, 0.5, 0.5]
 
@@ -5250,13 +5433,17 @@ def test_per_turn_credit_shim_reproduces_the_reference_advantages():
     spans = [[(0, 3), (3, 5)], [(0, 2), (2, 6)]]
     turns = [[0.25, 0.75], [1.0, 0.5]]
     expected = torch.tensor(
-        [[-0.375, -0.375, -0.375, 0.125, 0.125, 0.0],
-         [0.375, 0.375, -0.125, -0.125, -0.125, -0.125]],
+        [
+            [-0.375, -0.375, -0.375, 0.125, 0.125, 0.0],
+            [0.375, 0.375, -0.125, -0.125, -0.125, -0.125],
+        ],
         dtype=torch.float32,
     )
     got = _run_per_turn_shim(
-        [(tuple(map(tuple, spans[0])), tuple(turns[0])),
-         (tuple(map(tuple, spans[1])), tuple(turns[1]))],
+        [
+            (tuple(map(tuple, spans[0])), tuple(turns[0])),
+            (tuple(map(tuple, spans[1])), tuple(turns[1])),
+        ],
         ["p0", "p0"],
         # the episode tensor is what per-turn credit REPLACES, so its value cannot affect the
         # result; zeros make an accidental passthrough visible as a row of zeros.
@@ -5316,9 +5503,7 @@ def test_per_turn_credit_shim_ignores_a_turn_no_group_member_emitted():
         (((0, 2), (2, 4)), (1.0, 2.0)),
         (((0, 2), (2, 2)), (0.0, 8.0)),
     ]
-    advantages = _run_per_turn_shim(
-        rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32)
-    )
+    advantages = _run_per_turn_shim(rows, ["p0", "p0"], torch.zeros((2, 4), dtype=torch.float32))
     assert advantages[0].tolist() == [0.5, 0.5, 0.0, 0.0]
     assert advantages[1].tolist() == [-0.5, -0.5, 0.0, 0.0]
 
@@ -5357,13 +5542,15 @@ def test_per_turn_credit_shim_passes_through_a_batch_without_per_turn_metadata()
     # grpo's tensor untouched rather than zeroing a batch it cannot credit.
     pytest.importorskip("torch")
     import sys
-    from types import ModuleType
-    from types import SimpleNamespace as NS
+    from types import ModuleType, SimpleNamespace
 
     import torch
 
     episode = torch.full((2, 3), 0.4, dtype=torch.float32)
-    data = NS(batch={"advantages": episode.clone()}, non_tensor_batch={"uid": np.array(["p0", "p0"], dtype=object)})
+    data = SimpleNamespace(
+        batch={"advantages": episode.clone()},
+        non_tensor_batch={"uid": np.array(["p0", "p0"], dtype=object)},
+    )
     ray_trainer = ModuleType("verl.trainer.ppo.ray_trainer")
     ray_trainer.compute_advantage = lambda payload, *args, **kwargs: payload
     ppo = ModuleType("verl.trainer.ppo")

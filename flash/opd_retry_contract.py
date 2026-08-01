@@ -108,13 +108,9 @@ def validate_opd_resume_state_metadata(
     """Validate the dependency-free JSON contract for one OPD resume checkpoint."""
     if not isinstance(state, dict):
         raise ValueError("opd resume state must be a json object")
-    contract_version = _nonnegative_integer(
-        state.get("contract_version"), field="contract_version"
-    )
+    contract_version = _nonnegative_integer(state.get("contract_version"), field="contract_version")
     if contract_version != OPD_RESUME_STATE_VERSION:
-        raise ValueError(
-            f"opd resume state contract_version must equal {OPD_RESUME_STATE_VERSION}"
-        )
+        raise ValueError(f"opd resume state contract_version must equal {OPD_RESUME_STATE_VERSION}")
     expected = _nonnegative_integer(expected_seed, field="expected seed")
     seed = _nonnegative_integer(state.get("seed"), field="seed")
     if seed != expected:
@@ -134,8 +130,13 @@ def validate_opd_resume_state_metadata(
         raise ValueError("opd resume state step must be at least opt_steps")
     _nonnegative_integer(state.get("rollout_seed_ordinal"), field="rollout_seed_ordinal")
     fingerprint = state.get("prompt_pool_fingerprint")
-    if not isinstance(fingerprint, str) or _OPD_PROMPT_FINGERPRINT_RE.fullmatch(fingerprint) is None:
-        raise ValueError("opd resume state prompt_pool_fingerprint must be 64 lowercase hex characters")
+    if (
+        not isinstance(fingerprint, str)
+        or _OPD_PROMPT_FINGERPRINT_RE.fullmatch(fingerprint) is None
+    ):
+        raise ValueError(
+            "opd resume state prompt_pool_fingerprint must be 64 lowercase hex characters"
+        )
 
     for field, field_type in _OPD_RESUME_ACCOUNTING_SCHEMA.items():
         value = state.get(field)

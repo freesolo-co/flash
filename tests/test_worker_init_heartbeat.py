@@ -39,7 +39,7 @@ def fast_nvidia(monkeypatch):
     monkeypatch.setattr(
         diagnostics, "_query_nvidia_gpu", lambda: {"gpu_util_pct": 0, "device_name": "FAKE-GPU"}
     )
-    monkeypatch.setattr(diagnostics, "_query_nvidia_processes", lambda: [])
+    monkeypatch.setattr(diagnostics, "_query_nvidia_processes", list)
 
 
 def _install_blocking_torch(monkeypatch, gate: threading.Event) -> None:
@@ -141,7 +141,9 @@ def test_liveness_heartbeat_emits_liveness_pings_nvidia_smi_only(monkeypatch):
     with hb.liveness_heartbeat("init_stage"):
         time.sleep(0.2)
     assert emitted, "must emit while alive"
-    assert all(v is True for v in emitted), "bare liveness_heartbeat emits LIVENESS pings (liveness=True)"
+    assert all(v is True for v in emitted), (
+        "bare liveness_heartbeat emits LIVENESS pings (liveness=True)"
+    )
     assert diag, "diagnostics collected"
     assert all(it is False for it in diag), "must use gpu_diagnostics(include_torch=False)"
 
@@ -163,7 +165,9 @@ def test_liveness_heartbeat_progress_step_stamps_step(monkeypatch):
     step gate and cancel billing see the true step even when the daemon wins the upload slot."""
     hb, w, _ = _liveness_env(monkeypatch)
     seen: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: seen.append((k.get("liveness"), k.get("step"))))
+    monkeypatch.setattr(
+        w, "heartbeat", lambda s, **k: seen.append((k.get("liveness"), k.get("step")))
+    )
     vals = iter([3, 7])  # advances once, then stalls at 7
     with hb.liveness_heartbeat("sft_step", progress=lambda: next(vals, 7), progress_step=True):
         time.sleep(0.2)
@@ -181,7 +185,9 @@ def test_liveness_heartbeat_first_progress_sample_is_baseline_not_progress(monke
     setup-grace re-arm. Only an ADVANCE past the first-seen value is progress."""
     hb, w, _ = _liveness_env(monkeypatch)
     seen: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: seen.append((k.get("liveness"), k.get("step"))))
+    monkeypatch.setattr(
+        w, "heartbeat", lambda s, **k: seen.append((k.get("liveness"), k.get("step")))
+    )
     with hb.liveness_heartbeat("rl_step", progress=lambda: 57, progress_step=True):
         time.sleep(0.2)
     assert seen
@@ -199,7 +205,9 @@ def test_liveness_heartbeat_keepalive_forces_real_heartbeats_on_constant_progres
     heartbeat every tick, still stamped with the step so a cancel landing here still bills it."""
     hb, w, _ = _liveness_env(monkeypatch)
     seen: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: seen.append((k.get("liveness"), k.get("step"))))
+    monkeypatch.setattr(
+        w, "heartbeat", lambda s, **k: seen.append((k.get("liveness"), k.get("step")))
+    )
     with hb.liveness_heartbeat(
         "checkpoint_uploading", progress=lambda: 42, progress_step=True, keepalive=True
     ):
@@ -275,7 +283,9 @@ def test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges(monkeypatch):
     t0 = time.time()
     with hb.liveness_heartbeat("init_stage"):
         time.sleep(0.1)
-    assert time.time() - t0 < 5, "exit must be bounded by the join timeout, not wait on a wedged emit"
+    assert time.time() - t0 < 5, (
+        "exit must be bounded by the join timeout, not wait on a wedged emit"
+    )
 
 
 def test_liveness_heartbeat_rechecks_done_after_diagnostics():
@@ -283,7 +293,9 @@ def test_liveness_heartbeat_rechecks_done_after_diagnostics():
     daemon must re-check done BETWEEN diagnostics and the emit, so no stale stage lands afterward."""
     hb = importlib.import_module("flash.engine.worker.heartbeat")
     src = inspect.getsource(inspect.unwrap(hb.liveness_heartbeat))
-    between = src[src.index("gpu_diagnostics(include_torch=False)") : src.index("_w.heartbeat(stage")]
+    between = src[
+        src.index("gpu_diagnostics(include_torch=False)") : src.index("_w.heartbeat(stage")
+    ]
     assert "done.is_set()" in between, "must re-check done.is_set() between diagnostics and emit"
 
 
@@ -469,8 +481,12 @@ def test_opd_step_post_update_heartbeat_forces_through_throttle(monkeypatch):
     assert len(uploads) == 1
     ne.heartbeat("opd_step", step=6, samples_done=2)  # normal ping within 60s -> throttled out
     assert len(uploads) == 1, "a non-forced opd_step within the interval must be throttled"
-    ne.heartbeat("opd_step", step=6, loss=0.1, coverage=1.0, force=True)  # post-update forces through
-    assert len(uploads) == 2, "force=True must commit the stepped post-update ping despite the throttle"
+    ne.heartbeat(
+        "opd_step", step=6, loss=0.1, coverage=1.0, force=True
+    )  # post-update forces through
+    assert len(uploads) == 2, (
+        "force=True must commit the stepped post-update ping despite the throttle"
+    )
 
 
 @pytest.mark.parametrize("stage", ["rl_step", "opd_step"])
@@ -605,12 +621,16 @@ def test_forced_opd_step_burst_within_floor_coalesces_to_protect_commit_cap(monk
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
     monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
-    ne._HB_LAST_UPLOAD = time.time()  # a recent upload -> the 900s regular throttle blocks every ping
+    ne._HB_LAST_UPLOAD = (
+        time.time()
+    )  # a recent upload -> the 900s regular throttle blocks every ping
     ne._HB_LAST_FORCED_UPLOAD = 0.0  # forced clock cold -> only the first advance punches through
     ne._HB_LAST_COMMITTED_STEP = 0
     for stepv in (1, 2, 3, 4, 5):
         ne.heartbeat("opd_step", step=stepv, loss=0.1, force=True)
-    assert len(uploads) == 1, "a sub-floor burst of forced step-advances must commit once, not per step"
+    assert len(uploads) == 1, (
+        "a sub-floor burst of forced step-advances must commit once, not per step"
+    )
     assert ne._HB_LAST_COMMITTED_STEP == 1
 
 
@@ -625,13 +645,21 @@ def test_force_commit_via_regular_throttle_arms_the_floor(monkeypatch):
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
     monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
-    ne._HB_LAST_UPLOAD = 0.0  # regular throttle is DUE -> the first force commits via it, not the bypass
+    ne._HB_LAST_UPLOAD = (
+        0.0  # regular throttle is DUE -> the first force commits via it, not the bypass
+    )
     ne._HB_LAST_FORCED_UPLOAD = 0.0
     ne._HB_LAST_COMMITTED_STEP = 0
-    ne.heartbeat("opd_step", step=1, loss=0.1, force=True)  # commits via the elapsed regular throttle
+    ne.heartbeat(
+        "opd_step", step=1, loss=0.1, force=True
+    )  # commits via the elapsed regular throttle
     assert len(uploads) == 1
-    ne.heartbeat("opd_step", step=2, loss=0.1, force=True)  # sub-floor advance -> must be COALESCED now
-    assert len(uploads) == 1, "the regular-path force commit must arm the floor so the next is coalesced"
+    ne.heartbeat(
+        "opd_step", step=2, loss=0.1, force=True
+    )  # sub-floor advance -> must be COALESCED now
+    assert len(uploads) == 1, (
+        "the regular-path force commit must arm the floor so the next is coalesced"
+    )
     assert ne._HB_LAST_COMMITTED_STEP == 1
 
 
@@ -682,10 +710,14 @@ def test_forced_opd_step_commit_failure_rolls_back_committed_step(monkeypatch):
     forced_clock_after_2 = ne._HB_LAST_FORCED_UPLOAD  # any force=True commit arms the forced clock
     fail["on"] = True
     ne.heartbeat("opd_step", step=3, force=True)  # forces (3>2) within throttle, but upload FAILS
-    assert ne._HB_LAST_COMMITTED_STEP == 2, "a failed forced commit must roll back the committed step"
+    assert ne._HB_LAST_COMMITTED_STEP == 2, (
+        "a failed forced commit must roll back the committed step"
+    )
     assert forced_clock_after_2 == ne._HB_LAST_FORCED_UPLOAD, "and roll back the forced clock"
     fail["on"] = False
-    ne.heartbeat("opd_step", step=3, force=True)  # retry: still throttled by time, must force on 3>2
+    ne.heartbeat(
+        "opd_step", step=3, force=True
+    )  # retry: still throttled by time, must force on 3>2
     assert ne._HB_LAST_COMMITTED_STEP == 3
     assert len(attempts) == 3, "the retry must re-attempt the upload, not be throttled/blocked out"
 
@@ -895,10 +927,14 @@ def test_is_training_heartbeat_gates_setup_vs_training():
     # the silent cold first step keeps setup grace.
     assert is_training_heartbeat("rl_step", 0) is False
     assert is_training_heartbeat("sft_step", 0) is False
-    assert is_training_heartbeat("opd_step", 0) is False  # opd first-step in-progress ping (opt_steps==0)
+    assert (
+        is_training_heartbeat("opd_step", 0) is False
+    )  # opd first-step in-progress ping (opt_steps==0)
     assert is_training_heartbeat("rl_step", 1) is True
     assert is_training_heartbeat("sft_step", 3) is True
-    assert is_training_heartbeat("opd_step", 1) is True  # tightens once a real optimizer update lands
+    assert (
+        is_training_heartbeat("opd_step", 1) is True
+    )  # tightens once a real optimizer update lands
     # A malformed/missing step on a per-step stage is treated as 0 (must not raise) -> stays setup.
     assert is_training_heartbeat("rl_step", None) is False
     assert is_training_heartbeat("sft_step", "not-a-number") is False
@@ -1040,6 +1076,19 @@ def test_rl_warmstart_adapter_download_is_wrapped_in_liveness_heartbeat():
     )
 
 
+def test_sft_configuring_is_a_setup_stage_on_the_tight_liveness_cadence():
+    """The config span's stage must behave like every other pre-training liveness stage: it keeps the
+    wide setup grace (it has not even loaded the model yet), refreshes status on the faster setup
+    cadence, and is throttled so its 30s re-emit can't blow the HF commit cap."""
+    import flash.engine.worker as ne
+    from flash.providers._poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+
+    assert "sft_configuring" in SETUP_HEARTBEAT_STAGES
+    assert is_training_heartbeat("sft_configuring", 0) is False
+    assert "sft_configuring" in ne._HB_SETUP_LIVENESS_STAGES
+    assert "sft_configuring" in ne._HB_THROTTLED_STAGES
+
+
 def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
     from flash.engine.worker import hf
 
@@ -1078,5 +1127,3 @@ def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
     assert all("\n" not in name for name in bounded)
     assert "reward" not in bounded
     assert "step" not in bounded
-
-
