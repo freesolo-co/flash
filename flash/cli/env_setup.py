@@ -8,6 +8,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+from flash.envs.evaluations import _DEFAULT_EVALUATIONS_PATH
+
 from . import render, traces
 from .training_doc import TRAINING_MD
 
@@ -73,6 +75,121 @@ _STARTER_DATASET_JSONL = """\
 {"input":"What is 2 + 2?","output":"4"}
 {"input":"What is 3 + 5?","output":"8"}
 """
+
+_STARTER_EVALUATIONS_PY = '''\
+"""Held-out checks for this environment.
+
+Run them against a deployed model with `flash env eval TARGET .`. This file is
+published beside environment.py by `flash env push --project PROJECT_UUID --name my-env .`.
+"""
+
+from __future__ import annotations
+
+from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult
+
+
+class StarterEvaluationSuite(BaseEvalSuite):
+    name = "starter"
+
+    def __init__(self, environment=None):
+        self.environment = environment
+
+    def cases(self):
+        return [EvalCase(id="addition", input="What is 7 + 5?", expected="12")]
+
+    def score(self, case, response):
+        if self.environment is None:
+            return super().score(case, response)
+        example = dict(case.metadata or {})
+        example.update(input=case.input, output=case.expected)
+        # pass/fail comes from grade(), the environment's own success decision, not from the
+        # reward being positive. a shaped reward pays partial credit for a wrong answer -- the
+        # multi-turn starter scores a near miss as closeness * 0.5 with success=False -- and
+        # returning the bare float would report every such case as passing.
+        #
+        # this scores the response twice. if your scorer calls a judge or any other paid
+        # service, score once and build the EvalResult from that single result instead.
+        return EvalResult(
+            case_id=case.id or "case",
+            passed=self.environment.grade(response, example),
+            score=float(self.environment.reward(response, example)),
+            response=response,
+        )
+
+
+def load_evaluations(environment=None):
+    return [StarterEvaluationSuite(environment)]
+'''
+
+_STARTER_EVALUATIONS_MULTITURN_PY = '''\
+"""Held-out checks for this multi-turn environment.
+
+Run them against a deployed model with `flash env eval TARGET .`. This file is
+published beside environment.py by `flash env push --project PROJECT_UUID --name my-env .`.
+
+`env eval` sends one prompt and grades one reply, so these cases check the FIRST
+assistant action rather than a finished episode: given the opening prompt, does the
+model emit the single integer `step_episode` needs to advance the game? That is a real
+held-out check of the action format the episode depends on, and it is the honest scope
+of a single-shot evaluation. Episode-level reward is what GRPO optimizes through
+`score_episode`; validate it offline with `flash env test`.
+
+Do NOT grade these by calling `environment.reward(response, example)`: with no episode
+state that call scores an empty transcript, so an unrelated answer can score 1.0 and
+publish a green check that measured nothing.
+"""
+
+from __future__ import annotations
+
+from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult
+
+LOW, HIGH = 1, 100
+
+
+class StarterFirstActionSuite(BaseEvalSuite):
+    name = "starter-first-action"
+
+    def __init__(self, environment=None):
+        self.environment = environment
+
+    def cases(self):
+        # `input` is a dataset row's input, not a finished prompt. `env eval` builds the
+        # request through `environment.prompt_messages()`, which runs `start_episode` and
+        # appends the reply instructions -- exactly as training does. Spelling that block
+        # out here too would send it twice and evaluate a prompt training never used.
+        return [
+            EvalCase(
+                id="opening-guess",
+                input=f"I picked a secret whole number between {LOW} and {HIGH}.",
+            )
+        ]
+
+    def score(self, case, response):
+        # exactly the parse `step_episode` runs on an assistant turn: a reply it cannot
+        # read wastes a turn on a re-prompt, so parseability is the thing worth measuring.
+        try:
+            guess = int(response.strip().split()[0])
+        except (ValueError, IndexError):
+            return EvalResult(
+                case_id=case.id,
+                passed=False,
+                score=0.0,
+                response=response,
+                reason="first turn is not a single integer, so step_episode cannot read it",
+            )
+        in_range = LOW <= guess <= HIGH
+        return EvalResult(
+            case_id=case.id,
+            passed=in_range,
+            score=1.0 if in_range else 0.0,
+            response=response,
+            reason=None if in_range else f"guess {guess} is outside {LOW}-{HIGH}",
+        )
+
+
+def load_evaluations(environment=None):
+    return [StarterFirstActionSuite(environment)]
+'''
 
 
 _STARTER_ENV_MULTITURN_PY = '''\
@@ -348,6 +465,7 @@ def cmd_env_setup(args) -> int:
     project_id = _require_setup_project(args)
     _validate_existing_config_projects(project_id)
     starter_env = Path("environment.py")
+    starter_evaluations = Path(_DEFAULT_EVALUATIONS_PATH)
     dataset = Path("dataset/train.jsonl")
     # trace import is optional and can only read the selected project. an existing dataset is never
     # overwritten, so importing into it would be a silently discarded download.
@@ -358,7 +476,8 @@ def cmd_env_setup(args) -> int:
     # dataset (or vice versa); the flag/answer only decides the mode when starting fresh.
     existing_multi: bool | None = None
     anchor = "environment.py"
-    if starter_env.exists():
+    starter_env_exists = starter_env.exists()
+    if starter_env_exists:
         existing_multi = "EnvironmentMultiTurn" in starter_env.read_text(encoding="utf-8")
     elif dataset.exists():
         # No env.py to anchor on, but the starter multi-turn dataset carries a
@@ -444,8 +563,19 @@ def cmd_env_setup(args) -> int:
         f"{'exported from your traces' if traces_jsonl else 'the starter dataset has 2'}"
         f"{'' if traces_jsonl else ' (raise as your dataset grows)'}\n"
     )
-    if not starter_env.exists():
+    if not starter_env_exists:
         starter_env.write_text(env_py)
+        # the starter sidecar only matches the starter environment written in this run. rerun in a
+        # directory holding a custom environment.py, this used to drop in the arithmetic suite
+        # anyway, which then called that env's reward with an unrelated `7 + 5` example -- a
+        # published check measuring nothing (codex[bot]). the multi-turn scaffold gets its own
+        # suite: a single-shot eval cannot grade a finished episode, so it checks the first
+        # action's format instead.
+        if not starter_evaluations.exists():
+            evaluations_py = (
+                _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY
+            )
+            starter_evaluations.write_text(evaluations_py.replace("PROJECT_UUID", project_id))
     project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
         "# Environment: upload this project folder with\n"
@@ -550,6 +680,7 @@ def cmd_env_setup(args) -> int:
         )
     scaffolded = [
         "environment.py",
+        *([_DEFAULT_EVALUATIONS_PATH] if starter_evaluations.exists() else []),
         "dataset/train.jsonl",
         "configs/sft.toml",
         "configs/rl.toml",

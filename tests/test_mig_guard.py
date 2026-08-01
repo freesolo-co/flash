@@ -94,9 +94,7 @@ def test_mismatch_reason_joins_multiple():
 def test_host_driver_cuda_parses_nvidia_smi_header(monkeypatch):
     # pynvml is absent in CI (and nvmlInit fails on a GPU-less box), so it falls to the nvidia-smi
     # header parse. CUDA 12.8 in the table header -> 12.8.
-    header = (
-        "| NVIDIA-SMI 570.195.03    Driver Version: 570.195.03    CUDA Version: 12.8 |\n"
-    )
+    header = "| NVIDIA-SMI 570.195.03    Driver Version: 570.195.03    CUDA Version: 12.8 |\n"
     monkeypatch.setattr(
         "subprocess.run",
         lambda *a, **k: types.SimpleNamespace(stdout=header),
@@ -189,7 +187,9 @@ def test_wait_for_gpu_fast_fails_on_dead_nvml(monkeypatch):
     with pytest.raises(RetriableInfraError) as exc:
         wait_for_gpu()
     assert "NVML init failed" in str(exc.value)
-    assert "never became ready" not in str(exc.value)  # fast-failed, didn't exhaust the patient loop
+    assert "never became ready" not in str(
+        exc.value
+    )  # fast-failed, didn't exhaust the patient loop
 
 
 def test_wait_for_gpu_fast_fails_on_dead_nvml_when_cuda_unavailable(monkeypatch):
@@ -204,7 +204,9 @@ def test_wait_for_gpu_fast_fails_on_dead_nvml_when_cuda_unavailable(monkeypatch)
     with pytest.raises(RetriableInfraError) as exc:
         wait_for_gpu()
     assert "NVML init failed" in str(exc.value)
-    assert "never became ready" not in str(exc.value)  # fast-failed, didn't exhaust the patient loop
+    assert "never became ready" not in str(
+        exc.value
+    )  # fast-failed, didn't exhaust the patient loop
 
 
 def test_wait_for_gpu_stays_patient_when_nvml_alive(monkeypatch):
@@ -218,7 +220,9 @@ def test_wait_for_gpu_stays_patient_when_nvml_alive(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True, raising=False)
     monkeypatch.setattr(torch, "zeros", boom, raising=False)
     monkeypatch.setattr("time.sleep", lambda *a, **k: None)
-    monkeypatch.setattr(lifecycle, "_nvml_alive", lambda: True)  # busy but NVML alive -> stay patient
+    monkeypatch.setattr(
+        lifecycle, "_nvml_alive", lambda: True
+    )  # busy but NVML alive -> stay patient
     with pytest.raises(RetriableInfraError) as exc:
         wait_for_gpu()
     assert "never became ready" in str(exc.value)

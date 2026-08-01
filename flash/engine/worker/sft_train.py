@@ -243,7 +243,7 @@ def _write_sft_parquet(rows: list[dict], path: str) -> None:
 
 def _render_sft_dataset_module() -> str:
     """return the standalone custom dataset loaded by verl 0.8's data.custom_cls hook."""
-    return '''from __future__ import annotations
+    return """from __future__ import annotations
 
 import io
 
@@ -338,7 +338,7 @@ class FlashTokenizedSFTDataset:
             "loss_mask": loss_mask_tensor,
             "multi_modal_inputs": multi_modal_inputs,
         }
-'''
+"""
 
 
 def _multimodal_messages_with_images(messages: list[dict], images: list[object]) -> list[dict]:
@@ -421,7 +421,7 @@ def render_loraplus_shim(ratio: float) -> str:
     ratio = float(ratio)
     if ratio <= 1:
         return ""
-    return f'''
+    return f"""
 from importlib import import_module as _flash_import_module
 from peft.optimizers import create_loraplus_optimizer as _flash_create_loraplus_optimizer
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine as _FlashFSDPEngine
@@ -456,7 +456,7 @@ def _flash_build_loraplus_optimizer(self, module):
     return optimizer
 
 _FlashFSDPEngine._build_optimizer = _flash_build_loraplus_optimizer
-'''
+"""
 
 
 def _render_sft_sitecustomize(
@@ -468,7 +468,7 @@ def _render_sft_sitecustomize(
     reentrant_gradient_checkpointing: bool,
 ) -> str:
     required_steps = tuple(int(step) for step in save_at_steps)
-    source = f'''# generated flash sft runtime patches for verl 0.8
+    source = f"""# generated flash sft runtime patches for verl 0.8
 import random as _flash_random
 
 import numpy as _flash_numpy
@@ -528,9 +528,9 @@ def _flash_save_exact_checkpoint(self, step):
     return _flash_original_save_checkpoint(self, step)
 
 _FlashCheckpointHandler.save_checkpoint = _flash_save_exact_checkpoint
-'''
+"""
     if reentrant_gradient_checkpointing:
-        source += '''
+        source += """
 _flash_original_build_module = _FlashFSDPEngine._build_module
 
 def _flash_build_reentrant_module(self):
@@ -539,7 +539,7 @@ def _flash_build_reentrant_module(self):
     return module
 
 _FlashFSDPEngine._build_module = _flash_build_reentrant_module
-'''
+"""
     source += render_loraplus_shim(loraplus_ratio)
     return source
 
@@ -786,7 +786,9 @@ def _verl_image_message_content(content) -> str:
     return "".join(parts)
 
 
-def _materialize_verl_images(descriptors: list[str], package_root, image_dir: str, row_index: int) -> list[str]:
+def _materialize_verl_images(
+    descriptors: list[str], package_root, image_dir: str, row_index: int
+) -> list[str]:
     from flash.multimodal import decode_image_descriptors
 
     os.makedirs(image_dir, exist_ok=True)
@@ -900,7 +902,7 @@ def _build_verl_child_env(*, shim_dir: str, wandb_enabled: bool) -> dict[str, st
 
 
 def _probe_gpu_in_subprocess(requested_gpu: str | None, exact_type: str = "") -> dict:
-    script = r'''
+    script = r"""
 import json
 import sys
 
@@ -914,7 +916,7 @@ print("FLASH_GPU_PROBE=" + json.dumps({
     "memory_gb": torch.cuda.get_device_properties(0).total_memory / 1e9,
     "capability": list(torch.cuda.get_device_capability(0)),
 }), flush=True)
-'''
+"""
     try:
         result = subprocess.run(
             [sys.executable, "-c", script, json.dumps([requested_gpu, exact_type])],
@@ -928,9 +930,7 @@ print("FLASH_GPU_PROBE=" + json.dumps({
     if output:
         print(output, end="" if output.endswith("\n") else "\n", flush=True)
     if result.returncode != 0:
-        raise _w.RetriableInfraError(
-            f"gpu readiness probe exited with status {result.returncode}"
-        )
+        raise _w.RetriableInfraError(f"gpu readiness probe exited with status {result.returncode}")
     for line in result.stdout.splitlines():
         if line.startswith("FLASH_GPU_PROBE="):
             return json.loads(line.split("=", 1)[1])
@@ -958,7 +958,11 @@ class _NvidiaSmiPeakSampler:
                     timeout=8,
                 )
                 if result.returncode == 0:
-                    values = [float(value.strip()) for value in result.stdout.splitlines() if value.strip()]
+                    values = [
+                        float(value.strip())
+                        for value in result.stdout.splitlines()
+                        if value.strip()
+                    ]
                     if values:
                         self.peak_mib = max(self.peak_mib, max(values))
             except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -1239,13 +1243,18 @@ def run_sft_train(spec=None) -> None:
         gradient_checkpointing and _w.grpo_use_reentrant(model_id)
     )
 
-    python_bin = resolve_verl_python(workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY")))
+    # provisioning the verl interpreter builds a venv and installs the whole training stack when the
+    # run has no prebuilt worker image, which is minutes of silence with no training step to report
+    # and no liveness thread otherwise running here -- long enough for the stall watchdog to fail a
+    # healthy run. no progress= : there is no monotonic counter to read, only the keepalive.
+    with liveness_heartbeat("sft_configuring"):
+        python_bin = resolve_verl_python(
+            workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+        )
     model_path = _cached_model_path(model_id, model_revision)
     # verl logs from python_bin, so gate wandb on THAT interpreter (see resolve_verl_loggers).
     loggers = resolve_verl_loggers(python_bin)
-    project_name = (
-        (spec.wandb.project if spec and spec.wandb else None) or "flash"
-    )
+    project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
     shim_dir = os.path.join(workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
@@ -1353,7 +1362,9 @@ def run_sft_train(spec=None) -> None:
         if step_match is None:
             return
         if _SFT_LORAPLUS_RATIO > 1 and not loraplus_applied:
-            raise RuntimeError("verl reached an optimizer step before the required lora+ shim succeeded")
+            raise RuntimeError(
+                "verl reached an optimizer step before the required lora+ shim succeeded"
+            )
         # these three reach the logger as plain python floats (engine_workers.py returns
         # loss/grad_norm through .item() and lr through get_last_lr()), so unlike OPD's
         # Metric(SUM) they do not print in numpy's np.float64(...) spelling today. they share
@@ -1379,7 +1390,9 @@ def run_sft_train(spec=None) -> None:
             "grad_norm": progress["grad_norm"],
             "learning_rate": progress["lr"],
         }
-        _w.heartbeat("sft_step", **{key: value for key, value in payload.items() if value is not None})
+        _w.heartbeat(
+            "sft_step", **{key: value for key, value in payload.items() if value is not None}
+        )
 
     def child_heartbeat() -> None:
         _w.heartbeat("sft_step", liveness=True, step=int(progress["step"] or 0))
@@ -1413,7 +1426,9 @@ def run_sft_train(spec=None) -> None:
 
     actor_dir, final_step = latest_global_step_dir(local_dir)
     if sft_under_ran(final_step, update_horizon, max_steps):
-        raise RuntimeError(f"sft completed {final_step}/{update_horizon} requested optimizer updates")
+        raise RuntimeError(
+            f"sft completed {final_step}/{update_horizon} requested optimizer updates"
+        )
     train_tokens = sft_completed_train_tokens(
         total_tokens_per_epoch,
         epochs,

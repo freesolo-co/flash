@@ -39,6 +39,7 @@ FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
 FREESOLO_PROJECTS_PATH = "/api/projects"
 FREESOLO_TRACE_PROJECTS_PATH = "/api/traces/projects"
 FREESOLO_TRACES_EXPORT_PATH = "/api/traces/export"
+FREESOLO_EVAL_RUNS_PATH = "/api/evals/runs"
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
@@ -129,6 +130,11 @@ def _freesolo_request(
                 "(or set FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+    # a socket timeout surfaces as a bare TimeoutError rather than a URLError, so without this
+    # it escapes as an unexpected exception. callers catch ClientError to report a failure
+    # without changing their own verdict; a traceback instead would lose that.
+    except TimeoutError as exc:
+        raise RequestTimeoutError(f"request to {base}{path} timed out after {timeout}s") from exc
     except urllib.error.URLError as exc:
         raise ClientError(
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "
@@ -231,6 +237,47 @@ def export_trace_records(
     return _freesolo_get(path, api_key, base_url, timeout=300.0)
 
 
+def upload_eval_run(
+    *,
+    project_id: str,
+    suite_name: str,
+    environment_reference: str,
+    model: str | None,
+    status: str,
+    error: str | None,
+    started_at: str | None,
+    cases: list[dict[str, Any]],
+    api_key: str,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """Record one `flash env eval` suite run against one explicit Freesolo project.
+
+    The project id is required and never inferred: an API key identifies an org, not a
+    project, and picking a default here would file results under a project the caller
+    never named."""
+    try:
+        project_id = require_project_id(project_id)
+    except (TypeError, ValueError) as exc:
+        raise ClientError(str(exc).replace("project", "project id", 1)) from exc
+    body: dict[str, Any] = {
+        "project_id": project_id,
+        "suite_name": suite_name,
+        "environment_reference": environment_reference,
+        "model": model,
+        "status": status,
+        "error": error,
+        "started_at": started_at,
+        "cases": cases,
+    }
+    # a large suite is a bigger write than a normal control-plane call; give it room.
+    payload = _freesolo_request(
+        "POST", FREESOLO_EVAL_RUNS_PATH, api_key, base_url, body=body, timeout=300.0
+    )
+    if not isinstance(payload, dict):
+        raise ClientError("freesolo returned an invalid eval run response")
+    return payload
+
+
 class _ProgressReader:
     """File-like wrapper over in-memory bytes that fires a progress callback on each read()."""
 
@@ -330,6 +377,7 @@ class ApiClient:
         self.api_key = api_key
         self.timeout = timeout
         self.key_source = key_source
+        self._chat_step_selector_available = False
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key:
@@ -430,6 +478,12 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     def _require_chat_step_selector(self) -> None:
+        # cached after it first succeeds: this is a property of the control plane, not of the
+        # request. `env eval` sends one chat per case, so re-checking each time doubled the
+        # request count and let a single transient /v1/health blip fail an arbitrary case while
+        # the chat endpoint was healthy (codex[bot]).
+        if self._chat_step_selector_available:
+            return
         capabilities = self.health().get("capabilities")
         if not isinstance(capabilities, list) or _CHAT_STEP_SELECTOR_CAPABILITY not in capabilities:
             raise ClientError(
@@ -437,6 +491,21 @@ class ApiClient:
                 f"{_CHAT_STEP_SELECTOR_CAPABILITY}; use a full immutable adapter revision or "
                 "upgrade the control plane"
             )
+        # only a successful capability check is cached, so a transient failure remains visible and
+        # retryable. concurrent first calls may make the same benign request twice; a lock would add
+        # coordination to every client solely to optimize that one startup race, so a caller about to
+        # fan out settles it up front instead (see `warm_chat_step_selector`).
+        self._chat_step_selector_available = True
+
+    def warm_chat_step_selector(self, target: str) -> None:
+        """Settle the step-selector capability now, so concurrent callers inherit the cached answer.
+
+        A caller about to run many chats in parallel would otherwise have every worker miss the cold
+        cache at once and fire its own /v1/health (codex[bot]). Only a `RUN/step-N` target needs the
+        capability, so anything else is a no-op. Raises exactly what the per-request check raises.
+        """
+        if _parse_chat_target(target)[2] is not None:
+            self._require_chat_step_selector()
 
     def publish_env(
         self,
@@ -610,8 +679,57 @@ class ApiClient:
     def undeploy(self, run_id: str) -> dict:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
 
-    def deployments(self) -> list[dict]:
-        return self._request("GET", "/v1/deployments")["deployments"]
+    def deployments(self, timeout: float | None = None) -> list[dict]:
+        return self._request("GET", "/v1/deployments", timeout=timeout)["deployments"]
+
+    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
+        """The current deployment record for one run, or None when it is not listed.
+
+        ``deploy`` returns as soon as the record is persisted, which is normally before the
+        requested revision is servable. This is the read side a caller needs to tell "queued"
+        from "actually ready".
+
+        ``timeout`` bounds the single request. A caller polling against its own deadline needs
+        that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
+        overshoot the bound the user asked for by an order of magnitude.
+
+        Read from the run-scoped route rather than the listing. `/v1/deployments` walks every run
+        the key owns and loads each one's status before this picks a single record out, so on an
+        account with a long run history the poll's cost grows with that history and the wait can
+        expire scanning unrelated runs while the requested revision is already ready
+        (chatgpt-codex-connector). `/v1/runs/{run_id}/deploy` resolves the one run directly.
+        """
+        base_run_id, step = _parse_adapter_target(run_id)
+        try:
+            deployment = self._request("GET", f"/v1/runs/{base_run_id}/deploy", timeout=timeout)
+        except ApiError as exc:
+            # a run the key cannot see reads the same as one that is not deployed. the listing said
+            # "absent" by omitting the row; saying it by raising would turn a vanished deployment
+            # into a failed command.
+            if exc.status == 404:
+                return None
+            raise
+        if not isinstance(deployment, dict):
+            return None
+        # the route answers for a run that was never deployed with a synthesized `undeployed`
+        # record rather than 404, and the listing omits `undeployed`/`dry_run` rows entirely. keep
+        # the listing's meaning: neither is a revision anyone can serve.
+        if str(deployment.get("state") or "") in {"undeployed", "dry_run"}:
+            return None
+        # the requested step is part of the identity, not decoration. matching on the run id
+        # alone lets `deploy RUN/step-40 --wait` settle on whichever revision happens to be
+        # deployed -- an older one still marked ready, or a replacement another shell deployed
+        # mid-wait -- and report that as this caller's own revision.
+        if "checkpoint_step" in deployment:
+            listed = deployment.get("checkpoint_step")
+            # None is the final adapter, an int is RUN/step-N (see the deployments renderer).
+            if (listed if listed is None else int(listed)) != step:
+                return None
+        if not deployment.get("run_id"):
+            # `models deploy --wait` prints this record in place of the POST body, so without the
+            # id styled output renders an empty run field and the json omits it entirely.
+            deployment = {**deployment, "run_id": base_run_id}
+        return deployment
 
     def chat(
         self,

@@ -6,6 +6,7 @@ import argparse
 import base64
 import io
 import os
+import subprocess
 import sys
 import tarfile
 
@@ -68,6 +69,393 @@ def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):
     assert "published freesolo-co/u-environment" in capsys.readouterr().out
 
 
+def test_push_single_py_module_carries_its_evaluations_sidecar(monkeypatch, tmp_path):
+    # `env eval` loads evaluations.py next to an exact .py target, so a single-file push that
+    # dropped it would publish an environment whose suite passed locally and is simply gone
+    # once pushed -- a green local check for a package that cannot reproduce it.
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text("def load_evaluations(environment=None): return []\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "environment.py" in files
+    assert "evaluations.py" in files
+
+
+def test_push_single_py_module_carries_direct_evaluation_helper_imports(monkeypatch, tmp_path):
+    # evaluations.py can import sibling helpers locally, so dropping those direct imports from an
+    # exact-file push publishes a suite that passed env test but cannot load from the package.
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import eval_constants\n"
+        "from eval_scorer import score\n"
+        "def load_evaluations(environment=None): return []\n"
+    )
+    (tmp_path / "eval_constants.py").write_text("EXPECTED = '4'\n")
+    (tmp_path / "eval_scorer.py").write_text("def score(value): return value == '4'\n")
+    (tmp_path / "unrelated.py").write_text("VALUE = 'do not publish'\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "eval_constants.py" in files
+    assert "eval_scorer.py" in files
+    assert "unrelated.py" not in files
+
+
+def test_push_single_py_module_carries_lazily_imported_evaluation_helpers(monkeypatch, tmp_path):
+    """A helper imported inside cases()/score() ships too.
+
+    The loader deliberately keeps the package dir on sys.path so a sidecar can import its helpers
+    lazily, and `env test` exercises that path successfully. Scanning only top-level nodes omitted
+    those helpers from the package, so the suite passed the offline gate and then failed to import
+    the first time it graded a case against the pushed environment.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "def load_evaluations(environment=None):\n"
+        "    import eval_lazy\n"
+        "    try:\n"
+        "        from eval_guarded import score\n"
+        "    except ImportError:\n"
+        "        score = None\n"
+        "    return []\n"
+    )
+    (tmp_path / "eval_lazy.py").write_text("EXPECTED = '4'\n")
+    (tmp_path / "eval_guarded.py").write_text("def score(value): return True\n")
+    (tmp_path / "unrelated.py").write_text("VALUE = 'do not publish'\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "eval_lazy.py" in files
+    assert "eval_guarded.py" in files
+    # widening to nested imports must not turn the bounded single-file mode into a whole-dir push.
+    assert "unrelated.py" not in files
+
+
+@pytest.mark.parametrize("namespace", [False, True], ids=["regular-package", "namespace-package"])
+def test_push_single_py_module_carries_an_imported_sibling_package(
+    monkeypatch, tmp_path, namespace: bool
+):
+    """`from graders.rules import score` ships the graders/ package, not just graders.py.
+
+    Local loading succeeds because the environment directory stays on sys.path, so every offline
+    check passes. Matching only the `<name>.py` spelling published an environment whose sidecar
+    raises ModuleNotFoundError the first time it grades a case.
+
+    `__init__.py` is not what makes it a package: under PEP 420 a bare directory imports the same
+    way, so requiring the marker file dropped exactly the helper the sidecar needs while every
+    local check still passed (codex[bot]).
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from graders.rules import score\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    graders = tmp_path / "graders"
+    (graders / "nested").mkdir(parents=True)
+    if not namespace:
+        (graders / "__init__.py").write_text("")
+        (graders / "nested" / "__init__.py").write_text("")
+    (graders / "rules.py").write_text("def score(value): return True\n")
+    (graders / "nested" / "deep.py").write_text("THRESHOLD = 0.5\n")
+    unused = tmp_path / "unused_pkg"
+    unused.mkdir()
+    (unused / "__init__.py").write_text("VALUE = 'do not publish'\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "graders/rules.py" in files
+    # the whole package tree ships: a subpackage the imported module itself uses is part of it.
+    assert "graders/nested/deep.py" in files
+    if not namespace:
+        assert "graders/__init__.py" in files
+    # but an unimported sibling package still must not turn this into a whole-dir push.
+    assert "unused_pkg/__init__.py" not in files
+
+
+def test_push_ships_the_package_when_a_module_of_the_same_name_shadows_it(monkeypatch, tmp_path):
+    """With both graders.py and graders/, `import graders` is the package -- so ship the package.
+
+    Python's path finder checks directories before same-named modules. Yielding the .py first and
+    skipping the package published the file the sidecar never imports and dropped the one it does,
+    so the pushed environment raised ModuleNotFoundError on `graders.rules`.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from graders.rules import score\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    (tmp_path / "graders.py").write_text("SHADOWED = True\n")
+    graders = tmp_path / "graders"
+    graders.mkdir()
+    (graders / "__init__.py").write_text("")
+    (graders / "rules.py").write_text("def score(value): return True\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "graders/rules.py" in files
+    assert "graders/__init__.py" in files
+
+
+def test_push_ships_a_namespace_package_helper(monkeypatch, tmp_path):
+    """A PEP 420 `graders/` with no __init__.py is still importable, so it still has to ship.
+
+    Requiring the marker file sent the helper to the `graders.py` fallback, which does not exist
+    either, so the archive carried evaluations.py alone and the published environment raised
+    ModuleNotFoundError on its first case (codex[bot]).
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from graders.rules import score\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    graders = tmp_path / "graders"
+    graders.mkdir()
+    (graders / "rules.py").write_text("def score(value): return True\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "graders/rules.py" in files
+
+
+def test_push_prefers_the_module_over_a_namespace_directory(monkeypatch, tmp_path):
+    """With graders.py and a bare graders/, `import graders` binds the MODULE.
+
+    Only a regular package (one holding __init__.py) outranks a same-named module; a namespace
+    directory is merely a fallback portion. Shipping the directory here would publish the file
+    the sidecar never imports.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import graders\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    (tmp_path / "graders.py").write_text("WINS = True\n")
+    graders = tmp_path / "graders"
+    graders.mkdir()
+    (graders / "rules.py").write_text("def score(value): return True\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "graders.py" in files
+
+
+def test_push_ships_helpers_a_helper_imports(monkeypatch, tmp_path):
+    """A helper's own siblings ship too, or the published sidecar fails on its first case.
+
+    An exact-file push that packaged `scorer.py` but not the `thresholds` it imports passed
+    every local check -- the source directory is importable -- and raised ModuleNotFoundError
+    once published.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import scorer\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    (tmp_path / "scorer.py").write_text("from thresholds import CUTOFF\n")
+    (tmp_path / "thresholds.py").write_text("CUTOFF = 0.5\n")
+    # reached only through thresholds.py, so it proves the walk keeps following, not just one hop
+    (tmp_path / "units.py").write_text("SCALE = 2\n")
+    (tmp_path / "thresholds.py").write_text("import units\n\nCUTOFF = 0.5\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "scorer.py" in files
+    assert "thresholds.py" in files
+    assert "units.py" in files
+
+
+def test_push_ships_helpers_named_by_a_literal_dynamic_import(monkeypatch, tmp_path):
+    """`import_module("judge")` names a sibling as surely as an import statement does.
+
+    Scanning only Import/ImportFrom omitted the helper from the package, and the suite passed
+    every local check -- the sidecar scope makes the directory importable -- then failed on its
+    first published case.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import importlib\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    importlib.import_module('judge')\n"
+        "    __import__('rubric')\n"
+        "    return []\n"
+    )
+    # reached only through judge.py, so a dynamically named helper is followed like any other
+    (tmp_path / "judge.py").write_text("import weights\n")
+    (tmp_path / "weights.py").write_text("W = 1\n")
+    (tmp_path / "rubric.py").write_text("RULES = ()\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "judge.py" in files
+    assert "rubric.py" in files
+    assert "weights.py" in files
+
+
+def test_push_ships_helpers_named_through_an_alias_of_import_module(monkeypatch, tmp_path):
+    """`from importlib import import_module as load` imports exactly as the canonical name does.
+
+    Matching the call's identifier against `import_module` alone skipped the aliased call, so
+    `judge.py` was left out of the archive for a suite that passes locally -- its directory is
+    importable there -- and raises ModuleNotFoundError on its first published case (Cursor).
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from importlib import import_module as load\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    load('judge')\n"
+        "    return []\n"
+    )
+    # reached only through judge.py, so the alias is followed as far as any other import
+    (tmp_path / "judge.py").write_text("import weights\n")
+    (tmp_path / "weights.py").write_text("W = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "judge.py" in files
+    assert "weights.py" in files
+
+
+def test_push_does_not_read_an_unrelated_load_call_as_a_dynamic_import(monkeypatch, tmp_path):
+    """The alias is a per-file binding, not a reserved word.
+
+    A sidecar that never imports `import_module` may still call something named `load`, and
+    packaging whatever string it was handed would ship files on a guess. Only a name this module
+    actually bound to `import_module` counts.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import json\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    json.load('judge')\n"
+        "    return []\n"
+    )
+    (tmp_path / "judge.py").write_text("SHOULD_NOT_SHIP = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    assert "judge.py" not in _members(cap["package_b64"])
+
+
+def test_push_ships_helpers_named_by_the_keyword_form_of_a_dynamic_import(monkeypatch, tmp_path):
+    """`import_module(name="judge")` imports identically to the positional form.
+
+    Reading only `node.args[0]` skipped the keyword spelling, so the helper never entered the
+    archive and the suite raised ModuleNotFoundError on its first published case -- the same
+    failure the positional scan exists to prevent.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import importlib\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    importlib.import_module(name='judge')\n"
+        "    __import__(name='rubric')\n"
+        "    return []\n"
+    )
+    (tmp_path / "judge.py").write_text("import weights\n")
+    (tmp_path / "weights.py").write_text("W = 1\n")
+    (tmp_path / "rubric.py").write_text("RULES = ()\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "judge.py" in files
+    assert "rubric.py" in files
+    # followed transitively, exactly as a positionally named helper is
+    assert "weights.py" in files
+
+
+def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monkeypatch, tmp_path):
+    """`from custom import SCORER` must keep resolving after custom.py is published as environment.py.
+
+    Packaging renames the entrypoint, so a sidecar importing it by its local name resolved
+    locally and raised ModuleNotFoundError once published. The alias rebinds sys.modules so both
+    names give one module object rather than two copies of its state.
+    """
+    env_dir = tmp_path / "legacy-env"
+    env_dir.mkdir()
+    (env_dir / "custom.py").write_text(
+        "SCORER = 'gold'\n\ndef load_environment(**k):\n    return None\n"
+    )
+    (env_dir / "evaluations.py").write_text(
+        "from custom import SCORER\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir, name="legacy-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "custom.py" in files
+    # the published tree must import cleanly, with both names bound to ONE module object
+    (tmp_path / "published").mkdir()
+    for name, body in files.items():
+        target = tmp_path / "published" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import custom, environment; "
+            "assert custom is environment, (custom, environment); "
+            "print(custom.SCORER)",
+        ],
+        cwd=tmp_path / "published",
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "gold"
+
+
+def test_push_dir_infers_entrypoint_ignoring_the_evaluations_sidecar(monkeypatch, tmp_path):
+    # a legacy package whose sole module is custom.py resolved fine before evaluations.py
+    # existed. counting the sidecar as a candidate entrypoint makes adding one turn that
+    # directory into "multiple top-level .py modules" and reject it before either file loads.
+    env_dir = tmp_path / "legacy-env"
+    env_dir.mkdir()
+    (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "evaluations.py").write_text("def load_evaluations(environment=None): return []\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir, name="legacy-env")) == 0
+    files = _members(cap["package_b64"])
+    # packaging canonicalizes the inferred entrypoint to environment.py, so the assertion is
+    # that custom.py was chosen and published at all -- before the fix this raised instead.
+    assert "return None" in files["environment.py"]
+    assert "evaluations.py" in files
+
+
 def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
     env_dir = tmp_path / "my-env"
     env_dir.mkdir()
@@ -104,6 +492,7 @@ def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path
         "import helper\n\ndef load_environment(**k):\n    return helper.build()\n"
     )
     (env_dir / "helper.py").write_text("def build():\n    return None\n")
+    (env_dir / "evaluations.py").write_text("EVALUATIONS = []\n")
     (env_dir / "dataset").mkdir()
     (env_dir / "dataset" / "train.jsonl").write_text('{"input":"2+2","output":"4"}\n')
     cap: dict = {}
@@ -113,6 +502,7 @@ def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path
     files = _members(cap["package_b64"])
     assert "environment.py" in files
     assert "helper.py" in files
+    assert "evaluations.py" in files
     assert "dataset/train.jsonl" in files
     assert cap["name"] == "math"
 
@@ -239,7 +629,11 @@ def test_push_alternate_py_keeps_packaged_entrypoint(monkeypatch, tmp_path):
     files = _members(cap["package_b64"])
     assert "return 'custom'" in files["environment.py"]
     assert "return 'sibling'" not in files["environment.py"]
-    assert "custom_env.py" not in files
+    # the entrypoint's SOURCE is published once, under the canonical name. custom_env.py exists
+    # only as an import alias so a sidecar's `import custom_env` still resolves, and it must not
+    # carry a second copy of the module body.
+    assert "return 'custom'" not in files["custom_env.py"]
+    assert "sys.modules[__name__] = _environment" in files["custom_env.py"]
 
 
 def test_push_requires_explicit_name(tmp_path, capsys):
@@ -656,6 +1050,37 @@ def test_push_rejects_when_member_count_exceeds_limit_including_dirs(monkeypatch
     assert "(limit 4)" in error
 
 
+def test_push_counts_an_imported_dataset_package_once(monkeypatch, tmp_path):
+    """A helper package reachable BOTH ways must not be charged twice against the limit.
+
+    The single-file walk yields imported helper packages, then falls through to the `dataset/`
+    walk. A helper package that IS `dataset/` is reached by both, and the second pass did not
+    consult the first's `yielded` set -- so the limit check counted those files and bytes twice and
+    rejected a tree that actually fits. The archive was always correct (the copy just overwrites),
+    which is why only the limit saw it (codex[bot]).
+    """
+    # a SINGLE-FILE push: only that path builds the import closure whose `yielded` set the dataset
+    # walk has to honour. pushing the directory takes the full-tree branch and never reaches it.
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text("import dataset\n\n\ndef cases():\n    return []\n")
+    pkg = tmp_path / "dataset"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("ROWS = []\n")
+    (pkg / "rows.jsonl").write_text('{"a": 1}\n')
+
+    # environment.py + evaluations.py + the two dataset files + the synthesized readme = 5 members,
+    # plus the `dataset` directory = 6. counting the package twice charges 8 and trips this cap.
+    monkeypatch.setattr("flash.cli.envpush._ENV_PUSH_MAX_FILES", 6)
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert "dataset/__init__.py" in names
+    assert "dataset/rows.jsonl" in names
+
+
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses dir perms")
 def test_push_fails_fast_on_unreadable_directory(monkeypatch, tmp_path, capsys):
     import os as _os
@@ -729,3 +1154,66 @@ def test_push_drops_underscore_secret_files_but_keeps_secretish_packages(monkeyp
     assert "id_rsa_backup" not in names
     assert "credentials_store/__init__.py" in names
     assert "credentials_store/load.py" in names
+
+
+def test_push_single_py_ships_its_evaluations_sidecar(monkeypatch, tmp_path):
+    # `env eval TARGET ./environment.py` loads the sibling evaluations.py, so a single-file push
+    # that dropped it published a package whose suite passed locally and was simply gone once
+    # uploaded -- while a directory push of the same files kept it (codex[bot]).
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'held-out'\n"
+        "    def cases(self): return [EvalCase(id='c', input='2+2', expected='4')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    (tmp_path / "helper.py").write_text("VALUE = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+
+    files = _members(cap["package_b64"])
+    assert "held-out" in files["evaluations.py"]
+    # the sidecar is a known filename, not a blanket "ship every sibling module" change.
+    assert "helper.py" not in files
+
+
+def test_push_directory_infers_its_entrypoint_past_an_evaluations_sidecar(monkeypatch, tmp_path):
+    # a directory whose only module is `custom.py` is a supported layout. counting evaluations.py
+    # as a second top-level module made adding one reject the directory outright, so the very
+    # sidecar that enables evaluation disabled the push and the eval alike (codex[bot]).
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'held-out'\n"
+        "    def cases(self): return []\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+
+    files = _members(cap["package_b64"])
+    # custom.py was resolved as the entrypoint and published under the canonical name...
+    assert "load_environment" in files["environment.py"]
+    # ...and the sidecar rode along rather than being mistaken for a rival entrypoint.
+    assert "held-out" in files["evaluations.py"]
+
+
+def test_push_directory_still_rejects_two_real_candidate_modules(monkeypatch, tmp_path):
+    # the control for the scope of that exclusion: only the known sidecar filename is skipped,
+    # so a genuinely ambiguous directory is still refused rather than silently picking one.
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "other.py").write_text("def load_environment(**k):\n    return None\n")
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1

@@ -154,9 +154,7 @@ class StructuredOutputReplay:
         if grammar_start >= len(response_ids):
             # the response ended at (or before) the grammar region: no structured output was
             # generated at all — reject rather than replaying an empty region as valid.
-            raise RuntimeError(
-                "structured OPD response contains no tokens in the grammar region"
-            )
+            raise RuntimeError("structured OPD response contains no tokens in the grammar region")
         if not matcher.is_terminated():
             # a grammar like a bare integer is not "terminated" after `4` (it could continue as
             # `42`); completeness means STOPPING here is legal. accept the output iff the matcher

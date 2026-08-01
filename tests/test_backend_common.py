@@ -1260,7 +1260,7 @@ def test_a_straggler_that_was_never_ours_is_not_tracked_forever(monkeypatch):
         # a real, live process in its own group -- but reached through a wait that reports it is
         # not this process's child to reap.
         def _not_ours(pid, options):
-            raise ChildProcessError()
+            raise ChildProcessError
 
         monkeypatch.setattr(vc.os, "waitpid", _not_ours)
         vc._reap_group_zombies(os.getpgid(child.pid), skip=-1)

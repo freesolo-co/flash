@@ -323,13 +323,9 @@ def test_malformed_blocks_fail_clearly(tmp_path):
     with pytest.raises(ValueError, match="expected an object"):
         mm.normalize_prompt_images({}, [{"role": "user", "content": ["bad"]}], root)
     with pytest.raises(ValueError, match="missing text"):
-        mm.normalize_prompt_images(
-            {}, [{"role": "user", "content": [{"type": "text"}]}], root
-        )
+        mm.normalize_prompt_images({}, [{"role": "user", "content": [{"type": "text"}]}], root)
     with pytest.raises(ValueError, match="missing image source"):
-        mm.normalize_prompt_images(
-            {}, [{"role": "user", "content": [{"type": "image_url"}]}], root
-        )
+        mm.normalize_prompt_images({}, [{"role": "user", "content": [{"type": "image_url"}]}], root)
     with pytest.raises(ValueError, match="unsupported content block"):
         mm.normalize_prompt_images(
             {}, [{"role": "user", "content": [{"type": "audio", "audio": "x"}]}], root
@@ -376,9 +372,7 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
         mm.decode_image_descriptors([descriptor], root)
 
 
-def test_total_decoded_budget_is_checked_before_any_image_load_or_conversion(
-    monkeypatch, tmp_path
-):
+def test_total_decoded_budget_is_checked_before_any_image_load_or_conversion(monkeypatch, tmp_path):
     root, _image = _package(tmp_path)
     data = _png_bytes()
     descriptors = [mm.normalize_image_source(data, root), mm.normalize_image_source(data, root)]
@@ -438,9 +432,7 @@ def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
     image_example = {"input": "color?", "metadata": {"mixed": 7}}
     prompts = [
         {
-            "prompt": [
-                {"role": "user", "content": [{"type": "text", "text": "text?"}]}
-            ],
+            "prompt": [{"role": "user", "content": [{"type": "text", "text": "text?"}]}],
             "images": [],
             "example": text_example,
         },
@@ -460,9 +452,7 @@ def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
 
 
 def test_single_turn_conversational_completion_keeps_text_reward_semantics():
-    completion = [
-        {"role": "assistant", "content": [{"type": "text", "text": "red"}]}
-    ]
+    completion = [{"role": "assistant", "content": [{"type": "text", "text": "red"}]}]
     assert mm.assistant_completion_text(completion) == "red"
 
 
@@ -509,8 +499,9 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     assert [row["completion"][0]["content"] for row in dataset] == ["red", "blue"]
     # the normalizer must actually be applied on the training path, not merely importable: a mixed
     # str/list `content` column makes Arrow infer a struct type and drops one shape at write time.
-    assert "completion_messages = text_only_prompt_messages(completion_messages)" in inspect.getsource(
-        sft_train
+    assert (
+        "completion_messages = text_only_prompt_messages(completion_messages)"
+        in inspect.getsource(sft_train)
     )
 
 
@@ -656,9 +647,7 @@ def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
     multi_turn = SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
-        environment=SimpleNamespace(
-            id=str(env_file), resolved_sha="", params={}, multi_turn=True
-        ),
+        environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}, multi_turn=True),
         train=SimpleNamespace(teacher_model="kimi-k2.6"),
     )
 
@@ -723,9 +712,7 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
             "environment": {
                 "id": "local",
                 "params": {
-                    "records": [
-                        {"input": "color?", "output": "red", "image": "dataset/red.png"}
-                    ]
+                    "records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]
                 },
             },
             "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},

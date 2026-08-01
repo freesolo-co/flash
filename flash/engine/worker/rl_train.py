@@ -1064,7 +1064,7 @@ def render_image_pad_ban_shim(image_pad_token_id: int | None) -> str:
     """
     if image_pad_token_id is None:
         return ""
-    return f'''
+    return f"""
 from verl.experimental.agent_loop import agent_loop as _flash_image_agent_loop
 
 _flash_image_pad_token_id = {int(image_pad_token_id)!r}
@@ -1091,7 +1091,7 @@ if not getattr(
     _flash_patch_image_pad_ban()
     _flash_image_agent_loop.AgentLoopWorker._run_agent_loop._flash_image_pad_patched = True
     print({_IMAGE_PAD_BAN_MARKER!r} + " " + repr(_flash_image_pad_token_id), flush=True)
-'''
+"""
 
 
 def render_per_turn_credit_shim(per_turn_credit: bool) -> str:
@@ -1264,8 +1264,8 @@ def render_reentrant_checkpointing_shim(reentrant: bool, *, multimodal: bool = F
     # below. at 4 it dedents out of the block and the rendered sitecustomize is a SyntaxError, so
     # every multimodal reentrant run dies before the shim can do anything.
     vision_hook = (
-        '''
-        _flash_install_vision_input_grads(module)'''
+        """
+        _flash_install_vision_input_grads(module)"""
         if multimodal
         else ""
     )
@@ -1298,7 +1298,7 @@ def _flash_install_vision_input_grads(module):
         if multimodal
         else ""
     )
-    return f'''
+    return f"""
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine as _FlashReentrantEngine
 
 _flash_reentrant_original_build_module = _FlashReentrantEngine._build_module
@@ -1315,7 +1315,7 @@ def _flash_reentrant_build_module(self):
 
 
 _FlashReentrantEngine._build_module = _flash_reentrant_build_module
-'''
+"""
 
 
 def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
@@ -2649,9 +2649,7 @@ def _resolve_grpo_inputs():
     # render_per_turn_credit_shim.
     credit_assignment = getattr(_t, "credit_assignment", DEFAULT_CREDIT_ASSIGNMENT) if _t else None
     per_turn_credit = bool(
-        credit_assignment
-        and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT
-        and multi_turn
+        credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT and multi_turn
     )
     if credit_assignment and credit_assignment != DEFAULT_CREDIT_ASSIGNMENT and not multi_turn:
         print(
@@ -2873,6 +2871,12 @@ def _resolve_grpo_inputs():
 
     prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
     prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
+    # hand the same derived flag to the multi-turn grading path. the env cannot derive it itself --
+    # it has no tokenizer and never sees a rendered prompt -- and the template opens the block in
+    # EVERY assistant generation prompt (the glue tokenizer renders the next turn's header the same
+    # way), so one run-level value covers every turn, exactly as it does single-turn.
+    if hasattr(env, "prompt_opens_thinking"):
+        env.prompt_opens_thinking = prompt_opened_thinking
 
     # optimizer-update horizon, honoring [train].max_steps exactly like the retired trl path.
     epochs = int(_t.epochs) if (_t and _t.epochs is not None) else int(rl.num_epochs)

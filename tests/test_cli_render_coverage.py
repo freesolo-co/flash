@@ -415,3 +415,90 @@ def test_env_published_and_pulled(styled_plain) -> None:
     assert "pulled" in bare
     assert "./dest" in bare
     assert re.search(r"pulled.*dest", bare)
+
+
+# --------------------------------------------------------------------------- live-run cost
+
+
+def test_settled_cost_states_cover_every_runner_terminal_state() -> None:
+    """render's copy of the settled set must not drift from the runner's.
+
+    render.py is deliberately stdlib-only, so it restates which states mean "cost_usd is final"
+    instead of importing them. If the runner ever adds a terminal state, this fails here rather
+    than silently showing a settled charge as an estimate forever.
+    """
+    from flash.runner import _FINISHED_AT_PRESERVED_STATES
+
+    assert render.SETTLED_COST_STATES == _FINISHED_AT_PRESERVED_STATES
+
+
+def test_run_cost_prefers_the_quote_while_a_run_is_live() -> None:
+    # a running run has cost_usd 0.0 until the terminal transition writes it; showing that as the
+    # cost tells the user a billing GPU is free.
+    amount, is_estimate = render.run_cost(
+        {"state": "running", "cost_usd": 0.0, "estimated_cost_usd": 3.5}
+    )
+    assert (amount, is_estimate) == (3.5, True)
+
+
+def test_run_cost_uses_the_settled_charge_once_terminal() -> None:
+    for state in ("done", "failed", "cancelled", "dry_run", "deployed"):
+        amount, is_estimate = render.run_cost(
+            {"state": state, "cost_usd": 1.25, "estimated_cost_usd": 3.5}
+        )
+        assert (amount, is_estimate) == (1.25, False), state
+
+
+def test_run_cost_prefers_measured_spend_over_the_quote_while_live() -> None:
+    # once a live run has accrued a real number, that beats the submit-time guess -- but it is
+    # still not the settled charge, so it stays flagged as an estimate.
+    amount, is_estimate = render.run_cost(
+        {"state": "running", "cost_usd": 0.75, "estimated_cost_usd": 3.5}
+    )
+    assert (amount, is_estimate) == (0.75, True)
+
+
+def test_run_cost_without_a_quote_reports_zero_unflagged() -> None:
+    # nothing to show is not the same as an estimate of zero; don't decorate a bare 0.0.
+    assert render.run_cost({"state": "queued", "cost_usd": 0.0}) == (0.0, False)
+    assert render.run_cost({"state": "queued", "estimated_cost_usd": None}) == (0.0, False)
+
+
+def test_run_status_marks_a_live_cost_as_an_estimate(styled_plain) -> None:
+    obj = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo"},
+        "cost_usd": 0.0,
+        "estimated_cost_usd": 2.5,
+    }
+    out = render.run_status(obj)
+    assert "$2.5000" in out
+    assert "estimate, run in progress" in out
+    assert "$0.0000" not in out
+
+
+def test_runs_table_marks_live_rows_with_a_tilde(styled_plain) -> None:
+    out = render.runs_table(
+        [
+            {
+                "run_id": "flash-live",
+                "state": "running",
+                "updated_at": 2,
+                "spec": {"model": "m", "algorithm": "grpo"},
+                "cost_usd": 0.0,
+                "estimated_cost_usd": 2.5,
+            },
+            {
+                "run_id": "flash-done",
+                "state": "done",
+                "updated_at": 1,
+                "spec": {"model": "m", "algorithm": "sft"},
+                "cost_usd": 1.25,
+                "estimated_cost_usd": 2.5,
+            },
+        ]
+    )
+    assert "~$2.5000" in out  # live: the quote, flagged
+    assert "$1.2500" in out  # settled: the real charge
+    assert "~$1.2500" not in out

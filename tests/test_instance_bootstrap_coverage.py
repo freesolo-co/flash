@@ -703,9 +703,7 @@ def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, w
     [SystemExit(17), KeyboardInterrupt("interrupted"), RuntimeError("wait failed")],
     ids=["system-exit", "keyboard-interrupt", "unexpected-exception"],
 )
-def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(
-    monkeypatch, wait_error
-):
+def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeypatch, wait_error):
     uploader = _ReapTrackedUploader()
     stop_upload = threading.Event()
     marker_states = []
@@ -960,7 +958,9 @@ def test_run_mode_reaps_final_uploader_before_terminal_marker_reserve(monkeypatc
     )
     assert marker_started_at <= reaping_deadline
     assert deadline - marker_started_at >= b._TERMINAL_BOOKKEEPING_RESERVE_S
-    assert [event[0] for event in events].index("kill") < [event[0] for event in events].index("marker")
+    assert [event[0] for event in events].index("kill") < [event[0] for event in events].index(
+        "marker"
+    )
     assert events[-1] == ("marker", marker_started_at, False)
 
 
@@ -1105,14 +1105,14 @@ def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeyp
     )
     assert marker_started_at <= reaping_deadline
     assert deadline - marker_started_at >= b._TERMINAL_BOOKKEEPING_RESERVE_S
-    assert [event[0] for event in events].index("kill") < [event[0] for event in events].index("marker")
+    assert [event[0] for event in events].index("kill") < [event[0] for event in events].index(
+        "marker"
+    )
     assert events[-1] == ("marker", marker_started_at, False)
 
 
 @pytest.mark.parametrize("_iteration", range(3))
-def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(
-    monkeypatch, _iteration
-):
+def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monkeypatch, _iteration):
     stop_timeout = 0.03
     final_timeout = 0.03
     terminate_timeout = 0.02
@@ -1246,9 +1246,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(
 
 def test_stop_upload_process_reaps_real_sleeping_child_before_marker_reserve():
     context = multiprocessing.get_context("spawn")
-    process = _InspectableProcess(
-        context.Process(target=_sleeping_upload_child, daemon=True)
-    )
+    process = _InspectableProcess(context.Process(target=_sleeping_upload_child, daemon=True))
     stop_upload = context.Event()
     process.start()
     try:
