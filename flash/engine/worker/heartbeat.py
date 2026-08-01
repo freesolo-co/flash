@@ -34,6 +34,8 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
         "rl_data_loading",
         "rl_adapter_loading",
         "sft_pretokenizing",
+        "sft_configuring",
+        "opd_configuring",
         "opd_filtering_prompts",
         "sft_initializing",
         "rl_initializing",
@@ -70,6 +72,7 @@ def _is_critical_stage(stage: str) -> bool:
     """A terminal transition or an error is CRITICAL: never throttled (the commit must land) and
     given the longer upload-lock timeout, because no later heartbeat can repair a missed one."""
     return stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
+
 
 # Guards throttle bookkeeping; slow HF commit runs outside this lock so trainer callbacks don't
 # block on the network.
@@ -208,7 +211,10 @@ def heartbeat(
             if force:
                 _w._HB_LAST_FORCED_UPLOAD = now
             _committed_step = kw.get("step")
-            if isinstance(_committed_step, (int, float)) and _committed_step > _w._HB_LAST_COMMITTED_STEP:
+            if (
+                isinstance(_committed_step, (int, float))
+                and _committed_step > _w._HB_LAST_COMMITTED_STEP
+            ):
                 _w._HB_LAST_COMMITTED_STEP = int(_committed_step)
     payload_committed = False
     if upload_due:
@@ -229,7 +235,9 @@ def heartbeat(
                         os.remove(up)
                 if committed is False:
                     # ``is False`` (not falsy) so a mock/None never trips the rollback.
-                    _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
+                    _rollback_throttle_slot(
+                        my_claim, prev_last_upload, prev_last_step, prev_last_forced
+                    )
                     print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
                 else:
                     payload_committed = True

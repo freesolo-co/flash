@@ -154,7 +154,6 @@ def _legacy_lora_floor_gb(lora_rank: int, effective_params_b: float) -> float:
     return (lora_rank / 16.0) * (0.3 + 0.04 * effective_params_b)
 
 
-
 def opd_training_peak_gb(
     params_b: float,
     seq_len: int,
@@ -222,7 +221,6 @@ def opd_post_init_reserve_gb(params_b: float, lora_rank: int) -> float:
     adamw_state_gb = trainable_params_b * 4.0
     persistent_growth_gb = max(1.0, min(12.0, model_params_b * 0.35))
     return gradient_gb + adamw_state_gb + persistent_growth_gb
-
 
 
 def _lora_memory_gb(
@@ -763,14 +761,10 @@ def grpo_fits_resident(
     if revision:
         params_b = float(resolve_params_b(model_id, revision=revision) or 0.0)
     else:
-        params_b = (
-            float(getattr(catalog_info, "params_b", 0.0) or 0.0) if catalog_info else 0.0
-        )
+        params_b = float(getattr(catalog_info, "params_b", 0.0) or 0.0) if catalog_info else 0.0
     if params_b <= 0:
         return False
-    quant = (
-        (getattr(catalog_info, "quant", "bf16") or "bf16") if catalog_info else "bf16"
-    )
+    quant = (getattr(catalog_info, "quant", "bf16") or "bf16") if catalog_info else "bf16"
     # pinned revisions use the conservative generic kv and lora geometry, matching the runtime budget.
     info = None if revision else catalog_info
     active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
@@ -1078,9 +1072,7 @@ def model_required_vram_gb(
     is_grpo = _algo in ("grpo", "rl")
     is_opd = _algo == "opd"
     is_vllm_rollout = is_grpo or is_opd
-    vllm_concurrency = (
-        opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
-    )
+    vllm_concurrency = opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
     # the fused sft loss removes ignored positions before the lm head and projects valid tokens
     # without materializing dense logits. size validated qwen sft jobs without a [batch, seq, vocab]
     # term; models outside that validated set keep the conservative plain-nll estimate and cap.

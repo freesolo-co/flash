@@ -461,8 +461,13 @@ def _redact_internal_adapter_ref(data: dict) -> None:
 
     A worker/effective or legacy record can persist ``train.init_from_adapter`` as the internal
     storage ref ``<hf_repo>:<phase>/<run_id>[/checkpoints/step-N]``, which embeds the private HF
-    repo. Rewrite it back to the user-facing checkpoint ref (``<run_id>[/step-N]``); a public ref
-    (``parse_adapter_storage_ref`` returns ``None``) is left untouched.
+    repo. Rewrite it back to the user-facing checkpoint ref (``<run_id>[/step-N]``).
+
+    A ref is published only when it is PROVEN user-facing, never merely because this build failed
+    to parse it as internal. Those are different claims: a persisted locator whose phase this build
+    no longer knows (``opsd``, removed in #784) stops parsing as internal, and inferring "public"
+    from that published the private repo verbatim (chatgpt-codex-connector). Unrecognized shapes are
+    dropped, which is what the malformed-prefix branch below has always done.
     """
     train = data.get("train")
     if not isinstance(train, dict):
@@ -470,11 +475,15 @@ def _redact_internal_adapter_ref(data: dict) -> None:
     ref = train.get("init_from_adapter")
     if not isinstance(ref, str) or not ref.strip():
         return
-    from flash.schema import format_checkpoint_ref, parse_adapter_storage_ref
+    from flash.schema import format_checkpoint_ref, parse_adapter_storage_ref, parse_checkpoint_ref
 
+    if parse_checkpoint_ref(ref) is not None:
+        return  # the user-facing grammar, and the only one a submit accepts
     resolved = parse_adapter_storage_ref(ref)
     if resolved is None:
-        return  # already a user-facing ref, not an internal storage locator
+        # Neither grammar: cannot show it is free of a private repo, so do not publish it.
+        train.pop("init_from_adapter", None)
+        return
     _repo, prefix = resolved
     match = re.fullmatch(
         r"(?:sft|rl|opd)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
@@ -498,6 +507,13 @@ def _status_storage_dict(status: RunStatus) -> dict:
         _adapter_ref_for_status(status) if status.state in {"done", "deployed"} else None
     )
     return data
+
+
+class WarmStartPreparationError(ValueError):
+    """A submit failed while preparing ``train.init_from_adapter``'s source adapter.
+
+    Lets the submit route blame the adapter only for failures that really came from resolving it.
+    """
 
 
 class _RunCancelled(RuntimeError):
@@ -805,7 +821,30 @@ def _prepare_init_from_adapter(
     owner_key_id: int | None = None,
     token: str | None = None,
 ) -> tuple[JobSpec, JobSpec, dict | None]:
-    """prepare public and worker specs with source-authoritative adapter metadata."""
+    """prepare public and worker specs with source-authoritative adapter metadata.
+
+    Failures here are genuinely about the warm-start source, so they are tagged
+    ``WarmStartPreparationError`` for the submit route. Everything else in ``prepare_job`` (gpu
+    sizing, budget, environment resolution) must keep its own message rather than be reported as a
+    bad adapter, since those run for non-warm-start runs too and have nothing to do with the adapter.
+    """
+    try:
+        return _prepare_init_from_adapter_inner(
+            spec, owner_org_id=owner_org_id, owner_key_id=owner_key_id, token=token
+        )
+    except WarmStartPreparationError:
+        raise
+    except Exception as exc:
+        raise WarmStartPreparationError(str(exc)) from exc
+
+
+def _prepare_init_from_adapter_inner(
+    spec: JobSpec,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+    token: str | None = None,
+) -> tuple[JobSpec, JobSpec, dict | None]:
     _require_supported_adapter_continuation(spec)
     ref = spec.train.init_from_adapter
     if not ref:

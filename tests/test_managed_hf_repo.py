@@ -84,7 +84,9 @@ def test_managed_hf_repo_reuses_repo_for_same_environment():
     from flash import runner
 
     env_id = "github:owner/repo@main:env/environment.py"
-    assert runner.managed_hf_repo_for_environment(env_id) == runner.managed_hf_repo_for_environment(env_id)
+    assert runner.managed_hf_repo_for_environment(env_id) == runner.managed_hf_repo_for_environment(
+        env_id
+    )
     assert runner.managed_hf_repo_for_environment(env_id) != runner.managed_hf_repo_for_environment(
         "github:owner/repo@main:env/other.py"
     )

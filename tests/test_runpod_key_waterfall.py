@@ -150,7 +150,9 @@ def test_is_failover_error(monkeypatch):
     net = RuntimeError("connection reset")
     net.__cause__ = urllib.error.URLError("connection reset")
     assert keys.is_failover_error(net) is False
-    assert keys.is_failover_error(RuntimeError("Max workers across all endpoints ... quota")) is False
+    assert (
+        keys.is_failover_error(RuntimeError("Max workers across all endpoints ... quota")) is False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -379,5 +381,11 @@ def test_billing_endpoints_queries_every_pool_account(monkeypatch):
     rows = runpod_api.billing_endpoints(
         start_time="2026-06-01T00:00:00Z", end_time="2026-06-02T00:00:00Z", endpoint_id="ep-owned"
     )
-    assert set(queried) == {"rk-a", "rk-b", "rk-c"}  # every account queried, not just the active one
-    assert rows == [{"endpointId": "ep-owned", "amount": 4.5}]  # owner's rows; failing account skipped
+    assert set(queried) == {
+        "rk-a",
+        "rk-b",
+        "rk-c",
+    }  # every account queried, not just the active one
+    assert rows == [
+        {"endpointId": "ep-owned", "amount": 4.5}
+    ]  # owner's rows; failing account skipped

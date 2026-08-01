@@ -24,7 +24,9 @@ def _stub_prepare_dependencies(monkeypatch):
     import flash.runner as runner
 
     monkeypatch.setattr(runner, "resolve_model", lambda *args, **kwargs: catalog.MODELS[args[0]])
-    monkeypatch.setattr("flash.cost.spec.estimate_for_spec", lambda _spec: SimpleNamespace(total_usd=1.0))
+    monkeypatch.setattr(
+        "flash.cost.spec.estimate_for_spec", lambda _spec: SimpleNamespace(total_usd=1.0)
+    )
     monkeypatch.setattr(
         "flash.lora_rank.preflight_train_context_within_serving", lambda _spec: None
     )
@@ -166,9 +168,7 @@ def test_prepare_job_moving_ref_persists_first_resolved_commit(monkeypatch):
     assert prepared.worker_spec.model_revision == "b" * 40
 
 
-def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
-    monkeypatch, tmp_path
-):
+def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(monkeypatch, tmp_path):
     import flash.engine.vram as vram
 
     config = tmp_path / "config.json"
@@ -181,9 +181,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
             }
         )
     )
-    monkeypatch.setattr(
-        "huggingface_hub.hf_hub_download", lambda **kwargs: str(config)
-    )
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **kwargs: str(config))
 
     class Api:
         def __init__(self, *, token):
@@ -193,9 +191,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
             return SimpleNamespace(safetensors=SimpleNamespace(total=int(0.9e9)))
 
     monkeypatch.setattr("huggingface_hub.HfApi", Api)
-    need = vram.model_required_vram_gb(
-        "Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40
-    )
+    need = vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40)
     assert need > 0
 
     captured = {}
@@ -206,9 +202,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
 
     with monkeypatch.context() as scoped:
         scoped.setattr(vram, "estimate_vram_gb", capture_estimate)
-        vram.model_required_vram_gb(
-            "Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40
-        )
+        vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40)
     assert captured["model_info"] is None
     assert captured["active_params_b"] == 0.0
 
@@ -218,9 +212,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
 
     monkeypatch.setattr("huggingface_hub.HfApi", DriftApi)
     with pytest.raises(ValueError, match="geometry incompatible"):
-        vram.model_required_vram_gb(
-            "Qwen/Qwen3.5-0.8B", "sft", model_revision="e" * 40
-        )
+        vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="e" * 40)
 
 
 def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
@@ -246,9 +238,7 @@ def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
 
     monkeypatch.setattr("huggingface_hub.HfApi", NoParamApi)
     with pytest.raises(ValueError, match="no parameter-count metadata"):
-        vram.model_required_vram_gb(
-            "Qwen/Qwen3.5-0.8B", "sft", model_revision="f" * 40
-        )
+        vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="f" * 40)
 
 
 def test_check_fit_pinned_metadata_failure_is_unknown_but_sizing_stays_strict(monkeypatch):
@@ -323,7 +313,7 @@ def test_prefetch_pinned_revision_does_not_swallow_download_failure(monkeypatch)
 
     monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
     monkeypatch.setattr(hf, "_require_hf_deadline_allowance", lambda: None)
-    monkeypatch.setattr(hf, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
     monkeypatch.setattr(hf._w, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
@@ -343,7 +333,7 @@ def test_prefetch_pinned_revision_wraps_transient_download_failure(monkeypatch):
     transient = Timeout("timed out")
     monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
     monkeypatch.setattr(hf, "_require_hf_deadline_allowance", lambda: None)
-    monkeypatch.setattr(hf, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
     monkeypatch.setattr(hf._w, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",

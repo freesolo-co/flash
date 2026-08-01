@@ -105,9 +105,7 @@ def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
     )
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")]
-    )
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")])
     result = subprocess.run(
         [sys.executable, "-m", "flash.engine.worker"],
         cwd=repo_root,

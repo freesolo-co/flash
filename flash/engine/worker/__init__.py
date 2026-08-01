@@ -165,9 +165,7 @@ JOB_SPEC = load_job_spec_from_env()
 SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
 PHASE = os.environ.get(
     "PHASE",
-    JOB_SPEC.phase
-    if JOB_SPEC
-    else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
+    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
 )
 OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
 
@@ -239,9 +237,14 @@ def _load_active_env():
             "(a Freesolo environment id like 'your-name/your-env', returned by "
             "`flash env push --project <project-uuid> --name <name>`)."
         )
-    return load_environment(
+    env = load_environment(
         env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
     )
+    # tell the env whether this run samples <think> blocks, so the multi-turn scoring path strips
+    # reasoning exactly like the single-turn path does (see FreesoloEnvironment.record_model_turn).
+    if hasattr(env, "thinking"):
+        env.thinking = bool(JOB_SPEC.thinking)
+    return env
 
 
 ACTIVE_ENV = None

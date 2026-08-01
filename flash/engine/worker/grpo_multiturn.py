@@ -95,9 +95,7 @@ def post_json(url: str, path: str, payload: dict) -> dict:
     try:
         return json.loads(body.decode("utf-8"))
     except (TypeError, ValueError, UnicodeDecodeError) as error:
-        raise RuntimeError(
-            f"flash multi-turn bridge returned malformed json for {path}"
-        ) from error
+        raise RuntimeError(f"flash multi-turn bridge returned malformed json for {path}") from error
 
 
 def build_flash_grpo_multi_turn_agent_loop(
@@ -136,7 +134,8 @@ def build_flash_grpo_multi_turn_agent_loop(
             max_model_len = int(os.environ["FLASH_VERL_MAX_MODEL_LEN"])
             max_completion_tokens = int(os.environ["FLASH_VERL_MAX_COMPLETION_TOKENS"])
             stop_sequences = tuple(
-                str(value) for value in json.loads(os.environ.get("FLASH_VERL_STOP_SEQUENCES", "[]"))
+                str(value)
+                for value in json.loads(os.environ.get("FLASH_VERL_STOP_SEQUENCES", "[]"))
             )
             eos_token_ids = frozenset(
                 int(value) for value in json.loads(os.environ.get("FLASH_VERL_EOS_TOKEN_IDS", "[]"))

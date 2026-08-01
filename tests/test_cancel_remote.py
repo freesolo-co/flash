@@ -569,7 +569,6 @@ def test_cancel_run_retries_durable_cleanup_for_cancelled_run(tmp_path, monkeypa
     assert orch._CLEANUP_REMOTES_KEY not in orch._load_status_json(spec.run_id)
 
 
-
 def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
     tmp_path, monkeypatch
 ):

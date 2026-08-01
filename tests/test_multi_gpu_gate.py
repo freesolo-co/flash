@@ -14,7 +14,11 @@ import tempfile
 import pytest
 
 # the keys each phase used to be selected by. all dead: no worker reads any of them now.
-_STALE_BACKEND_ENV = {"sft": "FLASH_SFT_BACKEND", "grpo": "FLASH_RL_BACKEND", "opd": "FLASH_OPD_BACKEND"}
+_STALE_BACKEND_ENV = {
+    "sft": "FLASH_SFT_BACKEND",
+    "grpo": "FLASH_RL_BACKEND",
+    "opd": "FLASH_OPD_BACKEND",
+}
 
 
 def _spec(count: int, algorithm: str = "grpo", backend: str = "", provider: str = "runpod"):

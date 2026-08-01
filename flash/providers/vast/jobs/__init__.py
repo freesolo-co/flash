@@ -478,15 +478,10 @@ def _failure_detail(
     err_name = error_artifact_name(phase, attempt)
     content = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
     if content:
-        parts.append(
-            f"--- {err_name} ---\n{sanitize_diagnostic(content[-4096:], limit=4096)}"
-        )
+        parts.append(f"--- {err_name} ---\n{sanitize_diagnostic(content[-4096:], limit=4096)}")
     logs = vast_api.instance_logs(int(instance_id))
     if logs:
-        parts.append(
-            "--- instance log tail ---\n"
-            f"{sanitize_diagnostic(logs[-4096:], limit=4096)}"
-        )
+        parts.append(f"--- instance log tail ---\n{sanitize_diagnostic(logs[-4096:], limit=4096)}")
     return "\n".join(parts) or "vast worker terminated without a strict terminal marker"
 
 
@@ -744,11 +739,7 @@ def destroy_run_instances(run_id: str) -> list[int]:
         iid = _coerce_instance_id(inst.get("id"))  # skip a non-intable id, don't abort the loop
         label = str(inst.get("label") or "")
         # Match on the label boundary (not a raw prefix) so ``flash-100`` can't also destroy ``flash-1000``.
-        if (
-            iid
-            and label_matches_run(label, prefix)
-            and vast_api.destroy_instance(iid)
-        ):
+        if iid and label_matches_run(label, prefix) and vast_api.destroy_instance(iid):
             destroyed.append(iid)
     return destroyed
 

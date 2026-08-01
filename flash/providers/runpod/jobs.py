@@ -63,6 +63,7 @@ __all__ = [
     "apply_disk_gb",
     "apply_image_override_constraints",
     "build_function_input",
+    "capacity_escalation_note",
     "decode_output",
     "deploy_train_endpoint",
     "grow_weight_cache_volumes",
@@ -750,7 +751,9 @@ def deploy_train_endpoint(
                 rp_keys.key_count(),
             )
             continue
-        raise deploy_failover_exc or RuntimeError("deploy_train_endpoint: deploy failover exhausted")
+        raise deploy_failover_exc or RuntimeError(
+            "deploy_train_endpoint: deploy failover exhausted"
+        )
 
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
@@ -857,6 +860,33 @@ class GraceTimer:
         self.seen = now
 
 
+def capacity_escalation_note(on_last_gpu: bool) -> str:
+    """The escalation clause a capacity failure detail carries. States the escalation fact ONLY.
+
+    on_last_gpu means "no further GPU-class escalation follows", so "next-best GPU" is a false
+    promise there. It is NOT a class-exhaustion signal: the supervisor also sets it when the infra
+    retry budget runs out, which can happen with classes still untried. And it says nothing about
+    WHICH class a retry reuses -- the picker can clamp back to a cheaper already-tried one. So claim
+    neither exhaustion nor a retry; the supervisor owns both and logs them on the action line.
+
+    The false branch has to stay just as neutral, and originally did not. A cache-drop retry fires
+    while classes remain untried, so on_last_gpu is false, yet that path deliberately leaves
+    failed_providers and tried_classes untouched and reselects the SAME class without the volume.
+    Promising "the next-best GPU" there contradicted the action line printed directly beneath it,
+    which names the reused class. poll_job cannot see the cache-fallback intent -- it holds neither
+    the retry budget nor the candidate list -- so it states only the escalation fact and lets the
+    supervisor name the target (codex[bot], cursor).
+
+    Module-level so a supervisor-level test can assert the two log lines agree without hand-writing
+    this string: a stand-in would keep passing after the wording regressed.
+    """
+    return (
+        "no further GPU-class escalation follows"
+        if on_last_gpu
+        else "GPU-class escalation may follow"
+    )
+
+
 def poll_job(
     handle: JobHandle,
     log=None,
@@ -870,17 +900,23 @@ def poll_job(
     queue_grace_s: float = 300.0,
     deadline_at: float | None = None,
     current_attempt: int | None = None,
+    on_last_gpu: bool = False,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
 
     Uses setup_grace_s (large) until first training heartbeat, then stall_after_s (tight).
     Fails fast on THROTTLED/UNHEALTHY workers and jobs stuck IN_QUEUE past queue_grace_s.
+
+    ``on_last_gpu`` says no further GPU-class escalation follows, so a capacity failure states that.
+    Neither branch asserts that a retry happens, nor which class one would use: the supervisor owns
+    the candidate list and the retry budget, and logs both on the action line that follows.
     """
 
     if not handle.job_id:
         raise ValueError("endpoint-only RunPod handles cannot be polled")
 
     say = make_say(log)
+    next_gpu_note = capacity_escalation_note(on_last_gpu)
     poll_errors = PollErrorTracker(say, interval_s)
 
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
@@ -980,7 +1016,7 @@ def poll_job(
                 False,
                 failure="no_capacity",
                 detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
-                "(no RunPod capacity for the pinned GPU class)",
+                f"(no RunPod capacity for the pinned GPU class); {next_gpu_note}",
             )
         if status != "IN_QUEUE":
             # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
@@ -1032,8 +1068,8 @@ def poll_job(
                         False,
                         failure="no_capacity",
                         detail=f"never scheduled: worker stuck THROTTLED for "
-                        f"{int(now - throttled_timer.since)}s while IN_QUEUE "
-                        f"(no RunPod capacity for the pinned GPU class)",
+                        f"{int(now - throttled_timer.since)}s while IN_QUEUE (no RunPod "
+                        f"capacity for the pinned GPU class); {next_gpu_note}",
                     )
             except Exception:
                 pass
@@ -1212,6 +1248,7 @@ def submit_run(
         failure_detail_reader=failure_reader,
         current_attempt=attempt_id,
         **deadline_kwargs(poll_job, deadline_at),
+        on_last_gpu=on_last_gpu,
         **stall_kwargs(on_last_gpu=on_last_gpu),
     )
 

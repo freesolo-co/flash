@@ -285,11 +285,7 @@ def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
 
 
 def _worker_execution_deadline(upload_deadline_at: float) -> float:
-    return (
-        upload_deadline_at
-        - _CONSOLE_UPLOAD_STOP_TIMEOUT_S
-        - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
-    )
+    return upload_deadline_at - _CONSOLE_UPLOAD_STOP_TIMEOUT_S - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
 
 
 def _join_upload_process_before(process, deadline_at: float, max_wait_s: float) -> None:

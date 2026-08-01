@@ -22,7 +22,13 @@ def test_fp8_kv_unlocks_longer_resident_context():
 
     def f(ctx, fp8):
         return grpo_fits_resident(
-            mid, seq_len=ctx, max_tokens=384, lora_rank=16, group_size=8, card_vram_gb=179.06, fp8_kv=fp8
+            mid,
+            seq_len=ctx,
+            max_tokens=384,
+            lora_rank=16,
+            group_size=8,
+            card_vram_gb=179.06,
+            fp8_kv=fp8,
         )
 
     assert f(2048, False)  # short ctx fits either way
@@ -40,7 +46,13 @@ def test_sleep_unsupported_model_is_sized_resident_not_slept():
 
     def fits(ctx):
         return grpo_fits_resident(
-            mid, seq_len=ctx, max_tokens=384, lora_rank=16, group_size=8, card_vram_gb=179.06, fp8_kv=True
+            mid,
+            seq_len=ctx,
+            max_tokens=384,
+            lora_rank=16,
+            group_size=8,
+            card_vram_gb=179.06,
+            fp8_kv=True,
         )
 
     assert fits(4096)
@@ -53,8 +65,18 @@ def test_sleep_unsupported_model_rejected_at_parse_time_for_long_context():
     from flash.engine.vram import model_required_vram_gb
 
     mid = "Qwen/Qwen3.6-35B-A3B"
-    fits = {"max_context_tokens": 4096, "group_size": 8, "max_completion_tokens": 384, "lora_rank": 16}
-    over = {"max_context_tokens": 8192, "group_size": 8, "max_completion_tokens": 384, "lora_rank": 16}
+    fits = {
+        "max_context_tokens": 4096,
+        "group_size": 8,
+        "max_completion_tokens": 384,
+        "lora_rank": 16,
+    }
+    over = {
+        "max_context_tokens": 8192,
+        "group_size": 8,
+        "max_completion_tokens": 384,
+        "lora_rank": 16,
+    }
     assert model_required_vram_gb(mid, "grpo", train=fits) <= 180  # admitted on the B200
     assert model_required_vram_gb(mid, "grpo", train=over) > 180  # past every GPU -> rejected
 
@@ -154,9 +176,7 @@ def test_pinned_revision_is_sized_on_the_revisions_own_geometry(monkeypatch):
 
     monkeypatch.setattr(vram_mod, "_validated_revision_geometry", _capture)
 
-    pinned = vram_mod.model_required_vram_gb(
-        "Qwen/Qwen3.5-4B", "grpo", model_revision="a" * 40
-    )
+    pinned = vram_mod.model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", model_revision="a" * 40)
     assert seen["revision"] == "a" * 40, "the pinned revision never reached the sizing path"
     # and the substituted geometry actually moved the answer -- otherwise the assert above would
     # pass even if the result were computed from the catalog numbers regardless.
@@ -191,15 +211,27 @@ def test_moe_grpo_fits_resident_sizes_compute_on_active_params():
     # exceed 180 and the B200 case above would be False. Prove the active-aware estimate is materially
     # leaner than the (buggy) total-based one — that gap is what flips the B200 verdict.
     active_aware = estimate_vram_gb(
-        info.params_b, "grpo", "bf16", sleep_offload=False,
-        active_params_b=info.active_params_b, vocab=vocab_size_for(moe), **kw,
+        info.params_b,
+        "grpo",
+        "bf16",
+        sleep_offload=False,
+        active_params_b=info.active_params_b,
+        vocab=vocab_size_for(moe),
+        **kw,
     )
     total_based = estimate_vram_gb(
-        info.params_b, "grpo", "bf16", sleep_offload=False,
-        active_params_b=None, vocab=vocab_size_for(moe), **kw,
+        info.params_b,
+        "grpo",
+        "bf16",
+        sleep_offload=False,
+        active_params_b=None,
+        vocab=vocab_size_for(moe),
+        **kw,
     )
     assert active_aware < total_based
-    assert active_aware * 1.15 <= 180 < total_based * 1.15  # only the active-aware fit clears the B200
+    assert (
+        active_aware * 1.15 <= 180 < total_based * 1.15
+    )  # only the active-aware fit clears the B200
 
 
 def test_unset_max_length_still_resolves_the_real_rollout_length():

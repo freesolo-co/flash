@@ -257,7 +257,9 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
             if (
                 not isinstance(offsets, list)
                 or len(offsets) != 2
-                or any(not isinstance(offset, int) or isinstance(offset, bool) for offset in offsets)
+                or any(
+                    not isinstance(offset, int) or isinstance(offset, bool) for offset in offsets
+                )
                 or offsets[0] < 0
                 or offsets[0] > offsets[1]
                 or offsets[1] > data_size
@@ -324,7 +326,7 @@ def assert_lora_applied(model, model_id: str) -> int:
     count = 0
     for name, _ in model.named_modules():
         # peft names the per-target adapter submodules ``...lora_A.<adapter>`` / ``...lora_B.*``.
-        if name.endswith("lora_A.default") or name.endswith("lora_B.default"):
+        if name.endswith(("lora_A.default", "lora_B.default")):
             count += 1
     if count == 0:
         raise RuntimeError(

@@ -9,9 +9,7 @@ from typing import Any
 
 from flash.engine.structured_outputs import parse_structured_outputs
 
-_MISTRAL_TOKENIZER_FILE = re.compile(
-    r"(?:^|/)(?:tekken\.json|tokenizer(?:\.mm)?\.model\.v[^/]*)$"
-)
+_MISTRAL_TOKENIZER_FILE = re.compile(r"(?:^|/)(?:tekken\.json|tokenizer(?:\.mm)?\.model\.v[^/]*)$")
 
 
 @dataclass(frozen=True)
@@ -29,8 +27,7 @@ def _xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> bool:
         # array-valued type: the keyword applies if ANY member type would trigger the fallback;
         # normalize by re-running the predicate per member.
         return any(
-            _xgrammar_unsupported_json_feature({**schema, "type": member})
-            for member in schema_type
+            _xgrammar_unsupported_json_feature({**schema, "type": member}) for member in schema_type
         )
     # keywords trigger the guidance fallback whether or not "type" is spelled out (json-schema
     # keywords apply implicitly); an untyped schema with these keywords must also be rejected.
@@ -51,8 +48,7 @@ def _xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> bool:
         if isinstance(value, dict) and _xgrammar_unsupported_json_feature(value):
             return True
         if isinstance(value, list) and any(
-            isinstance(item, dict) and _xgrammar_unsupported_json_feature(item)
-            for item in value
+            isinstance(item, dict) and _xgrammar_unsupported_json_feature(item) for item in value
         ):
             return True
     return False
@@ -95,7 +91,9 @@ def _resolve_compiler_vocab_size(
     return int(info.vocab_size)
 
 
-def _resolve_structured_model_metadata(model_id: str, model_revision: str) -> tuple[int, tuple[str, ...]]:
+def _resolve_structured_model_metadata(
+    model_id: str, model_revision: str
+) -> tuple[int, tuple[str, ...]]:
     from huggingface_hub import HfApi
 
     from flash.engine.vram import fetch_hf_model_geometry
