@@ -11,7 +11,7 @@ import math
 import os
 import re
 import shutil
-import subprocess
+import socket
 import sys
 import textwrap
 import threading
@@ -1203,27 +1203,33 @@ def test_concurrent_scorers_are_serialized_for_the_env():
         server.shutdown()
 
 
-def test_reward_server_accept_queue_holds_a_whole_rollout_batch():
+def test_reward_server_accept_queue_holds_a_whole_rollout_batch(monkeypatch):
     # verl opens one connection per episode and starts a whole step at once, so the accept queue
     # sees prompts_per_step * group_size connects in a burst. socketserver's default backlog of 5
     # overflows there and the kernel RESETS the excess, which reaches the client as
     # ConnectionResetError at getresponse(); bridge_post does not retry, so that kills the run.
     rollout_batch = 512  # the default 64x8 recipe
+
+    # record the argument the server actually hands to listen(). asserting on request_queue_size
+    # alone cannot tell a working fix from a no-op: server_activate() reads that attribute once,
+    # so a value set after server_bind() would never reach the socket at all.
+    backlogs = []
+    real_listen = socket.socket.listen
+
+    def spy_listen(self, *args):
+        backlogs.append(args[0] if args else None)
+        return real_listen(self, *args)
+
+    monkeypatch.setattr(socket.socket, "listen", spy_listen)
+
     server, _url = rl_train.start_reward_server(
         lambda idx, solution: 1.0, example_count=8, rollout_batch=rollout_batch
     )
     try:
         assert server.request_queue_size >= rollout_batch
-        # the constant is only a floor -- assert on what listen() actually applied, since a
-        # class attribute set after server_bind would never reach the socket at all.
-        listening = subprocess.run(
-            ["ss", "-lntH", "sport", f"= :{server.server_address[1]}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.split()
-        assert listening, "reward server port is not listening"
-        assert int(listening[2]) >= rollout_batch, f"kernel backlog is {listening[2]}"
+        assert backlogs, "server never called listen()"
+        assert backlogs[-1] is not None, "listen() was called with no backlog argument"
+        assert backlogs[-1] >= rollout_batch, f"listen() backlog is {backlogs[-1]}"
     finally:
         server.shutdown()
         server.server_close()
