@@ -129,6 +129,23 @@ def _resolve_policy(reference_turns: list[str]) -> str:
     return "replay" if "".join(reference_turns).strip() else "echo"
 
 
+def _junk_response(reference_turns: list[str]) -> str:
+    """A deliberately wrong answer, guaranteed to differ from this row's gold one.
+
+    The control is only evidence while it is wrong. `_ECHO_RESPONSE` is the fixed string `test`,
+    and a reference answer that happens to be `test` collides with it, so the probe below fed the
+    grader the correct answer and read back the gold reward -- making a scorer that separates
+    perfectly look like one that pays junk as much as gold, and failing a working environment
+    (Cursor). Lengthening past every reference turn terminates: the turns are finite and each pass
+    grows the string. Compared stripped, because a control differing from gold only in whitespace
+    is one a grader may well still score as correct."""
+    gold = {turn.strip() for turn in reference_turns}
+    junk = _ECHO_RESPONSE
+    while junk.strip() in gold:
+        junk = f"not {junk}"
+    return junk
+
+
 def _carries_thinking_markup(reference_turns: list[str]) -> bool:
     """Whether a gold answer is written in reasoning markup this command cannot reproduce.
 
@@ -170,6 +187,7 @@ def _new_record() -> dict:
         "prompt": [],
         "responses": [],
         "thinking_markup": False,
+        "replay_incomplete": False,
     }
 
 
@@ -183,7 +201,7 @@ def _drive_single_turn(env, example: dict, record: dict, *, force_echo: bool = F
     response = (
         "\n".join(turn for turn in reference_turns if turn)
         if policy == "replay"
-        else _ECHO_RESPONSE
+        else _junk_response(reference_turns)
     )
     record["responses"] = [response]
     record["turns"] = 1
@@ -213,7 +231,13 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
         if policy == "replay" and turns < len(reference_turns):
             content = reference_turns[turns]
         else:
-            content = _ECHO_RESPONSE
+            # a reference shorter than the episode is padded so the rollout still reaches its own
+            # termination, but the trajectory graded at the end is then part gold and part junk.
+            # scoring it is not evidence about whether the grader recognizes its references, so
+            # the flag keeps it out of the blocking gate's totals (Cursor).
+            if policy == "replay":
+                record["replay_incomplete"] = True
+            content = _junk_response(reference_turns)
         record["responses"].append(content)
         env.record_model_turn(state, content)
         env_step_pending = True
@@ -727,9 +751,12 @@ def cmd_env_test(args) -> int:
         if record["policy"] == "replay" and reward is not None:
             # a reference written in reasoning markup cannot be replayed faithfully from here
             # (see `_carries_thinking_markup`), so its score is not evidence about the grader and
-            # is kept out of the blocking gate's totals. the advisory warning below still fires:
-            # a low reward is worth surfacing either way, it just cannot be the reason to fail.
-            if not record["thinking_markup"]:
+            # is kept out of the blocking gate's totals. neither is a multi-turn episode whose gold
+            # answer ran out before the rollout did: the graded trajectory is then part reference
+            # and part junk, and a zero says nothing about the reference the gate never ran
+            # (Cursor). the advisory warning below still fires for both: a low reward is worth
+            # surfacing either way, it just cannot be the reason to fail.
+            if not record["thinking_markup"] and not record["replay_incomplete"]:
                 replayed += 1
                 # an exact zero is what a scorer that recognized nothing returns, so it stays the
                 # signature this gate looks for. it is confirmed against a wrong answer once every

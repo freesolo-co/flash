@@ -494,6 +494,91 @@ def test_env_test_does_not_blame_the_grader_for_a_reference_it_cannot_replay(
     assert "overall: PASS" in captured.out
 
 
+def test_env_test_control_answer_differs_from_a_gold_answer_that_is_the_control_text(
+    monkeypatch, tmp_path, capsys
+):
+    """The negative control is only evidence while it is actually wrong.
+
+    The control was the fixed string `test`, so a reference answer of `test` collided with it and
+    the probe graded the CORRECT answer -- reading back the gold reward and concluding the grader
+    pays junk as much as gold. A centered scorer awarding 0 to the reference and less to anything
+    else separates perfectly, and this failed it (Cursor).
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "echo the word", "output": "test"}])
+    graded: list[str] = []
+
+    def reward(completion, example, state=None):
+        graded.append(completion)
+        # centered: the reference earns 0, anything else earns less.
+        return 0.0 if completion.strip() == example["output"] else -1.0
+
+    monkeypatch.setattr(env, "reward", reward)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    # the probe must have been handed something the grader scores as wrong, not the gold answer.
+    assert graded[-1].strip() != "test"
+    assert "cannot recognize its own reference answers" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_does_not_blame_the_grader_for_a_replay_shorter_than_the_episode(
+    monkeypatch, tmp_path, capsys
+):
+    """A gold answer that runs out mid-rollout never got the reference trajectory graded.
+
+    The driver pads the remaining turns with the junk control so the rollout still terminates, but
+    the scored trajectory is then part reference and part junk. Counting it as a gold replay let
+    the blocking gate fail on a trajectory it never fully exercised (Cursor).
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _MultiTurnEnv()
+    # the episode runs two model turns; the reference supplies only the first.
+    monkeypatch.setattr(
+        env,
+        "dataset",
+        lambda: [
+            {
+                "input": "finish the exchange",
+                "output": [{"role": "assistant", "content": "first"}],
+            }
+        ],
+    )
+    monkeypatch.setattr(env, "reward", lambda completion, example, state=None: 0.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "1/1 episodes passed contract checks" in captured.out
+    # the zero is still surfaced -- it is worth seeing -- it just cannot be the reason to fail.
+    assert "replay gold answer scored low" in captured.err
+    assert "cannot recognize its own reference answers" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_still_blames_the_grader_for_a_replay_that_covers_the_episode(
+    monkeypatch, tmp_path, capsys
+):
+    """The exclusion above is scoped to references that ran out, not to multi-turn as such.
+
+    A gold answer covering every turn of the episode is replayed faithfully, so its zero is real
+    evidence about the grader and must still block.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _MultiTurnEnv()
+    monkeypatch.setattr(env, "reward", lambda completion, example, state=None: 0.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "all 1 replayed gold answer(s) scored zero, no better than a deliberately wrong" in (
+        captured.err
+    )
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_test_still_blames_the_grader_for_plain_gold_answers(monkeypatch, tmp_path, capsys):
     # the exclusion above is scoped to the markup it cannot reproduce: a plain reference alongside a
     # tagged one is replayed faithfully, so its zero is real evidence and must still block.
