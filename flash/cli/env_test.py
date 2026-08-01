@@ -286,6 +286,22 @@ def _evaluation_example(case) -> dict:
     return example
 
 
+def _normalize_prompt_images(env, example: dict, messages: list[dict]) -> None:
+    """Resolve the case's images the way the online command and every training worker do.
+
+    Raises whatever `normalize_prompt_images` raises, so an unreadable, oversized, or malformed
+    image fails this gate with the message the caller would have hit at generation time. Text-only
+    cases -- the vast majority -- return without importing the multimodal machinery at all.
+    """
+    from flash.multimodal import record_has_images
+
+    if not record_has_images(example, messages):
+        return
+    from flash.multimodal import normalize_prompt_images
+
+    normalize_prompt_images(example, messages, getattr(env, "package_root", None))
+
+
 def _evaluation_response(env, case) -> tuple[str, str]:
     example = _evaluation_example(case)
     # build the prompt even though the replayed response does not need it. `flash env eval`
@@ -295,7 +311,16 @@ def _evaluation_response(env, case) -> tuple[str, str]:
     # gate print `overall: PASS` for exactly that sidecar (cursor[bot]).
     build = getattr(env, "prompt_messages", None)
     if callable(build):
-        _check_messages(build(example), "prompt")
+        messages = _check_messages(build(example), "prompt")
+        # `prompt_messages()` is only half of the prompt: `flash env eval` then runs
+        # `normalize_prompt_images` (`_remote_prompt_messages`), as every training worker does
+        # before tokenization. the envelope check above sees only the message list, so a case
+        # carrying a top-level `image`/`images` -- a missing or oversized package-relative file --
+        # or a malformed image block inside its prompt passed this gate, and the online command
+        # then recorded prompt-construction failures for a suite reported `overall: PASS`
+        # (chatgpt-codex-connector). run the same normalization here, against the environment's
+        # own package root, so both commands reject the same suites.
+        _normalize_prompt_images(env, example, messages)
     reference_turns = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     response = (
