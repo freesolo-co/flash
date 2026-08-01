@@ -1699,6 +1699,48 @@ def test_the_reentrant_shim_installs_vision_input_grads_only_for_multimodal_runs
     assert rl_train.render_reentrant_checkpointing_shim(False, multimodal=True) == ""
 
 
+def test_the_reentrant_shim_enables_language_side_input_grads_before_checkpointing():
+    """GRAD-001: every rl run is lora, so lora freezes the embeddings and nothing entering the
+    first checkpointed decoder layer requires grad. reentrant recompute then drops the backward
+    for the whole segment -- where every lora parameter lives -- and the run reports success while
+    training nothing. the vision hook only ever covered the patch embeddings on multimodal runs;
+    text-only runs had no hook at all."""
+    calls = []
+
+    class FakeModule:
+        def enable_input_require_grads(self):
+            calls.append("require_grads")
+
+        def gradient_checkpointing_enable(self, **kwargs):
+            calls.append(("gc_enable", kwargs))
+
+    class FakeEngine:
+        def __init__(self, checkpointing):
+            self.model_config = SimpleNamespace(enable_gradient_checkpointing=checkpointing)
+
+        def _build_module(self):
+            return FakeModule()
+
+    source = rl_train.render_reentrant_checkpointing_shim(True)
+    start = source.index("def _flash_reentrant_build_module")
+    end = source.index("_FlashReentrantEngine._build_module = _flash_reentrant_build_module")
+    namespace = {"_flash_reentrant_original_build_module": FakeEngine._build_module}
+    exec(compile(source[start:end], "sitecustomize.py", "exec"), namespace)
+    build = namespace["_flash_reentrant_build_module"]
+
+    build(FakeEngine(checkpointing=True))
+    # order matters: enabling checkpointing first captures the graph before any input requires
+    # grad, so asserting mere presence would pass on a broken shim.
+    assert calls[0] == "require_grads"
+    assert calls[1] == ("gc_enable", {"gradient_checkpointing_kwargs": {"use_reentrant": True}})
+
+    # the guard is load-bearing: when verl left checkpointing OFF, touching the module at all
+    # would turn on a feature verl deliberately declined and change the memory profile.
+    calls.clear()
+    build(FakeEngine(checkpointing=False))
+    assert calls == []
+
+
 @contextlib.contextmanager
 def _vision_hook_installer(torch_module):
     """yield the rendered vision helper with a stand-in torch visible to it.
@@ -1831,6 +1873,10 @@ def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alon
     class _Module:
         def __init__(self):
             self.kwargs = None
+            self.input_grads = False
+
+        def enable_input_require_grads(self):
+            self.input_grads = True
 
         def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
             self.kwargs = gradient_checkpointing_kwargs
@@ -1857,12 +1903,17 @@ def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alon
             sys.modules.setdefault(name, types.ModuleType(name))
         sys.modules[module_stub.__name__] = module_stub
         exec(rl_train.render_reentrant_checkpointing_shim(True), {})
-        # checkpointing on -> the flag is put back to reentrant
+        # checkpointing on -> the flag is put back to reentrant, and the lora-frozen embeddings
+        # get input grads so the checkpointed segment actually produces a backward (GRAD-001)
         engine = _Engine(True)
-        assert engine._build_module().kwargs == {"use_reentrant": True}
+        built = engine._build_module()
+        assert built.kwargs == {"use_reentrant": True}
+        assert built.input_grads is True
         # checkpointing off -> untouched, so the shim cannot silently raise the memory profile
         off = _Engine(False)
-        assert off._build_module().kwargs is None
+        off_built = off._build_module()
+        assert off_built.kwargs is None
+        assert off_built.input_grads is False
     finally:
         for name, value in saved.items():
             if value is None:
