@@ -29,7 +29,7 @@ import threading
 import time
 from collections.abc import Callable
 from functools import reduce
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from math import gcd
 
 from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
@@ -48,6 +48,7 @@ from flash.engine.structured_outputs import (
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
     VERL_REQUIREMENT,
+    BoundedThreadingHTTPServer,
     adopt_orphaned_descendants,
     agent_loop_workers,
     append_step_metrics,
@@ -2150,7 +2151,7 @@ def start_reward_server(
             self.end_headers()
             self.wfile.write(body)
 
-    class _RewardBridgeHTTPServer(ThreadingHTTPServer):
+    class _RewardBridgeHTTPServer(BoundedThreadingHTTPServer):
         request_queue_size = max(_REWARD_BRIDGE_MIN_REQUEST_BACKLOG, int(rollout_batch))
 
     server = _RewardBridgeHTTPServer(("127.0.0.1", 0), _Handler)
