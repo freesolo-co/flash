@@ -2496,6 +2496,60 @@ def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(monkeyp
     assert _processed_resume_steps((4,), 3) == {3}
 
 
+def test_the_watcher_marks_every_step_processed_but_publishes_only_required_ones():
+    # the two facts that make the final-publish guard below wrong. processed_steps.add(step) is
+    # unconditional, while the deployable publish is gated on `step in self.required_steps`, so a
+    # default run (save_at_steps empty -> required_steps empty) processes its last step without ever
+    # publishing a deployable for it.
+    source = inspect.getsource(_OpdVerlCheckpointWatcher)
+    publish_gate = "if step in self.required_steps:"
+    assert publish_gate in source
+    assert "self.processed_steps.add(step)" in source
+    # the unconditional mark must not sit inside the required-only publish branch.
+    assert source.index(publish_gate) < source.index("self.processed_steps.add(step)")
+
+
+def test_the_final_deployable_publish_is_not_suppressed_by_the_processed_marker():
+    # regression: the verl OPD path gated its final publish on `final_step not in
+    # watcher.processed_steps`. that guard reads as "skip if already published", but the two publish
+    # paths are PROVABLY DISJOINT -- final_save_due() is true only when save_at_steps is EMPTY, and
+    # the watcher publishes deployables only for steps that are IN save_at_steps. so the clause can
+    # never prevent a real double-publish; it can only suppress a legitimate one.
+    #
+    # live-confirmed on runpod a100 run flash-1785569991-7ce8c3c1 (4/4 steps, default save_at_steps):
+    # hf carries checkpoint/checkpoint-4/ (the watcher DID process step 4) but no
+    # checkpoints/step-4/adapter/, so `flash runs checkpoint` listed nothing and step-4 deploy was
+    # impossible. the pre-verl path published this unconditionally
+    # (opd.py: publish_checkpoint=final_save_due(opt_steps, knobs.save_at_steps)), and grpo's
+    # rl_train.py still does, so this was a verl-migration regression and a grpo/opd parity break.
+    source = inspect.getsource(opd_train.run_opd_train)
+    assert "final_save_due(final_step, knobs.save_at_steps)" in source
+    assert "final_step not in watcher.processed_steps" not in source
+
+
+def test_final_save_due_and_the_watcher_publish_set_never_overlap():
+    # the invariant the fix above rests on, asserted rather than assumed: if these two could ever be
+    # true for the same step, dropping the processed_steps clause would double-publish.
+    from flash.engine.steps import final_save_due
+
+    for save_at_steps in ((), (1,), (4,), (2, 4), (1, 2, 3, 4)):
+        for step in (1, 2, 3, 4):
+            watcher_publishes = step in save_at_steps
+            assert not (final_save_due(step, save_at_steps) and watcher_publishes), (
+                f"step={step} save_at_steps={save_at_steps} is published by BOTH paths"
+            )
+
+
+def test_both_ray_trainers_publish_their_final_step_deployable_the_same_way():
+    # grpo and opd must agree here: a default run's last step is what `flash models deploy
+    # <run>/step-N` targets, and one trainer silently not publishing it is exactly the shape of
+    # parity break this migration keeps producing.
+    for module in (rl_train, opd_train):
+        source = inspect.getsource(module)
+        assert "final_save_due(" in source, module.__name__
+        assert "publish_deployable_checkpoint(" in source, module.__name__
+
+
 def test_bridge_preserves_typed_permanent_teacher_failure():
     from flash.engine.worker.teacher import TeacherError
 
