@@ -446,7 +446,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
         # per core, which has killed real runs two ways (host-ram oom, and a fatal raylet fork
         # failure that takes every actor with it). size the pool to the container instead.
-        f"ray_kwargs.ray_init.num_cpus={ray_num_cpus()}",
+        f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(cfg['n_gpus'])}",
         f"trainer.n_gpus_per_node={cfg['n_gpus']}",
         "trainer.nnodes=1",
         f"trainer.total_epochs={cfg['total_epochs']}",

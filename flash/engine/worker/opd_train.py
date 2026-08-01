@@ -1570,7 +1570,7 @@ def build_opd_overrides(config: dict) -> list[str]:
         # per core. on a 1x4090 pod that is 48 forks nothing asked for, which oom-killed the actor
         # that mattered (VERL-123). size the pool to the container instead. this also keeps the
         # storage-unit reservation above satisfiable, since it stays well under the cpu floor.
-        f"ray_kwargs.ray_init.num_cpus={ray_num_cpus()}",
+        f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(config['n_gpus_per_node'])}",
         "critic.enable=false",
         "reward.reward_model.enable=false",
         "distillation._target_=flash_opd_plugin.FlashRemoteDistillationConfig",

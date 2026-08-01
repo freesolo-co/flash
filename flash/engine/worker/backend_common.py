@@ -119,7 +119,12 @@ def _cgroup_cpu_quota() -> int | None:
     try:  # cgroup v2: "<quota> <period>", or "max <period>" when uncapped
         with open("/sys/fs/cgroup/cpu.max") as fh:
             quota, period = fh.read().split()
-        if quota != "max" and int(period) > 0:
+        if quota == "max":
+            # an uncapped v2 controller is the authoritative answer: return it rather than falling
+            # through to v1, whose files can still exist on a hybrid layout and carry a stale or
+            # parent-scoped limit that has nothing to do with this container.
+            return None
+        if int(period) > 0:
             return max(1, int(int(quota) // int(period)))
     except Exception:
         pass
@@ -135,7 +140,25 @@ def _cgroup_cpu_quota() -> int | None:
     return None
 
 
-def ray_num_cpus(*, cap: int = 16) -> int:
+# cpus verl's placement group reserves per gpu bundle: RayResourcePool builds
+# bundle = {"CPU": max_colocate_count, "GPU": 1} per gpu (single_controller/ray/base.py:143) and
+# ResourcePoolManager defaults max_colocate_count to 3 (base.py:189).
+_VERL_CPU_PER_GPU_BUNDLE = 3
+# plus the singletons outside the bundles: TaskRunner is ray.remote(num_cpus=1) (main_ppo.py:83),
+# and opd adds one storage unit.
+_VERL_CPU_OVERHEAD = 2
+
+
+def verl_cpu_demand(gpu_count: int) -> int:
+    """cpus verl's placement group needs for ``gpu_count`` gpus, read off the verl source.
+
+    the bundles are requested STRICT_PACK, so this is a single-node demand: 8 gpus want 26 cpus on
+    one box, not spread over several.
+    """
+    return max(1, gpu_count) * _VERL_CPU_PER_GPU_BUNDLE + _VERL_CPU_OVERHEAD
+
+
+def ray_num_cpus(gpu_count: int = 1, *, cap: int = 16) -> int:
     """cpus to hand ray, sized to the CONTAINER rather than the host.
 
     ray autodetects cpus from the host and eagerly prestarts one idle worker per core before the
@@ -155,15 +178,24 @@ def ray_num_cpus(*, cap: int = 16) -> int:
     the pool sane on an unconstrained host, where the detected count reflects a machine flash does
     not own. this bounds ray's PREFILL only -- it is not a limit on training parallelism, which is
     sized by gpus, not by this.
+
+    the floor is not optional and must win over BOTH the cap and the detected count. ray's placement
+    group is a logical reservation, so a pool smaller than verl_cpu_demand does not oversubscribe --
+    it never schedules, and verl waits on ray.get(pg.ready()) with no timeout. verl's own
+    _check_resource_available validates GPUs only (base.py), so a cpu shortfall is not reported: the
+    run hangs on a rented, billing gpu having printed nothing. that is strictly worse than the crash
+    this function exists to prevent, and it is reachable two ways -- an 8-gpu job needs 26 cpus,
+    above the 16 cap, and a 2-cpu cgroup quota is below the demand of even a 1-gpu job.
     """
+    floor = verl_cpu_demand(gpu_count)
     quota = _cgroup_cpu_quota()
     if quota is not None:
-        return max(1, min(quota, cap))
+        return max(floor, min(quota, cap))
     try:
         affinity = len(os.sched_getaffinity(0))
     except Exception:
         affinity = os.cpu_count() or 1
-    return max(1, min(affinity, cap))
+    return max(floor, min(affinity, cap))
 
 
 def verl_supports_rollout_field(python_bin: str, field: str) -> bool:

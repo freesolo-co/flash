@@ -53,10 +53,17 @@ def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
     # the exact failure that killed both real-gpu arms: a 1x4090 pod on a 48-core host. the quota is
     # the container's truth, so a large affinity mask must NOT win over it.
     with (
+        mock.patch.object(vc, "_cgroup_cpu_quota", return_value=12),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+    ):
+        assert vc.ray_num_cpus() == 12
+    # a quota BELOW verl's placement-group demand is the one case the quota must not win outright:
+    # honouring it exactly would schedule nothing and hang. see the floor test below.
+    with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=4),
         mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
     ):
-        assert vc.ray_num_cpus() == 4
+        assert vc.ray_num_cpus() == vc.verl_cpu_demand(1)
 
 
 def test_ray_num_cpus_falls_back_to_affinity_when_no_quota_is_set():
@@ -75,7 +82,9 @@ def test_ray_num_cpus_caps_an_unconstrained_host():
         mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
     ):
         assert vc.ray_num_cpus() == 16
-    assert vc.ray_num_cpus(cap=2) == 2
+        # the cap tightens the pool but cannot push it under verl's placement-group demand, which
+        # would hang instead of crash. a cap of 2 therefore yields the 1-gpu floor, not 2.
+        assert vc.ray_num_cpus(cap=2) == vc.verl_cpu_demand(1)
 
 
 def test_ray_num_cpus_never_returns_zero():
@@ -110,6 +119,29 @@ def test_cgroup_cpu_quota_reads_v2_and_reports_none_when_uncapped(tmp_path):
     assert _read("max 100000") is None
 
 
+def test_an_uncapped_v2_controller_does_not_fall_through_to_v1(tmp_path):
+    # the test above stubs the v1 paths as MISSING, so it cannot see the fallthrough. on a hybrid
+    # layout those files exist and carry a parent-scoped or stale limit; reading them after v2 has
+    # already answered "uncapped" sizes ray from a container this job is not running in.
+    (tmp_path / "cpu.max").write_text("max 100000")
+    (tmp_path / "cpu.cfs_quota_us").write_text("200000")
+    (tmp_path / "cpu.cfs_period_us").write_text("100000")
+    real_open = builtins.open
+    routed = {
+        "/sys/fs/cgroup/cpu.max": tmp_path / "cpu.max",
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": tmp_path / "cpu.cfs_quota_us",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": tmp_path / "cpu.cfs_period_us",
+    }
+
+    def fake(name, *a, **k):
+        if str(name) in routed:
+            return real_open(routed[str(name)], *a, **k)
+        raise FileNotFoundError(name)
+
+    with mock.patch.object(builtins, "open", fake):
+        assert vc._cgroup_cpu_quota() is None
+
+
 def test_ray_cpu_floor_clears_what_verl_actually_reserves():
     # the cap must not create the OPPOSITE failure. verl blocks in ray.get(pg.ready()) with no
     # timeout, so a cluster with fewer cpus than the placement group wants hangs forever before the
@@ -118,11 +150,46 @@ def test_ray_cpu_floor_clears_what_verl_actually_reserves():
     # (RayClassWithInitArgs max_colocate_count=3, seen as CPU_group_0: [30000] in the raylet dump),
     # 1 for TaskRunner (main_ppo.py ray.remote(num_cpus=1)), 1 for opd's single storage unit.
     verl_peak_cpu_demand = 3 + 1 + 1
+    assert vc.verl_cpu_demand(1) == verl_peak_cpu_demand
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
         mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
     ):
-        assert vc.ray_num_cpus() > verl_peak_cpu_demand
+        assert vc.ray_num_cpus() >= verl_peak_cpu_demand
+
+
+def test_a_small_cgroup_quota_still_clears_verls_placement_group():
+    # the floor above only proved the CAP path: it mocks the quota as None, so a pod whose quota is
+    # itself below verl's demand walked straight past it. a 2-cpu quota is a normal rented-pod
+    # value, and returning 2 hangs forever in ray.get(pg.ready()) -- verl's own resource check
+    # validates GPUs only, so nothing reports the shortfall.
+    for quota in (1, 2, 4):
+        with mock.patch.object(vc, "_cgroup_cpu_quota", return_value=quota):
+            assert vc.ray_num_cpus() >= vc.verl_cpu_demand(1)
+
+
+def test_the_cpu_pool_scales_with_gpu_count():
+    # verl requests one bundle PER GPU under STRICT_PACK, so demand grows with the job. flash allows
+    # up to 8 gpus (spec.py _MAX_GPU_COUNT), which needs 26 cpus -- above the 16 cap. capping there
+    # would hang every large job on a rented, billing gpu.
+    assert vc.verl_cpu_demand(8) == 8 * 3 + 2
+    with (
+        mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+    ):
+        for gpus in range(1, 9):
+            assert vc.ray_num_cpus(gpus) >= vc.verl_cpu_demand(gpus), gpus
+
+
+def test_both_trainers_size_the_cpu_pool_from_their_own_gpu_count():
+    # a floor that the call sites never pass a gpu count to is a floor that only ever protects
+    # 1-gpu jobs, which is the shape of the bug this fixes. pin the wiring, not just the helper.
+    for module, expected in (
+        ("rl_train", "ray_num_cpus(cfg['n_gpus'])"),
+        ("opd_train", "ray_num_cpus(config['n_gpus_per_node'])"),
+    ):
+        src = pathlib.Path(_REPO_ROOT, "flash", "engine", "worker", f"{module}.py").read_text()
+        assert expected in src, module
 
 
 def test_every_ray_backed_trainer_constrains_rays_cpu_pool():
@@ -131,7 +198,7 @@ def test_every_ray_backed_trainer_constrains_rays_cpu_pool():
     # opd (host-ram oom) on real gpus. sft is excluded on purpose -- it runs torchrun, not ray.
     for module in ("rl_train", "opd_train"):
         src = pathlib.Path(_REPO_ROOT, "flash", "engine", "worker", f"{module}.py").read_text()
-        assert "ray_kwargs.ray_init.num_cpus={ray_num_cpus()}" in src, module
+        assert "ray_kwargs.ray_init.num_cpus={ray_num_cpus(" in src, module
 
 
 def test_latest_global_step_dir_picks_highest(tmp_path):
