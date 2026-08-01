@@ -11,9 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.engine.worker.backend_common import parse_verl_metric
 from flash.engine.worker.sft import _pretokenize_completion_only
 from flash.engine.worker.sft_train import (
     _LORAPLUS_READY_MARKER,
+    _MAX_ZERO_GRAD_STEPS,
     _VERL_OPTIMIZER_IMPL,
     _VERL_OPTIMIZER_NAME,
     _build_verl_child_env,
@@ -476,6 +478,115 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
     assert optimizer_calls[0]["optimizer_kwargs"]["eps"] == 1e-8
     assert engine._build_lr_scheduler("optimizer") == "linear"
     assert scheduler_calls == [("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})]
+
+
+def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointing():
+    """GRAD-001: lora freezes the embeddings, so nothing entering the first checkpointed layer
+    requires grad and reentrant checkpointing returns no gradient at all. the shim must call
+    enable_input_require_grads() BEFORE gradient_checkpointing_enable(), or every sft run
+    trains nothing while reporting done and billing."""
+    calls = []
+
+    class FakeModule:
+        def enable_input_require_grads(self):
+            calls.append("require_grads")
+
+        def gradient_checkpointing_enable(self, **kwargs):
+            calls.append(("gc_enable", kwargs))
+
+    class FakeEngine:
+        def _build_module(self):
+            return FakeModule()
+
+    source = _render_sft_sitecustomize(
+        seed=1,
+        loraplus_ratio=16,
+        save_at_steps=(),
+        total_steps=4,
+        reentrant_gradient_checkpointing=True,
+    )
+    # execute only the reentrant block: the surrounding shim imports verl/torch at module scope.
+    block = source[source.index("def _flash_build_reentrant_module") :]
+    block = block[: block.index("_FlashFSDPEngine._build_module = _flash_build_reentrant_module")]
+    namespace = {"_flash_original_build_module": FakeEngine._build_module}
+    exec(compile(block, "shim.py", "exec"), namespace)
+
+    namespace["_flash_build_reentrant_module"](FakeEngine())
+
+    # order matters: enabling checkpointing first would capture the graph before any input
+    # requires grad, so asserting mere presence would pass on a broken shim.
+    assert calls[0] == "require_grads"
+    assert calls[1] == ("gc_enable", {"gradient_checkpointing_kwargs": {"use_reentrant": True}})
+
+    # the non-reentrant path never patches _build_module at all, so it must not appear.
+    non_reentrant = _render_sft_sitecustomize(
+        seed=1,
+        loraplus_ratio=16,
+        save_at_steps=(),
+        total_steps=4,
+        reentrant_gradient_checkpointing=False,
+    )
+    assert "enable_input_require_grads" not in non_reentrant
+
+
+def test_zero_grad_norm_at_nonzero_lr_fails_the_run():
+    """GRAD-001: four runs reported done and charged while grad_norm was 0.0 on every step.
+    the number was parsed and recorded, never read. replay the real g4 log lines."""
+
+    def replay(lines):
+        zero_grad_steps: list[int] = []
+        for step, line in enumerate(lines):
+            grad_norm = parse_verl_metric(line, "train/grad_norm")
+            learning_rate_value = parse_verl_metric(line, "train/lr")
+            if grad_norm is None:
+                continue
+            if grad_norm == 0.0 and (learning_rate_value is None or learning_rate_value > 0.0):
+                zero_grad_steps.append(step)
+                if len(zero_grad_steps) >= _MAX_ZERO_GRAD_STEPS:
+                    raise RuntimeError(
+                        "verl reported train/grad_norm=0.0 with a nonzero learning rate on "
+                        f"{len(zero_grad_steps)} consecutive steps: no gradient is reaching "
+                        "the lora parameters, so this run would train nothing. see GRAD-001"
+                    )
+            else:
+                zero_grad_steps.clear()
+
+    # verbatim shape of the g4 gsm8k lines (flash-1785592071-e56cf3c6): loss barely moves on a
+    # replayed identical batch because nothing is learning.
+    broken = [
+        "step:1 - train/loss:0.5470 - train/grad_norm:0.0 - train/lr:0.0001",
+        "step:2 - train/loss:0.5437 - train/grad_norm:0.0 - train/lr:0.0001",
+        "step:3 - train/loss:0.5474 - train/grad_norm:0.0 - train/lr:0.0001",
+        "step:4 - train/loss:0.5444 - train/grad_norm:0.0 - train/lr:0.0001",
+    ]
+    with pytest.raises(RuntimeError, match="grad_norm=0.0"):
+        replay(broken)
+
+    # a healthy run must not trip the guard.
+    replay(
+        [
+            "step:1 - train/loss:0.9 - train/grad_norm:1.4 - train/lr:0.0001",
+            "step:2 - train/loss:0.7 - train/grad_norm:0.9 - train/lr:0.0001",
+        ]
+    )
+
+    # an isolated zero is a legitimately fully-masked micro-batch, not a severed graph.
+    replay(
+        [
+            "step:1 - train/loss:0.9 - train/grad_norm:0.0 - train/lr:0.0001",
+            "step:2 - train/loss:0.7 - train/grad_norm:1.1 - train/lr:0.0001",
+            "step:3 - train/loss:0.6 - train/grad_norm:0.0 - train/lr:0.0001",
+        ]
+    )
+
+    # a decayed schedule reaching lr 0.0 produces a legitimate zero grad norm.
+    replay(
+        [
+            "step:1 - train/loss:0.5 - train/grad_norm:0.0 - train/lr:0.0",
+            "step:2 - train/loss:0.5 - train/grad_norm:0.0 - train/lr:0.0",
+            "step:3 - train/loss:0.5 - train/grad_norm:0.0 - train/lr:0.0",
+        ]
+    )
 
 
 def test_loraplus_shim_has_no_plain_lora_fallback():
