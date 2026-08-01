@@ -314,6 +314,56 @@ def test_push_ships_helpers_named_by_a_literal_dynamic_import(monkeypatch, tmp_p
     assert "weights.py" in files
 
 
+def test_push_ships_helpers_named_through_an_alias_of_import_module(monkeypatch, tmp_path):
+    """`from importlib import import_module as load` imports exactly as the canonical name does.
+
+    Matching the call's identifier against `import_module` alone skipped the aliased call, so
+    `judge.py` was left out of the archive for a suite that passes locally -- its directory is
+    importable there -- and raises ModuleNotFoundError on its first published case (Cursor).
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "from importlib import import_module as load\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    load('judge')\n"
+        "    return []\n"
+    )
+    # reached only through judge.py, so the alias is followed as far as any other import
+    (tmp_path / "judge.py").write_text("import weights\n")
+    (tmp_path / "weights.py").write_text("W = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "judge.py" in files
+    assert "weights.py" in files
+
+
+def test_push_does_not_read_an_unrelated_load_call_as_a_dynamic_import(monkeypatch, tmp_path):
+    """The alias is a per-file binding, not a reserved word.
+
+    A sidecar that never imports `import_module` may still call something named `load`, and
+    packaging whatever string it was handed would ship files on a guess. Only a name this module
+    actually bound to `import_module` counts.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import json\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    json.load('judge')\n"
+        "    return []\n"
+    )
+    (tmp_path / "judge.py").write_text("SHOULD_NOT_SHIP = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    assert "judge.py" not in _members(cap["package_b64"])
+
+
 def test_push_ships_helpers_named_by_the_keyword_form_of_a_dynamic_import(monkeypatch, tmp_path):
     """`import_module(name="judge")` imports identically to the positional form.
 
