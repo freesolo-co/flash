@@ -1275,20 +1275,30 @@ def cmd_chat(args) -> int:
     if system:
         messages.insert(0, {"role": "system", "content": system})
     wrote = False
+    pending: list[str] = []
     for chunk in client.chat_stream(
         chat_target,
         messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
     ):
-        # the label waits for the first chunk: printing it up front would leave `assistant` on
-        # stdout when the stream turns out to be empty, so a styled run (a tty, or FLASH_STYLE=1)
-        # would exit 1 with non-empty stdout and break the same health check this failure exists
-        # to make possible.
-        if not wrote and render.styled():
-            print(render.chat_label())
+        # nothing reaches stdout until the stream produces non-whitespace. The label waits because
+        # printing it up front would leave `assistant` on stdout for an empty stream, so a styled
+        # run (a tty, or FLASH_STYLE=1) would exit 1 with non-empty stdout and break the same
+        # health check this failure exists to make possible -- and a stream of blank chunks does
+        # that too, spaces being just as non-empty as a label (Cursor). So blank chunks are held
+        # rather than printed, and released verbatim once real text arrives, which keeps the
+        # response byte-identical for every stream that has any. `_generate_response` grades
+        # emptiness the same way, for the same reason (flash/cli/env_eval.py).
+        if not wrote:
+            pending.append(chunk)
+            if not chunk.strip():
+                continue
+            if render.styled():
+                print(render.chat_label())
+            chunk = "".join(pending)
+            wrote = True
         print(chunk, end="", flush=True)
-        wrote = True
     if not wrote:
         # the request succeeded at the transport level but carried no assistant text, which is what
         # a serving path that stopped applying the run's chat template looks like from here. exiting
