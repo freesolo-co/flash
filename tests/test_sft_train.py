@@ -530,64 +530,114 @@ def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointi
     assert "enable_input_require_grads" not in non_reentrant
 
 
-def test_zero_grad_norm_at_nonzero_lr_fails_the_run():
+class _TolerantWatcher:
+    """a watcher that permits an incomplete run, for tests where a guard is meant to raise.
+
+    the default watcher in _stub_sft_run asserts require_complete is True, which is right for the
+    happy path but masks the assertion under test here: a guard that raises from on_line unwinds
+    before return_code is assigned, so the run is legitimately incomplete.
+    """
+
+    def __init__(self, **kwargs):
+        self.processed_steps = set()
+
+    def start(self):
+        return None
+
+    def raise_if_failed(self):
+        return None
+
+    def stop(self, *, require_complete):
+        return None
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        # verbatim shape of the g4 gsm8k lines (flash-1785592071-e56cf3c6): loss barely moves on a
+        # replayed identical batch because nothing is learning.
+        pytest.param(
+            [
+                "step:1 - train/loss:0.5470 - train/grad_norm:0.0 - train/lr:0.0001",
+                "step:2 - train/loss:0.5437 - train/grad_norm:0.0 - train/lr:0.0001",
+                "step:3 - train/loss:0.5474 - train/grad_norm:0.0 - train/lr:0.0001",
+                "step:4 - train/loss:0.5444 - train/grad_norm:0.0 - train/lr:0.0001",
+            ],
+            id="every-step-zero",
+        ),
+        # VERL-138: the same defect on a 2-step run, where the schedule decays lr to 0.0 on the
+        # final step. the lr is not why the gradient is zero -- verl measures grad_norm off p.grad
+        # before the optimizer and the scheduler run -- so this must fail exactly like the above.
+        pytest.param(
+            [
+                "step:1 - train/loss:0.5464 - train/grad_norm:0.0 - train/lr:5e-05",
+                "step:2 - train/loss:0.5477 - train/grad_norm:0.0 - train/lr:0.0",
+            ],
+            id="lr-decays-to-zero",
+        ),
+    ],
+)
+def test_zero_grad_norm_fails_the_run(monkeypatch, lines):
     """GRAD-001: four runs reported done and charged while grad_norm was 0.0 on every step.
-    the number was parsed and recorded, never read. replay the real g4 log lines."""
 
-    def replay(lines):
-        zero_grad_steps: list[int] = []
-        for step, line in enumerate(lines):
-            grad_norm = parse_verl_metric(line, "train/grad_norm")
-            learning_rate_value = parse_verl_metric(line, "train/lr")
-            if grad_norm is None:
-                continue
-            if grad_norm == 0.0 and (learning_rate_value is None or learning_rate_value > 0.0):
-                zero_grad_steps.append(step)
-                if len(zero_grad_steps) >= _MAX_ZERO_GRAD_STEPS:
-                    raise RuntimeError(
-                        "verl reported train/grad_norm=0.0 with a nonzero learning rate on "
-                        f"{len(zero_grad_steps)} consecutive steps: no gradient is reaching "
-                        "the lora parameters, so this run would train nothing. see GRAD-001"
-                    )
-            else:
-                zero_grad_steps.clear()
+    the number was parsed and recorded, never read. driven through run_sft_train so the assertion
+    lands on the shipped guard -- this test used to define its own copy of the guard body and
+    assert against that, which meant it could not fail no matter what the worker did.
+    """
+    from flash.engine.worker import sft_train
 
-    # verbatim shape of the g4 gsm8k lines (flash-1785592071-e56cf3c6): loss barely moves on a
-    # replayed identical batch because nothing is learning.
-    broken = [
-        "step:1 - train/loss:0.5470 - train/grad_norm:0.0 - train/lr:0.0001",
-        "step:2 - train/loss:0.5437 - train/grad_norm:0.0 - train/lr:0.0001",
-        "step:3 - train/loss:0.5474 - train/grad_norm:0.0 - train/lr:0.0001",
-        "step:4 - train/loss:0.5444 - train/grad_norm:0.0 - train/lr:0.0001",
-    ]
+    spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        for step, line in enumerate(lines, start=1):
+            on_line(line + "\n")
+            on_step(step)
+        raise AssertionError("the zero-grad guard should have stopped the run before this")
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
     with pytest.raises(RuntimeError, match=re.escape("grad_norm=0.0")):
-        replay(broken)
+        sft_train.run_sft_train(spec)
 
-    # a healthy run must not trip the guard.
-    replay(
-        [
-            "step:1 - train/loss:0.9 - train/grad_norm:1.4 - train/lr:0.0001",
-            "step:2 - train/loss:0.7 - train/grad_norm:0.9 - train/lr:0.0001",
-        ]
-    )
 
-    # an isolated zero is a legitimately fully-masked micro-batch, not a severed graph.
-    replay(
-        [
-            "step:1 - train/loss:0.9 - train/grad_norm:0.0 - train/lr:0.0001",
-            "step:2 - train/loss:0.7 - train/grad_norm:1.1 - train/lr:0.0001",
-            "step:3 - train/loss:0.6 - train/grad_norm:0.0 - train/lr:0.0001",
-        ]
-    )
+@pytest.mark.parametrize(
+    "lines",
+    [
+        pytest.param(
+            [
+                "step:1 - train/loss:0.9 - train/grad_norm:1.4 - train/lr:0.0001",
+                "step:2 - train/loss:0.7 - train/grad_norm:0.9 - train/lr:0.0001",
+            ],
+            id="healthy",
+        ),
+        # an isolated zero is a legitimately fully-masked micro-batch, not a severed graph.
+        pytest.param(
+            [
+                "step:1 - train/loss:0.9 - train/grad_norm:0.0 - train/lr:0.0001",
+                "step:2 - train/loss:0.7 - train/grad_norm:1.1 - train/lr:0.0001",
+                "step:3 - train/loss:0.6 - train/grad_norm:0.0 - train/lr:0.0001",
+            ],
+            id="isolated-zeros",
+        ),
+    ],
+)
+def test_healthy_grad_norms_do_not_trip_the_guard(monkeypatch, lines):
+    """the guard must not fail a run that is training: any nonzero norm resets the count."""
+    from flash.engine.worker import sft_train
 
-    # a decayed schedule reaching lr 0.0 produces a legitimate zero grad norm.
-    replay(
-        [
-            "step:1 - train/loss:0.5 - train/grad_norm:0.0 - train/lr:0.0",
-            "step:2 - train/loss:0.5 - train/grad_norm:0.0 - train/lr:0.0",
-            "step:3 - train/loss:0.5 - train/grad_norm:0.0 - train/lr:0.0",
-        ]
-    )
+    spec, _ = _stub_sft_run(monkeypatch)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        for step, line in enumerate(lines, start=1):
+            on_line(line + "\n")
+            on_step(step)
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
 
 
 def test_step_gate_admits_a_line_a_tqdm_bar_was_flushed_in_front_of():
@@ -1016,6 +1066,70 @@ def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monke
     # the watcher still gets stopped -- it just is not asked to prove completeness for a run that
     # never finished. without this, stop() raises and the grad_norm error never reaches the caller.
     assert stopped == [False]
+
+
+def test_zero_grad_guard_survives_an_lr_that_decays_to_zero(monkeypatch):
+    """VERL-138: a decayed lr must not launder a run that trained nothing.
+
+    replays the real 2-step shape of flash-1785606382-389d4630, which reported done and billed with
+    grad_norm 0.0 on every step. the scheduler puts lr at 0.0 on the final step, so a guard that
+    treats an lr of 0.0 as an excuse for a zero gradient never fires on the second step and the run
+    bills for an adapter that learned nothing.
+
+    the lr cannot cause this: verl computes grad_norm in optimizer_step (transformer_impl.py:683)
+    by clipping over p.grad, before optimizer.step() and before lr_scheduler_step() advances the
+    schedule. driven through run_sft_train rather than a local copy of the guard, so the assertion
+    is about the shipped code and not about the test's own reimplementation of it.
+    """
+    from flash.engine.worker import sft_train
+
+    spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line(
+            "step:1 - train/loss:0.5464 - train/grad_norm:0.0 - train/lr:5e-05 "
+            "- train/global_tokens:6588\n"
+        )
+        on_line(
+            "step:2 - train/loss:0.5477 - train/grad_norm:0.0 - train/lr:0.0 "
+            "- train/global_tokens:6274\n"
+        )
+        raise AssertionError("the zero-grad guard should have stopped the run before this")
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    with pytest.raises(RuntimeError, match=re.escape("grad_norm=0.0")):
+        sft_train.run_sft_train(spec)
+
+
+def test_zero_grad_guard_clears_on_a_recovered_step(monkeypatch):
+    """the guard must count consecutive steps, not keep a run-lifetime tally.
+
+    a nonzero grad norm is proof the graph is intact, so evidence collected before it is stale and
+    must be discarded. without this, one isolated zero-grad step early plus another much later
+    would fail a run that is training normally in between.
+    """
+    from flash.engine.worker import sft_train
+
+    spec, captured = _stub_sft_run(monkeypatch)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        # zero, healthy (clears), zero, healthy (clears). two zero-grad steps in total but never
+        # two in a row, so the run must survive.
+        for step, grad in enumerate([0.0, 1.4, 0.0, 0.9], start=1):
+            on_line(
+                f"step:{step} - train/loss:1.0 - train/grad_norm:{grad} - train/lr:5e-05 "
+                "- train/global_tokens:8\n"
+            )
+            on_step(step)
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+    assert captured["meta"]["notes"]["loss_curve"] == [1.0, 1.0, 1.0, 1.0]
 
 
 def test_overrides_enable_fused_linear_ce_for_long_context():
