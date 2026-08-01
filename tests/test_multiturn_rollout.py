@@ -1129,8 +1129,13 @@ def test_close_out_does_not_hang_when_the_env_worker_dies_unreported():
     the answer alone then blocks forever on a queue no live thread can fill, so the interrupt never
     reaches the CLI and the step hangs instead of exiting.
 
-    The timeout is the assertion: without the liveness check this test does not fail, it hangs, so
-    it is run on a separate thread and the wait is bounded here.
+    Ending the wait is necessary but not sufficient: breaking out of it and returning normally
+    scores the episode on partial state, since the close-out env step never ran -- so the death is
+    reported as the failure it is, and the interrupt reaches the caller (chatgpt-codex-connector).
+
+    Two assertions, because the two failure modes are opposite: without the liveness check this
+    test hangs rather than fails, so it runs on a separate thread with a bounded wait; without the
+    propagation it returns cleanly, so the raised exception is checked too.
     """
 
     class _InterruptOnCloseOutEnv(_StatefulBoardEnv):
@@ -1143,6 +1148,7 @@ def test_close_out_does_not_hang_when_the_env_worker_dies_unreported():
     env = _InterruptOnCloseOutEnv()
     submit, poll, busy = _fake_async_engine(_det_generate)
     done = threading.Event()
+    raised: list[BaseException] = []
 
     def _drive() -> None:
         try:
@@ -1158,14 +1164,19 @@ def test_close_out_does_not_hang_when_the_env_worker_dies_unreported():
                 max_turns=3,
                 per_turn_max_tokens=8,
             )
-        except BaseException:
-            pass
+        except BaseException as exc:
+            raised.append(exc)
         finally:
             done.set()
 
     driver = threading.Thread(target=_drive, daemon=True)
     driver.start()
     assert done.wait(timeout=20.0), "close-out wait never returned after the env worker died"
+    # ending the wait is not enough: returning normally scores this episode on partial state, since
+    # the close-out env step never ran. the interrupt is re-raised on THIS thread, which is the one
+    # the CLI-side user-code paths catch it on.
+    assert [type(exc) for exc in raised] == [KeyboardInterrupt], raised
+    assert env.env_reply_calls == 2
 
 
 def test_close_out_reports_a_sys_exit_from_user_env_code():
