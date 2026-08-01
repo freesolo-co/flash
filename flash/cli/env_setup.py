@@ -79,8 +79,10 @@ _STARTER_DATASET_JSONL = """\
 _STARTER_EVALUATIONS_PY = '''\
 """Held-out checks for this environment.
 
-Run them against a deployed model with `flash env eval TARGET .`. This file is
-published beside environment.py by `flash env push --project PROJECT_UUID --name my-env .`.
+Publish this file beside environment.py with
+`flash env push --project PROJECT_UUID --name my-env .`, then run the suites against a
+model trained on it with `flash env eval TARGET`. The run names the published
+environment, so `env eval` takes no local path.
 """
 
 from __future__ import annotations
@@ -124,8 +126,10 @@ def load_evaluations(environment=None):
 _STARTER_EVALUATIONS_MULTITURN_PY = '''\
 """Held-out checks for this multi-turn environment.
 
-Run them against a deployed model with `flash env eval TARGET .`. This file is
-published beside environment.py by `flash env push --project PROJECT_UUID --name my-env .`.
+Publish this file beside environment.py with
+`flash env push --project PROJECT_UUID --name my-env .`, then run the suites against a
+model trained on it with `flash env eval TARGET`. The run names the published
+environment, so `env eval` takes no local path.
 
 `env eval` sends one prompt and grades one reply, so these cases check the FIRST
 assistant action rather than a finished episode: given the opening prompt, does the
