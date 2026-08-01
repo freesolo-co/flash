@@ -413,7 +413,12 @@ class RunStatus:
     #                        the sweep stops retrying, and the run is counted as a known gap rather
     #                        than an invisible one.
     reconcile_state: str | None = None
+    # Failed PROVIDER-ATTRIBUTION attempts only (no cost came back). This is the budget that decides
+    # `unattributable`; see record_reconcile_attempt for why delivery failures are counted apart.
     reconcile_attempts: int = 0
+    # Failed BACKEND-DELIVERY attempts (cost was attributed, the POST failed). Tracked for visibility
+    # but deliberately NOT budgeted: a backend outage must never make an attributable run terminal.
+    reconcile_report_failures: int = 0
     reconcile_error: str | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deploy/reconcile.
     finished_at: float | None = None
@@ -1920,13 +1925,32 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
     _report_status(status)
 
 
-def record_reconcile_attempt(run_id: str, *, error: str | None, unattributable: bool) -> None:
-    """Persist a FAILED realized-cost attempt: bump the attempt counter and record why.
+def record_reconcile_attempt(
+    run_id: str, *, error: str | None, stage: str, max_attempts: int
+) -> None:
+    """Persist a FAILED realized-cost attempt: bump the right counter and record why.
 
     Same COST-FIELDS-ONLY discipline as ``record_realized_cost`` -- re-reads under the guard and never
     writes ``state``, so a run that advanced since the sweep's snapshot (e.g. to ``deployed``) is not
-    reverted. ``unattributable`` marks the run TERMINAL for reconciliation so the sweep stops retrying
-    it forever; the run then surfaces as a KNOWN gap instead of silently pending."""
+    reverted.
+
+    ``stage`` separates the two ways reconciliation can fail, because they mean opposite things:
+
+      "attribution" -- the PROVIDER gave us no cost (billing API down, invoice unsettled, endpoint
+                       purged). Bumps ``reconcile_attempts``; once that reaches ``max_attempts`` the
+                       run is marked ``unattributable`` (terminal), so the sweep stops retrying and
+                       the gap becomes visible instead of silently permanent.
+      "report"      -- the provider DID give us a cost; only delivery to the backend failed. That
+                       says nothing about whether the run is attributable, so it must NOT consume the
+                       attribution budget: a long backend outage would otherwise burn through every
+                       attempt and permanently drop a run whose cost we successfully computed. It
+                       bumps a separate counter and always leaves the run ``pending`` (retryable).
+
+    Terminality is decided HERE, from the INCREMENTED PERSISTED count under the guard -- never from a
+    caller's snapshot. Two reconcilers racing off the same stale count (the startup sweep overlapping
+    the inline completion hook) would both compute "not terminal yet" and leave the run at the limit
+    but still ``pending``, which ``_due`` rejects -- stranding it as the exact invisible gap this
+    state machine exists to prevent."""
     with _status_guard(run_id):
         try:
             status = get_status(run_id)
@@ -1934,9 +1958,14 @@ def record_reconcile_attempt(run_id: str, *, error: str | None, unattributable: 
             return
         if status.reconcile_state == "reconciled":
             return  # a concurrent success won; never downgrade it
-        status.reconcile_attempts = int(status.reconcile_attempts or 0) + 1
         status.reconcile_error = error
-        status.reconcile_state = "unattributable" if unattributable else "pending"
+        if stage == "report":
+            status.reconcile_report_failures = int(status.reconcile_report_failures or 0) + 1
+            status.reconcile_state = "pending"
+        else:
+            attempts = int(status.reconcile_attempts or 0) + 1
+            status.reconcile_attempts = attempts
+            status.reconcile_state = "unattributable" if attempts >= max_attempts else "pending"
         status.updated_at = time.time()
         _save_status_unlocked(status)
     _report_status(status)

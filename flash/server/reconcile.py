@@ -63,6 +63,9 @@ _RUNPOD_SETTLE_SECONDS = 3600.0  # 1h
 # old 7-day window silently converted "still owed" into "never" for any run whose control plane was
 # down during the window -- which is exactly how the estimator accuracy dataset ended up empty.
 # Bounded attempts (not elapsed time) is what stops an unrecoverable run from being retried forever.
+# Budgets PROVIDER-ATTRIBUTION failures ONLY (no cost came back). Backend-delivery failures are
+# counted separately and are never budgeted -- see runner.record_reconcile_attempt: a run whose cost
+# we successfully computed must not be dropped because the backend happened to be down.
 _MAX_RECONCILE_ATTEMPTS = 24
 # States that incur no GPU cost -> never reconciled.
 _FREE_TERMINAL_STATES = frozenset({"dry_run"})
@@ -147,16 +150,19 @@ def _due(status: runner.RunStatus, now: float) -> bool:
     return bool(status.remote)
 
 
-def _fail(run_id: str, reason: str, attempts: int) -> bool:
+def _fail(run_id: str, reason: str, *, stage: str) -> bool:
     """Record a failed realized-cost attempt and return False (nothing reported this pass).
 
-    Once _MAX_RECONCILE_ATTEMPTS is reached the run is marked ``unattributable`` so the sweep stops
-    retrying and the gap becomes visible rather than silently permanent."""
+    ``stage`` is "attribution" (the provider returned no cost -> counts against the budget, and can
+    end in ``unattributable``) or "report" (the cost WAS attributed, only the backend POST failed ->
+    always retryable, never budgeted). Terminality is decided inside record_reconcile_attempt from
+    the incremented persisted count, NOT from a snapshot here -- see its docstring for the race."""
     with contextlib.suppress(Exception):
         runner.record_reconcile_attempt(
             run_id,
             error=reason,
-            unattributable=attempts + 1 >= _MAX_RECONCILE_ATTEMPTS,
+            stage=stage,
+            max_attempts=_MAX_RECONCILE_ATTEMPTS,
         )
     return False
 
@@ -165,11 +171,12 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     """Pull + report realized cost for one run; mark it reconciled on success. Returns True when
     a positive realized cost was reported.
 
-    A zero/None pull or a failed report records a FAILED ATTEMPT (never a silent skip) so the run
-    stays in the queue and is retried on the next sweep -- and, after _MAX_RECONCILE_ATTEMPTS, is
-    marked ``unattributable`` so it stops being retried forever and shows up as a known gap."""
+    Every failure is RECORDED (never a silent skip) so the run stays in the queue and is retried on
+    the next sweep. Failures are split by stage: a provider pull that yields no cost counts against
+    _MAX_RECONCILE_ATTEMPTS and eventually marks the run ``unattributable`` (a visible gap), whereas a
+    failed backend POST is retried indefinitely -- the cost WAS attributed, only delivery failed, so a
+    backend outage must not strand a run we successfully priced."""
     now = time.time() if now is None else now
-    attempts = int(status.reconcile_attempts or 0)
     remote = status.remote or {}
     spec = status.spec or {}
     # raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
@@ -187,11 +194,19 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
             remote, start=start, end=run_end + _RUNPOD_SETTLE_SECONDS, run_end=run_end
         )
     except Exception as exc:  # provider billing API down / credentials rotated / rate limited
-        return _fail(status.run_id, f"provider billing pull failed: {type(exc).__name__}", attempts)
+        return _fail(
+            status.run_id,
+            f"provider billing pull failed: {type(exc).__name__}",
+            stage="attribution",
+        )
     if realized is None:
-        return _fail(status.run_id, "no realized cost attributable to this handle", attempts)
+        return _fail(
+            status.run_id, "no realized cost attributable to this handle", stage="attribution"
+        )
     if realized.realized_usd <= 0:
-        return _fail(status.run_id, "provider reported no cost yet (invoice unsettled)", attempts)
+        return _fail(
+            status.run_id, "provider reported no cost yet (invoice unsettled)", stage="attribution"
+        )
 
     body = {
         "runId": status.run_id,
@@ -204,7 +219,7 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
         "source": realized.source,
     }
     if not _report(body):
-        return _fail(status.run_id, "backend report failed", attempts)
+        return _fail(status.run_id, "backend report failed", stage="report")
 
     # Persist locally so we don't re-pull/re-report, and so `flash status` can show realized vs
     # estimated. COST-FIELDS-ONLY: record_realized_cost re-reads the run under the lock and writes
