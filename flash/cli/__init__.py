@@ -14,6 +14,7 @@ from flash import __version__
 from flash._channel import CLI_NAME
 from flash._logging import configure_logging
 from flash._update_check import emit_update_notice, maybe_start_update_check
+from flash.catalog import ALGORITHMS
 from flash.cli import render
 
 # package-level command imports remain available through flash.cli.
@@ -355,6 +356,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "dataset split to validate, matching [environment.params] split (default: train). "
             "use the split the run actually trains on, e.g. --split train_sft"
+        ),
+    )
+    env_test.add_argument(
+        "--algorithm",
+        default="grpo",
+        choices=ALGORITHMS,
+        help=(
+            "algorithm the environment is for, matching [train] algorithm (default: grpo). "
+            "only grpo trains from the environment reward, so sft and opd skip the reward gate"
         ),
     )
     env_test.add_argument(

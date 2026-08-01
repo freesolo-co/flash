@@ -9,6 +9,7 @@ import pytest
 
 import flash.cli as cli
 from flash.cli.env_test import cmd_env_test
+from flash.envs.base import RolloutReward
 
 
 class _SingleTurnEnv:
@@ -576,6 +577,94 @@ def test_env_test_still_blames_the_grader_for_a_replay_that_covers_the_episode(
     assert "all 1 replayed gold answer(s) scored zero, no better than a deliberately wrong" in (
         captured.err
     )
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_does_not_apply_the_reward_gate_to_an_sft_environment(
+    monkeypatch, tmp_path, capsys
+):
+    """SFT trains on a supervised loss and never calls the environment reward.
+
+    A no-op scorer is legitimate for it, so blocking on one failed the recommended pre-push check
+    for an environment that trains perfectly well (Cursor). Same for OPD, which trains on a teacher
+    token loss.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "cannot recognize its own reference answers" not in captured.err
+    # the zero is still surfaced; it just cannot be the reason to fail an algorithm that ignores it.
+    assert "replay gold answer scored low" in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_keeps_the_reward_gate_when_no_algorithm_is_given(monkeypatch, tmp_path, capsys):
+    """An absent algorithm must not be the way to switch a blocking check off.
+
+    The flag defaults to grpo -- the one algorithm that trains from the reward -- and a caller that
+    passes no algorithm at all still gets the gate.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "cannot recognize its own reference answers" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_reads_per_turn_rewards_before_calling_the_grader_flat(
+    monkeypatch, tmp_path, capsys
+):
+    """A per-turn env trains on a vector the episode scalar cannot express.
+
+    `credit_assignment = "per_turn"` learns from `per_turn_rewards`, which reaches the trainer
+    through `rollout_rewards_many` and never through `env.reward` (flash/envs/adapter.py). Reading
+    only the flat scalar reported an environment whose turns separate as unable to recognize its
+    references (Cursor).
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _MultiTurnEnv()
+    monkeypatch.setattr(env, "reward", lambda completion, example, state=None: 0.0)
+    # the turns separate even though the episode scalar is flat.
+    monkeypatch.setattr(
+        env,
+        "rollout_rewards_many",
+        lambda items: [RolloutReward(episode=0.0, turns=(1.0, 0.0)) for _ in items],
+        raising=False,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "cannot recognize its own reference answers" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_still_blames_the_grader_for_a_flat_per_turn_vector(monkeypatch, tmp_path, capsys):
+    """The exclusion is separation, not the mere presence of a per-turn vector.
+
+    A vector whose turns are all identical distinguishes nothing the scalar did not, so it is no
+    evidence that the grader recognizes its references and the gate must still block.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _MultiTurnEnv()
+    monkeypatch.setattr(env, "reward", lambda completion, example, state=None: 0.0)
+    monkeypatch.setattr(
+        env,
+        "rollout_rewards_many",
+        lambda items: [RolloutReward(episode=0.0, turns=(0.0, 0.0)) for _ in items],
+        raising=False,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "cannot recognize its own reference answers" in captured.err
     assert "overall: FAIL" in captured.err
 
 
