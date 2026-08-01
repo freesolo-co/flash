@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import sys
 import textwrap
 import threading
@@ -1200,6 +1201,52 @@ def test_concurrent_scorers_are_serialized_for_the_env():
         assert max(peak) == 1, f"env saw {max(peak)} concurrent calls"
     finally:
         server.shutdown()
+
+
+def test_reward_server_accept_queue_holds_a_whole_rollout_batch(monkeypatch):
+    # verl opens one connection per episode and starts a whole step at once, so the accept queue
+    # sees prompts_per_step * group_size connects in a burst. socketserver's default backlog of 5
+    # overflows there and the kernel RESETS the excess, which reaches the client as
+    # ConnectionResetError at getresponse(); bridge_post does not retry, so that kills the run.
+    rollout_batch = 512  # the default 64x8 recipe
+
+    # record the argument the server actually hands to listen(). asserting on request_queue_size
+    # alone cannot tell a working fix from a no-op: server_activate() reads that attribute once,
+    # so a value set after server_bind() would never reach the socket at all.
+    backlogs = []
+    real_listen = socket.socket.listen
+
+    def spy_listen(self, *args):
+        backlogs.append(args[0] if args else None)
+        return real_listen(self, *args)
+
+    monkeypatch.setattr(socket.socket, "listen", spy_listen)
+
+    server, _url = rl_train.start_reward_server(
+        lambda idx, solution: 1.0, example_count=8, rollout_batch=rollout_batch
+    )
+    try:
+        assert server.request_queue_size >= rollout_batch
+        assert backlogs, "server never called listen()"
+        assert backlogs[-1] is not None, "listen() was called with no backlog argument"
+        assert backlogs[-1] >= rollout_batch, f"listen() backlog is {backlogs[-1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("rollout_batch", [0, 32, 64 * 8, 2048])
+def test_reward_bridge_backlog_never_falls_below_the_burst(rollout_batch):
+    # a fixed constant would only move the cliff, so the queue is sized from the caller's burst.
+    # an unspecified batch still keeps a floor well clear of socketserver's default of 5.
+    server, _url = rl_train.start_reward_server(
+        lambda idx, solution: 1.0, example_count=1, rollout_batch=rollout_batch
+    )
+    try:
+        assert server.request_queue_size >= max(128, rollout_batch)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 # ------------------------------- reward parity -------------------------------
