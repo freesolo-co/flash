@@ -49,9 +49,7 @@ def test_populate_empty_dir_rejects_destination_changes_after_staging(
     assert not (dest / "environment.py").exists()
 
 
-def test_populate_empty_dir_rolls_back_files_moved_before_a_conflict(
-    tmp_path, monkeypatch
-) -> None:
+def test_populate_empty_dir_rolls_back_files_moved_before_a_conflict(tmp_path, monkeypatch) -> None:
     """A mid-move conflict must remove already-moved files while preserving the conflicting writer."""
     source = _source(tmp_path, {"a.txt": "a", "b.txt": "b"})
     dest = tmp_path / "dest"
@@ -77,9 +75,7 @@ def test_populate_empty_dir_rolls_back_files_moved_before_a_conflict(
     assert (dest / "b.txt").read_text() == "concurrent"
 
 
-def test_replace_with_tree_restores_original_after_replace_failure(
-    tmp_path, monkeypatch
-) -> None:
+def test_replace_with_tree_restores_original_after_replace_failure(tmp_path, monkeypatch) -> None:
     """A failed staged replacement must restore the original destination exactly."""
     source = _source(tmp_path, {"environment.py": "new"})
     dest = tmp_path / "dest"
@@ -104,9 +100,7 @@ def test_replace_with_tree_restores_original_after_replace_failure(
     assert not (dest / "environment.py").exists()
 
 
-def test_replace_with_tree_retains_backup_when_restore_also_fails(
-    tmp_path, monkeypatch
-) -> None:
+def test_replace_with_tree_retains_backup_when_restore_also_fails(tmp_path, monkeypatch) -> None:
     """A double replacement failure must retain the original tree in the documented backup path."""
     source = _source(tmp_path, {"environment.py": "new"})
     dest = tmp_path / "dest"
@@ -143,9 +137,7 @@ def test_replace_with_tree_installs_a_new_destination(tmp_path) -> None:
     assert (dest / "environment.py").read_text() == "new"
 
 
-def test_copy_environment_source_refuses_current_working_directory(
-    tmp_path, monkeypatch
-) -> None:
+def test_copy_environment_source_refuses_current_working_directory(tmp_path, monkeypatch) -> None:
     """The copy helper must retain its own current-directory guard even after preflight."""
     source = _source(tmp_path, {"environment.py": "new"})
     dest = tmp_path / "dest"

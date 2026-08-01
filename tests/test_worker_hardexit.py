@@ -106,9 +106,7 @@ def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
     )
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")]
-    )
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")])
     result = subprocess.run(
         [sys.executable, "-m", "flash.engine.worker"],
         cwd=repo_root,
@@ -187,22 +185,6 @@ def test_worker_dispatches_opd_run_mode(monkeypatch):
     assert ran["v"] is True, "RUN_MODE=opd must invoke run_opd"
     assert raised is not None
     assert raised.code == 0
-
-
-def test_worker_dispatches_opsd_run_mode(monkeypatch):
-    ran = {"v": False}
-
-    def fake_exit(code=0):
-        raise _HardExit(code)
-
-    _patch_common(monkeypatch, fake_exit)
-    monkeypatch.setattr(worker, "RUN_MODE", "opsd")
-    monkeypatch.setattr(worker, "run_opsd", lambda: ran.__setitem__("v", True))
-
-    with pytest.raises(_HardExit) as raised:
-        worker.main()
-    assert ran["v"] is True
-    assert raised.value.code == 0
 
 
 def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_path):

@@ -111,7 +111,7 @@ def api(tmp_path, monkeypatch):
     import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.run_registry as run_registry
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     # The dummy FREESOLO_INTERNAL_KEY also enables the best-effort backend reporting path: a dry-run
     # /v1/runs submit carries an org_id, so runner.submit_job() -> _report_status() ->
     # run_registry._post() would urllib-POST the real backend (or wait out its 10s timeout). Stub the
@@ -1255,14 +1255,18 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
 
 
 def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatch):
-    import flash.server.app as app_mod
+    # fail inside adapter resolution itself, which is where an internal storage ref can come from.
+    # stubbing the whole of prepare_job instead would assert something broader than this test's
+    # name: that EVERY submit failure is redacted for a warm-start run, including gpu sizing and
+    # budget, which fail identically for the non-warm-start runs that never redacted them.
+    import flash.runner as runner
 
     internal_ref = "private-owner/private-repo:sft/source-run/checkpoints/step-20"
-    monkeypatch.setattr(
-        app_mod,
-        "prepare_job",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"failed to read {internal_ref}")),
-    )
+
+    def _boom(spec, **kwargs):
+        raise RuntimeError(f"failed to read {internal_ref}")
+
+    monkeypatch.setattr(runner, "_prepare_init_from_adapter_inner", _boom)
     spec = {
         **SPEC,
         "train": {**SPEC["train"], "init_from_adapter": "source-run/step-20"},
@@ -1279,6 +1283,36 @@ def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatc
     assert "source-run/step-20" in detail
     assert "private-owner" not in resp.text
     assert "private-repo" not in resp.text
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, monkeypatch):
+    # the companion direction to the redaction above. a failure raised OUTSIDE adapter resolution
+    # keeps its own message, so a warm-start run told to check its adapter really has an adapter
+    # problem. the previous broad except rewrote every prepare_job failure into the adapter
+    # message, sending users to re-verify a healthy adapter while the real cause never arrived.
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(
+        app_mod,
+        "prepare_job",
+        lambda *a, **k: (_ for _ in ()).throw(ValueError("no configured provider can provision")),
+    )
+    spec = {
+        **SPEC,
+        "train": {**SPEC["train"], "init_from_adapter": "source-run/step-20"},
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec},
+    )
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "no configured provider can provision" in detail
+    assert "could not be prepared" not in detail
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
@@ -2593,6 +2627,38 @@ def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
     assert "lora_rank" not in public["spec"]["train"]
     assert public["spec"]["train"]["init_from_adapter"] == "source-run"
     assert "effective_preparation" not in public
+
+
+def test_public_spec_does_not_publish_a_storage_ref_whose_phase_was_removed():
+    """Redaction must not infer "public" from "this build cannot parse it as internal".
+
+    A persisted worker/effective spec keeps whatever phase was current when it was written. `opsd`
+    was removed from the internal-ref grammar (#784), so its locators stopped parsing as internal
+    and the redactor left them alone as though they were user-facing refs -- publishing the private
+    repo verbatim (chatgpt-codex-connector). The phase set is not frozen, so this is the shape of
+    every future removal too.
+    """
+    import flash.runner as runner
+
+    for ref in ("private-owner/private-source:opsd/source-run", "private-owner/private-source:!"):
+        data = runner._public_status_spec({"train": {"init_from_adapter": ref}})
+        assert "private-owner" not in json.dumps(data), ref
+        assert "init_from_adapter" not in data["train"], ref
+
+    # the two grammars this function must still recognize are unaffected: a user-facing ref is
+    # preserved, and a known internal phase is rewritten rather than dropped.
+    assert (
+        runner._public_status_spec({"train": {"init_from_adapter": "source-run/step-20"}})["train"][
+            "init_from_adapter"
+        ]
+        == "source-run/step-20"
+    )
+    assert (
+        runner._public_status_spec(
+            {"train": {"init_from_adapter": "private-owner/private-source:sft/source-run"}}
+        )["train"]["init_from_adapter"]
+        == "source-run"
+    )
 
 
 def test_deploy_serving_error_is_recorded_as_failed_deployment(api, monkeypatch):
@@ -4669,6 +4735,84 @@ def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
     assert resp.json()["state"] == "ready"
 
 
+def test_chat_forwards_trained_stop_sequences(api, monkeypatch):
+    """A run trained with stop_sequences terminates on its delimiter, not EOS. The deployment smoke
+    forwards them, so the adapter verifies and activates -- but if user inference does not, the same
+    model runs on to max_tokens or emits trailing text past its answer on every real request."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    spec = json.loads(json.dumps(SPEC))
+    spec["train"] = {**spec["train"], "stop_sequences": ["</answer>"]}
+    run_id = api.post(
+        "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+
+    seen: dict = {}
+
+    def serve_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["stop"] == ["</answer>"]
+
+
+def test_chat_sends_no_stop_when_run_configured_none(api, monkeypatch):
+    """A run that never configured a delimiter must not receive one."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "b" * 40
+    runner.mark_deployed(
+        run_id,
+        {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+
+    seen: dict = {}
+
+    def serve_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["stop"] is None
+
+
 def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -6335,7 +6479,7 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": run_id}])
     drained = []
     monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda rid: drained.append(rid) or set())
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
 
     app_mod.recover_runs()
 
@@ -6393,7 +6537,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner, "_run_job_background", lambda recovered: submitted.append(recovered.run_id)
     )
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
 
     app_mod.recover_runs()
 
@@ -6516,7 +6660,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     # Vast is no longer configured -> omitted from configured_providers(); the real get_provider("vast")
     # still exposes run_instances_remaining, so the recorded-but-unconfigurable provider can't be
     # enumerated -> the guard must fail closed rather than declare clear.
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
     monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
 
     app_mod.recover_runs()
@@ -6582,7 +6726,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     # Vast unconfigurable now: the OLD unconditional guard would fail closed here and defer forever. A
     # queued run must resubmit anyway, because it provably never created the phantom the guard protects
     # against. _confirm_run_clear must not even be consulted (Vast enumeration would raise/defer).
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
     monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
 
     app_mod.recover_runs()
@@ -6640,7 +6784,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
 
     import flash.providers as providers_mod
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
 
     app_mod.recover_runs()
 

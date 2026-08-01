@@ -98,7 +98,6 @@ from flash.engine.worker.lora import (
     patch_grpo_mask_aware_lm_head,
 )
 from flash.engine.worker.opd import run_opd
-from flash.engine.worker.opsd import run_opsd
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,
@@ -172,9 +171,7 @@ JOB_SPEC = load_job_spec_from_env()
 SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
 PHASE = os.environ.get(
     "PHASE",
-    JOB_SPEC.phase
-    if JOB_SPEC
-    else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd", "opsd") else "sft"),
+    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
 )
 OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
 
@@ -246,9 +243,14 @@ def _load_active_env():
             "(a Freesolo environment id like 'your-name/your-env', returned by "
             "`flash env push --project <project-uuid> --name <name>`)."
         )
-    return load_environment(
+    env = load_environment(
         env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
     )
+    # tell the env whether this run samples <think> blocks, so the multi-turn scoring path strips
+    # reasoning exactly like the single-turn path does (see FreesoloEnvironment.record_model_turn).
+    if hasattr(env, "thinking"):
+        env.thinking = bool(JOB_SPEC.thinking)
+    return env
 
 
 ACTIVE_ENV = None
@@ -303,7 +305,6 @@ def main():
             "sft": run_sft,
             "rl": run_rl,
             "opd": run_opd,
-            "opsd": run_opsd,
         }
         handler = modes.get(RUN_MODE)
         if handler is None:
@@ -547,7 +548,6 @@ __all__ = [
     "resolve_grpo_prompts_per_step",
     "rl_per_device_comps",
     "run_opd",
-    "run_opsd",
     "run_rl",
     "run_sft",
     "seed_training_rngs",

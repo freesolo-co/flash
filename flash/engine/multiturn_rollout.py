@@ -36,6 +36,10 @@ class RolloutResult(TypedDict):
 
 RolloutCompletion = tuple[str, list[int], list[float], str]
 
+# asks the env worker to run the driver-side close-out before it exits, so every env_reply of an
+# episode happens on one thread. distinct from the None shutdown sentinel: this one is answered.
+_CLOSE_OUT = object()
+
 
 class RolloutRequestExhaustedError(RuntimeError):
     """Raised when one logical assistant turn exhausts its physical request attempts."""
@@ -156,6 +160,24 @@ def _dedup_seam_terminator(prev_completion_ids: list[int], glue: list[int]) -> l
     return glue
 
 
+def _final_env_step(
+    active_env, messages: list[dict], state: dict, max_turns: int, *, pending: bool
+) -> None:
+    """Give the env the last assistant turn when the DRIVER, not the env, ended the episode.
+
+    The turn loops stop on the turn cap and on token-budget exhaustion *before* the inter-turn
+    ``env_reply``, so a stateful environment would score a board or transcript missing the last thing
+    the model did. The env step still has to run; only the inter-turn glue is skipped, because no
+    further model turn is conditioned on the reply.
+
+    ``pending`` is False once the last generated turn has already been through ``env_reply`` (an env
+    that replied with nothing, a natural finish, a glue overflow) — stepping again there would be a
+    spurious extra move. ``rollout_done`` covers the env having declared the episode over."""
+    if not pending or active_env.rollout_done(state, max_turns):
+        return
+    active_env.env_reply(messages, state)
+
+
 def rollout_one(
     *,
     example: dict,
@@ -182,6 +204,8 @@ def rollout_one(
     turn_spans: list[tuple[int, int]] = []
 
     turns = 0
+    # True while the newest assistant turn has not been through env_reply yet.
+    env_step_pending = False
     while True:
         max_new = per_turn_max_tokens
         if token_budget is not None:
@@ -190,6 +214,7 @@ def rollout_one(
                 break
             max_new = min(max_new, remaining)
         asst_ids, asst_lp, text = generate(cur_ids, max_new)
+        env_step_pending = True
         turn_start = len(completion_ids)
         completion_ids.extend(asst_ids)
         turn_spans.append((turn_start, len(completion_ids)))
@@ -205,6 +230,7 @@ def rollout_one(
         if turns >= max_turns or active_env.rollout_done(state, max_turns):
             break
         env_msgs = active_env.env_reply(messages, state)
+        env_step_pending = False
         if not env_msgs:
             break
         messages.extend(env_msgs)
@@ -220,6 +246,7 @@ def rollout_one(
         env_mask.extend([0] * len(glue))
         cur_ids.extend(glue)
 
+    _final_env_step(active_env, messages, state, max_turns, pending=env_step_pending)
     score = score_rollouts(
         active_env,
         [RolloutScoreRequest(example=example, state=state, turn_count=len(turn_spans))],
@@ -282,6 +309,8 @@ def rollout_one_records(
     records: list[TurnRecord] = []
 
     turns = 0
+    # True while the newest assistant turn has not been through env_reply yet.
+    env_step_pending = False
     while True:
         completion_so_far = len(cur_ids) - len(prompt_ids)
         max_new = per_turn_max_tokens
@@ -295,6 +324,7 @@ def rollout_one_records(
         prefix_ids = list(cur_ids)
         context_messages = [dict(m) for m in messages]
         gen = generate(prefix_ids, max(1, max_new))
+        env_step_pending = True
         if on_turn_generated is not None:
             on_turn_generated()
         records.append({"prefix_ids": prefix_ids, "gen": gen, "context_messages": context_messages})
@@ -306,6 +336,9 @@ def rollout_one_records(
         # episode: it's recorded (counted) but not distilled, and continuing from a broken turn is
         # pointless (the student can't end its turn / said nothing).
         if getattr(gen, "truncated", False) or getattr(gen, "skip", False):
+            # NOT a move: a turn the student couldn't terminate, or said nothing in, must not reach
+            # the env — so it is deliberately excluded from the final close-out step below.
+            env_step_pending = False
             break
         asst_ids = getattr(gen, "completion_ids", None) or []
         cur_ids.extend(asst_ids)
@@ -315,6 +348,7 @@ def rollout_one_records(
         if turns >= max_turns or active_env.rollout_done(state, max_turns):
             break
         env_msgs = active_env.env_reply(messages, state)
+        env_step_pending = False
         if not env_msgs:
             break
         messages.extend(env_msgs)
@@ -326,6 +360,7 @@ def rollout_one_records(
             break
         cur_ids.extend(glue)
 
+    _final_env_step(active_env, messages, state, max_turns, pending=env_step_pending)
     return records
 
 
@@ -338,6 +373,7 @@ class _RolloutState:
         "cur_ids",
         "done",
         "env_mask",
+        "env_step_pending",
         "example",
         "images",
         "logprobs",
@@ -362,6 +398,8 @@ class _RolloutState:
         self.turns = 0
         self.budget = budget
         self.done = False
+        # True while the newest assistant turn has not been through env_reply yet.
+        self.env_step_pending = False
 
     def result(self, reward: float, turn_rewards: list[float] | None) -> RolloutResult:
         return {
@@ -386,6 +424,7 @@ def _advance_after_turn(
     max_turns: int,
 ) -> None:
     """Fold one assistant turn into ``r`` and run its env step. Sets ``r.done`` when finished."""
+    r.env_step_pending = True
     turn_start = len(r.completion_ids)
     r.completion_ids.extend(asst_ids)
     r.turn_spans.append((turn_start, len(r.completion_ids)))
@@ -402,6 +441,7 @@ def _advance_after_turn(
         r.done = True
         return
     env_msgs = active_env.env_reply(r.messages, r.state)
+    r.env_step_pending = False
     if not env_msgs:
         r.done = True
         return
@@ -610,6 +650,33 @@ def rollout_async(
             item = to_env.get()
             if item is None:
                 return
+            if item is _CLOSE_OUT:
+                # the driver-side close-out belongs on this thread too: an env that keeps
+                # thread-affine state (a lazily-opened sqlite connection, a tokenizer bound to its
+                # creating thread) built it here on the first turn, so running the last env_reply
+                # on the engine thread would raise and lose an otherwise finished episode.
+                try:
+                    for r in rollouts:
+                        _final_env_step(
+                            active_env,
+                            r.messages,
+                            r.state,
+                            max_turns,
+                            pending=r.env_step_pending,
+                        )
+                # every close-out failure is reported, including BaseException: user env code that
+                # calls sys.exit(), or a KeyboardInterrupt landing in the close-out env_reply,
+                # unwound this thread without reporting anything (codex[bot]). The receive loop
+                # below ends on a dead worker rather than hanging, so the cost is not a stall: it
+                # is silence. The final env step never ran, and the episode was scored on that
+                # partial state as if the close-out had succeeded. Catching BaseException here does
+                # not swallow the interrupt -- it is re-raised on the driver thread, which is the
+                # thread the CLI-side user-code paths catch it on (flash/cli/env_test.py).
+                except BaseException as exc:
+                    to_submit.put(("error", exc))
+                    return
+                to_submit.put(("closed",))
+                continue
             r, asst_ids, asst_lp, text = item
             try:
                 _advance_after_turn(
@@ -675,6 +742,35 @@ def rollout_async(
                     # the environment worker is mid-advance; block briefly instead of spinning.
                     with contextlib.suppress(queue.Empty):
                         take(to_submit.get(timeout=0.1))
+        # on the success path only: an episode that raised has no close-out to run, and the worker
+        # may already have exited after reporting the error.
+        to_env.put(_CLOSE_OUT)
+        while True:
+            # waits on liveness, not just on an answer, so a worker that dies without putting
+            # anything ends the wait instead of blocking the training step forever on a queue
+            # nothing can ever fill. a death is a FAILURE, not an answer: the worker reports every
+            # close-out outcome it survives, so silence means the final env step did not finish and
+            # the episode below would be scored on partial state as if it had (codex[bot]).
+            try:
+                msg = to_submit.get(timeout=0.1)
+            except queue.Empty:
+                if worker.is_alive():
+                    continue
+                # drain once more before concluding silence: a report queued between the timeout
+                # above and this liveness check is still waiting to be read, and treating it as an
+                # unreported death would replace the worker's real error with this generic one.
+                try:
+                    msg = to_submit.get_nowait()
+                except queue.Empty:
+                    raise RuntimeError(
+                        "the environment worker died during close-out without reporting a "
+                        "result; the final environment step did not complete"
+                    ) from None
+            if msg[0] == "closed":
+                break
+            if msg[0] == "error":
+                err = msg[1]
+                raise err.with_traceback(err.__traceback__)
     finally:
         active = list(by_id)
         by_id.clear()

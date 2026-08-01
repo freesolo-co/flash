@@ -143,7 +143,6 @@ def _legacy_lora_floor_gb(lora_rank: int, effective_params_b: float) -> float:
     return (lora_rank / 16.0) * (0.3 + 0.04 * effective_params_b)
 
 
-
 def opd_training_peak_gb(
     params_b: float,
     seq_len: int,
@@ -213,7 +212,6 @@ def opd_post_init_reserve_gb(params_b: float, lora_rank: int) -> float:
     return gradient_gb + adamw_state_gb + persistent_growth_gb
 
 
-
 def _lora_memory_gb(
     lora_rank: int,
     effective_params_b: float,
@@ -232,7 +230,7 @@ def _lora_memory_gb(
     trainable_params = max(1, int(lora_rank)) * target_dims
     bytes_per_param = (
         _LORA_ADAMW_BYTES_PER_PARAM
-        if (algorithm or "").lower() in ("opd", "opsd")
+        if (algorithm or "").lower() == "opd"
         else _LORA_PAGED_BYTES_PER_PARAM
     )
     exact = trainable_params * bytes_per_param / 1e9
@@ -611,7 +609,7 @@ def estimate_vram_gb(
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     weights = params_b * bpp
     eff_b = float(active_params_b) if active_params_b else params_b
-    is_opd = (algorithm or "").lower() in ("opd", "opsd")
+    is_opd = (algorithm or "").lower() == "opd"
     algo = "grpo" if (algorithm or "").lower() in ("grpo", "rl") else "sft"
     width = math.sqrt(max(eff_b, 0.1))
     lora_opt = _lora_memory_gb(lora_rank, eff_b, algorithm, model_info)
@@ -721,14 +719,10 @@ def grpo_fits_resident(
     if revision:
         params_b = float(resolve_params_b(model_id, revision=revision) or 0.0)
     else:
-        params_b = (
-            float(getattr(catalog_info, "params_b", 0.0) or 0.0) if catalog_info else 0.0
-        )
+        params_b = float(getattr(catalog_info, "params_b", 0.0) or 0.0) if catalog_info else 0.0
     if params_b <= 0:
         return False
-    quant = (
-        (getattr(catalog_info, "quant", "bf16") or "bf16") if catalog_info else "bf16"
-    )
+    quant = (getattr(catalog_info, "quant", "bf16") or "bf16") if catalog_info else "bf16"
     # pinned revisions use the conservative generic kv and lora geometry, matching the runtime budget.
     info = None if revision else catalog_info
     active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
@@ -938,14 +932,14 @@ def model_required_vram_gb(
     _algo = (algorithm or "").lower()
     if _algo in ("grpo", "rl"):
         _default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
-    elif _algo in ("opd", "opsd"):
-        # opd-style algorithms size prompt plus completion for the resident rollout path.
+    elif _algo == "opd":
+        # opd sizes prompt plus completion for the resident rollout path.
         _default_len = opd_rollout_seq_len(0, max_tokens, thinking)
     else:
         _default_len = 1024
     seq_len = _pos_int(_get(train, "max_context_tokens"), _default_len)
     lora_rank = _pos_int(_get(train, "lora_rank"), 32)
-    if _algo in ("opd", "opsd"):
+    if _algo == "opd":
         from flash.engine.recipe import RECIPE
 
         batch_size_default = int(RECIPE.opd.prompts_per_step)
@@ -1027,11 +1021,9 @@ def model_required_vram_gb(
     info = MODELS.get(model_id)
     model_vocab = vocab_size_for(model_id)
     is_grpo = _algo in ("grpo", "rl")
-    is_opd = _algo in ("opd", "opsd")
+    is_opd = _algo == "opd"
     is_vllm_rollout = is_grpo or is_opd
-    vllm_concurrency = (
-        opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
-    )
+    vllm_concurrency = opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
     # trl chunked_nll removes ignored positions before the lm head and projects valid tokens in
     # bounded chunks. size validated qwen sft jobs without a dense [batch, seq, vocab] term; models
     # outside that validated set keep the conservative plain-nll estimate and micro-batch cap.

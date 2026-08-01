@@ -511,7 +511,7 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     # Never scheduled (no capacity) is reported distinctly from a scheduled-then-stalled worker.
     assert res.failure == "no_capacity"
     assert "IN_QUEUE" in res.detail
-    assert "next-best GPU" in res.detail
+    assert "GPU-class escalation may follow" in res.detail
 
 
 def test_capacity_grace_scales_with_gpu_walk_position():
@@ -3786,6 +3786,65 @@ def test_attach_requires_handle(monkeypatch):
             orch.attach_run("nh")
 
 
+def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
+    """A spec that stops parsing must terminate the run, not silently strand a billing worker.
+
+    `attach_run` parses the persisted spec ABOVE its try, so a raise there escapes every handler.
+    It is dispatched on a daemon thread by `recover_runs`, so nothing surfaces the exception: the
+    run stays nonterminal holding a live handle and its worker bills until someone notices. A spec
+    stops parsing when the plane drops a surface a still-in-flight run was accepted under -- here a
+    local `environment.path`, which `JobSpec.from_dict` rejects (codex[bot]).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import json
+
+        import flash.providers.runpod.train as flash_train
+        import flash.runner.lifecycle as lifecycle
+
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "epBad",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "jBad",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+        from dataclasses import replace
+
+        spec = _spec("bad")
+        spec = replace(spec, gpu=replace(spec.gpu, type="RTX 5090"))
+        orch._save_status(
+            orch.RunStatus(run_id="bad", state="running", spec=spec.to_dict(), remote=remote)
+        )
+        # Rewrite the spec on disk: the plane can no longer WRITE this record, so go around the
+        # writer the same way an older plane's leftover file would have arrived.
+        raw = orch._load_status_json("bad")
+        raw["spec"] = {**raw["spec"], "environment": {"path": "/legacy/local/env"}}
+        with open(orch.runs_file_path("bad", ".json"), "w") as file:
+            json.dump(raw, file)
+
+        torn_down = []
+        terminated = []
+        monkeypatch.setattr(
+            lifecycle,
+            "_strict_teardown_handle",
+            lambda handle, rid: torn_down.append((handle.data.get("endpoint_id"), rid)) or True,
+        )
+        monkeypatch.setattr(
+            flash_train, "terminate_endpoint", lambda gpu, rid: terminated.append((gpu, rid))
+        )
+
+        status = orch.attach_run("bad", log_stream=sys.stderr)
+
+        assert status.state == "failed"
+        assert "spec is malformed" in (status.error or "")
+        # the exact endpoint the handle names, plus the rN retry endpoints it cannot name.
+        assert torn_down == [("epBad", "bad")]
+        assert terminated == [("RTX 5090", "bad")]
+
+
 def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
     # A recovered run whose remote job ended not-ok (it died while the control plane was down for
     # the redeploy) must NOT be failed — reattach resumes training on a fresh host (worker resumes
@@ -5536,3 +5595,128 @@ def test_deploy_train_endpoint_gpu_count_defaults_to_one(monkeypatch):
 
     jobs.deploy_train_endpoint("A100", name_suffix="testrun", endpoint_kwargs={})
     assert captured["gpu_count"] == 1
+
+
+def _poll_in_queue_forever(monkeypatch, **poll_kwargs):
+    """Drive poll_job against a job that never leaves IN_QUEUE (no capacity for the pinned class)."""
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: (_ for _ in ()).throw(RuntimeError("no workers yet")),
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    return jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=5000.0,
+        queue_grace_s=900.0,
+        **poll_kwargs,
+    )
+
+
+def test_capacity_detail_does_not_promise_a_next_best_gpu_on_the_last_class(monkeypatch):
+    """LS-008/AT-013: the capacity failure detail claimed 'retrying on the next-best GPU' even when
+    no further class escalation followed. On the last GPU it must report that instead.
+
+    It must NOT name a class: on_last_gpu says nothing about WHICH class a retry reuses (the picker
+    can clamp back to a cheaper already-tried one), and only the supervisor holds the candidate list
+    needed to know -- so a "same class" promise here would be the same false claim in new words."""
+    res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
+    assert res.failure == "no_capacity"
+    assert "next-best" not in res.detail, res.detail
+    assert "no further GPU-class escalation follows" in res.detail, res.detail
+    assert "same class" not in res.detail, res.detail
+
+
+def test_capacity_detail_claims_neither_a_retry_nor_class_exhaustion(monkeypatch):
+    """The supervisor sets on_last_gpu for TWO different reasons: no untried class remains, or the
+    infra retry budget is spent. The second can fire with classes still untried, and it is also the
+    case where ``can_retry()`` returns false and the lifecycle logs ``not retrying``.
+
+    A detail that asserted either "no untried class" or "retrying" would therefore contradict the
+    real candidate set and the real retry decision on that path. poll_job can see neither, so it
+    states only the escalation fact it does know and leaves both claims to the supervisor."""
+    res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
+    assert res.failure == "no_capacity"
+    # not a retry promise: this detail is also emitted on the attempt that ends the run.
+    assert "retrying" not in res.detail, res.detail
+    # not a class-exhaustion claim: untried classes can remain when the budget is what ran out.
+    assert "untried" not in res.detail, res.detail
+
+
+def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch):
+    """The persisted flag answers one of the two questions it is read for, and only one.
+
+    It is a snapshot of a supervisor loop that no longer exists. Recovery calls
+    reallocation_spec_from_status -- restoring the run's original unpinned gpu type -- and re-enters
+    _run_training with empty failed_providers and tried_classes, so the replacement really can pick
+    another class or provider. Forwarding the snapshot to poll_job would state "no further GPU-class
+    escalation follows" about a picker that has its whole candidate list back (codex[bot]).
+
+    The stall grace is a different question -- how long to wait on hardware that was scarce -- which
+    the snapshot still answers correctly, so it must keep flowing through."""
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import PROVIDER
+    from flash.providers.runpod import jobs as jobs
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    captured: dict = {}
+
+    def fake_poll_job(handle, **kw):
+        captured.update(kw)
+        return jobs.PollResult(True, metrics={})
+
+    monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
+    spec = JobSpec(
+        run_id="reattach-lastgpu",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="grpo",
+        train=TrainSpec(epochs=1, max_examples=1, hf_repo=""),
+        gpu=GpuSpec(type="A100 PCIe"),
+    )
+    base = {
+        "provider": "runpod",
+        "endpoint_id": "ep",
+        "endpoint_name": "n",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
+        "job_id": "j",
+        "started_ts": 1.0,
+        "attempt": 2,
+    }
+
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True}), spec, spec.seed)
+    # the capacity wording is left at poll_job's neutral default: escalation may follow, because
+    # after recovery it genuinely can.
+    assert "on_last_gpu" not in captured, captured
+    # the scarcity grace still honours the snapshot: 900s, not the 300s of a normal attempt.
+    assert captured["queue_grace_s"] == 900.0, captured
+    assert captured["throttled_grace_s"] == 900.0, captured
+
+    captured.clear()
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False}), spec, spec.seed)
+    assert "on_last_gpu" not in captured, captured
+    assert captured["queue_grace_s"] == 300.0, captured
+
+
+def test_capacity_detail_promises_no_retry_when_a_next_class_exists(monkeypatch):
+    """The false branch must be exactly as neutral as the true one. It originally read "retrying on
+    the next-best GPU", which asserts BOTH a retry and a class walk -- and a cache-drop retry fires
+    with on_last_gpu false while deliberately reselecting the SAME class, so that wording
+    contradicted the action line printed beneath it (see
+    test_cache_drop_retry_names_the_same_class_it_reselects).
+
+    Deliberately relies on the default rather than passing on_last_gpu, to guard the normal path."""
+    res = _poll_in_queue_forever(monkeypatch)
+    assert res.failure == "no_capacity"
+    assert "GPU-class escalation may follow" in res.detail, res.detail
+    assert "retrying" not in res.detail, res.detail
+    assert "next-best" not in res.detail, res.detail

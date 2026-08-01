@@ -8,6 +8,7 @@ verified the same way a real template (Qwen-style <|im_start|>/<|im_end|>) would
 from __future__ import annotations
 
 import sys
+import threading
 import types
 
 import pytest
@@ -994,3 +995,291 @@ def test_rollout_func_unconstrained_without_structured_outputs():
     rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
     assert captured
     assert all(not hasattr(sp, "structured_outputs") for sp in captured)
+
+
+# ============================================================================================
+# LO-004 — the driver must not end an episode without giving the env the final assistant turn
+# ============================================================================================
+class _StatefulBoardEnv:
+    """Env whose reward is the state it has actually STEPPED, not the raw transcript.
+
+    Models a board/game env: every model turn is a move the env must apply through ``env_reply``
+    before the position means anything. ``rollout_done`` is driven only by the env's own state, so
+    the DRIVER's turn cap is what cuts these episodes short.
+    """
+
+    multi_turn = True
+    rollout_rewards_many = BaseEnvironment.rollout_rewards_many
+
+    def __init__(self):
+        self.env_reply_calls = 0
+
+    def new_rollout_state(self, example):
+        return {"prompt": [{"role": "user", "content": "u1"}], "pending": None, "applied": 0}
+
+    def record_model_turn(self, state, content):
+        state["pending"] = content
+
+    def rollout_done(self, state, max_turns):
+        return False  # only the driver's cap ends these episodes
+
+    def env_reply(self, messages, state):
+        self.env_reply_calls += 1
+        if state["pending"] is not None:
+            state["applied"] += 1  # the move is only on the board once the env has stepped it
+            state["pending"] = None
+        return [{"role": "user", "content": "u2"}]
+
+    def reward(self, completion, example, state=None):
+        return float((state or {}).get("applied", 0))
+
+
+def test_rollout_one_steps_the_env_on_the_final_turn_before_scoring():
+    """LO-004: the loop broke at the turn cap BEFORE env_reply, so the last model turn was never
+    applied and a stateful env scored a stale board."""
+    env = _StatefulBoardEnv()
+    out = rollout_one(
+        example={},
+        active_env=env,
+        render=render,
+        generate=_det_generate,
+        env_glue=env_glue,
+        max_turns=3,
+        per_turn_max_tokens=8,
+    )
+    assert out["reward"] == 3.0, "the final model turn was scored without being applied by the env"
+    assert env.env_reply_calls == 3
+
+
+def test_rollout_async_steps_the_env_on_the_final_turn_before_scoring():
+    """Same close-out in the continuously-batched driver."""
+    env = _StatefulBoardEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    out = rollout_async(
+        examples=[{}],
+        active_env=env,
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=busy,
+        abort=lambda ids: None,
+        env_glue=env_glue,
+        max_turns=3,
+        per_turn_max_tokens=8,
+    )
+    assert out[0]["reward"] == 3.0
+    assert env.env_reply_calls == 3
+
+
+def test_rollout_async_runs_every_env_step_on_one_thread():
+    """A thread-affine env must see its whole episode on the thread it built its state on.
+
+    Intermediate turns advance on `env_worker`, but the driver-side close-out used to run on the
+    engine thread after that worker was joined. An env that lazily creates thread-bound state on
+    its first `env_reply` -- the sqlite default of `check_same_thread=True` is the common one --
+    then raised on the last turn and lost an otherwise finished episode.
+
+    Asserting on thread identity rather than on a raised error is deliberate: it fails for the
+    right reason, and it keeps holding if the env's own affinity check is ever relaxed.
+    """
+
+    class _ThreadAffineEnv(_StatefulBoardEnv):
+        def __init__(self):
+            super().__init__()
+            self.owner = None
+
+        def env_reply(self, messages, state):
+            current = threading.current_thread().name
+            if self.owner is None:
+                self.owner = current
+            elif current != self.owner:
+                raise RuntimeError(f"env state built on {self.owner} was used from {current}")
+            return super().env_reply(messages, state)
+
+    env = _ThreadAffineEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    out = rollout_async(
+        examples=[{}],
+        active_env=env,
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=busy,
+        abort=lambda ids: None,
+        env_glue=env_glue,
+        max_turns=3,
+        per_turn_max_tokens=8,
+    )
+
+    assert out[0]["reward"] == 3.0
+    assert env.env_reply_calls == 3
+    # the episode really did run off the caller's thread, so the assertion above is about the
+    # worker holding every step rather than about everything collapsing onto the main thread.
+    assert env.owner is not None
+    assert env.owner != threading.current_thread().name
+
+
+def test_close_out_does_not_hang_when_the_env_worker_dies_unreported():
+    """A worker that dies without answering must end the wait, not stall the training step.
+
+    The close-out is a handshake: the driver queues the request and waits for "closed". The worker
+    reports failures through the same queue, but only for exceptions it CATCHES -- a BaseException
+    unwinds the thread having put nothing. `KeyboardInterrupt` landing in a close-out `env_reply`
+    is the realistic one, and it is exactly the moment a user is trying to stop the run. Waiting on
+    the answer alone then blocks forever on a queue no live thread can fill, so the interrupt never
+    reaches the CLI and the step hangs instead of exiting.
+
+    Ending the wait is necessary but not sufficient: breaking out of it and returning normally
+    scores the episode on partial state, since the close-out env step never ran -- so the death is
+    reported as the failure it is, and the interrupt reaches the caller (chatgpt-codex-connector).
+
+    Two assertions, because the two failure modes are opposite: without the liveness check this
+    test hangs rather than fails, so it runs on a separate thread with a bounded wait; without the
+    propagation it returns cleanly, so the raised exception is checked too.
+    """
+
+    class _InterruptOnCloseOutEnv(_StatefulBoardEnv):
+        def env_reply(self, messages, state):
+            # the close-out is the 3rd and last call for this episode
+            if self.env_reply_calls >= 2:
+                raise KeyboardInterrupt("interrupted during the close-out step")
+            return super().env_reply(messages, state)
+
+    env = _InterruptOnCloseOutEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    done = threading.Event()
+    raised: list[BaseException] = []
+
+    def _drive() -> None:
+        try:
+            rollout_async(
+                examples=[{}],
+                active_env=env,
+                render=render,
+                submit=submit,
+                poll=poll,
+                busy=busy,
+                abort=lambda ids: None,
+                env_glue=env_glue,
+                max_turns=3,
+                per_turn_max_tokens=8,
+            )
+        except BaseException as exc:
+            raised.append(exc)
+        finally:
+            done.set()
+
+    driver = threading.Thread(target=_drive, daemon=True)
+    driver.start()
+    assert done.wait(timeout=20.0), "close-out wait never returned after the env worker died"
+    # ending the wait is not enough: returning normally scores this episode on partial state, since
+    # the close-out env step never ran. the interrupt is re-raised on THIS thread, which is the one
+    # the CLI-side user-code paths catch it on.
+    assert [type(exc) for exc in raised] == [KeyboardInterrupt], raised
+    assert env.env_reply_calls == 2
+
+
+def test_close_out_reports_a_sys_exit_from_user_env_code():
+    """`sys.exit()` in an env must fail the step, not silently truncate the episode.
+
+    SystemExit derives from BaseException, so `except Exception` let it unwind the worker having
+    reported nothing. The liveness check ends the wait rather than hanging, so the cost is not a
+    stall: the close-out env step never ran and the episode was scored on that partial state as if
+    it had succeeded -- here `applied` stays 2 of 3, a silently wrong reward feeding the gradient.
+    A one-turn env running a CLI-style parser is the realistic way to reach this.
+    """
+
+    class _ExitOnCloseOutEnv(_StatefulBoardEnv):
+        def __init__(self):
+            super().__init__()
+            self.entered = 0
+
+        def env_reply(self, messages, state):
+            self.entered += 1
+            # the close-out is the 3rd and last call for this episode
+            if self.entered >= 3:
+                sys.exit("environment called sys.exit() during its final step")
+            return super().env_reply(messages, state)
+
+    env = _ExitOnCloseOutEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    with pytest.raises(SystemExit):
+        rollout_async(
+            examples=[{}],
+            active_env=env,
+            render=render,
+            submit=submit,
+            poll=poll,
+            busy=busy,
+            abort=lambda ids: None,
+            env_glue=env_glue,
+            max_turns=3,
+            per_turn_max_tokens=8,
+        )
+    # the close-out really was the step that died: it was entered, and the two turns before it had
+    # completed. without the report this run returns a reward of 2 for a 3-move episode.
+    assert (env.entered, env.env_reply_calls) == (3, 2)
+
+
+def test_token_budget_exhaustion_also_steps_the_env():
+    """The token budget is the other driver-side exit that skipped the env step."""
+    env = _StatefulBoardEnv()
+    # engine_max_len leaves room for ~2 turns; the cap is never reached.
+    out = rollout_one(
+        example={},
+        active_env=env,
+        render=render,
+        generate=_det_generate,
+        env_glue=env_glue,
+        max_turns=99,
+        per_turn_max_tokens=8,
+        engine_max_len=len(render([{"role": "user", "content": "u1"}], True)) + 8 + 6,
+    )
+    assert out["reward"] == float(env.env_reply_calls)
+    assert env.env_reply_calls >= 1
+
+
+class _FinishingEnv(_StatefulBoardEnv):
+    """Env that declares the episode over itself after the first env step."""
+
+    def rollout_done(self, state, max_turns):
+        return state["applied"] >= 1
+
+
+def test_env_that_finishes_itself_is_not_stepped_twice():
+    """The close-out must fire only when the DRIVER ended the episode. An env that already stepped
+    the last turn (or declared itself done) would otherwise get a spurious extra move."""
+    env = _FinishingEnv()
+    out = rollout_one(
+        example={},
+        active_env=env,
+        render=render,
+        generate=_det_generate,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
+    )
+    assert env.env_reply_calls == 1
+    assert out["reward"] == 1.0
+
+
+class _SilentEnv(_StatefulBoardEnv):
+    """Env that ends the episode by replying with nothing."""
+
+    def env_reply(self, messages, state):
+        super().env_reply(messages, state)
+        return []
+
+
+def test_env_ending_with_an_empty_reply_is_not_stepped_twice():
+    env = _SilentEnv()
+    rollout_one(
+        example={},
+        active_env=env,
+        render=render,
+        generate=_det_generate,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
+    )
+    assert env.env_reply_calls == 1
