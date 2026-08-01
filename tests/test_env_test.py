@@ -291,6 +291,34 @@ def test_env_test_validates_evaluation_sidecar_offline(monkeypatch, tmp_path, ca
     assert "overall: PASS" in output
 
 
+def test_env_test_rejects_an_evaluation_case_whose_image_cannot_be_resolved(
+    monkeypatch, tmp_path, capsys
+):
+    # `prompt_messages()` is only half of the prompt: env eval and every training worker then run
+    # `normalize_prompt_images`. checking only the message envelope approved a case whose
+    # package-relative image does not exist, and the online command then recorded a
+    # prompt-construction failure for a suite this gate had reported `overall: PASS`
+    # (chatgpt-codex-connector).
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'held-out'\n"
+        "    def cases(self): return [EvalCase(input='what is this?', expected='a cat',\n"
+        "        metadata={'image': 'missing-cat.png'})]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class _ImageEnv(_SingleTurnEnv):
+        package_root = env_dir
+
+    _patch_loader(monkeypatch, _ImageEnv())
+
+    assert cmd_env_test(_args(env_dir)) != 0
+    output = capsys.readouterr().out
+    assert "overall: PASS" not in output
+
+
 def test_env_test_rejects_an_empty_evaluation_suite(monkeypatch, tmp_path, capsys):
     # approving 0/0 contract checks makes the offline gate pass a sidecar that env eval refuses
     # to run, so the first online use fails after setup already declared the package valid.
