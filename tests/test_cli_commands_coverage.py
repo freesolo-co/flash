@@ -257,6 +257,71 @@ def test_chat_fails_when_the_stream_carries_no_text(monkeypatch, capsys) -> None
     assert "models list" not in captured.err
 
 
+def test_chat_treats_a_whitespace_only_stream_as_no_response(monkeypatch, capsys) -> None:
+    """Blank chunks are the same empty answer as no chunks, and must fail the same way.
+
+    Counting any chunk as text exited 0 here, so a serving path that stopped applying the run's
+    chat template and emitted only whitespace read as a healthy response (Cursor). Spaces are as
+    non-empty as the `assistant` label the test below keeps off stdout, so they must not be
+    printed either -- the contract is exit 1 with empty stdout.
+    """
+
+    class BlankChatClient:
+        def chat_stream(self, run_id, messages, **kwargs):
+            yield "  "
+            yield "\n"
+            yield "\t"
+
+    monkeypatch.setattr(commands, "client_from_config", BlankChatClient)
+    monkeypatch.setattr(commands.render, "styled", lambda: True)
+    monkeypatch.setattr(commands.render, "chat_label", lambda: "assistant-label")
+
+    result = commands.cmd_chat(
+        SimpleNamespace(
+            run_id="flash-1",
+            message="hello",
+            system=None,
+            temperature=0.0,
+            max_tokens=32,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert "no response text from flash-1" in captured.err
+
+
+def test_chat_preserves_leading_whitespace_once_the_stream_has_text(monkeypatch, capsys) -> None:
+    """Holding blank chunks back must not edit a response that turns out to have text.
+
+    A model whose first chunks are whitespace still answered, so the held chunks are released
+    verbatim and the output stays byte-identical to what the stream produced.
+    """
+
+    class LeadingBlankChatClient:
+        def chat_stream(self, run_id, messages, **kwargs):
+            yield "  "
+            yield "hi"
+
+    monkeypatch.setattr(commands, "client_from_config", LeadingBlankChatClient)
+    monkeypatch.setattr(commands.render, "styled", lambda: False)
+
+    result = commands.cmd_chat(
+        SimpleNamespace(
+            run_id="flash-1",
+            message="hello",
+            system=None,
+            temperature=0.0,
+            max_tokens=32,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == "  hi\n"
+
+
 def test_chat_keeps_stdout_empty_when_a_styled_stream_carries_no_text(monkeypatch, capsys) -> None:
     """The empty-stream contract is "exit 1 with empty stdout", and styling must not break it.
 
