@@ -870,6 +870,10 @@ _DEPLOY_ZERO_WAIT_READ_SECONDS = 1.0
 # sleep spends the whole remainder and the wait ends on the deadline check having never looked
 # again, so a revision that went ready early in a short window reads as queued.
 _DEPLOY_FINAL_READ_SECONDS = 1.0
+# how much of the final window is slept before its one read. the rest bounds that read, so it stays
+# inside the deadline rather than in flight past it. late in the window, not halfway: a midpoint
+# read stops watching with half the advertised wait still to run.
+_DEPLOY_FINAL_READ_FRACTION = 0.9
 # an auth or authorization rejection answers the same way every time; polling through it just
 # spends the whole timeout to arrive at the identical error.
 _PERMANENT_POLL_STATUSES = frozenset({401, 403})
@@ -893,8 +897,8 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
     deadline = time.monotonic() + timeout
     latest = deployment
     first = True
-    # set once the wait enters its final window, so the read funded by that window's split is the
-    # last one. see the sleep below: without a stop the split repeats down to clock granularity.
+    # set once the wait enters its final window, so the read that window funds is the last one.
+    # see the sleep below: without a stop it would repeat down to clock granularity.
     final_read = False
     while True:
         remaining = deadline - time.monotonic()
@@ -911,15 +915,20 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             # EXCEEDS the reserve meant a remainder at or under it was slept in full and the
             # post-sleep deadline check ended the wait with no further read: `--wait 1` reported a
             # revision that went ready mid-window as still queued and exited 1, and every longer
-            # wait carried the same blind spot through its last second (cursor, codex[bot]). split
-            # that window instead, and take the split as the wait's last sleep -- repeating it would
-            # be the fraction this comment already rejects, terminating only on the clock's
-            # granularity while issuing an unbounded number of reads inside one second.
+            # wait carried the same blind spot through its last second (cursor, codex[bot]).
+            #
+            # that window's one read is placed LATE in it, not at its midpoint. Splitting it in half
+            # stopped looking with half the budget unspent: `--wait 1` read at t=0 and t=0.5 and
+            # then reported a timeout for a revision that went ready at t=0.75
+            # (chatgpt-codex-connector). The read cannot sit at the deadline itself -- it would
+            # still be in flight past it, which is the overshoot the per-poll bound exists to
+            # prevent (`test_deploy_wait_does_not_start_a_read_after_the_deadline_expires`) -- so
+            # sleep most of the window and leave just enough budget to bound the read inside it.
             slice_seconds = min(_DEPLOY_POLL_SECONDS, remaining)
             if slice_seconds > _DEPLOY_FINAL_READ_SECONDS:
                 slice_seconds -= _DEPLOY_FINAL_READ_SECONDS
             else:
-                slice_seconds /= 2
+                slice_seconds *= _DEPLOY_FINAL_READ_FRACTION
                 final_read = True
             time.sleep(slice_seconds)
             remaining = deadline - time.monotonic()

@@ -29,6 +29,20 @@ _PROJECT_ID = "11111111-1111-1111-1111-111111111111"
 _EXPLICIT_TARGET = "flash-1@step-3." + "a" * 40
 
 
+class _ConcurrentClient:
+    """Base for a double a concurrent eval fans out through.
+
+    The real client always has `warm_chat_step_selector` (there is one `ApiClient`), and for the
+    full-revision targets these doubles use it is a no-op -- only `RUN/step-N` needs the
+    capability. A double that omitted it was fine only while the call site suppressed the
+    resulting AttributeError; now that a failed prewarm ends the eval (as it must), the no-op
+    belongs here rather than repeated in each double.
+    """
+
+    def warm_chat_step_selector(self, target):
+        return None
+
+
 def _environment_dir(tmp_path: Path) -> Path:
     env_dir = tmp_path / "environment"
     env_dir.mkdir()
@@ -547,7 +561,7 @@ def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys
     )
     second_started = threading.Event()
 
-    class Client:
+    class Client(_ConcurrentClient):
         def chat_stream(self, target, messages, **kwargs):
             prompt = messages[0]["content"]
             if prompt == "first":
@@ -625,6 +639,81 @@ def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
 
     # exactly one warm-up, and it precedes every chat -- a per-worker check would interleave.
     assert events == ["warm:flash-1/step-3"] + ["chat"] * 6
+
+
+def test_env_eval_fails_the_target_when_the_capability_prewarm_fails(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A failed prewarm must end the eval, not be swallowed and re-raised once per case.
+
+    Suppressing it did not soften a transient blip, it multiplied it: the client caches only a
+    SUCCESSFUL check, so every worker then missed the same cold cache and re-ran it -- one bad
+    /v1/health became one per worker plus a generation error per case, burying the single line
+    that names the real cause (chatgpt-codex-connector). So assert the cascade is gone: nothing
+    is generated, and the cause is stated once at target level.
+    """
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'many'\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id=f'c{i}', input='hi', expected='hi') for i in range(6)\n"
+        "    ]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    from flash.client import ClientError
+
+    calls = {"warm": 0, "chat": 0}
+    lock = threading.Lock()
+
+    class Client:
+        def get_run(self, run_id):
+            return {"spec": {"thinking": False}}
+
+        def deployments(self):
+            # step-20 is live, so the requested step-3 keeps its selector into the fan-out.
+            return [
+                {
+                    "run_id": "flash-1",
+                    "deployment": {
+                        "state": "ready",
+                        "checkpoint_step": 20,
+                        "adapter_revision": "flash-1@step-20." + "a" * 40,
+                    },
+                }
+            ]
+
+        def _unsupported(self):
+            raise ClientError(
+                "chat checkpoint selectors require a control plane that advertises "
+                "chat_step_selector; use a full immutable adapter revision or upgrade the "
+                "control plane"
+            )
+
+        def warm_chat_step_selector(self, target):
+            with lock:
+                calls["warm"] += 1
+            self._unsupported()
+
+        def chat_stream(self, target, messages, **kwargs):
+            # what a worker really hits on a cold cache: the same check, failing the same way.
+            with lock:
+                calls["chat"] += 1
+            self._unsupported()
+            yield ""
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir), "--concurrency", "4"]) == 1
+
+    # settled once and never retried per worker, and no case bought a generation behind it.
+    assert calls == {"warm": 1, "chat": 0}
+    err = capsys.readouterr().err
+    # the cause reaches the user as one target-level error, not six per-case ones hiding it.
+    assert "chat checkpoint selectors require" in err
+    assert "generation failed" not in err
 
 
 def test_env_eval_rejects_invalid_target_before_loading(monkeypatch, capsys) -> None:
@@ -1267,7 +1356,7 @@ def test_env_eval_serializes_scoring_across_worker_threads(monkeypatch, tmp_path
 
     generating = threading.Barrier(6, timeout=5)
 
-    class Client:
+    class Client(_ConcurrentClient):
         def chat_stream(self, target, messages, **kwargs):
             # force all six generations to be genuinely in flight together, so any
             # unserialized scoring really would overlap.
@@ -1700,7 +1789,7 @@ def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_pat
     release_slow_case = threading.Event()
     slow_case_started = threading.Event()
 
-    class Client:
+    class Client(_ConcurrentClient):
         def chat_stream(self, target, messages, **kwargs):
             if messages[0]["content"] == "blocks":
                 # stands in for a generation still streaming when the user aborts.
@@ -1755,9 +1844,13 @@ def test_env_eval_abort_does_not_hold_the_process_open(tmp_path) -> None:
         "    return 'late'\n"
         "import flash.cli.env_eval as env_eval\n"
         "env_eval._generate_case = chat\n"
+        # the fan-out settles the step-selector capability on this thread first, so the client
+        # has to answer that call; 't' carries no step, so the real one does nothing here.
+        "class Client:\n"
+        "    def warm_chat_step_selector(self, target): return None\n"
         "args = argparse.Namespace(concurrency=2)\n"
         "worker = threading.Thread(\n"
-        "    target=_generate_concurrently, args=(None, 't', [[{'role': 'user'}]], args),\n"
+        "    target=_generate_concurrently, args=(Client(), 't', [[{'role': 'user'}]], args),\n"
         "    daemon=True,\n"
         ")\n"
         "worker.start()\n"
@@ -1820,7 +1913,7 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
     generating = threading.Barrier(6, timeout=5)
     generation_threads: set[str] = set()
 
-    class Client:
+    class Client(_ConcurrentClient):
         def chat_stream(self, target, messages, **kwargs):
             # all six really are in flight together, so generation is genuinely concurrent and
             # the assertion below is about where scoring runs, not about a serial fallback.
@@ -1884,7 +1977,7 @@ def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, cap
         "def load_evaluations(environment=None): return [Good(), Broken()]\n"
     )
 
-    class Client:
+    class Client(_ConcurrentClient):
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
@@ -1935,7 +2028,7 @@ def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class SlowFirstClient:
+    class SlowFirstClient(_ConcurrentClient):
         def chat_stream(self, target, messages, **kwargs):
             content = messages[0]["content"]
             # case 0 finishes last, so completion order is the reverse of submission order.
