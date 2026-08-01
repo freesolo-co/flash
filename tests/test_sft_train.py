@@ -727,7 +727,11 @@ def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
     assert sft_train._durable_required_save_steps((3, 5, 9), 5) == {3}
 
 
-def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
+def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
+    """monkeypatch every out-of-process dependency of run_sft_train and return (spec, captured).
+
+    the caller supplies its own ``run_verl_training`` fake, which is the only remaining seam.
+    """
     import flash.engine.worker as worker
     from flash.engine.worker import sft_train
 
@@ -742,7 +746,7 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
             max_context_tokens=1024,
             max_examples=2,
             max_steps=2,
-            save_at_steps=(),
+            save_at_steps=save_at_steps,
             save_every=50,
             init_from_adapter="",
         ),
@@ -795,7 +799,7 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
         def stop_gb(self):
             return 12.5
 
-    class Watcher:
+    class _DefaultWatcher:
         def __init__(self, **kwargs):
             self.processed_steps = set()
 
@@ -808,7 +812,25 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
         def raise_if_failed(self):
             return None
 
+    Watcher = watcher_cls or _DefaultWatcher
+
     captured = {"heartbeats": [], "published": [], "uploads": []}
+    # run_sft_train imports AutoProcessor at data-loading time and transformers is not installed in
+    # the cpu test env. this used to pass only because some EARLIER test module left a transformers
+    # stub in sys.modules, so running this file alone failed -- stub it here so the test stands on
+    # its own. monkeypatch.setitem restores whatever was there (real module or nothing) afterwards.
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        sys.modules.get("transformers")
+        or _module(
+            "transformers",
+            AutoProcessor=SimpleNamespace(from_pretrained=lambda *a, **k: None),
+            # datasets' dill serializer issubclass()-checks against this while writing the
+            # parquet, so it has to be a real class rather than a namespace attribute.
+            PreTrainedTokenizerBase=type("PreTrainedTokenizerBase", (), {}),
+        ),
+    )
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     monkeypatch.setattr(worker, "SEED", 7)
     monkeypatch.setattr(worker, "RUN_ID", "test-sft-verl-orchestration")
@@ -877,6 +899,14 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
 
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
 
+    return spec, captured
+
+
+def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
+    from flash.engine.worker import sft_train
+
+    spec, captured = _stub_sft_run(monkeypatch)
+
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         captured["command"] = command
         captured["child_env"] = env
@@ -908,6 +938,61 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     assert captured["meta"]["notes"]["loss_curve"] == [1.0]
     assert captured["meta"]["notes"]["loraplus_applied"] is True
     assert captured["meta"]["notes"]["realized_max_length"] > 0
+
+
+def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monkeypatch):
+    """the zero-grad diagnosis must survive the finally block, not be overwritten by it.
+
+    an on_line guard raises from INSIDE run_verl_training, so return_code is never assigned and
+    keeps its initial 0. deriving require_complete from it would then demand every save_at_steps
+    entry from a run that died at step 2, and the watcher's "required saves were not durably
+    published" would unwind out of the finally in place of the real cause -- turning the one
+    error GRAD-001 exists to surface into a checkpointing red herring.
+    """
+    from flash.engine.worker import sft_train
+
+    stopped: list[bool] = []
+
+    class Watcher:
+        def __init__(self, **kwargs):
+            self.processed_steps = set()
+            self.required_steps = frozenset(kwargs.get("required_steps", ()))
+
+        def start(self):
+            return None
+
+        def raise_if_failed(self):
+            return None
+
+        def stop(self, *, require_complete):
+            stopped.append(require_complete)
+            if require_complete:
+                missing = sorted(self.required_steps - self.processed_steps)
+                if missing:
+                    raise RuntimeError(f"required saves were not durably published: {missing}")
+
+    # a required save the run never durably publishes: the guard raises on the same step, before
+    # the watcher has processed it. (the step is inside the 2-update horizon because
+    # validate_save_steps rejects anything beyond it at config time.)
+    spec, _ = _stub_sft_run(monkeypatch, save_at_steps=(2,), watcher_cls=Watcher)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        for step in range(1, _MAX_ZERO_GRAD_STEPS + 1):
+            on_line(
+                f"step:{step} - train/loss:1.0 - train/grad_norm:0.0 - train/lr:5e-05 "
+                "- train/global_tokens:8\n"
+            )
+        raise AssertionError("the zero-grad guard should have stopped the run before this")
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    with pytest.raises(RuntimeError, match=re.escape("grad_norm=0.0")):
+        sft_train.run_sft_train(spec)
+
+    # the watcher still gets stopped -- it just is not asked to prove completeness for a run that
+    # never finished. without this, stop() raises and the grad_norm error never reaches the caller.
+    assert stopped == [False]
 
 
 def test_overrides_enable_fused_linear_ce_for_long_context():
