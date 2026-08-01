@@ -664,14 +664,15 @@ def rollout_async(
                             max_turns,
                             pending=r.env_step_pending,
                         )
-                # SystemExit derives from BaseException, so user env code that calls sys.exit() --
-                # a one-turn environment running a CLI-style parser is the realistic one -- unwound
-                # this thread without reporting anything (codex[bot]). The receive loop below ends
-                # on a dead worker rather than hanging, so the cost is not a stall: it is silence.
-                # The final env step never ran, and the episode was scored on that partial state as
-                # if the close-out had succeeded. Report it like any other close-out failure; the
-                # CLI-side user-code paths catch it the same way (flash/cli/env_test.py).
-                except (Exception, SystemExit) as exc:
+                # every close-out failure is reported, including BaseException: user env code that
+                # calls sys.exit(), or a KeyboardInterrupt landing in the close-out env_reply,
+                # unwound this thread without reporting anything (codex[bot]). The receive loop
+                # below ends on a dead worker rather than hanging, so the cost is not a stall: it
+                # is silence. The final env step never ran, and the episode was scored on that
+                # partial state as if the close-out had succeeded. Catching BaseException here does
+                # not swallow the interrupt -- it is re-raised on the driver thread, which is the
+                # thread the CLI-side user-code paths catch it on (flash/cli/env_test.py).
+                except BaseException as exc:
                     to_submit.put(("error", exc))
                     return
                 to_submit.put(("closed",))
@@ -745,17 +746,26 @@ def rollout_async(
         # may already have exited after reporting the error.
         to_env.put(_CLOSE_OUT)
         while True:
-            # waits on liveness, not just on an answer. the worker reports through `to_submit`
-            # only for exceptions it catches; a BaseException -- KeyboardInterrupt during a
-            # close-out env_reply is the realistic one -- unwinds the thread without putting
-            # anything, so an unbounded get() here would block the training step forever on a
-            # queue nothing can ever fill. a dead worker means the close-out is over.
+            # waits on liveness, not just on an answer, so a worker that dies without putting
+            # anything ends the wait instead of blocking the training step forever on a queue
+            # nothing can ever fill. a death is a FAILURE, not an answer: the worker reports every
+            # close-out outcome it survives, so silence means the final env step did not finish and
+            # the episode below would be scored on partial state as if it had (codex[bot]).
             try:
                 msg = to_submit.get(timeout=0.1)
             except queue.Empty:
-                if not worker.is_alive():
-                    break
-                continue
+                if worker.is_alive():
+                    continue
+                # drain once more before concluding silence: a report queued between the timeout
+                # above and this liveness check is still waiting to be read, and treating it as an
+                # unreported death would replace the worker's real error with this generic one.
+                try:
+                    msg = to_submit.get_nowait()
+                except queue.Empty:
+                    raise RuntimeError(
+                        "the environment worker died during close-out without reporting a "
+                        "result; the final environment step did not complete"
+                    ) from None
             if msg[0] == "closed":
                 break
             if msg[0] == "error":
