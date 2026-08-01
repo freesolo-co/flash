@@ -67,6 +67,11 @@ _RUNPOD_SETTLE_SECONDS = 3600.0  # 1h
 # counted separately and are never budgeted -- see runner.record_reconcile_attempt: a run whose cost
 # we successfully computed must not be dropped because the backend happened to be down.
 _MAX_RECONCILE_ATTEMPTS = 24
+# Minimum wall time between attempts on one run. The budget must be spent over real time, not over
+# boot count: the startup sweep runs on EVERY boot, so without this a crash-looping control plane
+# burns all 24 attempts in minutes and marks a run unattributable seconds before its invoice settles.
+# Matches the periodic sweep interval, so the loop's own cadence is unaffected.
+_RETRY_BACKOFF_SECONDS = 3600.0
 # States that incur no GPU cost -> never reconciled.
 _FREE_TERMINAL_STATES = frozenset({"dry_run"})
 # States whose training is finished and whose GPU cost is therefore final -> eligible for
@@ -159,15 +164,23 @@ def _due(status: runner.RunStatus, now: float) -> bool:
         return bool(status.reconcile_report)
     if int(status.reconcile_attempts or 0) >= _MAX_RECONCILE_ATTEMPTS:
         return False
+    # Wall-clock backoff between attempts (see _RETRY_BACKOFF_SECONDS).
+    next_at = status.reconcile_next_attempt_at
+    if next_at is not None and now < float(next_at):
+        return False
+    if not _attribution_handle(status):
+        # No handle was ever persisted, so there is nothing to attribute cost from. Still DUE: the
+        # sweep visits it once to classify it `unattributable`, because the queue's promise is that
+        # every billable run ends reconciled or explicitly marked -- silently skipping it forever
+        # (the old behaviour) recreates the invisible gap in the one case we can never resolve.
+        return True
     age = now - _terminal_ts(
         status
     )  # from teardown, not a later updated_at bump (see _terminal_ts)
-    if age < _settle_seconds(status):
-        return False
-    return bool(_attribution_handle(status))
+    return age >= _settle_seconds(status)
 
 
-def _fail(run_id: str, reason: str, *, stage: str) -> bool:
+def _fail(run_id: str, reason: str, *, stage: str, max_attempts: int | None = None) -> bool:
     """Record a failed realized-cost attempt and return False (nothing reported this pass).
 
     ``stage`` is "attribution" (the provider returned no cost -> counts against the budget, and can
@@ -179,7 +192,8 @@ def _fail(run_id: str, reason: str, *, stage: str) -> bool:
             run_id,
             error=reason,
             stage=stage,
-            max_attempts=_MAX_RECONCILE_ATTEMPTS,
+            max_attempts=_MAX_RECONCILE_ATTEMPTS if max_attempts is None else max_attempts,
+            retry_after=_RETRY_BACKOFF_SECONDS,
         )
     return False
 
@@ -232,6 +246,17 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
         return _deliver(status.run_id, dict(status.reconcile_report), now=now)
     remote = _attribution_handle(status)
     spec = status.spec or {}
+    if not remote:
+        # Nothing was ever persisted to attribute from (e.g. a non-idempotent provider create whose
+        # handle never landed). No number of retries can fix that, so terminalize on the FIRST visit
+        # (max_attempts=1) -- a visible `unattributable` gap rather than a run that sits pending
+        # forever. Phantom creates can still have cost real money, so this must be surfaced.
+        return _fail(
+            status.run_id,
+            "no provider handle was ever persisted for this run",
+            stage="attribution",
+            max_attempts=1,
+        )
     # raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
     # unknown launch rather than the epoch; falling back to created_at prevents inflated flat-rate
     # instance billing.

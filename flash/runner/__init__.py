@@ -427,6 +427,11 @@ class RunStatus:
     # Failed BACKEND-DELIVERY attempts (cost was attributed, the POST failed). Tracked for visibility
     # but deliberately NOT budgeted: a backend outage must never make an attributable run terminal.
     reconcile_report_failures: int = 0
+    # Earliest wall-clock time the next attempt may run. The attempt BUDGET must be spent over real
+    # time, not over boot count: the startup sweep fires on every boot, so a crash-looping control
+    # plane could otherwise burn all _MAX_RECONCILE_ATTEMPTS within minutes and permanently mark a
+    # run unattributable seconds before its invoice settled.
+    reconcile_next_attempt_at: float | None = None
     # The attributed report body awaiting delivery, persisted the moment the provider returns a cost.
     # This is what makes delivery independent of the provider: once attributed, a backend retry
     # re-POSTs THIS payload instead of re-querying the provider, so credentials rotating (or an
@@ -1961,7 +1966,12 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
 
 
 def record_reconcile_attempt(
-    run_id: str, *, error: str | None, stage: str, max_attempts: int
+    run_id: str,
+    *,
+    error: str | None,
+    stage: str,
+    max_attempts: int,
+    retry_after: float = 0.0,
 ) -> None:
     """Persist a FAILED realized-cost attempt: bump the right counter and record why.
 
@@ -2001,12 +2011,15 @@ def record_reconcile_attempt(
         if current == "reconciled":
             return  # a concurrent success won; never downgrade it
         if stage == "report":
-            # A cost is in hand. Only meaningful while we still owe delivery -- never resurrect a
-            # terminal `unattributable` into a state `_due` would refuse to retry anyway.
-            if current != "delivering":
+            # Never resurrect a terminal `unattributable` into a state `_due` would refuse to retry.
+            if current == "unattributable":
                 return
             status.reconcile_report_failures = int(status.reconcile_report_failures or 0) + 1
             status.reconcile_error = error
+            # Deliberately leaves `reconcile_state` UNTOUCHED: `delivering` stays delivering, and a
+            # still-`pending` run (a staging write that failed before delivery was ever acquired)
+            # stays pending. Recording without transitioning is what makes repeated staging failures
+            # visible instead of vanishing, while still never downgrading anything.
         else:
             # A stale attribution failure says nothing once a cost has already been attributed.
             if current == "delivering":
@@ -2017,6 +2030,9 @@ def record_reconcile_attempt(
             status.reconcile_state = "unattributable" if attempts >= max_attempts else "pending"
         _freeze_teardown_before_bump(status)
         status.updated_at = time.time()
+        # Space attempts out in WALL TIME so restarts can't accelerate the budget (see the field).
+        if retry_after > 0:
+            status.reconcile_next_attempt_at = status.updated_at + retry_after
         _save_status_unlocked(status)
     _report_status(status)
 
@@ -2044,13 +2060,20 @@ def record_attributed_cost(run_id: str, *, realized_cost_usd: float, report: dic
             status = get_status(run_id)
         except FileNotFoundError:
             return False
-        if status.reconcile_state == "reconciled":
-            return False  # already delivered; this pass is stale -- caller must not re-post
+        if status.reconcile_state in ("reconciled", "delivering"):
+            # `reconciled`: a concurrent pass already delivered; this body is stale.
+            # `delivering`: another pass already OWNS delivery of its own independently-fetched body.
+            # Accepting a second owner would let both POST, and since record_realized_cost has no
+            # ownership CAS the later completion could overwrite both the backend row and the local
+            # value with whichever invoice happened to finish last. Exactly one owner stages; the
+            # loser does nothing and the staged payload is delivered (or retried) by its owner.
+            return False
         status.realized_cost_usd = realized_cost_usd
         status.reconcile_report = dict(report)
         status.reconcile_state = "delivering"
         status.reconcile_attempts = 0
         status.reconcile_error = None
+        status.reconcile_next_attempt_at = None  # attributed; deliver as soon as we can
         _freeze_teardown_before_bump(status)
         status.updated_at = time.time()
         _save_status_unlocked(status)
@@ -2374,6 +2397,9 @@ def _save_status_unlocked(
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
+    # write-then-rename so concurrent readers never see a half-written file.
+    path = runs_file_path(status.run_id, ".json")
+    existing = _load_status_json(status.run_id) if os.path.exists(path) else {}
     # Remember the last non-null provider handle for COST ATTRIBUTION ONLY. `remote` is the LIVE
     # handle and is deliberately cleared once a resource is torn down -- but cancel_run tears down and
     # clears it BEFORE writing the billable `cancelled` state (deploy._clear_exact_remote), so a run
@@ -2381,13 +2407,21 @@ def _save_status_unlocked(
     # cost from: never swept, never even marked unattributable, silently pending forever. This
     # snapshot is never cleared and is read only by reconciliation; recovery/teardown continue to use
     # `remote` so nothing here can resurrect a torn-down resource.
-    # Tracks the LATEST live handle (not the first): reconciliation attributes from the run's last
-    # persisted handle, so a run that retried across resources must snapshot the one it ended on.
+    #
+    # Two sources, in order, so the handle cannot slip through:
+    #   1. the handle being written now -- tracks the LATEST live handle (not the first), since
+    #      attribution uses the run's last persisted handle when it retried across resources;
+    #   2. failing that, the handle ALREADY ON DISK that this very write is about to drop. Relying on
+    #      (1) alone assumes the in-memory record carries a snapshot a previous save happened to
+    #      write; a caller that clears `remote` on a status built without one would silently lose the
+    #      only copy. Reading the outgoing value from `existing` makes the clearing write itself the
+    #      capture point, so teardown ordering stops mattering.
     if status.remote:
         status.reconcile_remote = dict(status.remote)
-    # write-then-rename so concurrent readers never see a half-written file.
-    path = runs_file_path(status.run_id, ".json")
-    existing = _load_status_json(status.run_id) if os.path.exists(path) else {}
+    elif not status.reconcile_remote:
+        outgoing = existing.get("remote")
+        if isinstance(outgoing, dict) and outgoing:
+            status.reconcile_remote = dict(outgoing)
     existing_sequence = _valid_status_report_sequence(existing.get("report_sequence", 0))
     current_sequence = _valid_status_report_sequence(status.report_sequence)
     with _STATUS_REPORT_LOCK:

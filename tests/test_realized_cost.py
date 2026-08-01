@@ -99,8 +99,14 @@ def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
         ),
         now,
     )
-    # no provider handle to attribute cost
-    assert not reconcile._due(_status(state="done", updated_at=settled, remote=None), now)
+    # No provider handle to attribute cost: still DUE exactly once, so the sweep can classify it
+    # `unattributable` instead of leaving it pending forever (see _due).
+    assert reconcile._due(_status(state="done", updated_at=settled, remote=None), now)
+    # ...and once classified it is terminal, so it stops being swept.
+    assert not reconcile._due(
+        _status(state="done", updated_at=settled, remote=None, reconcile_state="unattributable"),
+        now,
+    )
 
 
 def test_due_anchors_settle_to_finished_at_not_bumped_updated_at():
@@ -327,8 +333,14 @@ def _record_calls(monkeypatch) -> list[dict]:
     monkeypatch.setattr(
         runner,
         "record_reconcile_attempt",
-        lambda run_id, *, error, stage, max_attempts: calls.append(
-            {"run_id": run_id, "error": error, "stage": stage, "max_attempts": max_attempts}
+        lambda run_id, *, error, stage, max_attempts, retry_after=0.0: calls.append(
+            {
+                "run_id": run_id,
+                "error": error,
+                "stage": stage,
+                "max_attempts": max_attempts,
+                "retry_after": retry_after,
+            }
         ),
     )
     return calls
@@ -927,3 +939,114 @@ def test_reconcile_writes_freeze_legacy_teardown_time(tmp_path, monkeypatch):
         "r-legacy", error="provider down again", stage="attribution", max_attempts=24
     )
     assert reconcile._terminal_ts(runner.get_status("r-legacy")) == before
+
+
+def test_clearing_the_handle_captures_it_even_with_no_prior_snapshot(tmp_path, monkeypatch):
+    """Regression (Cursor High, round 4): snapshotting only when `remote` is truthy relies on some
+    earlier save having written `reconcile_remote` into the in-memory record. A caller that clears
+    `remote` on a status without one would lose the only copy. The clearing write itself must capture
+    the OUTGOING on-disk handle."""
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    handle = {"provider": "vast", "instance_id": 9, "hourly_usd": 0.5, "started_ts": 1_000.0}
+    runner._save_status(
+        runner.RunStatus(
+            run_id="r-nosnap",
+            state="running",
+            spec={},
+            created_at=1_000.0,
+            updated_at=1_000.0,
+            remote=handle,
+        )
+    )
+    # simulate a writer whose in-memory record never carried the snapshot at all
+    stale = runner.get_status("r-nosnap")
+    stale.reconcile_remote = None
+    stale.remote = None
+    stale.state = "cancelled"
+    stale.finished_at = 2_000.0
+    runner._save_status(stale)
+
+    st = runner.get_status("r-nosnap")
+    assert st.reconcile_remote == handle  # captured from the outgoing on-disk value
+    assert reconcile._due(st, 1_000_000.0)
+
+
+def test_second_concurrent_pass_is_refused_delivery_ownership(tmp_path, monkeypatch):
+    """Regression (Cursor + Codex P2, round 4): two passes that both finish their provider pull must
+    not BOTH acquire delivery. record_realized_cost has no ownership CAS, so two POSTs of
+    independently-fetched bodies could leave the backend and local value on whichever finished last."""
+    _persist(tmp_path, monkeypatch, "r-two")
+    first = runner.record_attributed_cost(
+        "r-two", realized_cost_usd=4.2, report={"runId": "r-two", "realizedCostUsd": 4.2}
+    )
+    second = runner.record_attributed_cost(
+        "r-two", realized_cost_usd=9.9, report={"runId": "r-two", "realizedCostUsd": 9.9}
+    )
+    assert first is True
+    assert second is False  # the second owner is refused
+
+    st = runner.get_status("r-two")
+    assert st.realized_cost_usd == 4.2  # the first owner's payload is authoritative
+    assert st.reconcile_report["realizedCostUsd"] == 4.2
+
+
+def test_staging_failure_before_delivering_is_still_recorded(tmp_path, monkeypatch):
+    """Regression (Cursor Low, round 4): a report-stage failure recorded while the run is still
+    `pending` (staging itself blew up) must persist its error and counter. Requiring `delivering`
+    dropped it entirely, so repeated staging failures left no trace at all."""
+    _persist(tmp_path, monkeypatch, "r-stagefail")
+    runner.record_reconcile_attempt(
+        "r-stagefail", error="could not stage the attributed cost", stage="report", max_attempts=24
+    )
+
+    st = runner.get_status("r-stagefail")
+    assert st.reconcile_report_failures == 1
+    assert st.reconcile_error == "could not stage the attributed cost"
+    # recorded WITHOUT transitioning: None and "pending" are the same "still owed a pull" state
+    assert st.reconcile_state in (None, "pending")
+    assert st.reconcile_attempts == 0  # and without consuming the attribution budget
+    assert reconcile._due(st, 1_000_000.0)  # still retryable
+
+
+def test_restart_loop_cannot_burn_the_attribution_budget(tmp_path, monkeypatch):
+    """Regression (Codex P1, round 4): the startup sweep runs on EVERY boot, so without a wall-clock
+    backoff a crash-looping plane spends all 24 attempts in minutes and marks a run unattributable
+    moments before its invoice settles. The budget must be spent over real time."""
+    _persist(tmp_path, monkeypatch, "r-loop")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "k")
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda remote, **kw: realized.RealizedCost(provider="runpod", realized_usd=0.0),
+    )
+    now = 1_000_000.0
+    # first boot consumes one attempt and arms the backoff
+    assert reconcile.reconcile_once(now=now) == 0
+    st = runner.get_status("r-loop")
+    assert st.reconcile_attempts == 1
+    assert st.reconcile_next_attempt_at is not None
+
+    # 50 more immediate restarts: none are due, so the budget is untouched
+    for _ in range(50):
+        reconcile.reconcile_once(now=now)
+    assert runner.get_status("r-loop").reconcile_attempts == 1
+    assert runner.get_status("r-loop").reconcile_state == "pending"
+
+    # once the backoff elapses the run is due again
+    later = float(runner.get_status("r-loop").reconcile_next_attempt_at) + 1
+    assert reconcile._due(runner.get_status("r-loop"), later)
+
+
+def test_handleless_terminal_run_becomes_a_visible_unattributable_gap(tmp_path, monkeypatch):
+    """Regression (Codex P2, round 4): a billable terminal run whose handle never landed (a phantom
+    non-idempotent create) was excluded before any failure was recorded, so it stayed pending
+    forever -- breaking the queue's promise that every run ends reconciled or explicitly marked."""
+    _persist(tmp_path, monkeypatch, "r-nohandle", remote=None)
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "k")
+    now = 1_000_000.0
+    assert reconcile.reconcile_once(now=now) == 0
+
+    st = runner.get_status("r-nohandle")
+    assert st.reconcile_state == "unattributable"  # classified, not silently skipped
+    assert "no provider handle" in st.reconcile_error
+    assert not reconcile._due(st, now)  # and terminal, so it stops being swept
