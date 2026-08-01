@@ -13,6 +13,10 @@ from .envpush import _err, _resolve_local_env_entrypoint
 
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ECHO_RESPONSE = "test"
+# the one algorithm that trains from the environment reward. sft optimizes a supervised loss and opd
+# a teacher token loss; neither reads `env.reward` anywhere (flash/engine/worker/sft.py, opd.py), so
+# a scorer they never call cannot be evidence of anything for them.
+_REWARD_DRIVEN_ALGORITHM = "grpo"
 _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
 # characters that give a TOML value structure. text containing none of them is a bare string, so a
@@ -188,6 +192,10 @@ def _new_record() -> dict:
         "responses": [],
         "thinking_markup": False,
         "replay_incomplete": False,
+        # the multi-turn rollout state, kept so the per-turn check below can ask about the episode
+        # that was actually scored rather than a fresh one. None for single-turn, which has no state
+        # and no per-turn vector either.
+        "state": None,
     }
 
 
@@ -262,6 +270,7 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     # scores the state the run would score. reusing the helper is what keeps the two in step.
     _final_env_step(env, state["messages"], state, hard_cap, pending=env_step_pending)
     record["reward"] = float(env.reward("", example, state))
+    record["state"] = state
 
 
 def _scores_gold_no_better_than_junk(env, example: dict, gold_reward: float) -> bool:
@@ -293,6 +302,34 @@ def _scores_gold_no_better_than_junk(env, example: dict, gold_reward: float) -> 
     if junk_reward is None or not math.isfinite(junk_reward):
         return False
     return junk_reward >= gold_reward
+
+
+def _separates_on_turn_rewards(env, example: dict, state: dict | None) -> bool:
+    """Whether the env grades this episode on a per-turn vector the episode scalar cannot show.
+
+    `credit_assignment = "per_turn"` trains from `per_turn_rewards` in the score result's metadata,
+    which reaches the trainer through `rollout_rewards_many` (flash/envs/adapter.py) and never
+    through `env.reward`. So a multi-turn env may legitimately return a flat episode scalar while
+    the vector it actually trains on distinguishes the turns, and reading only the scalar reported a
+    working environment as unable to recognize its references (Cursor).
+
+    Unlike the algorithm, this is answerable here: ask the env for the typed reward and look. A
+    vector holding more than one distinct value is separation the scalar could not express. Anything
+    else -- no such method, single-turn, no vector, a raise -- leaves the scalar as the only evidence
+    and the gate proceeds on it."""
+    rollout_rewards_many = getattr(env, "rollout_rewards_many", None)
+    if not callable(rollout_rewards_many):
+        return False
+    try:
+        rewards = rollout_rewards_many([(example, state or {})])
+    except (Exception, SystemExit):
+        return False
+    if not rewards:
+        return False
+    turns = getattr(rewards[0], "turns", None)
+    if not turns:
+        return False
+    return len({float(turn) for turn in turns}) > 1
 
 
 def _load_failure(reason: str) -> int:
@@ -720,7 +757,7 @@ def cmd_env_test(args) -> int:
     # only replay episodes carry a gold answer to score. an echo episode has none, so its reward
     # says nothing about the grader and is counted in neither total.
     replayed = 0
-    replayed_zero: list[dict] = []
+    replayed_zero: list[tuple[dict, dict | None]] = []
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
         failure: str | None = None
@@ -762,7 +799,7 @@ def cmd_env_test(args) -> int:
                 # signature this gate looks for. it is confirmed against a wrong answer once every
                 # episode has run, not here: see `_scores_gold_no_better_than_junk`.
                 if reward == 0.0:
-                    replayed_zero.append(example)
+                    replayed_zero.append((example, record["state"]))
             if reward <= 0.0:
                 message = (
                     f"replay gold answer scored low (reward={reward:.6f}); "
@@ -787,10 +824,22 @@ def cmd_env_test(args) -> int:
     # reward what a deliberately wrong answer is worth, and block only if it is worth as much. one
     # probe settles it: the question is whether this reward can separate at all, and a grader that
     # scored every gold answer identically will answer identically for each of them.
+    #
+    # and the whole gate presumes the reward IS the training signal, which is true of grpo alone.
+    # sft trains on a supervised loss and opd on a teacher token loss; neither reads `env.reward`,
+    # so a no-op scorer is legitimate for them and blocking on it failed the recommended pre-push
+    # check for environments that train perfectly well (Cursor). the algorithm lives in the run
+    # config (`JobSpec.algorithm`), which an environment directory does not carry, so it is asked
+    # for -- and defaults to grpo, the case that needs the gate.
+    # defaulting to the reward-driven algorithm keeps the gate for a caller that passes no
+    # algorithm at all: an absent field must not be the way to switch a blocking check off.
+    algorithm = getattr(args, "algorithm", None) or _REWARD_DRIVEN_ALGORITHM
     grader_recognizes_gold = not (
-        replayed
+        algorithm == _REWARD_DRIVEN_ALGORITHM
+        and replayed
         and len(replayed_zero) == replayed
-        and _scores_gold_no_better_than_junk(env, replayed_zero[0], 0.0)
+        and not _separates_on_turn_rewards(env, *replayed_zero[0])
+        and _scores_gold_no_better_than_junk(env, replayed_zero[0][0], 0.0)
     )
     if not grader_recognizes_gold:
         _err(
