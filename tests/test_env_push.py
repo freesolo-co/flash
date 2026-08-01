@@ -433,6 +433,65 @@ def test_push_ships_helpers_named_through_an_assignment_bound_dynamic_import(mon
     assert "weights.py" in files
 
 
+def test_alias_chains_resolve_without_rescanning_every_binding() -> None:
+    """A long reverse-ordered chain must cost one look per binding, not one sweep per link.
+
+    Re-scanning every assignment per pass resolves exactly one new name per pass when the chain is
+    declared in reverse -- the ordering this walk explicitly supports -- so the cost is quadratic:
+    a generated 5,000-link sidecar spent ~3.4s here, and `env push` walks again while copying, so
+    it paid that twice before any archive limit applied (codex[bot]).
+
+    Counts reads of the bound name on the real function rather than timing it. A wall-clock bound
+    is flaky on a shared runner and would not say why it got slow, whereas the read count separates
+    the two shapes by two orders of magnitude at n=300: ~n for a work queue against ~n**2/2 for
+    repeated sweeps.
+    """
+    import ast
+
+    from flash.cli import envpush
+
+    n = 300
+
+    reads = 0
+
+    class CountingName(ast.Name):
+        """An `ast.Name` that records each time the walk reads the identifier it binds.
+
+        `id` shadows the builtin, but that is the attribute name `ast.Name` itself uses and the
+        walk reads, so counting reads means defining it under exactly that name.
+        """
+
+        def __getattribute__(self, attr):
+            if attr == "id":
+                nonlocal reads
+                reads += 1
+            return object.__getattribute__(self, attr)
+
+    # reverse dependency order: each link names the next and only the last reaches the importer,
+    # so a sweep-based walk resolves one hop per pass and re-reads every other binding meanwhile.
+    src = "\n".join(
+        ["import importlib"]
+        + [f"a{i} = a{i + 1}" for i in range(n - 1)]
+        + [f"a{n - 1} = importlib.import_module"]
+    )
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+            node.value.__class__ = CountingName
+
+    reads = 0
+    names = envpush._dynamic_import_callees(tree)
+
+    # every link resolved, in either declaration order
+    assert {f"a{i}" for i in range(n)} <= set(names)
+    # and each binding's source was read a bounded number of times rather than once per pass. the
+    # quadratic form reads ~n**2/2 = ~45,000 for n=300; a small constant per binding is fine.
+    assert reads <= 4 * n, (
+        f"read bound sources {reads} times for {n} bindings -- "
+        "the walk is rescanning rather than resolving each binding once"
+    )
+
+
 def test_push_does_not_mistake_an_unrelated_callable_for_a_dynamic_import(monkeypatch, tmp_path):
     """Binding some other function to a plausible name must not make its argument a module.
 

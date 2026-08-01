@@ -497,8 +497,14 @@ def _dynamic_import_callees(tree) -> frozenset[str]:
 
     An assignment binds it just as well: `load = importlib.import_module` is not an `import ... as`
     and so appears in no import statement at all, which left the same helper unpackaged for the
-    same reason (codex[bot]). Assignments are followed to a fixpoint, because the value bound may
-    itself be an alias (`a = importlib.import_module` then `b = a`).
+    same reason (codex[bot]). Chains are followed too (`a = importlib.import_module` then `b = a`),
+    in either declaration order, since nothing requires the alias to appear before its use.
+
+    Chains resolve through a work queue rather than repeated sweeps. Re-scanning every assignment
+    per pass discovers one link at a time when they are declared in reverse order -- the very order
+    this supports -- so a generated 5,000-link sidecar spent ~3.4s here, twice, because `env push`
+    walks again while copying (codex[bot]). Each binding is instead indexed by the name it reads
+    and visited when that name becomes known, so the walk costs one visit per binding.
 
     Deliberately flow-insensitive: a name rebound to something else later still counts here. The
     two errors are not symmetric -- an extra name ships a file the archive did not need, while a
@@ -510,40 +516,57 @@ def _dynamic_import_callees(tree) -> frozenset[str]:
     than left to look like full coverage -- the symptom is the ModuleNotFoundError above, and
     knowing which spellings are walked is what makes it diagnosable."""
     import ast
+    from collections import deque
 
     names = set(_DYNAMIC_IMPORT_FUNCTIONS)
-    bindings: list[tuple[list[ast.expr], ast.expr]] = []
+    # names bound from another name, keyed by the name they read: `b = a` waits under "a" until
+    # "a" is known to be an importer, whether that happens before or after this line was parsed.
+    pending: dict[str, list[str]] = {}
+    newly_known: deque[str] = deque()
+
+    def learn(name: str) -> None:
+        """Record a name as an importer, and queue it so anything waiting on it can resolve."""
+        if name not in names:
+            names.add(name)
+            newly_known.append(name)
+
+    def bind(targets, value) -> None:
+        if isinstance(value, ast.Attribute):
+            # `importlib.import_module`, under any alias of the module itself. Matched on the
+            # canonical attribute name only, exactly as `_dynamic_import_name` matches the call
+            # site, so the two cannot disagree about what counts as a dynamic import.
+            if value.attr not in _DYNAMIC_IMPORT_FUNCTIONS:
+                return
+            source = None  # bound straight from the importer, so it needs nothing else first
+        elif isinstance(value, ast.Name):
+            source = value.id  # bound from another name, which may not be known yet
+        else:
+            return
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if source is None:
+                learn(target.id)
+            else:
+                pending.setdefault(source, []).append(target.id)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "importlib":
-            names.update(
-                alias.asname or alias.name for alias in node.names if alias.name == "import_module"
-            )
+            for alias in node.names:
+                if alias.name == "import_module":
+                    learn(alias.asname or alias.name)
         elif isinstance(node, ast.Assign):
-            bindings.append((node.targets, node.value))
+            bind(node.targets, node.value)
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            bindings.append(([node.target], node.value))
+            bind([node.target], node.value)
 
-    while True:
-        bound_this_pass = False
-        for targets, value in bindings:
-            if isinstance(value, ast.Attribute):
-                # `importlib.import_module`, under any alias of the module itself. Matched on the
-                # canonical attribute name only, exactly as `_dynamic_import_name` matches the
-                # call site, so the two cannot disagree about what counts as a dynamic import.
-                binds_import = value.attr in _DYNAMIC_IMPORT_FUNCTIONS
-            elif isinstance(value, ast.Name):
-                binds_import = value.id in names
-            else:
-                continue
-            if not binds_import:
-                continue
-            for target in targets:
-                if isinstance(target, ast.Name) and target.id not in names:
-                    names.add(target.id)
-                    bound_this_pass = True
-        # terminates: `names` only grows, and is bounded by the module's assignment targets.
-        if not bound_this_pass:
-            break
+    # seeded with the canonical names too, so `load = import_module` resolves like any other link.
+    newly_known.extend(_DYNAMIC_IMPORT_FUNCTIONS)
+    while newly_known:
+        # each binding is released exactly once, when the name it reads becomes known, so the
+        # whole walk costs one visit per binding however the chain is ordered in the source.
+        for target_id in pending.pop(newly_known.popleft(), ()):
+            learn(target_id)
     return frozenset(names)
 
 
