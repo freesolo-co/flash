@@ -2629,6 +2629,38 @@ def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
     assert "effective_preparation" not in public
 
 
+def test_public_spec_does_not_publish_a_storage_ref_whose_phase_was_removed():
+    """Redaction must not infer "public" from "this build cannot parse it as internal".
+
+    A persisted worker/effective spec keeps whatever phase was current when it was written. `opsd`
+    was removed from the internal-ref grammar (#784), so its locators stopped parsing as internal
+    and the redactor left them alone as though they were user-facing refs -- publishing the private
+    repo verbatim (chatgpt-codex-connector). The phase set is not frozen, so this is the shape of
+    every future removal too.
+    """
+    import flash.runner as runner
+
+    for ref in ("private-owner/private-source:opsd/source-run", "private-owner/private-source:!"):
+        data = runner._public_status_spec({"train": {"init_from_adapter": ref}})
+        assert "private-owner" not in json.dumps(data), ref
+        assert "init_from_adapter" not in data["train"], ref
+
+    # the two grammars this function must still recognize are unaffected: a user-facing ref is
+    # preserved, and a known internal phase is rewritten rather than dropped.
+    assert (
+        runner._public_status_spec({"train": {"init_from_adapter": "source-run/step-20"}})["train"][
+            "init_from_adapter"
+        ]
+        == "source-run/step-20"
+    )
+    assert (
+        runner._public_status_spec(
+            {"train": {"init_from_adapter": "private-owner/private-source:sft/source-run"}}
+        )["train"]["init_from_adapter"]
+        == "source-run"
+    )
+
+
 def test_deploy_serving_error_is_recorded_as_failed_deployment(api, monkeypatch):
     """A serving-backend failure during deploy is recorded on the deployment status."""
     import flash.runner as runner
