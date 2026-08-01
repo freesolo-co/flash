@@ -14,7 +14,7 @@ import shutil
 import threading
 import time
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 from flash.engine.recipe import RECIPE
@@ -27,6 +27,7 @@ from flash.engine.steps import (
 from flash.engine.structured_outputs import reasoning_parser_for
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
+    BoundedThreadingHTTPServer,
     ChildOutputTail,
     ChildTailStaleness,
     agent_loop_workers,
@@ -111,7 +112,7 @@ def _align_granularity(groups, student_tokens) -> float:
     return n_align / len(groups)
 
 
-class _TeacherBridgeHTTPServer(ThreadingHTTPServer):
+class _TeacherBridgeHTTPServer(BoundedThreadingHTTPServer):
     request_queue_size = _TEXT_TEACHER_REQUEST_BACKLOG
 
 
