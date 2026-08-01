@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import math
 import queue
 import threading
@@ -352,10 +351,16 @@ def _generate_concurrently(
         # each fire their own /v1/health -- one eval's worth of duplicate requests for a fact about
         # the plane that cannot differ between them (codex[bot]). warming it costs one call and needs
         # no lock in the client, where it would put coordination on every caller for this one race.
-        # a `RUN/step-N` target is what makes the check run at all; anything else skips it, and a
-        # genuine capability failure still surfaces from the first case rather than being swallowed.
-        with contextlib.suppress(Exception):
-            client.warm_chat_step_selector(target)
+        # a `RUN/step-N` target is what makes the check run at all; anything else skips it.
+        #
+        # A failure propagates rather than being suppressed. Suppressing it did not soften a
+        # transient blip, it multiplied it: only a SUCCESSFUL check is cached, so every worker then
+        # missed the same cold cache, and one timed-out or rate-limited /v1/health became up to 32
+        # more plus one generation error per case -- instead of one target-level failure naming the
+        # real cause (chatgpt-codex-connector). An unsupported plane is not transient at all, and
+        # answering it with a suite of per-case errors buries the one line that says to use a full
+        # revision or upgrade.
+        client.warm_chat_step_selector(target)
         finished: queue.SimpleQueue = queue.SimpleQueue()
         aborted = threading.Event()
         abort_lock = threading.Lock()

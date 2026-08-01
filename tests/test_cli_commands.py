@@ -2191,6 +2191,30 @@ def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, mon
     assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 0
 
 
+def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monkeypatch) -> None:
+    """The final window must be watched to its END, not only to its midpoint.
+
+    Splitting that window put its one read halfway through and then stopped, so the wait returned
+    with half its advertised budget unspent: `--wait 1` read at t=0 and t=0.5 and reported a timeout
+    for a revision that went ready at t=0.75 (chatgpt-codex-connector). Sleeping the window whole
+    and reading at the deadline covers it without adding a read.
+    """
+    _queued_deploy(monkeypatch, fake_client)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    def _poll(run_id, timeout=None):
+        # ready in the second half of the window -- past a midpoint read, inside the deadline.
+        return {"state": "ready" if clock["t"] >= 0.75 else "queued"}
+
+    monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
+
+    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 0
+
+
 def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeypatch) -> None:
     """Splitting the final window must be the wait's last sleep, not a converging series.
 
