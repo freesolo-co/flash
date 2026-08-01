@@ -502,11 +502,17 @@ def _dynamic_import_callees(tree) -> frozenset[str]:
 
     Deliberately flow-insensitive: a name rebound to something else later still counts here. The
     two errors are not symmetric -- an extra name ships a file the archive did not need, while a
-    missed one is a published environment that raises on its first case."""
+    missed one is a published environment that raises on its first case.
+
+    Covers the two spellings that occur: a plain or annotated assignment. Destructuring
+    (`load, x = importlib.import_module, 1`), walrus, star targets and augmented assignment are
+    not followed, so a helper named only through one of those is still missed. Said plainly rather
+    than left to look like full coverage -- the symptom is the ModuleNotFoundError above, and
+    knowing which spellings are walked is what makes it diagnosable."""
     import ast
 
     names = set(_DYNAMIC_IMPORT_FUNCTIONS)
-    bindings: list[tuple[list, object]] = []
+    bindings: list[tuple[list[ast.expr], ast.expr]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "importlib":
             names.update(
@@ -522,8 +528,8 @@ def _dynamic_import_callees(tree) -> frozenset[str]:
         for targets, value in bindings:
             if isinstance(value, ast.Attribute):
                 # `importlib.import_module`, under any alias of the module itself. Matched on the
-                # canonical attribute name only, exactly as the call site is (`_dynamic_import_
-                # name`), so the two cannot disagree about what counts as a dynamic import.
+                # canonical attribute name only, exactly as `_dynamic_import_name` matches the
+                # call site, so the two cannot disagree about what counts as a dynamic import.
                 binds_import = value.attr in _DYNAMIC_IMPORT_FUNCTIONS
             elif isinstance(value, ast.Name):
                 binds_import = value.id in names
