@@ -538,6 +538,47 @@ def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp
     assert client.targets == ["flash-1/step-3"]
 
 
+def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The exemption above is `failed` only, because that is the state that spares the ledger.
+
+    `mark_deployment_revocation_failed` and the undeploy paths call
+    `invalidate_verified_adapter_revisions` (`flash/runner/deploy.py`), so under those states there
+    is no ledger left for `RUN/step-N` to resolve against and every case 409s -- the wasted suite of
+    generation failures this check exists to avoid. Exempting every terminal state for a pinned step
+    let `revocation_failed` through (Cursor).
+    """
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def __init__(self):
+            self.targets = []
+
+        def get_run(self, run_id):
+            return {"spec": {"thinking": False}}
+
+        def deployments(self):
+            return [{"run_id": "flash-1", "deployment": {"state": "revocation_failed"}}]
+
+        def warm_chat_step_selector(self, target):
+            return None
+
+        def chat_stream(self, target, messages, **kwargs):
+            self.targets.append(target)
+            yield "4"
+
+    client = Client()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+
+    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir)]) == 1
+    captured = capsys.readouterr()
+    assert "deployment is revocation_failed" in captured.err
+    # one failure up front, not one per case: no generation was attempted.
+    assert client.targets == []
+
+
 def test_env_eval_never_pins_the_revision_a_rollout_is_heading_to(
     monkeypatch, tmp_path, capsys
 ) -> None:
