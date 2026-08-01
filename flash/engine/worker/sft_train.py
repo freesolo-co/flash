@@ -58,8 +58,9 @@ from flash.engine.worker.sft import (
 _SFT_LORAPLUS_RATIO = 16.0
 _LORAPLUS_READY_MARKER = "FLASH_LORAPLUS_READY"
 # consecutive zero-grad-norm steps tolerated before the run is failed as untrainable (GRAD-001).
-# 2 is enough to separate a one-off fully-masked batch from a severed backward graph, and keeps
-# the wasted spend to a couple of steps rather than the whole run.
+# any nonzero grad norm is proof the backward graph is intact and resets the count. 2 is enough to
+# separate a one-off fully-masked batch from a severed graph, and keeps the wasted spend to a couple
+# of steps rather than the whole run.
 _MAX_ZERO_GRAD_STEPS = 2
 
 _REQUIRED_OVERRIDE_KEYS = (
@@ -1394,17 +1395,27 @@ def run_sft_train(spec=None) -> None:
             progress["loss"] = loss
         if grad_norm is not None:
             progress["grad_norm"] = grad_norm
-            # a grad norm of exactly 0.0 while the lr is still nonzero means the backward pass
-            # produced nothing for every trainable parameter. that is never legitimate: it is a
-            # broken graph, not a small update. GRAD-001 shipped four runs that reported done and
-            # billed while training nothing, because this number was recorded and never read.
-            # fail the run instead of paying for a zero adapter that then deploys and serves.
-            if grad_norm == 0.0 and (learning_rate_value is None or learning_rate_value > 0.0):
+            # a grad norm of exactly 0.0 means the backward pass produced nothing for every
+            # trainable parameter. that is never legitimate: it is a broken graph, not a small
+            # update. GRAD-001 shipped four runs that reported done and billed while training
+            # nothing, because this number was recorded and never read. fail the run instead of
+            # paying for a zero adapter that then deploys and serves.
+            #
+            # VERL-138: this deliberately does NOT condition on the learning rate. verl computes
+            # grad_norm in optimizer_step (transformer_impl.py:683-688) by clipping over p.grad,
+            # strictly BEFORE optimizer.step() and before lr_scheduler_step() advances the
+            # schedule -- so the lr cannot make a gradient zero. the earlier "an lr of 0.0
+            # legitimately produces grad_norm 0.0" reading had the causality backwards, and a
+            # decayed final step was enough to launder a dead run: on a 2-step run the sequence
+            # (grad 0.0, lr 5e-5) then (grad 0.0, lr 0.0) cleared the counter, so the run reported
+            # done and billed while training nothing. every real lr:0.0 line on record comes from
+            # a run that was already broken at every other step too.
+            if grad_norm == 0.0:
                 zero_grad_steps.append(int(progress["step"] or 0))
                 if len(zero_grad_steps) >= _MAX_ZERO_GRAD_STEPS:
                     raise RuntimeError(
-                        "verl reported train/grad_norm=0.0 with a nonzero learning rate on "
-                        f"{len(zero_grad_steps)} consecutive steps: no gradient is reaching the "
+                        "verl reported train/grad_norm=0.0 on "
+                        f"{len(zero_grad_steps)} steps: no gradient is reaching the "
                         "lora parameters, so this run would train nothing. see GRAD-001"
                     )
             else:
