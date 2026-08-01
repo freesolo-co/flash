@@ -57,6 +57,7 @@ from flash.engine.worker.backend_common import (
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    ray_num_cpus,
     reap_stragglers,
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
@@ -442,6 +443,10 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # is migrated in the main process but not visible to the RewardLoopWorker actor); emit both.
         f"reward.custom_reward_function.path={cfg['reward_path']}",
         f"reward.custom_reward_function.name={cfg['reward_name']}",
+        # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
+        # per core, which has killed real runs two ways (host-ram oom, and a fatal raylet fork
+        # failure that takes every actor with it). size the pool to the container instead.
+        f"ray_kwargs.ray_init.num_cpus={ray_num_cpus()}",
         f"trainer.n_gpus_per_node={cfg['n_gpus']}",
         "trainer.nnodes=1",
         f"trainer.total_epochs={cfg['total_epochs']}",

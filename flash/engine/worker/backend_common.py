@@ -114,6 +114,58 @@ def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
     return next(n for n in range(min(cap, rollout_batch), 0, -1) if rollout_batch % n == 0)
 
 
+def _cgroup_cpu_quota() -> int | None:
+    """cpus this container is actually allowed, from its cgroup quota, or None if unlimited."""
+    try:  # cgroup v2: "<quota> <period>", or "max <period>" when uncapped
+        with open("/sys/fs/cgroup/cpu.max") as fh:
+            quota, period = fh.read().split()
+        if quota != "max" and int(period) > 0:
+            return max(1, int(int(quota) // int(period)))
+    except Exception:
+        pass
+    try:  # cgroup v1: quota and period in separate files, quota -1 when uncapped
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as fh:
+            quota = int(fh.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as fh:
+            period = int(fh.read())
+        if quota > 0 and period > 0:
+            return max(1, int(quota // period))
+    except Exception:
+        pass
+    return None
+
+
+def ray_num_cpus(*, cap: int = 16) -> int:
+    """cpus to hand ray, sized to the CONTAINER rather than the host.
+
+    ray autodetects cpus from the host and eagerly prestarts one idle worker per core before the
+    first task runs (worker_pool.cc "[Eagerly] Start install runtime environment"). on a rented
+    single-gpu pod that detection is wrong in the dangerous direction: the pod is a container on a
+    much larger host, so a 1x4090 box with 46GB of ram reports the host's 48 cores and ray forks 48
+    interpreters that no workload asked for. two ways that kills a run, both observed on real gpus:
+
+      - the forks exhaust host ram. 42 idle workers held 23.29GB USS -- over half the node -- and
+        ray's memory monitor killed the actor that mattered (VERL-123, opd).
+      - the forks exhaust process/thread limits. worker_pool.cc:704 "Failed to start worker with
+        return value system:11: Resource temporarily unavailable" is a FATAL check, so the raylet
+        aborts and every actor dies with "Owner's node has crashed" (VERL-124, grpo).
+
+    neither failure names cpus, which is what made them expensive to diagnose. cgroup quota is the
+    honest number when the pod sets one; the affinity mask catches cpuset-pinned pods; the cap keeps
+    the pool sane on an unconstrained host, where the detected count reflects a machine flash does
+    not own. this bounds ray's PREFILL only -- it is not a limit on training parallelism, which is
+    sized by gpus, not by this.
+    """
+    quota = _cgroup_cpu_quota()
+    if quota is not None:
+        return max(1, min(quota, cap))
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except Exception:
+        affinity = os.cpu_count() or 1
+    return max(1, min(affinity, cap))
+
+
 def verl_supports_rollout_field(python_bin: str, field: str) -> bool:
     """report whether python_bin's verl declares `field` on RolloutConfig.
 

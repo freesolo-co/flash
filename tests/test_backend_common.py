@@ -49,6 +49,76 @@ def test_agent_loop_workers_rejects_a_nonpositive_batch():
         vc.agent_loop_workers(0)
 
 
+def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
+    # the exact failure that killed both real-gpu arms: a 1x4090 pod on a 48-core host. the quota is
+    # the container's truth, so a large affinity mask must NOT win over it.
+    with (
+        mock.patch.object(vc, "_cgroup_cpu_quota", return_value=4),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+    ):
+        assert vc.ray_num_cpus() == 4
+
+
+def test_ray_num_cpus_falls_back_to_affinity_when_no_quota_is_set():
+    with (
+        mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(6))),
+    ):
+        assert vc.ray_num_cpus() == 6
+
+
+def test_ray_num_cpus_caps_an_unconstrained_host():
+    # no quota and a full 48-core affinity mask means flash cannot tell the pod from the host, which
+    # is exactly the case that forked 48 idle workers. the cap is what makes that survivable.
+    with (
+        mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+    ):
+        assert vc.ray_num_cpus() == 16
+    assert vc.ray_num_cpus(cap=2) == 2
+
+
+def test_ray_num_cpus_never_returns_zero():
+    # ray.init(num_cpus=0) schedules nothing and hangs; a bogus quota must not produce it.
+    for quota in (0, -1):
+        with mock.patch.object(vc, "_cgroup_cpu_quota", return_value=quota):
+            assert vc.ray_num_cpus() >= 1
+    with (
+        mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
+        mock.patch.object(os, "sched_getaffinity", side_effect=OSError("boom")),
+        mock.patch.object(os, "cpu_count", return_value=None),
+    ):
+        assert vc.ray_num_cpus() >= 1
+
+
+def test_cgroup_cpu_quota_reads_v2_and_reports_none_when_uncapped(tmp_path):
+    def _read(text):
+        path = tmp_path / "cpu.max"
+        path.write_text(text)
+        real_open = builtins.open
+
+        def fake(name, *a, **k):
+            if str(name) == "/sys/fs/cgroup/cpu.max":
+                return real_open(path, *a, **k)
+            raise FileNotFoundError(name)
+
+        with mock.patch.object(builtins, "open", fake):
+            return vc._cgroup_cpu_quota()
+
+    assert _read("400000 100000") == 4
+    assert _read("50000 100000") == 1  # a sub-core share still has to schedule something
+    assert _read("max 100000") is None
+
+
+def test_every_ray_backed_trainer_constrains_rays_cpu_pool():
+    # asserted across BOTH ray entrypoints rather than in one file: ray autodetects the host's cores
+    # and eagerly forks one idle worker per core, which killed grpo (fatal raylet fork failure) and
+    # opd (host-ram oom) on real gpus. sft is excluded on purpose -- it runs torchrun, not ray.
+    for module in ("rl_train", "opd_train"):
+        src = pathlib.Path(_REPO_ROOT, "flash", "engine", "worker", f"{module}.py").read_text()
+        assert "ray_kwargs.ray_init.num_cpus={ray_num_cpus()}" in src, module
+
+
 def test_latest_global_step_dir_picks_highest(tmp_path):
     for step in (1, 5, 20, 3):
         os.makedirs(tmp_path / f"global_step_{step}" / "actor" / "huggingface", exist_ok=True)
