@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import importlib.metadata
 import importlib.util
+import inspect
 import json
 import math
 import multiprocessing
@@ -20,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.engine.worker import opd_train, rl_train
 from flash.engine.worker.opd_plugin import (
     FlashTeacherBridgeError,
     _AllNoSignalBatch,
@@ -4569,6 +4571,37 @@ def test_overrides_size_agent_loop_workers_to_the_opd_rollout_batch():
         for value in build_opd_overrides(_config(train_batch_size=64, group_size=8))
     )
     assert big["actor_rollout_ref.rollout.agent.num_workers"] == "8"
+
+
+def test_overrides_gate_rollout_enforce_eager_on_hardware():
+    off = build_opd_overrides(_config())
+    assert not any("enforce_eager" in value for value in off)
+    on = build_opd_overrides(_config(enforce_eager=True))
+    # plain override, not '+': enforce_eager is a declared verl RolloutConfig field
+    # (workers/config/rollout.py:194), so appending it would be a duplicate-key error.
+    assert "actor_rollout_ref.rollout.enforce_eager=True" in on
+
+
+def test_the_resolved_eager_flag_reaches_the_opd_verl_config():
+    # the string assertions above pass against a resolver whose answer is never carried into the
+    # config, which is exactly the shape of the bug this fixes. pin the wiring.
+    built = inspect.getsource(opd_train.run_opd_train)
+    assert "resolve_rollout_enforce_eager(resolve_verl_device_capability(python_bin))" in built
+    assert '"enforce_eager": enforce_eager,' in built
+
+
+def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
+    # asserted across BOTH trainers rather than in one file: grpo has resolved this since the trl
+    # driver and opd did not, so opd captured 102 cuda graphs on an rtx 4090 and died on HOST ram
+    # during the first weight sync. opd is the more exposed path, not the less -- it always runs
+    # rollout.mode=async, whose server hardcodes cudagraph_mode=FULL_AND_PIECEWISE. a fix applied to
+    # only one trainer is how this reached production in the first place.
+    for module, source in (
+        ("rl_train", inspect.getsource(rl_train.run_rl_train)),
+        ("opd_train", inspect.getsource(opd_train.run_opd_train)),
+    ):
+        assert "resolve_rollout_enforce_eager(" in source, module
+        assert "resolve_verl_device_capability(python_bin)" in source, module
 
 
 def test_overrides_size_the_engine_to_the_job_not_a_hardcoded_context():
