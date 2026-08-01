@@ -442,6 +442,41 @@ def _case_payload(case: EvalCase | None, result: EvalResult) -> dict:
     }
 
 
+def _spec_project(spec: object) -> str:
+    """The project a run's public spec files under, or empty when it names none."""
+    if not isinstance(spec, dict):
+        return ""
+    project = spec.get("project")
+    return project.strip() if isinstance(project, str) else ""
+
+
+def _spec_environment_id(spec: object) -> str:
+    """The hub environment a run trains against, as the dashboard stores it.
+
+    A managed slug (`namespace/name`) is what the environment pages are keyed by, so a `github:`
+    ref pointing at the managed hub is canonicalized to the slug it denotes -- the same
+    normalization the submit route applies before it records the run's environment
+    (`flash/server/routes/runs.py`). Anything else is a reference this side cannot resolve to a
+    hub page, so it is returned verbatim rather than guessed at."""
+    if not isinstance(spec, dict):
+        return ""
+    environment = spec.get("environment")
+    if not isinstance(environment, dict):
+        return ""
+    env_id = environment.get("id")
+    if not isinstance(env_id, str) or not env_id.strip():
+        return ""
+    env_id = env_id.strip()
+    from flash.envs.loader import canonical_managed_environment_slug
+
+    try:
+        return canonical_managed_environment_slug(env_id) or env_id
+    except ValueError:
+        # a malformed managed ref is still the identity the run carries; recording it verbatim
+        # keeps the report honest about what it graded rather than dropping the provenance.
+        return env_id
+
+
 def _require_accessible_project(project_id: str) -> str:
     """The canonical id of a project this caller can actually upload to.
 
@@ -479,9 +514,10 @@ def _upload_report(
 ) -> int:
     """Record one suite's results against a project, reporting failures without hiding them.
 
-    `environment_reference` is the resolved entrypoint, not its directory: a package may hold
-    several environment modules, and evaluating `/env/easy.py` then `/env/hard.py` recorded the
-    same provenance for two runs graded by different environments.
+    `environment_reference` is the hub environment the graded run trains against, so the dashboard
+    can open it. It falls back to the resolved entrypoint -- the file, not its directory, since a
+    package may hold several environment modules and `/env/easy.py` and `/env/hard.py` are
+    different provenances -- only when the run names no environment at all.
 
     Upload failure is reported but does not change the eval's own exit status: the suite
     already ran and its verdict is printed above. Returning FAIL here would relabel a
@@ -561,34 +597,10 @@ def cmd_env_eval(args) -> int:
     from flash.client import ApiError, ClientError, client_from_config
     from flash.envs.loader import load_freesolo_environment
     from flash.schema import parse_adapter_revision, parse_checkpoint_ref
-
-    # checked before the suites run so a bad project id fails in a second rather than after a
-    # long paid evaluation whose results would then have nowhere to go. the id is validated
-    # here, not just checked for emptiness: upload_eval_run requires a canonical UUID, so a
-    # malformed one would otherwise buy every model request and be rejected at the end -- and
-    # because upload failure deliberately does not change the verdict, it would still print
-    # `overall: PASS` with nothing recorded.
     from flash.spec import require_project_id
 
-    project_id = ""
-    if args.upload:
-        try:
-            project_id = require_project_id(args.project)
-        except (TypeError, ValueError) as exc:
-            return _err(f"--upload requires a valid --project PROJECT_ID: {exc}")
-        # a well-formed UUID is not an accessible project. checking only the shape let a deleted id,
-        # or one belonging to another organization, buy the whole evaluation and be rejected at
-        # upload -- printing `overall: PASS` with nothing recorded, since upload failure
-        # deliberately does not change the verdict. `env setup` already resolves the project this
-        # way before scaffolding anything.
-        try:
-            project_id = _require_accessible_project(project_id)
-        except (ApiError, ClientError) as exc:
-            if getattr(args, "debug", False):
-                raise
-            return _err(f"--upload requires a valid --project PROJECT_ID: {exc}")
     if args.project and not args.upload:
-        return _err("--project only applies with --upload")
+        return _err("--project cannot be combined with --no-upload")
 
     revision = parse_adapter_revision(args.target)
     parsed = parse_checkpoint_ref(args.target) if revision is None else None
@@ -597,6 +609,19 @@ def cmd_env_eval(args) -> int:
             f"invalid evaluation target {args.target!r} "
             "(expected a bare <run_id>, <run_id>/step-N, or full immutable adapter revision)"
         )
+
+    # an explicitly named project is fully settled before anything else happens, including before a
+    # client exists: it is already known, so neither its shape nor its accessibility needs the run
+    # lookup below, and a typo or an unreachable project costs one second rather than a control
+    # plane round trip and then a whole paid suite.
+    project_id = ""
+    if args.project:
+        try:
+            project_id = _require_accessible_project(require_project_id(args.project))
+        except (TypeError, ValueError, ClientError) as exc:
+            if isinstance(exc, ClientError) and getattr(args, "debug", False):
+                raise
+            return _err(f"--project must be a valid PROJECT_ID: {exc}")
 
     try:
         params = _env_params(args)
@@ -630,6 +655,7 @@ def cmd_env_eval(args) -> int:
             return _err("overall: FAIL")
 
     client = client_from_config()
+
     evaluation_target = args.target
     if revision is None and parsed is not None:
         run_id, want_step = parsed
@@ -714,7 +740,7 @@ def cmd_env_eval(args) -> int:
             # `/v1/runs/{id}/checkpoints` carries no revision, and the chat route never echoes the
             # revision that answered. So refuse before buying a single generation rather than spend
             # a whole suite on a result nobody can identify. Both ways out are in the message, and
-            # evaluating without `--upload` still prints the verdict.
+            # evaluating with `--no-upload` still prints the verdict.
             #
             # Only when a step was asked for. A bare alias means "whatever serves this run now",
             # which is what it records, and a busy one deliberately stays unpinned so the run still
@@ -722,17 +748,21 @@ def cmd_env_eval(args) -> int:
             _err(
                 f"env eval failed: cannot upload results for {args.target}: the immutable "
                 "revision that will answer it is not knowable here. re-run with the full "
-                f"revision from `{CLI_NAME} models deployments`, or drop --upload"
+                f"revision from `{CLI_NAME} models deployments`, or pass --no-upload"
             )
             return _err("overall: FAIL")
 
-    # graders must see what training graded, so the run's own `thinking` decides whether the
-    # reasoning is stripped first (see `_scored_response`). read once here rather than per case:
-    # it is the same answer for every case, and a suite of 200 would otherwise buy 200 lookups.
-    thinking = False
+    # one lookup answers everything this command still needs to know ABOUT THE TARGET RUN: whether
+    # its responses carry reasoning, which hub environment it trains against, and which project owns
+    # its results. all three are properties of that run, so none is a default or a fallback -- an
+    # evaluation files under the project that owns the weights it graded, and names the environment
+    # those weights were trained on rather than whichever local copy happened to score them.
+    #
+    # read once here rather than per case: it is the same answer for every case, and a suite of 200
+    # would otherwise buy 200 lookups.
+    spec = None
     target_run_id = (revision or parsed or (None,))[0]
     if target_run_id:
-        spec = None
         try:
             spec = client.get_run(target_run_id).get("spec")
         except ClientError as exc:
@@ -742,13 +772,14 @@ def cmd_env_eval(args) -> int:
             # exact failure the retryable branch exists to stop (cursor[bot]).
             #
             # a 4xx is the plane answering, just not about this run: an old build with no such
-            # route, or a run this key cannot see. retrying returns the same answer, and every
-            # eval before this lookup existed graded the raw response, so keep that and say so.
+            # route, or a run this key cannot see. retrying returns the same answer, so warn and
+            # keep going; the project preflight below then decides whether the results can still be
+            # recorded, and grading itself proceeds against the raw response as it always did.
             answered_definitively = (
                 isinstance(exc, ApiError) and exc.status < 500 and exc.status != 429
             )
             if answered_definitively:
-                _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
+                _err(f"warning: could not read the target run {target_run_id}: {exc}")
             else:
                 # the plane did not answer, or answered with a fault that will pass: unreachable,
                 # timed out, overloaded. the chat requests that follow may still succeed, and then
@@ -767,8 +798,35 @@ def cmd_env_eval(args) -> int:
         except Exception as exc:
             # anything else is not a transport fault, so it is not retryable either. broad, so an
             # unexpected client shape cannot crash a command the user asked for.
-            _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
-        thinking = bool(spec.get("thinking")) if isinstance(spec, dict) else False
+            _err(f"warning: could not read the target run {target_run_id}: {exc}")
+
+    # graders must see what training graded, so the run's own `thinking` decides whether the
+    # reasoning is stripped first (see `_scored_response`).
+    thinking = bool(spec.get("thinking")) if isinstance(spec, dict) else False
+
+    if args.upload and not project_id:
+        # the run's own project, and not a default: an evaluation of these weights files where the
+        # weights themselves live. nothing here falls back to a first, sole, or example project --
+        # when the run names none and the user did not either, recording would have to invent a home
+        # for a permanent result, so it refuses before any paid generation and names both ways out.
+        try:
+            project_id = _require_accessible_project(require_project_id(_spec_project(spec)))
+        except (TypeError, ValueError, ClientError) as exc:
+            if isinstance(exc, ClientError) and getattr(args, "debug", False):
+                raise
+            _err(
+                f"env eval failed: cannot record results for {args.target}: its project is unknown "
+                f"({exc}). pass `--project PROJECT_ID`, or pass --no-upload to score without "
+                "recording"
+            )
+            return _err("overall: FAIL")
+
+    # the hub environment the graded weights were trained on, which is what the dashboard links to.
+    # the local entrypoint that scored them is a path on this machine: it names no environment
+    # anyone else can open, and two developers evaluating the same run recorded two different
+    # provenances for one measurement. falls back to the resolved entrypoint only when the run names
+    # no environment, so a report still records where it was scored from.
+    environment_reference = _spec_environment_id(spec) or str(entrypoint)
 
     reports: list[EvalSuiteReport] = []
     for suite in suites:
@@ -796,7 +854,7 @@ def cmd_env_eval(args) -> int:
                     report,
                     [],
                     project_id=project_id,
-                    environment_reference=str(entrypoint),
+                    environment_reference=environment_reference,
                     target=evaluation_target,
                     started_at=started_at,
                     status="failed",
@@ -818,7 +876,7 @@ def cmd_env_eval(args) -> int:
                     report,
                     cases,
                     project_id=project_id,
-                    environment_reference=str(entrypoint),
+                    environment_reference=environment_reference,
                     target=evaluation_target,
                     started_at=started_at,
                     status="failed",
@@ -847,7 +905,7 @@ def cmd_env_eval(args) -> int:
                 report,
                 cases,
                 project_id=project_id,
-                environment_reference=str(entrypoint),
+                environment_reference=environment_reference,
                 target=evaluation_target,
                 started_at=started_at,
             )
