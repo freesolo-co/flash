@@ -36,6 +36,8 @@ from flash.engine.worker.backend_common import (
     parse_verl_metric,
     parse_wandb_link,
     render_wandb_link_shim,
+    resolve_rollout_enforce_eager,
+    resolve_verl_device_capability,
     resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
@@ -1537,6 +1539,9 @@ def build_opd_overrides(config: dict) -> list[str]:
         # sync dies with a KeyError before a rollout is ever produced. loading the base from
         # safetensors keeps vllm authoritative for base weights and transfers only lora deltas.
         "actor_rollout_ref.rollout.load_format=safetensors",
+        # rollout.enforce_eager is a real verl field, so this is a plain override, not a '+' append.
+        # the caller resolves it from the device capability; absent/false keeps verl's default.
+        *(["actor_rollout_ref.rollout.enforce_eager=True"] if config.get("enforce_eager") else []),
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={_hydra_val(config['n_gpus_per_node'])}",
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
         # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
@@ -2334,6 +2339,19 @@ def run_opd_train(spec=None) -> None:
     except Exception:  # no cuda / probe failure -> conservative bf16 kv
         fp8_kv = False
 
+    # vllm 0.19.1 graph capture is only validated on a100/h100/blackwell; elsewhere it dies in
+    # aot_compile or triton slot-mapping, so the rollout runs eagerly. grpo has resolved this since
+    # the trl driver; opd never did, and opd is the MORE exposed of the two because it always runs
+    # `rollout.mode=async`, whose server hardcodes cudagraph_mode=FULL_AND_PIECEWISE
+    # (vllm_async_server.py:240). on an rtx 4090 (sm89, the catalog's recommended card for the small
+    # models) that captured 102 graphs and pushed the box to 41.51GB/42.84GB of HOST ram, and the
+    # weight sync at the end of the first opd step was killed. the graphs live in vllm's EngineCore
+    # CHILD process, so ray's own accounting saw only 12.45GB of it and the run read as a mystery
+    # oom. see resolve_rollout_enforce_eager for why this one knob is enough and cannot fight
+    # verl's: vllm resolves enforce_eager LAST (config/vllm.py:1024), after the async server has set
+    # cudagraph_mode, and forces both compilation mode and cudagraph_mode to NONE.
+    enforce_eager = resolve_rollout_enforce_eager(resolve_verl_device_capability(python_bin))
+
     plugin_path = os.path.join(shim_dir, "flash_opd_plugin.py")
     shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_plugin.py"), plugin_path)
     structured_helper_path = os.path.join(shim_dir, "flash_opd_structured.py")
@@ -2421,6 +2439,7 @@ def run_opd_train(spec=None) -> None:
             "thinking": bool(_w.THINKING),
             "structured_outputs": structured_outputs,
             "fp8_kv": fp8_kv,
+            "enforce_eager": enforce_eager,
             "loggers": loggers,
         }
         overrides = build_opd_overrides(config)
