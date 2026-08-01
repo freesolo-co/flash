@@ -481,6 +481,11 @@ def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bo
     return not (path.is_dir() or path.is_file())
 
 
+# the functions that import a module named at runtime. one definition, because the binding walk
+# and the call-site matcher below must agree on what counts as one.
+_DYNAMIC_IMPORT_FUNCTIONS = frozenset({"import_module", "__import__"})
+
+
 def _dynamic_import_callees(tree) -> frozenset[str]:
     """Bare names that call `importlib.import_module` in this module, aliases included.
 
@@ -488,15 +493,51 @@ def _dynamic_import_callees(tree) -> frozenset[str]:
     identifier, so the call site reads `load("judge")` and matching on the canonical name alone
     skipped it -- leaving `judge.py` out of the archive for a suite that passes locally, its
     directory being importable there, and raises ModuleNotFoundError on its first published case
-    (Cursor). The binding is in the same file as the call, so the alias is statically knowable."""
+    (Cursor). The binding is in the same file as the call, so the alias is statically knowable.
+
+    An assignment binds it just as well: `load = importlib.import_module` is not an `import ... as`
+    and so appears in no import statement at all, which left the same helper unpackaged for the
+    same reason (codex[bot]). Assignments are followed to a fixpoint, because the value bound may
+    itself be an alias (`a = importlib.import_module` then `b = a`).
+
+    Deliberately flow-insensitive: a name rebound to something else later still counts here. The
+    two errors are not symmetric -- an extra name ships a file the archive did not need, while a
+    missed one is a published environment that raises on its first case."""
     import ast
 
-    names = {"import_module", "__import__"}
+    names = set(_DYNAMIC_IMPORT_FUNCTIONS)
+    bindings: list[tuple[list, object]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "importlib":
             names.update(
                 alias.asname or alias.name for alias in node.names if alias.name == "import_module"
             )
+        elif isinstance(node, ast.Assign):
+            bindings.append((node.targets, node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            bindings.append(([node.target], node.value))
+
+    while True:
+        bound_this_pass = False
+        for targets, value in bindings:
+            if isinstance(value, ast.Attribute):
+                # `importlib.import_module`, under any alias of the module itself. Matched on the
+                # canonical attribute name only, exactly as the call site is (`_dynamic_import_
+                # name`), so the two cannot disagree about what counts as a dynamic import.
+                binds_import = value.attr in _DYNAMIC_IMPORT_FUNCTIONS
+            elif isinstance(value, ast.Name):
+                binds_import = value.id in names
+            else:
+                continue
+            if not binds_import:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in names:
+                    names.add(target.id)
+                    bound_this_pass = True
+        # terminates: `names` only grows, and is bounded by the module's assignment targets.
+        if not bound_this_pass:
+            break
     return frozenset(names)
 
 
@@ -514,7 +555,7 @@ def _dynamic_import_name(node, callees: frozenset[str]) -> str | None:
         # `importlib.import_module(...)`, under any alias of the module itself. Attribute access is
         # matched on the canonical name only: a module that happens to bind `load` at top level
         # does not make an unrelated `obj.load("x")` a dynamic import.
-        matched = func.attr in ("import_module", "__import__")
+        matched = func.attr in _DYNAMIC_IMPORT_FUNCTIONS
     else:
         matched = getattr(func, "id", None) in callees
     if not matched:

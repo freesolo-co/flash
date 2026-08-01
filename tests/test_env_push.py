@@ -394,6 +394,71 @@ def test_push_ships_helpers_named_by_the_keyword_form_of_a_dynamic_import(monkey
     assert "weights.py" in files
 
 
+def test_push_ships_helpers_named_through_an_assignment_bound_dynamic_import(monkeypatch, tmp_path):
+    """`load = importlib.import_module` binds the importer without any `import ... as`.
+
+    The alias walk read import statements, so the from-import spelling was covered and this one --
+    which appears in no import statement at all -- was not (codex[bot]). Same end state either way:
+    the helper stays out of the archive, the suite passes locally because its directory is on
+    sys.path, and the published environment raises ModuleNotFoundError on its first case.
+
+    The chain is two hops deep and declared out of order, so a single pass over the assignments in
+    source order resolves neither `pick` nor the helper it names.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import importlib\n\n"
+        # `pick` is bound from `load` BEFORE `load` itself is bound, so resolving this needs a
+        # fixpoint rather than one ordered sweep.
+        "pick = load\n"
+        "load = importlib.import_module\n"
+        "grab = __import__\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    pick('judge')\n"
+        "    grab('rubric')\n"
+        "    return []\n"
+    )
+    (tmp_path / "judge.py").write_text("import weights\n")
+    (tmp_path / "weights.py").write_text("W = 1\n")
+    (tmp_path / "rubric.py").write_text("RULES = ()\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "judge.py" in files
+    assert "rubric.py" in files
+    # and followed transitively, exactly as a directly named helper is
+    assert "weights.py" in files
+
+
+def test_push_does_not_mistake_an_unrelated_callable_for_a_dynamic_import(monkeypatch, tmp_path):
+    """Binding some other function to a plausible name must not make its argument a module.
+
+    The guard against over-matching: `load` is an ordinary name, and a sidecar that binds it to
+    something unrelated calls it with strings that are not module names. Shipping a file per such
+    call would be wrong in the quiet direction -- the archive grows and nothing points at why.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import os.path\n\n"
+        "load = os.path.join\n\n"
+        "def load_evaluations(environment=None):\n"
+        "    load('judge')\n"
+        "    return []\n"
+    )
+    # present on disk, so the assertion is about the walker's judgement rather than the file
+    # simply being absent: a match would package it.
+    (tmp_path / "judge.py").write_text("SHOULD_NOT_SHIP = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    assert "judge.py" not in _members(cap["package_b64"])
+
+
 def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monkeypatch, tmp_path):
     """`from custom import SCORER` must keep resolving after custom.py is published as environment.py.
 
