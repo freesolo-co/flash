@@ -481,7 +481,26 @@ def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bo
     return not (path.is_dir() or path.is_file())
 
 
-def _dynamic_import_name(node) -> str | None:
+def _dynamic_import_callees(tree) -> frozenset[str]:
+    """Bare names that call `importlib.import_module` in this module, aliases included.
+
+    `from importlib import import_module as load` binds the same function to a different
+    identifier, so the call site reads `load("judge")` and matching on the canonical name alone
+    skipped it -- leaving `judge.py` out of the archive for a suite that passes locally, its
+    directory being importable there, and raises ModuleNotFoundError on its first published case
+    (Cursor). The binding is in the same file as the call, so the alias is statically knowable."""
+    import ast
+
+    names = {"import_module", "__import__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            names.update(
+                alias.asname or alias.name for alias in node.names if alias.name == "import_module"
+            )
+    return frozenset(names)
+
+
+def _dynamic_import_name(node, callees: frozenset[str]) -> str | None:
     """The module a literal `import_module("x")` or `__import__("x")` call names, if any.
 
     A sidecar importing a sibling dynamically passes local test and eval -- the scope makes the
@@ -491,8 +510,14 @@ def _dynamic_import_name(node) -> str | None:
     import ast
 
     func = node.func
-    name = getattr(func, "attr", None) or getattr(func, "id", None)
-    if name not in ("import_module", "__import__"):
+    if isinstance(func, ast.Attribute):
+        # `importlib.import_module(...)`, under any alias of the module itself. Attribute access is
+        # matched on the canonical name only: a module that happens to bind `load` at top level
+        # does not make an unrelated `obj.load("x")` a dynamic import.
+        matched = func.attr in ("import_module", "__import__")
+    else:
+        matched = getattr(func, "id", None) in callees
+    if not matched:
         return None
     # both accept the module as the keyword `name`, and that form imports identically. reading
     # only the positional argument left `import_module(name="judge")` out of the archive, so the
@@ -515,13 +540,14 @@ def _imported_module_names(tree) -> set[str]:
     import ast
 
     names: set[str] = set()
+    callees = _dynamic_import_callees(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name.split(".", 1)[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             names.add(node.module.split(".", 1)[0])
         elif isinstance(node, ast.Call):
-            dynamic = _dynamic_import_name(node)
+            dynamic = _dynamic_import_name(node, callees)
             if dynamic:
                 names.add(dynamic)
     return names
