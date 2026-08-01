@@ -2627,10 +2627,16 @@ def run_opd_train(spec=None) -> None:
                 python_bin=python_bin,
             )
             _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-            if (
-                final_save_due(final_step, knobs.save_at_steps)
-                and final_step not in watcher.processed_steps
-            ):
+            # preserve the final checkpoint only when exact save steps are not configured, exactly as
+            # the grpo path does: with save_at_steps set the customer asked for those steps and
+            # nothing else, and the watcher has already published each of them.
+            #
+            # NOT also gated on watcher.processed_steps. the watcher marks every step it processes
+            # but publishes a deployable only for a step in required_steps (== save_at_steps), and
+            # final_save_due is true only when save_at_steps is EMPTY -- so the two publish paths are
+            # disjoint and that guard could never prevent a double-publish, only suppress the last
+            # step's deployable on every default run.
+            if final_save_due(final_step, knobs.save_at_steps):
                 _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
 
         setup_seconds = train_started_at - started_at
