@@ -418,6 +418,42 @@ def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
     return True
 
 
+def rollout_sleep_unsupported(model_id: str) -> bool:
+    """whether vLLM's sleep/wake cycle is non-functional for this model.
+
+    a few models HANG on wake/reload rather than erroring (live-confirmed, every attempt), so the
+    catalog flags them and the rollout engine must stay RESIDENT instead. shared by grpo and opd:
+    verl runs the same ``vllm_async_server`` sleep path for both, so the flag has to mean the same
+    thing on both drivers or the one that ignores it wedges on the flagged model.
+    """
+    from flash.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    return bool(info is not None and getattr(info, "sleep_unsupported", False))
+
+
+def rollout_resident_overrides(sleep_unsupported: bool) -> list[str]:
+    """verl overrides that pin the rollout engine resident, or ``[]`` to keep verl's default.
+
+    verl defaults ``free_cache_engine`` and ``enable_sleep_mode`` BOTH True and offloads the engine
+    between steps, so on a flagged model a run wedges at a sleep boundary instead of failing fast.
+    both knobs go: ``free_cache_engine`` is what actually gates the sleep()/wake_up() rpcs
+    (``vllm_async_server.py:626,648``), and ``enable_sleep_mode`` is what builds the sleep-capable
+    engine in the first place (``:265``).
+
+    safe because vram sizing never credits the offload for a flagged job -- grpo sizes it on the
+    RESIDENT peak and rejects a config that cannot fit, and opd's estimator ignores ``sleep_offload``
+    outright (it is resident-only by construction). staying resident therefore cannot admit an OOM
+    that the sleep path would have avoided.
+    """
+    if not sleep_unsupported:
+        return []
+    return [
+        "actor_rollout_ref.rollout.free_cache_engine=false",
+        "actor_rollout_ref.rollout.enable_sleep_mode=false",
+    ]
+
+
 def resolve_blackwell_attention_backends(
     python_bin: str, cc: tuple[int, int] | None
 ) -> tuple[str | None, str | None]:
