@@ -454,6 +454,7 @@ def _adopt_completed_attempt(
     applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
     if applied:
         _charge_completed_run_best_effort(spec, log)
+        _reconcile_completed_run_best_effort(spec, log)
         _register_checkpoints_best_effort(spec, log)
     return applied
 
@@ -1172,6 +1173,7 @@ def _run_training(
     )
     if applied:
         _charge_completed_run_best_effort(spec, log)
+        _reconcile_completed_run_best_effort(spec, log)
         _register_checkpoints_best_effort(spec, log)
 
 
@@ -1186,6 +1188,46 @@ def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
     except Exception as exc:  # never let checkpoint bookkeeping disturb a run
         print(
             f"[ckpt] register warn ({spec.run_id}): {type(exc).__name__}",
+            file=log,
+            flush=True,
+        )
+
+
+def _reconcile_completed_run_best_effort(spec: JobSpec, log) -> None:
+    """Record realized provider COGS inline for an instance-provider run (best-effort).
+
+    Lambda/Vast bill a flat $/hr against a lease whose rate and launch time are already stamped on
+    the handle, so realized cost is exact arithmetic the instant the run ends -- there is no invoice
+    to wait for. Reporting here means the estimator-accuracy data point lands even if the control
+    plane never runs another sweep, which is precisely the failure that left the dataset empty.
+
+    RunPod is deliberately NOT reconciled here: its invoice lags teardown, so a pull now would read
+    zero. It stays on the settle-delayed sweep.
+
+    Never disturbs the run: the backend route is an idempotent upsert by runId, so a later sweep
+    re-reporting the same run is a safe no-op, and any failure here just leaves the run queued."""
+    from flash.runner import get_status
+
+    try:
+        from flash.providers import INSTANCE_PROVIDERS
+        from flash.server.reconcile import reconcile_enabled, reconcile_run
+
+        if not reconcile_enabled():
+            return
+        status = get_status(spec.run_id)
+        if (status.remote or {}).get("provider") not in INSTANCE_PROVIDERS:
+            return
+        if reconcile_run(status):
+            # re-read: `status` is the pre-reconcile snapshot, so its realized cost is still unset.
+            realized = get_status(spec.run_id).realized_cost_usd or 0.0
+            print(
+                f"[cost] realized cost recorded ({spec.run_id}): ${realized:.4f}",
+                file=log,
+                flush=True,
+            )
+    except Exception as exc:  # never let COGS metering disturb a run
+        print(
+            f"[cost] reconcile warn ({spec.run_id}): {type(exc).__name__}",
             file=log,
             flush=True,
         )

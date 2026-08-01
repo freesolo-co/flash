@@ -6,13 +6,33 @@ This job is the COGS side: the realized provider invoice (RunPod /v1/billing/end
 REPORTS (via ``/api/billing/training-cost``) is COGS, not a customer charge. The backend's
 training_cost_accuracy view joins the two per run to surface charged-vs-realized error.
 
-Best-effort and entirely off the run hot path: it runs in a background loop (see the server
-lifespan), never blocks request handling, and any failure is swallowed and retried next cycle.
-Realized cost is reported with the operator INTERNAL key (this is COGS, not a customer charge),
-which also gates the whole feature -- with no FREESOLO_INTERNAL_KEY set, reconciliation is off.
+Best-effort and entirely off the run hot path: it never blocks request handling, and any failure is
+swallowed and retried next cycle. Realized cost is reported with the operator INTERNAL key (this is
+COGS, not a customer charge), which also gates the whole feature -- with no FREESOLO_INTERNAL_KEY
+set, reconciliation is off.
 
-Scope note (v1): cost is attributed from the run's last persisted handle (RunStatus.remote).
-This is exact for the common single-attempt run; runs that retried across multiple resources may be
+DURABILITY (why this is a queue, not a timer). The invariant is that every billable terminal run
+eventually gets a realized cost recorded, or is explicitly marked ``unattributable`` -- and that this
+must NOT depend on any process being alive at a particular moment. The persisted run records ARE the
+queue: a run is owed a pull until ``reconcile_state`` says otherwise. Concretely:
+
+  * the sweep runs at STARTUP and then on an interval, so a control plane that restarts more often
+    than the interval still reconciles (the old loop slept a full hour before its first sweep, so a
+    plane that was up for less than that swept nothing, ever);
+  * there is NO time window -- a run that was missed while the plane was down is picked up whenever
+    it next comes up, instead of silently aging out;
+  * failures are RECORDED (attempt count + reason), not silently skipped, and a run that exhausts
+    _MAX_RECONCILE_ATTEMPTS is marked ``unattributable`` so it stops being retried and becomes a
+    visible gap;
+  * instance-provider runs are reported INLINE at completion (see
+    runner.lifecycle._reconcile_completed_run_best_effort) because their cost is exact at teardown;
+    this sweep is their backstop, not their primary path.
+
+The backend route is an idempotent upsert by runId, so re-reporting a run is always safe -- which is
+what makes unbounded retry sound.
+
+Scope note (v1): cost is attributed from the run's last persisted handle (RunStatus.remote). This is
+exact for the common single-attempt run; runs that retried across multiple resources may be
 under-counted until every attempt's resource id is persisted.
 """
 
@@ -24,6 +44,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 from flash import runner
 from flash.providers.realized import realized_cost_for_remote
@@ -31,10 +52,26 @@ from flash.server.auth import INTERNAL_KEY_ENV, freesolo_base_url
 
 _REPORT_PATH = "/api/billing/training-cost"
 _REPORT_TIMEOUT_S = 10.0
-# Provider billing lags; wait this long after a run goes terminal before pulling (so the
-# invoice has settled) and stop retrying once a run is older than the window.
-_SETTLE_SECONDS = 3600.0  # 1h
-_WINDOW_SECONDS = 7 * 86400.0  # only reconcile runs that finished within the last 7 days
+# RunPod bills through an invoice that lags teardown, so its realized pull waits this long after a
+# run goes terminal. Instance providers (Lambda/Vast) bill a FLAT $/hr against a lease whose rate and
+# launch time are already stamped on the handle, so their realized cost is exact arithmetic the
+# moment the run ends -- nothing to settle, hence _SETTLE_BY_PROVIDER = 0 for them (see
+# _settle_seconds). That is what lets the completion path report them inline.
+_RUNPOD_SETTLE_SECONDS = 3600.0  # 1h
+# There is deliberately NO time window. A realized pull is OWED for every billable run, so a run that
+# has not been reconciled stays due until it either succeeds or exhausts _MAX_RECONCILE_ATTEMPTS. The
+# old 7-day window silently converted "still owed" into "never" for any run whose control plane was
+# down during the window -- which is exactly how the estimator accuracy dataset ended up empty.
+# Bounded attempts (not elapsed time) is what stops an unrecoverable run from being retried forever.
+# Budgets PROVIDER-ATTRIBUTION failures ONLY (no cost came back). Backend-delivery failures are
+# counted separately and are never budgeted -- see runner.record_reconcile_attempt: a run whose cost
+# we successfully computed must not be dropped because the backend happened to be down.
+_MAX_RECONCILE_ATTEMPTS = 24
+# Minimum wall time between attempts on one run. The budget must be spent over real time, not over
+# boot count: the startup sweep runs on EVERY boot, so without this a crash-looping control plane
+# burns all 24 attempts in minutes and marks a run unattributable seconds before its invoice settles.
+# Matches the periodic sweep interval, so the loop's own cadence is unaffected.
+_RETRY_BACKOFF_SECONDS = 3600.0
 # States that incur no GPU cost -> never reconciled.
 _FREE_TERMINAL_STATES = frozenset({"dry_run"})
 # States whose training is finished and whose GPU cost is therefore final -> eligible for
@@ -84,29 +121,142 @@ def _terminal_ts(status: runner.RunStatus) -> float:
     return float(status.finished_at if status.finished_at is not None else status.updated_at)
 
 
+def _attribution_handle(status: runner.RunStatus) -> dict:
+    """The handle to attribute cost from: the LIVE one, else the persisted snapshot.
+
+    cancel_run tears down the resource and clears ``status.remote`` BEFORE writing the billable
+    ``cancelled`` state, so a cancelled run that burned real GPU time (and IS charged, at the steps it
+    actually ran) would otherwise have nothing to attribute from -- excluded from every sweep, never
+    even marked unattributable, silently pending forever. ``reconcile_remote`` is the never-cleared
+    snapshot kept for exactly this; it is read ONLY here, so teardown/recovery semantics are unchanged.
+    """
+    return status.remote or status.reconcile_remote or {}
+
+
+def _settle_seconds(status: runner.RunStatus) -> float:
+    """How long after teardown this run's realized cost can be pulled.
+
+    RunPod needs its invoice to settle; instance providers (Lambda/Vast) bill a flat $/hr against a
+    lease whose rate and launch time are already on the handle, so their cost is final at teardown and
+    settles instantly. Unknown/missing provider falls back to the conservative RunPod delay."""
+    from flash.providers import INSTANCE_PROVIDERS
+
+    provider = _attribution_handle(status).get("provider")
+    return 0.0 if provider in INSTANCE_PROVIDERS else _RUNPOD_SETTLE_SECONDS
+
+
 def _due(status: runner.RunStatus, now: float) -> bool:
     """Whether a run should be reconciled this pass: a billable run whose training is finished
-    (a terminal billable state, or `deployed` -- see _RECONCILABLE_STATES), not yet reconciled,
-    past the settle delay, still within the window, and carrying a provider handle."""
+    (a terminal billable state, or `deployed` -- see _RECONCILABLE_STATES), still owed a realized
+    pull, past its provider's settle delay, and carrying a provider handle.
+
+    Deliberately UNBOUNDED in age -- see _MAX_RECONCILE_ATTEMPTS. A run stays due until it reconciles
+    or is marked `unattributable`, so a control plane that was down when the run finished still picks
+    it up on its next startup sweep instead of losing the data point forever."""
     if status.state not in _RECONCILABLE_STATES:
         return False
-    if status.reconciled_at:
+    if status.reconciled_at or status.reconcile_state in ("reconciled", "unattributable"):
         return False
+    # `delivering`: the provider already gave us a cost and it is staged on the run. Only the backend
+    # POST is owed, so NONE of the provider-side gates apply -- not the settle delay, not the
+    # attribution budget, not even still having a handle. Retried until the backend accepts it.
+    if status.reconcile_state == "delivering":
+        return bool(status.reconcile_report)
+    if int(status.reconcile_attempts or 0) >= _MAX_RECONCILE_ATTEMPTS:
+        return False
+    # Wall-clock backoff between attempts (see _RETRY_BACKOFF_SECONDS).
+    next_at = status.reconcile_next_attempt_at
+    if next_at is not None and now < float(next_at):
+        return False
+    if not _attribution_handle(status):
+        # No handle was ever persisted, so there is nothing to attribute cost from. Still DUE: the
+        # sweep visits it once to classify it `unattributable`, because the queue's promise is that
+        # every billable run ends reconciled or explicitly marked -- silently skipping it forever
+        # (the old behaviour) recreates the invisible gap in the one case we can never resolve.
+        return True
     age = now - _terminal_ts(
         status
     )  # from teardown, not a later updated_at bump (see _terminal_ts)
-    if age < _SETTLE_SECONDS or age > _WINDOW_SECONDS:
-        return False
-    return bool(status.remote)
+    return age >= _settle_seconds(status)
+
+
+def _fail(run_id: str, reason: str, *, stage: str, max_attempts: int | None = None) -> bool:
+    """Record a failed realized-cost attempt and return False (nothing reported this pass).
+
+    ``stage`` is "attribution" (the provider returned no cost -> counts against the budget, and can
+    end in ``unattributable``) or "report" (the cost WAS attributed, only the backend POST failed ->
+    always retryable, never budgeted). Terminality is decided inside record_reconcile_attempt from
+    the incremented persisted count, NOT from a snapshot here -- see its docstring for the race."""
+    with contextlib.suppress(Exception):
+        runner.record_reconcile_attempt(
+            run_id,
+            error=reason,
+            stage=stage,
+            max_attempts=_MAX_RECONCILE_ATTEMPTS if max_attempts is None else max_attempts,
+            retry_after=_RETRY_BACKOFF_SECONDS,
+        )
+    return False
+
+
+def _deliver(run_id: str, body: dict, *, now: float) -> bool:
+    """POST an already-attributed cost and mark the run reconciled. Returns True on delivery.
+
+    Shared by the fresh-pull path and the ``delivering`` retry path so both record the same states.
+    The backend route is an idempotent upsert by runId, so re-delivering a payload a previous attempt
+    may have actually landed (a response we never saw) is a safe no-op.
+
+    A successful POST is NOT on its own success: if the local persist then fails, the run is still
+    ``delivering`` with no ``reconciled_at`` and is genuinely still owed work, so reporting True would
+    both over-count the sweep and log "realized cost recorded" for a run that isn't. The persist
+    failure is recorded and False returned; the next sweep re-POSTs the staged payload, which the
+    backend's upsert-by-runId makes a safe no-op.
+
+    COST-FIELDS-ONLY: record_realized_cost re-reads the run under the guard and writes only the
+    realized-cost columns, never ``state`` -- a caller's snapshot could otherwise REVERT a run that
+    advanced since (e.g. to ``deployed``), which the terminal-sticky CAS does not protect against."""
+    if not _report(body):
+        return _fail(run_id, "backend report failed", stage="report")
+    try:
+        runner.record_realized_cost(
+            run_id,
+            realized_cost_usd=float(body.get("realizedCostUsd") or 0.0),
+            reconciled_at=now,
+        )
+    except Exception as exc:
+        return _fail(
+            run_id, f"delivered but local persist failed: {type(exc).__name__}", stage="report"
+        )
+    return True
 
 
 def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool:
     """Pull + report realized cost for one run; mark it reconciled on success. Returns True when
-    a positive realized cost was reported. A zero/None result leaves the run unreconciled so a
-    later cycle (within the window) retries once the provider invoice settles."""
+    a positive realized cost was reported.
+
+    Every failure is RECORDED (never a silent skip) so the run stays in the queue and is retried on
+    the next sweep. Failures are split by stage: a provider pull that yields no cost counts against
+    _MAX_RECONCILE_ATTEMPTS and eventually marks the run ``unattributable`` (a visible gap), whereas a
+    failed backend POST is retried indefinitely -- the cost WAS attributed, only delivery failed, so a
+    backend outage must not strand a run we successfully priced.
+
+    A run already in ``delivering`` skips the provider entirely and re-POSTs its staged payload, so a
+    backend retry can never be defeated by the provider becoming unreachable in the meantime."""
     now = time.time() if now is None else now
-    remote = status.remote or {}
+    if status.reconcile_state == "delivering" and status.reconcile_report:
+        return _deliver(status.run_id, dict(status.reconcile_report), now=now)
+    remote = _attribution_handle(status)
     spec = status.spec or {}
+    if not remote:
+        # Nothing was ever persisted to attribute from (e.g. a non-idempotent provider create whose
+        # handle never landed). No number of retries can fix that, so terminalize on the FIRST visit
+        # (max_attempts=1) -- a visible `unattributable` gap rather than a run that sits pending
+        # forever. Phantom creates can still have cost real money, so this must be surfaced.
+        return _fail(
+            status.run_id,
+            "no provider handle was ever persisted for this run",
+            stage="attribution",
+            max_attempts=1,
+        )
     # raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
     # unknown launch rather than the epoch; falling back to created_at prevents inflated flat-rate
     # instance billing.
@@ -117,11 +267,24 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     run_end = _terminal_ts(status)
     # RunPod's billing query pads past run end so the settled invoice is in range; the instance
     # providers bill flat $/hr to teardown, so they get the UN-padded run_end (no extra settle hour).
-    realized = realized_cost_for_remote(
-        remote, start=start, end=run_end + _SETTLE_SECONDS, run_end=run_end
-    )
-    if realized is None or realized.realized_usd <= 0:
-        return False
+    try:
+        realized = realized_cost_for_remote(
+            remote, start=start, end=run_end + _RUNPOD_SETTLE_SECONDS, run_end=run_end
+        )
+    except Exception as exc:  # provider billing API down / credentials rotated / rate limited
+        return _fail(
+            status.run_id,
+            f"provider billing pull failed: {type(exc).__name__}",
+            stage="attribution",
+        )
+    if realized is None:
+        return _fail(
+            status.run_id, "no realized cost attributable to this handle", stage="attribution"
+        )
+    if realized.realized_usd <= 0:
+        return _fail(
+            status.run_id, "provider reported no cost yet (invoice unsettled)", stage="attribution"
+        )
 
     body = {
         "runId": status.run_id,
@@ -133,34 +296,48 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
         "costBasis": "realized",
         "source": realized.source,
     }
-    if not _report(body):
-        return False
-
-    # Persist locally so we don't re-pull/re-report, and so `flash status` can show realized vs
-    # estimated. COST-FIELDS-ONLY: record_realized_cost re-reads the run under the lock and writes
-    # only the realized-cost columns, never `state`. The `status` here is an earlier snapshot, so
-    # writing its `state` back could REVERT a run that advanced since (e.g. to `deployed`) -- which
-    # the terminal-sticky CAS does NOT protect against, since `deployed` is non-terminal. Updating
-    # only the cost columns keeps the run's current state intact.
-    with contextlib.suppress(Exception):
-        runner.record_realized_cost(
-            status.run_id,
-            realized_cost_usd=realized.realized_usd,
-            reconciled_at=now,
+    # Stage the attribution BEFORE attempting delivery. From here the cost is ours: a failed POST
+    # retries against this persisted payload rather than re-querying the provider, so provider access
+    # lapsing during a backend outage can no longer destroy a cost we already computed.
+    try:
+        acquired = runner.record_attributed_cost(
+            status.run_id, realized_cost_usd=realized.realized_usd, report=body
         )
-    return True
+    except Exception:
+        return _fail(status.run_id, "could not stage the attributed cost", stage="report")
+    if not acquired:
+        # A concurrent pass already reconciled this run while we were fetching. Our body is stale and
+        # the backend upserts by runId, so delivering it would overwrite a settled row with an older
+        # invoice. Nothing to do -- and nothing failed, so record no attempt.
+        return False
+    return _deliver(status.run_id, body, now=now)
 
 
-def reconcile_once(*, now: float | None = None) -> int:
-    """One sweep over local runs: reconcile every due run. Returns how many were reported."""
+def reconcile_once(
+    *, now: float | None = None, should_stop: Callable[[], bool] | None = None
+) -> int:
+    """One sweep over local runs: reconcile every due run. Returns how many were reported.
+
+    Resilient to one bad record: runs are listed by id and loaded ONE AT A TIME (like
+    ``billing_retry.retry_completion_charges_once``), so a single corrupt/legacy status file is
+    skipped instead of aborting the whole sweep. The old ``list_runs()`` parsed every record up front,
+    so one unreadable file blocked reconciliation for every OTHER run too.
+
+    ``should_stop`` is an optional cooperative-cancel callback checked BETWEEN runs. The sweep runs in
+    a worker thread (the provider billing pull is blocking urllib) which ``task.cancel()`` cannot
+    interrupt, so at shutdown the caller sets a stop flag rather than leaving a backlog of slow pulls
+    holding the thread alive."""
     if not reconcile_enabled():
         return 0
     now = time.time() if now is None else now
     reported = 0
-    for status in runner.list_runs():
-        if not _due(status, now):
-            continue
+    for run_id in runner.list_run_ids():
+        if should_stop is not None and should_stop():
+            break
         with contextlib.suppress(Exception):
+            status = runner.get_status(run_id)
+            if not _due(status, now):
+                continue
             if reconcile_run(status, now=now):
                 reported += 1
     return reported

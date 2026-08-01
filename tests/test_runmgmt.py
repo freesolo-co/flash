@@ -1326,7 +1326,7 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     status = runner.get_status(spec.run_id)
     assert status.state == terminal_state
     assert status.remote == remote
-    assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
+    assert reconcile._due(status, status.finished_at + reconcile._RUNPOD_SETTLE_SECONDS + 1.0)
 
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):

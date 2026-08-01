@@ -402,6 +402,45 @@ class RunStatus:
     # isn't re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
+    # Reconciliation state machine, mirroring ``billing_state``. A realized pull is OWED for every
+    # billable terminal run, so "not yet reconciled" must be a durable, inspectable state rather than
+    # the absence of one -- the old time-window sweep silently turned "owed" into "never" once a run
+    # aged out, losing the estimate/actual pair for good.
+    #   None/"pending"    -- still owed a realized pull (the work queue)
+    #   "reconciled"      -- a positive provider cost was recorded (``reconciled_at`` is stamped)
+    #   "unattributable"  -- gave up after _MAX_RECONCILE_ATTEMPTS; the provider never returned a
+    #                        cost for this run (endpoint purged, invoice never settled). Terminal:
+    #                        the sweep stops retrying, and the run is counted as a known gap rather
+    #                        than an invisible one.
+    #   None/"pending"   -- owed a PROVIDER pull (the work queue)
+    #   "delivering"     -- cost ATTRIBUTED and persisted (see reconcile_report); only the backend
+    #                       POST is still owed. The provider is out of the picture from here, so this
+    #                       state is retried forever and never consumes the attribution budget.
+    #   "reconciled"     -- delivered to the backend (``reconciled_at`` stamped)
+    #   "unattributable" -- the provider will never give us a cost; gave up after
+    #                       _MAX_RECONCILE_ATTEMPTS. Terminal, and a VISIBLE gap rather than an
+    #                       invisible one.
+    reconcile_state: str | None = None
+    # Failed PROVIDER-ATTRIBUTION attempts only (no cost came back). This is the budget that decides
+    # `unattributable`; see record_reconcile_attempt for why delivery failures are counted apart.
+    reconcile_attempts: int = 0
+    # Failed BACKEND-DELIVERY attempts (cost was attributed, the POST failed). Tracked for visibility
+    # but deliberately NOT budgeted: a backend outage must never make an attributable run terminal.
+    reconcile_report_failures: int = 0
+    # Earliest wall-clock time the next attempt may run. The attempt BUDGET must be spent over real
+    # time, not over boot count: the startup sweep fires on every boot, so a crash-looping control
+    # plane could otherwise burn all _MAX_RECONCILE_ATTEMPTS within minutes and permanently mark a
+    # run unattributable seconds before its invoice settled.
+    reconcile_next_attempt_at: float | None = None
+    # The attributed report body awaiting delivery, persisted the moment the provider returns a cost.
+    # This is what makes delivery independent of the provider: once attributed, a backend retry
+    # re-POSTs THIS payload instead of re-querying the provider, so credentials rotating (or an
+    # endpoint being purged) during a backend outage can no longer destroy a cost we already knew.
+    reconcile_report: dict | None = None
+    # Last non-null provider handle, kept purely so cost stays attributable after teardown clears
+    # ``remote`` (see _save_status_unlocked). Read only by reconciliation.
+    reconcile_remote: dict | None = None
+    reconcile_error: str | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deploy/reconcile.
     finished_at: float | None = None
     billing_context: dict | None = None
@@ -1900,6 +1939,23 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     return True
 
 
+def _freeze_teardown_before_bump(status: RunStatus) -> None:
+    """Backfill ``finished_at`` from the CURRENT ``updated_at`` before a cost write bumps it.
+
+    ``reconcile._terminal_ts`` falls back to ``updated_at`` when ``finished_at`` is None (pre-feature
+    records on disk right now). Bumping ``updated_at`` without freezing it first would make the run's
+    apparent teardown time drift forward on every write -- which both DELAYS settle eligibility and,
+    worse, moves the RunPod billing query's ``run_end`` forward, so a later report could sweep in
+    endpoint spend incurred long after this run actually ended. ``record_billing_state`` already does
+    exactly this; every reconciliation writer must too."""
+    if (
+        status.state in _FINISHED_AT_PRESERVED_STATES
+        and status.finished_at is None
+        and not status.reconciled_at
+    ):
+        status.finished_at = status.updated_at
+
+
 def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
     """Persist reconciliation COGS without touching run state. No-ops if run vanished."""
     with _status_guard(run_id):
@@ -1909,9 +1965,129 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
             return
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
+        status.reconcile_state = "reconciled"
+        status.reconcile_error = None
+        status.reconcile_report = None  # delivered; drop the staged payload
+        _freeze_teardown_before_bump(status)
         status.updated_at = time.time()
         _save_status_unlocked(status)
     _report_status(status)
+
+
+def record_reconcile_attempt(
+    run_id: str,
+    *,
+    error: str | None,
+    stage: str,
+    max_attempts: int,
+    retry_after: float = 0.0,
+) -> None:
+    """Persist a FAILED realized-cost attempt: bump the right counter and record why.
+
+    Same COST-FIELDS-ONLY discipline as ``record_realized_cost`` -- re-reads under the guard and never
+    writes ``state``, so a run that advanced since the sweep's snapshot (e.g. to ``deployed``) is not
+    reverted.
+
+    ``stage`` separates the two ways reconciliation can fail, because they mean opposite things:
+
+      "attribution" -- the PROVIDER gave us no cost (billing API down, invoice unsettled, endpoint
+                       purged). Bumps ``reconcile_attempts``; once that reaches ``max_attempts`` the
+                       run is marked ``unattributable`` (terminal), so the sweep stops retrying and
+                       the gap becomes visible instead of silently permanent.
+      "report"      -- the provider DID give us a cost; only delivery to the backend failed. That
+                       says nothing about whether the run is attributable, so it must NOT consume the
+                       attribution budget: a long backend outage would otherwise burn through every
+                       attempt and permanently drop a run whose cost we successfully computed. It
+                       bumps a separate counter and leaves the run in ``delivering``, retried forever.
+
+    Terminality is decided HERE, from the INCREMENTED PERSISTED count under the guard -- never from a
+    caller's snapshot. Two reconcilers racing off the same stale count (the startup sweep overlapping
+    the inline completion hook) would both compute "not terminal yet" and leave the run at the limit
+    but still ``pending``, which ``_due`` rejects -- stranding it as the exact invisible gap this
+    state machine exists to prevent.
+
+    NEITHER stage may DOWNGRADE a state that already represents a settled outcome. ``reconciled`` and
+    ``delivering`` both mean a cost is in hand, so a stale attribution failure is meaningless against
+    them; and a late report failure must not overwrite ``unattributable`` back to a retryable state,
+    which would leave the run at the exhausted budget but no longer terminal -- rejected by ``_due``
+    and invisible again. Every write here is therefore guarded on the CURRENT persisted state."""
+    with _status_guard(run_id):
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        current = status.reconcile_state
+        if current == "reconciled":
+            return  # a concurrent success won; never downgrade it
+        if stage == "report":
+            # Never resurrect a terminal `unattributable` into a state `_due` would refuse to retry.
+            if current == "unattributable":
+                return
+            status.reconcile_report_failures = int(status.reconcile_report_failures or 0) + 1
+            status.reconcile_error = error
+            # Deliberately leaves `reconcile_state` UNTOUCHED: `delivering` stays delivering, and a
+            # still-`pending` run (a staging write that failed before delivery was ever acquired)
+            # stays pending. Recording without transitioning is what makes repeated staging failures
+            # visible instead of vanishing, while still never downgrading anything.
+        else:
+            # A stale attribution failure says nothing once a cost has already been attributed.
+            if current == "delivering":
+                return
+            attempts = int(status.reconcile_attempts or 0) + 1
+            status.reconcile_attempts = attempts
+            status.reconcile_error = error
+            status.reconcile_state = "unattributable" if attempts >= max_attempts else "pending"
+        _freeze_teardown_before_bump(status)
+        status.updated_at = time.time()
+        # Space attempts out in WALL TIME so restarts can't accelerate the budget (see the field).
+        if retry_after > 0:
+            status.reconcile_next_attempt_at = status.updated_at + retry_after
+        _save_status_unlocked(status)
+    _report_status(status)
+
+
+def record_attributed_cost(run_id: str, *, realized_cost_usd: float, report: dict) -> bool:
+    """Persist a cost the provider HAS returned, before attempting delivery to the backend.
+
+    Returns True when this call ACQUIRED the delivery state, i.e. the caller now owns delivering this
+    payload. Returns False when the run is already ``reconciled`` -- a concurrent pass won while this
+    one was still fetching from the provider, so this pass holds a stale result. The caller MUST NOT
+    deliver on False: the backend upserts by runId, so posting a stale body would overwrite an
+    already-settled row (and record_realized_cost would then overwrite the local value too), which
+    matters whenever the provider invoice changed between the two pulls.
+
+    This is also the hinge that makes delivery independent of the provider. Previously a failed POST
+    threw the computed cost away and the next sweep re-queried the provider; if provider access lapsed
+    during a backend outage (rotated credentials, purged endpoint) those later pulls burned the
+    attribution budget and the run was marked ``unattributable`` -- discarding a cost we already had.
+
+    Recording the attribution also CLEARS ``reconcile_attempts``: the run is now proven attributable,
+    so any earlier failures (including a stale concurrent pass that had marked it ``unattributable``)
+    are moot. ``reconciled`` is never downgraded."""
+    with _status_guard(run_id):
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return False
+        if status.reconcile_state in ("reconciled", "delivering"):
+            # `reconciled`: a concurrent pass already delivered; this body is stale.
+            # `delivering`: another pass already OWNS delivery of its own independently-fetched body.
+            # Accepting a second owner would let both POST, and since record_realized_cost has no
+            # ownership CAS the later completion could overwrite both the backend row and the local
+            # value with whichever invoice happened to finish last. Exactly one owner stages; the
+            # loser does nothing and the staged payload is delivered (or retried) by its owner.
+            return False
+        status.realized_cost_usd = realized_cost_usd
+        status.reconcile_report = dict(report)
+        status.reconcile_state = "delivering"
+        status.reconcile_attempts = 0
+        status.reconcile_error = None
+        status.reconcile_next_attempt_at = None  # attributed; deliver as soon as we can
+        _freeze_teardown_before_bump(status)
+        status.updated_at = time.time()
+        _save_status_unlocked(status)
+    _report_status(status)
+    return True
 
 
 _BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
@@ -2233,6 +2409,28 @@ def _save_status_unlocked(
     # write-then-rename so concurrent readers never see a half-written file.
     path = runs_file_path(status.run_id, ".json")
     existing = _load_status_json(status.run_id) if os.path.exists(path) else {}
+    # Remember the last non-null provider handle for COST ATTRIBUTION ONLY. `remote` is the LIVE
+    # handle and is deliberately cleared once a resource is torn down -- but cancel_run tears down and
+    # clears it BEFORE writing the billable `cancelled` state (deploy._clear_exact_remote), so a run
+    # that burned real GPU time and IS charged would reach reconciliation with nothing to attribute
+    # cost from: never swept, never even marked unattributable, silently pending forever. This
+    # snapshot is never cleared and is read only by reconciliation; recovery/teardown continue to use
+    # `remote` so nothing here can resurrect a torn-down resource.
+    #
+    # Two sources, in order, so the handle cannot slip through:
+    #   1. the handle being written now -- tracks the LATEST live handle (not the first), since
+    #      attribution uses the run's last persisted handle when it retried across resources;
+    #   2. failing that, the handle ALREADY ON DISK that this very write is about to drop. Relying on
+    #      (1) alone assumes the in-memory record carries a snapshot a previous save happened to
+    #      write; a caller that clears `remote` on a status built without one would silently lose the
+    #      only copy. Reading the outgoing value from `existing` makes the clearing write itself the
+    #      capture point, so teardown ordering stops mattering.
+    if status.remote:
+        status.reconcile_remote = dict(status.remote)
+    elif not status.reconcile_remote:
+        outgoing = existing.get("remote")
+        if isinstance(outgoing, dict) and outgoing:
+            status.reconcile_remote = dict(outgoing)
     existing_sequence = _valid_status_report_sequence(existing.get("report_sequence", 0))
     current_sequence = _valid_status_report_sequence(status.report_sequence)
     with _STATUS_REPORT_LOCK:

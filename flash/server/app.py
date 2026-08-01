@@ -47,6 +47,7 @@ from ._runtime import (
     _charge_retry_loop,
     _charge_retry_startup,
     _reconcile_cost_loop,
+    _reconcile_cost_startup,
     _repo_cleanup_loop,
     _worker_artifacts,
     recover_runs,
@@ -77,6 +78,7 @@ __all__ = [
     "_charge_retry_startup",
     "_deploy_lock",
     "_reconcile_cost_loop",
+    "_reconcile_cost_startup",
     "_repo_cleanup_loop",
     "_worker_artifacts",
     "adapter_alias_target",
@@ -407,6 +409,13 @@ def create_app():
             reconcile_endpoint_slots()
         # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
         # internal key is configured.
+        # Prompt first pass: the periodic loop below sleeps a full interval before its first
+        # sweep, so without this a plane that restarts more often than that never reconciles
+        # anything. Background task (not awaited) so a backlog of slow provider pulls can't delay
+        # the lifespan from accepting traffic.
+        startup_cost_task = (
+            asyncio.create_task(_reconcile_cost_startup()) if reconcile_enabled() else None
+        )
         cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
         # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
         # so it can't leak revenue. Same internal-key gate as the charge itself.
@@ -443,6 +452,7 @@ def create_app():
                 await startup_report_task
             for task in (
                 startup_charge_task,
+                startup_cost_task,
                 cost_task,
                 charge_task,
                 reap_task,
