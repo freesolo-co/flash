@@ -373,6 +373,37 @@ def test_chat_checkpoint_capability_is_probed_once_per_client(stub):
     assert seen["health_calls"] == 2
 
 
+def test_warming_the_capability_serves_later_chats_from_the_cache(stub):
+    # a caller about to fan out settles the check up front, so its workers inherit the cached
+    # answer instead of every one of them missing the cold cache at once and firing its own
+    # /v1/health (codex[bot]). a target with no step selector needs nothing and must stay silent.
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    client.warm_chat_step_selector("run-a@step-40." + "a" * 40)
+    assert seen.get("health_calls") is None
+
+    client.warm_chat_step_selector("run-a/step-40")
+    assert seen["health_calls"] == 1
+
+    for _ in range(3):
+        client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
+    assert seen["health_calls"] == 1
+
+
+def test_warming_the_capability_raises_on_a_plane_that_lacks_it(stub):
+    # the warm-up must not swallow a genuine capability failure into a silently uncached state:
+    # it raises exactly what the per-request check raises, so the caller fails before fanning out.
+    url, seen = stub
+    seen["old_chat_server"] = True
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ClientError, match="chat_step_selector_v1"):
+        client.warm_chat_step_selector("run-a/step-40")
+
+    assert "body" not in seen
+
+
 def test_chat_checkpoint_capability_failure_is_not_cached(stub):
     # only a positive result is cached: a plane that genuinely lacks the capability must keep
     # failing, not fall through to an unsupported request on the second call.

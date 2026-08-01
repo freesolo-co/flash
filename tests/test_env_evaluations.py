@@ -553,6 +553,68 @@ def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys
     assert output.index("case first: PASS") < output.index("case second: PASS")
 
 
+def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
+    monkeypatch, tmp_path
+) -> None:
+    # the client caches the step-selector capability only after the check succeeds, so workers
+    # starting together all miss the cold cache and each fire their own /v1/health -- one eval's
+    # worth of duplicate requests for a fact about the control plane that cannot differ between
+    # them (codex[bot]). settling it once on this thread first is what collapses them, so assert
+    # the ordering: the warm-up happens before any worker runs, not concurrently with them.
+    #
+    # only a surviving `RUN/step-N` reaches this at all. a full revision carries no step, and a
+    # shorthand whose live deployment is at that same step is pinned to the revision before
+    # generation -- so the case under test is the one the CLI deliberately forwards unpinned:
+    # asked for step-3 while step-20 is deployed, the server resolves it against its ledger.
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'many'\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id=f'c{i}', input='hi', expected='hi') for i in range(6)\n"
+        "    ]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    events: list[str] = []
+    lock = threading.Lock()
+
+    class Client:
+        def get_run(self, run_id):
+            return {"spec": {"thinking": False}}
+
+        def deployments(self):
+            # step-20 is live, so the requested step-3 shorthand is NOT pinned to a revision and
+            # arrives at the fan-out still carrying its step selector.
+            return [
+                {
+                    "run_id": "flash-1",
+                    "deployment": {
+                        "state": "ready",
+                        "checkpoint_step": 20,
+                        "adapter_revision": "flash-1@step-20." + "a" * 40,
+                    },
+                }
+            ]
+
+        def warm_chat_step_selector(self, target):
+            with lock:
+                events.append(f"warm:{target}")
+
+        def chat_stream(self, target, messages, **kwargs):
+            with lock:
+                events.append("chat")
+            yield "hi"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir), "--concurrency", "4"]) == 0
+
+    # exactly one warm-up, and it precedes every chat -- a per-worker check would interleave.
+    assert events == ["warm:flash-1/step-3"] + ["chat"] * 6
+
+
 def test_env_eval_rejects_invalid_target_before_loading(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "flash.client.client_from_config",
