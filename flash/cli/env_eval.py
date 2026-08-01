@@ -644,11 +644,23 @@ def cmd_env_eval(args) -> int:
             _err(f"env eval failed: run {args.target} is not deployed")
             return _err("overall: FAIL")
         deployment_state = deployment.get("state")
-        if deployment_state not in _READY_DEPLOYMENT_STATES | _BUSY_DEPLOYMENT_STATES:
+        if (
+            want_step is None
+            and deployment_state not in _READY_DEPLOYMENT_STATES | _BUSY_DEPLOYMENT_STATES
+        ):
             # having a record is not having a servable one: the listing keeps terminal states like
             # `failed` and `revocation_failed`, and the chat route has no ready predecessor to fall
             # back to for them, so every case 409s. That spends a whole suite of generation
             # failures to learn what one target error says now (chatgpt-codex-connector).
+            #
+            # Only for a bare alias. A pinned step does not go through the deployment record at
+            # all: the chat route resolves `RUN/step-N` against the verified ledger and, once it
+            # resolves, `has_ready_deploy` is already true, so the terminal-state arms below it
+            # never run (`flash/server/routes/serving.py`). And `mark_deployment_failed` leaves
+            # that ledger intact -- only undeploy and revocation invalidate it -- so a step
+            # verified before a LATER deploy failed still serves. Refusing it here would fail an
+            # evaluation the server answers 200 (Cursor). A step that genuinely is not in the
+            # ledger still gets one 409 naming the deployed steps, not a suite of them.
             _err(
                 f"env eval failed: run {args.target} deployment is {deployment_state or 'unknown'}"
                 f"; run `{CLI_NAME} models deploy {run_id}` first"

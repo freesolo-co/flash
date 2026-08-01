@@ -498,6 +498,46 @@ def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
     assert "overall: FAIL" in captured
 
 
+def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp_path) -> None:
+    """A failed deployment record does not un-verify the steps already in the run's ledger.
+
+    The check above refuses a terminal record because a bare alias has nothing left to serve it.
+    A pinned step does not go through that record at all: the chat route resolves `RUN/step-N`
+    against the verified ledger, and once it resolves, `has_ready_deploy` is true and the
+    terminal-state arms never run (`flash/server/routes/serving.py`). `mark_deployment_failed`
+    leaves that ledger alone -- only undeploy and revocation invalidate it -- so a step verified
+    before a LATER deploy failed still answers 200, and refusing it here failed an evaluation the
+    server runs correctly (Cursor).
+    """
+    env_dir = _upload_env_dir(tmp_path)
+
+    class Client:
+        def __init__(self):
+            self.targets = []
+
+        def get_run(self, run_id):
+            return {"spec": {"thinking": False}}
+
+        def deployments(self):
+            # the newest attempt failed; step-3 was verified by an earlier, successful one.
+            return [{"run_id": "flash-1", "deployment": {"state": "failed"}}]
+
+        def warm_chat_step_selector(self, target):
+            return None
+
+        def chat_stream(self, target, messages, **kwargs):
+            self.targets.append(target)
+            yield "4"
+
+    client = Client()
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
+
+    assert cli.main(["env", "eval", "flash-1/step-3", str(env_dir)]) == 0
+    # forwarded as written: the ledger the server resolves it against is not readable from here.
+    assert client.targets == ["flash-1/step-3"]
+
+
 def test_env_eval_never_pins_the_revision_a_rollout_is_heading_to(
     monkeypatch, tmp_path, capsys
 ) -> None:
