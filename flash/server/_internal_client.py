@@ -35,7 +35,10 @@ def run_org_id(status: Any) -> str:
     order), each isinstance-guarded against a non-dict legacy value; ``""`` if none. NOTE: this is the
     OPPOSITE order to ``run_registry`` (which prefers ``platform_context`` — see its comment); the two
     are intentionally different, do not conflate them."""
-    for ctx in (getattr(status, "billing_context", None), getattr(status, "platform_context", None)):
+    for ctx in (
+        getattr(status, "billing_context", None),
+        getattr(status, "platform_context", None),
+    ):
         if isinstance(ctx, dict):
             org = str(ctx.get("org_id") or "").strip()
             if org:

@@ -35,7 +35,6 @@ def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
     return rows, examples
 
 
-
 def grpo_overrides() -> dict:
     """GRPO knobs from job spec's [train] table; omits unset fields so recipe defaults apply."""
     if not _w.JOB_SPEC:
@@ -67,8 +66,6 @@ def card_vram_gb() -> float | None:
         return torch.cuda.get_device_properties(0).total_memory / 1e9
     except Exception:
         return None
-
-
 
 
 def grpo_mask_truncated_completions(train) -> bool:

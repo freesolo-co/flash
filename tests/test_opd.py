@@ -1068,7 +1068,9 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
     need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
     assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
-    assert not supports_fp8_kv(cheapest_gpu(need))  # ...on the A100 (sm80), which does NOT use fp8 KV
+    assert not supports_fp8_kv(
+        cheapest_gpu(need)
+    )  # ...on the A100 (sm80), which does NOT use fp8 KV
 
 
 def test_gdn_fp8_exclusion_survives_a_pinned_revision():
@@ -1769,9 +1771,7 @@ def test_teacher_http_error_diagnostic_omits_opaque_response_body(monkeypatch):
         client.score("P", "hi")
 
     detail = str(exc_info.value)
-    formatted = "".join(
-        traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb)
-    )
+    formatted = "".join(traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb))
     assert exc_info.value.permanent is True
     assert "teacher HTTP 403" in detail
     assert "/completions" in detail
@@ -2251,8 +2251,7 @@ def test_live_kimi_multimodal_teacher_conditions_red_completion_on_image():
         return f"data:image/png;base64,{encoded}"
 
     prompt = (
-        "User: <|media_pad|>\nWhat color is this image? Reply with one lowercase word.\n"
-        "Assistant: "
+        "User: <|media_pad|>\nWhat color is this image? Reply with one lowercase word.\nAssistant: "
     )
     client = TeacherClient(
         os.environ["FIREWORKS_API_KEY"],
@@ -2265,9 +2264,7 @@ def test_live_kimi_multimodal_teacher_conditions_red_completion_on_image():
             (prompt, "red", [data_uri((20, 20, 220))]),
         ]
     )
-    delta = sum(token.logprob for token in red_tokens) - sum(
-        token.logprob for token in blue_tokens
-    )
+    delta = sum(token.logprob for token in red_tokens) - sum(token.logprob for token in blue_tokens)
 
     assert delta > 0.05
 
@@ -2378,9 +2375,7 @@ class _TinyLM:
         "accounts/fireworks/models/deepseek-v4-pro",
     ],
 )
-def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(
-    monkeypatch, teacher_model
-):
+def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(monkeypatch, teacher_model):
     """An image dataset paired with a text-only teacher must fail before any paid GPU work.
 
     Runs against the verl worker, which owns the whole OPD path. The rejection is the load-bearing
@@ -2398,9 +2393,7 @@ def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(
         is_tool_env=False,
         multi_turn=False,
         dataset=lambda: [{"image": "dataset/red.png"}],
-        prompt_messages=lambda _record: [
-            {"role": "user", "content": [{"type": "image"}]}
-        ],
+        prompt_messages=lambda _record: [{"role": "user", "content": [{"type": "image"}]}],
     )
     train = SimpleNamespace(
         init_from_adapter="",

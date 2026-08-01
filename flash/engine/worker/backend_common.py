@@ -286,9 +286,7 @@ def resolve_verl_device_capability(python_bin: str) -> tuple[int, int] | None:
         "print(tuple(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else ())"
     )
     try:
-        out = subprocess.run(
-            [python_bin, "-c", probe], capture_output=True, text=True, timeout=120
-        )
+        out = subprocess.run([python_bin, "-c", probe], capture_output=True, text=True, timeout=120)
         cc = ast.literal_eval((out.stdout or "").strip().splitlines()[-1])
         return (int(cc[0]), int(cc[1]))
     except Exception as e:
@@ -1177,7 +1175,7 @@ def render_wandb_link_shim() -> str:
     never raises. wandb is optional and a logging link must not be able to abort paid training, so
     every failure path leaves the run unlinked instead of dead.
     """
-    return f'''
+    return f"""
 # --- flash: report the w&b run link to the parent (see backend_common.render_wandb_link_shim) ---
 try:
     import json as _flash_wandb_json
@@ -1204,7 +1202,7 @@ try:
     _flash_wandb.init = _flash_wandb_init_reporting
 except Exception:
     pass
-'''
+"""
 
 
 def parse_wandb_link(line: str) -> dict | None:

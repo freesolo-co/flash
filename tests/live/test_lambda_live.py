@@ -38,7 +38,9 @@ def test_lambda_list_filesystems_is_reachable():
     from flash.providers.lambdalabs import api as lambda_api
 
     fses = lambda_api.list_filesystems()
-    assert isinstance(fses, list)  # read-only; the cache create/delete lifecycle is exercised offline
+    assert isinstance(
+        fses, list
+    )  # read-only; the cache create/delete lifecycle is exercised offline
 
 
 def test_lambda_provider_hourly_rate():

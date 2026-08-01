@@ -360,9 +360,7 @@ def _prompt_pool_fingerprint(prompts: list[_BridgePrompt]) -> str:
         if prompt.example is not None:
             fingerprint_fields.append(prompt.example)
         if prompt.image_descriptors:
-            fingerprint_fields.extend(
-                [prompt.teacher_messages, list(prompt.image_descriptors)]
-            )
+            fingerprint_fields.extend([prompt.teacher_messages, list(prompt.image_descriptors)])
         payload = json.dumps(
             fingerprint_fields,
             sort_keys=True,
@@ -387,7 +385,9 @@ def _normalize_prompt_ids(value) -> tuple[int, ...]:
         value = value[0]
     if not isinstance(value, list):
         raise TypeError("processor prompt input_ids must be list-like")
-    return tuple(int(token_id.item() if hasattr(token_id, "item") else token_id) for token_id in value)
+    return tuple(
+        int(token_id.item() if hasattr(token_id, "item") else token_id) for token_id in value
+    )
 
 
 def _processor_expanded_prompt_ids(
@@ -532,7 +532,9 @@ class _TeacherAlignmentBridge:
         self.teacher_input_tokens = int(state.get("teacher_input_tokens", 0))
         self.aligned_sequences = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
         self.empty_alignments = int(
-            state.get("empty_alignments", dict(state.get("skip_counts", {})).get("empty_alignment", 0))
+            state.get(
+                "empty_alignments", dict(state.get("skip_counts", {})).get("empty_alignment", 0)
+            )
         )
         self.truncated_rollouts = int(state.get("truncated_rollouts", 0))
         self.forced_tokens = int(state.get("forced_tokens", 0))
@@ -710,7 +712,9 @@ class _TeacherAlignmentBridge:
         prompt_length = int(prompt_length)
         sequence_ids = [int(token_id) for token_id in sequence_ids]
         if prompt_length != len(prompt_ids) or sequence_ids[:prompt_length] != prompt_ids:
-            raise ValueError("verl rollout prompt ids do not exactly match the frozen flash prompt pool")
+            raise ValueError(
+                "verl rollout prompt ids do not exactly match the frozen flash prompt pool"
+            )
         response_ids = sequence_ids[prompt_length:]
         forced = _validate_forced_mask(
             forced,
@@ -899,7 +903,9 @@ class _TeacherAlignmentBridge:
                     initial_messages, source="environment initial prompt"
                 )
             if initial_messages != prompt.student_messages:
-                raise ValueError("multi-turn environment initial prompt changed after prompt freezing")
+                raise ValueError(
+                    "multi-turn environment initial prompt changed after prompt freezing"
+                )
             per_example_limit = state.get("max_episode_turns")
             if per_example_limit is not None:
                 try:
@@ -909,7 +915,9 @@ class _TeacherAlignmentBridge:
                         "multi-turn environment returned an invalid per-example turn limit"
                     ) from error
                 if per_example_limit <= 0:
-                    raise ValueError("multi-turn environment requires a positive per-example turn limit")
+                    raise ValueError(
+                        "multi-turn environment requires a positive per-example turn limit"
+                    )
             turn_limit = min(self.max_turns, per_example_limit or self.max_turns)
             self._sessions[session_id] = {
                 "index": int(index),
@@ -948,7 +956,9 @@ class _TeacherAlignmentBridge:
             if termination != "truncated" or skip_reason != "truncated_rollout":
                 raise ValueError("multi-turn truncated assistant turn has inconsistent metadata")
             if response_ids != raw_response_ids:
-                raise ValueError("multi-turn truncated assistant ids must preserve the sampled span")
+                raise ValueError(
+                    "multi-turn truncated assistant ids must preserve the sampled span"
+                )
         elif termination == "eos":
             if self.eos_token_ids.isdisjoint(raw_response_ids):
                 raise ValueError("multi-turn eos termination is not present in the sampled ids")
@@ -1015,9 +1025,7 @@ class _TeacherAlignmentBridge:
             context_messages = [dict(message) for message in session["messages"]]
             state = session["state"]
             self.active_env.record_model_turn(state, completion_text)
-            session["messages"].append(
-                {"role": "assistant", "content": completion_text}
-            )
+            session["messages"].append({"role": "assistant", "content": completion_text})
             terminal = bool(payload.get("truncated")) or bool(skip_reason)
             messages: list[dict] = []
             next_prefix = [*accepted_prefix, *response_ids]
@@ -1081,15 +1089,12 @@ class _TeacherAlignmentBridge:
                 return copy.deepcopy(cached["result"])
             turns = list(session["turns"])
             results = [
-                self._empty(len(turn["prompt_ids"]), len(turn["response_ids"]))
-                for turn in turns
+                self._empty(len(turn["prompt_ids"]), len(turn["response_ids"])) for turn in turns
             ]
             scorable = [
                 position
                 for position, turn in enumerate(turns)
-                if not turn["truncated"]
-                and not turn["skip_reason"]
-                and turn["response_ids"]
+                if not turn["truncated"] and not turn["skip_reason"] and turn["response_ids"]
             ]
             if scorable:
                 items = [
@@ -1184,9 +1189,7 @@ class _TeacherAlignmentBridge:
                 self.mutation_callback()
             except Exception as error:
                 classification = (
-                    "transient"
-                    if isinstance(error, _w.RetriableInfraError)
-                    else "permanent"
+                    "transient" if isinstance(error, _w.RetriableInfraError) else "permanent"
                 )
                 callback_failure = self._record_mutation_callback_failure(
                     classification,
@@ -1277,16 +1280,12 @@ class _TeacherAlignmentBridge:
                         )
                     if teacher_delivery_failure:
                         if recovered_teacher_failure is not None:
-                            bridge._promote_recovered_teacher_failure(
-                                recovered_teacher_failure
-                            )
+                            bridge._promote_recovered_teacher_failure(recovered_teacher_failure)
                         else:
                             bridge._record_teacher_delivery_failure(error)
                     elif self.path == "/score":
                         if recovered_teacher_failure is not None:
-                            bridge._promote_recovered_teacher_failure(
-                                recovered_teacher_failure
-                            )
+                            bridge._promote_recovered_teacher_failure(recovered_teacher_failure)
                         else:
                             bridge._record_teacher_failure(classification, str(error))
                     elif self.path == "/multiturn/score":
@@ -1388,7 +1387,9 @@ class _OpdProgressState:
             d_aligned = aligned - self._prev_aligned
             d_cov = cov_sum - self._prev_cov_sum
             self._prev_aligned, self._prev_cov_sum = aligned, cov_sum
-            coverage = (d_cov / d_aligned) if d_aligned > 0 else (cov_sum / aligned if aligned else 0.0)
+            coverage = (
+                (d_cov / d_aligned) if d_aligned > 0 else (cov_sum / aligned if aligned else 0.0)
+            )
             self.coverage_curve.append(coverage)
             snapshot.update(
                 {
@@ -1595,16 +1596,12 @@ def build_opd_overrides(config: dict) -> list[str]:
         "trainer.max_actor_ckpt_to_keep=null",
     ]
     if config.get("multi_turn"):
-        overrides.append(
-            f"actor_rollout_ref.rollout.prompt_length={_hydra_val(max_tokens)}"
-        )
+        overrides.append(f"actor_rollout_ref.rollout.prompt_length={_hydra_val(max_tokens)}")
     structured_outputs = config.get("structured_outputs")
     if structured_outputs:
         structured_outputs_config = {
             "backend": "xgrammar",
-            "disable_any_whitespace": bool(
-                structured_outputs.get("disable_any_whitespace", False)
-            ),
+            "disable_any_whitespace": bool(structured_outputs.get("disable_any_whitespace", False)),
         }
         reasoning_parser = reasoning_parser_for(
             thinking=bool(config.get("thinking", False)),
@@ -1619,11 +1616,9 @@ def build_opd_overrides(config: dict) -> list[str]:
     return overrides
 
 
-def _render_opd_sitecustomize(
-    *, save_at_steps: tuple[int, ...], total_steps: int
-) -> str:
+def _render_opd_sitecustomize(*, save_at_steps: tuple[int, ...], total_steps: int) -> str:
     required_steps = tuple(int(step) for step in save_at_steps)
-    return f'''# generated flash opd runtime patches for verl 0.8
+    return f"""# generated flash opd runtime patches for verl 0.8
 from verl.utils.checkpoint.checkpoint_handler import CheckpointHandler as _FlashCheckpointHandler
 
 _flash_required_save_steps = frozenset({required_steps!r})
@@ -1638,7 +1633,7 @@ def _flash_save_exact_checkpoint(self, step):
 
 
 _FlashCheckpointHandler.save_checkpoint = _flash_save_exact_checkpoint
-'''
+"""
 
 
 def _build_opd_child_env(
@@ -1872,25 +1867,17 @@ def _raise_verl_failure(
     if cycle_commit_failure is not None:
         classification, message = cycle_commit_failure
         if classification == "transient":
-            raise _w.RetriableInfraError(
-                f"pre-update cycle commitment failure: {message}"
-            )
-        raise RuntimeError(
-            f"permanent pre-update cycle commitment failure: {message}"
-        )
+            raise _w.RetriableInfraError(f"pre-update cycle commitment failure: {message}")
+        raise RuntimeError(f"permanent pre-update cycle commitment failure: {message}")
     if no_signal_failure is not None:
         classification, message = no_signal_failure
         if classification == "transient":
-            raise _w.RetriableInfraError(
-                f"transient no-signal notification failure: {message}"
-            )
+            raise _w.RetriableInfraError(f"transient no-signal notification failure: {message}")
         raise RuntimeError(f"permanent no-signal notification failure: {message}")
     if score_delivery_failure is not None:
         classification, message = score_delivery_failure
         if classification == "transient":
-            raise _w.RetriableInfraError(
-                f"transient teacher score delivery failure: {message}"
-            )
+            raise _w.RetriableInfraError(f"transient teacher score delivery failure: {message}")
         raise RuntimeError(f"permanent teacher score delivery failure: {message}")
     if teacher_failure is not None:
         classification, message = teacher_failure
@@ -2042,9 +2029,7 @@ def _restore_verl_resume(
     return step, state
 
 
-def _processed_resume_steps(
-    required_steps: tuple[int, ...], resume_step: int
-) -> set[int]:
+def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
     processed = _durable_required_save_steps(required_steps, resume_step)
     if resume_step and resume_step not in required_steps:
         processed.add(resume_step)
@@ -2184,7 +2169,9 @@ def run_opd_train(spec=None) -> None:
             _prepped[0] += 1
             messages = env.prompt_messages(example)
             if multi_turn:
-                messages = validate_transcript_messages(messages, source="environment initial prompt")
+                messages = validate_transcript_messages(
+                    messages, source="environment initial prompt"
+                )
             if record_has_images(example, messages):
                 assert processor is not None
                 normalized = normalize_prompt_images(example, messages, package_root)
@@ -2317,7 +2304,12 @@ def run_opd_train(spec=None) -> None:
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
     warmstart_adapter = _warmstart_adapter_path(model_id, model_revision, lora_rank)
-    python_bin = resolve_verl_python(workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY")))
+    # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv and
+    # installs the training stack, minutes long with nothing to report and no liveness thread running.
+    with liveness_heartbeat("opd_configuring"):
+        python_bin = resolve_verl_python(
+            workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+        )
     model_path = _cached_model_path(model_id, model_revision)
     gpu_count = int(getattr(spec.gpu, "count", 1) or 1)
     save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else knobs.save_every
@@ -2446,9 +2438,7 @@ def run_opd_train(spec=None) -> None:
             group_size=knobs.group_size,
             accounting_state=progress_state.checkpoint_state,
         )
-        watcher.processed_steps.update(
-            _processed_resume_steps(knobs.save_at_steps, resume_step)
-        )
+        watcher.processed_steps.update(_processed_resume_steps(knobs.save_at_steps, resume_step))
         child_env = _build_opd_child_env(
             shim_dir=shim_dir,
             wandb_enabled="wandb" in loggers,
@@ -2556,14 +2546,10 @@ def run_opd_train(spec=None) -> None:
                 _read_abandonment_failure_fallback(abandonment_failure_path),
             ),
         )
-        fallback_mutation_failure = _read_mutation_failure_fallback(
-            mutation_failure_path
-        )
+        fallback_mutation_failure = _read_mutation_failure_fallback(mutation_failure_path)
         if fallback_mutation_failure is not None:
             bridge._record_mutation_failure(*fallback_mutation_failure)
-        cycle_commit_failure = _read_cycle_commit_failure_fallback(
-            cycle_commit_failure_path
-        )
+        cycle_commit_failure = _read_cycle_commit_failure_fallback(cycle_commit_failure_path)
         _raise_verl_failure(
             return_code,
             bridge.teacher_failure,
@@ -2616,13 +2602,19 @@ def run_opd_train(spec=None) -> None:
                 python_bin=python_bin,
             )
             _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-            if final_save_due(final_step, knobs.save_at_steps) and final_step not in watcher.processed_steps:
-                _w.publish_deployable_checkpoint(
-                    adapter_dir, final_step, _provenance_ready=True
-                )
+            if (
+                final_save_due(final_step, knobs.save_at_steps)
+                and final_step not in watcher.processed_steps
+            ):
+                _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
 
         setup_seconds = train_started_at - started_at
-        _w.heartbeat("opd_trained", step=final_step, train_wall=train_wall, gpu=_w.gpu_diagnostics(include_torch=False))
+        _w.heartbeat(
+            "opd_trained",
+            step=final_step,
+            train_wall=train_wall,
+            gpu=_w.gpu_diagnostics(include_torch=False),
+        )
         _w.write_train_meta(
             phase="opd",
             step=final_step,
@@ -2664,9 +2656,7 @@ def run_opd_train(spec=None) -> None:
                 ),
                 "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
                 "forced_tokens": int(final_accounting["forced_tokens"]),
-                "dropped_forced_groups": int(
-                    final_accounting["dropped_forced_groups"]
-                ),
+                "dropped_forced_groups": int(final_accounting["dropped_forced_groups"]),
                 "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
                 "aligned_sequences": int(final_accounting["aligned_sequences"]),
                 "empty_alignments": int(final_accounting["empty_alignments"]),

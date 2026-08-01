@@ -102,7 +102,9 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
 
     import flash.engine.worker as ne
 
-    monkeypatch.setenv("HF_REPO", "")  # scoped to this test (auto-restored), not a raw os.environ write
+    monkeypatch.setenv(
+        "HF_REPO", ""
+    )  # scoped to this test (auto-restored), not a raw os.environ write
 
     # Clear stale upload temp files up front so the end-of-test "no temp files" assertion isn't a false
     # failure against cruft from a prior failed run or another process on the same host.

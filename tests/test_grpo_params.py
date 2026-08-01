@@ -223,7 +223,7 @@ def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypa
 
     config = tmp_path / "grpo.toml"
     config.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'model = "Qwen/Qwen3.5-0.8B"',
                 'algorithm = "grpo"',
@@ -384,7 +384,10 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     # user-supplied -> rejected as an unknown [train] key (managed, not user-authorable)
     with pytest.raises(ConfigError, match="hf_repo"):
         spec_from_dict(
-            {**raw, "train": {"epochs": 1, "max_examples": 10, "hf_repo": "someone-else/their-repo"}},
+            {
+                **raw,
+                "train": {"epochs": 1, "max_examples": 10, "hf_repo": "someone-else/their-repo"},
+            },
             run_id="hf-y",
         )
 
@@ -519,9 +522,13 @@ def test_grpo_rejects_single_generation_group_before_paid_worker() -> None:
     }
 
     with pytest.raises(ConfigError, match=r"group_size.*>= 2.*GRPO"):
-        spec_from_dict({**base, "train": {"epochs": 1, "max_examples": 8, "group_size": 1}}, run_id="bad")
+        spec_from_dict(
+            {**base, "train": {"epochs": 1, "max_examples": 8, "group_size": 1}}, run_id="bad"
+        )
 
-    spec = spec_from_dict({**base, "train": {"epochs": 1, "max_examples": 8, "group_size": 2}}, run_id="ok")
+    spec = spec_from_dict(
+        {**base, "train": {"epochs": 1, "max_examples": 8, "group_size": 2}}, run_id="ok"
+    )
     assert spec.train.group_size == 2
 
 
