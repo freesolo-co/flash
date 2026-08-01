@@ -17,7 +17,5 @@ def ensure_auth() -> str:
     """Collapse RUNPOD_API_KEY to the active key — the SDK sends the raw env var verbatim, so a comma-separated pool would 401."""
     key = _keys.select_active()
     if not key:
-        raise RuntimeError(
-            "no RunPod API key found; set RUNPOD_API_KEY on the control-plane host"
-        )
+        raise RuntimeError("no RunPod API key found; set RUNPOD_API_KEY on the control-plane host")
     return key

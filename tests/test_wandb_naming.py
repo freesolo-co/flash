@@ -169,7 +169,7 @@ def test_report_to_inits_wandb_from_spec_without_env(monkeypatch):
     monkeypatch.setattr(
         importlib.util,
         "find_spec",
-        lambda name, *a, **k: (object() if name == "wandb" else _orig_find(name, *a, **k)),
+        lambda name, *a, **k: object() if name == "wandb" else _orig_find(name, *a, **k),
     )
     monkeypatch.setenv("WANDB_API_KEY", "k")
     monkeypatch.delenv("WANDB_PROJECT", raising=False)
@@ -204,7 +204,7 @@ def test_report_to_is_best_effort_when_wandb_init_fails(monkeypatch):
     monkeypatch.setattr(
         importlib.util,
         "find_spec",
-        lambda name, *a, **k: (object() if name == "wandb" else _orig_find(name, *a, **k)),
+        lambda name, *a, **k: object() if name == "wandb" else _orig_find(name, *a, **k),
     )
     monkeypatch.setenv("WANDB_API_KEY", "k")
     monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(project="p", run_name="r")))
@@ -232,9 +232,10 @@ def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, m
         "WANDB_API_KEY": "wb-from-user-file",
     }
     monkeypatch.setenv("SERPAPI_API_KEY", "serp-from-process")
-    assert runtime_secrets_from_local_env(cfg, keys=("SERPAPI_API_KEY",))[
-        "SERPAPI_API_KEY"
-    ] == "serp-from-process"
+    assert (
+        runtime_secrets_from_local_env(cfg, keys=("SERPAPI_API_KEY",))["SERPAPI_API_KEY"]
+        == "serp-from-process"
+    )
     monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
     (tmp_path / ".env").write_text("WANDB_API_KEY=wb-from-user-file\n")
     with pytest.raises(ValueError, match="missing declared environment secret"):

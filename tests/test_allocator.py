@@ -13,7 +13,9 @@ def test_required_vram_catalog_and_open(monkeypatch):
     # MEASURED: tiny-model GRPO OOMs a 20 GB card (vLLM-colocate engine overhead the param
     # estimate missed); floored to the 24 GB vLLM-colocate minimum (_VLLM_COLOCATE_FLOOR_GB).
     assert required_vram_gb("Qwen/Qwen3.5-0.8B", "grpo") == 24
-    assert required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 19  # chunked nll bounds the vocab projection to 256 tokens
+    assert (
+        required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 19
+    )  # chunked nll bounds the vocab projection to 256 tokens
     # open model: sized for GRPO (the heavier phase of the usual SFT+GRPO run) + headroom
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 4.0)
     est = vram.estimate_vram_gb(4.0, "grpo")
@@ -88,7 +90,9 @@ def test_runpod_allocation_lands_on_full_validated_cards():
     assert a27_sft.gpu == "A100 PCIe"
     a27_grpo = allocator.allocate("Qwen/Qwen3.6-27B", "grpo")
     assert a27_grpo.provider == "runpod"
-    assert a27_grpo.gpu == "B200"  # colocated GRPO (trainer + vLLM rollout = two ~54GB copies) needs B200
+    assert (
+        a27_grpo.gpu == "B200"
+    )  # colocated GRPO (trainer + vLLM rollout = two ~54GB copies) needs B200
 
 
 def test_default_max_retries():
@@ -302,8 +306,12 @@ def _stub_alloc(monkeypatch, *, runpod, lambda_, vast):
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
     # allocate() now sources each provider's candidates via provider.live_candidates(need, constraints);
     # adapt the per-provider stubs (runpod/lambda take need; vast takes need + disk/wall) onto that seam.
-    monkeypatch.setattr(get_provider("runpod"), "live_candidates", lambda need, constraints: runpod(need))
-    monkeypatch.setattr(get_provider("lambda"), "live_candidates", lambda need, constraints: lambda_(need))
+    monkeypatch.setattr(
+        get_provider("runpod"), "live_candidates", lambda need, constraints: runpod(need)
+    )
+    monkeypatch.setattr(
+        get_provider("lambda"), "live_candidates", lambda need, constraints: lambda_(need)
+    )
     monkeypatch.setattr(
         get_provider("vast"),
         "live_candidates",
@@ -400,20 +408,56 @@ def test_required_vram_policy_floors_and_downrouting():
     # 9B GRPO is bf16 (QLoRA dropped: the 4-bit vLLM-rollout merge collapsed the GRPO
     # importance ratio -> no learning), so colocated GRPO needs an 80GB-class card.
     assert need("Qwen/Qwen3.5-9B", "grpo") >= 80  # bf16 colocate: 80GB floor
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 2048, "group_size": 8}) >= 80
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 4096, "group_size": 8}) >= 80
+    assert (
+        need(
+            "Qwen/Qwen3.5-9B",
+            "grpo",
+            train={"max_context_tokens": 8192, "max_completion_tokens": 2048, "group_size": 8},
+        )
+        >= 80
+    )
+    assert (
+        need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 4096, "group_size": 8}) >= 80
+    )
     need_27b_sft = need("Qwen/Qwen3.6-27B", "sft")
     need_27b_grpo = need("Qwen/Qwen3.6-27B", "grpo")
     assert need_27b_sft == 80
     assert need_27b_grpo == 150  # colocated-GRPO resident peak -> B200
     # group size and thinking never DECREASE the requirement
-    base = need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4})
-    assert need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 16}) >= base
-    assert need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4}, thinking=True) >= base
+    base = need(
+        m4,
+        "grpo",
+        train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4},
+    )
+    assert (
+        need(
+            m4,
+            "grpo",
+            train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 16},
+        )
+        >= base
+    )
+    assert (
+        need(
+            m4,
+            "grpo",
+            train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4},
+            thinking=True,
+        )
+        >= base
+    )
     # max_tokens (completion length) lifts the fp32-logits term -> a longer completion never sizes
     # DOWN, and a much longer one sizes UP (the term the estimator previously ignored).
-    short_c = need(m4, "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 256, "group_size": 8})
-    long_c = need(m4, "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 8192, "group_size": 8})
+    short_c = need(
+        m4,
+        "grpo",
+        train={"max_context_tokens": 8192, "max_completion_tokens": 256, "group_size": 8},
+    )
+    long_c = need(
+        m4,
+        "grpo",
+        train={"max_context_tokens": 8192, "max_completion_tokens": 8192, "group_size": 8},
+    )
     assert long_c >= short_c
 
 
@@ -464,7 +508,9 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
     # ... but never by more than the logits budget (the per_device=1 floor is capped there)
     assert hi - lo <= vram._LOGITS_BUDGET_GB + 1e-6
     # SFT path ignores max_tokens entirely (no logits-over-completion term there)
-    assert e(2.0, "sft", seq_len=4096, max_tokens=256) == e(2.0, "sft", seq_len=4096, max_tokens=8192)
+    assert e(2.0, "sft", seq_len=4096, max_tokens=256) == e(
+        2.0, "sft", seq_len=4096, max_tokens=8192
+    )
 
 
 def test_opd_vram_estimate_reserves_one_dense_image_loss_peak():
@@ -530,7 +576,12 @@ def test_open_model_opd_applies_colocated_vllm_floor(monkeypatch):
 
     fake_id = "test-org/uncataloged-small-opd"
     assert fake_id not in MODELS
-    train = {"max_context_tokens": 1536, "max_completion_tokens": 128, "batch_size": 1, "group_size": 1}
+    train = {
+        "max_context_tokens": 1536,
+        "max_completion_tokens": 128,
+        "batch_size": 1,
+        "group_size": 1,
+    }
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda _model_id, **_kwargs: 0.8)
     assert model_required_vram_gb(fake_id, "opd", train=train, headroom=1.0) >= 24
@@ -546,10 +597,14 @@ def test_vram_headroom_consistent_across_sizing_paths():
 
     assert allocator.vram_headroom() == 1.1
     # both paths feed model_required_vram_gb the same headroom -> identical sizing
-    a_need = allocator.required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096})
+    a_need = allocator.required_vram_gb(
+        "Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096}
+    )
     from flash.engine.vram import model_required_vram_gb
 
-    direct = model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096}, headroom=1.1)
+    direct = model_required_vram_gb(
+        "Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096}, headroom=1.1
+    )
     assert a_need == direct
 
 
@@ -568,7 +623,11 @@ def test_allocate_never_selects_below_matrix_need():
         ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 1536}),
         ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 8192}),
         ("Qwen/Qwen3.5-4B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
-        ("Qwen/Qwen3.5-4B", "grpo", {"max_context_tokens": 16384, "max_completion_tokens": 4096, "group_size": 8}),
+        (
+            "Qwen/Qwen3.5-4B",
+            "grpo",
+            {"max_context_tokens": 16384, "max_completion_tokens": 4096, "group_size": 8},
+        ),
         ("Qwen/Qwen3.5-4B", "sft", {"max_context_tokens": 32768}),
         ("Qwen/Qwen3.5-9B", "grpo", {"max_context_tokens": 8192, "group_size": 8}),
     ]
@@ -645,7 +704,8 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "epochs": 1,
                 "max_context_tokens": 2048,
                 "max_completion_tokens": 128,
-                "lora_rank": 32,            },
+                "lora_rank": 32,
+            },
             "A100 PCIe",
         ),
         (
@@ -654,7 +714,8 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "epochs": 1,
                 "max_context_tokens": 8192,
                 "max_completion_tokens": 128,
-                "lora_rank": 32,            },
+                "lora_rank": 32,
+            },
             "A100 PCIe",
         ),
         (
@@ -665,7 +726,8 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "epochs": 1,
                 "max_context_tokens": 16384,
                 "max_completion_tokens": 128,
-                "lora_rank": 32,            },
+                "lora_rank": 32,
+            },
             "H200",
         ),
         (
@@ -674,7 +736,8 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "epochs": 1,
                 "max_context_tokens": 24576,
                 "max_completion_tokens": 128,
-                "lora_rank": 32,            },
+                "lora_rank": 32,
+            },
             "H200",
         ),
         (
@@ -684,7 +747,9 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
         ),
     ],
 )
-def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(monkeypatch, label, train, expected_gpu):
+def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(
+    monkeypatch, label, train, expected_gpu
+):
     """Attachment regression: 2B OPD/vLLM dry-runs stayed on 4090/5090-class GPUs.
 
     The submitted worker then OOMed during vLLM rollout initialization. These are the same sweep axes
@@ -907,9 +972,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
                 raw = {
                     "model": model_id,
                     "algorithm": "opd",
-                    "environment": {
-                        "id": "github:freesolo-co/envs@main:gsm8k/environment.py"
-                    },
+                    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
                     "train": dict(train),
                     "gpu": {"type": configured_gpu},
                 }
@@ -1008,24 +1071,16 @@ def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
             if algo not in info.algos:
                 continue
             train = {"epochs": 1, "max_examples": 8}
-            # opsd runs only in reasoning mode (the config gate rejects nonthink opsd), so thread
-            # thinking=true through both the vram sizing and the config for opsd rows so they stay
-            # consistent; other algorithms keep the default thinking=false sizing.
-            row_thinking = algo == "opsd"
-            need = allocator.required_vram_gb(model_id, algo, train=train, thinking=row_thinking)
+            need = allocator.required_vram_gb(model_id, algo, train=train)
 
             for configured_gpu in configured_gpu_types:
                 raw = {
                     "model": model_id,
                     "algorithm": algo,
-                    "environment": {
-                        "id": "github:freesolo-co/envs@main:gsm8k/environment.py"
-                    },
+                    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
                     "train": train,
                     "gpu": {"type": configured_gpu},
                 }
-                if row_thinking:
-                    raw["thinking"] = True
                 key = (model_id, algo, configured_gpu)
                 if get_gpu_info(configured_gpu).vram_gb < need:
                     with pytest.raises(ConfigError, match="requires at least"):
@@ -1081,7 +1136,9 @@ def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
         # cap holds logits <= budget unless pd is already floored to 1 (irreducible)
         assert pd == 1 or logits_gb <= vram._LOGITS_BUDGET_GB + 1e-6, (seq, pd, logits_gb)
         # the cap is TIGHT: one more micro-batch would breach the budget
-        assert (pd + 1) * seq * V * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9 > vram._LOGITS_BUDGET_GB or pd == 4
+        assert (
+            pd + 1
+        ) * seq * V * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9 > vram._LOGITS_BUDGET_GB or pd == 4
     # fused -> no cap, the full micro-batch runs (no needless throughput loss)
     assert vram.sft_per_device(4, seq_len=4096, vocab=V, fused=True) == 4
 
@@ -1348,7 +1405,9 @@ def test_vast_candidates_searches_at_effective_disk(monkeypatch):
     vast = get_provider("vast")
     vast.live_candidates(16, AllocationConstraints())  # default -> floored at MIN_DISK_GB
     assert captured["disk_gb"] == vast_jobs.MIN_DISK_GB
-    vast.live_candidates(16, AllocationConstraints(disk_gb=200.0))  # high-disk run searches at the request
+    vast.live_candidates(
+        16, AllocationConstraints(disk_gb=200.0)
+    )  # high-disk run searches at the request
     assert captured["disk_gb"] == 200.0
     vast.live_candidates(16, AllocationConstraints(disk_gb=10.0))  # below the floor still clamps up
     assert captured["disk_gb"] == vast_jobs.MIN_DISK_GB
@@ -1370,7 +1429,11 @@ def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
 
     monkeypatch.setattr(vast_jobs, "usable_offers", fake_usable)
     vast = get_provider("vast")
-    vast.live_candidates(16, AllocationConstraints())  # default -> no deadline threaded (0 = duration filter off)
+    vast.live_candidates(
+        16, AllocationConstraints()
+    )  # default -> no deadline threaded (0 = duration filter off)
     assert captured["max_wall_seconds"] == 0.0
-    vast.live_candidates(16, AllocationConstraints(max_wall_seconds=7200.0))  # long run threads its wall cap
+    vast.live_candidates(
+        16, AllocationConstraints(max_wall_seconds=7200.0)
+    )  # long run threads its wall cap
     assert captured["max_wall_seconds"] == 7200.0

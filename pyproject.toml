@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.0.32"
+version = "1.0.37"
 description = "Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -36,7 +36,7 @@ gpu = [
     "accelerate>=1.4",
     # Worker runtime: Freesolo environment loading and HF checkpoint I/O.
     "datasets>=2.19",
-    "freesolo>=0.2.60",
+    "freesolo>=0.4.0",
     "huggingface-hub>=1.2.0",
 ]
 # freesolo-chalk (freesolo's custom triton/cuda kernels) is a worker-side package selected by the
@@ -66,7 +66,7 @@ server = [
     "regex>=2024.11.6",
     "huggingface-hub>=1.2.0",
     "datasets>=2.19",
-    "freesolo>=0.2.60",
+    "freesolo>=0.4.0",
     "transformers>=5.6,<5.11",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
@@ -83,7 +83,7 @@ dev = [
     "regex>=2024.11.6",
     "huggingface-hub>=1.2.0",
     "datasets>=2.19",
-    "freesolo>=0.2.60",
+    "freesolo>=0.4.0",
     "transformers>=5.6,<5.11",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
@@ -116,7 +116,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.0.32"
+version = "1.0.37"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -138,7 +138,7 @@ dev = [
     # Offline worker/env tests import these without the heavy `gpu` stack; the CI test env
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
-    "freesolo>=0.2.60",
+    "freesolo>=0.4.0",
 ]
 
 [tool.mypy]
@@ -152,18 +152,65 @@ target-version = "py311"
 extend-exclude = [".venv", "uv-cache"]
 
 [tool.ruff.lint]
-# Matches the backend/agent convention: pycodestyle, pyflakes, import sort,
-# pyupgrade, bugbear, comprehensions, simplify, returns, ruff-specific, perf,
-# pytest-style, fastapi, async, datetime-zone.
-select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RET", "RUF", "PERF", "PT", "FAST", "ASYNC", "DTZ"]
-# E501 (line length) is reported but not enforced as hard failure here; keep code tidy
-# without churn on long, descriptive comments/strings.
-ignore = ["E501", "B008"]
+# Shared strict ruleset. The select/ignore lists below are byte-identical in flash and in freesolo
+# (backend, agent, serving) so a fix that satisfies one repo satisfies the other; change them in
+# every copy or in none. Only per-file-ignores differ, since those name paths in one repo.
+#
+# Beyond the original set (pycodestyle, pyflakes, import sort, pyupgrade, bugbear, comprehensions,
+# simplify, returns, ruff-specific, perf, pytest-style, fastapi, async, datetime-zone) this adds:
+#   N     pep8-naming            ICN   import conventions      A     builtin shadowing
+#   ISC   implicit str concat    G     logging format          EXE   shebang/exec bits
+#   PIE   misc lints             Q     quote consistency       INT   gettext
+#   PYI   stub/typing shape      RSE   raise cleanliness       YTT   sys.version checks
+#   SLOT  __slots__ on subclass  FLY   static join -> f-string ERA   commented-out code
+#   LOG   logging misuse         TID   tidy imports            PGH   blanket noqa/type-ignore
+#   TC    typing-only imports
+select = [
+  "E", "W", "F", "I", "UP", "B", "C4", "SIM", "RET", "RUF", "PERF", "PT", "FAST", "ASYNC", "DTZ",
+  "N", "ISC", "ICN", "G", "PIE", "PYI", "Q", "RSE", "SLOT", "FLY", "LOG", "A", "EXE", "INT", "YTT",
+  "ERA", "PGH", "TC", "TID",
+]
+ignore = [
+  # E501 (line length) is reported by the formatter's own wrapping; keep long descriptive comments
+  # and strings without churn.
+  "E501",
+  # FastAPI/Typer signatures are built on `= Depends(...)` / `= Argument(...)` defaults by design.
+  "B008",
+  # Naming: these fire on deliberate house conventions, not defects.
+  #   `torch.nn.functional as F` and similar canonical aliases, ALL_CAPS locals for
+  #   module-level-ish pins, and internal exceptions named for the condition (`_RunCancelled`)
+  #   rather than `...Error`.
+  "N802", "N803", "N806", "N811", "N812", "N815", "N818",
+  # TC would push runtime-needed imports into `if TYPE_CHECKING`, which breaks the places that
+  # resolve annotations at runtime (pydantic models, FastAPI signatures, get_type_hints).
+  "TC001", "TC002", "TC003",
+  # Mirroring a stdlib/third-party signature (`dir=` on mkdtemp, `requests`' own ConnectionError)
+  # requires shadowing the builtin name; renaming would break the call it is standing in for.
+  "A002",
+  # Sibling modules inside a package are imported relatively on purpose.
+  "TID252",
+]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests do sys.path hacks, importlib.reload, and intentional broad excepts.
-"tests/*" = ["E402", "B011", "F841"]
+"tests/*" = [
+  "E402", "B011", "F841",
+  # Explanatory prose in test bodies reads as commented-out code to ERA.
+  "ERA001",
+  # Fakes stand in for real context managers/namedtuples; they are not typing stubs.
+  "PYI024", "PYI034",
+  # A test may shadow a builtin to mirror the signature it patches.
+  "A001", "A004",
+  # Config fixtures are built as one line-per-key join so the TOML stays readable; an f-string
+  # would collapse them into one long literal.
+  "FLY002",
+]
 # Routes live inside the create_app() closure; with PEP 563 lazy annotations,
 # Annotated[..., Depends(closure_local)] cannot be resolved by get_type_hints,
 # so the definition-time `= Depends(...)` form is required here.
 "flash/server/app.py" = ["FAST002"]
+# `_ScoredResponseText` subclasses `str` to stay grader-compatible while carrying the structured
+# views as attributes; __slots__ would defeat that.
+"flash/envs/adapter.py" = ["SLOT000"]
+# `_RunLock` is never subclassed, so returning the concrete type from __enter__ is correct.
+"flash/server/_locks.py" = ["PYI034"]
