@@ -452,8 +452,13 @@ def _redact_internal_adapter_ref(data: dict) -> None:
 
     A worker/effective or legacy record can persist ``train.init_from_adapter`` as the internal
     storage ref ``<hf_repo>:<phase>/<run_id>[/checkpoints/step-N]``, which embeds the private HF
-    repo. Rewrite it back to the user-facing checkpoint ref (``<run_id>[/step-N]``); a public ref
-    (``parse_adapter_storage_ref`` returns ``None``) is left untouched.
+    repo. Rewrite it back to the user-facing checkpoint ref (``<run_id>[/step-N]``).
+
+    A ref is published only when it is PROVEN user-facing, never merely because this build failed
+    to parse it as internal. Those are different claims: a persisted locator whose phase this build
+    no longer knows (``opsd``, removed in #784) stops parsing as internal, and inferring "public"
+    from that published the private repo verbatim (chatgpt-codex-connector). Unrecognized shapes are
+    dropped, which is what the malformed-prefix branch below has always done.
     """
     train = data.get("train")
     if not isinstance(train, dict):
@@ -461,11 +466,15 @@ def _redact_internal_adapter_ref(data: dict) -> None:
     ref = train.get("init_from_adapter")
     if not isinstance(ref, str) or not ref.strip():
         return
-    from flash.schema import format_checkpoint_ref, parse_adapter_storage_ref
+    from flash.schema import format_checkpoint_ref, parse_adapter_storage_ref, parse_checkpoint_ref
 
+    if parse_checkpoint_ref(ref) is not None:
+        return  # the user-facing grammar, and the only one a submit accepts
     resolved = parse_adapter_storage_ref(ref)
     if resolved is None:
-        return  # already a user-facing ref, not an internal storage locator
+        # Neither grammar: cannot show it is free of a private repo, so do not publish it.
+        train.pop("init_from_adapter", None)
+        return
     _repo, prefix = resolved
     match = re.fullmatch(
         r"(?:sft|rl|opd)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
