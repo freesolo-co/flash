@@ -24,6 +24,8 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from http.server import ThreadingHTTPServer
 
 from flash.diagnostics import sanitize_diagnostic
 
@@ -112,6 +114,63 @@ def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
     if rollout_batch <= 0:
         raise ValueError("rollout_batch must be positive")
     return next(n for n in range(min(cap, rollout_batch), 0, -1) if rollout_batch % n == 0)
+
+
+# worker threads each bridge serves requests from. the bridges are pure i/o relays (parse json,
+# hand the payload to a callback, write json back), so this bounds concurrency, not throughput:
+# requests beyond the pool wait in the listen backlog instead of each spawning an os thread.
+_BRIDGE_WORKER_THREADS = 16
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """an http server that serves requests from a fixed thread pool instead of one thread each.
+
+    ``ThreadingHTTPServer`` starts a new os thread per request and never bounds them. under a real
+    rollout (agent.num_workers x rollout.n concurrent callers, alongside ray, vllm and libgomp
+    pools already holding thousands of threads) the container hits its thread limit, and
+    ``socketserver.process_request`` dies with ``RuntimeError: can't start new thread``. that kills
+    the connection mid-request, so the caller sees ``RemoteDisconnected`` and the whole run fails
+    -- VERL-139, observed on a 4090 where libgomp reported "Thread creation failed" first.
+
+    a fixed pool cannot exhaust the thread table no matter how many callers arrive.
+
+    bounding the pool makes the listen backlog load-bearing: with a thread per request the kernel
+    queue drained immediately, but a busy pool leaves arrivals sitting in it. socketserver's default
+    of 5 is far below a rollout's burst, and overflowing it resets the connection -- which the
+    caller sees as the same ``RemoteDisconnected`` this fix exists to remove. so the default here is
+    sized for a burst, and subclasses raise it further to their own known batch size.
+    """
+
+    # daemon threads so a stuck handler can never keep the worker process alive at shutdown.
+    daemon_threads = True
+
+    # measured: at the socketserver default of 5, 13 of 64 simultaneous callers were reset by peer.
+    request_queue_size = 128
+
+    def __init__(self, *args, worker_threads: int = _BRIDGE_WORKER_THREADS, **kwargs):
+        self._bridge_pool = ThreadPoolExecutor(
+            max_workers=worker_threads, thread_name_prefix="flash-bridge"
+        )
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address) -> None:
+        """hand the request to the pool. socketserver's default starts an unbounded thread here."""
+        self._bridge_pool.submit(self._run_request, request, client_address)
+
+    def _run_request(self, request, client_address) -> None:
+        # mirrors ThreadingMixIn.process_request_thread: the pool owns the thread, so shutdown of
+        # the connection (not the server) is all this needs to do.
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+
+    def server_close(self) -> None:
+        super().server_close()
+        # do not wait: a handler blocked on a hung peer must not stop the worker from exiting.
+        self._bridge_pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _cgroup_cpu_quota() -> int | None:

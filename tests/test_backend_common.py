@@ -7,6 +7,7 @@ import builtins
 import contextlib
 import ctypes
 import errno
+import http.client
 import inspect
 import json
 import os
@@ -15,7 +16,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
@@ -2197,3 +2200,159 @@ def test_a_session_without_a_logs_dir_yields_nothing_rather_than_raising(tmp_pat
     # raise here would replace the run's real error with this collector's own.
     (tmp_path / "ray" / "session_1").mkdir(parents=True)
     assert vc.collect_ray_failure_logs(root=str(tmp_path / "ray")) == ""
+
+
+# ---------------------------------------------------------------------------------------------
+# VERL-139: the reward/teacher bridges must not spawn one os thread per request.
+# ---------------------------------------------------------------------------------------------
+def _drive_bridge(server_cls, *, callers: int, hold: threading.Event, await_arrivals: int):
+    """fire `callers` concurrent requests at a bridge whose handler blocks until `hold` is set.
+
+    returns ``(peak_threads_over_baseline, errors)`` measured while the handlers are held open.
+    holding them is what makes the measurement meaningful: it forces requests to be resident
+    simultaneously, which is the rollout shape that exhausted the thread table.
+
+    ``await_arrivals`` is how many requests must be inside a handler before the peak is sampled.
+    it cannot be ``callers`` for a bounded server -- only pool-size handlers can ever be resident
+    at once, so waiting for all 64 would hang. that ceiling IS the fix, so the caller passes what
+    it expects to be able to observe and the difference between the arms is the evidence.
+    """
+    arrived = threading.Semaphore(0)
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):  # keep pytest output clean
+            return
+
+        def do_POST(self):
+            arrived.release()
+            hold.wait(timeout=30)
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = server_cls(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    # count only threads the SERVER owns. threading.active_count() also counts the caller threads
+    # this helper starts, which would put the bounded arm over the bound and measure nothing.
+    def _server_threads() -> int:
+        return sum(1 for t in threading.enumerate() if t not in known)
+
+    known = set(threading.enumerate())
+    errors: list[BaseException] = []
+
+    def _call():
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            conn.request("POST", "/step", body=b"{}", headers={"Content-Type": "application/json"})
+            conn.getresponse().read()
+            conn.close()
+        except BaseException as exc:  # recorded, not raised: the caller asserts on it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_call, daemon=True) for _ in range(callers)]
+    known.update(threads)  # callers are not the server's threads
+    for t in threads:
+        t.start()
+    # wait until the expected number of requests is actually inside a handler, so the peak reflects
+    # real concurrency rather than however fast the callers happened to be scheduled.
+    for _ in range(await_arrivals):
+        assert arrived.acquire(timeout=30), "a request never reached the handler"
+    # let any further threads the server wants to spawn actually appear before sampling, otherwise
+    # an unbounded server could be measured before it has grown.
+    time.sleep(1.0)
+    peak = _server_threads()
+    hold.set()
+    for t in threads:
+        t.join(timeout=30)
+    server.shutdown()
+    server.server_close()
+    return peak, errors
+
+
+def test_the_bridge_serves_concurrent_requests_from_a_bounded_pool():
+    """VERL-139: 64 simultaneous callers must not create 64 handler threads.
+
+    the shipped bridges used ThreadingHTTPServer, which starts a thread per request and never
+    bounds them. on a real rollout (agent.num_workers x rollout.n callers, next to ray/vllm/libgomp
+    pools) that hit the container's thread limit: socketserver.process_request raised
+    "can't start new thread", the connection died mid-request, and verl saw RemoteDisconnected.
+    driving the real server class is the point -- an assertion against a hand-rolled copy of the
+    pool would pass no matter what the worker shipped.
+    """
+    callers = 64
+    assert callers > vc._BRIDGE_WORKER_THREADS * 2, (
+        "callers must overshoot the pool to prove a bound"
+    )
+    bound = vc._BRIDGE_WORKER_THREADS + 4  # + serve_forever and a little slack
+
+    # control: the server this replaced. it must FAIL the same assertion, otherwise the assertion
+    # proves nothing and would pass on the shipped defect. give it the same listen backlog so the
+    # only difference under test is the thread policy.
+    class _UnboundedControl(ThreadingHTTPServer):
+        request_queue_size = vc.BoundedThreadingHTTPServer.request_queue_size
+
+    hold = threading.Event()
+    try:
+        unbounded_peak, unbounded_errors = _drive_bridge(
+            _UnboundedControl, callers=callers, hold=hold, await_arrivals=callers
+        )
+    finally:
+        hold.set()
+    assert not unbounded_errors, f"control arm failed to run: {unbounded_errors[:3]}"
+    assert unbounded_peak > bound, (
+        f"control: ThreadingHTTPServer used only {unbounded_peak} threads for {callers} held "
+        "requests, so this test cannot distinguish the fix from the defect"
+    )
+
+    hold = threading.Event()
+    try:
+        peak, errors = _drive_bridge(
+            vc.BoundedThreadingHTTPServer,
+            callers=callers,
+            hold=hold,
+            # only pool-size handlers can be resident at once -- that ceiling is the fix.
+            await_arrivals=vc._BRIDGE_WORKER_THREADS,
+        )
+    finally:
+        hold.set()
+
+    assert not errors, f"requests failed: {errors[:3]}"
+    assert peak <= bound, (
+        f"bridge grew to {peak} threads for {callers} concurrent requests "
+        f"(control used {unbounded_peak}): it is still spawning a thread per request"
+    )
+
+
+def test_both_verl_bridges_use_the_bounded_server():
+    """the fix is only real if the reward AND teacher bridges inherit it.
+
+    each bridge is defined in its own module, so a fix applied to one leaves the other able to
+    exhaust the thread table on exactly the same rollout shape.
+    """
+    from flash.engine.worker import opd_train
+
+    # the teacher bridge is a module-level class, so check the type itself.
+    assert issubclass(opd_train._TeacherBridgeHTTPServer, vc.BoundedThreadingHTTPServer), (
+        "the opd teacher bridge does not use BoundedThreadingHTTPServer"
+    )
+    # the reward bridge is defined inside the function that starts it, so it is only reachable
+    # through the source. parse rather than substring-match: a comment mentioning the old name
+    # must not pass, and a real subclass must not be missed.
+    for mod in (rl_train, opd_train):
+        tree = ast.parse(pathlib.Path(inspect.getfile(mod)).read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for base in node.bases:
+                name = base.id if isinstance(base, ast.Name) else getattr(base, "attr", "")
+                assert name != "ThreadingHTTPServer", (
+                    f"{mod.__name__}.{node.name} still subclasses the unbounded "
+                    "ThreadingHTTPServer; it will spawn a thread per request"
+                )
