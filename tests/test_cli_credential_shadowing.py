@@ -118,10 +118,10 @@ def test_every_org_binding_command_is_registered():
 
 @pytest.mark.parametrize("upload", [False, True])
 def test_env_eval_warns_whether_or_not_it_uploads(monkeypatch, capsys, upload):
-    # gating this on --upload treated a plain eval as local, but every case still makes an
-    # authenticated chat_stream request and the target's accessibility is resolved from the ambient
-    # key. so a plain eval can report the target inaccessible, or spend the whole suite against the
-    # unintended org, with no warning at all (codex[bot]).
+    # gating this on whether results are recorded treats a --no-upload eval as local, but every case
+    # still makes an authenticated chat_stream request and the target's accessibility is resolved
+    # from the ambient key. so such an eval can report the target inaccessible, or spend the whole
+    # suite against the unintended org, with no warning at all (codex[bot]).
     monkeypatch.setattr(cli, "shadowed_login_warning", lambda: "shadowed!")
 
     cli._warn_if_login_shadowed(argparse.Namespace(func=cmd_env_eval, upload=upload))
