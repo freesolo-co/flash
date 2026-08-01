@@ -71,8 +71,7 @@ def test_build_rollout_sample_neutralizes_terminal_control_characters() -> None:
     assert sample["completion"] == "answer\\x1b[2J\\x9b2J\nnext\\x00done\\x7f"
     for field in ("prompt_tail", "completion"):
         assert all(
-            char == "\n" or 0x20 <= ord(char) < 0x7F or ord(char) >= 0xA0
-            for char in sample[field]
+            char == "\n" or 0x20 <= ord(char) < 0x7F or ord(char) >= 0xA0 for char in sample[field]
         )
 
 

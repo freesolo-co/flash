@@ -29,7 +29,7 @@ def extract_validated_archive_members(
     total = 0
     extracted = 0
     scanned = 0
-    with tarfile.open(fileobj=cast(BinaryIO, reader), mode="r|") as tar:
+    with tarfile.open(fileobj=cast("BinaryIO", reader), mode="r|") as tar:
         for member in tar:
             scanned += 1
             if scanned > scanned_member_limit:

@@ -465,9 +465,7 @@ def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) 
     )
 
 
-def hf_resume_checkpoint(
-    fail_closed: bool = False, revision: str | None = None
-) -> str | None:
+def hf_resume_checkpoint(fail_closed: bool = False, revision: str | None = None) -> str | None:
     """Download the latest streamed trainer checkpoint for this run, or return none."""
     required = bool(revision)
     strict = bool(fail_closed or required)
@@ -523,9 +521,7 @@ def hf_resume_checkpoint(
         if strict:
             if isinstance(e, RetriableInfraError):
                 raise
-            raise RetriableInfraError(
-                f"required resume checkpoint fetch failed: {e}"
-            ) from e
+            raise RetriableInfraError(f"required resume checkpoint fetch failed: {e}") from e
         return None
 
 
@@ -638,9 +634,7 @@ def _prefetch_error_is_retriable(exc: BaseException) -> bool:
         status = getattr(resp, "status_code", None)
         if status in {401, 403, 404}:
             return False
-        return status is None or status == 429 or (
-            isinstance(status, int) and 500 <= status <= 599
-        )
+        return status is None or status == 429 or (isinstance(status, int) and 500 <= status <= 599)
     return False
 
 
@@ -751,6 +745,7 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
     with liveness_heartbeat(
         "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
     ):
+
         def _download() -> None:
             _require_hf_deadline_allowance()
             local_path = snapshot_download(
@@ -763,16 +758,33 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
             # warmed configs): snapshot_download returns it as a cache hit without weights, and
             # the trainer then fails offline with "no pytorch_model.bin or model.safetensors".
             # validate weights exist before trusting the hit; one forced re-download repairs it.
-            if isinstance(local_path, str) and os.path.isdir(local_path) and not _snapshot_has_weights(local_path):
-                print(f"prefetch_model: cached snapshot for {model_id} has no weight files; re-downloading")
+            if (
+                isinstance(local_path, str)
+                and os.path.isdir(local_path)
+                and not _snapshot_has_weights(local_path)
+            ):
+                print(
+                    f"prefetch_model: cached snapshot for {model_id} has no weight files; re-downloading"
+                )
                 local_path = snapshot_download(
                     repo_id=model_id,
                     cache_dir=shared_hub,
-                    ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+                    ignore_patterns=[
+                        "*.pth",
+                        "*.gguf",
+                        "original/*",
+                        "*.onnx",
+                        "*.msgpack",
+                        "*.h5",
+                    ],
                     force_download=True,
                     **model_revision_kwargs(revision),
                 )
-                if isinstance(local_path, str) and os.path.isdir(local_path) and not _snapshot_has_weights(local_path):
+                if (
+                    isinstance(local_path, str)
+                    and os.path.isdir(local_path)
+                    and not _snapshot_has_weights(local_path)
+                ):
                     raise _SnapshotWeightsMissing(
                         f"model snapshot for {model_id} has no weight files even after a forced "
                         "re-download; the repo layout is unsupported or the cache volume is corrupt"
@@ -786,9 +798,7 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
             except Exception as e:
                 if _prefetch_error_is_retriable(e):
                     detail = sanitize_diagnostic(e, limit=500)
-                    raise RetriableInfraError(
-                        f"pinned model prefetch failed: {detail}"
-                    ) from e
+                    raise RetriableInfraError(f"pinned model prefetch failed: {detail}") from e
                 raise
         else:
             try:
@@ -1162,9 +1172,7 @@ def make_checkpoint_upload_callback(save_at_steps=()):
         _OPTIONAL_CHECKPOINT_UPLOADER.enqueue(
             f"checkpoint step {step}",
             staged_dir,
-            lambda: _upload(
-                step, staged_checkpoint, provenance_ready=True, emit_heartbeat=False
-            ),
+            lambda: _upload(step, staged_checkpoint, provenance_ready=True, emit_heartbeat=False),
             on_coalesce=_publish_coalesced_deployable,
         )
 

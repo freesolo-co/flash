@@ -785,8 +785,12 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     assert replies == [{"role": "user", "content": "observed click"}]
     assert state["done"] is True
     assert env.rollout_done(state) is True
-    assert env.reward("ignored", {"id": "browse", "input": "browse", "output": "done"}, state) == 0.5
-    assert env.grade("ignored", {"id": "browse", "input": "browse", "output": "done"}, state) is True
+    assert (
+        env.reward("ignored", {"id": "browse", "input": "browse", "output": "done"}, state) == 0.5
+    )
+    assert (
+        env.grade("ignored", {"id": "browse", "input": "browse", "output": "done"}, state) is True
+    )
     assert (
         env.reward_from_messages(
             [{"role": "assistant", "content": "final"}],
@@ -1026,4 +1030,397 @@ def test_worker_deps():
     import flash.envs.registry as registry
 
     env_id = "github:owner/repo@main:env/environment.py"
-    assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.2.60"]
+    assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.4.0"]
+
+
+# ============================================================================================
+# MP-005 — single-turn and multi-turn grading must receive the same thinking-text shape
+# ============================================================================================
+class _ThinkingRecordingMultiTurnEnv(_EnvironmentMultiTurn):
+    """Multi-turn env that records exactly what text its scorer was handed."""
+
+    def __init__(self):
+        self.scored: list[object] = []
+
+    def start_episode(self, example, prompt_text):
+        return [{"role": "user", "content": "go"}]
+
+    def step_episode(self, example, messages, assistant_response):
+        return _EnvironmentStepResult(done=True, messages=(), final_response_text=None)
+
+    def score_episodes(self, example, episodes):
+        for episode in episodes:
+            self.scored.append(episode.response_text)
+        return [_RewardResult(score=1.0, success=True) for _ in episodes]
+
+
+class _SteppingMultiTurnEnv(_EnvironmentMultiTurn):
+    """Multi-turn env that records exactly what step_episode was handed, and keeps going."""
+
+    def __init__(self):
+        self.stepped: list[tuple[str, str]] = []
+        self.scored: list[object] = []
+
+    def start_episode(self, example, prompt_text):
+        return [{"role": "user", "content": "go"}]
+
+    def step_episode(self, example, messages, assistant_response):
+        # an env that parses the model's action records BOTH what it was handed and the transcript
+        # message it is supposed to match, so a divergence between them is visible to the test.
+        last = str(messages[-1].get("content", "")) if messages else ""
+        self.stepped.append((assistant_response, last))
+        return _EnvironmentStepResult(
+            done=False, messages=({"role": "user", "content": "next"},), final_response_text=None
+        )
+
+    def score_episodes(self, example, episodes):
+        for episode in episodes:
+            self.scored.append(episode.response_text)
+        return [_RewardResult(score=1.0, success=True) for _ in episodes]
+
+
+_THINK_COMPLETION = "<think>let me work it out</think>the answer is 4"
+# a turn that ran out of budget mid-reasoning: no </think>, and no <think> either because the chat
+# template already opened the block in the generation prompt. tagless reasoning, not an answer.
+_TRUNCATED_THINK_COMPLETION = "let me work it out, first I take 2 and then"
+
+
+def test_multi_turn_scoring_strips_thinking_like_the_single_turn_path(monkeypatch):
+    """MP-005: the multi-turn path used to hand score_episodes the RAW turn including <think>.
+
+    The single-turn path grades ``graded_text`` (answer only), so an env whose scorer does
+    ``response.strip() == expected`` scored correctly single-turn and silently mis-scored the same
+    completion multi-turn. Both paths must see the same shape.
+    """
+    sdk_env = _ThinkingRecordingMultiTurnEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    env.thinking = True
+
+    state = env.new_rollout_state({"id": "a", "input": "2+2?", "output": "4"})
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env._score_episode({"id": "a", "input": "2+2?", "output": "4"}, state)
+
+    assert sdk_env.scored == ["the answer is 4"], (
+        f"multi-turn scorer saw raw thinking text: {sdk_env.scored!r}"
+    )
+
+
+def test_multi_turn_scored_text_keeps_the_reasoning_available(monkeypatch):
+    """Stripping must not destroy the reasoning: thinking-aware scorers still opt into .thinking."""
+    sdk_env = _ThinkingRecordingMultiTurnEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    env.thinking = True
+
+    state = env.new_rollout_state({"id": "a", "input": "2+2?", "output": "4"})
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env._score_episode({"id": "a", "input": "2+2?", "output": "4"}, state)
+
+    scored = sdk_env.scored[0]
+    assert scored.raw == _THINK_COMPLETION
+    assert scored.thinking == "let me work it out"
+
+
+def test_multi_turn_transcript_keeps_the_raw_turn(monkeypatch):
+    """The message the next turn conditions on stays raw; only the SCORED text is answer-only."""
+    sdk_env = _ThinkingRecordingMultiTurnEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    env.thinking = True
+
+    state = env.new_rollout_state({"id": "a", "input": "2+2?", "output": "4"})
+    msg = env.record_model_turn(state, _THINK_COMPLETION)
+    assert msg["content"] == _THINK_COMPLETION
+    assert state["messages"][-1]["content"] == _THINK_COMPLETION
+    assert state["turns"][-1].content == _THINK_COMPLETION
+
+
+def test_non_thinking_run_scores_the_completion_unchanged(monkeypatch):
+    """With thinking off, nothing is stripped — a literal <think> is just text the model wrote."""
+    sdk_env = _ThinkingRecordingMultiTurnEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    assert env.thinking is False  # default: a CLI-side load grades raw text
+
+    state = env.new_rollout_state({"id": "a", "input": "2+2?", "output": "4"})
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env._score_episode({"id": "a", "input": "2+2?", "output": "4"}, state)
+
+    assert sdk_env.scored == [_THINK_COMPLETION]
+
+
+def test_reward_from_messages_strips_thinking_too(monkeypatch):
+    """The GRPO transcript path (rl.py reward_from_messages) shares the same rule."""
+    sdk_env = _ThinkingRecordingMultiTurnEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    env.thinking = True
+
+    env.reward_from_messages(
+        [{"role": "assistant", "content": _THINK_COMPLETION}],
+        {"id": "a", "input": "2+2?", "output": "4"},
+    )
+    assert sdk_env.scored == ["the answer is 4"]
+
+
+def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
+    """The worker is what knows whether the run samples <think>; it must tell the env."""
+    import flash.engine.worker as worker
+    from flash.spec import JobSpec
+
+    class _Env:
+        thinking = False
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "thinking": True,
+            "environment": {"id": "org/env"},
+        }
+    )
+    monkeypatch.setattr(worker, "JOB_SPEC", spec)
+    monkeypatch.setattr(worker, "load_environment", lambda *a, **k: _Env())
+
+    assert worker._load_active_env().thinking is True
+
+
+def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    env.thinking = True
+    env.prompt_opens_thinking = prompt_opens_thinking
+    return env
+
+
+def test_multi_turn_grading_honors_a_prompt_opened_think_block(monkeypatch):
+    """A turn truncated mid-reasoning must grade empty here too, exactly as it does single-turn.
+
+    When the chat template pre-opens <think> in the generation prompt (Qwen with enable_thinking),
+    a completion cut off before </think> is tagless REASONING. strip_think without the flag sees no
+    tags at all and returns the whole ramble as the answer, so the rollout can be rewarded for
+    unfinished thinking that the single-turn path correctly scores 0.
+    """
+    sdk_env = _ThinkingRecordingMultiTurnEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=True)
+
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+    state = env.new_rollout_state(example)
+    env.record_model_turn(state, _TRUNCATED_THINK_COMPLETION)
+    env._score_episode(example, state)
+
+    assert sdk_env.scored == [""], (
+        f"unterminated reasoning was graded as the answer: {sdk_env.scored!r}"
+    )
+    # the reasoning is still reachable -- stripping decides the GRADE, it does not destroy the text.
+    assert sdk_env.scored[0].thinking == _TRUNCATED_THINK_COMPLETION
+    assert sdk_env.scored[0].raw == _TRUNCATED_THINK_COMPLETION
+
+
+def test_multi_turn_grading_matches_the_single_turn_path_exactly(monkeypatch):
+    """Same completion, same flag, same parsers -- the two modes must not diverge.
+
+    This is the whole point of the shared flash.thinking parsers: pin multi-turn grading against
+    the single-turn helper rather than against a hand-written expectation, so a future change to
+    one path that doesn't reach the other fails here.
+    """
+    from flash.thinking import strip_think
+
+    for opened in (True, False):
+        for completion in (_THINK_COMPLETION, _TRUNCATED_THINK_COMPLETION):
+            sdk_env = _ThinkingRecordingMultiTurnEnv()
+            env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=opened)
+
+            example = {"id": "a", "input": "2+2?", "output": "4"}
+            state = env.new_rollout_state(example)
+            env.record_model_turn(state, completion)
+            env._score_episode(example, state)
+
+            expected = strip_think(completion, prompt_opened_thinking=opened)
+            assert sdk_env.scored == [expected], (
+                f"multi-turn diverged from single-turn for opened={opened} on {completion!r}: "
+                f"{sdk_env.scored!r} != {[expected]!r}"
+            )
+
+
+def test_a_tagless_answer_is_not_stripped_when_the_template_ignores_thinking(monkeypatch):
+    """The flag is derived, not assumed: with it False a tagless answer grades as the answer.
+
+    A template that ignores enable_thinking never opens a block, so its plain answers must not be
+    read as unterminated reasoning and zeroed. This is why the worker derives the flag from a real
+    rendered prompt instead of from the thinking flag.
+    """
+    sdk_env = _ThinkingRecordingMultiTurnEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+    state = env.new_rollout_state(example)
+    env.record_model_turn(state, _TRUNCATED_THINK_COMPLETION)
+    env._score_episode(example, state)
+
+    assert sdk_env.scored == [_TRUNCATED_THINK_COMPLETION]
+
+
+def test_the_env_defaults_to_no_prompt_opened_thinking(monkeypatch):
+    """Nothing may assume the opener: an env nobody configured must grade text as written."""
+    sdk_env = _ThinkingRecordingMultiTurnEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    assert env.prompt_opens_thinking is False
+
+
+def test_step_episode_receives_the_raw_turn_not_the_scored_one(monkeypatch):
+    """step_episode drives the episode; it must see what the model actually emitted.
+
+    An env that parses the model's action commonly requires assistant_response to equal
+    messages[-1]["content"] -- and that message is the RAW turn. Handing it the answer-only text
+    steps the env on something the model never emitted, so it can advance or terminate wrongly.
+    """
+    sdk_env = _SteppingMultiTurnEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+    state = env.new_rollout_state(example)
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env.env_reply(state["messages"], state)
+
+    handed, last_message = sdk_env.stepped[0]
+    assert handed == _THINK_COMPLETION, f"step_episode was handed the stripped text: {handed!r}"
+    assert handed == last_message, (
+        f"assistant_response disagrees with messages[-1]: {handed!r} != {last_message!r}"
+    )
+
+
+def test_stepping_the_env_leaves_the_scored_text_stripped(monkeypatch):
+    """Fixing step_episode must not un-fix grading: the scorer still sees answer-only text."""
+    sdk_env = _SteppingMultiTurnEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+    state = env.new_rollout_state(example)
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env.env_reply(state["messages"], state)
+    env._score_episode(example, state)
+
+    assert sdk_env.scored == ["the answer is 4"]
+
+
+def test_a_final_response_override_reaches_both_views(monkeypatch):
+    """When the env supplies the episode's answer it is already final: graded AND stepped as-is."""
+
+    class _OverridingEnv(_SteppingMultiTurnEnv):
+        def step_episode(self, example, messages, assistant_response):
+            last = str(messages[-1].get("content", "")) if messages else ""
+            self.stepped.append((assistant_response, last))
+            return _EnvironmentStepResult(
+                done=False,
+                messages=({"role": "user", "content": "next"},),
+                final_response_text="env says 7",
+            )
+
+    sdk_env = _OverridingEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+    state = env.new_rollout_state(example)
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env.env_reply(state["messages"], state)
+
+    # the override is the answer, so it is not stripped -- and the STEPPING view tracks it, or a
+    # later step_episode would be handed a turn the env already superseded.
+    assert state["response_text"] == "env says 7"
+    assert state["raw_response_text"] == "env says 7"
+
+    # equality alone would pass on a bare str, and a bare str is the defect: a thinking-aware
+    # score_episode reading .thinking would raise on exactly the episodes an env terminates by
+    # overriding. the model's reasoning from this turn survives the override that replaced its
+    # answer, since the env supplied the answer but did not produce the reasoning.
+    assert state["response_text"].thinking == "let me work it out"
+    assert env._episode_from_state(state).response_text.thinking == "let me work it out"
+
+    # .raw is the model's emission, NOT the override -- see the dedicated test below. asserting it
+    # here as "env says 7" is what made the scorer-facing raw view track the stepping view.
+    assert state["response_text"].raw == _THINK_COMPLETION
+
+
+def test_a_final_response_override_keeps_the_models_raw_output_for_scorers(monkeypatch):
+    """`.raw` is the model's original output, so an env override must not overwrite it.
+
+    The documented contract (flash/cli/training_doc.py) defines `.raw` as the original raw model
+    output, and it is the one view a scorer cannot reconstruct once it is gone: `.completion` and
+    `str(response_text)` are both the override already. Assigning the override to `.raw` also left
+    the object incoherent -- an env-authored `.raw` paired with the model's own `.thinking`, so
+    `.raw` did not contain the reasoning `.thinking` was extracted from.
+
+    Distinct from the stepping view: `state["raw_response_text"]` SHOULD carry the override, so a
+    later turn steps the env on the answer it substituted. The two are asserted together here
+    because keeping them apart is the whole point.
+    """
+
+    class _OverridingEnv(_SteppingMultiTurnEnv):
+        def step_episode(self, example, messages, assistant_response):
+            last = str(messages[-1].get("content", "")) if messages else ""
+            self.stepped.append((assistant_response, last))
+            return _EnvironmentStepResult(
+                done=True,
+                messages=(),
+                final_response_text="env says 7",
+            )
+
+    sdk_env = _OverridingEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+    state = env.new_rollout_state(example)
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env.env_reply(state["messages"], state)
+
+    scored = env._episode_from_state(state).response_text
+    # what the scorer grades is the override...
+    assert str(scored) == "env says 7"
+    assert scored.completion == "env says 7"
+    # ...but a scorer that explicitly inspects what the model emitted still gets it, reasoning and
+    # all -- including the reasoning `.thinking` was taken from.
+    assert scored.raw == _THINK_COMPLETION
+    assert scored.thinking == "let me work it out"
+    assert scored.thinking in scored.raw
+    # the stepping view is the override, deliberately: it is what a later step_episode receives.
+    assert state["raw_response_text"] == "env says 7"
+
+
+def test_rl_hands_the_derived_opener_flag_to_the_env():
+    """The env cannot derive the flag (no tokenizer, no rendered prompt); the rl path must pass it.
+
+    the rl path needs a GPU, so pin the wiring at the source level: the flag the single-turn path
+    derives is the same one the multi-turn env is given. _resolve_grpo_inputs is where the rendered
+    prompt exists, so it is where the flag is derived and handed to the env.
+    """
+    import inspect
+
+    from flash.engine.worker.rl_train import _resolve_grpo_inputs
+
+    src = inspect.getsource(_resolve_grpo_inputs)
+    assert 'hasattr(env, "prompt_opens_thinking")' in src
+    assert "env.prompt_opens_thinking = prompt_opened_thinking" in src

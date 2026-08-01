@@ -110,10 +110,7 @@ def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:
             if len(length_bytes) != 8:
                 raise ValueError("file is too small to contain a safetensors header")
             (header_length,) = struct.unpack("<Q", length_bytes)
-            if (
-                header_length > file_size - 8
-                or header_length > _MAX_SAFETENSORS_HEADER_BYTES
-            ):
+            if header_length > file_size - 8 or header_length > _MAX_SAFETENSORS_HEADER_BYTES:
                 raise ValueError(
                     f"declared header length {header_length} is implausible for {file_size}-byte file"
                 )
@@ -148,9 +145,7 @@ def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:
             normalized: dict[str, object] = {}
             remapped = 0
             for key, value in header.items():
-                normalized_key = (
-                    key if key == "__metadata__" else _strip_language_model_infix(key)
-                )
+                normalized_key = key if key == "__metadata__" else _strip_language_model_infix(key)
                 if normalized_key in normalized:
                     raise ValueError(
                         f"key {key!r} collides after stripping the '.language_model.' infix"
@@ -182,7 +177,9 @@ def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:
         os.replace(temp_path, path)
         temp_path = None
     except Exception as exc:
-        logger.warning("could not normalize exported adapter keys; leaving weights unchanged: %s", exc)
+        logger.warning(
+            "could not normalize exported adapter keys; leaving weights unchanged: %s", exc
+        )
         return False
     finally:
         if temp_path is not None:
@@ -205,8 +202,10 @@ def _rewrite_adapter_config_base_model(
         return False
 
     existing_base = str(config.get("base_model_name_or_path") or "").strip()
-    if existing_base and existing_base != base_model and not _TEMP_MERGED_BASE_MODEL_RE.fullmatch(
+    if (
         existing_base
+        and existing_base != base_model
+        and not _TEMP_MERGED_BASE_MODEL_RE.fullmatch(existing_base)
     ):
         raise ValueError(
             f"adapter base_model_name_or_path {existing_base!r} does not match run model {base_model!r}"
@@ -242,9 +241,7 @@ def _repair_export_metadata(
     adapter_dir: Path, base_model: str, base_model_revision: str = ""
 ) -> None:
     changed = 0
-    changed += int(
-        _rewrite_adapter_config_base_model(adapter_dir, base_model, base_model_revision)
-    )
+    changed += int(_rewrite_adapter_config_base_model(adapter_dir, base_model, base_model_revision))
     changed += int(_rewrite_readme_temp_base_model(adapter_dir, base_model))
     if changed:
         logger.info("repaired exported adapter metadata base_model=%s", base_model)

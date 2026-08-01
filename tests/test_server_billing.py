@@ -287,7 +287,7 @@ def api(tmp_path, monkeypatch):
     import flash.server.projects as projects_mod
     import flash.server.run_registry as run_registry
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(
         projects_mod,
         "require_project_access",
@@ -404,22 +404,25 @@ def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
     ] == [res.json()["run_id"]]
 
 
-def test_dry_run_skips_affordability_precheck_and_still_persists(api, monkeypatch):
+def test_dry_run_verifies_affordability_and_still_persists(api, monkeypatch):
+    # a dry run is the pre-submit validation gate, so it must also answer "can this org afford
+    # this run". the precheck is verify-only (moves no money), so running it here costs nothing
+    # and stops a config from passing --dry-run only to be rejected 402 on real submission.
     import flash.server.billing as billing_mod
     import flash.server.db as db_mod
 
     events = []
     original_record_run = db_mod.record_run
 
-    def unexpected_precheck(**kwargs):
+    def capture_precheck(**kwargs):
         events.append(("precheck", kwargs["org_id"]))
-        raise AssertionError("dry-run must not authorize budget")
+        return {"ok": True}
 
     def capture_record_run(*args, **kwargs):
         events.append(("record", args[0]))
         return original_record_run(*args, **kwargs)
 
-    monkeypatch.setattr(billing_mod, "precheck_training_run", unexpected_precheck)
+    monkeypatch.setattr(billing_mod, "precheck_training_run", capture_precheck)
     monkeypatch.setattr(db_mod, "record_run", capture_record_run)
     res = api.post(
         "/v1/runs",
@@ -429,7 +432,122 @@ def test_dry_run_skips_affordability_precheck_and_still_persists(api, monkeypatc
 
     assert res.status_code == 200, res.text
     assert res.json()["state"] == "dry_run"
-    assert events == [("record", res.json()["run_id"])]
+    # verified before the run is recorded, and it stays a dry run: no billing context is attached
+    assert events == [("precheck", "org-1"), ("record", res.json()["run_id"])]
+    assert res.json()["billing_state"] is None
+    assert res.json()["billing_context"] is None
+
+
+def test_dry_run_blocked_when_org_cannot_afford_the_estimate(api, monkeypatch):
+    # the whole point of validating billing on --dry-run: an unaffordable config fails here
+    # instead of passing validation and being rejected only when the user really submits.
+    import flash.server.billing as billing_mod
+
+    def _block(**k):
+        raise billing_mod.BillingError(402, "insufficient balance")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 402, res.text
+    assert "insufficient" in res.text
+
+
+def test_dry_run_fails_open_when_billing_backend_is_unreachable(api, monkeypatch):
+    # a billing-infra blip must not block local validation, matching real submission's behavior.
+    import flash.server.billing as billing_mod
+
+    def _unreachable(**k):
+        raise billing_mod.BillingError(503, "billing service unavailable")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _unreachable)
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["state"] == "dry_run"
+    # failing open is intentional, but the response must not imply cost was validated: the same
+    # spec can still be rejected 402 once the backend recovers.
+    assert res.json()["affordability_verified"] is False
+
+
+def test_dry_run_reports_affordability_verified_when_the_check_ran(api, monkeypatch):
+    """A real pass and a failed-open skip must be distinguishable, since both answer 200."""
+    import flash.server.billing as billing_mod
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["affordability_verified"] is True
+
+
+def test_dry_run_reports_unverified_when_internal_reporting_is_off(api, monkeypatch):
+    """The other fail-open path: no internal key, so the precheck returns before calling billing."""
+    import flash.server._internal_client as internal_mod
+
+    monkeypatch.setattr(internal_mod, "internal_key", lambda: None)
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["affordability_verified"] is False
+
+
+def test_billable_dry_run_without_an_org_is_rejected_like_a_real_submit(api, monkeypatch):
+    # the org requirement belongs to the key, not the mode. when it was checked only for real
+    # submits, an org-less billable key skipped the affordability conjunct and got 200 from
+    # --dry-run, then 400 for the identical spec on submit: the preview contradicting the launch.
+    import flash.server.billing as billing_mod
+
+    def _unexpected(**kwargs):
+        raise AssertionError("affordability cannot be checked without an org")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _unexpected)
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-noorg"),
+    )
+
+    assert res.status_code == 400, res.text
+    assert "org id" in res.text
+
+
+def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, monkeypatch):
+    # gpu.count > 1 is unsupported at ANY balance, so 402 would send the user to top up over a spec
+    # that can never launch. submit_job rejects it too, but only after this point -- so with the
+    # precheck ahead of the gate, the payment error won the race and hid the real cause.
+    import flash.server.billing as billing_mod
+
+    def _block(**k):
+        raise billing_mod.BillingError(402, "insufficient balance")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
+    multi_gpu_spec = {**SPEC, "gpu": {**SPEC["gpu"], "count": 2}}
+    res = api.post(
+        "/v1/runs",
+        json={"spec": multi_gpu_spec, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 400, res.text
+    assert "multi-gpu" in res.text
+    assert "insufficient" not in res.text
 
 
 def test_internal_submit_skips_affordability_precheck_before_persistence(api, monkeypatch):
@@ -589,3 +707,46 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
     status = runner.get_status("run-1")
     assert status.billing_state == "failed"
     assert "FREESOLO_INTERNAL_KEY" in (status.billing_error or "")
+
+
+# --------------------------------------------------------- warm-start error attribution
+
+
+def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
+    # a genuine adapter-resolution failure keeps the actionable 400 that names the source.
+    import flash.runner as runner_mod
+    import flash.server.app as app_mod
+
+    # raise the class off the reloaded module: the api fixture reloads flash.runner, so a symbol
+    # imported at module scope here would be a different object than the route's.
+    def _prepare(*args, **kwargs):
+        raise runner_mod.WarmStartPreparationError("private-owner/private-repo:sft/step-20")
+
+    monkeypatch.setattr(app_mod, "prepare_job", _prepare)
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
+
+    assert res.status_code == 400, res.text
+    assert "train.init_from_adapter source" in res.text
+    # the reason stays server-side: it can name internal storage paths. see
+    # test_server_api.py::test_create_run_redacts_internal_warmstart_preparation_error.
+    assert "private-owner" not in res.text
+
+
+def test_route_does_not_blame_the_adapter_for_unrelated_failures(api, monkeypatch):
+    # the regression this guards: gpu sizing, budget, and environment resolution also run inside
+    # prepare_job, for every submit. those failures must reach the user as themselves instead of
+    # sending them to re-check an adapter that is fine.
+    #
+    # the spec MUST set train.init_from_adapter: the old bug only rewrote failures when that field
+    # was populated, so a submit without it cannot distinguish the fix from the bug.
+    import flash.server.app as app_mod
+
+    def _prepare(*args, **kwargs):
+        raise ValueError("no gpu class satisfies the requested memory")
+
+    monkeypatch.setattr(app_mod, "prepare_job", _prepare)
+    warm_start_spec = {**SPEC, "train": {**SPEC["train"], "init_from_adapter": "source-run"}}
+    res = api.post("/v1/runs", json={"spec": warm_start_spec}, headers=_bearer("fslo-user-1"))
+
+    assert "no gpu class satisfies" in res.text
+    assert "init_from_adapter" not in res.text

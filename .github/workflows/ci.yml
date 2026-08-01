@@ -21,8 +21,14 @@ jobs:
       - name: Sync (server extra + dev)
         run: uv sync --extra server --dev
 
-      - name: Ruff
+      - name: Ruff check
         run: uv run ruff check .
+
+      # The formatter was never gated, so 102 files had drifted out of `ruff format` shape while
+      # CI stayed green. Enforcing it here keeps that from happening again; freesolo's backend job
+      # runs the same two commands against the same shared config.
+      - name: Ruff format check
+        run: uv run ruff format --check .
 
       - name: Tests (CPU, offline)
         run: uv run pytest -q

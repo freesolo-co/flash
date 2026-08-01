@@ -192,7 +192,8 @@ def test_select_gpu_picks_cheapest_including_unvalidated():
     gpu, need = select_gpu(RunConfig(MID, "sft", 100))
     assert gpu == pick_gpu(need)
     cheaper = [
-        g for g in GPU_INFO.values()
+        g
+        for g in GPU_INFO.values()
         if g.vram_gb >= need and gpu_hourly_usd(g.name) < gpu_hourly_usd(gpu)
     ]
     assert not cheaper, f"{cheaper} cheaper than {gpu} for {need} GB"
@@ -217,10 +218,19 @@ def test_35b_moe_long_context_grpo_sized_past_the_b200():
     moe = "Qwen/Qwen3.6-35B-A3B"
     # default + moderate context fit the single B200 (<= 180 GB).
     assert alloc_required_vram_gb(moe, "grpo", train={}, thinking=False) <= 180
-    assert alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 4096}, thinking=False) <= 180
+    assert (
+        alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 4096}, thinking=False)
+        <= 180
+    )
     # past the resident wall -> sized ABOVE the 180 GB B200 -> rejected (NOT routed to broken sleep).
-    assert alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 8192}, thinking=False) > 180
-    assert alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 32768}, thinking=False) > 180
+    assert (
+        alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 8192}, thinking=False)
+        > 180
+    )
+    assert (
+        alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 32768}, thinking=False)
+        > 180
+    )
     # The GRPO escalation is GRPO-only: default SFT stays at its 180 GB floor (fits the B200). (Long-
     # context SFT has its OWN large-vocab fp32-logits growth, independent of this grpo escalation.)
     assert alloc_required_vram_gb(moe, "sft", train={}, thinking=False) <= 180
@@ -247,7 +257,9 @@ def test_omitted_grpo_context_sizes_like_the_real_allocator():
     real = alloc_required_vram_gb(MID, "grpo", train={}, thinking=False)
     assert need == real
     # ...and never under-sizes vs the old bare-max_prompt_len default.
-    old = alloc_required_vram_gb(MID, "grpo", train={"max_context_tokens": RECIPE.rl.max_prompt_len}, thinking=False)
+    old = alloc_required_vram_gb(
+        MID, "grpo", train={"max_context_tokens": RECIPE.rl.max_prompt_len}, thinking=False
+    )
     assert need >= old
 
 
