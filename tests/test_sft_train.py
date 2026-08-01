@@ -87,7 +87,7 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "model.target_modules": "all-linear",
         "model.lora_adapter_path": "null",
         "model.use_remove_padding": "true",
-        "model.use_liger": "true",
+        "model.use_liger": "false",
         "model.enable_gradient_checkpointing": "true",
         "engine.strategy": "fsdp2",
         "engine.model_dtype": "bfloat16",
@@ -1183,3 +1183,61 @@ def test_sft_drops_a_non_finite_loss_instead_of_poisoning_the_heartbeat():
     assert sv.parse_verl_metric("step:2 - train/loss:inf", "train/loss") is None
     # a finite value on the same line is unaffected.
     assert sv.parse_verl_metric("step:2 - train/loss:nan - train/lr:1e-05", "train/lr") == 1e-05
+
+
+def test_sft_never_enables_liger_because_it_zeroes_the_lora_gradient():
+    """liger is off on the sft path, and the emitted verl override must say so.
+
+    GRAD-001: a matched two-arm a/b on Qwen3.5-9B (identical data, seed, hardware and code,
+    differing only in `model.use_liger`) measured train/grad_norm 0.0 with liger on and 7.02
+    with liger off, at a loss identical to four decimal places. liger silently severed the
+    gradient to the lora params under this fsdp2 + peft + gradient-checkpointing composition,
+    so sft trained nothing while looking healthy. the grpo path never sets the key (verl
+    defaults it false), which is why only sft was affected.
+
+    this asserts the RENDERED override rather than the config literal, so re-enabling liger
+    anywhere between the dict and the command line fails the test.
+    """
+    from flash.engine.worker.sft_train import build_sft_overrides
+
+    base = {
+        "train_files": "/w/train.parquet",
+        "val_files": "/w/val.parquet",
+        "train_batch_size": 8,
+        "max_length": 1024,
+        "micro_batch": 1,
+        "max_token_len_per_gpu": 1024,
+        "custom_dataset_path": "/w/ds.py",
+        "model_path": "Qwen/Qwen3.5-9B",
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "target_modules": "all-linear",
+        "lora_adapter_path": None,
+        "ulysses_sp_size": 1,
+        "lr": 1e-4,
+        "warmup_ratio": 0.03,
+        "weight_decay": 0.0,
+        "optimizer_impl": "bitsandbytes.optim",
+        "optimizer_name": "PagedAdamW8bit",
+        "optimizer_kwargs": None,
+        "local_dir": "/w/ckpt",
+        "save_freq": 50,
+        "n_gpus_per_node": 1,
+        "seed": 42,
+        "project_name": "p",
+        "experiment_name": "e",
+        "loop_epochs": 1,
+        "gradient_checkpointing": True,
+        "total_training_steps": None,
+        "total_epochs": 1,
+        "loggers": ["console"],
+    }
+
+    # the default must be off: a caller that omits the key must not get liger.
+    assert "model.use_liger=false" in build_sft_overrides(dict(base))
+    assert "model.use_liger=true" not in build_sft_overrides(dict(base))
+
+    # the dense-logit-free loss comes from fused kernels, not liger, so it survives.
+    overrides = build_sft_overrides(dict(base))
+    assert "model.use_fused_kernels=true" in overrides
+    assert "model.fused_kernel_options.impl_backend=torch" in overrides

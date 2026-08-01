@@ -456,9 +456,11 @@ _LIGER_LONG_CTX_TOKENS = 2048
 
 # the fused, dense-logit-free sft loss is validated against these model families. other models keep
 # plain nll until their output-head and backbone traversal are covered by the same parity tests.
-# the implementation moved from trl's chunked_nll to verl's use_fused_kernels + use_liger (set
-# unconditionally in engine/worker/sft_train.py); the sizing property -- no dense [b, s, vocab]
-# logits tensor -- is what this set gates, and it holds for both.
+# the implementation moved from trl's chunked_nll to verl's use_fused_kernels (set unconditionally
+# in engine/worker/sft_train.py, with impl_backend=torch); the sizing property -- no dense
+# [b, s, vocab] logits tensor -- is what this set gates, and it holds for both. liger is NOT part
+# of that property: verl disables liger's fused linear ce, and liger zeroed the sft lora gradient
+# (GRAD-001), so sft runs with use_liger=false.
 _SFT_CHUNKED_NLL_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-0.8B",
