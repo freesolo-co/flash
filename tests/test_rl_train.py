@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 
 import flash.engine.worker as W
-from flash.engine.worker import backend_common, rl, rl_train
+from flash.engine.worker import backend_common, rl, rl_train, sft_train
 from flash.engine.worker.heartbeat import RewardObservabilityBuffer
 
 
@@ -2298,9 +2298,47 @@ def test_model_revision_resolves_pinned_snapshot_for_verl():
 
     resolver_src = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert "model_revision pinning is not yet supported" not in resolver_src
+    # assert on the resolver being CALLED, not on snapshot_download's keywords appearing inline:
+    # the resolution moved into _cached_model_path (shared with sft/opd), so pinning the argument
+    # spelling here would only re-assert where the code happens to live today.
     run_src = inspect.getsource(rl_train.run_rl_train)
-    assert "local_files_only=True" in run_src
-    assert 'revision=inp["model_revision"]' in run_src
+    assert '_cached_model_path(inp["model_id"], inp["model_revision"])' in run_src
+    helper_src = inspect.getsource(sft_train._cached_model_path)
+    assert "local_files_only=True" in helper_src
+
+
+def test_unpinned_model_also_resolves_a_snapshot_dir_for_verl():
+    """An EMPTY model_revision must resolve a real snapshot dir too, not pass the bare repo id.
+
+    verl runs with HF_HUB_OFFLINE=1, so a bare repo id resolves only through cache symlinks that
+    are best-effort on this worker. When they do not land, verl raises "does not appear to have a
+    file named pytorch_model.bin or model.safetensors" -- a PERMANENT OSError, thrown after the GPU
+    is already rented, so the user is billed for a pod that never trains. The pinned branch was
+    always resolved; the unpinned one is the path most runs take, and it was the one left bare.
+
+    _cached_model_path raises RetriableInfraError instead, so an unresolvable cache relands the run
+    on a healthy worker. Assert it is called UNCONDITIONALLY -- outside any `if model_revision`
+    branch -- because a resolver reachable on only one branch is exactly the defect.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    fn = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train))).body[0]
+
+    def _calls(node):
+        return [
+            n
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "_cached_model_path"
+        ]
+
+    assert _calls(fn), "run_rl_train must resolve the model path through _cached_model_path"
+    # every call sits at statement level in the function body, so none is guarded by a revision test
+    guarded = [c for stmt in fn.body if isinstance(stmt, ast.If) for c in _calls(stmt)]
+    assert not guarded, "the resolver must run for an unpinned revision too, not only a pinned one"
 
 
 def test_pinned_snapshot_dir_is_what_reaches_verl_model_path():
