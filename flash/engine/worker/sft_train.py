@@ -57,6 +57,10 @@ from flash.engine.worker.sft import (
 _SFT_LORAPLUS_RATIO = 16.0
 _LORAPLUS_READY_MARKER = "FLASH_LORAPLUS_READY"
 _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
+# consecutive zero-grad-norm steps tolerated before the run is failed as untrainable (GRAD-001).
+# 2 is enough to separate a one-off fully-masked batch from a severed backward graph, and keeps
+# the wasted spend to a couple of steps rather than the whole run.
+_MAX_ZERO_GRAD_STEPS = 2
 
 _REQUIRED_OVERRIDE_KEYS = (
     "train_files",
@@ -535,6 +539,15 @@ _flash_original_build_module = _FlashFSDPEngine._build_module
 
 def _flash_build_reentrant_module(self):
     module = _flash_original_build_module(self)
+    # REQUIRED before enabling reentrant checkpointing on a lora model, and the reason every
+    # verl sft run silently trained nothing (GRAD-001). lora freezes the embeddings, so the
+    # hidden states entering the first checkpointed decoder layer have requires_grad=False.
+    # reentrant checkpointing needs at least one input tensor requiring grad to attach the
+    # recomputed forward to the graph; with none it warns "None of the inputs have
+    # requires_grad=True. Gradients will be None" and returns no gradient for the whole
+    # segment -- which is where every lora parameter lives. result was grad_norm 0.0 on every
+    # step while the run reported done and billed. opd already does this; sft did not.
+    module.enable_input_require_grads()
     module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
     return module
 
@@ -1340,6 +1353,9 @@ def run_sft_train(spec=None) -> None:
     ]
 
     progress = {"step": resume_step, "loss": None, "grad_norm": None, "lr": None}
+    # consecutive steps seen with grad_norm == 0.0 at a nonzero lr. one step can legitimately be
+    # zero (a fully-masked micro-batch), so require a short run of them before failing.
+    zero_grad_steps: list[int] = []
     loss_curve: list[float] = []
     train_tokens = sft_completed_train_tokens(
         total_tokens_per_epoch,
@@ -1379,6 +1395,21 @@ def run_sft_train(spec=None) -> None:
             progress["loss"] = loss
         if grad_norm is not None:
             progress["grad_norm"] = grad_norm
+            # a grad norm of exactly 0.0 while the lr is still nonzero means the backward pass
+            # produced nothing for every trainable parameter. that is never legitimate: it is a
+            # broken graph, not a small update. GRAD-001 shipped four runs that reported done and
+            # billed while training nothing, because this number was recorded and never read.
+            # fail the run instead of paying for a zero adapter that then deploys and serves.
+            if grad_norm == 0.0 and (learning_rate_value is None or learning_rate_value > 0.0):
+                zero_grad_steps.append(int(progress["step"] or 0))
+                if len(zero_grad_steps) >= _MAX_ZERO_GRAD_STEPS:
+                    raise RuntimeError(
+                        "verl reported train/grad_norm=0.0 with a nonzero learning rate on "
+                        f"{len(zero_grad_steps)} consecutive steps: no gradient is reaching the "
+                        "lora parameters, so this run would train nothing. see GRAD-001"
+                    )
+            else:
+                zero_grad_steps.clear()
         if learning_rate_value is not None:
             progress["lr"] = learning_rate_value
 
