@@ -1433,6 +1433,14 @@ def run_sft_train(spec=None) -> None:
     return_code = 0
     if resume_step < update_horizon:
         watcher.start()
+        # completeness is only a meaningful question when training ran to the end. an on_line
+        # callback that raises (the zero-grad guard above, the lora+ guard) unwinds BEFORE
+        # return_code is assigned, so deriving the flag from return_code alone would leave it at
+        # its initial 0 and demand every required save from a run that stopped at step 2. the
+        # watcher would then raise "required saves were not durably published" from the finally
+        # and REPLACE the diagnosis with a downstream symptom. opd_train tracks the same flag for
+        # the same reason.
+        training_completed = False
         try:
             with liveness_heartbeat(
                 "sft_step",
@@ -1446,8 +1454,9 @@ def run_sft_train(spec=None) -> None:
                     on_line=on_line,
                     heartbeat=child_heartbeat,
                 )
+                training_completed = return_code == 0
         finally:
-            watcher.stop(require_complete=return_code == 0)
+            watcher.stop(require_complete=training_completed)
     train_wall = time.time() - train_started_at
     device_peak_gpu_gb = gpu_sampler.stop_gb()
     if return_code != 0:
