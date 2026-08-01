@@ -477,13 +477,21 @@ def _spec_environment_id(spec: object) -> str:
         return env_id
 
 
-def _require_accessible_project(project_id: str) -> str:
+def _require_accessible_project(project_id: object) -> str:
     """The canonical id of a project this caller can actually upload to.
 
-    Raises ClientError when the credentials are missing or the project is not reachable from
-    this organization, so the refusal happens before a single generation is bought."""
+    Shape and reachability are one question here because they have one answer at every call
+    site: a project that cannot be resolved is not a project to record against, whether it is
+    malformed, deleted, or owned by another organization. Raises ClientError in every one of
+    those cases, so the refusal happens before a single generation is bought."""
     from flash.client import ApiError, ClientError, get_project
     from flash.client.config import load_credentials
+    from flash.spec import require_project_id
+
+    try:
+        project_id = require_project_id(project_id)
+    except (TypeError, ValueError) as exc:
+        raise ClientError(str(exc)) from exc
 
     _, api_key = load_credentials()
     if not api_key:
@@ -597,7 +605,6 @@ def cmd_env_eval(args) -> int:
     from flash.client import ApiError, ClientError, client_from_config
     from flash.envs.loader import load_freesolo_environment
     from flash.schema import parse_adapter_revision, parse_checkpoint_ref
-    from flash.spec import require_project_id
 
     if args.project and not args.upload:
         return _err("--project cannot be combined with --no-upload")
@@ -617,9 +624,9 @@ def cmd_env_eval(args) -> int:
     project_id = ""
     if args.project:
         try:
-            project_id = _require_accessible_project(require_project_id(args.project))
-        except (TypeError, ValueError, ClientError) as exc:
-            if isinstance(exc, ClientError) and getattr(args, "debug", False):
+            project_id = _require_accessible_project(args.project)
+        except ClientError as exc:
+            if getattr(args, "debug", False):
                 raise
             return _err(f"--project must be a valid PROJECT_ID: {exc}")
 
@@ -655,7 +662,6 @@ def cmd_env_eval(args) -> int:
             return _err("overall: FAIL")
 
     client = client_from_config()
-
     evaluation_target = args.target
     if revision is None and parsed is not None:
         run_id, want_step = parsed
@@ -810,9 +816,9 @@ def cmd_env_eval(args) -> int:
         # when the run names none and the user did not either, recording would have to invent a home
         # for a permanent result, so it refuses before any paid generation and names both ways out.
         try:
-            project_id = _require_accessible_project(require_project_id(_spec_project(spec)))
-        except (TypeError, ValueError, ClientError) as exc:
-            if isinstance(exc, ClientError) and getattr(args, "debug", False):
+            project_id = _require_accessible_project(_spec_project(spec))
+        except ClientError as exc:
+            if getattr(args, "debug", False):
                 raise
             _err(
                 f"env eval failed: cannot record results for {args.target}: its project is unknown "
