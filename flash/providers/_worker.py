@@ -255,8 +255,13 @@ def build_worker_env(
         "HF_TOKEN",
         "GITHUB_TOKEN",
     ):
-        if os.environ.get(key):
-            env[key] = os.environ[key]
+        # Stripped, and a blank value forwards NOTHING. The worker's git askpass and HF client both
+        # branch on presence, so a whitespace-only credential is worse than an absent one: it turns
+        # an anonymous public fetch into an authenticated request with a malformed token, which
+        # GitHub and HF reject outright.
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            env[key] = value
     env["HF_REPO"] = spec.train.hf_repo
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
