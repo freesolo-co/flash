@@ -246,10 +246,23 @@ _RUN_BLOCK_S: dict[str, float] = {
     # reason the TFLOPS table does. Left out, it fell through to the pooled default and mis-priced
     # every lambda/vast quote in that band.
     "A100 SXM 40GB": 543.4,
-    "B200": 410.3,
+    # Re-estimated on step leverage (was 410.3, fitted at a single step count). B200 is the ONLY
+    # class the step-identification sweep moved: its 410.3 exceeded the entire realized 4-step run
+    # on that card (272.8 s), and a block is a strict subset of the run it starts. 1.50x is past the
+    # 1.194x replicate noise floor, and all three estimators agree it is >15% high (least squares
+    # 235.7, robust median 302.8, feasibility 180.9). The robust median is taken rather than the
+    # least-squares point because on B200's own arms 235.7 overshoots to 0.823x while 302.8 lands at
+    # 0.932x and gains an arm into band (4/6 -> 5/6).
+    "B200": 302.8,
     "H100": 339.0,
     # H200 is the outlier: ~2.2x the H100 block on the same sm90 kernels. Consistent across its arms,
     # so it is a property of the class as provisioned, not a bad sample.
+    #
+    # Its 4-step arm also under-runs this block (549.6 s), but it is NOT corrected, and the contrast
+    # with B200 is the reason: the three estimators disagree here (672.7 / 769.4 / 457.7, only 1 of 3
+    # below), the class carries 2.17x spread across its own arms, and the shipped value already
+    # scores 1.016x on them. Every candidate replacement is worse (457.7 -> 0.726x). One low arm on a
+    # wide-spread class is a leverage point, not a measurement.
     "H200": 762.4,
     "RTX 4090": 404.6,
     "RTX 5090": 98.4,

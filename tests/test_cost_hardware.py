@@ -169,6 +169,54 @@ def test_run_block_is_charged_per_class_not_pooled():
     assert _DEFAULT_RUN_BLOCK_S > 0.0
 
 
+def test_run_block_never_exceeds_the_shortest_run_measured_on_that_card():
+    """A block is a strict subset of the run that starts it, so it cannot outlast one.
+
+    This is the check that caught B200 (410.3 s block against a complete 272.8 s 4-step run) after
+    the step-identification sweep, and it is worth a permanent test because the failure is invisible
+    at the horizons the corpus is thickest at: a too-large block only shows up where it dominates the
+    wall, which is the short-run end nothing else scores.
+
+    The bound is per card and measured, not a modelled quantity, so this cannot be satisfied by
+    recalibrating the step slope. Values are the shortest realized TRAIN wall (``wall - setup``) on
+    the canonical 0.8B rollout cell, taken from the worker's own metrics.json and confirmed to have
+    completed every requested step rather than exiting early.
+
+    Compared against the 1.194x replicate noise floor rather than 1.0: a block within run-to-run pod
+    variance of its shortest run is tight, not impossible, and failing on that would make the test
+    fire on noise.
+
+    Two classes are held out, each for a stated reason rather than to make the test pass:
+      - RTX 4090: its shortest arm banked a 829 s setup, 9.4x that card's median, so the engine
+        build landed BEFORE the setup stamp and its train wall is not comparable to the corpus.
+      - H200: it DOES violate the bound (1.39x) and is knowingly left uncorrected -- see the table
+        comment. One low arm on a class with 2.17x internal spread is a leverage point, and every
+        candidate replacement scores worse on that card's own arms. It is asserted below at the
+        looser bound it actually satisfies, so a further regression there still fails.
+    """
+    from flash.cost.facts import run_block_seconds
+
+    shortest_train_s = {
+        "A100 PCIe": 339.9,
+        "A100 SXM": 541.0,
+        "B200": 272.8,
+        "H100": 323.7,
+        "RTX 5090": 198.8,
+        "RTX Pro 6000": 292.8,
+    }
+    noise_floor = 1.194
+
+    for card, realized in shortest_train_s.items():
+        block = run_block_seconds(card)
+        assert block <= realized * noise_floor, (
+            f"{card}: block {block:.1f}s exceeds its shortest measured run {realized:.1f}s by "
+            f"{block / realized:.2f}x, past the {noise_floor}x noise floor"
+        )
+
+    # the known exception, pinned so it cannot silently drift further from its own measurement.
+    assert run_block_seconds("H200") <= 549.6 * 1.40
+
+
 def test_run_block_table_only_lists_real_classes():
     # same drift guard the TFLOPS table gets. a typo'd key here does not raise -- it silently falls
     # through to the pooled default, so the measured value would be quietly discarded and the class
@@ -241,6 +289,46 @@ def test_run_block_is_charged_once_per_run_not_once_per_step():
     for steps in (4, 8, 16, 48):
         marginal = train_wall(steps * 2) - train_wall(steps)
         assert marginal == pytest.approx(steps * sps), f"block re-charged at steps={steps}"
+
+
+def test_opd_run_block_is_measured_not_borrowed_from_grpo():
+    """OPD shares grpo's block by MEASUREMENT, not merely by shared mechanism.
+
+    The table is fitted on rollout arms and applied to both methods, which is only sound if opd's
+    step/block split actually matches. It does: 7 opd arms on RTX 4090 at steps 4/8/16/48 (12x
+    leverage, 3 replicates at the short end) fit step 33.55 s and block 384.3 s at R2 0.992, against
+    the shipped 404.6 -- 0.95x, well inside the 1.194x replicate noise floor.
+
+    Asserted through the quote at two horizons rather than against the fitted numbers directly, so
+    it tests the shipped path. The wide tolerance is deliberate: this pins that opd is priced on its
+    own measured scale, and would fail on a borrowed-from-nowhere or method-blind default, without
+    re-asserting a fit that a handful of arms cannot place more tightly than the noise floor.
+    """
+    from flash.cost.analytical import compile_seconds, run_startup_seconds, seconds_per_step
+    from flash.cost.types import RunConfig
+
+    card = "RTX 4090"
+    measured = {4: 494.3, 48: 1962.3}  # median of the 3 short replicates; the single long arm
+
+    for steps, realized in measured.items():
+        cfg = RunConfig(
+            "Qwen/Qwen3.5-0.8B",
+            "opd",
+            steps,
+            seq_len=512,
+            completion_len=128,
+            batch_size=8,
+            group_size=4,
+        )
+        quoted = (
+            compile_seconds(cfg, card)
+            + run_startup_seconds(cfg, card)
+            + steps * seconds_per_step(cfg, card)
+        )
+        assert 1 / 1.5 <= quoted / realized <= 1.5, (
+            f"opd steps={steps}: quoted {quoted:.0f}s vs measured {realized:.0f}s "
+            f"({quoted / realized:.2f}x)"
+        )
 
 
 def test_run_block_is_not_shardable_across_cards():
