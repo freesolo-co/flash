@@ -441,7 +441,13 @@ def spec_from_dict(
                 train=train_raw,
                 thinking=thinking,
             )
-            if get_gpu_info(gpu_type).vram_gb < required_vram:
+            # required_vram is the WHOLE-RUN floor, so it may only be compared against a single
+            # card's VRAM when the run is confined to a single card. above that the allocator
+            # shards the run across a combination and applies its own multi-card fit test
+            # (allocator.py:181), which this gate must not pre-empt: a pinned 141 GB class with
+            # gpu.count=2 holds 282 GB and is rejected here on a 180 GB floor it clears.
+            single_card = gpu_count is None or gpu_count <= 1
+            if single_card and get_gpu_info(gpu_type).vram_gb < required_vram:
                 raise ConfigError(
                     f"gpu.type {gpu_type!r} has {get_gpu_info(gpu_type).vram_gb} GB VRAM, "
                     f"but this run requires at least {required_vram} GB"

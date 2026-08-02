@@ -286,7 +286,9 @@ platform-managed. For controlled experiments, `[gpu] provider` restricts allocat
 provider and `[gpu] type` pins one exact active validated GPU class. Run artifacts are stored in a private environment-scoped repo with content-addressed
 Flash code snapshots. Set `seed` only at the top level; `[worker_env]` cannot override
 `SEED`, `RUN_ID`, `HF_REPO`, or `FLASH_ARM`. Compose or tweak configs without editing files: `--config
-extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).
+extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`). `--gpus N` is
+shorthand for `--set gpu.count=N`; both land in one override list, so repeats resolve left to
+right.
 
 ### 4. Submit
 
@@ -1276,6 +1278,36 @@ count = 4
 # submit names the ones that qualify when it rejects an unpinned multi-gpu spec.
 ```
 
+`flash train configs/grpo.toml --gpus 4` sets the same key from the command line, so a config can
+stay at its authored count while one submit asks for more. The flag is exactly `--set
+gpu.count=4`: the same 1..8 bound rejects a bad value, and the same submit gate still demands a
+provider that rents all n cards on one machine.
+
+`gpu.count` is a **ceiling, not an exact count** — by either spelling. Allocation treats it as the
+most cards it may use, and it stops at the first count that fits: a class that fits the run on one
+card is allocated as one card, and a class that needs sharding gets the _smallest_ fitting
+combination, not the count you asked for. `--gpus 4` on a 9B **SFT** run pinned to a 24 GB class
+allocates 2. Combinations are also capped at 4, so 5-8 only lower the count that would otherwise be
+chosen.
+
+That example is SFT-specific on purpose. The fit test is per algorithm, and the same 9B pinned to
+the same 24 GB class does not allocate at all under GRPO or OPD — it raises `UnsupportedGpuError:
+... cannot fit this run even as a 4-card combination`, because rollout memory pushes it past what
+four such cards hold. Raising `--gpus` cannot rescue a pin the algorithm never fits on.
+
+**There is no exact-count mechanism.** Pinning a small `[gpu] type` raises the floor above one card
+but still does not pin n — it only moves which combination is smallest. To see what a submit
+actually chose, read the `allocated 2x <class> on <provider> at $N/hr` line at the top of `flash runs
+log`: the runner writes it when it places the run, so it is there before a worker exists and stays
+there for the life of the run. A single card is spelled without the `Nx` prefix.
+
+Do **not** read the count off `spec.gpu.count` in `flash runs status` — that echoes the ceiling you
+submitted, so it shows 4 even on a run allocated 1 card. `gpu_status.device_count` is a genuine
+worker-side observation, but it is not a reliable place to look either: the mid-run heartbeats
+(`sft_train`, `opd_step`, `rl_step`) collect diagnostics without torch, and each heartbeat _replaces_
+`gpu_status` wholesale, so the field is usually absent while a run is live and reappears only on the
+terminal heartbeat.
+
 GRPO, SFT and OPD all shard across `gpu.count` with no backend key to set: the worker launches one
 rank per card with Ulysses sequence parallelism.
 
@@ -1309,6 +1341,7 @@ flash env delete --project <project-uuid> your-org/my-env -y   # delete a publis
 flash train configs/sft.toml --dry-run # validate the config on the server (no GPU, no charge)
 flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/sft.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
+flash train configs/grpo.toml --gpus 4 # shorthand for --set gpu.count=4; a CEILING (needs a multi-card provider)
 flash runs status <run-id>                 # state + accrued cost
 flash runs log <run-id>                    # reward/loss trend + worker console/error logs
 flash runs log <run-id> --follow           # stream a live run to completion
