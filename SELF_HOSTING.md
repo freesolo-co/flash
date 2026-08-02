@@ -190,6 +190,12 @@ and on your plane that key is what grants full control of it - so the fallback w
 your plane's credential to a service you do not operate. Export the adapter and serve it
 yourself if you do not run a compatible backend.
 
+The catalog reports a `serving.serve_model_id` per model - the pre-quantized FP8 checkpoint
+Freesolo's serving app loads, and most of those repos are private. They are **informational
+only**: nothing in the training path reads them, so they cannot block a run. If you stand up
+your own serving backend, quantize the base model yourself (or serve it unquantized) rather
+than expecting to pull those repo names.
+
 ## The worker image
 
 The GPU worker image is public and pulls directly. It is published under an explicit CUDA
