@@ -4667,9 +4667,7 @@ def test_opd_pins_the_blackwell_attention_backends_like_grpo_does():
     )
     # '+' appends under the existing engine_kwargs.vllm struct: these are AsyncEngineArgs fields
     # spread by verl, not declared RolloutConfig fields, so a bare assignment would not reach them.
-    assert (
-        "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHINFER" in on
-    ), on
+    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHINFER" in on, on
     assert (
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend=TORCH_SDPA" in on
     ), on
