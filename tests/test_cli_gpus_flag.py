@@ -171,3 +171,37 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
     assert allocated == [2, 2, 2], (
         f"expected the smallest fitting combination for every ask, got {allocated}"
     )
+
+
+def test_the_public_record_reports_the_ceiling_not_the_allocated_count():
+    """TRAINING.md tells users to read the allocated count off gpu_status, not spec.gpu.count.
+
+    Both halves of that sentence are load-bearing and both are asserted here, because the doc
+    previously said to read `gpu.count` back off the run record -- which silently reports the
+    ceiling. A user who submits --gpus 4, reads 4 back and concludes they got 4 cards would size
+    throughput and cost off a number the allocator never honoured.
+
+    The allocated count IS recorded, but only in effective_preparation, which to_dict() pops as
+    server-internal. So the assertion is that the public record does NOT carry it -- if a future
+    change starts publishing it there, this fails and the doc gets rewritten with it.
+    """
+    from flash.runner import RunStatus
+
+    submitted_ceiling = 4
+    status = RunStatus(
+        run_id="x",
+        state="running",
+        spec={"gpu": {"type": "RTX 4090", "provider": "runpod", "count": submitted_ceiling}},
+        # what the allocator actually chose, recorded exactly where the runner records it.
+        effective_preparation={"worker_spec": {"gpu": {"count": 2}}},
+    )
+    public = status.to_dict()
+
+    # the internal carrier holding the real count is stripped, so users cannot reach it at all.
+    assert "effective_preparation" not in public, (
+        "the allocated count became publicly readable; TRAINING.md should now point at it"
+    )
+    # and the field users CAN see still echoes what they asked for, not what they got.
+    assert public["spec"]["gpu"]["count"] == submitted_ceiling, (
+        "spec.gpu.count no longer echoes the submitted ceiling; the doc's warning is now wrong"
+    )

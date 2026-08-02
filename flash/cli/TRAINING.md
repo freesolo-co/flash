@@ -1291,7 +1291,9 @@ Combinations are also capped at 4, so 5-8 only lower the count that would otherw
 
 **There is no exact-count mechanism.** Pinning a small `[gpu] type` raises the floor above one card
 but still does not pin n — it only moves which combination is smallest. To see what a submit
-actually chose, read `gpu.count` back off the run record.
+actually chose, read `gpu_status.device_count` off `flash runs status`, which the worker reports
+from the cards it was actually given. `spec.gpu.count` there echoes the ceiling you submitted, so it
+shows 4 even on a run allocated 1 card.
 
 GRPO, SFT and OPD all shard across `gpu.count` with no backend key to set: the worker launches one
 rank per card with Ulysses sequence parallelism.
