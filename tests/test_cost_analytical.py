@@ -297,33 +297,62 @@ def test_nonpositive_run_knobs_rejected(knob, bad):
         RunConfig(MID, "grpo", 100, **{knob: bad})
 
 
-def test_opd_teacher_scoring_is_one_parallel_wave():
-    # Teacher scoring fans a step's completions across prompts_per_step*group_size concurrent Fireworks
-    # calls (opd.py Phase 2), so EVERY completion in a step is scored in one parallel wave -- the
-    # teacher wall is a single latency regardless of completion count, NOT the serial (completions x
-    # latency) sum. Hold seq_tokens (hence gen_s/update_s) constant while doubling the completion count;
-    # since scoring is now fully parallel the teacher term is unchanged, so the per-step delta is 0.
-    from flash.cost.analytical import seconds_per_step
+def test_opd_teacher_scoring_bills_serial_batched_round_trips():
+    # Teacher scoring is batched AND serial: _TextTeacherBatcher (opd_train.py) fills a batch of
+    # OPD_TEACHER_BATCH_SIZE and hands it to ONE daemon thread, whose loop blocks in _score_batch
+    # (a single score_many = a single echo POST) before taking the next batch. So a step's teacher
+    # wall is ceil(completions / batch) latencies -- not one wave, and not completions x latency.
+    # Hold seq_tokens (hence gen_s/update_s) constant while doubling the completion count so the
+    # only thing that can move the delta is per-completion scaling.
+    from flash.cost.analytical import OPD_TEACHER_BATCH_SIZE, seconds_per_step
     from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, teacher_seconds_per_completion
 
     gpu = "RTX 5090"
     teacher_lat = teacher_seconds_per_completion()
     assert teacher_lat > 0  # else the isolation below is vacuous
     # completions x seq_len is identical (8*2048 == 16*1024), so gen_s/update_s match and only the
-    # completion count (hence any wave scaling) differs.
+    # completion count (hence teacher round trips + rollout slope) differs.
     few = RunConfig(MID, "opd", 10, batch_size=8, group_size=1, seq_len=2048)
     many = RunConfig(MID, "opd", 10, batch_size=16, group_size=1, seq_len=1024)
+    # 8 completions fill exactly one batch; 16 need two. pin that the fixture actually straddles a
+    # batch boundary, or the assertion below passes for the wrong reason.
+    assert 8 % OPD_TEACHER_BATCH_SIZE == 0 and 16 // OPD_TEACHER_BATCH_SIZE == 2
     delta = seconds_per_step(many, gpu) - seconds_per_step(few, gpu)
-    # the rollout wall DOES scale per completion (vllm samples and detokenizes each sequence
-    # separately, whatever the token total), so the delta is that slope and nothing more. what this
-    # pins is that the TEACHER term contributes none of it -- a serial teacher would add another
-    # 8 x latency on top.
-    expected = 8 * ROLLOUT_SECONDS_PER_COMPLETION
+    # the rollout wall scales per completion (vllm samples and detokenizes each sequence separately,
+    # whatever the token total), and the teacher adds exactly ONE more round trip across this
+    # boundary -- not eight (per-completion serial) and not zero (one parallel wave).
+    expected = 8 * ROLLOUT_SECONDS_PER_COMPLETION + teacher_lat
     assert delta == pytest.approx(expected, abs=1e-6), (
-        "full-parallel teacher scoring bills one wave; doubling completions at equal total tokens "
-        "must add the rollout slope only, no teacher latency"
+        "teacher scoring bills ceil(completions/batch) serial round trips; crossing one batch "
+        "boundary at equal total tokens must add the rollout slope plus exactly one latency"
     )
-    assert delta < teacher_lat * 8  # a serial teacher would swamp the slope
+    assert delta < teacher_lat * 8  # a per-completion serial teacher would swamp the slope
+
+
+def test_opd_teacher_batch_size_matches_the_worker():
+    # flash.cost must not import the training worker (it prices runs on machines without the
+    # training stack), so OPD_TEACHER_BATCH_SIZE is a MIRROR of the worker's _TEXT_TEACHER_BATCH_SIZE.
+    # A mirror that nothing pins silently goes stale, and the teacher term would then quote a batch
+    # shape the worker no longer runs. Read the worker's literal from source rather than importing
+    # it, since importing opd_train pulls in the training dependencies this test must not require.
+    import ast
+    import pathlib
+
+    from flash.cost.analytical import OPD_TEACHER_BATCH_SIZE
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "flash/engine/worker/opd_train.py"
+    tree = ast.parse(src.read_text())
+    worker_value = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_TEXT_TEACHER_BATCH_SIZE" for t in node.targets
+        ):
+            worker_value = ast.literal_eval(node.value)
+    assert worker_value is not None, "worker no longer defines _TEXT_TEACHER_BATCH_SIZE at module level"
+    assert OPD_TEACHER_BATCH_SIZE == worker_value, (
+        f"cost model mirrors a stale teacher batch size ({OPD_TEACHER_BATCH_SIZE}) — "
+        f"the worker now batches {worker_value}"
+    )
 
 
 def test_revision_pinned_sizing_flows_into_setup_and_required_save(monkeypatch, tmp_path):

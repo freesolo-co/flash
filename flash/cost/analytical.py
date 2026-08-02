@@ -36,6 +36,11 @@ GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref f
 # Fireworks API, so there is NO local frozen-reference forward (GRPO's extra 2).
 OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 6.0
 
+# mirrors _TEXT_TEACHER_BATCH_SIZE in flash/engine/worker/opd_train.py. the cost model must not
+# import the worker (it has to price a run without the training stack installed), so the value is
+# duplicated here and pinned by a test that reads the worker's constant and asserts they agree.
+OPD_TEACHER_BATCH_SIZE = 8
+
 # Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod
 # wall clock. LoRA + small batches sit well below dense-pretraining MFU.
 MFU_TRAIN = 0.35  # GRPO policy/reference update
@@ -227,7 +232,7 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     update_mfu = MFU_TRAIN_MOE if moe else MFU_TRAIN
 
     if n.is_opd:
-        # OPD step = on-policy student rollout (like GRPO) + remote teacher scoring (CONCURRENT
+        # OPD step = on-policy student rollout (like GRPO) + remote teacher scoring (SERIAL batched
         # Fireworks round-trips, replaces reward grading) + policy update (fwd+bwd only, NO local
         # reference forward — the teacher is the API). Bill local compute on the FULL prompt+completion
         # sequence (see _opd_step_shape), not completion-only, or long-prompt opd is underquoted.
@@ -237,12 +242,20 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
             peak * update_mfu
         )
         teacher_lat = teacher_seconds_per_completion()
-        # run_opd's primary path scores a step's completions CONCURRENTLY over Fireworks with a fan-out
-        # cap of the step's OWN completion count (prompts_per_step * group_size, opd.py Phase 2), so
-        # every completion in a step is scored in ONE parallel wave — the teacher wall is a single
-        # latency, NOT the full serial sum (that describes only the CPU-test fallback that can't
-        # batch-generate). The teacher endpoint's rate limit is the real ceiling on this fan-out.
-        teacher_s = teacher_lat
+        # a step's completions are echo-scored in batches of OPD_TEACHER_BATCH_SIZE, and those
+        # batches are SERIAL: _TextTeacherBatcher (opd_train.py) runs a single daemon thread whose
+        # loop takes one batch, blocks in _score_batch, and only then takes the next. _score_batch
+        # issues exactly one score_many call = one echo POST (teacher.py). so the teacher wall is
+        # ceil(completions / batch) round trips, NOT one — it grows linearly with step size, and the
+        # two coincide only for a step that fits in a single batch.
+        #
+        # teacher_lat is an assumed average (facts.AVG_TEACHER_SECONDS_PER_COMPLETION), not a
+        # measured per-batch latency, and an 8-item echo batch does not cost the same wall as a
+        # 1-item one. the ROUND-TRIP COUNT below is read off the worker; the per-trip coefficient
+        # remains a declared assumption. opd records only a teacher success count and no teacher
+        # wall time, so nothing in-tree can calibrate it yet.
+        teacher_trips = -(-completions // OPD_TEACHER_BATCH_SIZE)  # ceil, ints only
+        teacher_s = teacher_lat * teacher_trips
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
         #
