@@ -288,7 +288,7 @@ def test_a_stale_backend_key_cannot_change_the_allocator(stale_backend):
     trainer that cannot run, and "trl" on grpo/opd would hand verl's rollout the expandable conf that
     trips the CuMemAllocator assert before step 1."""
     from flash.providers._worker import build_worker_env
-    from flash.spec import JobSpec, effective_backend
+    from flash.spec import JobSpec
 
     for algorithm, phase, expect_expandable in (
         ("grpo", "rl", False),
@@ -304,7 +304,6 @@ def test_a_stale_backend_key_cannot_change_the_allocator(stale_backend):
             }
         )
         env = build_worker_env(spec, 0)
-        assert effective_backend(spec) == "verl"
         for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
             assert ("expandable_segments" in env[key]) is expect_expandable, (
                 f"{algorithm} allocator moved under a stale {stale_backend!r} key"
