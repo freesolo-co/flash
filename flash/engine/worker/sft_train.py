@@ -42,7 +42,7 @@ from flash.engine.worker.backend_common import (
     stamp_adapter_dir_provenance,
     verl_step_number,
 )
-from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.heartbeat import join_while_draining, liveness_heartbeat
 from flash.engine.worker.packing import completion_mask_from_ids
 from flash.engine.worker.rng import seed_training_rngs
 from flash.engine.worker.sft import (
@@ -636,9 +636,11 @@ class _VerlCheckpointWatcher:
 
     def stop(self, *, require_complete: bool) -> None:
         self._stop.set()
-        self._thread.join(timeout=600)
-        if self._thread.is_alive():
-            raise RuntimeError("verl checkpoint watcher did not stop")
+        # bounded by lack of progress, not wall clock, so a big-model upload that is still moving
+        # is never killed (VERL-131). a watcher that died mid-publish is already not alive, so the
+        # join returns at once and raise_if_failed surfaces its real exception rather than a
+        # generic "did not stop".
+        join_while_draining(self._thread, "verl checkpoint watcher")
         self.raise_if_failed()
         if require_complete:
             missing = sorted(self.required_steps - self.processed_steps)
