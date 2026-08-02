@@ -594,12 +594,10 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
         )
         return rl_train.build_verl_overrides(cfg)
 
-    # the hydra prefixes DIFFER and each is asserted exactly. free_cache_engine is in
-    # trainer/config/rollout/rollout.yaml (:56) so a bare override resolves; enable_sleep_mode is
-    # dataclass-only (workers/config/rollout.py:277) and absent from that yaml, so it needs `+` or
-    # hydra raises `Key 'enable_sleep_mode' is not in struct` and main_ppo exits 1 before allocating
-    # anything. a substring assertion on the bare key passes against BOTH spellings and so cannot
-    # fail on the broken one. see ISSUES.md VERL-148.
+    # the two knobs need DIFFERENT hydra prefixes -- rollout_resident_overrides' docstring has the
+    # why. asserted EXACTLY rather than as a substring, because "x=false" is a substring of
+    # "+x=false": the obvious assertion passes against the spelling that kills the run at parse,
+    # which is how this shipped. see ISSUES.md VERL-148.
     for override in (
         "actor_rollout_ref.rollout.free_cache_engine=false",
         "+actor_rollout_ref.rollout.enable_sleep_mode=false",
