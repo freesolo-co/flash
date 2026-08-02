@@ -171,6 +171,79 @@ def test_standalone_refuses_to_default_the_serving_url(monkeypatch) -> None:
     assert "serving.example.internal" in deploy.serving_base_url()
 
 
+# Every spelling below resolves to Freesolo-operated infrastructure. An operator carrying any of
+# them in an old `.env` must not have the plane's root credential shipped to a third party.
+HOSTED_SERVING_URL_SPELLINGS = [
+    "https://serve.freesolo.co",
+    "https://serve.freesolo.co/",
+    "https://serve.freesolo.co/v1",
+    "  https://serve.freesolo.co  ",
+    "https://SERVE.FREESOLO.CO",
+    "https://Serve.Freesolo.Co/v1",
+    "http://serve.freesolo.co",
+    "https://serve.freesolo.co:443",
+    "https://serve.freesolo.co./v1",
+    "https://user:pw@serve.freesolo.co",
+    "serve.freesolo.co",
+    "https://api.freesolo.co",
+    "https://freesolo.co",
+]
+
+
+@pytest.mark.parametrize("configured", HOSTED_SERVING_URL_SPELLINGS)
+def test_standalone_refuses_an_explicitly_configured_hosted_serving_url(monkeypatch, configured):
+    """SET-to-the-hosted-URL is the case an unset-only guard misses, and it is the LIKELY one.
+
+    A self-hoster who started from a copied `.env` -- or who ran managed first -- has
+    FREESOLO_SERVING_URL already assigned to the hosted default. Guarding only the unset case
+    means `flash deploy`/`chat` still POST to serve.freesolo.co with FREESOLO_INTERNAL_KEY in
+    X-Freesolo-Internal-Key, which on a standalone plane is the credential controlling the plane.
+
+    Matched on the parsed HOST, so the guard is not a string compare against one canonical
+    spelling: scheme, case, port, trailing dot, credentials, and /v1 suffix all vary in real
+    config files and every one of them reaches the same third party.
+    """
+    from flash.serve import deploy
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    monkeypatch.setenv("FREESOLO_SERVING_URL", configured)
+
+    with pytest.raises(deploy.ServingError) as excinfo:
+        deploy.serving_base_url()
+    assert "FREESOLO_SERVING_URL" in str(excinfo.value)
+    # same resolver underneath, so the OpenAI base url cannot be used to route around it
+    with pytest.raises(deploy.ServingError):
+        deploy.serving_openai_base_url()
+
+    # managed mode is unaffected: the hosted backend is exactly what it should be talking to.
+    monkeypatch.delenv(auth.STANDALONE_ENV)
+    assert deploy.serving_base_url()
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "https://serving.example.internal",
+        "http://localhost:8000",
+        "https://my-serve.example.com/v1",
+        # a host that merely CONTAINS the domain is not ours -- the guard must not over-block
+        "https://notfreesolo.co",
+        "https://freesolo.co.evil.example.com",
+        "https://serve.freesolo.co.attacker.test",
+    ],
+)
+def test_standalone_still_allows_a_serving_backend_the_operator_runs(monkeypatch, configured):
+    """The counterpart: over-blocking would make self-hosted serving impossible, which is the
+    feature. Suffix matching is on a dotted boundary, so `freesolo.co.evil.example.com` and
+    `notfreesolo.co` are other people's hosts and stay allowed."""
+    from flash.serve import deploy
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    monkeypatch.setenv("FREESOLO_SERVING_URL", configured)
+    assert deploy.serving_base_url()
+    assert deploy.serving_openai_base_url().endswith("/v1")
+
+
 def test_standalone_operator_key_survives_surrounding_whitespace(monkeypatch, tmp_path) -> None:
     """The preflight tests the STRIPPED value, so an env file with a trailing newline starts a plane
     that then rejects the only credential it accepts -- every request 401 behind a preflight that
