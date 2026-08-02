@@ -5651,3 +5651,33 @@ def test_opd_missing_managed_teacher_key_fails_before_the_gpu_probe(monkeypatch)
 
     with pytest.raises(RuntimeError, match="managed teacher api key is missing"):
         opd_mod.run_opd_train()
+
+
+def test_the_opd_trainer_stores_the_frozen_base_in_bf16():
+    """VERL-150: verl's fsdp.yaml default is fp32, which doubles the trainer's resident base.
+
+    an un-overridden run loads the base at 4 bytes/param, because ``model_dtype: fp32``
+    (``trainer/config/engine/fsdp.yaml:33``) is passed straight to ``from_pretrained`` and the
+    ``if torch_dtype is None`` fallback below it never fires. at 27B that is 103 GB instead of 52,
+    which left vLLM 71.9 GB against an 89.2 GB demand and killed g5's OPD leg at engine startup --
+    reported 4 frames above the real error, as a bare ``ValueError`` from a child worker process.
+
+    the sft driver has set an explicit dtype since it was written and the rl/opd drivers did not,
+    which is exactly why g5's sft leg succeeded and its grpo and opd legs failed on the same model
+    and the same card. the rl driver's half of this lives in test_rl_train.
+    """
+    overrides = build_opd_overrides(_config())
+    want = "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16"
+    # exact, not substring: "x=bfloat16" is a substring of "+x=bfloat16", so the obvious `in`
+    # assertion passes against a spelling hydra REJECTS here ("Could not append to config. An item
+    # is already at ..."). the key is declared in the yaml and takes a BARE override -- the inverse
+    # of enable_sleep_mode above, which is dataclass-only and requires `+`. neighbouring keys,
+    # opposite prefixes. see ISSUES.md VERL-150.
+    assert want in overrides
+    assert f"+{want}" not in overrides, "must not be + prefixed"
+    # ref is deliberately NOT set. it reads like a second resident copy and is not one:
+    # ray_trainer.py:897 aliases ref_policy_wg to the actor worker whenever ref_in_actor holds, and
+    # flash parses lora_rank with minimum=1 (schema/__init__.py:485) so it always holds. setting it
+    # would free nothing. this asserts the absence so a future reader has to re-derive the above
+    # rather than pattern-match it back in.
+    assert not [o for o in overrides if "ref.fsdp_config.model_dtype" in o]
