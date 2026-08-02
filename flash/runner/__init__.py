@@ -29,7 +29,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import MANAGED_GPU_KEYS, JobSpec, effective_backend
+from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, JobSpec
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -1241,7 +1241,7 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
         "worker_spec": worker_spec.to_internal_dict(),
         "adapter_identity": adapter_identity,
         "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
-        "backend": effective_backend(public_spec),
+        "backend": TRAINER_BACKEND,
     }
     return _update(
         worker_spec.run_id,
@@ -1331,7 +1331,7 @@ def submit_job(
             "preparation_digest": _preparation_digest(
                 public_spec, worker_spec, prepared.adapter_identity
             ),
-            "backend": effective_backend(public_spec),
+            "backend": TRAINER_BACKEND,
         },
         # Snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
