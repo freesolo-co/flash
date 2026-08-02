@@ -606,7 +606,7 @@ def _dynamic_import_name(node, callees: frozenset[str]) -> str | None:
 
 
 def _imported_module_names(tree) -> set[str]:
-    """Top-level names a parsed module imports absolutely, statement or literal call."""
+    """Top-level sibling names a parsed module imports, by statement or literal call."""
     import ast
 
     names: set[str] = set()
@@ -614,8 +614,22 @@ def _imported_module_names(tree) -> set[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name.split(".", 1)[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            names.add(node.module.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                if node.module:
+                    names.add(node.module.split(".", 1)[0])
+            elif node.level == 1:
+                # `from . import config` and `from .utils import load` name siblings of this file
+                # just as the absolute spellings do. an entrypoint written to work both as a
+                # package member and as a loose module puts the relative form first and falls back
+                # to the absolute one, so reading only absolute imports left the helper unpackaged
+                # whenever the relative spelling came first -- and the fallback then had no file to
+                # import. a bare `from . import x` carries the name in `names`, not in `module`.
+                if node.module:
+                    names.add(node.module.split(".", 1)[0])
+                else:
+                    names.update(alias.name.split(".", 1)[0] for alias in node.names)
+            # level >= 2 climbs above the package this push carries, so it can name no sibling.
         elif isinstance(node, ast.Call):
             dynamic = _dynamic_import_name(node, callees)
             if dynamic:
@@ -639,6 +653,86 @@ def _helper_imports(helper: Path) -> set[str]:
         )
     except (OSError, SyntaxError, UnicodeDecodeError):
         return set()
+
+
+def _iter_import_closure(
+    seed_modules: set[str], *, env_root: Path, entrypoint: Path, yielded: set[Path]
+) -> Iterator[tuple[Path, Path]]:
+    """Yield the sibling helpers reachable from `seed_modules`, following their imports too.
+
+    A helper that imports another sibling needs that sibling too: shipping `scorer.py` without
+    the `thresholds` it imports published an environment that raised ModuleNotFoundError on its
+    first case, having passed every local check because the source directory was importable
+    (cursor[bot]). The queue grows only through siblings actually reached, so it stays a closure
+    over files this push already carries rather than a general dependency resolver -- an
+    unimported neighbour stays local.
+
+    `yielded` is shared with the caller's other walks so a helper that IS `dataset/` (or lives
+    under it) is not emitted twice; `_check_env_push_limits` would otherwise charge those bytes
+    and members twice and reject a tree that is actually under the limit (codex[bot]).
+    """
+    import os
+
+    pending = sorted(seed_modules)
+    visited: set[str] = set()
+    while pending:
+        module_name = pending.pop()
+        if module_name in visited:
+            continue
+        visited.add(module_name)
+        # `from graders.rules import score` resolves to a sibling PACKAGE, not graders.py.
+        # matching only the module spelling published an environment whose sidecar raises
+        # ModuleNotFoundError on its first case, having passed every local check.
+        #
+        # resolution follows python's own order, which is NOT simply "directories first".
+        # a directory holding __init__.py is a regular package and outranks a same-named
+        # module, so shipping the .py and skipping the package published the file the
+        # sidecar never imports while dropping the one it does (cursor[bot]). but a PEP 420
+        # namespace directory (no __init__.py) is only a fallback portion: `graders.py`
+        # wins over a bare `graders/`. requiring the marker unconditionally sent a
+        # namespace helper to the .py fallback, which did not exist either, and published
+        # an archive missing the helper entirely (codex[bot]). verified by probe: with both
+        # present, `import graders` binds graders.py.
+        package = env_root / module_name
+        helper = env_root / f"{module_name}.py"
+        ships_package = (
+            package.is_dir()
+            and not package.is_symlink()
+            and ((package / "__init__.py").is_file() or not helper.is_file())
+        )
+        if ships_package and not _ignore_env_push_path(
+            package, env_root=env_root, entrypoint=entrypoint
+        ):
+            for root, dirs, files in os.walk(
+                package, topdown=True, followlinks=False, onerror=_raise_walk_error
+            ):
+                root_path = Path(root)
+                dirs[:] = sorted(
+                    name
+                    for name in dirs
+                    if not _ignore_env_push_path(
+                        root_path / name, env_root=env_root, entrypoint=entrypoint
+                    )
+                )
+                for name in sorted(files):
+                    child = root_path / name
+                    if child in yielded or _ignore_env_push_path(
+                        child, env_root=env_root, entrypoint=entrypoint
+                    ):
+                        continue
+                    yielded.add(child)
+                    pending.extend(_helper_imports(child))
+                    yield child, child.relative_to(env_root)
+            continue
+        if (
+            helper.is_file()
+            and helper != entrypoint
+            and helper not in yielded
+            and not _ignore_env_push_path(helper, env_root=env_root, entrypoint=entrypoint)
+        ):
+            yielded.add(helper)
+            pending.extend(_helper_imports(helper))
+            yield helper, helper.relative_to(env_root)
 
 
 def _iter_env_sidecar_files(
@@ -666,6 +760,24 @@ def _iter_env_sidecar_files(
             ):
                 yielded.add(doc)
                 yield doc, doc.relative_to(env_root)
+        # the entrypoint's OWN imports ship, exactly as its evaluation sidecar's do. seeding the
+        # closure only from evaluations.py published an environment whose entrypoint imported
+        # siblings without them: `env push` exits 0 and prints an id, so nothing surfaces until a
+        # GPU has been rented and the worker imports the module. parsed with the same reader as
+        # every other module here, so a lazily imported helper (inside load_environment) counts.
+        try:
+            entry_tree = ast.parse(entrypoint.read_text(encoding="utf-8"), filename=str(entrypoint))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            # the entrypoint is validated for syntax on its own path, and a push that cannot read
+            # it fails there with a better message. an unreadable file here just means no closure.
+            entry_tree = None
+        if entry_tree is not None:
+            yield from _iter_import_closure(
+                _imported_module_names(entry_tree),
+                env_root=env_root,
+                entrypoint=entrypoint,
+                yielded=yielded,
+            )
         # the eval sidecar ships with its entrypoint. `env eval` loads evaluations.py next to an
         # exact .py target, so omitting it here would publish an environment whose suite passed
         # locally and is simply absent once pushed.
@@ -688,73 +800,12 @@ def _iter_env_sidecar_files(
             # (flash/envs/evaluations.py). scanning only top-level nodes skips exactly that
             # pattern, so `env test` passes locally and the pushed environment is missing the
             # helper the sidecar imports the moment it grades a case.
-            imported_modules = _imported_module_names(tree)
-            # a helper that imports another sibling needs that sibling too: shipping `scorer.py`
-            # without the `thresholds` it imports published an environment that raised
-            # ModuleNotFoundError on its first case, having passed every local check because the
-            # source directory was importable (cursor[bot]). the queue is seeded from the sidecar
-            # and grows only through siblings actually reached, so it stays a closure over files
-            # this push already carries rather than a general dependency resolver.
-            pending = sorted(imported_modules)
-            visited: set[str] = set()
-            while pending:
-                module_name = pending.pop()
-                if module_name in visited:
-                    continue
-                visited.add(module_name)
-                # `from graders.rules import score` resolves to a sibling PACKAGE, not graders.py.
-                # matching only the module spelling published an environment whose sidecar raises
-                # ModuleNotFoundError on its first case, having passed every local check.
-                #
-                # resolution follows python's own order, which is NOT simply "directories first".
-                # a directory holding __init__.py is a regular package and outranks a same-named
-                # module, so shipping the .py and skipping the package published the file the
-                # sidecar never imports while dropping the one it does (cursor[bot]). but a PEP 420
-                # namespace directory (no __init__.py) is only a fallback portion: `graders.py`
-                # wins over a bare `graders/`. requiring the marker unconditionally sent a
-                # namespace helper to the .py fallback, which did not exist either, and published
-                # an archive missing the helper entirely (codex[bot]). verified by probe: with both
-                # present, `import graders` binds graders.py.
-                package = env_root / module_name
-                helper = env_root / f"{module_name}.py"
-                ships_package = (
-                    package.is_dir()
-                    and not package.is_symlink()
-                    and ((package / "__init__.py").is_file() or not helper.is_file())
-                )
-                if ships_package and not _ignore_env_push_path(
-                    package, env_root=env_root, entrypoint=entrypoint
-                ):
-                    for root, dirs, files in os.walk(
-                        package, topdown=True, followlinks=False, onerror=_raise_walk_error
-                    ):
-                        root_path = Path(root)
-                        dirs[:] = sorted(
-                            name
-                            for name in dirs
-                            if not _ignore_env_push_path(
-                                root_path / name, env_root=env_root, entrypoint=entrypoint
-                            )
-                        )
-                        for name in sorted(files):
-                            child = root_path / name
-                            if child in yielded or _ignore_env_push_path(
-                                child, env_root=env_root, entrypoint=entrypoint
-                            ):
-                                continue
-                            yielded.add(child)
-                            pending.extend(_helper_imports(child))
-                            yield child, child.relative_to(env_root)
-                    continue
-                if (
-                    helper.is_file()
-                    and helper != entrypoint
-                    and helper not in yielded
-                    and not _ignore_env_push_path(helper, env_root=env_root, entrypoint=entrypoint)
-                ):
-                    yielded.add(helper)
-                    pending.extend(_helper_imports(helper))
-                    yield helper, helper.relative_to(env_root)
+            yield from _iter_import_closure(
+                _imported_module_names(tree),
+                env_root=env_root,
+                entrypoint=entrypoint,
+                yielded=yielded,
+            )
         roots = [
             env_root / name
             for name in ("dataset", "datasets")
