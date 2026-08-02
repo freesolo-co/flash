@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import random
 import re
 import time
@@ -14,6 +13,7 @@ from collections.abc import Callable
 from typing import Any
 
 from flash.diagnostics import sanitize_diagnostic
+from flash.providers._auth import load_provider_key
 from flash.providers._deadline import remaining_seconds, require_deadline_at
 
 _HTTP_404_RE = re.compile(r"\bhttp 404\b")
@@ -54,7 +54,13 @@ class RestClient:
         self.extra_headers = dict(extra_headers or {})
 
     def api_key(self) -> str:
-        key = os.environ.get(self.env_var)
+        # Through load_provider_key, so the key SENT is the key `is_configured()` and the startup
+        # preflight judged. Reading os.environ raw here let a value with a stray newline pass
+        # preflight (which strips) and then go out as `Authorization: Bearer <key>\n`, which the
+        # provider rejects: a Lambda- or Vast-only plane reported healthy while every capacity
+        # lookup and allocation failed. RunPod is unaffected -- its pool strips on parse -- but it
+        # reaches the same value through this method, so normalizing once here covers all three.
+        key = load_provider_key(self.env_var)
         if not key:
             raise self.error_cls(self.missing_key_message)
         return key

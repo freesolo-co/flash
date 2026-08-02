@@ -290,11 +290,22 @@ def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
     # just-verified key via ApiClient, so stub that (not client_from_config).
     monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
     monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    # `kind` mirrors the real /v1/me, which always sends it alongside key_prefix (server/routes/
+    # meta.py); only `email` is conditional. Login now checks for that shape before trusting a
+    # plane's answer, so a fixture missing it would be asserting on a response no server can send.
     monkeypatch.setattr(
         cli.commands,
         "ApiClient",
         lambda *a, **k: type(
-            "_C", (), {"me": lambda self: {"key_prefix": "freesolo", "email": "t@example.com"}}
+            "_C",
+            (),
+            {
+                "me": lambda self: {
+                    "kind": "freesolo_api_key",
+                    "key_prefix": "freesolo",
+                    "email": "t@example.com",
+                }
+            },
         )(),
     )
     assert _run(["login", "--api-key", "fs-secret-key"]) == 0

@@ -41,7 +41,13 @@ env:
 
 jobs:
   gate:
-    if: github.event.workflow_run.conclusion == 'success'
+    # Upstream only -- see publish.yml. Guarded at the GATE rather than on each downstream job so
+    # one condition covers the whole chain: `gpu-warm` calls bake-kernel-cache.yml, which spends
+    # real GPU money, and `relayer` wants the org's larger runner. A fork can never reach either if
+    # the gate does not run.
+    if: >-
+      github.repository == 'freesolo-co/flash'
+      && github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       proceed: ${{ steps.base.outputs.proceed }}
