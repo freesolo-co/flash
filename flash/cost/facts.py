@@ -254,11 +254,23 @@ def step_floor_seconds(name: str, completions: int = 0, resident: bool = False) 
 
     ``resident=True`` drops the constant for a model the catalog flags ``sleep_unsupported``. Those
     pin the rollout engine resident instead of sleeping it (catalog.py, backend_common.py), so the
-    engine entry/exit cycle the constant is made of never runs. Charging it anyway extrapolates well
-    past the fit: every one of the 56 arms is a sleep-capable 0.8B/2B/4B model, so a resident rollout
-    was never measured. It is not a small error -- on Qwen3.6-35B-A3B the constant alone (55.4s B200,
-    126.4s H200) exceeds this module's own ~24s realized-step figure for that model, so the quote is
-    dominated by a term whose mechanism is switched off.
+    engine entry/exit cycle the constant is mostly made of never runs. Charging it anyway extrapolates
+    well past the fit: every one of the 56 arms is a sleep-capable 0.8B/2B/4B model, so a resident
+    rollout was never measured. It is not a small error -- on Qwen3.6-35B-A3B the constant alone
+    (55.4s B200, 126.4s H200) exceeds this module's own ~24s realized-step figure for that model, so
+    the quote was dominated by a term whose mechanism is switched off.
+
+    Being exact about what zero here gives up: the intercept is engine entry/exit AND the
+    actor->rollout weight sync, and the sync still runs every step on a resident engine -- the
+    resident overrides touch only ``free_cache_engine``/``enable_sleep_mode``, both sleep knobs, and
+    an on-policy step must push the updated policy into vLLM either way. So zero under-quotes by one
+    sync. The intercept is NOT split, because the corpus cannot split it: every fitted arm ran
+    sleep-enabled, so no measurement separates the two components. A guessed split ratio would be a
+    fabricated number wearing a measured one's clothes. Zero is chosen as the bounded, honest error:
+    a colocate sync is a same-device weight copy (~70GB bf16 for the 35B, tens of ms at HBM
+    bandwidth plus collective overhead), which is small against a 55-126s intercept, and it errs
+    toward under-quoting a single model rather than over-quoting it by ~5x its realized step.
+    Replace this with a measured resident intercept once a resident arm is calibrated.
 
     The SLOPE is still charged: a resident engine skips the cycle, not the per-sequence sampling,
     detokenization and dispatch work. Zero here would be the opposite error. The slope itself is
