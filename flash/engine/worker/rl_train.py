@@ -53,7 +53,9 @@ from flash.engine.worker.backend_common import (
     agent_loop_workers,
     append_step_metrics,
     clamp_engine_len,
+    export_peft_adapter,
     kill_process_group,
+    latest_global_step_dir,
     model_max_position_embeddings,
     parse_verl_metric,
     parse_verl_step_metrics,
@@ -467,7 +469,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         "trainer.resume_mode=auto",
         "trainer.test_freq=-1",
         "trainer.val_before_train=False",
-        f"trainer.logger=[{cfg['loggers']}]",
+        f"trainer.logger={_hydra_val(cfg['loggers'])}",
         # the run's own wandb project/name, exactly as the sft and opd verl backends resolve them. a
         # hardcoded pair would land every grpo run in one wandb project under one experiment name, so
         # concurrent runs overwrite each other's curves and an explicit [wandb] config is ignored.
@@ -538,7 +540,7 @@ def _build_verl_training_cfg(
     val_files: str,
     model_id: str,
     thinking: bool,
-    loggers: str,
+    loggers: list[str],
     fp8_kv: bool,
     enforce_eager: bool,
     attention_backend: str | None,
@@ -2169,64 +2171,6 @@ def start_reward_server(
 # --------------------------------------------------------------------------------------------
 # verl interpreter + checkpoint export.
 # --------------------------------------------------------------------------------------------
-def _resolve_verl_loggers(python_bin: str) -> str:
-    """verl's ``trainer.logger`` list, as the comma-joined form this module's override emits."""
-    return ",".join(resolve_verl_loggers(python_bin))
-
-
-def _export_peft_adapter(
-    ckpt_actor_dir: str,
-    out_adapter_dir: str,
-    *,
-    base_model_id: str,
-    python_bin: str,
-) -> None:
-    """turn verl's saved lora checkpoint into a flash-servable peft adapter dir.
-
-    verl saves fsdp-sharded checkpoints under ``<local_dir>/global_step_N/actor`` (model/optim
-    shards + a ``huggingface/`` config+tokenizer subfolder). ``verl.model_merger merge`` writes a
-    standard peft adapter (adapter_config.json + adapter_model.safetensors) to a ``lora_adapter/``
-    subfolder of its target; we copy just that adapter into flash's adapter dir (the co-produced
-    merged full model is discarded -- flash serves the lora on the immutable base).
-
-    verified against verl 0.8 on an h100 (r2): merger emits ``<target>/lora_adapter/{adapter_config
-    .json,adapter_model.safetensors}`` with ``base_model_name_or_path: null``.
-    """
-    os.makedirs(out_adapter_dir, exist_ok=True)
-    merge_out = out_adapter_dir.rstrip("/") + "_merge"
-    shutil.rmtree(merge_out, ignore_errors=True)
-    merge_env = dict(os.environ)
-    # the base config/tokenizer are already cached; keep the merger off hf's rate-limited api.
-    merge_env["HF_HUB_OFFLINE"] = "1"
-    merge_env["TRANSFORMERS_OFFLINE"] = "1"
-    merge_env["HF_HUB_DISABLE_XET"] = "1"
-    subprocess.run(
-        [
-            python_bin,
-            "-m",
-            "verl.model_merger",
-            "merge",
-            "--backend",
-            "fsdp",
-            "--local_dir",
-            ckpt_actor_dir,
-            "--target_dir",
-            merge_out,
-        ],
-        check=True,
-        env=merge_env,
-    )
-    lora_dir = os.path.join(merge_out, "lora_adapter")
-    if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
-        raise RuntimeError(
-            f"verl model_merger did not produce a peft adapter at {lora_dir} (no adapter_config.json); "
-            "the merger output layout must be adjusted for this verl version."
-        )
-    for name in os.listdir(lora_dir):
-        shutil.copy2(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
-    shutil.rmtree(merge_out, ignore_errors=True)
-
-
 class _VerlResumeUploader:
     """stream each completed verl checkpoint to hf so a preempted grpo run can resume from it.
 
@@ -2379,7 +2323,7 @@ class _VerlResumeUploader:
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         shutil.rmtree(adapter_dir, ignore_errors=True)
         os.makedirs(adapter_dir, exist_ok=True)
-        _export_peft_adapter(
+        export_peft_adapter(
             actor_dir, adapter_dir, base_model_id=self.model_id, python_bin=self.python_bin
         )
         # the served adapter needs its preprocessor alongside it, exactly as the final publish does:
@@ -2547,20 +2491,6 @@ def _check_grpo_had_a_gradient(
             "environment's reward does not discriminate between completions. refusing to publish an "
             "adapter identical to its initialization"
         )
-
-
-def _latest_global_step_dir(local_dir: str) -> tuple[str, int]:
-    """return (actor_dir, step) for the highest global_step_N checkpoint verl wrote."""
-    best_step, best = -1, ""
-    if os.path.isdir(local_dir):
-        for name in os.listdir(local_dir):
-            m = re.fullmatch(r"global_step_(\d+)", name)
-            if m and int(m.group(1)) > best_step:
-                best_step = int(m.group(1))
-                best = os.path.join(local_dir, name, "actor")
-    if best_step < 0:
-        raise RuntimeError(f"no global_step_N checkpoint found under {local_dir}")
-    return best, best_step
 
 
 # --------------------------------------------------------------------------------------------
@@ -3006,7 +2936,7 @@ def run_rl_train():
     os.makedirs(workdir, exist_ok=True)
     local_dir = os.path.join(workdir, "ckpt")
     # a retry reuses the pod workdir; stale global_step_N dirs from a prior attempt would satisfy
-    # _latest_global_step_dir and publish an old policy as if this attempt trained it.
+    # latest_global_step_dir and publish an old policy as if this attempt trained it.
     shutil.rmtree(local_dir, ignore_errors=True)
     # restore after the wipe, never before: the wipe is what makes a stale local dir safe, and the
     # resume checkpoint is the one global_step_N this attempt is entitled to start from.
@@ -3186,8 +3116,8 @@ def run_rl_train():
                 '[worker_env] as FLASH_VERL_PYTHON = "" to provision one.'
             )
         expected_steps = int(inp["steps"])
-        # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).
-        loggers = _resolve_verl_loggers(python_bin)
+        # verl logs from its own interpreter; gate wandb on that env (see resolve_verl_loggers).
+        loggers = resolve_verl_loggers(python_bin)
         _spec = _w.JOB_SPEC
         project_name = (_spec.wandb.project if _spec and _spec.wandb else None) or "flash"
         experiment_name = _w.wandb_run_name()
@@ -3481,7 +3411,7 @@ def run_rl_train():
     # the zero-gradient verdict already ran inside the try above, ahead of required-save
     # completeness, so that a withheld deployable reports the reward cause rather than the
     # publication symptom.
-    actor_dir, steps_run = _latest_global_step_dir(local_dir)
+    actor_dir, steps_run = latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
         raise RuntimeError(
             f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
@@ -3494,7 +3424,7 @@ def run_rl_train():
         progress_step=True,
         keepalive=True,
     ):
-        _export_peft_adapter(
+        export_peft_adapter(
             actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
         )
         preprocessor.save_pretrained(adapter_dir)

@@ -284,7 +284,7 @@ def _overrides_cfg(**over):
         "steps": 60,
         "gpu_mem_util": 0.5,
         "n_gpus": 1,
-        "loggers": "console",
+        "loggers": ["console"],
         "fp8_kv": False,
         "enforce_eager": False,
         "warmstart_adapter": "",
@@ -582,7 +582,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
             val_files="/w/v.parquet",
             model_id="/w/model",
             thinking=False,
-            loggers="console",
+            loggers=["console"],
             fp8_kv=False,
             enforce_eager=False,
             attention_backend=None,
@@ -644,7 +644,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "val_files": "/w/v.parquet",
         "model_id": "Qwen/Qwen3-4B",
         "thinking": False,
-        "loggers": "console",
+        "loggers": ["console"],
         "fp8_kv": False,
         "enforce_eager": False,
         "attention_backend": None,
@@ -744,7 +744,7 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
         val_files="/w/val.parquet",
         model_id=inp["model_id"],
         thinking=False,
-        loggers="console",
+        loggers=["console"],
         fp8_kv=False,
         enforce_eager=False,
         attention_backend=None,
@@ -821,7 +821,7 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
     monkeypatch.setattr(
         rl_train._w, "write_base_model_provenance", lambda *a, **kw: None, raising=False
     )
-    monkeypatch.setattr(rl_train, "_export_peft_adapter", lambda *a, **kw: None)
+    monkeypatch.setattr(rl_train, "export_peft_adapter", lambda *a, **kw: None)
     monkeypatch.setattr(rl_train, "stamp_adapter_dir_provenance", lambda *a, **kw: None)
 
     local_dir = tmp_path / "ckpt"
@@ -952,7 +952,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         val_files="/w/val.parquet",
         model_id=inp["model_id"],
         thinking=False,
-        loggers="console",
+        loggers=["console"],
         fp8_kv=False,
         enforce_eager=False,
         attention_backend=None,
@@ -981,7 +981,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
 
 
 def test_build_verl_overrides_wandb_logger_when_enabled():
-    o = rl_train.build_verl_overrides(_overrides_cfg(loggers="console,wandb"))
+    o = rl_train.build_verl_overrides(_overrides_cfg(loggers=["console", "wandb"]))
     assert "trainer.logger=[console,wandb]" in o
 
 
@@ -2472,31 +2472,6 @@ def test_pinned_snapshot_dir_is_what_reaches_verl_model_path():
     assert model_id.value.id == "model_path_for_verl"
 
 
-def test_resolve_verl_loggers_console_when_no_api_key(monkeypatch):
-    # no WANDB_API_KEY -> console only, and no wandb probe of the verl interpreter.
-    monkeypatch.delenv("WANDB_API_KEY", raising=False)
-    monkeypatch.setattr(
-        rl_train.subprocess,
-        "run",
-        lambda *a, **k: pytest.fail("must not probe verl env without an api key"),
-    )
-    assert rl_train._resolve_verl_loggers("/verl/bin/python") == "console"
-
-
-def test_resolve_verl_loggers_enables_wandb_only_when_verl_env_has_it(monkeypatch):
-    # api key set AND wandb importable in the verl interpreter -> wandb logger enabled.
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.setattr(rl_train.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
-    assert rl_train._resolve_verl_loggers("/verl/bin/python") == "console,wandb"
-
-
-def test_resolve_verl_loggers_falls_back_to_console_when_verl_env_lacks_wandb(monkeypatch):
-    # api key set but wandb missing in the verl interpreter -> console only (never aborts verl).
-    monkeypatch.setenv("WANDB_API_KEY", "k")
-    monkeypatch.setattr(rl_train.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
-    assert rl_train._resolve_verl_loggers("/verl/bin/python") == "console"
-
-
 # ------------------------------- resume (VERL-018) -------------------------------
 def test_build_verl_overrides_enables_resume_mode():
     # without resume_mode=auto verl ignores a staged checkpoint and silently restarts at step 0.
@@ -2667,7 +2642,7 @@ def test_run_rl_train_wires_the_gradient_check_into_the_publish_path():
     assert "_check_grpo_had_a_gradient(" in source
     assert "resumed=bool(resume_step)," in source
     assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in source
-    assert source.index("_check_grpo_had_a_gradient") < source.index("_export_peft_adapter")
+    assert source.index("_check_grpo_had_a_gradient") < source.index("export_peft_adapter")
     # and that the spread series it passes is actually collected from the child's output.
     assert 'parse_verl_metric(line, "critic/advantages/max")' in source
     assert 'parse_verl_metric(line, "critic/advantages/min")' in source
@@ -3404,7 +3379,7 @@ def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
         val_files="/w/val.parquet",
         model_id=inp["model_id"],
         thinking=False,
-        loggers="console",
+        loggers=["console"],
         fp8_kv=False,
         enforce_eager=False,
         attention_backend=None,
@@ -4423,7 +4398,7 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
         val_files="/w/val.parquet",
         model_id=inp["model_id"],
         thinking=False,
-        loggers="console",
+        loggers=["console"],
         fp8_kv=False,
         enforce_eager=False,
         attention_backend=None,
