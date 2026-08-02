@@ -770,18 +770,6 @@ def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: i
     return adapter_dir
 
 
-def _message_contains_text(messages: list[dict], needle: str) -> bool:
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, str) and needle in content:
-            return True
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and needle in str(block.get("text") or ""):
-                    return True
-    return False
-
-
 def _verl_image_message_content(content) -> str:
     if isinstance(content, str):
         return content
