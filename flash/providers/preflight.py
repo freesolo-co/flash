@@ -43,11 +43,50 @@ def _present(var: str) -> bool:
     return bool((os.environ.get(var) or "").strip())
 
 
+# Credentials the plane reads straight from ``os.environ`` at many call sites rather than through
+# one accessor. Normalized in place at startup so the value consumers read is the value preflight
+# accepted -- see ``_normalize_operator_credentials``.
+_NORMALIZED_IN_PLACE = ("HF_TOKEN", "GITHUB_TOKEN")
+
+
+def _normalize_operator_credentials() -> None:
+    """Strip surrounding whitespace off operator credentials, in the process environment.
+
+    ``_present`` strips before deciding a credential is set, so a token with a trailing newline
+    (routine in a copied ``.env``) passes startup. The consumers then read ``os.environ`` RAW:
+    ``HfApi(token=...)`` does not strip either, so the padding reaches the wire as
+    ``Authorization: Bearer <sp><sp>hf_...`` and HF rejects it. The plane reported healthy and the
+    first submit died creating the artifact repo, after the operator thought setup was done.
+
+    Fixed here rather than at ~40 call sites because this is where the two halves disagree: the
+    check that ACCEPTS the padded value is the right place to make it true. Every other operator
+    credential already normalizes at its single accessor (``load_provider_key``, ``internal_key``,
+    ``artifact_namespace``, the RunPod key pool), so this brings the odd ones out into line rather
+    than adding a new convention.
+
+    Stripping and accepting, not rejecting: a stray newline is a typo, and every other credential
+    in this plane tolerates one. Runs before the checks below, and before anything is served, so
+    no consumer can observe the unnormalized value.
+    """
+    for var in _NORMALIZED_IN_PLACE:
+        raw = os.environ.get(var)
+        if raw is None:
+            continue
+        stripped = raw.strip()
+        if stripped != raw:
+            # a whitespace-ONLY value becomes "", which every consumer's `or None` / truthiness
+            # check already reads as absent -- the same meaning `_present` gives it.
+            os.environ[var] = stripped
+            logger.warning("%s had surrounding whitespace; using the stripped value.", var)
+
+
 def check_run_preflight() -> None:
     """Raise PreflightError if the plane cannot run a job; warn on degraded-but-workable config."""
     from flash.providers import available_providers
     from flash.providers.runpod import keys as runpod_keys
     from flash.server.auth import standalone
+
+    _normalize_operator_credentials()
 
     problems: list[str] = []
 

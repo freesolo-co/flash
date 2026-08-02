@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import flash.providers.preflight as pf
@@ -198,3 +200,47 @@ def test_client_requires_login(monkeypatch, tmp_path):
     finally:
         monkeypatch.undo()
         importlib.reload(client_config)
+
+
+@pytest.mark.parametrize("var", ["HF_TOKEN", "GITHUB_TOKEN"])
+@pytest.mark.parametrize("padded", ["  hf_tok  ", "hf_tok\n", "\thf_tok", "hf_tok "])
+def test_preflight_normalizes_credentials_it_accepted_after_stripping(
+    clean_env, monkeypatch, var, padded
+):
+    """Preflight must leave the environment holding the value it JUDGED, not the padded original.
+
+    `_present` strips before deciding a credential is set, so a token with a trailing newline (a
+    routine artifact of a copied `.env`) passes startup. The consumers then read `os.environ`
+    raw and `HfApi(token=...)` does not strip either -- the padding reaches the wire as
+    `Authorization: Bearer <sp><sp>hf_...`, HF rejects it, and the first submit dies creating the
+    artifact repo long after the plane reported healthy.
+
+    Asserted on `os.environ` rather than on "preflight did not raise" because not raising was
+    already true while the bug was live: the accept-decision and the value consumers read were
+    two different things, and only the second one is what breaks.
+    """
+    _minimal_config(monkeypatch)
+    monkeypatch.setenv(var, padded)
+    pf.check_run_preflight()  # no raise: a stray newline is a typo, not a missing credential
+    assert os.environ[var] == "hf_tok"
+
+
+def test_preflight_leaves_a_clean_credential_untouched(clean_env, monkeypatch):
+    """The normalizer must be a no-op on the normal case, including for an UNSET variable --
+    it must not materialize an empty GITHUB_TOKEN that then reads as configured-but-blank."""
+    _minimal_config(monkeypatch)
+    monkeypatch.setenv("HF_TOKEN", "hf_tok")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    pf.check_run_preflight()
+    assert os.environ["HF_TOKEN"] == "hf_tok"
+    assert "GITHUB_TOKEN" not in os.environ
+
+
+def test_preflight_still_rejects_a_whitespace_only_hf_token(clean_env, monkeypatch):
+    """Normalizing must not turn a whitespace-only credential into an accepted one: stripping it
+    yields "", which is absent, and preflight must still refuse to boot."""
+    _minimal_config(monkeypatch)
+    monkeypatch.setenv("HF_TOKEN", "   \n ")
+    with pytest.raises(pf.PreflightError) as excinfo:
+        pf.check_run_preflight()
+    assert "HF_TOKEN" in str(excinfo.value)
