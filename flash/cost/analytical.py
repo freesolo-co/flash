@@ -314,18 +314,27 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
     fan-out grows, so this never credits a wide combination with more than it can deliver.
 
     It is also, for now, unfalsifiable in-tree: no multi-card arm in the calibration campaign ever
-    reached a step timing (0 of 5), so there is no realized wall to compare against. Two runtime
-    defects outside this module cause that -- the allocator proposes card counts that fail verl's
-    num_attention_heads % ulysses_sp_size assertion (3 cards on a 16-head model), and counts that do
-    divide still die in NCCL because Ray is never told the container's GPU count. Neither is a cost
-    defect, but together they mean this curve should be read as an assumption, not a measurement.
+    reached a step timing (0 of 6), so there is no realized wall to compare against. Three runtime
+    defects outside this module cause that, and none of them is a cost defect -- but together they
+    mean this curve should be read as an assumption, not a measurement.
 
-    Both are still live as of this change: ``ulysses_sequence_parallel_size`` is set to the raw card
-    count with no divisibility guard (sft_train.py:1292/1553, rl_train.py:391, opd_train.py:
+    1. The allocator proposes card counts verl rejects. The gate is KV heads, not attention heads,
+       and it is a disjunction: ``kv % sp == 0 or sp % kv == 0``. Under grouped-query attention the
+       KV count is far smaller than the attention-head count, so it binds much earlier -- 27B has 24
+       attention heads (``24 % 3 == 0`` passes) and only 4 KV heads, and dies on ``sp=3``. Computing
+       both branches across the catalog (every model has 2 or 4 KV heads) leaves legal sp of {1,2,4},
+       so a 3-card combination is unusable for EVERY catalog model while the allocator proposes it
+       for all of them.
+    2. Counts that do divide still die in NCCL, because Ray is never told the container's GPU count
+       and both ranks bind device 0.
+    3. Multi-card SFT dies before its first step on a fused-CE label shape under Ulysses SP.
+
+    All three are still live as of this change: ``ulysses_sequence_parallel_size`` is set to the raw
+    card count with no divisibility guard (sft_train.py:1292/1553, rl_train.py:391, opd_train.py:
     2501/2806), and ``ray_kwargs.ray_init`` passes num_cpus but never num_gpus (rl_train.py:454,
     opd_train.py:1622). So the 2-card CONSTANTS are measured (one fsdp benchmark per interconnect)
-    while the end-to-end CURVE is not, and this docstring is the place that says so. Fixing either
-    defect is trainer work, not cost work.
+    while the end-to-end CURVE is not, and this docstring is the place that says so. Fixing any of
+    them is trainer work, not cost work.
 
     What this module can and does guarantee meanwhile is SELF-CONSISTENCY: the ranker that picks a
     combination and the quote that prices it now share one call (``seconds_per_step``), so whatever
