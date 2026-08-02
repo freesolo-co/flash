@@ -38,6 +38,7 @@ from flash.engine.worker.backend_common import (
     parse_wandb_link,
     ray_num_cpus,
     render_wandb_link_shim,
+    resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
     resolve_verl_device_capability,
     resolve_verl_loggers,
@@ -1561,6 +1562,25 @@ def build_opd_overrides(config: dict) -> list[str]:
         # rollout.enforce_eager is a real verl field, so this is a plain override, not a '+' append.
         # the caller resolves it from the device capability; absent/false keeps verl's default.
         *(["actor_rollout_ref.rollout.enforce_eager=True"] if config.get("enforce_eager") else []),
+        # blackwell attention pins, resolved by the caller and absent off blackwell. both are real
+        # AsyncEngineArgs fields in the pinned vllm 0.19.1 and verl spreads engine_kwargs.vllm
+        # straight into them, so '+' appends under the existing struct exactly as on the grpo path.
+        *(
+            [
+                "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend="
+                f"{config['attention_backend']}"
+            ]
+            if config.get("attention_backend")
+            else []
+        ),
+        *(
+            [
+                "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend="
+                f"{config['mm_encoder_attn_backend']}"
+            ]
+            if config.get("mm_encoder_attn_backend")
+            else []
+        ),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported), exactly as the grpo path does. opd is NOT exempt: main_ppo_sync calls
         # checkpoint_manager.sleep_replicas() during init_workers and again around validation, which
@@ -2389,7 +2409,19 @@ def run_opd_train(spec=None) -> None:
     # oom. see resolve_rollout_enforce_eager for why this one knob is enough and cannot fight
     # verl's: vllm resolves enforce_eager LAST (config/vllm.py:1024), after the async server has set
     # cudagraph_mode, and forces both compilation mode and cudagraph_mode to NONE.
-    enforce_eager = resolve_rollout_enforce_eager(resolve_verl_device_capability(python_bin))
+    # one capability probe feeds both rollout decisions, as it does on the grpo path.
+    verl_cc = resolve_verl_device_capability(python_bin)
+    enforce_eager = resolve_rollout_enforce_eager(verl_cc)
+    # the same grpo/opd divergence as enforce_eager above, one knob over: blackwell needs both
+    # rollout attention backends pinned because vllm 0.19.1's defaults are wrong there, and opd
+    # never pinned them. the ViT default routes into a CUTE flash-attn that is unimportable against
+    # every published nvidia-cutlass-dsl, which aborts the engine with
+    # `RuntimeError: Worker failed with error 'module 'cutlass.cute.core' has no attribute
+    # 'ThrMma''` -- and a VL model builds its vision tower even for a text-only rollout, so this
+    # reaches text-only opd too. no-op off blackwell. see resolve_blackwell_attention_backends.
+    attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(
+        python_bin, verl_cc
+    )
 
     plugin_path = os.path.join(shim_dir, "flash_opd_plugin.py")
     shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_plugin.py"), plugin_path)
@@ -2489,6 +2521,8 @@ def run_opd_train(spec=None) -> None:
             "structured_outputs": structured_outputs,
             "fp8_kv": fp8_kv,
             "enforce_eager": enforce_eager,
+            "attention_backend": attention_backend,
+            "mm_encoder_attn_backend": mm_encoder_attn_backend,
             "sleep_unsupported": rollout_sleep_unsupported(model_id),
             "loggers": loggers,
         }
