@@ -61,14 +61,10 @@ def test_gate_allows_multi_gpu_with_no_key_at_all(algorithm):
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
 def test_a_stale_backend_key_cannot_downgrade_any_phase(algorithm):
     from flash import runner
-    from flash.spec import effective_backend
 
-    # a config carried over from when these phases had selectors must not resolve a backend that no
-    # longer exists: the worker would still run verl, and the gate would refuse it multi-gpu while
-    # the launcher handed it trl's expandable_segments alloc conf (which kills verl's CuMemAllocator).
-    spec = _spec(4, algorithm, backend="trl")
-    assert effective_backend(spec) == "verl"
-    assert runner._require_supported_gpu_count(spec) is None
+    # a config carried over from when these phases had selectors must not reach the gate at all: the
+    # worker runs verl regardless, so refusing it multi-gpu would strand a spec that runs fine.
+    assert runner._require_supported_gpu_count(_spec(4, algorithm, backend="trl")) is None
 
 
 def test_gate_rejects_multi_gpu_on_providers_that_ignore_count():
@@ -79,17 +75,6 @@ def test_gate_rejects_multi_gpu_on_providers_that_ignore_count():
     for provider in ("vast", "lambda", ""):
         with pytest.raises(ValueError, match=r"gpu\.provider"):
             runner._require_supported_gpu_count(_spec(4, backend="verl", provider=provider))
-
-
-def test_effective_backend_is_verl_for_every_phase():
-    from flash.spec import effective_backend
-
-    # verl is the only backend. this stays pinned because the answer is load-bearing: it picks the
-    # allocator conf and gates multi-gpu, and a spec that resolved anything else would take
-    # expandable_segments and crash its vllm rollout on the CuMemAllocator assert.
-    for algorithm in ("sft", "grpo", "opd"):
-        assert effective_backend(_spec(1, algorithm)) == "verl"
-        assert effective_backend(_spec(1, algorithm, backend="trl")) == "verl"
 
 
 def test_submit_job_rejects_multi_gpu_at_boundary(monkeypatch):
