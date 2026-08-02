@@ -594,10 +594,20 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
         )
         return rl_train.build_verl_overrides(cfg)
 
+    # the two knobs need DIFFERENT hydra prefixes -- rollout_resident_overrides' docstring has the
+    # why. asserted EXACTLY rather than as a substring, because "x=false" is a substring of
+    # "+x=false": the obvious assertion passes against the spelling that kills the run at parse,
+    # which is how this shipped. see ISSUES.md VERL-148.
+    for override in (
+        "actor_rollout_ref.rollout.free_cache_engine=false",
+        "+actor_rollout_ref.rollout.enable_sleep_mode=false",
+    ):
+        assert override in _argv(flagged[0])
+    # the bare spelling must be ABSENT, not merely accompanied by the prefixed one.
+    assert "actor_rollout_ref.rollout.enable_sleep_mode=false" not in _argv(flagged[0])
+    # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
+    # what lets a large rollout fit alongside the training weights.
     for key in ("free_cache_engine", "enable_sleep_mode"):
-        assert f"actor_rollout_ref.rollout.{key}=false" in _argv(flagged[0])
-        # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
-        # what lets a large rollout fit alongside the training weights.
         assert not [a for a in _argv("Qwen/Qwen3-4B") if key in a]
 
 
