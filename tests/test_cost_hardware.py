@@ -464,14 +464,21 @@ def test_rollout_slope_is_per_completion_not_per_generated_token():
 
     def quote(cap: int) -> float:
         cfg = RunConfig(
-            "Qwen/Qwen3.5-0.8B", "grpo", 1, seq_len=512, completion_len=cap,
-            batch_size=8, group_size=4,
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            1,
+            seq_len=512,
+            completion_len=cap,
+            batch_size=8,
+            group_size=4,
         )
         return sum(step_seconds_split(cfg, "H100"))
 
     base, wide = quote(128), quote(1536)
     # a 12x cap must not carry a 12x wall. the arithmetic (FLOPs) term may move; the wall may not.
-    assert wide < 1.5 * base, f"cap 128->1536 moved the quote {wide / base:.2f}x; slope went per-token"
+    assert wide < 1.5 * base, (
+        f"cap 128->1536 moved the quote {wide / base:.2f}x; slope went per-token"
+    )
 
     # the wall term itself must be BIT-identical across the two caps: it is the thing that would
     # have to move for the per-token reading to be right, and it takes no cap argument at all.
@@ -479,8 +486,13 @@ def test_rollout_slope_is_per_completion_not_per_generated_token():
 
     def wall(cap: int) -> float:
         cfg = RunConfig(
-            "Qwen/Qwen3.5-0.8B", "grpo", 1, seq_len=512, completion_len=cap,
-            batch_size=8, group_size=4,
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            1,
+            seq_len=512,
+            completion_len=cap,
+            batch_size=8,
+            group_size=4,
         )
         return _split(cfg, "H100")[1]  # non-shardable half == reward + rollout wall
 
