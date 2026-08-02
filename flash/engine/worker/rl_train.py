@@ -74,6 +74,7 @@ from flash.engine.worker.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
     RewardObservabilityBuffer,
+    join_while_draining,
     liveness_heartbeat,
 )
 from flash.engine.worker.hf import _deployable_adapter_on_hf
@@ -2304,9 +2305,9 @@ class _VerlResumeUploader:
         # idempotent: the clean path stops the drain early to surface a missing required save, and
         # the finally block stops it again on every path.
         self._stop.set()
-        self._thread.join(timeout=600)
-        if self._thread.is_alive():
-            raise RuntimeError("verl resume uploader did not stop")
+        # bounded by lack of progress, not wall clock: the uploads run on this thread, so a big
+        # model's full-state drain can legitimately outlast any constant deadline (VERL-131).
+        join_while_draining(self._thread, "verl resume uploader")
 
     def raise_if_incomplete(self) -> None:
         """fail the run when a required save never became durable.

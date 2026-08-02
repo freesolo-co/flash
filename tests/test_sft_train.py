@@ -1241,3 +1241,69 @@ def test_sft_never_enables_liger_because_it_zeroes_the_lora_gradient():
     overrides = build_sft_overrides(dict(base))
     assert "model.use_fused_kernels=true" in overrides
     assert "model.fused_kernel_options.impl_backend=torch" in overrides
+
+
+def test_drain_join_survives_a_slow_upload_that_keeps_reporting_progress(monkeypatch):
+    """VERL-131: a checkpoint drain must be bounded by lack of progress, not wall clock.
+
+    The measured failure was a 35B-A3B full-state upload that needed 607.6s against a fixed 600s
+    join. It was healthy and still uploading -- it emitted another `checkpoint_uploading` heartbeat
+    9s AFTER the join gave up -- and the timeout converted a run that had already trained and
+    published into `failed`. The bound has to distinguish "still working" from "cannot progress".
+    """
+    import threading
+    import time as real_time
+
+    # NB: the worker package rebinds the name `heartbeat` to the re-exported heartbeat
+    # FUNCTION, so `import ... as hb` yields that function rather than this module.
+    # import_module returns the real module object.
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    from flash.engine.worker._pkg import W as _w
+
+    # a drain that runs far past any constant deadline while stamping progress, as a real upload
+    # does through its keepalive daemon. virtual clock: the test must not actually take 600s.
+    now = [0.0]
+    monkeypatch.setattr(hb.time, "monotonic", lambda: now[0])
+
+    class _SlowButHealthy:
+        """alive for 3600 virtual seconds, reporting progress throughout."""
+
+        def __init__(self) -> None:
+            self.elapsed = 0.0
+
+        def is_alive(self) -> bool:
+            return self.elapsed < 3600.0
+
+        def join(self, timeout=None) -> None:
+            step = timeout or 5.0
+            self.elapsed += step
+            now[0] += step
+            # the upload keepalive stamps this on every tick while bytes move.
+            _w._HB_LAST_PROGRESS_TS = self.elapsed
+
+    monkeypatch.setattr(_w, "_HB_LAST_PROGRESS_TS", 0.0, raising=False)
+    # would have raised under the old fixed 600s join; must return cleanly now.
+    hb.join_while_draining(_SlowButHealthy(), "slow uploader")
+
+    # and the converse: a drain that stops progressing must still be caught, or the bound is
+    # unfailable and a genuinely wedged thread holds the worker open forever.
+    now[0] = 0.0
+
+    class _Wedged:
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout=None) -> None:
+            now[0] += timeout or 5.0  # time advances; _HB_LAST_PROGRESS_TS never does
+
+    monkeypatch.setattr(_w, "_HB_LAST_PROGRESS_TS", 0.0, raising=False)
+    with pytest.raises(RuntimeError, match="made no progress"):
+        hb.join_while_draining(_Wedged(), "wedged uploader")
+
+    # a real finished thread returns immediately rather than waiting out a window.
+    done = threading.Thread(target=lambda: None)
+    done.start()
+    done.join()
+    started = real_time.monotonic()
+    hb.join_while_draining(done, "finished uploader")
+    assert real_time.monotonic() - started < 5.0
