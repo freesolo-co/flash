@@ -8,6 +8,8 @@
 #   - "Generated with ... Claude Code" attribution lines
 #   - the build-box identity (a *.internal.cloudapp.net address) leaked into the
 #     author/committer fields and into "Co-authored-by:" trailers
+#   - the maintainer's stray local git identities, folded onto the GitHub account
+#     (see MAINTAINER_ALIAS_EMAILS): two of them resolve to OTHER PEOPLE's accounts
 #
 # This rewrites every commit sha. Run it once, on a fresh mirror clone, while the
 # repository is still private. Rewriting after publication is pointless: the old
@@ -63,6 +65,36 @@ ASSISTANT_EMAIL_RE='@anthropic[.]com$'
 # string) and keeps the pattern usable verbatim in both awk and git --grep, which
 # disagree about how to escape a literal dot inside a shell-passed variable.
 LEAKED_EMAIL_RE='internal[.]cloudapp[.]net'
+
+# The maintainer committed under several local git identities over the repo's life. Folding
+# them onto the GitHub account is not cosmetic: GitHub resolves a commit's author from its
+# EMAIL, so on a public repo two of these credit somebody else entirely.
+#
+#   david@clado.ai   -> renders as the unrelated account "CladoTest"
+#   d@d              -> renders as "dimas1", a stranger's account registered in 2013
+#   david@freesolo.co-> no linked account; renders as inert plain text
+#
+# Verify with: gh api repos/<owner>/<repo>/commits/<sha> --jq .author.login
+#
+# This is an EXPLICIT ADDRESS LIST, never a name-prefix test. "DavidBShan" as a name match
+# would be both too narrow (it misses "David", "davidbshan", "d") and far too dangerous:
+# the same rewrite applied by name would sweep up any future contributor whose name
+# collides. Addresses are unambiguous and reviewable, and every other identity in this
+# history (tomzheng1012@gmail.com, git@r0h.in) belongs to a REAL contributor whose
+# attribution must survive untouched.
+#
+# The canonical noreply address is deliberately ABSENT: it is already correct, and listing
+# it would make the mailmap map an identity onto itself.
+#
+# Listed in LOWERCASE, and every comparison against this list lowercases its input first.
+# The domain part of an address is case-insensitive and git preserves whatever case was
+# committed, so "DavidBShan@Gmail.com" is the same GitHub account as the entry below. An
+# exact-case test would leave that identity unremapped AND uncounted -- the residual gate
+# would report a clean history while GitHub still misattributed the commits, which is the
+# false-clean certificate this script exists to prevent. The trailer counter (git --grep
+# --regexp-ignore-case) and the message rewrite ((?i) below) are already case-insensitive;
+# the identity tests must agree with them or the gate and the rewrite disagree.
+MAINTAINER_ALIAS_EMAILS='davidbshan@gmail.com david@freesolo.co david@clado.ai d@d'
 
 # Message patterns, shared by the counters and (in spirit) the rewrite callback below.
 # Each is LINE-ANCHORED and trailer-shaped so that counting and removing agree: a commit
@@ -149,16 +181,25 @@ count_identities() {
   # named Claude as an unscrubbed leak and block publication over nothing.
   git log --all --format='%H%x09%an <%ae>%x09%cn <%ce>' \
     | awk -F'\t' -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" \
-          -v bot_mail_re="$ASSISTANT_EMAIL_RE" '
+          -v bot_mail_re="$ASSISTANT_EMAIL_RE" -v alias_list="$MAINTAINER_ALIAS_EMAILS" '
+        BEGIN { split(alias_list, a, " "); for (i in a) if (a[i] != "") alias[tolower(a[i])] = 1 }
         function leaks(ident,   name, email) {
           name = ident; sub(/ *<.*/, "", name)
           email = ident; sub(/^[^<]*</, "", email); sub(/>.*$/, "", email)
-          return (name ~ names_re || email ~ bot_mail_re || email ~ mail_re)
+          email = tolower(email)
+          return (name ~ names_re || email ~ bot_mail_re || email ~ mail_re || (email in alias))
         }
         leaks($2) || leaks($3) { n++ }
         END { print n + 0 }
       '
 }
+
+# Co-authored-by trailers still carrying a maintainer alias address. Counted separately
+# from count_identities, which reads the identity FIELDS: the mailmap fixes the fields but
+# not the message, so without this count the gate would certify a history whose trailers
+# still credit the wrong GitHub accounts.
+ALIAS_TRAILER_RE="^[[:space:]]*Co-authored-by:.*<($(printf '%s' "$MAINTAINER_ALIAS_EMAILS" \
+  | tr ' ' '\n' | grep -v '^$' | sed 's/[.]/[.]/g' | paste -sd'|' -))>[[:space:]]*$"
 
 report_counts() {
   echo "    total commits:         $(git rev-list --count --all)"
@@ -166,6 +207,7 @@ report_counts() {
   echo "    Claude-Session:        $(count_pattern "$SESSION_RE")"
   echo "    Generated with Claude: $(count_pattern "$GENERATED_RE")"
   echo "    leaked hostname:       $(count_pattern "$HOSTNAME_RE")"
+  echo "    alias co-author lines: $(count_pattern "$ALIAS_TRAILER_RE")"
   echo "    leaking identities:    $(count_identities)"
 }
 
@@ -186,13 +228,15 @@ MAILMAP="$WORKDIR/flash-scrub-mailmap"
 git log --all --format='%an <%ae>%n%cn <%ce>' \
   | sort -u \
   | awk -v canon="$CANONICAL_IDENTITY" -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" \
-        -v bot_mail_re="$ASSISTANT_EMAIL_RE" '
+        -v bot_mail_re="$ASSISTANT_EMAIL_RE" -v alias_list="$MAINTAINER_ALIAS_EMAILS" '
+      BEGIN { split(alias_list, a, " "); for (i in a) if (a[i] != "") alias[tolower(a[i])] = 1 }
       {
         name = $0
         sub(/ *<.*/, "", name)          # identity name, minus the address
         email = $0
         sub(/^[^<]*</, "", email); sub(/>.*$/, "", email)
-        if (name ~ names_re || email ~ bot_mail_re || email ~ mail_re) print canon " " $0
+        email = tolower(email)
+        if (name ~ names_re || email ~ bot_mail_re || email ~ mail_re || (email in alias)) print canon " " $0
       }
     ' > "$MAILMAP"
 
@@ -204,12 +248,38 @@ else
   echo "    remapping $(wc -l < "$MAILMAP") identit(ies) onto $CANONICAL_IDENTITY"
 fi
 
+# --mailmap rewrites author/committer/tagger FIELDS only; it does not touch message
+# trailers. The stray addresses also appear inside "Co-authored-by:" lines, so without the
+# rewrite below those trailers keep crediting CladoTest and dimas1 on a public repo.
+#
+# These trailers are REWRITTEN onto the canonical identity, not deleted. The maintainer
+# co-authoring with their own second identity is still a real co-authorship record;
+# correcting the address fixes the misattribution without discarding history. (The Claude
+# trailers above are deleted instead because there is no correct identity to point them at.)
+#
+# Passed through the ENVIRONMENT rather than interpolated into the callback source: the
+# canonical identity is operator-supplied and may legitimately contain quotes, which would
+# otherwise terminate the Python literal and inject arbitrary code into the rewrite.
+ALIAS_ALT="$(printf '%s' "$MAINTAINER_ALIAS_EMAILS" | tr ' ' '\n' | grep -v '^$' \
+  | sed 's/[.]/[.]/g' | paste -sd'|' -)"
+export FLASH_SCRUB_ALIAS_ALT="$ALIAS_ALT"
+export FLASH_SCRUB_CANON="$CANONICAL_IDENTITY"
+
 # Drop whole trailer lines. Matching is line-anchored and trailer-shaped, so a commit
 # body that merely mentions Claude in prose is left alone.
 "${FILTER_REPO[@]}" \
   --mailmap "$MAILMAP" \
   --commit-callback '
+import os
 import re
+
+_alias_alt = os.environ["FLASH_SCRUB_ALIAS_ALT"].encode()
+_canon = os.environ["FLASH_SCRUB_CANON"].encode()
+# the address must be the WHOLE bracketed value (anchored by "<" and ">"), so a longer
+# address that merely ends with an alias cannot match.
+_alias_trailer = re.compile(
+    rb"(?im)^([ \t]*Co-authored-by:)[ \t]*[^\n<]*<(?:" + _alias_alt + rb")>[ \t]*$",
+    )
 
 patterns = [
     # "Claude" must be the complete name or carry a model family -- see CO_AUTHORED_RE
@@ -227,6 +297,24 @@ message = commit.message
 scrubbed = message
 for pattern in patterns:
     scrubbed = re.sub(pattern, b"", scrubbed)
+# rewrite (not drop) the maintainer alias trailers onto the canonical identity.
+# The replacement is a FUNCTION, so the canonical identity is returned as literal bytes
+# and is never parsed as a replacement template. The previous form doubled the backslashes
+# instead, which was also correct (every backreference begins with a backslash, so doubling
+# neutralizes "\1" and "\g<1>" alike) -- this is the same behaviour without the escaping
+# argument, since the identity is operator-editable and the next reader should not have to
+# re-derive that proof.
+scrubbed = _alias_trailer.sub(lambda m: m.group(1) + b" " + _canon, scrubbed)
+# folding several aliases onto one identity can leave the same trailer twice
+_seen, _kept = set(), []
+for _line in scrubbed.split(b"\n"):
+    _key = _line.strip().lower()
+    if _key.startswith(b"co-authored-by:") and _key in _seen:
+        continue
+    if _key.startswith(b"co-authored-by:"):
+        _seen.add(_key)
+    _kept.append(_line)
+scrubbed = b"\n".join(_kept)
 
 # Only reformat commits we actually touched: collapsing blank lines or trimming
 # trailing newlines on every commit would rewrite unrelated message formatting.
@@ -276,7 +364,8 @@ for label_and_re in \
   "co-authored-by|$CO_AUTHORED_RE" \
   "claude-session|$SESSION_RE" \
   "generated-with|$GENERATED_RE" \
-  "leaked-hostname|$HOSTNAME_RE"
+  "leaked-hostname|$HOSTNAME_RE" \
+  "alias-co-author|$ALIAS_TRAILER_RE"
 do
   n="$(checked_count "${label_and_re%%|*}" count_pattern "${label_and_re#*|}")"
   residual=$((residual + n))

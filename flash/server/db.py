@@ -178,6 +178,76 @@ def ensure_internal_key(api_key: str) -> dict:
     return row
 
 
+# The standalone plane's owner row is keyed on this sentinel instead of a key hash, so its `id`
+# -- which every `runs.key_id` points at -- does NOT change when the operator rotates
+# FREESOLO_INTERNAL_KEY. A sha256 digest is 64 hex chars, so this can never collide with one.
+_STANDALONE_OWNER_HASH = "standalone-operator"
+
+
+def ensure_standalone_owner() -> dict:
+    """The single owner row for a standalone plane, independent of the operator key's VALUE.
+
+    Standalone is single-tenant: the operator key is the only credential, so it owns every run.
+    Deriving the owner row from the key's hash meant rotating that key (or regenerating it after
+    a restart) minted a NEW row with a new id, and every existing run -- matched by
+    ``runs.key_id`` -- became invisible: absent from the listing, 404 on status, logs, cancel.
+    An in-flight job would keep burning GPU hours with no supported way for the new credential to
+    stop it, which makes rotating a COMPROMISED key the thing that costs you control of the plane.
+
+    Not reachable by presenting a token: nothing hashes to the sentinel, so this row is only ever
+    returned to a caller who already matched the operator key in ``authenticate``.
+
+    Runs already in the store are ADOPTED, not orphaned. A plane that ran managed first -- or ran
+    on an earlier build of this code -- has runs pointing at whichever key row created them, and
+    leaving them there would reproduce the bug this row exists to fix the moment standalone is
+    switched on: empty listing, 404 on status/logs/cancel, an in-flight job still spending. Adopting
+    is sound precisely because standalone is SINGLE-TENANT: there is exactly one principal, so
+    every run in this store is already the operator's, and there is no second identity that
+    reassignment could take a run away from.
+
+    Called on EVERY authenticated request, so in the steady state this function must issue NO
+    write statements at all. SQLite has a single write slot and takes it for any write regardless
+    of how many rows the statement touches, so a no-op write still serializes concurrent
+    status/logs/submit behind whichever request happens to be recording a run -- up to the
+    connection's 30s timeout. Measured under WAL, both of the writes below block a second writer
+    exactly as hard as a real INSERT does when they change nothing, so both are guarded by a read:
+
+    - The `INSERT OR IGNORE` is read-guarded rather than fired blind. It is NOT a cost problem
+      (the unique-index probe is cheaper per call than the SELECT that replaces it) -- it is
+      purely that it takes the write slot. Kept as OR IGNORE in the miss path because two threads
+      can both miss the SELECT and race to insert; OR IGNORE makes the loser a no-op instead of
+      an IntegrityError, and the re-read then returns the winner's row.
+    - The adoption `UPDATE` cannot use `runs_key_idx` (`WHERE key_id != ?` plans as `SCAN runs`),
+      so unguarded it would also full-scan the whole run history every request. The `< or >`
+      split is a MULTI-INDEX OR over the covering index that stops at the first foreign row: at
+      50k runs, 1.22 ms/call becomes 0.003 ms/call. Standalone mints no new foreign rows --
+      `record_run` takes the key_id of the authenticated identity, which is this row -- so the
+      guard cannot miss a run that appears later.
+    """
+    now = time.time()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ?", (_STANDALONE_OWNER_HASH,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (_STANDALONE_OWNER_HASH, "standalone", "operator@localhost", now),
+            )
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE key_hash = ?", (_STANDALONE_OWNER_HASH,)
+            ).fetchone()
+        if row is None:  # pragma: no cover - the row was just inserted
+            raise RuntimeError("failed to provision the standalone owner row")
+        unowned = conn.execute(
+            "SELECT 1 FROM runs WHERE key_id < ? OR key_id > ? LIMIT 1", (row["id"], row["id"])
+        ).fetchone()
+        if unowned is not None:
+            conn.execute("UPDATE runs SET key_id = ? WHERE key_id != ?", (row["id"], row["id"]))
+    return dict(row)
+
+
 def ensure_external_key(
     api_key: str, *, key_prefix: str | None = None, email: str | None = None
 ) -> dict | None:

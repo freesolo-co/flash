@@ -2880,6 +2880,8 @@ def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
 
     monkeypatch.setenv("FLASH_PRELOAD_STATUS_REPO", "other/repo")
     importlib.reload(preload)
+    # the repo follows FLASH_HF_NAMESPACE (unset here -> the managed namespace) and nothing else:
+    # FLASH_PRELOAD_STATUS_REPO is not a knob, so setting it must change nothing.
     managed_repo = "Freesolo-Co/flash-weight-preload"
     created = []
     readers = []
@@ -2913,7 +2915,7 @@ def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
     spec = preload._preload_instance_spec("A10", "preload-test")
     result = preload._warm_one_lambda_instance(jobs_mod, [_cand("us-east-1")], ["a/b"], 5, 0.0)
 
-    assert managed_repo == preload._PRELOAD_STATUS_REPO
+    assert managed_repo == preload._preload_status_repo()
     assert created == [
         (managed_repo, "token", {"repo_type": "dataset", "exist_ok": True, "private": True})
     ]
@@ -2925,6 +2927,36 @@ def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
     assert readers[1][1].endswith("/lambda_attempt0.json")
     assert result["status"] == "ok"
     assert len(terminated) == 1
+
+
+def test_preload_status_repo_follows_self_hosted_namespace(monkeypatch):
+    """A self-hoster's HF_TOKEN cannot write to Freesolo-Co, so the status repo -- which the warm
+    path CREATES before launching paid GPUs -- has to follow FLASH_HF_NAMESPACE like run artifacts
+    do. Hardcoded, the warm path fails at create_repo and blames the operator's HF_TOKEN."""
+    import huggingface_hub
+
+    from flash.providers import weight_cache_preload as preload
+
+    monkeypatch.setenv("FLASH_HF_NAMESPACE", "self-hoster")
+
+    assert preload._preload_status_repo() == "self-hoster/flash-weight-preload"
+    # the spec the warm box runs writes there too, so the poller and the box agree.
+    assert preload._preload_instance_spec("A10", "r1").train.hf_repo == (
+        "self-hoster/flash-weight-preload"
+    )
+
+    created = []
+
+    class FakeHfApi:
+        def __init__(self, token):
+            self.token = token
+
+        def create_repo(self, repo, **kwargs):
+            created.append(repo)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)
+    preload._ensure_status_repo("token")
+    assert created == ["self-hoster/flash-weight-preload"]
 
 
 def test_warm_instances_requires_status_repo_before_launch(monkeypatch):

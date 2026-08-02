@@ -628,7 +628,13 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
 
     metrics = lifecycle._submit_seed_supervised(spec, 42, io.StringIO())
 
-    assert metrics == {"train_tokens": 1, "allocated_gpu": "RTX 4090"}
+    assert metrics == {
+        "train_tokens": 1,
+        "allocated_gpu": "RTX 4090",
+        # stamped alongside the gpu so cost attribution prices the class on the substrate
+        # that actually billed it.
+        "allocated_provider": "runpod",
+    }
     assert provider.attempts == [0, 1]
     retry_submit = provider.events.index(("submit", 1))
     assert provider.events.index(("cancel", 0)) < retry_submit
@@ -710,7 +716,13 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
         },
     )
 
-    assert metrics == {"train_tokens": 1, "allocated_gpu": "RTX 4090"}
+    assert metrics == {
+        "train_tokens": 1,
+        "allocated_gpu": "RTX 4090",
+        # stamped alongside the gpu so cost attribution prices the class on the substrate
+        # that actually billed it.
+        "allocated_provider": "runpod",
+    }
     assert provider.runtime_secrets == [
         {"WANDB_API_KEY": "real-secret"},
         {
