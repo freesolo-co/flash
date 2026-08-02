@@ -318,11 +318,11 @@ def test_deployment_dict_carries_openai_v1_url(monkeypatch):
 
 
 def test_immutable_revision_identifier_uses_full_hub_sha():
-    from flash.serve.deploy import adapter_revision_id
+    from flash.schema import format_adapter_revision
 
     sha = "a1" * 20
-    assert adapter_revision_id("flash-1-abc", 32, sha) == f"flash-1-abc@step-32.{sha}"
-    assert adapter_revision_id("flash-1-abc", None, sha) == f"flash-1-abc@final.{sha}"
+    assert format_adapter_revision("flash-1-abc", 32, sha) == f"flash-1-abc@step-32.{sha}"
+    assert format_adapter_revision("flash-1-abc", None, sha) == f"flash-1-abc@final.{sha}"
 
 
 def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
