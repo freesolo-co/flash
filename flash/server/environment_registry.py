@@ -19,6 +19,7 @@ from ._internal_client import (
     org_id_of,
     post_internal_json,
 )
+from .auth import standalone
 
 _LOG = logging.getLogger("flash.server.environments")
 _PATH = "/api/flash/environments/internal"
@@ -90,6 +91,11 @@ def require_environment_project(
         resolved_project_id = require_project_id(project_id)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if standalone():
+        # The mirror this validates against is a Freesolo backend table that does not exist here.
+        # Single tenant means there is no cross-org environment to guard against; the environment
+        # package itself is still resolved and authorized by the normal env paths.
+        return
     resolved_org_id = org_id_of(key) or str(org_id or "").strip()
     if not resolved_org_id:
         raise HTTPException(

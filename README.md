@@ -28,19 +28,21 @@ This repository contains:
 - the GPU provider substrate (`flash/providers/`) — pricing, allocation, submit/poll,
 - the environment loading machinery (`flash/envs/`).
 
-It does **not** contain everything needed to stand up an equivalent service from scratch.
-The following are Freesolo-operated and not part of this repository:
+The training path is self-hostable end to end: with `FLASH_STANDALONE=1`, one GPU provider
+key, and a HuggingFace token, you can run SFT, GRPO, and on-policy distillation on your own
+hardware budget with no Freesolo backend involved. See
+**[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
-| Component               | Where it lives                                        |
-| ----------------------- | ----------------------------------------------------- |
-| Identity and API keys   | `api.freesolo.co` — verifies keys, owns projects/orgs |
-| Multi-LoRA serving      | `serve.freesolo.co` — `flash/serve/` is a thin client |
-| Managed environment hub | a private repository of published environments        |
+Two components stay Freesolo-operated and are not in this repository:
 
-If you are evaluating Flash, the honest summary is: **use it against the hosted service**,
-or **read and modify the training/provider code**, which is self-contained and the most
-reusable part of the repository. Running your own end-to-end copy of the service is
-possible but requires replacing the components above — see [Self-hosting](#self-hosting).
+| Component             | Where it lives                                        | Self-hosted equivalent                                                          |
+| --------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Multi-tenant identity | `api.freesolo.co` - verifies keys, owns projects/orgs | `FLASH_STANDALONE=1` runs single-tenant on your own operator key                |
+| Multi-LoRA serving    | `serve.freesolo.co` - `flash/serve/` is a thin client | adapters land in your HuggingFace repos; serve them with any LoRA-capable stack |
+
+So there are three honest ways to use Flash: **against the hosted service**, **self-hosted
+against your own GPU accounts**, or as **training and provider code to read and modify**,
+which is self-contained and the most reusable part of the repository.
 
 ## Using the hosted service
 
@@ -183,44 +185,40 @@ model — in short, **pull requests go into `dev`**.
 
 ## Self-hosting
 
-You can run your own control plane, but read this first — it is an operator deployment,
-not a one-command install.
-
-The control plane needs the `server` extra — the base install above is client-only and
-`flash-server` will refuse to start without it:
+You can run your own control plane against your own GPU accounts, with no Freesolo backend
+involved. **[SELF_HOSTING.md](SELF_HOSTING.md) is the full guide**; the short version:
 
 ```bash
-pip install 'freesolo-flash[server]'
+pip install 'freesolo-flash[server]'   # the base install is client-only
+
+export FLASH_STANDALONE=1
+export FREESOLO_INTERNAL_KEY=$(openssl rand -hex 32)
+export HF_TOKEN=hf_...
+export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
+
+flash-server --host 0.0.0.0 --port 8080
 ```
 
-`flash-server` then fails fast at startup unless all of the following are present (see
-`flash/providers/preflight.py` and `.env.example`). Note it reads the PROCESS
-environment, so load your `.env` (`set -a && . ./.env && set +a`) rather than relying on
-the file being present:
+You need **one** of RunPod, Lambda, or Vast - not all three. Providers whose key is unset
+are never considered, and the allocator only proposes GPU classes it can actually
+provision. Startup fails only when all three are missing.
 
-- `RUNPOD_API_KEY` — **two or more distinct** RunPod account keys, comma-separated. A
-  single-account pool cannot reap or fail over across accounts, so the preflight rejects
-  it.
-- `LAMBDA_API_KEY` — Lambda Cloud API key.
-- `HF_TOKEN` — write access to the dataset repos flash creates for artifacts. The repo is
-  assigned by the control plane and scoped to the environment, so runs sharing an
-  environment share a repo, each under its own prefix.
-- `FREESOLO_INTERNAL_KEY` — control-plane authentication. Requests presenting this key
-  authenticate as a single service identity with no network call, which is the path to use
-  if you are not integrating with Freesolo identity.
-- `GITHUB_TOKEN` — access to the managed environment repository.
+`FLASH_STANDALONE=1` is what makes this work: it stops the plane calling out for project,
+environment, and billing validation, and trusts `FREESOLO_INTERNAL_KEY` as a single-tenant
+operator credential. External bearer tokens are rejected rather than accepted unverified.
+A standalone plane is **single-tenant** - whoever holds that key can spend your GPU budget,
+so keep it off untrusted networks. See
+[the security model](SELF_HOSTING.md#the-security-model).
 
-Beyond credentials, three seams point at Freesolo services and would need replacing for a
-fully independent deployment:
+Two seams remain Freesolo-operated and are not part of this repository:
 
-1. **User authentication.** Unknown bearer tokens are verified against
-   `{FREESOLO_BASE_URL}/api/auth/verify` (`flash/server/auth.py`). Only the internal-key
-   path works without the Freesolo backend.
-2. **Environments.** Publishing and managed-slug loading target a private environment
-   repository (`flash/server/envs.py`, `flash/envs/loader.py`).
-3. **Serving.** `flash/serve/` is a client for the Freesolo multi-LoRA serving app; point
-   it elsewhere with `FREESOLO_SERVING_URL`, but this repository does not include a
-   serving backend.
+1. **Multi-tenant identity.** Real per-user keys and org ownership need a backend serving
+   the `/api/auth/verify` contract in `flash/server/auth.py`, pointed at by
+   `FREESOLO_BASE_URL`. Standalone mode is single-tenant instead.
+2. **Serving.** `flash/serve/` is a client for a multi-LoRA serving app; point it elsewhere
+   with `FREESOLO_SERVING_URL`. Training, checkpoint streaming, and adapter export are
+   fully self-hostable - adapters land in your own HuggingFace repos and can be served by
+   any stack that loads LoRA adapters.
 
 The GPU worker image is public and can be pulled directly. It is published under an
 explicit CUDA tag, not `latest`:

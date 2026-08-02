@@ -17,6 +17,8 @@ INTERNAL_KEY_ENV = "FREESOLO_INTERNAL_KEY"
 
 FREESOLO_BASE_URL_ENV = "FREESOLO_BASE_URL"
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
+
+STANDALONE_ENV = "FLASH_STANDALONE"
 _VERIFY_TIMEOUT_S = 5.0
 _VERIFY_CACHE_TTL_S = 300.0
 # Short negative TTL: a transient backend 401 shouldn't lock out a valid key for 5 min.
@@ -150,6 +152,23 @@ def freesolo_base_url() -> str:
     return (os.environ.get(FREESOLO_BASE_URL_ENV) or DEFAULT_FREESOLO_BASE_URL).rstrip("/")
 
 
+def standalone() -> bool:
+    """True when this plane runs with NO Freesolo backend behind it (self-hosted deployments).
+
+    Flash's managed deployment keeps org/project/billing records in a Freesolo SaaS backend, and
+    the submit path validates against it on every run. A self-hoster has no such backend: without
+    this flag the plane resolves ``api.freesolo.co``, fails the validation call, and every run is
+    rejected 503 -- so the flag is what makes "self-hosted" a supported configuration rather than
+    an unreachable one.
+
+    Standalone changes AUTHORIZATION SCOPE, not just transport: the plane can no longer distinguish
+    organizations, so it trusts ``FREESOLO_INTERNAL_KEY`` as a single-tenant operator credential
+    and treats every project id the caller sends as theirs. Only run it where that key is the
+    trust boundary (see SELF_HOSTING.md).
+    """
+    return (os.environ.get(STANDALONE_ENV) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _freesolo_verify(token: str) -> bool:
     """Verify a token against the freesolo backend; network errors return False, never raise."""
     if not token or len(token) > _MAX_TOKEN_LEN:
@@ -215,6 +234,10 @@ def authenticate(authorization: str | None) -> dict | None:
         out = dict(row)
         out["auth_kind"] = "internal"
         return out
+    if standalone():
+        # No backend to verify an external key against, and an unverifiable token must never be
+        # accepted. The operator key above is the ONLY credential a standalone plane honours.
+        return None
     if _freesolo_verify(token):
         identity = _cached_identity(token)
         if not identity.get("org_slug"):

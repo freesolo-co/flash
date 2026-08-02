@@ -128,14 +128,32 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     return status.run_id
 
 
-def _gpu_rate(gpu_type: str) -> float:
-    """Static representative $/hr for cost projection."""
-    try:
-        from flash.providers import get_provider
+def _gpu_rate(gpu_type: str, provider: str = "") -> float:
+    """Static representative $/hr for cost projection.
 
-        return get_provider("runpod").hourly_rate(gpu_type)
+    Prices on the provider that actually ran the job when it is known; provider rates for the
+    same class differ (a RunPod-priced table misreports a Lambda or Vast run). Falls back to any
+    configured provider that offers the class, so a plane without RunPod still prices its runs.
+
+    Never raises: this feeds cost ANNOTATION on an already-finished run, so a provider-registry
+    problem must degrade to the flat estimate rather than fail the metrics write.
+    """
+    names: list[str] = []
+    try:
+        from flash.providers import available_providers, get_provider
+
+        names = [provider.strip().lower()] if provider.strip() else []
+        names += [n for n in available_providers() if n not in names]
     except Exception:
         return 0.80
+    for name in names:
+        try:
+            rate = get_provider(name).hourly_rate(gpu_type)
+        except Exception:
+            continue
+        if rate:
+            return float(rate)
+    return 0.80
 
 
 def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0) -> float:
@@ -1553,7 +1571,10 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     os.makedirs(dest, exist_ok=True)
     # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.
     gpu_type = metrics.get("allocated_gpu") or spec.gpu.type
-    rate = _gpu_rate(gpu_type)
+    # the substrate that actually billed the run; empty on a record predating the stamp, in which
+    # case _gpu_rate prices off whichever configured provider offers the class.
+    provider = str(metrics.get("allocated_provider") or "")
+    rate = _gpu_rate(gpu_type, provider)
     cost = metrics.get("cost_usd")
     if cost:
         cost = float(cost or 0.0)
@@ -1563,9 +1584,9 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
         metrics = {**metrics, "cost_usd": cost}
         metrics.setdefault("notes", {})
         if isinstance(metrics["notes"], dict):
-            metrics["notes"]["provider"] = "runpod"
-            metrics["notes"]["runpod_rate_usd_hr"] = rate
-            metrics["notes"]["runpod_gpu"] = gpu_type
+            metrics["notes"]["provider"] = provider or "unknown"
+            metrics["notes"]["gpu_rate_usd_hr"] = rate
+            metrics["notes"]["gpu"] = gpu_type
     with open(os.path.join(dest, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     with contextlib.suppress(Exception):

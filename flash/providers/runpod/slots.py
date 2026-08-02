@@ -11,7 +11,7 @@ import socket
 import urllib.error
 import urllib.request
 
-from flash.server.auth import INTERNAL_KEY_ENV, freesolo_base_url
+from flash.server.auth import INTERNAL_KEY_ENV, freesolo_base_url, standalone
 
 _TIMEOUT_S = 10.0
 _CLAIM_PATH = "/api/runpod/internal/slots/claim"
@@ -24,7 +24,13 @@ class SlotStoreError(RuntimeError):
 
 
 def internal_key() -> str | None:
-    """The operator internal key, or None when unset (local/dev: use the in-process semaphore)."""
+    """The operator internal key, or None when unset (local/dev: use the in-process semaphore).
+
+    Also None in standalone mode: the shared slot store lives in a Freesolo backend that a
+    self-hosted plane does not have, so it falls back to the in-process semaphore. That is the
+    correct cap for a single-replica self-host, which is what standalone means."""
+    if standalone():
+        return None
     return os.environ.get(INTERNAL_KEY_ENV, "").strip() or None
 
 

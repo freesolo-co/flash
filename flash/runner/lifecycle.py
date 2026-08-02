@@ -637,6 +637,7 @@ def _submit_seed_supervised(
                 lock.release()
 
     def _gc_seen_endpoints() -> None:
+        # only RunPod handles carry an endpoint_id, so this set is empty on a plane without it.
         if not seen_endpoints:
             return
         from flash.providers import get_provider
@@ -670,6 +671,8 @@ def _submit_seed_supervised(
         _gc_seen_endpoints()
         if current_gpu.get("name"):
             metrics.setdefault("allocated_gpu", current_gpu["name"])
+        if current_gpu.get("provider"):
+            metrics.setdefault("allocated_provider", current_gpu["provider"])
         return metrics
 
     max_retries = int(spec.gpu.max_retries)
@@ -968,6 +971,9 @@ def _submit_seed_supervised(
             _gc_seen_endpoints()
             if chosen is not None and isinstance(res.metrics, dict):
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
+                # the provider that actually billed this run, so cost attribution prices the
+                # class on ITS substrate rather than assuming RunPod's table.
+                res.metrics.setdefault("allocated_provider", chosen.provider)
             return res.metrics
         # cancel wins over any retry-shaped failure.
         try:
@@ -1309,16 +1315,14 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
                 _record_cleanup_remote(spec.run_id, status.remote)
         except Exception:
             pass
-    try:
-        # RunPod gc reaps rN-suffixed endpoints the persisted handle can't name.
-        from flash.providers import get_provider
-
-        get_provider("runpod").gc(spec)
-    except Exception:
-        pass
     from flash.providers import INSTANCE_PROVIDERS, available_providers, get_provider
 
     _avail = available_providers()
+    if "runpod" in _avail:
+        # RunPod gc reaps rN-suffixed endpoints the persisted handle can't name. Skipped on a
+        # plane without a RunPod key: there is nothing of ours in an account we cannot reach.
+        with contextlib.suppress(Exception):
+            get_provider("runpod").gc(spec)
     for _prov in INSTANCE_PROVIDERS:
         if _prov in _avail:
             with contextlib.suppress(Exception):

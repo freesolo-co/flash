@@ -72,7 +72,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             m = json.load(f)
         assert abs(m["cost_usd"] - hourly_rate("RTX 4090")) < 1e-6  # measured: 1h on the 4090
         assert m["trained_eval_acc"] == 0.7
-        assert m["notes"]["runpod_gpu"] == "RTX 4090"
+        assert m["notes"]["gpu"] == "RTX 4090"
 
 
 def test_upload_code_forces_private_on_reused_repo(monkeypatch):
