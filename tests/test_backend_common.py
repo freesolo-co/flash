@@ -346,7 +346,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7"
+        "verl @ git+https://github.com/freesolo-co/verl@ee327f43c87c031034ddb88c17fefe03d20a0505"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     assert "liger-kernel" in install
@@ -550,11 +550,13 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
     # asserting the constant alone would let a newer-base commit land silently, so bind the pinned
     # commit itself to that version. this is the sha of the truncation-mask and 3d position id
-    # commits cherry-picked onto the v0.8.0 tag; moving the pin must be a deliberate edit here, with
-    # the base re-verified.
+    # commits cherry-picked onto the v0.8.0 tag, plus the agent-loop position-id pad fix; moving the
+    # pin must be a deliberate edit here, with the base re-verified. re-verified at ee327f43:
+    # verl/version/version still reads 0.8.0, verl/trainer/main_ppo_sync.py is still present, and the
+    # only diff against the previous pin is agent_loop.py.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
-    assert commit == "b7492fa3b7ab843294d06dbf754e887950f559c7"
+    assert commit == "ee327f43c87c031034ddb88c17fefe03d20a0505"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):
