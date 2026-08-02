@@ -42,29 +42,37 @@ def test_gate_helper_allows_single_gpu():
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
-def test_gate_allows_multi_gpu_for_verl_backend(algorithm):
+def test_gate_allows_multi_gpu_on_a_provider_that_rents_n_cards(algorithm):
+    # no phase has a selector left: run_sft, run_rl and run_opd all delegate to verl, whose worker
+    # launches nproc-per-node == gpu.count ranks. so multi-gpu needs no opt-in beyond the provider.
     from flash import runner
 
-    # every verl worker launches nproc-per-node == gpu.count ranks, so all three shard.
-    assert runner._require_supported_gpu_count(_spec(4, algorithm, backend="verl")) is None
-
-
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
-def test_gate_allows_multi_gpu_with_no_key_at_all(algorithm):
-    from flash import runner
-
-    # no phase has a selector: run_sft, run_rl and run_opd all delegate to verl, so multi-gpu needs
-    # no opt-in anywhere.
     assert runner._require_supported_gpu_count(_spec(4, algorithm)) is None
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
-def test_a_stale_backend_key_cannot_downgrade_any_phase(algorithm):
+@pytest.mark.parametrize("stale", ["verl", "trl", "bogus"])
+@pytest.mark.parametrize("provider", ["runpod", "vast"])
+def test_a_stale_backend_key_changes_no_gate_outcome(stale, provider):
+    """A [worker_env] selector carried over from the trl era must not move this gate either way.
+
+    Asserted as "same outcome as the identical spec WITHOUT the key" rather than as a fixed verdict:
+    a bare `is None` on a runpod spec passes no matter what the gate does with the key, since the
+    provider alone already decides it. Pairing against the no-key baseline on BOTH an accepting and
+    a rejecting provider is what makes the claim able to fail -- it breaks the moment the gate starts
+    reading worker_env, in either direction.
+    """
     from flash import runner
 
-    # a config carried over from when these phases had selectors must not reach the gate at all: the
-    # worker runs verl regardless, so refusing it multi-gpu would strand a spec that runs fine.
-    assert runner._require_supported_gpu_count(_spec(4, algorithm, backend="trl")) is None
+    def outcome(backend: str) -> str:
+        try:
+            runner._require_supported_gpu_count(
+                _spec(4, "grpo", backend=backend, provider=provider)
+            )
+        except ValueError as exc:
+            return f"rejected: {exc}"
+        return "allowed"
+
+    assert outcome(stale) == outcome("")
 
 
 def test_gate_rejects_multi_gpu_on_providers_that_ignore_count():
