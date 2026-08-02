@@ -159,6 +159,12 @@ def cmd_login(args) -> int:
 
 
 _IDENTITY_LOOKUP_TIMEOUT_S = 5.0
+# Verification is MANDATORY, so it gets a normal request budget rather than the 5s the optional
+# identity card uses: abandoning a slow lookup is harmless when the card is decoration, but here it
+# would reject a valid key. Matches the hosted path's 30s (`verify_freesolo_key`) so the same
+# decision gets the same budget whoever answers it -- a self-hosted plane that is cold-starting,
+# behind a slow proxy, or under database contention is exactly the documented quickstart case.
+_LOGIN_VERIFY_TIMEOUT_S = 30.0
 
 
 def _verify_key_against_plane(api_key: str, api_url: str) -> dict:
@@ -171,12 +177,26 @@ def _verify_key_against_plane(api_key: str, api_url: str) -> dict:
     `flash login --api-key <typo>` exit 0 and store an unusable key, with the real 401 surfacing
     later on an unrelated command.
 
-    `/v1/me` is the right probe: it is behind `require_key`, so reaching it IS proof the plane
-    accepted the key, and its response is the identity card login already prints -- one round
-    trip does both jobs. Auth failures propagate as ClientError for the friendly handler; the
-    identity is returned so the caller doesn't re-request it.
+    `/v1/me` is the right probe: it is behind `require_key`, and its response is the identity card
+    login already prints, so one round trip both authenticates and fills the card.
+
+    Reaching the endpoint is NOT by itself proof of acceptance, though. `_request` turns an empty
+    2xx body into `{}`, so a misrouted `--api-url` -- a proxy, a health-check responder, an older
+    service without this route -- returns success having never consulted `require_key`. Trusting
+    that would persist an arbitrary key and print "logged in", which is the same mistake this
+    function exists to correct, one layer down. So require the shape the real endpoint always
+    returns: `kind` and `key_prefix` are unconditional in `flash/server/routes/meta.py`, while
+    `email` is not, making those two the honest contract to assert.
     """
-    return ApiClient(api_url, api_key, timeout=_IDENTITY_LOOKUP_TIMEOUT_S).me()
+    identity = ApiClient(api_url, api_key, timeout=_LOGIN_VERIFY_TIMEOUT_S).me()
+    if not isinstance(identity, dict) or not identity.get("kind") or not identity.get("key_prefix"):
+        raise ClientError(
+            f"{api_url} answered the login check but did not return a Flash identity, so the key "
+            "could not be verified and was not saved. Check that --api-url points at your Flash "
+            'control plane (its /v1/health should report "service": "flash") rather than at a '
+            "proxy or another service."
+        )
+    return identity
 
 
 def _identity_or_none(api_key: str, api_url: str) -> dict | None:

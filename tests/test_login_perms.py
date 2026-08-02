@@ -255,6 +255,82 @@ def test_login_against_a_self_hosted_plane_rejects_a_bad_key(monkeypatch, tmp_pa
     assert client_config.load_credentials()[1] is None
 
 
+def _login_against_plane(monkeypatch, tmp_path, plane_cls, *, api_key="a-key"):
+    """Run cmd_login against a self-hosted plane stubbed by `plane_cls`; return (rc, saved_key)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
+
+    import flash.client.config as client_config
+
+    importlib.reload(client_config)
+    import flash.cli as cli
+
+    monkeypatch.setattr(cli.commands, "ApiClient", plane_cls)
+    args = types.SimpleNamespace(api_key=api_key, api_url="http://my-plane:8080", freesolo_url=None)
+    try:
+        rc = cli.cmd_login(args)
+    except Exception as exc:  # a crash must not be the thing that "stops" a bad login
+        rc = f"raised {type(exc).__name__}"
+    return rc, client_config.load_credentials()[1]
+
+
+def test_plane_verification_gets_a_real_request_timeout(monkeypatch, tmp_path):
+    """A valid plane that is merely SLOW must not have its key rejected.
+
+    Verification reused `_IDENTITY_LOOKUP_TIMEOUT_S` (5s), which exists for the OPTIONAL identity
+    card where abandoning a slow lookup is harmless. As the timeout for MANDATORY auth it turned a
+    cold-starting plane -- the documented quickstart case -- into a hard login failure, while the
+    hosted path allowed 30s for the very same decision.
+    """
+    from flash.client import RequestTimeoutError
+
+    class _SlowButValidPlane:
+        def __init__(self, api_url, api_key=None, timeout=None):
+            self.timeout = timeout
+
+        def me(self):
+            # answers in 8s: comfortable within a real request budget, fatal under the 5s one.
+            if self.timeout is not None and self.timeout < 8.0:
+                raise RequestTimeoutError("request timed out")
+            return {"kind": "internal", "key_prefix": "operator"}
+
+    rc, saved = _login_against_plane(monkeypatch, tmp_path, _SlowButValidPlane, api_key="good-key")
+    assert rc == 0, "a slow but valid plane must not fail the login"
+    assert saved == "good-key"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param({}, id="empty-2xx-body"),
+        pytest.param("not-an-identity", id="truthy-non-object"),
+        pytest.param({"detail": "ok"}, id="object-without-identity-fields"),
+        pytest.param({"kind": "internal"}, id="missing-key_prefix"),
+    ],
+)
+def test_a_plane_that_does_not_return_an_identity_fails_the_login(monkeypatch, tmp_path, response):
+    """Reaching the endpoint is not proof the key was accepted.
+
+    `_request` turns an empty 2xx body into `{}`, so a misrouted --api-url (a proxy, a health
+    responder, an older service without /v1/me) returns success having never consulted
+    `require_key`. Treating that as verified persisted an ARBITRARY key and printed "logged in" --
+    the same "I reached it, so it must have authenticated me" mistake this path exists to fix.
+    """
+
+    class _NotAFlashPlane:
+        def __init__(self, *a, **k):
+            pass
+
+        def me(self):
+            return response
+
+    rc, saved = _login_against_plane(monkeypatch, tmp_path, _NotAFlashPlane, api_key="unverified")
+    assert rc == 1, f"a non-identity response must fail the login, got rc={rc}"
+    # the key must not be persisted -- including in the crash case, where an exception AFTER
+    # save_credentials would still leave an unusable key on disk.
+    assert saved is None, f"an unverified key was persisted: {saved!r}"
+
+
 def test_read_json_or_empty_returns_dict_for_non_object(tmp_path):
     """read_json_or_empty honors its ``-> dict`` contract: valid-but-non-object JSON (list,
     scalar, null) and unreadable/empty content all yield ``{}`` so config/credential callers
