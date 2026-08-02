@@ -504,11 +504,11 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu: 3600.0)
+        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
         from flash.spec import JobSpec
 
         spec = JobSpec(run_id="r0", model="Qwen/Qwen3.5-4B", algorithm="grpo")
-        # A zero placeholder is not a settled provider cost; use the RunPod wall-pricing fallback.
+        # A zero placeholder is not a settled provider cost; use the wall-pricing fallback.
         metrics = {
             "cost_usd": 0.0,
             "wall_seconds": 1.0,
@@ -518,7 +518,44 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["cost_usd"] == 1.0
-        assert on_disk["notes"]["provider"] == "runpod"
+        # No allocated_provider stamped -> say so, rather than attributing the cost to RunPod.
+        assert on_disk["notes"]["provider"] == "unknown"
+
+
+def test_persist_metrics_attributes_the_provider_that_billed_the_run(monkeypatch):
+    """The note records the substrate that ran the job, not a hardcoded default.
+
+    A plane with no RunPod key still prices its runs, and a Lambda/Vast run is not filed under
+    RunPod's rate table.
+    """
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
+        seen = {}
+
+        def _rate(gpu, provider=""):
+            seen["gpu"], seen["provider"] = gpu, provider
+            return 3600.0
+
+        monkeypatch.setattr(runner, "_gpu_rate", _rate)
+        from flash.spec import JobSpec
+
+        spec = JobSpec(run_id="r-vast", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+        runner._persist_metrics(
+            spec,
+            {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090", "allocated_provider": "vast"},
+        )
+        assert seen == {"gpu": "RTX 5090", "provider": "vast"}
+        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
+            on_disk = json.load(f)
+        assert on_disk["notes"]["provider"] == "vast"
+        assert on_disk["notes"]["gpu"] == "RTX 5090"
+        assert on_disk["notes"]["gpu_rate_usd_hr"] == 3600.0
 
 
 def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
@@ -530,16 +567,16 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu: 3600.0)
+        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
         from flash.spec import JobSpec
 
         spec = JobSpec(run_id="r1", model="Qwen/Qwen3.5-4B", algorithm="grpo")
-        # No cost_usd stamped (RunPod path): fall back to wall * rate and attribute runpod.
+        # No cost_usd stamped: fall back to wall * rate.
         out = runner._persist_metrics(spec, {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090"})
         assert out == 1.0  # 1s / 3600 * 3600/hr
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
-        assert on_disk["notes"]["provider"] == "runpod"
+        assert on_disk["notes"]["provider"] == "unknown"
 
 
 def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
@@ -551,7 +588,7 @@ def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu: 3600.0)
+        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
         from flash.spec import JobSpec
 
         spec = JobSpec(run_id="r-train-only", model="Qwen/Qwen3.5-4B", algorithm="sft")

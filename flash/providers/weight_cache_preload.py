@@ -579,7 +579,21 @@ _LAMBDA_SNAPSHOT_BUDGET_S = 30.0
 # driver's poll before the instance wall cap it is watching. Its own budget bounds a hung Lambda
 # without taking anything from the warm.
 _FS_PRECHECK_BUDGET_S = 120.0
-_PRELOAD_STATUS_REPO = "Freesolo-Co/flash-weight-preload"
+_PRELOAD_STATUS_REPO_NAME = "flash-weight-preload"
+
+
+def _preload_status_repo() -> str:
+    """The HF dataset repo the warm boxes report completion into.
+
+    Derived from ``artifact_namespace()`` for the same reason run artifacts are: this repo is
+    CREATED with the operator's ``HF_TOKEN``, and a hardcoded ``Freesolo-Co`` made the warm path
+    unusable for a self-hoster whose token cannot write there -- with an error telling them to fix
+    an ``HF_TOKEN`` that was already correct. Not a separate knob: it follows wherever
+    ``FLASH_HF_NAMESPACE`` already points, so every path here still names one repo.
+    """
+    from flash.runner import artifact_namespace
+
+    return f"{artifact_namespace()}/{_PRELOAD_STATUS_REPO_NAME}"
 
 
 class IncompleteWarmPlanError(RuntimeError):
@@ -694,7 +708,7 @@ def _ensure_status_repo(token: str | None) -> None:
     from huggingface_hub import HfApi
 
     HfApi(token=token).create_repo(
-        _PRELOAD_STATUS_REPO, repo_type="dataset", exist_ok=True, private=True
+        _preload_status_repo(), repo_type="dataset", exist_ok=True, private=True
     )
 
 
@@ -708,7 +722,7 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": run_id,
-            "train": {"hf_repo": _PRELOAD_STATUS_REPO},
+            "train": {"hf_repo": _preload_status_repo()},
             "gpu": {
                 "type": gpu,
                 "max_wall_seconds": max(60, int(wall_s)),
@@ -895,15 +909,17 @@ def _warm_one_lambda_instance(
         if launch_err is not None or spec is None:
             return _result("error", error=f"launch: {launch_err}")
         prefix = f"{spec.phase}/{run_id}"
+        # bound once: both readers must watch the repo the launched spec actually writes to.
+        status_repo = spec.train.hf_repo
         reader = make_hf_text_reader(
-            _PRELOAD_STATUS_REPO,
+            status_repo,
             f"{prefix}/preload_result.json",
             min_interval_s=max(5.0, poll_interval_s),
         )
         # Also watch the attempt marker: if the box dies early the failmark is the only signal (avoids
         # polling to full timeout on a dead box). Completion file is authoritative when present.
         fail_reader = make_hf_text_reader(
-            _PRELOAD_STATUS_REPO,
+            status_repo,
             f"{prefix}/lambda_attempt0.json",
             min_interval_s=max(5.0, poll_interval_s),
         )
@@ -1002,7 +1018,7 @@ def warm_instances(
         _ensure_status_repo(token)
     except Exception as exc:
         raise RuntimeError(
-            f"preload status repo {_PRELOAD_STATUS_REPO!r} unavailable ({exc}); set a valid HF_TOKEN "
+            f"preload status repo {_preload_status_repo()!r} unavailable ({exc}); set a valid HF_TOKEN "
             "with write access before warming (refusing to launch paid GPUs that can't report)."
         ) from exc
     with ThreadPoolExecutor(max_workers=max_workers) as ex:

@@ -81,6 +81,13 @@ this repository have one, and it is the main reason the history is readable.
 Do not add tool-generated trailers (co-author lines for AI assistants, session links, or
 "generated with" footers) to commits.
 
+That rule governs new commits only. Commits already in this history carry such trailers,
+plus a build box that committed under an internal hostname. `scripts/scrub_history.sh`
+rewrites both out of every ref and refuses to print publication instructions unless the
+residual counts reach zero. It has to run on a fresh mirror clone **before** the
+repository is made public: rewriting afterwards accomplishes nothing, because the old
+shas stay reachable through forks, caches, and the GitHub API.
+
 ## Code style
 
 - Ruff is the formatter and linter; its configuration lives in `pyproject.toml`. Run

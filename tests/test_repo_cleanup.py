@@ -21,7 +21,7 @@ _REAL_DEPLOYED = rc.deployed_prefixes
 _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
 _REAL_RUN_SCHEDULED_CLEANUP = rc.run_scheduled_cleanup
 
-NS = rc._ARTIFACT_NAMESPACE
+NS = rc.artifact_namespace()
 NOW = 1_800_000_000.0
 DAY = 86400.0
 AGE_DAYS = rc.DELETE_AGE_SECONDS / DAY  # the fixed 7-day threshold, in days

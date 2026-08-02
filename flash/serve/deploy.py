@@ -20,7 +20,7 @@ from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 from flash.engine.structured_outputs import parse_structured_outputs
 from flash.lora_rank import rank_from_adapter_config
 from flash.schema import format_adapter_revision
-from flash.serve.urls import openai_base_url, serving_control_url
+from flash.serve.urls import is_freesolo_hosted_url, openai_base_url, serving_control_url
 
 logger = get_logger(__name__)
 
@@ -221,9 +221,35 @@ def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
 
 
 def serving_base_url() -> str:
-    """Env-overridable serving control root."""
-    configured = os.environ.get("FREESOLO_SERVING_URL") or DEFAULT_FREESOLO_SERVING_URL
-    return serving_control_url(configured)
+    """Env-overridable serving control root.
+
+    A standalone plane must configure this explicitly, and to a backend it OPERATES. Every
+    serving request carries ``FREESOLO_INTERNAL_KEY`` (see ``_internal_key_header``), and on a
+    self-hosted plane that key is the credential granting full control of the plane itself.
+    Sending it to a third party the operator has no relationship with, on an ordinary
+    ``flash deploy`` or ``flash chat``, is the failure this guards.
+
+    Both ways of arriving at the hosted backend are refused, not just the unset one: an operator
+    who copied a managed ``.env`` has ``FREESOLO_SERVING_URL`` already SET to it, so a guard on
+    the fallback alone would miss the more likely case. Raising here covers every caller
+    (including ``serving_openai_base_url``) rather than stripping the header at one call site,
+    and the error names the fix.
+    """
+    # imported lazily: flash.serve is the CLIENT side, and a module-level import would pull
+    # flash.server into every CLI invocation.
+    from flash.server.auth import standalone
+
+    configured = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
+    if standalone() and (not configured or is_freesolo_hosted_url(configured)):
+        raise ServingError(
+            f"FREESOLO_SERVING_URL is {'not set' if not configured else 'a Freesolo-hosted URL'}. "
+            "A standalone plane has no serving backend of its own, and using the hosted one would "
+            "send FREESOLO_INTERNAL_KEY - the key that controls this plane - to a service you do "
+            "not operate. Point FREESOLO_SERVING_URL at your own multi-LoRA deployment, or export "
+            "the adapter and serve it yourself (see SELF_HOSTING.md). Training does not require "
+            "this."
+        )
+    return serving_control_url(configured or DEFAULT_FREESOLO_SERVING_URL)
 
 
 def serving_openai_base_url() -> str:
@@ -232,7 +258,13 @@ def serving_openai_base_url() -> str:
 
 
 def _internal_key_header() -> dict[str, str]:
-    key = os.environ.get("FREESOLO_INTERNAL_KEY") or ""
+    # Stripped for the same reason `authenticate` strips: the two must agree on what the key IS.
+    # A trailing newline (routine in a `.env` file) authenticates fine against the plane but is an
+    # illegal header value, so httpx rejects the request outright; a stray space authenticates and
+    # then presents a DIFFERENT credential to the serving backend. Either way deploy/undeploy/chat
+    # break for a config the plane itself accepts. Blank collapses to no header rather than an
+    # empty one, which is what an unset key already does.
+    key = (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
     return {"X-Freesolo-Internal-Key": key} if key else {}
 
 

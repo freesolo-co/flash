@@ -167,7 +167,13 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
 
 
 def _github_token() -> str | None:
-    return os.environ.get("GITHUB_TOKEN")
+    """The GitHub token, or ``None`` when unset OR blank.
+
+    Blank collapses to ``None`` so the ``if not token`` guards below report a missing credential
+    instead of pushing a malformed one, and so ``_redact`` is never handed a whitespace needle it
+    would substitute across every space in the message.
+    """
+    return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
 
 
 def _redact(value: str, token: str) -> str:

@@ -52,7 +52,7 @@ async def _reconcile_cost_loop() -> None:
 
 async def _repo_cleanup_loop() -> None:
     """Background loop: sweep ONCE on startup, then daily, deleting aged undeployed run prefixes
-    (``<phase>/<run_id>``) inside the per-environment HF artifact repos (``Freesolo-Co/flashrun-*``)
+    (``<phase>/<run_id>``) inside the per-environment HF artifact repos (``<ns>/flashrun-*``)
     to reclaim the org's private-storage quota. The 7-day age and the daily cadence are hardcoded
     constants (no env knobs) — see ``flash.server.repo_cleanup``. Sweeping on startup (rather than
     after a full interval) keeps the GC making progress even on a plane that restarts more often than

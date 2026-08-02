@@ -13,7 +13,7 @@ from fastapi import HTTPException
 from flash.spec import require_project_id
 
 from ._internal_client import build_internal_request, internal_key
-from .auth import freesolo_base_url
+from .auth import freesolo_base_url, standalone
 
 _PROJECT_TIMEOUT_S = 10.0
 _INTERNAL_PROJECT_PATH = "/api/flash/projects/validate/internal"
@@ -135,6 +135,13 @@ def require_project_access(
         project_id = require_project_id(project_id)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if standalone():
+        # Single tenant, no org directory: there is no OTHER organization to confuse this project
+        # with, so ownership is already established by the operator key that got the caller here.
+        # The id is still REQUIRED and still validated for shape above -- runs stay grouped, and a
+        # malformed id fails the same way it would against the backend.
+        return project_id
 
     if key.get("auth_kind") == "internal":
         expected_org = str(org_id or "").strip()
