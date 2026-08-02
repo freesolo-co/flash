@@ -4665,8 +4665,14 @@ def test_overrides_pin_the_rollout_resident_for_sleep_unsupported_models():
     on = build_opd_overrides(_config(sleep_unsupported=True))
     # both knobs, not one: free_cache_engine gates the sleep()/wake_up() rpcs
     # (vllm_async_server.py:626), enable_sleep_mode is what builds the sleep-capable engine (:265).
+    # they need DIFFERENT hydra prefixes -- rollout_resident_overrides' docstring has the why.
+    #
+    # asserted EXACTLY rather than as a substring, because "x=false" is a substring of "+x=false":
+    # the obvious assertion passes against the spelling that kills the run at parse, which is how
+    # this shipped. see ISSUES.md VERL-148.
     assert "actor_rollout_ref.rollout.free_cache_engine=false" in on
-    assert "actor_rollout_ref.rollout.enable_sleep_mode=false" in on
+    assert "+actor_rollout_ref.rollout.enable_sleep_mode=false" in on
+    assert "actor_rollout_ref.rollout.enable_sleep_mode=false" not in on
 
 
 def test_the_resolved_sleep_flag_reaches_the_opd_verl_config():
