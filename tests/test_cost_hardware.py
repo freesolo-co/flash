@@ -404,3 +404,35 @@ def test_resident_flag_reaches_the_quote_not_just_the_helper():
         assert fixed < step_floor_seconds("H200"), method
         # and the slope is still in there -- this is not a "wall deleted" pass.
         assert fixed >= slope, method
+
+
+def test_hardware_choice_is_not_a_restatement_of_the_hourly_rate():
+    """Selection must rank on what the JOB costs, which requires per-card step times to differ.
+
+    This is the property the allocator's total-cost ranking rides on. Before the per-card wall, a
+    step was quoted as compute plus reward wait, and compute is 0.3-9.3s on every class -- so all
+    eight classes quoted within 0.6s of each other and dollars-per-step degenerated into a monotone
+    function of the hourly rate. The ranking looked speed-aware and was arithmetically incapable of
+    disagreeing with sorting on $/hr.
+
+    Measured on the one campaign family that ran on all eight classes (Qwen3.5-0.8B, b8 g4, ctx512,
+    cap128), RTX 5090 is the cheapest per job at $0.0123/step despite RTX 4090 being cheaper per
+    hour ($0.69 vs $0.99): the 4090 takes 101.4s against the 5090's 44.6s. Ranking on rate alone
+    buys the 4090 and pays 1.59x more per step.
+    """
+    from flash.cost.analytical import step_seconds_split
+    from flash.cost.types import RunConfig
+
+    cfg = RunConfig(
+        "Qwen/Qwen3.5-0.8B", "grpo", 1, seq_len=512, completion_len=128, batch_size=8, group_size=4
+    )
+    rates = {"RTX 4090": 0.69, "RTX 5090": 0.99}
+    seconds = {c: sum(step_seconds_split(cfg, c)) for c in rates}
+
+    # the two cards must not be quoted as interchangeable; the 4090's wall is 4.5x the 5090's.
+    assert seconds["RTX 4090"] > 2 * seconds["RTX 5090"]
+
+    dollars = {c: seconds[c] * rates[c] / 3600.0 for c in rates}
+    # cheaper per hour, dearer per job -- so the two orderings genuinely disagree here.
+    assert rates["RTX 4090"] < rates["RTX 5090"]
+    assert dollars["RTX 5090"] < dollars["RTX 4090"]
