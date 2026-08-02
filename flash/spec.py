@@ -215,18 +215,10 @@ def validate_worker_env_reserved(worker_env: Any) -> None:
         )
 
 
-def effective_backend(spec: JobSpec) -> str:
-    """the training backend this spec will actually run, as the worker resolves it.
-
-    verl is the only backend: run_sft, run_opd and run_rl all delegate straight to it, so every
-    spec resolves "verl" whatever [worker_env] says.
-
-    kept as a function rather than folded into its call sites because the answer is load-bearing --
-    it picks the allocator conf (a spec that resolved "trl" would take expandable_segments and crash
-    its vLLM rollout outright, cumem.py CuMemAllocator assert) and gates multi-gpu, so the
-    resolution belongs in one place even now that it has one answer.
-    """
-    return "verl"
+# the trainer every run reports. run_sft, run_opd and run_rl all delegate straight to verl, so this
+# is a constant rather than a resolution: nothing in [worker_env] or the spec can select anything
+# else. recorded on effective_preparation so a stored run says which trainer produced it.
+TRAINER_BACKEND = "verl"
 
 
 def require_matching_seed(spec: JobSpec, seed: Any) -> int:
