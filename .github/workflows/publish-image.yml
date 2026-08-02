@@ -19,6 +19,10 @@ concurrency:
 jobs:
   publish-flash-image:
     name: Build and push flash control-plane image
+    # Upstream only -- see publish.yml. The push target `ghcr.io/freesolo-co/freesolo-flash` is in
+    # our org namespace, so a fork's GITHUB_TOKEN cannot write it: the build would burn ~10 minutes
+    # and then fail at the push. A fork that wants its own image builds it from the Dockerfile.
+    if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
     permissions:
       contents: read
