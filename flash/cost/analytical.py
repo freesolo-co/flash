@@ -100,6 +100,34 @@ REQUIRED_SAVE_COMMIT_FLOOR_S = 7.5
 REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32 = 1.5
 _REQUIRED_SAVE_COMMITS = {"sft": 2, "grpo": 2, "opd": 1}
 
+# SFT-ONLY run-level startup, paid once inside the billed train wall: verl launch, model load, lora
+# wrap and fsdp init all land after setup_seconds is stamped (lifecycle.py:1203, before the training
+# subprocess starts) and before the first optimizer step. sft quoted this at zero, so it underquoted
+# EVERY sft arm: shipped/realized median 0.46x, 14 of 16 arms below 0.8x.
+#
+# MEASURED as the intercept of train_wall regressed on step count, with card, model, batch and
+# sequence shape held fixed. the raw pooled fit is not identifiable at this sample size (replicates
+# at one step count spread 39-61%), but the spread is not noise: it is BIMODAL, and pod class --
+# read off the heartbeat's driver version, independent of anything fitted -- separates it. within a
+# class the spread collapses to 2-3s, and each class puts the intercept well above zero:
+#   4090 drv 580.126.20  0.868 s/step + 68.4s   (n=5, within-class spread 3.0s at 32 steps)
+#   4090 drv 570.195.03  1.173 s/step + 105.3s  (n=4, spread 2.4s)
+#   4090 drv 570.172.08  1.648 s/step + 123.0s  (n=2, SAME physical gpu -> zero pod variance)
+#   H100 (own fit, no part in choosing this value)      + 74.4s
+# the class model beat the pooled fit on 8 of 9 arms, INCLUDING replicates launched after the
+# hypothesis was formed, so this is a holdout result rather than a post-hoc rationalization.
+#
+# the value is the smallest per-class intercept, not the mean: the quote cannot see the pod class,
+# so the floor is the only figure justified in EVERY class. this still underquotes the slow classes
+# -- deliberately, since overquoting a class the user might not land on is the worse error.
+#
+# NOT applied to grpo or opd, which already price this through their per-step non-shardable floor
+# (29-347s/step); adding a run-level term there would double-count it. grpo ships at 1.05x over
+# n=63, so it is measured and accurate. opd's 1.29x rests on a SINGLE arm: it is excluded here on
+# the mechanism (it carries a 114.3s/step non-shardable floor, so the block is already priced),
+# not on that ratio, which is too thin to accept or reject a coefficient on.
+SFT_RUN_STARTUP_S = 68.4
+
 DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
 
 
@@ -148,6 +176,11 @@ def required_save_overhead_seconds(config: RunConfig) -> float:
     )
     per_save = commits * REQUIRED_SAVE_COMMIT_FLOOR_S + serialize_s
     return len(n.save_at_steps) * per_save
+
+
+def sft_run_startup_seconds(config: RunConfig) -> float:
+    """One-time SFT startup inside the billed train wall (0 for grpo/opd; see SFT_RUN_STARTUP_S)."""
+    return SFT_RUN_STARTUP_S if config.method == "sft" else 0.0
 
 
 def _is_moe(model_id: str) -> bool:
@@ -297,18 +330,44 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # within 5%) and did not survive leave-one-out: dropping one of five 4090 arms moved the
         # slope 1.021 -> 1.992 s/step and the intercept 70.9s -> 26.6s.
         #
-        # replicates were then run to settle it, and they settle it the other way. six arms
-        # identical in card, model, step count and seed -- differing only in run_name -- spread
-        # 99.2/148.1/150.4s at 32 steps (39% of the mean) and 291.9/404.1/545.0s at 256 steps
-        # (61%). refitting through every pairing gives slope 0.632..1.990 s/step (a factor of 3.2)
-        # and intercept 35.5..130.2s. run-to-run pod variance alone reproduces the whole
-        # leave-one-out swing, so a per-step SFT coefficient is not identifiable at this sample
-        # size no matter how the arms are fitted -- and adding the third 256-step replicate WIDENED
-        # the spread rather than narrowing it, which is what a variance-dominated measurement does.
-        # separating the fixed block from the slope needs either far more replicates or a timer
-        # inside the worker that brackets run_verl_training directly; the fit cannot recover it.
-        # the underquote is real -- it follows from the disjoint intervals above, not from any fit
-        # -- and its magnitude is unknown.
+        # replicates were then run to settle it. six arms identical in card, model, step count and
+        # seed -- differing only in run_name -- spread 99.2/148.1/150.4s at 32 steps (39% of the
+        # mean) and 291.9/404.1/545.0s at 256 steps (61%), and pooling them gives slope
+        # 0.632..1.990 s/step (a factor of 3.2) with intercept 35.5..130.2s.
+        #
+        # that spread is NOT run-to-run pod noise, which is what it was first read as. the six arms
+        # landed on three different host classes (nvidia driver builds 570.172.08 / 570.195.03 /
+        # 580.126.20) and the wall tracks the class: across 11 replicate groups campaign-wide,
+        # the 8 whose replicates shared a driver build spread 1.2..16.4% (median 5.2%) while the 3
+        # that straddled builds spread 38.6..81.4%. driver is near-perfectly confounded with
+        # datacenter in these arms, but the cases that separate them rule datacenter out -- same
+        # build across different sites stays tight (grpo 453.2s@US-CA-2 vs 477.5s@US-NE-1, and the
+        # 32-step sft pair 148.1s@US-IL-1 vs 150.4s@EUR-NO-1, 1.6% apart) while same site across
+        # different builds does not. so the confound is host class, and it is systematic, not noise.
+        #
+        # controlling for it, the fit IS stable: within build 580.126.20 (5 arms, 3 step counts, 8
+        # pairings) slope is 0.657..0.894 s/step and the fixed block 63.0..78.2s -- the intercept
+        # range collapses from 94.7s pooled to 15.2s. the other builds fit the same shape with a
+        # slower slope and a bigger block (570.195.03: 1.132..1.808 s/step, 92.6..114.2s).
+        #
+        # a fixed block of roughly 63..123s therefore exists and is measured, but it is per host
+        # class, and this module has no host-class input: the caller knows the card, not which
+        # driver build the pod will land on.
+        #
+        # that argues against quoting the MEAN, not against quoting anything. the alternative on
+        # offer is not "a right value vs a wrong one" -- it is 0s, which is wrong for every class by
+        # more than any in-range value is wrong for any single one. so the block IS quoted, once per
+        # run, at the bottom of the measured range (SFT_RUN_STARTUP_S, charged in estimate_cost
+        # rather than here because it is per run, not per step). the floor is the one value that
+        # cannot overquote any class observed, and it strictly beats zero everywhere: over all 16
+        # sft arms, quoted/realized moves from a median 0.46x to 0.83x, 14 of 16 arms land closer to
+        # their measured wall, arms underquoting by >20% fall from 14 to 6, and no arm crosses into
+        # overquoting (0 of 16 above 1.25x, before and after). what remains is a deliberate residual
+        # underquote on the slower classes, which is the safe direction -- a user who lands on a
+        # fast pod is never billed for a slow one.
+        #
+        # the per-step SFT slope is a different question and stays unchanged: pooled it is still
+        # unidentifiable (0.632..1.990 s/step across pairings), and nothing above resolves it.
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
@@ -532,10 +591,16 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     # A one-time kernel/graph compile is paid once on the first step (MoE-only; 0 for dense). It is
     # training GPU time, so it belongs in the (billed) train term, not setup.
     compile_s = compile_seconds(config, gpu)
-    raw_train = compile_s + config.steps * sps + required_save_s
+    # Same argument, SFT only: verl launch + model load + fsdp init run inside the billed train wall
+    # and are quoted per RUN, not per step. grpo/opd already carry this in their per-step floor.
+    startup_s = sft_run_startup_seconds(config)
+    raw_train = compile_s + startup_s + config.steps * sps + required_save_s
     if not config.is_grpo and config.train_tokens is not None:
         raw_train = (
-            compile_s + sft_seconds_for_tokens(config, gpu, config.train_tokens) + required_save_s
+            compile_s
+            + startup_s
+            + sft_seconds_for_tokens(config, gpu, config.train_tokens)
+            + required_save_s
         )
     sps = raw_train / config.steps
 

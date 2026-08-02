@@ -8,10 +8,12 @@ import pytest
 from flash.cost import RunConfig, estimate_cost
 from flash.cost.analytical import (
     DEFAULT_WALL_CAP_S,
+    SFT_RUN_STARTUP_S,
     VLLM_INIT_S,
     seconds_per_step,
     select_gpu,
     setup_seconds,
+    sft_run_startup_seconds,
 )
 
 SMALL = "Qwen/Qwen3.5-0.8B"
@@ -28,6 +30,22 @@ def test_estimate_is_positive_and_self_consistent():
     assert e.billable_hours == pytest.approx(e.train_seconds / 3600.0)
     # chosen card actually fits the run's requirement
     assert e.gpu_vram_gb >= e.required_vram_gb
+
+
+def test_sft_run_startup_is_charged_once_to_sft_only():
+    # verl launch + model load + fsdp init land inside the billed train wall on sft. grpo and opd
+    # already carry that time in their per-step floor, so charging it again would double-count.
+    assert sft_run_startup_seconds(RunConfig(MID, "sft", 32)) == SFT_RUN_STARTUP_S
+    assert sft_run_startup_seconds(RunConfig(MID, "grpo", 32)) == 0.0
+    assert sft_run_startup_seconds(RunConfig(MID, "opd", 32)) == 0.0
+
+
+def test_sft_run_startup_stays_within_the_measured_range():
+    # 68.4s is the SMALLEST per-class intercept measured on the 4090 sft arms (classes fit at 68.4 /
+    # 105.3 / 123.0s). the quote cannot see which pod class it will land on, so the floor is the one
+    # value that cannot overquote any observed class. raising it above the floor would.
+    assert pytest.approx(68.4) == SFT_RUN_STARTUP_S
+    assert 0.0 < SFT_RUN_STARTUP_S <= 68.4
 
 
 def test_cost_increases_with_steps():
@@ -395,3 +413,37 @@ def test_revision_pinned_sizing_flows_into_setup_and_required_save(monkeypatch, 
     default = RunConfig(SMALL, "sft", 100, save_at_steps=(100,))
     assert setup_seconds(pinned) < setup_seconds(default)
     assert required_save_overhead_seconds(pinned) < required_save_overhead_seconds(default)
+
+
+def test_sft_run_startup_is_charged_once_per_run_not_per_step(monkeypatch):
+    """The SFT startup block must reach the billed wall, be SFT-only, and not scale with steps.
+
+    Asserting the constant equals its own value would pass even if nothing consumed it, so this
+    perturbs the constant and requires the quote to move by exactly that delta -- it fails if the
+    term is ever unwired from estimate_cost, and fails differently if it is multiplied by steps.
+    """
+    from flash.cost import analytical
+
+    base_32 = estimate_cost(RunConfig(SMALL, "sft", 32)).train_seconds
+    base_64 = estimate_cost(RunConfig(SMALL, "sft", 64)).train_seconds
+    grpo_before = estimate_cost(RunConfig(SMALL, "grpo", 32)).train_seconds
+
+    bump = 100.0
+    monkeypatch.setattr(analytical, "SFT_RUN_STARTUP_S", analytical.SFT_RUN_STARTUP_S + bump)
+
+    # charged once: the same delta at 32 and at 64 steps. a per-step term would double.
+    assert estimate_cost(RunConfig(SMALL, "sft", 32)).train_seconds == pytest.approx(base_32 + bump)
+    assert estimate_cost(RunConfig(SMALL, "sft", 64)).train_seconds == pytest.approx(base_64 + bump)
+    # SFT-only: grpo and opd already price this through their per-step non-shardable floor, so
+    # charging them again would double-count it.
+    assert estimate_cost(RunConfig(SMALL, "grpo", 32)).train_seconds == pytest.approx(grpo_before)
+
+
+def test_sft_run_startup_reaches_the_token_budgeted_branch(monkeypatch):
+    """train_tokens takes a second raw_train path; the startup block must be charged there too."""
+    from flash.cost import analytical
+
+    cfg = RunConfig(SMALL, "sft", 32, train_tokens=200_000)
+    before = estimate_cost(cfg).train_seconds
+    monkeypatch.setattr(analytical, "SFT_RUN_STARTUP_S", analytical.SFT_RUN_STARTUP_S + 100.0)
+    assert estimate_cost(cfg).train_seconds == pytest.approx(before + 100.0)
