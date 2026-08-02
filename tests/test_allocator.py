@@ -1589,7 +1589,7 @@ def test_multi_card_ranking_prices_the_same_run_the_quote_bills():
         step_cost_key,
         step_seconds_split,
     )
-    from flash.providers.base import Candidate, run_config_for_ranking
+    from flash.providers.base import run_config_for_ranking
 
     for method in ("sft", "grpo", "opd"):
         config = run_config_for_ranking(
@@ -1634,11 +1634,15 @@ def test_multi_card_ranking_reaches_the_allocator_not_just_the_key():
     train = {"max_steps": 32}
     ranker = _step_cost_ranker("Qwen/Qwen3.5-4B", "grpo", train, False)
     assert ranker is not None
-    key = step_cost_key(run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo", train=train, thinking=False))
+    key = step_cost_key(
+        run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo", train=train, thinking=False)
+    )
 
     for gpu, rate in (("H200", 3.99), ("RTX 5090", 0.99)):
         for n in (1, 2, 4):
-            candidate = Candidate(provider="runpod", gpu=gpu, hourly_usd=rate, vram_gb=80, gpu_count=n)
+            candidate = Candidate(
+                provider="runpod", gpu=gpu, hourly_usd=rate, vram_gb=80, gpu_count=n
+            )
             assert ranker(candidate) == pytest.approx(key(gpu, rate, n)), f"{gpu} n={n}"
 
 

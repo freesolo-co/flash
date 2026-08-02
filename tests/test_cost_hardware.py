@@ -153,9 +153,7 @@ def test_rollout_wall_dominates_a_small_rollout_step():
     reward_share = fixed - no_reward
     assert no_reward > 10 * reward_share  # the wall is rollout, not grading
     n = config.normalized()
-    assert no_reward == pytest.approx(
-        n.batch_size * n.group_size * ROLLOUT_SECONDS_PER_COMPLETION
-    )
+    assert no_reward == pytest.approx(n.batch_size * n.group_size * ROLLOUT_SECONDS_PER_COMPLETION)
 
 
 def test_run_block_is_charged_per_class_not_pooled():

@@ -3,6 +3,8 @@ steps, GRPO > SFT, bigger model costs more, the wall cap bounds runs) + arithmet
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 from flash.cost import RunConfig, estimate_cost
@@ -11,10 +13,10 @@ from flash.cost.analytical import (
     SFT_RUN_STARTUP_S,
     VLLM_INIT_S,
     multi_card_speedup,
+    run_startup_seconds,
     seconds_per_step,
     select_gpu,
     setup_seconds,
-    run_startup_seconds,
     step_seconds_split,
 )
 
@@ -50,7 +52,8 @@ def test_run_startup_is_charged_per_method_and_per_card():
         h100 = run_startup_seconds(RunConfig(MID, method, 32), "H100")
         rtx = run_startup_seconds(RunConfig(MID, method, 32), "RTX 5090")
         assert h100 > SFT_RUN_STARTUP_S, method
-        assert rtx > 0.0 and h100 != rtx, method
+        assert rtx > 0.0, method
+        assert h100 != rtx, method
 
 
 def test_run_startup_is_zero_for_a_resident_rollout_engine():
@@ -716,5 +719,5 @@ def test_ranking_choice_moves_with_the_horizon():
     # ... and it converges: no further change once the block's share is small.
     assert picks[-4:] == [picks[-1]] * 4, f"ranking still moving at long horizons: {picks}"
     # the winner changes at most once, monotonically -- no oscillation.
-    switches = sum(1 for a, b in zip(picks, picks[1:]) if a != b)
+    switches = sum(1 for a, b in itertools.pairwise(picks) if a != b)
     assert switches == 1, f"expected a single crossover, saw {switches}: {picks}"
