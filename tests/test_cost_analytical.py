@@ -316,7 +316,8 @@ def test_opd_teacher_scoring_bills_serial_batched_round_trips():
     many = RunConfig(MID, "opd", 10, batch_size=16, group_size=1, seq_len=1024)
     # 8 completions fill exactly one batch; 16 need two. pin that the fixture actually straddles a
     # batch boundary, or the assertion below passes for the wrong reason.
-    assert 8 % OPD_TEACHER_BATCH_SIZE == 0 and 16 // OPD_TEACHER_BATCH_SIZE == 2
+    assert 8 % OPD_TEACHER_BATCH_SIZE == 0, "8 completions must fill whole batches exactly"
+    assert 16 // OPD_TEACHER_BATCH_SIZE == 2, "16 completions must need exactly two batches"
     delta = seconds_per_step(many, gpu) - seconds_per_step(few, gpu)
     # the rollout wall scales per completion (vllm samples and detokenizes each sequence separately,
     # whatever the token total), and the teacher adds exactly ONE more round trip across this
@@ -348,9 +349,11 @@ def test_opd_teacher_batch_size_matches_the_worker():
             isinstance(t, ast.Name) and t.id == "_TEXT_TEACHER_BATCH_SIZE" for t in node.targets
         ):
             worker_value = ast.literal_eval(node.value)
-    assert worker_value is not None, "worker no longer defines _TEXT_TEACHER_BATCH_SIZE at module level"
-    assert OPD_TEACHER_BATCH_SIZE == worker_value, (
-        f"cost model mirrors a stale teacher batch size ({OPD_TEACHER_BATCH_SIZE}) — "
+    assert worker_value is not None, (
+        "worker no longer defines _TEXT_TEACHER_BATCH_SIZE at module level"
+    )
+    assert worker_value == OPD_TEACHER_BATCH_SIZE, (
+        f"cost model mirrors a stale teacher batch size ({OPD_TEACHER_BATCH_SIZE}) - "
         f"the worker now batches {worker_value}"
     )
 
