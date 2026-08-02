@@ -4641,8 +4641,57 @@ def test_the_resolved_eager_flag_reaches_the_opd_verl_config():
     # the string assertions above pass against a resolver whose answer is never carried into the
     # config, which is exactly the shape of the bug this fixes. pin the wiring.
     built = inspect.getsource(opd_train.run_opd_train)
-    assert "resolve_rollout_enforce_eager(resolve_verl_device_capability(python_bin))" in built
+    # one probe now feeds both eager and the attention pins, so the call is bound to a name rather
+    # than nested inline. assert the resolver still consumes THAT probe, not a second one.
+    assert "verl_cc = resolve_verl_device_capability(python_bin)" in built
+    assert "resolve_rollout_enforce_eager(verl_cc)" in built
     assert '"enforce_eager": enforce_eager,' in built
+
+
+def test_opd_pins_the_blackwell_attention_backends_like_grpo_does():
+    """VERL-156: opd's rollout died on B200 because it never pinned the ViT attention backend.
+
+    vllm 0.19.1 defaults the ViT to a CUTE flash-attn that is unimportable against every published
+    nvidia-cutlass-dsl, so the engine aborts with `cutlass.cute.core has no attribute 'ThrMma'`.
+    grpo has pinned both backends since the trl driver; opd never did, which is the same one-sided
+    fix that produced the enforce_eager bug directly above. two attempts on two fresh B200s
+    reproduced it byte-identically before this was found.
+    """
+    # off blackwell the resolver answers (None, None) and nothing may be emitted -- an unconditional
+    # pin would change the rollout on every other card.
+    off = build_opd_overrides(_config())
+    assert not any("attention_backend" in value for value in off)
+
+    on = build_opd_overrides(
+        _config(attention_backend="FLASHINFER", mm_encoder_attn_backend="TORCH_SDPA")
+    )
+    # '+' appends under the existing engine_kwargs.vllm struct: these are AsyncEngineArgs fields
+    # spread by verl, not declared RolloutConfig fields, so a bare assignment would not reach them.
+    assert (
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHINFER" in on
+    ), on
+    assert (
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend=TORCH_SDPA" in on
+    ), on
+
+
+def test_both_ray_rollouts_pin_blackwell_attention_from_the_same_resolver():
+    # the enforce_eager cross-trainer check below exists because a one-sided fix is how that bug
+    # shipped. the attention pins are the same divergence one knob over, so assert them the same
+    # way rather than trusting opd alone.
+    for module, source in (
+        ("rl_train", inspect.getsource(rl_train.run_rl_train)),
+        ("opd_train", inspect.getsource(opd_train.run_opd_train)),
+    ):
+        # the resolver must be CALLED and its second return value must be carried onward. the two
+        # trainers spell the handoff differently (rl_train passes it as a kwarg into
+        # _rl_runconfig, opd_train builds its config dict inline), so assert the binding both
+        # share rather than either one's syntax.
+        assert "resolve_blackwell_attention_backends(" in source, module
+        assert "attention_backend, mm_encoder_attn_backend = " in source, module
+        assert "mm_encoder_attn_backend=mm_encoder_attn_backend" in source or (
+            '"mm_encoder_attn_backend": mm_encoder_attn_backend,' in source
+        ), module
 
 
 def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
