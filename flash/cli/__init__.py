@@ -575,8 +575,9 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_gpu_count_override,
         metavar="N",
         help=(
-            "cards to run the job on; sets [gpu] count (1-8). "
-            "more than one also needs an explicit [gpu] provider that rents n cards on one machine"
+            "most cards to run the job on; sets [gpu] count (1-8). a ceiling, not an exact "
+            "count: allocation still picks one card when one fits the run alone. more than one "
+            "also needs an explicit [gpu] provider that rents n cards on one machine"
         ),
     )
     train.add_argument("--dry-run", action="store_true")

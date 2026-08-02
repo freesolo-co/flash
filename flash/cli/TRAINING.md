@@ -1283,6 +1283,12 @@ stay at its authored count while one submit asks for more. The flag is exactly `
 gpu.count=4`: the same 1..8 bound rejects a bad value, and the same submit gate still demands a
 provider that rents all n cards on one machine.
 
+`gpu.count` is a **ceiling, not an exact count** — by either spelling. Allocation treats it as the
+most cards it may combine, so a class that fits the run on one card is still allocated as one card
+and the worker launches one rank. Combinations are also capped at 4, so 5-8 only lower the count
+that would otherwise be chosen. To guarantee n cards, pin a `[gpu] type` too small to fit the run
+alone; to see what a submit actually chose, read `gpu.count` back off the run record.
+
 GRPO, SFT and OPD all shard across `gpu.count` with no backend key to set: the worker launches one
 rank per card with Ulysses sequence parallelism.
 
@@ -1316,7 +1322,7 @@ flash env delete --project <project-uuid> your-org/my-env -y   # delete a publis
 flash train configs/sft.toml --dry-run # validate the config on the server (no GPU, no charge)
 flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/sft.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
-flash train configs/grpo.toml --gpus 4 # shorthand for --set gpu.count=4 (needs a multi-card provider)
+flash train configs/grpo.toml --gpus 4 # shorthand for --set gpu.count=4; a CEILING (needs a multi-card provider)
 flash runs status <run-id>                 # state + accrued cost
 flash runs log <run-id>                    # reward/loss trend + worker console/error logs
 flash runs log <run-id> --follow           # stream a live run to completion

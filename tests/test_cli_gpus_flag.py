@@ -117,3 +117,29 @@ def test_gpus_still_hits_the_multi_gpu_provider_gate(tmp_path):
     spec = _spec(tmp_path, "--gpus", "4", config=vast)
     with pytest.raises(ValueError, match=r"gpu\.provider"):
         runner._require_supported_gpu_count(spec)
+
+
+def test_the_help_does_not_promise_an_exact_card_count():
+    """The flag must describe gpu.count as the CEILING the allocator treats it as.
+
+    allocate() takes this field as max_gpu_count and keeps fit-alone candidates, so a class that
+    fits the run on one card is allocated as one card and _spec_with_gpu rewrites the effective
+    count to 1 -- the worker then launches one rank. Help that reads "cards to run the job on"
+    states something the allocator does not honor, and a user sizing an experiment off it would be
+    wrong with nothing in the output saying so. Asserted on the rendered help (not the source
+    string) because that is what the user actually reads.
+    """
+    from flash.cli import _build_parser
+
+    # render the train subparser's help, which is the text `flash train --help` prints.
+    sub = _build_parser()._subparsers._group_actions[0].choices["train"]  # type: ignore[union-attr]
+    rendered = sub.format_help()
+
+    # rindex, not index: "--gpus N" appears first in the usage line, whose text is just the metavar.
+    # collapse argparse's wrapping first, or a phrase split across two lines reads as absent.
+    start = rendered.rindex("--gpus")
+    window = " ".join(rendered[start : start + 400].split()).lower()
+    assert "ceiling" in window, "help must say the count is a ceiling, not an exact card count"
+    assert not window.startswith("--gpus n cards to run the job on"), (
+        "that phrasing promises exact-count semantics the allocator does not provide"
+    )
