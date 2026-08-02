@@ -154,6 +154,16 @@ def test_step_floor_is_charged_per_class_not_pooled():
     assert _DEFAULT_STEP_FLOOR_S > 0.0
 
 
+def test_step_floor_table_only_lists_real_classes():
+    # same drift guard the TFLOPS table gets. a typo'd key here does not raise -- it silently falls
+    # through to the pooled default, so the measured value would be quietly discarded and the class
+    # would go on being mispriced with nothing failing.
+    from flash.cost.facts import _STEP_FLOOR_S
+
+    for name in _STEP_FLOOR_S:
+        assert name in GPU_INFO, f"{name} is not a managed GPU class"
+
+
 def test_step_floor_applies_to_rollout_methods_only():
     # the floor is vllm engine entry/exit + actor->rollout weight sync. sft runs neither, and the
     # floor was fitted on rollout arms only, so charging it to sft would invent ~45s per step.

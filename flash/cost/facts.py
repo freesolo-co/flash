@@ -122,9 +122,9 @@ def effective_train_tflops(name: str) -> float:
 # The effect dominates real runs. Across a 45-arm RunPod campaign (Qwen3.5 0.8B/2B/4B, 6 classes,
 # batch/group/context swept) the compute term was 0.3-9.3s while realized steps took 43-383s, so
 # 95-99% of a real step is floor the model did not price. Quoting without it ran ~0.48x of realized
-# (typical error 2.17x) and put only 8/45 arms inside the 0.70-1.43x band. On a later 10-arm holdout
-# (new environments and shapes, none used to fit) it moves geo-bias 0.30x -> 0.90x, typical error
-# 3.30x -> 1.25x, and in-band 0/10 -> 9/10.
+# (typical error 2.17x) and put only 8/45 arms inside the 0.70-1.43x band. On a later 11-arm holdout
+# (new environments and shapes, none used to fit) it moves geo-bias 0.31x -> 0.89x, typical error
+# 3.26x -> 1.25x, and in-band 0/11 -> 10/11.
 #
 # Values are the per-card MEDIAN residual (realized step - quoted step) over that campaign. The
 # median, not the mean, so one preempted or thermally-throttled arm cannot drag a class. The floor

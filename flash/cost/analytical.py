@@ -244,6 +244,11 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         teacher_s = teacher_lat
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
+        #
+        # opd carries the rollout floor because it runs the same verl rollout path grpo does -- vllm
+        # generation and the actor->rollout weight sync both happen here. that is the mechanism the
+        # floor measures, but note every arm it was FITTED on is grpo, so the size of the opd floor is
+        # inferred from a shared mechanism rather than measured on opd arms.
         return gen_s + update_s, overhead + teacher_s + step_floor_seconds(gpu)
 
     if not n.is_grpo:
