@@ -822,7 +822,7 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
         rl_train._w, "write_base_model_provenance", lambda *a, **kw: None, raising=False
     )
     monkeypatch.setattr(rl_train, "_export_peft_adapter", lambda *a, **kw: None)
-    monkeypatch.setattr(rl_train, "_stamp_adapter_dir_provenance", lambda *a, **kw: None)
+    monkeypatch.setattr(rl_train, "stamp_adapter_dir_provenance", lambda *a, **kw: None)
 
     local_dir = tmp_path / "ckpt"
     (local_dir / "global_step_10" / "actor").mkdir(parents=True)

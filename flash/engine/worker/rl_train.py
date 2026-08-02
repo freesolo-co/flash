@@ -68,6 +68,8 @@ from flash.engine.worker.backend_common import (
     resolve_verl_python,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
+    stage_verl_resume,
+    stamp_adapter_dir_provenance,
     trainer_dtype_overrides,
     verl_supports_rollout_field,
 )
@@ -2383,7 +2385,7 @@ class _VerlResumeUploader:
         # the served adapter needs its preprocessor alongside it, exactly as the final publish does:
         # the processor on a multimodal job (tokenizer + image preprocessor), else the tokenizer.
         self.preprocessor.save_pretrained(adapter_dir)
-        _stamp_adapter_dir_provenance(adapter_dir, self.model_id, self.model_revision)
+        stamp_adapter_dir_provenance(adapter_dir, self.model_id, self.model_revision)
         _w.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
         return adapter_dir
 
@@ -2469,23 +2471,12 @@ class _VerlResumeUploader:
 def _restore_verl_resume(local_dir: str) -> int:
     """stage this run's streamed resume checkpoint into local_dir; return the step it resumes at.
 
-    the resume artifact is keyed on the run prefix, not the job type, so the control plane hands
-    grpo the same ``checkpoint-N`` layout it hands sft. verl finds it via
-    latest_checkpointed_iteration.txt under trainer.default_local_dir once resume_mode=auto.
     returns 0 when there is nothing to resume, which is the ordinary fresh-run path.
     """
     resume = _w.hf_resume_checkpoint()
     if not resume:
         return 0
-    match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume))
-    if match is None:
-        raise RuntimeError(f"invalid GRPO resume checkpoint path {resume!r}")
-    step = int(match.group(1))
-    target = os.path.join(local_dir, f"global_step_{step}")
-    shutil.copytree(resume, target, dirs_exist_ok=True)
-    with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
-        file.write(str(step))
-    return step
+    return stage_verl_resume(resume, local_dir, job_label="GRPO")
 
 
 def _check_grpo_had_a_gradient(
@@ -2570,31 +2561,6 @@ def _latest_global_step_dir(local_dir: str) -> tuple[str, int]:
     if best_step < 0:
         raise RuntimeError(f"no global_step_N checkpoint found under {local_dir}")
     return best, best_step
-
-
-def _stamp_adapter_dir_provenance(
-    adapter_dir: str, model_id: str, model_revision: str = ""
-) -> None:
-    """stamp the saved adapter's immutable base identity into adapter_config.json.
-
-    dir-based analogue of _w.stamp_adapter_provenance (which needs an in-memory peft model). same
-    validation + fields, applied to the json verl produced.
-    """
-    cfg_path = os.path.join(adapter_dir, "adapter_config.json")
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-    current_base = str(cfg.get("base_model_name_or_path", "") or "").strip()
-    if current_base and current_base != model_id:
-        raise RuntimeError(
-            f"adapter base model {current_base!r} does not match validated target {model_id!r}"
-        )
-    current_rev = str(cfg.get("revision", "") or "").strip()
-    if current_rev and model_revision and current_rev != model_revision:
-        raise RuntimeError("adapter base revision does not match the validated target commit")
-    cfg["base_model_name_or_path"] = model_id
-    cfg["revision"] = model_revision or None
-    with open(cfg_path, "w") as f:
-        json.dump(cfg, f, indent=2)
 
 
 # --------------------------------------------------------------------------------------------
@@ -3532,7 +3498,7 @@ def run_rl_train():
             actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
         )
         preprocessor.save_pretrained(adapter_dir)
-        _stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
+        stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         # preserve the final checkpoint only when exact save steps are not configured: with
