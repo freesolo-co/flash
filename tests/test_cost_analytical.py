@@ -304,7 +304,7 @@ def test_opd_teacher_scoring_is_one_parallel_wave():
     # latency) sum. Hold seq_tokens (hence gen_s/update_s) constant while doubling the completion count;
     # since scoring is now fully parallel the teacher term is unchanged, so the per-step delta is 0.
     from flash.cost.analytical import seconds_per_step
-    from flash.cost.facts import teacher_seconds_per_completion
+    from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, teacher_seconds_per_completion
 
     gpu = "RTX 5090"
     teacher_lat = teacher_seconds_per_completion()
@@ -314,10 +314,16 @@ def test_opd_teacher_scoring_is_one_parallel_wave():
     few = RunConfig(MID, "opd", 10, batch_size=8, group_size=1, seq_len=2048)
     many = RunConfig(MID, "opd", 10, batch_size=16, group_size=1, seq_len=1024)
     delta = seconds_per_step(many, gpu) - seconds_per_step(few, gpu)
-    assert delta == pytest.approx(0.0, abs=1e-6), (
+    # the rollout wall DOES scale per completion (vllm samples and detokenizes each sequence
+    # separately, whatever the token total), so the delta is that slope and nothing more. what this
+    # pins is that the TEACHER term contributes none of it -- a serial teacher would add another
+    # 8 x latency on top.
+    expected = 8 * ROLLOUT_SECONDS_PER_COMPLETION
+    assert delta == pytest.approx(expected, abs=1e-6), (
         "full-parallel teacher scoring bills one wave; doubling completions at equal total tokens "
-        "must not add teacher latency"
+        "must add the rollout slope only, no teacher latency"
     )
+    assert delta < teacher_lat * 8  # a serial teacher would swamp the slope
 
 
 def test_revision_pinned_sizing_flows_into_setup_and_required_save(monkeypatch, tmp_path):

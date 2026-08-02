@@ -245,22 +245,23 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
         #
-        # opd carries the rollout floor because it runs the same verl rollout path grpo does -- vllm
-        # generation and the actor->rollout weight sync both happen here. that is the mechanism the
-        # floor measures, but note every arm it was FITTED on is grpo, so the size of the opd floor is
-        # inferred from a shared mechanism rather than measured on opd arms.
-        return gen_s + update_s, overhead + teacher_s + step_floor_seconds(gpu)
+        # opd carries the rollout wall because it runs the same verl rollout path grpo does -- vllm
+        # generation and the actor->rollout weight sync both happen here, and it generates the same
+        # per-completion sequences, so both the constant and the slope apply. that is the mechanism
+        # the wall measures, but note every arm it was FITTED on is grpo, so the size of the opd wall
+        # is inferred from a shared mechanism rather than measured on opd arms.
+        return gen_s + update_s, overhead + teacher_s + step_floor_seconds(gpu, completions)
 
     if not n.is_grpo:
-        # NO rollout floor here. sft is a plain fwd/bwd loop: no vllm engine to enter and leave, and
-        # no actor->rollout weight sync, so the mechanism the floor measures does not exist. every arm
-        # the floor was fitted on is a rollout arm, so charging it here would extrapolate ~45s/step
-        # onto a loop it was never measured against.
+        # NO rollout wall here, neither term. sft is a plain fwd/bwd loop: no vllm engine to enter and
+        # leave, no actor->rollout weight sync, and no sampled completions for the slope to price. the
+        # mechanism does not exist here. every arm the wall was fitted on is a rollout arm, so charging
+        # it would extrapolate ~50s/step onto a loop it was never measured against.
         #
         # this exclusion is reasoned from the mechanism, NOT measured: both sft calibration arms died
         # on an unrelated liger/lora grad-zero defect, so there is no sft timing to check it against.
         # sft is left on the pre-existing compute-only quote it always had -- this change cannot make
-        # sft worse, but it does not verify it either. measure sft floors before assuming zero is right.
+        # sft worse, but it does not verify it either. measure sft walls before assuming zero is right.
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
@@ -274,7 +275,12 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     reward_s = completions * latency
     # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
     # changes. a grpo step dominated by it is latency-bound, not compute-bound.
-    return gen_s + update_s, overhead + reward_s + step_floor_seconds(gpu)
+    #
+    # reward and rollout are BOTH per-completion but they are separate terms on purpose. they were
+    # conflated before: the rollout slope (0.81s) is close enough to the reward default (1.0s) that
+    # one term could stand in for both, right up until a caller passed a MEASURED reward latency --
+    # real graders here are ~0.0003s -- and the rollout cost vanished with it. see facts.py.
+    return gen_s + update_s, overhead + reward_s + step_floor_seconds(gpu, completions)
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:

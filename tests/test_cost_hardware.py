@@ -198,6 +198,68 @@ def test_step_floor_is_not_shardable_across_cards():
     assert gpu_bound < step_floor_seconds("H100")
 
 
+def test_rollout_wall_survives_a_measured_reward_latency():
+    # THE regression. rollout cost per completion (~0.81s) is close enough to the default reward
+    # guess (1.0s/completion) that one term appeared to cover both -- until a caller supplied a
+    # MEASURED reward latency. real graders in the calibration corpus grade in ~0.0003s, so passing
+    # the true value used to delete ~32s of real rollout wall along with the fictitious reward and
+    # collapsed the quote from geo-bias 1.00x to 0.50x. the more accurate the caller's input, the
+    # worse the estimate.
+    #
+    # asserting the delta alone would be UNFALSIFIABLE: the drop equals the reward difference under
+    # both the broken and the fixed model, since both subtract the same reward term. what separates
+    # them is the ABSOLUTE floor left standing once the fictitious reward is gone, so that is what
+    # this pins -- against the realized wall, not against the model's own arithmetic.
+    from flash.cost.analytical import step_seconds_split
+    from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, step_floor_seconds
+    from flash.cost.types import RunConfig
+
+    shape = {"seq_len": 512, "completion_len": 128, "batch_size": 8, "group_size": 4}
+    completions = shape["batch_size"] * shape["group_size"]
+
+    measured = RunConfig(
+        "Qwen/Qwen3.5-0.8B", "grpo", 6, reward_seconds_per_completion=0.0003, **shape
+    )
+    gpu_bound, fixed = step_seconds_split(measured, "H100")
+
+    # h100 arms at this shape realized 56-100s/step with graders this fast. the broken model quoted
+    # ~43s of constant and nothing per-completion, landing at ~0.5x realized; the rollout slope is
+    # what closes that gap, so it must survive the caller supplying a true reward latency.
+    assert fixed >= step_floor_seconds("H100") + completions * ROLLOUT_SECONDS_PER_COMPLETION
+    assert gpu_bound + fixed > 60.0
+
+
+def test_rollout_wall_scales_with_completion_count():
+    # the wall is const_card + slope*completions. fitted on 16-256 completions/step, where the
+    # per-card median rose ~3x (h100 77.8s at 32 -> 230.7s at 256). a constant-only model fitted on
+    # the original campaign missed this because 30 of its 32 arms ran exactly 32 completions.
+    from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, step_floor_seconds
+
+    base = step_floor_seconds("H100")
+    assert step_floor_seconds("H100", 0) == pytest.approx(base)
+    assert step_floor_seconds("H100", 256) == pytest.approx(
+        base + 256 * ROLLOUT_SECONDS_PER_COMPLETION
+    )
+    # the slope is a rollout-path property, so it is the SAME on every card; only the constant differs.
+    for card in ("H100", "H200", "RTX 5090"):
+        delta = step_floor_seconds(card, 100) - step_floor_seconds(card, 0)
+        assert delta == pytest.approx(100 * ROLLOUT_SECONDS_PER_COMPLETION)
+    # a negative completion count cannot credit time back.
+    assert step_floor_seconds("H100", -5) == pytest.approx(base)
+
+
+def test_a100_sxm_40gb_inherits_its_siblings_wall():
+    # same SMs and tensor cores as the 80GB board, less hbm only -- and this wall is engine-entry and
+    # weight-sync bound, not capacity bound, so the 40GB variant cannot be ~2x cheaper per step than
+    # the board it is a memory-trimmed version of. left out of the table it fell through to the
+    # pooled default and under-priced the dominant per-step term on every lambda/vast quote in that
+    # band. the TFLOPS table inherits across this same pair for the same reason.
+    from flash.cost.facts import _DEFAULT_STEP_FLOOR_S, step_floor_seconds
+
+    assert step_floor_seconds("A100 SXM 40GB") == step_floor_seconds("A100 SXM")
+    assert step_floor_seconds("A100 SXM 40GB") != _DEFAULT_STEP_FLOOR_S
+
+
 def test_nvlink_classification_is_by_form_factor():
     from flash.cost.facts import has_nvlink
 

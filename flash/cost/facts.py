@@ -113,23 +113,23 @@ def effective_train_tflops(name: str) -> float:
     return min(peak, cap) if cap is not None else peak
 
 
-# --- per-step floor -----------------------------------------------------------------------------
-# MEASURED. Every optimizer step pays a fixed wall cost the FLOPs model cannot see: vLLM engine
-# entry/exit, the actor->rollout weight sync, ray actor dispatch, and dataloader/collate work. None
-# of it scales with the arithmetic, so no MFU or TFLOPS number can produce it, and the previous
-# model had no constant term at all -- it quoted a step as (compute + reward wait) and nothing else.
+# --- per-step rollout wall ----------------------------------------------------------------------
+# MEASURED. Every optimizer step pays wall cost the FLOPs model cannot see: vLLM engine entry/exit,
+# the actor->rollout weight sync, ray actor dispatch, per-sequence sampling and detokenize, and
+# dataloader/collate work. None of it is arithmetic, so no MFU or TFLOPS number can produce it, and
+# the previous model had no term for it at all -- it quoted a step as (compute + reward wait).
 #
-# The effect dominates real runs. Across a 45-arm RunPod campaign (Qwen3.5 0.8B/2B/4B, 6 classes,
-# batch/group/context swept) the compute term was 0.3-9.3s while realized steps took 43-383s, so
-# 95-99% of a real step is floor the model did not price. Quoting without it ran ~0.48x of realized
-# (typical error 2.17x) and put only 8/45 arms inside the 0.70-1.43x band. On a later 11-arm holdout
-# (new environments and shapes, none used to fit) it moves geo-bias 0.31x -> 0.89x, typical error
-# 3.26x -> 1.25x, and in-band 0/11 -> 10/11.
+# The effect dominates real runs. Across a 56-arm RunPod campaign (Qwen3.5 0.8B/2B/4B, 8 classes,
+# batch/group/context swept, 16-256 completions/step) the compute term was 0.3-9.3s while realized
+# steps took 43-392s, so 95-99% of a real step is wall the model did not price. Under leave-one-out
+# cross-validation over that corpus -- every arm predicted by a fit that never saw it -- this lands
+# geo-bias 1.01x, typical error 1.22x, 50/56 arms inside the 0.70-1.43x band.
 #
-# Values are the per-card MEDIAN residual (realized step - quoted step) over that campaign. The
-# median, not the mean, so one preempted or thermally-throttled arm cannot drag a class. The floor
-# is a CARD property: it varies 12s (5090) to 111s (H200) across classes but is stable within a
-# class across model size, environment, and batch shape.
+# LOOCV rather than a single holdout because the obvious holdout is not honest: the wave-M arms that
+# would serve as one include the only two A100 SXM arms in existence, which are also the only source
+# for that class's constant. Scoring a table on rows it was fitted on flatters it. LOOCV has no such
+# row, and it uses the whole corpus for the completion-count axis the two candidate models disagree
+# on. On the 9 wave-M arms that ARE genuinely out-of-sample, this scores geo-bias 0.93x / 7 in band.
 #
 # Every arm here is a ROLLOUT (grpo) arm on RUNPOD. Two limits follow, both deliberate:
 #   - sft is excluded at the call site (see analytical.step_seconds_split), on mechanism not
@@ -142,39 +142,94 @@ def effective_train_tflops(name: str) -> float:
 #     provider, and if a provider offset does exist it shows up as a class being uniformly off on
 #     that provider, which is the same signal that would justify adding an entry.
 #
-# Deliberately a CONSTANT, not a per-completion slope. The residual after applying these constants
-# shows no consistent direction with completion count (A100/H100 rise, 4090/B200 fall, H200 flat),
-# so a fitted slope would be fitting noise; and the classes with the widest span were measured over
-# only a 1.0-1.2x workload range, which cannot separate slope from intercept. A per-card linear fit
-# extrapolated to large workloads produced NEGATIVE step times, which is why it is not used.
+# The wall has TWO terms, and separating them is the whole subtlety here.
+#
+# An earlier revision of this table fitted a per-card CONSTANT on top of the existing quote. That
+# quote still contained ``completions * AVG_REWARD_SECONDS_PER_COMPLETION``, whose default is 1.0s.
+# 30 of the 32 arms in the first campaign ran exactly 32 completions, so that term was a near
+# constant 32s across the entire fit and the "floor" silently absorbed it. It scored well only
+# because the corpus never varied the axis the two terms disagree on.
+#
+# Widening to 56 arms spanning 16-256 completions separates them, and the wall is plainly NOT
+# completion-independent -- per-card medians of (realized - compute), reward excluded:
+#
+#     card         g=32    g=64    g=96    g=256
+#     H100         77.8                    230.7
+#     A100 PCIe    71.8                    215.6
+#     B200         77.7                    383.2
+#     H200        133.3                    351.5
+#     RTX 4090     79.6   146.6   216.1
+#     RTX 5090     43.9           60.7
+#
+# So it is modelled as ``const_card + ROLLOUT_SECONDS_PER_COMPLETION * completions``. The slope is
+# pooled across cards (it is a rollout-path property -- sampling, detokenize, per-sequence engine
+# bookkeeping) while each class keeps its own constant (engine entry/exit and weight sync, which do
+# not scale with the batch). Per-card slopes were rejected: several classes have 2-4 arms, which
+# cannot separate slope from intercept, and fitting per-card slopes on that produced NEGATIVE
+# extrapolated step times.
+#
+# Why this matters beyond accuracy: at 0.81s/completion the slope is within 20% of the fictitious
+# 1.0s reward default, which is exactly why the constant-only revision looked right. It was pricing
+# per-completion ROLLOUT cost through the reward term. That is not a harmless mislabel -- envs that
+# profile their real grader (see engine/reward_profile.py) pass a measured
+# ``reward_seconds_per_completion``, and the real values here are ~0.0003s. Under the constant-only
+# model, supplying a measured reward latency collapsed the quote from geo-bias 1.00x (50/56 in band)
+# to 0.50x (11/56): the more accurate the caller's reward number, the worse the estimate. Splitting
+# the terms means reward and rollout are each priced by their own measurement.
+ROLLOUT_SECONDS_PER_COMPLETION = 0.81
+
+# Per-card constant, fitted as the MEDIAN of (realized - compute - slope*completions) so one
+# preempted or thermally-throttled arm cannot drag a class. Stable within a class across model size,
+# environment and batch shape; it varies ~7x across classes, which is why it is keyed on the card.
+#
+# Every arm is a ROLLOUT (grpo) arm on RUNPOD. Two limits follow, both deliberate:
+#   - sft is excluded at the call site (see analytical.step_seconds_split), on mechanism not
+#     measurement: sft runs no vllm engine and no weight sync, so the wall this table measures has
+#     no source there. sft keeps its pre-existing compute-only quote.
+#   - it is keyed on card alone, not (card, provider). A matched lambda/vast replication was
+#     attempted and returned zero usable timings (8/8 arms died in provisioning, step-0 wedge, or a
+#     trainer crash), so a provider term is unmeasured rather than measured-and-rejected. Card-only
+#     is the conservative choice: it is a strict improvement over pricing no wall at all on every
+#     provider, and if a provider offset does exist it shows up as a class being uniformly off on
+#     that provider, which is the same signal that would justify adding an entry.
 _STEP_FLOOR_S: dict[str, float] = {
-    "A100 PCIe": 42.0,
-    # A100 SXM was added from a later 2-arm replicate (residuals 94.4s and 100.5s, 1.06x apart, well
-    # inside the 1.39x same-config pod-to-pod noise floor). It is ~2.3x its own PCIe sibling, which is
-    # why the two SXM/PCIe variants cannot share one entry.
-    "A100 SXM": 97.5,
-    "B200": 44.5,
-    "H100": 43.5,
-    # H200 is the outlier: ~2.5x the H100 floor on the same sm90 kernels. Consistent across all of
+    "A100 PCIe": 45.9,
+    # ~2.3x its own PCIe sibling, which is why the two variants cannot share one entry.
+    "A100 SXM": 103.6,
+    # Same SMs and tensor cores as the 80GB board, less HBM only -- and this wall is engine-entry and
+    # weight-sync bound, not capacity bound. So it inherits the 80GB measurement for the same reason
+    # the TFLOPS table does. Left out, it fell through to the pooled default and under-priced the
+    # dominant per-step term by ~2x on every lambda/vast quote in that band.
+    "A100 SXM 40GB": 103.6,
+    "B200": 55.4,
+    "H100": 51.4,
+    # H200 is the outlier: ~2.5x the H100 constant on the same sm90 kernels. Consistent across all of
     # its arms, so it is a property of the class as provisioned, not a bad sample.
-    "H200": 111.0,
-    "RTX 4090": 65.0,
-    "RTX 5090": 12.0,
+    "H200": 126.4,
+    "RTX 4090": 80.4,
+    "RTX 5090": 17.7,
+    # Its two arms disagree 4.1x on byte-identical configs (137.9s vs 58.1s realized), far outside the
+    # 1.39x same-config pod-to-pod noise floor. The median of the two is kept rather than the pooled
+    # default -- it is at least measured on this class -- but treat it as provisional until replicates
+    # agree. This is the one class whose own variance exceeds the error the table is correcting.
+    "RTX Pro 6000": 71.6,
 }
 # Unmeasured classes take the pooled median across the whole campaign rather than zero: charging no
-# floor at all is the failure this table exists to fix, and it under-quotes by 3-4x. A class here is
+# wall at all is the failure this table exists to fix, and it under-quotes by 3-4x. A class here is
 # quoted low, so add a measured entry above once a class has replicates that agree.
-#
-# RTX Pro 6000 is deliberately NOT in the table despite having two arms: on byte-identical configs it
-# realized 137.9s and 58.1s (residuals 105.3s and 25.5s, 4.1x apart, far outside the noise floor). One
-# of those is not a floor, and picking either would be fitting a single sample -- so the class waits
-# for replicates that agree rather than getting a confident wrong constant.
-_DEFAULT_STEP_FLOOR_S = 46.5
+_DEFAULT_STEP_FLOOR_S = 52.5
 
 
-def step_floor_seconds(name: str) -> float:
-    """Fixed per-step wall cost of class ``name`` that no amount of FLOPs shortens."""
-    return _STEP_FLOOR_S.get(name, _DEFAULT_STEP_FLOOR_S)
+def step_floor_seconds(name: str, completions: int = 0) -> float:
+    """Wall time of one rollout step on ``name`` that no amount of FLOPs shortens.
+
+    ``const_card + slope * completions``. The constant is engine entry/exit and the actor->rollout
+    weight sync; the slope is per-sequence rollout work. Neither is arithmetic, so neither shrinks on
+    a faster card, and (see ``providers.allocator``) neither shards across more of them.
+    """
+    return _STEP_FLOOR_S.get(name, _DEFAULT_STEP_FLOOR_S) + (
+        ROLLOUT_SECONDS_PER_COMPLETION * max(0, completions)
+    )
 
 
 def gpu_hourly_usd(
@@ -332,8 +387,20 @@ def download_weight_gb(model_id: str, revision: str = "") -> float:
     return total_params_b(model_id, revision) * 2.0
 
 
-# ~1s mid-range default across grader types (regex ~0.01s to LLM judge ~3s).
-AVG_REWARD_SECONDS_PER_COMPLETION = 1.0
+# Per-completion GRADING latency only -- the wall spent inside the env's scorer, nothing else.
+#
+# This was 1.0s, chosen as a mid-range across grader types (regex ~0.01s to LLM judge ~3s). That
+# value was doing a second, undeclared job: it was the only per-completion term in the model, so it
+# also stood in for rollout cost, which is ~0.81s/completion (see ROLLOUT_SECONDS_PER_COMPLETION).
+# The two are now separate, and leaving this at 1.0 would charge that rollout cost twice -- it
+# over-quotes the 56-arm corpus at geo-bias 1.46x, with only 28/56 arms in band.
+#
+# 0.05s is a grading-only default. It is NOT the corpus minimum: every env measured here is a fast
+# programmatic grader (~0.0003s), and fitting to that would publish "grading is free" and badly
+# under-quote the llm-judge envs the corpus contains none of. It sits two orders above the measured
+# programmatic graders and two below a judge, so it is wrong in the safe direction for both, and
+# envs that care measure their own (engine/reward_profile.py) and pass it explicitly.
+AVG_REWARD_SECONDS_PER_COMPLETION = 0.05
 
 
 def reward_seconds_per_completion(override: float | None = None) -> float:
