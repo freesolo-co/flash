@@ -789,45 +789,38 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
 # fixed 600s deadline and was killed while healthy and still uploading, turning a run that had
 # already trained AND published into `failed`. see VERL-131.
 #
-# the honest question is not "has this taken too long" but "is it still getting anywhere". the
-# upload's own keepalive daemon (liveness_heartbeat(keepalive=True)) emits a REAL heartbeat every
-# tick while bytes move, and every real heartbeat stamps _HB_LAST_PROGRESS_TS -- so a drain that is
-# advancing is observable from here without threading a progress callback through the watchers.
-_DRAIN_NO_PROGRESS_S = 900.0
-# absolute ceiling so a pathological drain cannot hold the worker open forever. generous because
-# exceeding it is a real hang, not a big upload: at 900s of TOTAL silence we already give up.
-_DRAIN_MAX_S = 14400.0
+# the drain needs no invented deadline of its own, because the upload it is waiting on is already
+# bounded from the inside: `upload_resume_checkpoint` runs a finite retry budget
+# (_CKPT_UPLOAD_RETRIES) and re-checks `_require_hf_deadline_allowance()` before every attempt, so a
+# wedged upload surfaces as an EXCEPTION against the run wall deadline rather than hanging forever.
+# the only correct job here is to not impose a SECOND, tighter deadline on top of that one.
+#
+# FLASH_RUN_DEADLINE_AT is the canonical ceiling for everything this worker does. honoring it (and
+# nothing else) means a drain can never outlive the run it belongs to, and can never be killed while
+# the run still has time left to finish it.
+_DRAIN_POLL_S = 5.0
+# only used when the worker has no wall deadline configured (local runs, tests). generous: at this
+# point the upload's own retry budget has long since been the real bound.
+_DRAIN_NO_DEADLINE_MAX_S = 14400.0
 
 
-def join_while_draining(
-    thread: threading.Thread,
-    what: str,
-    *,
-    no_progress_s: float = _DRAIN_NO_PROGRESS_S,
-    max_s: float = _DRAIN_MAX_S,
-) -> None:
-    """Wait for ``thread`` to finish draining, bounded by LACK OF PROGRESS rather than wall clock.
+def join_while_draining(thread: threading.Thread, what: str) -> None:
+    """Wait for ``thread`` to finish publishing, bounded only by the run's own wall deadline.
 
-    Raises only when the drain is genuinely stuck: no heartbeat progress for ``no_progress_s``, or
-    ``max_s`` total. A drain that keeps reporting progress is allowed to finish however long it
-    takes, because killing it discards work that has already succeeded.
+    A drain that still has run budget left is allowed to finish however long it takes, because
+    killing it discards work that has already succeeded (VERL-131). It is cut off only when the run
+    itself is out of time, at which point every other worker path would raise too.
     """
     started = time.monotonic()
-    # baseline from NOW, not from the last stamp: a drain that begins after a quiet stretch must get
-    # its own full no-progress window rather than inheriting an already-expired one.
-    last_seen_progress = float(getattr(_w, "_HB_LAST_PROGRESS_TS", 0.0) or 0.0)
-    last_advance = time.monotonic()
     while True:
-        thread.join(timeout=5.0)
+        thread.join(timeout=_DRAIN_POLL_S)
         if not thread.is_alive():
             return
-        now = time.monotonic()
-        current = float(getattr(_w, "_HB_LAST_PROGRESS_TS", 0.0) or 0.0)
-        if current > last_seen_progress:
-            last_seen_progress, last_advance = current, now
-        if now - last_advance > no_progress_s:
-            raise RuntimeError(
-                f"{what} made no progress for {no_progress_s:.0f}s while draining; giving up"
-            )
-        if now - started > max_s:
-            raise RuntimeError(f"{what} did not finish draining within {max_s:.0f}s")
+        remaining = _w._remaining_worker_wall_seconds()
+        if remaining is None:
+            # no deadline configured: fall back to an absolute ceiling so a hang in a local run
+            # cannot wedge the process forever.
+            if time.monotonic() - started > _DRAIN_NO_DEADLINE_MAX_S:
+                raise RuntimeError(f"{what} did not finish within {_DRAIN_NO_DEADLINE_MAX_S:.0f}s")
+        elif remaining <= 0:
+            raise RuntimeError(f"{what} was still draining when the run wall deadline expired")
