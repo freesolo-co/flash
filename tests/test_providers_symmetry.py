@@ -358,3 +358,52 @@ def test_runpod_destroy_rejects_unconfirmed_delete(monkeypatch):
 
     with pytest.raises(rp_api.RunpodApiError, match="unconfirmed"):
         get_provider("runpod").destroy(handle)
+
+
+@pytest.mark.parametrize(
+    ("provider", "env_var"),
+    [("runpod", "RUNPOD_API_KEY"), ("lambda", "LAMBDA_API_KEY"), ("vast", "VAST_API_KEY")],
+)
+def test_the_key_sent_on_the_wire_is_the_key_preflight_accepted(monkeypatch, provider, env_var):
+    """A padded provider key must not pass preflight and then go out unstripped.
+
+    ``load_provider_key`` strips, so ``is_configured()`` and the startup preflight accept a key
+    carrying a stray newline from an env file. The outbound REST client used to re-read
+    ``os.environ`` raw, so the request went out as ``Authorization: Bearer <key>\\n`` -- a
+    Lambda-only or Vast-only plane reported a clean preflight while every capacity lookup and
+    allocation was rejected, with nothing pointing at the credential.
+
+    Asserted on the ``Authorization`` HEADER, not on ``api_key()``: the header is what the
+    provider sees, and it is the only place the two halves can be observed disagreeing.
+    """
+    import urllib.request
+
+    from flash.providers._auth import load_provider_key
+    from flash.providers._http import RestClient
+
+    padded = "\n  key-with-padding  \n"
+    monkeypatch.setenv(env_var, padded)
+    assert load_provider_key(env_var) == "key-with-padding"  # what preflight judges
+
+    client = RestClient(env_var=env_var, error_cls=RuntimeError, base_url="https://api.invalid")
+    seen: dict[str, str] = {}
+
+    class _Resp:
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _capture(req, timeout=None):
+        seen.update(req.headers)
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _capture)
+    client.request("/whatever")
+
+    auth = seen.get("Authorization") or seen.get("Authorization".title())
+    assert auth == "Bearer key-with-padding", f"padded credential reached the wire: {auth!r}"

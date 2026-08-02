@@ -32,6 +32,7 @@ from flash.schema import (
     spec_from_file,
     train_schema_metadata,
 )
+from flash.serve.urls import is_freesolo_hosted_url
 
 from . import render
 from ._tty import TtyStatusLine
@@ -93,7 +94,33 @@ def cmd_version(args) -> int:
     return 0
 
 
+def _verifies_against_freesolo(api_url: str, freesolo_url: str | None) -> bool:
+    """Whether ``flash login`` should check this key against the hosted Freesolo backend.
+
+    The two URLs name different services: ``--api-url`` is the control plane that runs training,
+    ``--freesolo-url`` is the backend that issues and verifies user keys. On a SELF-HOSTED plane
+    the second one does not exist -- the plane authenticates FREESOLO_INTERNAL_KEY itself -- so
+    verifying against ``https://api.freesolo.co`` sends the operator's plane-root credential to a
+    service they have no relationship with, which then rejects it. The documented quickstart could
+    not complete, and the key leaked on the way to failing.
+
+    Keyed off the control-plane URL because that is the only standalone signal the CLIENT has:
+    FLASH_STANDALONE is set on the server, and the client cannot see it before it has authenticated.
+    An operator pointing at their own plane is exactly the case that must not phone home. An
+    explicit ``--freesolo-url`` still wins, so a self-hoster running a Freesolo-compatible auth
+    backend of their own keeps verification.
+
+    False routes verification to the plane itself (see ``_verify_key_against_plane``); it never
+    means "accept the key unchecked".
+    """
+    if freesolo_url:
+        return True
+    return is_freesolo_hosted_url(api_url)
+
+
 def cmd_login(args) -> int:
+    api_url = args.api_url or load_credentials()[0]
+    identity: dict | None = None
     try:
         env_api_key = os.environ.get("FREESOLO_API_KEY")
         api_key = args.api_key or env_api_key
@@ -102,13 +129,18 @@ def cmd_login(args) -> int:
                 "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
                 "Create or copy a key at https://freesolo.co/sign-in."
             )
-        verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
+        freesolo_url = getattr(args, "freesolo_url", None)
+        if _verifies_against_freesolo(api_url, freesolo_url):
+            verify_freesolo_key(api_key, base_url=freesolo_url)
+        else:
+            # a self-hosted plane is its own key issuer, so it is the only service that CAN
+            # verify this key -- and the only one allowed to see it.
+            identity = _verify_key_against_plane(api_key, api_url)
     except ClientError as exc:
         if getattr(args, "debug", False):
             raise
         print(render.login_failed(str(exc)), file=sys.stderr)
         return 1
-    api_url = args.api_url or load_credentials()[0]
     save_credentials(api_key, api_url=api_url)
     if args.api_key and env_api_key and env_api_key != args.api_key:
         msg = (
@@ -120,11 +152,51 @@ def cmd_login(args) -> int:
     # have to run a second command. Never echo the key itself. The identity lookup is
     # best-effort: the key is already verified and stored, so a momentary control-plane
     # hiccup must not turn a successful login into a failure.
-    print(render.login_ok(_identity_or_none(api_key, api_url)))
+    print(
+        render.login_ok(identity if identity is not None else _identity_or_none(api_key, api_url))
+    )
     return 0
 
 
 _IDENTITY_LOOKUP_TIMEOUT_S = 5.0
+# Verification is MANDATORY, so it gets a normal request budget rather than the 5s the optional
+# identity card uses: abandoning a slow lookup is harmless when the card is decoration, but here it
+# would reject a valid key. Matches the hosted path's 30s (`verify_freesolo_key`) so the same
+# decision gets the same budget whoever answers it -- a self-hosted plane that is cold-starting,
+# behind a slow proxy, or under database contention is exactly the documented quickstart case.
+_LOGIN_VERIFY_TIMEOUT_S = 30.0
+
+
+def _verify_key_against_plane(api_key: str, api_url: str) -> dict:
+    """Verify a key against a self-hosted plane by calling its authenticated identity endpoint.
+
+    The self-hosted path cannot use `verify_freesolo_key` (that would leak the plane-root
+    credential to a third party), but it must not simply SKIP verification either: the key is
+    saved before the identity card is fetched, and `_identity_or_none` deliberately swallows
+    errors so a control-plane hiccup can't fail an already-verified login. Skipping therefore made
+    `flash login --api-key <typo>` exit 0 and store an unusable key, with the real 401 surfacing
+    later on an unrelated command.
+
+    `/v1/me` is the right probe: it is behind `require_key`, and its response is the identity card
+    login already prints, so one round trip both authenticates and fills the card.
+
+    Reaching the endpoint is NOT by itself proof of acceptance, though. `_request` turns an empty
+    2xx body into `{}`, so a misrouted `--api-url` -- a proxy, a health-check responder, an older
+    service without this route -- returns success having never consulted `require_key`. Trusting
+    that would persist an arbitrary key and print "logged in", which is the same mistake this
+    function exists to correct, one layer down. So require the shape the real endpoint always
+    returns: `kind` and `key_prefix` are unconditional in `flash/server/routes/meta.py`, while
+    `email` is not, making those two the honest contract to assert.
+    """
+    identity = ApiClient(api_url, api_key, timeout=_LOGIN_VERIFY_TIMEOUT_S).me()
+    if not isinstance(identity, dict) or not identity.get("kind") or not identity.get("key_prefix"):
+        raise ClientError(
+            f"{api_url} answered the login check but did not return a Flash identity, so the key "
+            "could not be verified and was not saved. Check that --api-url points at your Flash "
+            'control plane (its /v1/health should report "service": "flash") rather than at a '
+            "proxy or another service."
+        )
+    return identity
 
 
 def _identity_or_none(api_key: str, api_url: str) -> dict | None:
