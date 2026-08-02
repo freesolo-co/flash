@@ -517,19 +517,30 @@ def test_b200_compute_is_h200_class_and_never_cheaper_for_grpo(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# multi-gpu: total scales linearly with gpu_count
+# multi-gpu: n cards bill n rates against a SHORTER wall
 # ---------------------------------------------------------------------------
 
 
-def test_total_usd_scales_linearly_with_gpu_count():
+def test_second_card_bills_two_rates_against_a_shorter_wall():
+    """Two cards bill two per-card rates, but not for the same duration as one card.
+
+    This test previously asserted ``dual.train_seconds == single.train_seconds`` and a flat 2x on
+    total_usd. That encoded a defect as the contract: the wall really was card-invariant, so the
+    quote charged a second card for time it modelled as buying nothing, and one card always won a
+    job-cost ranking by construction. Sharding halves only the gpu-bound part of a step (the
+    teacher/reward/routing floor is paid on every card), so the honest expectation is 1x < total <
+    2x -- strictly more than one card, strictly less than naive linear.
+    """
     single = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150))
     dual = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=2))
     assert single.gpu_count == 1
     assert dual.gpu_count == 2
-    # per-card rate and training time are unchanged; only the card-count multiplier moves the total.
+    # the per-card rate is what stays fixed; the wall is what a second card is supposed to move.
     assert dual.gpu_hourly_usd == single.gpu_hourly_usd
-    assert dual.train_seconds == pytest.approx(single.train_seconds)
-    assert dual.total_usd == pytest.approx(2 * single.total_usd)
+    assert dual.train_seconds < single.train_seconds
+    assert single.total_usd < dual.total_usd < 2 * single.total_usd
+    # the whole discrepancy is the wall: cost is still exactly rate x time x cards.
+    assert dual.total_usd == pytest.approx(dual.train_seconds / 3600.0 * dual.gpu_hourly_usd * 2)
 
 
 def test_gpu_count_defaults_and_renders_in_breakdown():

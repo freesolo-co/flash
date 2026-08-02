@@ -10,10 +10,12 @@ from flash.cost.analytical import (
     DEFAULT_WALL_CAP_S,
     SFT_RUN_STARTUP_S,
     VLLM_INIT_S,
+    multi_card_speedup,
     seconds_per_step,
     select_gpu,
     setup_seconds,
     sft_run_startup_seconds,
+    step_seconds_split,
 )
 
 SMALL = "Qwen/Qwen3.5-0.8B"
@@ -447,3 +449,94 @@ def test_sft_run_startup_reaches_the_token_budgeted_branch(monkeypatch):
     before = estimate_cost(cfg).train_seconds
     monkeypatch.setattr(analytical, "SFT_RUN_STARTUP_S", analytical.SFT_RUN_STARTUP_S + 100.0)
     assert estimate_cost(cfg).train_seconds == pytest.approx(before + 100.0)
+
+
+def test_extra_cards_shorten_the_quoted_wall():
+    """A billed card that buys no modelled time is a card charged for nothing.
+
+    total_usd multiplies by gpu_count, so if the wall were card-invariant the quote would rank one
+    card cheapest by construction rather than by any measurement. Regression for the state before
+    this change, where wall_s was bit-identical at 1/2/4 cards while cost scaled exactly 4.00x.
+    """
+    for method in ("sft", "grpo", "opd"):
+        walls = [
+            estimate_cost(RunConfig(SMALL, method, 32, gpu_count=n)).wall_clock_seconds
+            for n in (1, 2, 4)
+        ]
+        assert walls[1] < walls[0], f"{method}: a 2nd card must shorten the modelled wall"
+        assert walls[2] < walls[1], f"{method}: a 4th card must shorten the modelled wall"
+
+
+def test_extra_cards_shorten_the_token_budgeted_wall():
+    """train_tokens takes the other raw_train branch; sharding must reach it too."""
+    tokens = 2_000_000
+    one = estimate_cost(
+        RunConfig(SMALL, "sft", 32, gpu_count=1, train_tokens=tokens)
+    ).wall_clock_seconds
+    two = estimate_cost(
+        RunConfig(SMALL, "sft", 32, gpu_count=2, train_tokens=tokens)
+    ).wall_clock_seconds
+    assert two < one
+
+
+def test_only_the_gpu_bound_half_of_a_step_shards():
+    """The non-shardable floor (teacher waits, reward grading, MoE routing) is paid on every card.
+
+    Pins the exact split rather than just "smaller", so a change that sharded the whole step -- and
+    would model n cards as n times faster -- fails here instead of quietly overcrediting wide combos.
+    """
+    cfg = RunConfig(MID, "grpo", 32)
+    for gpu in ("RTX 4090", "A100 SXM"):
+        gpu_bound, fixed = step_seconds_split(cfg, gpu)
+        assert fixed > 0, "this config must have a non-shardable half for the test to mean anything"
+        for n in (2, 4):
+            expected = gpu_bound / multi_card_speedup(n, gpu) + fixed
+            assert seconds_per_step(cfg, gpu, n) == pytest.approx(expected)
+            # the floor bounds it from below no matter how many cards are added
+            assert seconds_per_step(cfg, gpu, n) > fixed
+
+
+def test_ranker_and_quote_price_a_combination_identically():
+    """The allocator picks the combination and the quote bills it; they must agree on its wall.
+
+    They disagreed by the full speedup factor before this change (ranker 1.41x of one card for a
+    2-card 4090, quote 2.00x with an identical wall), because only the ranker applied the speedup.
+    Asserting through the allocator's own ranker is what makes this catch a future divergence: a
+    test that re-derived the arithmetic locally would pass while the two drifted apart.
+
+    Both sides are anchored to SHIPPED output, not to a locally recomputed formula: the ranker end
+    is the allocator's real closure, and the quote end is estimate_cost's own train_seconds. Pinning
+    only ``seconds_per_step`` on both sides would leave the quote free to stop calling it (exactly
+    the defect being fixed) while this still passed.
+    """
+    from flash.providers.allocator import _step_cost_ranker
+    from flash.providers.base import Candidate, run_config_for_ranking
+
+    model, method = MID, "sft"
+    ranker = _step_cost_ranker(model, method, train={}, thinking=False)
+    assert ranker is not None, "ranker must be available or this test proves nothing"
+
+    config = run_config_for_ranking(model, method, train={}, thinking=False)
+    for gpu, hourly, vram in (("RTX 4090", 0.69, 24), ("A100 SXM", 1.89, 80)):
+        for n in (1, 2, 4):
+            candidate = Candidate(
+                provider="probe", gpu=gpu, hourly_usd=hourly, vram_gb=vram, gpu_count=n
+            )
+            quoted = seconds_per_step(config, gpu, n) * candidate.total_hourly_usd / 3600.0
+            assert ranker(candidate) == pytest.approx(quoted)
+
+    # and the QUOTE has to be on that same curve. estimate_cost is the shipped surface; comparing
+    # its realized per-step wall against the shared helper is what fails if the quote ever stops
+    # calling it, which the ranker-side assertion above cannot see on its own.
+    steps = 64
+    single = estimate_cost(RunConfig(MID, method, steps, gpu_count=1))
+    for n in (2, 4):
+        e = estimate_cost(RunConfig(MID, method, steps, gpu_count=n))
+        assert e.gpu == single.gpu, "same class, or the deltas below compare different hardware"
+        # estimate_cost REDEFINES seconds_per_step as raw_train/steps, so it also carries the
+        # per-run compile/startup/save blocks -- which do not shard. those are identical across
+        # card counts, so they cancel in a DIFFERENCE while corrupting a ratio.
+        got = single.train_seconds - e.train_seconds
+        want = steps * (seconds_per_step(config, e.gpu, 1) - seconds_per_step(config, e.gpu, n))
+        assert got == pytest.approx(want, rel=1e-6)
+        assert got > 0, "adding cards must remove time from the quoted wall"

@@ -235,6 +235,17 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
     divide still die in NCCL because Ray is never told the container's GPU count. Neither is a cost
     defect, but together they mean this curve should be read as an assumption, not a measurement.
 
+    Both are still live as of this change: ``ulysses_sequence_parallel_size`` is set to the raw card
+    count with no divisibility guard (sft_train.py:1292/1553, rl_train.py:391, opd_train.py:
+    2501/2806), and ``ray_kwargs.ray_init`` passes num_cpus but never num_gpus (rl_train.py:454,
+    opd_train.py:1622). So the 2-card CONSTANTS are measured (one fsdp benchmark per interconnect)
+    while the end-to-end CURVE is not, and this docstring is the place that says so. Fixing either
+    defect is trainer work, not cost work.
+
+    What this module can and does guarantee meanwhile is SELF-CONSISTENCY: the ranker that picks a
+    combination and the quote that prices it now share one call (``seconds_per_step``), so whatever
+    this curve is worth, both halves of the cost model are worth exactly the same.
+
     Clamped to be non-decreasing in ``gpu_count``. Below a scaling factor of ~0.72 the raw
     geometric curve turns back down (at 0.71: 3 cards 1.512x but 4 cards 1.432x), which would model
     a wider combination as SLOWER than a narrower one and let the allocator reject cards that do
@@ -394,10 +405,19 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     )
 
 
-def seconds_per_step(config: RunConfig, gpu: str) -> float:
-    """Steady-state wall time for one optimizer step on ``gpu``."""
+def seconds_per_step(config: RunConfig, gpu: str, gpu_count: int = 1) -> float:
+    """Steady-state wall time for one optimizer step on ``gpu_count`` cards of class ``gpu``.
+
+    Sharding divides only the gpu-bound half (see ``step_seconds_split``); the non-shardable floor
+    is paid whole on every card count. This is the SAME arithmetic the allocator ranks combinations
+    with (``_step_cost_ranker``), and it has to be, because the two answer one question: the ranker
+    picks the combination and this prices it. Before they were shared, the quote applied no speedup
+    at all while still billing every card, so a 2-card 4090 run was ranked at 1.41x of one card and
+    then quoted at 2.00x with an identical wall -- the model contradicting itself by the full
+    speedup factor.
+    """
     gpu_bound, fixed = step_seconds_split(config, gpu)
-    return gpu_bound + fixed
+    return gpu_bound / multi_card_speedup(gpu_count, gpu) + fixed
 
 
 def step_cost_key(config: RunConfig):
@@ -434,8 +454,14 @@ def step_cost_key(config: RunConfig):
     return cost_key
 
 
-def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> float:
-    """SFT steady-state wall time for an actual token count on ``gpu``."""
+def sft_seconds_for_tokens(
+    config: RunConfig, gpu: str, train_tokens: float, gpu_count: int = 1
+) -> float:
+    """SFT steady-state wall time for an actual token count on ``gpu_count`` cards of ``gpu``.
+
+    Unlike a step, this is pure arithmetic with no non-shardable floor in it, so the WHOLE quantity
+    divides by the multi-card speedup rather than half of it.
+    """
     n = config.normalized()
     # MoE prices on total params at a reduced MFU (see seconds_per_step); dense keeps active.
     moe = _is_moe(n.model_id)
@@ -443,7 +469,7 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
     peak = effective_train_tflops(gpu) * 1e12
     flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * train_tokens
-    return flops / (peak * mfu)
+    return flops / (peak * mfu) / multi_card_speedup(gpu_count, gpu)
 
 
 def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str, int]:
@@ -586,7 +612,11 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         )
 
     setup = setup_seconds(config)
-    sps = seconds_per_step(config, gpu)
+    # price the step on the card count actually billed, not on one card. total_usd multiplies by
+    # billed_gpu_count, so quoting a single-card wall here would charge n cards for a run the model
+    # says takes the same time on 1 -- always ranking one card cheapest, by construction rather than
+    # by measurement. the speedup applies to the gpu-bound half only (see seconds_per_step).
+    sps = seconds_per_step(config, gpu, billed_gpu_count)
     required_save_s = required_save_overhead_seconds(config)
     # A one-time kernel/graph compile is paid once on the first step (MoE-only; 0 for dense). It is
     # training GPU time, so it belongs in the (billed) train term, not setup.
@@ -599,7 +629,7 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         raw_train = (
             compile_s
             + startup_s
-            + sft_seconds_for_tokens(config, gpu, config.train_tokens)
+            + sft_seconds_for_tokens(config, gpu, config.train_tokens, billed_gpu_count)
             + required_save_s
         )
     sps = raw_train / config.steps
