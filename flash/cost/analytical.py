@@ -277,10 +277,21 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # mechanism does not exist here. every arm the wall was fitted on is a rollout arm, so charging
         # it would extrapolate ~50s/step onto a loop it was never measured against.
         #
-        # this exclusion is reasoned from the mechanism, NOT measured: both sft calibration arms died
-        # on an unrelated liger/lora grad-zero defect, so there is no sft timing to check it against.
-        # sft is left on the pre-existing compute-only quote it always had -- this change cannot make
-        # sft worse, but it does not verify it either. measure sft walls before assuming zero is right.
+        # 11 sft arms have since been measured (2..256 steps, RTX 4090 and H100, 0.8B and 4B) and
+        # they do NOT contradict the exclusion above: there is no rollout in an sft loop and nothing
+        # in the timings looks like one. what they DO show is that a separate fixed block exists.
+        # train_wall wraps run_verl_training and the watcher.stop() upload drain (sft_train.py
+        # 1450-1478) while setup_seconds is stamped at :1203, BEFORE that subprocess launches -- so
+        # verl startup, model load, lora wrap and fsdp init land inside train_wall and are quoted
+        # here at zero.
+        #
+        # that block is deliberately NOT added, because its size is not measured. fitting
+        # wall = fixed + slope*steps looked convincing (two families agreeing with the quote below to
+        # within 5%) and did not survive leave-one-out: dropping one of five 4090 arms moved the
+        # slope 1.021 -> 1.992 s/step and the intercept 70.9s -> 26.6s. the data is non-monotonic in
+        # steps -- 2 and 32 steps both took 96.2s, 128 steps took MORE wall than 256 -- so pod
+        # variance currently exceeds the step-count signal. replicates are needed before any
+        # coefficient here changes. the underquote is real; its magnitude is not yet known.
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
