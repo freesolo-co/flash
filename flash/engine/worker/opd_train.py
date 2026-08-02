@@ -98,6 +98,17 @@ _TEXT_TEACHER_FLUSH_WAIT_S = 0.1
 _TEXT_TEACHER_SHUTDOWN_WAIT_S = 5.0
 _TEXT_TEACHER_REQUEST_BACKLOG = 64
 
+# opd supervises the teacher's distribution, not a task reward, so every rollout scores zero. the
+# score is unreachable either way: use_task_rewards=false makes verl zero the whole policy loss
+# (distillation/losses.py:211), so nothing a scorer returns can enter the gradient. this exists
+# only to keep the reward loop out of its builtin data_source registry -- see the call site.
+_OPD_ZERO_REWARD_SOURCE = '''"""flash opd reward shim (generated). opd carries no task reward."""
+
+
+def compute_score(data_source, solution_str, ground_truth, extra_info=None):
+    return 0.0
+'''
+
 
 def _align_granularity(groups, student_tokens) -> float:
     """mean student-tokens-per-group: the alignment-health signal coverage cannot provide.
@@ -1456,6 +1467,7 @@ _REQUIRED_OVERRIDE_KEYS = (
     "bridge_url",
     "bridge_token",
     "kl_penalty_coef",
+    "reward_path",
 )
 
 
@@ -1590,6 +1602,15 @@ def build_opd_overrides(config: dict) -> list[str]:
         f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(config['n_gpus_per_node'])}",
         "critic.enable=false",
         "reward.reward_model.enable=false",
+        # disabling the reward MODEL does not disable reward SCORING. with no custom function the
+        # loop still calls the default rule-based scorer, which dispatches on data_source and raises
+        # NotImplementedError for "flash_opd" (VERL-153). point it at the generated zero function.
+        # both key forms are required: the legacy top-level key is migrated in the main process but
+        # is not visible to the RewardLoopWorker actor, which reads reward.custom_reward_function.
+        f"custom_reward_function.path={_hydra_val(config['reward_path'])}",
+        "custom_reward_function.name=compute_score",
+        f"reward.custom_reward_function.path={_hydra_val(config['reward_path'])}",
+        "reward.custom_reward_function.name=compute_score",
         "distillation._target_=flash_opd_plugin.FlashRemoteDistillationConfig",
         "distillation.enabled=true",
         "distillation.n_gpus_per_node=0",
@@ -2390,6 +2411,15 @@ def run_opd_train(spec=None) -> None:
     entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
     with open(entry_path, "w", encoding="utf-8") as file:
         file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
+    # opd carries no task reward: use_task_rewards=false makes verl discard the policy loss the
+    # score would feed. the reward loop still runs regardless, and with no custom function it falls
+    # through to the default rule-based scorer, which dispatches on data_source against a builtin
+    # registry that has never heard of "flash_opd" and raises NotImplementedError on every rollout
+    # (reward_loop.py:146-155). supply the zero function so the loop takes the custom branch and
+    # never consults that registry.
+    reward_path = os.path.join(shim_dir, "flash_opd_reward.py")
+    with open(reward_path, "w", encoding="utf-8") as file:
+        file.write(_OPD_ZERO_REWARD_SOURCE)
     opd_shim_source = _render_opd_sitecustomize(
         save_at_steps=knobs.save_at_steps,
         total_steps=update_horizon,
@@ -2444,6 +2474,7 @@ def run_opd_train(spec=None) -> None:
             "group_size": knobs.group_size,
             "bridge_url": bridge.url,
             "bridge_token": bridge.token,
+            "reward_path": reward_path,
             "kl_penalty_coef": knobs.kl_coef,
             "temperature": knobs.temperature,
             "top_p": knobs.top_p,
