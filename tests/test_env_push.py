@@ -731,7 +731,12 @@ def test_push_synthesizes_readme_stub_when_absent(monkeypatch, tmp_path):
     assert "# math-env" in files["README.md"]
 
 
-def test_push_single_py_does_not_ship_sibling_helper_modules(monkeypatch, tmp_path):
+def test_push_single_py_does_not_ship_unimported_sibling_modules(monkeypatch, tmp_path):
+    """An exact-file push carries a closure, not the directory it happens to sit in.
+
+    A sibling nothing imports stays local: shipping every neighbour would turn `env push
+    environment.py` into a whole-tree push and carry unrelated scratch files into the archive.
+    """
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "helper.py").write_text("VALUE = 1\n")
@@ -740,6 +745,62 @@ def test_push_single_py_does_not_ship_sibling_helper_modules(monkeypatch, tmp_pa
 
     assert cli.cmd_env_push(_args(env_file)) == 0
     assert "helper.py" not in _members(cap["package_b64"])
+
+
+def test_push_single_py_module_carries_its_own_helper_imports(monkeypatch, tmp_path):
+    """The entrypoint's own imports ship, exactly as its evaluation sidecar's already do.
+
+    The closure walk was seeded only from evaluations.py, so an environment whose entrypoint
+    imported siblings published without them: the push exits 0 and prints an id, and the
+    ModuleNotFoundError surfaces only after a GPU is rented and the worker imports the module.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text(
+        "import config\nfrom utils import load_jsonl\ndef load_environment(**k):\n    return None\n"
+    )
+    (tmp_path / "config.py").write_text("MODEL = 'qwen'\n")
+    (tmp_path / "utils.py").write_text("import data\n\ndef load_jsonl(p): return []\n")
+    # reached only through utils.py, so it proves the entrypoint walk keeps following
+    (tmp_path / "data.py").write_text("ROWS = []\n")
+    (tmp_path / "unrelated.py").write_text("VALUE = 'do not publish'\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "config.py" in files
+    assert "utils.py" in files
+    assert "data.py" in files
+    assert "unrelated.py" not in files
+
+
+def test_push_single_py_module_carries_helpers_named_by_a_relative_import(monkeypatch, tmp_path):
+    """`from . import config` names a sibling too, under the package-relative spelling.
+
+    An entrypoint authored to work both as a package member and as a loose module writes the
+    relative form first and falls back to the absolute one. Reading only absolute imports left
+    the helper unpackaged whenever the relative spelling came first.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text(
+        "try:\n"
+        "    from . import config\n"
+        "    from .utils import load_jsonl\n"
+        "except ImportError:\n"
+        "    import config\n"
+        "    from utils import load_jsonl\n"
+        "def load_environment(**k):\n"
+        "    return None\n"
+    )
+    (tmp_path / "config.py").write_text("MODEL = 'qwen'\n")
+    (tmp_path / "utils.py").write_text("def load_jsonl(p): return []\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "config.py" in files
+    assert "utils.py" in files
 
 
 def test_push_alternate_py_keeps_packaged_entrypoint(monkeypatch, tmp_path):
