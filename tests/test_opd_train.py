@@ -4529,6 +4529,7 @@ def _config(**overrides):
         "bridge_url": "http://127.0.0.1:1234",
         "bridge_token": "token",
         "kl_penalty_coef": 0.5,
+        "reward_path": "/w/shim/flash_opd_reward.py",
     }
     config.update(overrides)
     return config
@@ -4748,6 +4749,47 @@ def test_overrides_bound_transfer_queue_storage_to_one_unit():
     # the run forever before a gpu is touched. flash's trainer is single-node: one unit.
     overrides = dict(value.split("=", 1) for value in build_opd_overrides(_config()))
     assert overrides["transfer_queue.backend.SimpleStorage.num_data_storage_units"] == "1"
+
+
+def test_overrides_route_reward_scoring_away_from_verls_data_source_registry():
+    """OPD must configure a custom reward function even though it carries no task reward.
+
+    `reward.reward_model.enable=false` disables the reward MODEL, not reward SCORING. verl's
+    RewardLoopWorker (reward_loop.py:146-155) branches on custom_reward_function.path first and
+    only falls through to the default rule-based scorer when it is None -- and that scorer
+    dispatches on data_source against a builtin registry that has no "flash_opd" entry, so it
+    raises NotImplementedError on every rollout and kills the run at step 0 (VERL-153).
+
+    Both key forms are required. The legacy top-level key is migrated onto reward.* in the main
+    process, but the RewardLoopWorker actor reads its own config copy and never sees that
+    migration, so emitting only one leaves the actor on the failing branch.
+    """
+    overrides = dict(value.split("=", 1) for value in build_opd_overrides(_config()))
+
+    for key in ("custom_reward_function.path", "reward.custom_reward_function.path"):
+        assert overrides[key] == "/w/shim/flash_opd_reward.py"
+    for key in ("custom_reward_function.name", "reward.custom_reward_function.name"):
+        assert overrides[key] == "compute_score"
+
+    # the branch this fix depends on: the reward model stays off, so a missing custom path would
+    # land on the default scorer rather than on some other safe fallback.
+    assert overrides["reward.reward_model.enable"] == "false"
+
+
+def test_generated_opd_reward_shim_scores_every_rollout_zero():
+    """The generated shim must be importable and return 0.0, matching use_task_rewards=false.
+
+    OPD's gradient comes from the teacher distribution; a nonzero task reward here would silently
+    add signal the objective never asked for.
+    """
+    namespace: dict = {}
+    # exec, not import: the shim only exists on disk inside a live workdir, and the constant is
+    # what actually ships to the worker.
+    exec(opd_train._OPD_ZERO_REWARD_SOURCE, namespace)
+
+    compute_score = namespace["compute_score"]
+    assert compute_score("flash_opd", "any completion", "") == 0.0
+    assert compute_score("flash_opd", "", "gt", {"index": 3}) == 0.0
 
 
 def test_opd_rollout_reserves_the_fp8_kv_cache_its_sizing_assumes():
