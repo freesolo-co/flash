@@ -436,3 +436,58 @@ def test_hardware_choice_is_not_a_restatement_of_the_hourly_rate():
     # cheaper per hour, dearer per job -- so the two orderings genuinely disagree here.
     assert rates["RTX 4090"] < rates["RTX 5090"]
     assert dollars["RTX 5090"] < dollars["RTX 4090"]
+
+
+def test_rollout_slope_is_per_completion_not_per_generated_token():
+    """Raising ``max_completion_tokens`` must not scale the rollout wall, because it is a CEILING.
+
+    The slope charges 0.81s per completion and ignores ``completion_len`` entirely, which reads like
+    an omission: sampling and detokenization are per-token work, so a 512-token cap "should" cost 4x
+    a 128-token one. The corpus says otherwise. Holding card AND completion count fixed so cap is the
+    only variable, on H100 at 32 completions: cap 128 -> 79.1s (n=17), cap 256 -> 70.3s (n=1), cap
+    512 -> 69.0s (n=2). Quadrupling the cap moved the wall to 0.873x -- slightly DOWN, where a
+    per-token slope predicts ~4x up. Implied per-token cost falls ~6x across that range while implied
+    per-completion cost stays inside the 1.095x per-observation noise floor.
+
+    The mechanism is that generation stops at EOS, so on a short-answer env the cap raises the bound
+    and not the work. Pooled residual is flat across cap for the same reason: 1.027x at 128, 1.027x
+    at 256, 1.063x at 512.
+
+    What this test does NOT establish: that the same holds for an env whose completions SATURATE the
+    cap (thinking traces at the 1536 default). Every corpus arm is short-answer, and the corpus has
+    no generated-token field at all (``gens`` is the completion count on 56/56 rows), so a per-token
+    term cannot be identified here -- fitting one would fit noise. This pins the measured behaviour;
+    a saturating env is the case that would distinguish the two forms and it has not been run.
+    """
+    from flash.cost.analytical import step_seconds_split
+    from flash.cost.types import RunConfig
+
+    def quote(cap: int) -> float:
+        cfg = RunConfig(
+            "Qwen/Qwen3.5-0.8B", "grpo", 1, seq_len=512, completion_len=cap,
+            batch_size=8, group_size=4,
+        )
+        return sum(step_seconds_split(cfg, "H100"))
+
+    base, wide = quote(128), quote(1536)
+    # a 12x cap must not carry a 12x wall. the arithmetic (FLOPs) term may move; the wall may not.
+    assert wide < 1.5 * base, f"cap 128->1536 moved the quote {wide / base:.2f}x; slope went per-token"
+
+    # the wall term itself must be BIT-identical across the two caps: it is the thing that would
+    # have to move for the per-token reading to be right, and it takes no cap argument at all.
+    from flash.cost.analytical import step_seconds_split as _split
+
+    def wall(cap: int) -> float:
+        cfg = RunConfig(
+            "Qwen/Qwen3.5-0.8B", "grpo", 1, seq_len=512, completion_len=cap,
+            batch_size=8, group_size=4,
+        )
+        return _split(cfg, "H100")[1]  # non-shardable half == reward + rollout wall
+
+    assert wall(128) == wall(1536)
+
+    # the slope IS live, so this cannot pass by the wall being constant everywhere: it must still
+    # scale with the COMPLETION count, which is what it actually prices.
+    from flash.cost.facts import step_floor_seconds
+
+    assert step_floor_seconds("H100", 64) > step_floor_seconds("H100", 32)
