@@ -324,7 +324,10 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
        attention heads (``24 % 3 == 0`` passes) and only 4 KV heads, and dies on ``sp=3``. Computing
        both branches across the catalog (every model has 2 or 4 KV heads) leaves legal sp of {1,2,4},
        so a 3-card combination is unusable for EVERY catalog model while the allocator proposes it
-       for all of them.
+       for all of them. Confirmed against the live allocator rather than only from the head counts:
+       sweeping 27B and 35B-A3B over {sft, grpo, opd} x {A100 SXM, H100, A100 PCIe, RTX 5090} at
+       ``max_gpu_count=4``, every grpo and opd shape returned exactly 3 cards. The illegal count is
+       the modal multi-card outcome for the RL methods, not a corner case.
     2. Counts that do divide still die in NCCL, because Ray is never told the container's GPU count
        and both ranks bind device 0.
     3. Multi-card SFT dies before its first step on a fused-CE label shape under Ulysses SP.
