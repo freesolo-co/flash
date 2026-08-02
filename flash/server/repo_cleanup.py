@@ -143,11 +143,11 @@ def repo_cleanup_enabled() -> bool:
     prefixes, impossible (and meaningless) without it — so a plane without the token never schedules
     the loop. This is a credential check, not a knob: there is no on/off env switch.
 
-    Never in standalone mode, for two independent reasons. The sweep only ever deletes inside the
-    hardcoded ``Freesolo-Co/flashrun-*`` allowlist, which a self-hoster's token does not own, so it
-    cannot reclaim anything on a self-hosted plane. And confirming the live set first calls the
-    Freesolo serving registry with the operator's ``FREESOLO_INTERNAL_KEY``, so leaving it on would
-    ship that key to ``serve.freesolo.co`` on every startup to do work that can only fail closed."""
+    Never in standalone mode: the sweep confirms the live set against the Freesolo serving registry
+    before deleting anything, sending the operator's ``FREESOLO_INTERNAL_KEY`` to
+    ``serve.freesolo.co`` on every startup. On a self-hosted plane that registry is not the
+    authority on what is live, so the sweep would ship the plane's root credential to a service the
+    operator does not run in order to answer a question it cannot answer correctly."""
     from flash.server.auth import standalone
 
     return bool((os.environ.get("HF_TOKEN") or "").strip()) and not standalone()

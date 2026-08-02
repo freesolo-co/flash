@@ -1329,15 +1329,12 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
                 _record_cleanup_remote(spec.run_id, status.remote)
         except Exception:
             pass
-    from flash.providers import INSTANCE_PROVIDERS, available_providers, get_provider
+    from flash.providers import available_providers, get_provider
 
-    _avail = available_providers()
-    if "runpod" in _avail:
-        # RunPod gc reaps rN-suffixed endpoints the persisted handle can't name. Skipped on a
-        # plane without a RunPod key: there is nothing of ours in an account we cannot reach.
+    # Sweep every CONFIGURED provider, including RunPod (whose gc also reaps the rN-suffixed
+    # endpoints the persisted handle cannot name). Gating on available_providers() is what makes
+    # this work on a self-hosted plane: an unconfigured provider holds nothing of ours, and
+    # calling it would only raise against a credential the operator never set.
+    for _prov in available_providers():
         with contextlib.suppress(Exception):
-            get_provider("runpod").gc(spec)
-    for _prov in INSTANCE_PROVIDERS:
-        if _prov in _avail:
-            with contextlib.suppress(Exception):
-                get_provider(_prov).gc(spec)
+            get_provider(_prov).gc(spec)

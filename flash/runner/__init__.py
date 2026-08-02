@@ -138,10 +138,11 @@ def _gpu_rate(gpu_type: str, provider: str = "") -> float:
     Never raises: this feeds cost ANNOTATION on an already-finished run, so a provider-registry
     problem must degrade to the flat estimate rather than fail the metrics write.
     """
-    names: list[str] = []
     try:
         from flash.providers import available_providers, get_provider
 
+        # the billing substrate first when known, then any other configured provider that offers
+        # the class -- so a plane without RunPod still prices its runs.
         names = [provider.strip().lower()] if provider.strip() else []
         names += [n for n in available_providers() if n not in names]
     except Exception:
