@@ -245,21 +245,6 @@ def cmd_env_list(args) -> int:
     return 0
 
 
-def _train_overrides(args) -> list[str]:
-    """the --set list with --gpus folded in as the gpu.count override it is sugar for.
-
-    routing the flag through --set rather than mutating the parsed spec keeps ONE precedence order
-    (file < --config < --set) and one validator: gpu.count's 1..8 bound lives in JobSpec, so a bad
-    --gpus is rejected by the same code that rejects a bad [gpu] count. appended last so it wins
-    over a --set of the same key, matching "the more specific flag wins".
-    """
-    overrides = list(args.overrides or [])
-    gpus = getattr(args, "gpus", None)
-    if gpus is not None:
-        overrides.append(f"gpu.count={gpus}")
-    return overrides
-
-
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
@@ -271,7 +256,7 @@ def _cmd_train_cost(args) -> int:
     spec = spec_from_file(
         args.config,
         run_id=None,
-        overrides=_train_overrides(args),
+        overrides=args.overrides,
         extra_configs=args.extra_configs,
         project_required=True,
     )
@@ -380,7 +365,7 @@ def cmd_train(args) -> int:
     spec, authored_train_keys = spec_and_train_keys_from_file(
         args.config,
         run_id=None,
-        overrides=_train_overrides(args),
+        overrides=args.overrides,
         extra_configs=args.extra_configs,
         project_required=True,
     )

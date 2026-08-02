@@ -286,7 +286,9 @@ platform-managed. For controlled experiments, `[gpu] provider` restricts allocat
 provider and `[gpu] type` pins one exact active validated GPU class. Run artifacts are stored in a private environment-scoped repo with content-addressed
 Flash code snapshots. Set `seed` only at the top level; `[worker_env]` cannot override
 `SEED`, `RUN_ID`, `HF_REPO`, or `FLASH_ARM`. Compose or tweak configs without editing files: `--config
-extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).
+extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`). `--gpus N` is
+shorthand for `--set gpu.count=N`; both land in one override list, so repeats resolve left to
+right.
 
 ### 4. Submit
 
@@ -1276,6 +1278,11 @@ count = 4
 # submit names the ones that qualify when it rejects an unpinned multi-gpu spec.
 ```
 
+`flash train configs/grpo.toml --gpus 4` sets the same key from the command line, so a config can
+stay at its authored count while one submit asks for more. The flag is exactly `--set
+gpu.count=4`: the same 1..8 bound rejects a bad value, and the same submit gate still demands a
+provider that rents all n cards on one machine.
+
 GRPO, SFT and OPD all shard across `gpu.count` with no backend key to set: the worker launches one
 rank per card with Ulysses sequence parallelism.
 
@@ -1309,6 +1316,7 @@ flash env delete --project <project-uuid> your-org/my-env -y   # delete a publis
 flash train configs/sft.toml --dry-run # validate the config on the server (no GPU, no charge)
 flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/sft.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
+flash train configs/grpo.toml --gpus 4 # shorthand for --set gpu.count=4 (needs a multi-card provider)
 flash runs status <run-id>                 # state + accrued cost
 flash runs log <run-id>                    # reward/loss trend + worker console/error logs
 flash runs log <run-id> --follow           # stream a live run to completion
