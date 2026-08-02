@@ -325,16 +325,21 @@ def test_the_standalone_owner_row_is_not_reachable_by_presenting_a_token(monkeyp
 
 
 def test_adoption_does_not_write_once_every_run_is_already_owned(monkeypatch, tmp_path):
-    """`ensure_standalone_owner` runs on EVERY authenticated request, so the adoption UPDATE must
-    not fire in the steady state.
+    """`ensure_standalone_owner` runs on EVERY authenticated request, so in the steady state it
+    must issue NO write statements at all.
 
-    `WHERE key_id != ?` cannot use `runs_key_idx` (it plans as `SCAN runs`), and SQLite takes its
-    single write slot for an UPDATE even when it matches zero rows -- so an unconditional adoption
-    would full-scan the run history on every status/logs/submit call and serialize them behind a
-    migration with nothing left to migrate.
+    SQLite has one write slot and takes it for any write regardless of rows touched, so a no-op
+    write still serializes concurrent status/logs/submit behind whichever request is recording a
+    run. Both writes here are affected: the adoption `UPDATE` (which additionally cannot use
+    `runs_key_idx` -- `WHERE key_id != ?` plans as `SCAN runs`) and the `INSERT OR IGNORE` that
+    provisions the owner row.
+
+    Asserted on ALL writes rather than on `UPDATE runs` specifically. An earlier version of this
+    test named the UPDATE, and so kept passing while the unguarded INSERT held the write slot on
+    every single request -- the narrower assertion could not see the second half of its own claim.
 
     Counted at the sqlite layer rather than timed: a timing assertion on a small fixture is noise,
-    and asserting "no UPDATE was issued" is what actually distinguishes the two implementations.
+    and asserting "no write was issued" is what actually distinguishes the implementations.
     """
     from flash.server import db
 
@@ -370,19 +375,60 @@ def test_adoption_does_not_write_once_every_run_is_already_owned(monkeypatch, tm
         "the backlog was not adopted on the first call"
     )
 
-    # steady state: everything is owned, so no further call may issue an UPDATE.
+    # steady state: the owner row exists and every run is owned, so no further call may issue ANY
+    # write -- not the adoption UPDATE, and not the owner-row INSERT either.
     writes.clear()
     for _ in range(3):
         assert db.ensure_standalone_owner()["id"] == owner["id"]
-    assert [w for w in writes if w.upper().startswith("UPDATE RUNS")] == [], (
-        f"adoption re-ran with nothing to adopt: {writes}"
-    )
+    assert writes == [], f"took the write slot with nothing to do: {writes}"
 
     # a foreign row appearing LATER is still adopted -- the guard is a check, not a one-shot latch.
     later = db.ensure_internal_key("another-key")
     db.record_run("run-appearing-later", later["id"])
     assert db.ensure_standalone_owner()["id"] == owner["id"]
     assert db.run_owner("run-appearing-later") == owner["id"]
+
+
+def test_the_owner_row_is_still_provisioned_on_a_cold_database(monkeypatch, tmp_path):
+    """The counterpart to the steady-state check above: the owner INSERT sits behind a read now,
+    so a database that has never seen it must still get one -- and the first call is the only
+    chance, since nothing else provisions that row."""
+    from flash.server import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+
+    writes: list[str] = []
+    real_connect = db._connect
+
+    def tracing_connect():
+        conn = real_connect()
+        conn.set_trace_callback(
+            lambda sql: (
+                writes.append(" ".join(sql.split()))
+                if sql.lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
+                else None
+            )
+        )
+        return conn
+
+    monkeypatch.setattr(db, "_connect", tracing_connect)
+
+    assert db.lookup_key(db._STANDALONE_OWNER_HASH) is None
+    owner = db.ensure_standalone_owner()
+    assert owner["id"]
+    assert owner["key_hash"] == db._STANDALONE_OWNER_HASH
+    assert any(w.upper().startswith("INSERT OR IGNORE INTO API_KEYS") for w in writes), (
+        f"the owner row was never provisioned on a cold db: {writes}"
+    )
+
+    # and a run recorded against it resolves back, so the row is usable and not just present.
+    db.record_run("run-on-a-fresh-plane", owner["id"])
+    assert db.run_owner("run-on-a-fresh-plane") == owner["id"]
+
+    # second call on the now-warm db: same row, and no write at all.
+    writes.clear()
+    assert db.ensure_standalone_owner()["id"] == owner["id"]
+    assert writes == [], f"re-provisioned an owner row that already existed: {writes}"
 
 
 def test_standalone_startup_requires_a_writable_artifact_namespace(monkeypatch) -> None:

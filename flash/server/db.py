@@ -205,27 +205,39 @@ def ensure_standalone_owner() -> dict:
     every run in this store is already the operator's, and there is no second identity that
     reassignment could take a run away from.
 
-    Called on EVERY authenticated request, so the adoption is guarded by a read instead of run
-    unconditionally. `WHERE key_id != ?` cannot use `runs_key_idx` and plans as `SCAN runs`, and
-    an UPDATE takes SQLite's single write slot even when it matches zero rows -- so once the
-    backlog is adopted (the steady state, forever after the first request) the unconditional form
-    would still full-scan the run history and serialize concurrent status/logs/submit behind it.
-    The `< or >` split is a MULTI-INDEX OR over the covering index, which stops at the first
-    foreign row instead of scanning: measured at 50k runs, 1.22 ms/call becomes 0.003 ms/call and
-    a concurrent writer is no longer blocked. Standalone mints no new foreign rows -- `record_run`
-    takes the key_id of the authenticated identity, which is this row -- so the guard cannot miss
-    a run that appears later.
+    Called on EVERY authenticated request, so in the steady state this function must issue NO
+    write statements at all. SQLite has a single write slot and takes it for any write regardless
+    of how many rows the statement touches, so a no-op write still serializes concurrent
+    status/logs/submit behind whichever request happens to be recording a run -- up to the
+    connection's 30s timeout. Measured under WAL, both of the writes below block a second writer
+    exactly as hard as a real INSERT does when they change nothing, so both are guarded by a read:
+
+    - The `INSERT OR IGNORE` is read-guarded rather than fired blind. It is NOT a cost problem
+      (the unique-index probe is cheaper per call than the SELECT that replaces it) -- it is
+      purely that it takes the write slot. Kept as OR IGNORE in the miss path because two threads
+      can both miss the SELECT and race to insert; OR IGNORE makes the loser a no-op instead of
+      an IntegrityError, and the re-read then returns the winner's row.
+    - The adoption `UPDATE` cannot use `runs_key_idx` (`WHERE key_id != ?` plans as `SCAN runs`),
+      so unguarded it would also full-scan the whole run history every request. The `< or >`
+      split is a MULTI-INDEX OR over the covering index that stops at the first foreign row: at
+      50k runs, 1.22 ms/call becomes 0.003 ms/call. Standalone mints no new foreign rows --
+      `record_run` takes the key_id of the authenticated identity, which is this row -- so the
+      guard cannot miss a run that appears later.
     """
     now = time.time()
     with _connect() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (_STANDALONE_OWNER_HASH, "standalone", "operator@localhost", now),
-        )
         row = conn.execute(
             "SELECT * FROM api_keys WHERE key_hash = ?", (_STANDALONE_OWNER_HASH,)
         ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (_STANDALONE_OWNER_HASH, "standalone", "operator@localhost", now),
+            )
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE key_hash = ?", (_STANDALONE_OWNER_HASH,)
+            ).fetchone()
         if row is None:  # pragma: no cover - the row was just inserted
             raise RuntimeError("failed to provision the standalone owner row")
         unowned = conn.execute(
