@@ -123,6 +123,71 @@ def test_effective_train_tflops_is_peak_for_uncapped_classes():
         assert effective_train_tflops(name) == expected
 
 
+def test_step_floor_dominates_a_small_rollout_step():
+    # regression: the model used to quote a grpo step as compute + reward wait and nothing else,
+    # which ran ~0.48x of realized because it priced no per-step floor at all. a small 0.8B step is
+    # ~0.3s of arithmetic against a realized 60-140s, so the floor -- not the flops -- must be what
+    # the quote is made of. asserting the RATIO, so recalibrating any single constant cannot silently
+    # return the model to a compute-only quote.
+    from flash.cost.analytical import step_seconds_split
+    from flash.cost.types import RunConfig
+
+    config = RunConfig(
+        "Qwen/Qwen3.5-0.8B", "grpo", 6, seq_len=512, completion_len=128, batch_size=8, group_size=4
+    )
+    gpu_bound, fixed = step_seconds_split(config, "H100")
+    assert gpu_bound < 5.0  # the arithmetic really is negligible at this size
+    assert fixed > 10 * gpu_bound  # ... so a quote that omits the floor is wrong by an order
+    # and the floor specifically, not the reward wall, has to be in there: the reward term alone is
+    # completions x reward_seconds, which this assert deliberately sits above.
+    assert fixed > config.normalized().batch_size * config.normalized().group_size
+
+
+def test_step_floor_is_charged_per_class_not_pooled():
+    from flash.cost.facts import _DEFAULT_STEP_FLOOR_S, step_floor_seconds
+
+    # measured classes carry their own floor; h200's is the outlier the pooled value would erase.
+    assert step_floor_seconds("H200") > step_floor_seconds("H100")
+    assert step_floor_seconds("RTX 5090") < step_floor_seconds("RTX 4090")
+    # an unmeasured class falls back to the pooled median rather than to no floor at all.
+    assert step_floor_seconds("some-unmeasured-class") == _DEFAULT_STEP_FLOOR_S
+    assert _DEFAULT_STEP_FLOOR_S > 0.0
+
+
+def test_step_floor_applies_to_rollout_methods_only():
+    # the floor is vllm engine entry/exit + actor->rollout weight sync. sft runs neither, and the
+    # floor was fitted on rollout arms only, so charging it to sft would invent ~45s per step.
+    from flash.cost.analytical import step_seconds_split
+    from flash.cost.facts import step_floor_seconds
+    from flash.cost.types import RunConfig
+
+    sft = RunConfig("Qwen/Qwen3.5-0.8B", "sft", 6, seq_len=512, batch_size=8)
+    assert step_seconds_split(sft, "H100")[1] == pytest.approx(0.0)
+    # rollout methods carry it, and by the card's own amount -- comparing two classes isolates the
+    # floor from the reward/teacher wait, which is identical on both.
+    for method in ("grpo", "opd"):
+        config = RunConfig("Qwen/Qwen3.5-0.8B", method, 6, seq_len=512, completion_len=128)
+        h100 = step_seconds_split(config, "H100")[1]
+        h200 = step_seconds_split(config, "H200")[1]
+        assert h200 - h100 == pytest.approx(step_floor_seconds("H200") - step_floor_seconds("H100"))
+
+
+def test_step_floor_is_not_shardable_across_cards():
+    # the allocator divides ONLY the first half by card count. engine init and weight sync do not
+    # get faster on more ranks, so a floor that leaked into the shardable half would make wide
+    # multi-card jobs look arbitrarily cheap.
+    from flash.cost.analytical import step_seconds_split
+    from flash.cost.facts import step_floor_seconds
+    from flash.cost.types import RunConfig
+
+    config = RunConfig(
+        "Qwen/Qwen3.5-0.8B", "grpo", 6, seq_len=512, completion_len=128, batch_size=8, group_size=4
+    )
+    gpu_bound, fixed = step_seconds_split(config, "H100")
+    assert fixed >= step_floor_seconds("H100")
+    assert gpu_bound < step_floor_seconds("H100")
+
+
 def test_nvlink_classification_is_by_form_factor():
     from flash.cost.facts import has_nvlink
 

@@ -113,6 +113,70 @@ def effective_train_tflops(name: str) -> float:
     return min(peak, cap) if cap is not None else peak
 
 
+# --- per-step floor -----------------------------------------------------------------------------
+# MEASURED. Every optimizer step pays a fixed wall cost the FLOPs model cannot see: vLLM engine
+# entry/exit, the actor->rollout weight sync, ray actor dispatch, and dataloader/collate work. None
+# of it scales with the arithmetic, so no MFU or TFLOPS number can produce it, and the previous
+# model had no constant term at all -- it quoted a step as (compute + reward wait) and nothing else.
+#
+# The effect dominates real runs. Across a 45-arm RunPod campaign (Qwen3.5 0.8B/2B/4B, 6 classes,
+# batch/group/context swept) the compute term was 0.3-9.3s while realized steps took 43-383s, so
+# 95-99% of a real step is floor the model did not price. Quoting without it ran ~0.48x of realized
+# (typical error 2.17x) and put only 8/45 arms inside the 0.70-1.43x band. On a later 10-arm holdout
+# (new environments and shapes, none used to fit) it moves geo-bias 0.30x -> 0.90x, typical error
+# 3.30x -> 1.25x, and in-band 0/10 -> 9/10.
+#
+# Values are the per-card MEDIAN residual (realized step - quoted step) over that campaign. The
+# median, not the mean, so one preempted or thermally-throttled arm cannot drag a class. The floor
+# is a CARD property: it varies 12s (5090) to 111s (H200) across classes but is stable within a
+# class across model size, environment, and batch shape.
+#
+# Every arm here is a ROLLOUT (grpo) arm on RUNPOD. Two limits follow, both deliberate:
+#   - sft is excluded at the call site (see analytical.step_seconds_split), on mechanism not
+#     measurement: sft runs no vllm engine and no weight sync, so the wall this table measures has
+#     no source there. sft keeps its pre-existing compute-only quote.
+#   - the floor is keyed on card alone, not (card, provider). A matched lambda/vast replication was
+#     attempted and returned zero usable timings (8/8 arms died in provisioning, step-0 wedge, or a
+#     trainer crash), so a provider term is unmeasured rather than measured-and-rejected. Card-only
+#     is the conservative choice: it is a strict improvement over pricing no floor at all on every
+#     provider, and if a provider offset does exist it shows up as a class being uniformly off on
+#     that provider, which is the same signal that would justify adding an entry.
+#
+# Deliberately a CONSTANT, not a per-completion slope. The residual after applying these constants
+# shows no consistent direction with completion count (A100/H100 rise, 4090/B200 fall, H200 flat),
+# so a fitted slope would be fitting noise; and the classes with the widest span were measured over
+# only a 1.0-1.2x workload range, which cannot separate slope from intercept. A per-card linear fit
+# extrapolated to large workloads produced NEGATIVE step times, which is why it is not used.
+_STEP_FLOOR_S: dict[str, float] = {
+    "A100 PCIe": 42.0,
+    # A100 SXM was added from a later 2-arm replicate (residuals 94.4s and 100.5s, 1.06x apart, well
+    # inside the 1.39x same-config pod-to-pod noise floor). It is ~2.3x its own PCIe sibling, which is
+    # why the two SXM/PCIe variants cannot share one entry.
+    "A100 SXM": 97.5,
+    "B200": 44.5,
+    "H100": 43.5,
+    # H200 is the outlier: ~2.5x the H100 floor on the same sm90 kernels. Consistent across all of
+    # its arms, so it is a property of the class as provisioned, not a bad sample.
+    "H200": 111.0,
+    "RTX 4090": 65.0,
+    "RTX 5090": 12.0,
+}
+# Unmeasured classes take the pooled median across the whole campaign rather than zero: charging no
+# floor at all is the failure this table exists to fix, and it under-quotes by 3-4x. A class here is
+# quoted low, so add a measured entry above once a class has replicates that agree.
+#
+# RTX Pro 6000 is deliberately NOT in the table despite having two arms: on byte-identical configs it
+# realized 137.9s and 58.1s (residuals 105.3s and 25.5s, 4.1x apart, far outside the noise floor). One
+# of those is not a floor, and picking either would be fitting a single sample -- so the class waits
+# for replicates that agree rather than getting a confident wrong constant.
+_DEFAULT_STEP_FLOOR_S = 46.5
+
+
+def step_floor_seconds(name: str) -> float:
+    """Fixed per-step wall cost of class ``name`` that no amount of FLOPs shortens."""
+    return _STEP_FLOOR_S.get(name, _DEFAULT_STEP_FLOOR_S)
+
+
 def gpu_hourly_usd(
     name: str,
     provider: str | None = None,

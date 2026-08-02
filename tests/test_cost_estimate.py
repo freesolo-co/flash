@@ -478,13 +478,19 @@ def test_estimate_exact_pinned_provider_routes_through_disk_aware_allocate(monke
     assert (est.provider, est.gpu, est.gpu_hourly_usd) == ("runpod", "H100", 3.29)
 
 
-def test_b200_not_cheaper_or_faster_than_h200_for_grpo(monkeypatch):
-    # regression: the estimator must not advertise b200 as faster/cheaper than h200 on peak flops.
-    # b200/sm100 training is h200-class (portable kernels), so at its higher $/hr b200 must never
-    # come out cheaper, and never faster, than h200 for the same run.
+def test_b200_compute_is_h200_class_and_never_cheaper_for_grpo(monkeypatch):
+    # regression: the estimator must not advertise b200 as faster/cheaper than h200 ON PEAK FLOPS.
+    # b200/sm100 training is h200-class (portable kernels), so its COMPUTE half must match h200's
+    # exactly, and at its higher $/hr the run must never come out cheaper.
+    #
+    # total step time is deliberately NOT asserted equal. the two classes have different measured
+    # per-step floors (h200 111s vs b200 44.5s -- see facts._STEP_FLOOR_S), which is real wall time
+    # unrelated to peak flops: at matched g32/cap128 b200 realized 68-85 s/step against h200's
+    # 129-172 s. asserting equal totals here would re-encode the modelling gap this test predates.
     from types import SimpleNamespace
 
     import flash.providers.allocator as allocator_mod
+    from flash.cost.analytical import step_seconds_split
     from flash.cost.facts import gpu_hourly_usd
 
     def alloc_as(gpu):
@@ -501,10 +507,12 @@ def test_b200_not_cheaper_or_faster_than_h200_for_grpo(monkeypatch):
     b200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, gpu_type="B200"))
 
     assert gpu_hourly_usd("B200") > gpu_hourly_usd("H200")  # b200 is the pricier card
-    # same effective training throughput => b200 is no faster than h200 ...
-    assert b200.seconds_per_step == pytest.approx(h200.seconds_per_step)
-    assert b200.train_seconds == pytest.approx(h200.train_seconds)
-    # ... and at its higher $/hr, never cheaper.
+    # same effective training throughput => the flops-driven half is identical on both ...
+    config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 100)
+    assert step_seconds_split(config, "B200")[0] == pytest.approx(
+        step_seconds_split(config, "H200")[0]
+    )
+    # ... and at its higher $/hr, the run is never cheaper on b200.
     assert b200.total_usd > h200.total_usd
 
 

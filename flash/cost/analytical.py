@@ -20,6 +20,7 @@ from .facts import (
     model_quant,
     pick_gpu,
     reward_seconds_per_completion,
+    step_floor_seconds,
     teacher_seconds_per_completion,
     teacher_token_cost_usd,
     total_params_b,
@@ -200,13 +201,19 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
 
 
 def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
-    """(gpu-bound, gpu-independent) seconds for one optimizer step on ``gpu``.
+    """(shardable, non-shardable) seconds for one optimizer step on ``gpu``.
 
-    Sharding a step across cards divides the gpu-bound half and leaves the rest untouched: remote
+    Sharding a step across cards divides the first half and leaves the rest untouched: remote
     teacher scoring and reward grading are waits on services no card count speeds up, and an MoE pays
     its routing overhead once per step regardless. Ranking hardware needs the halves apart, because a
     latency-bound job gets no benefit from a faster card while a compute-bound one gets all of it.
     ``seconds_per_step`` is simply their sum, so this is the single source of the step model.
+
+    The second half is what ADDING CARDS cannot shorten, which is not the same as being identical on
+    every card. The rollout floor below is the case that distinguishes them: it varies by card class
+    but does not shard, because engine init and weight sync do not run faster when split across more
+    ranks (a wider job syncs more of them). Anything that scales with the arithmetic goes in the
+    first half; anything a second card cannot help goes in the second.
     """
     n = config.normalized()
     peak = effective_train_tflops(gpu) * 1e12  # FLOP/s (realized training throughput; see facts)
@@ -237,9 +244,18 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         teacher_s = teacher_lat
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
-        return gen_s + update_s, overhead + teacher_s
+        return gen_s + update_s, overhead + teacher_s + step_floor_seconds(gpu)
 
     if not n.is_grpo:
+        # NO rollout floor here. sft is a plain fwd/bwd loop: no vllm engine to enter and leave, and
+        # no actor->rollout weight sync, so the mechanism the floor measures does not exist. every arm
+        # the floor was fitted on is a rollout arm, so charging it here would extrapolate ~45s/step
+        # onto a loop it was never measured against.
+        #
+        # this exclusion is reasoned from the mechanism, NOT measured: both sft calibration arms died
+        # on an unrelated liger/lora grad-zero defect, so there is no sft timing to check it against.
+        # sft is left on the pre-existing compute-only quote it always had -- this change cannot make
+        # sft worse, but it does not verify it either. measure sft floors before assuming zero is right.
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
@@ -253,7 +269,7 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     reward_s = completions * latency
     # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
     # changes. a grpo step dominated by it is latency-bound, not compute-bound.
-    return gen_s + update_s, overhead + reward_s
+    return gen_s + update_s, overhead + reward_s + step_floor_seconds(gpu)
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:

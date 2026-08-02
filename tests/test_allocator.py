@@ -784,7 +784,9 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
         ),
         (
             # the dense image fallback grows with context and keeps this mixed-modality-safe route
-            # above the 96 gb class.
+            # above the 96 gb class. b200 over h200 (both fit): ranking is $/step, and b200's
+            # measured per-step floor is 44.5s against h200's 111s, which more than pays for its
+            # higher $/hr. the invariant under test is the vram floor, and 180 gb clears it.
             "max_context_16384",
             {
                 "epochs": 1,
@@ -792,7 +794,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "max_completion_tokens": 128,
                 "lora_rank": 32,
             },
-            "H200",
+            "B200",
         ),
         (
             # b200, not h200: every catalog model is a gdn hybrid, so the opd rollout runs a bf16 kv
