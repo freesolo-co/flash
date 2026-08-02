@@ -504,12 +504,21 @@ def rollout_resident_overrides(sleep_unsupported: bool) -> list[str]:
     RESIDENT peak and rejects a config that cannot fit, and opd's estimator ignores ``sleep_offload``
     outright (it is resident-only by construction). staying resident therefore cannot admit an OOM
     that the sleep path would have avoided.
+
+    the two knobs need DIFFERENT hydra prefixes, and getting it wrong kills the run at config parse
+    before a single byte is allocated. ``free_cache_engine`` is in ``trainer/config/rollout/
+    rollout.yaml`` (:56) so a bare override resolves. ``enable_sleep_mode`` is NOT: it exists only as
+    a ``RolloutConfig`` dataclass field (``workers/config/rollout.py:277``), and the yaml that hydra
+    builds the struct from omits it -- so a bare override raises ``Key 'enable_sleep_mode' is not in
+    struct`` and ``main_ppo`` exits 1. ``+`` appends the key instead of overriding it, which is what
+    verl's own error text prescribes. dataclass-default-only keys are the norm here, not the
+    exception, so check the yaml before adding a bare override.
     """
     if not sleep_unsupported:
         return []
     return [
         "actor_rollout_ref.rollout.free_cache_engine=false",
-        "actor_rollout_ref.rollout.enable_sleep_mode=false",
+        "+actor_rollout_ref.rollout.enable_sleep_mode=false",
     ]
 
 

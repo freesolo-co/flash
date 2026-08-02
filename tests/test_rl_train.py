@@ -594,10 +594,22 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
         )
         return rl_train.build_verl_overrides(cfg)
 
+    # the hydra prefixes DIFFER and each is asserted exactly. free_cache_engine is in
+    # trainer/config/rollout/rollout.yaml (:56) so a bare override resolves; enable_sleep_mode is
+    # dataclass-only (workers/config/rollout.py:277) and absent from that yaml, so it needs `+` or
+    # hydra raises `Key 'enable_sleep_mode' is not in struct` and main_ppo exits 1 before allocating
+    # anything. a substring assertion on the bare key passes against BOTH spellings and so cannot
+    # fail on the broken one. see ISSUES.md VERL-148.
+    for override in (
+        "actor_rollout_ref.rollout.free_cache_engine=false",
+        "+actor_rollout_ref.rollout.enable_sleep_mode=false",
+    ):
+        assert override in _argv(flagged[0])
+    # the bare spelling must be ABSENT, not merely accompanied by the prefixed one.
+    assert "actor_rollout_ref.rollout.enable_sleep_mode=false" not in _argv(flagged[0])
+    # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
+    # what lets a large rollout fit alongside the training weights.
     for key in ("free_cache_engine", "enable_sleep_mode"):
-        assert f"actor_rollout_ref.rollout.{key}=false" in _argv(flagged[0])
-        # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
-        # what lets a large rollout fit alongside the training weights.
         assert not [a for a in _argv("Qwen/Qwen3-4B") if key in a]
 
 

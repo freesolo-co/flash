@@ -4665,8 +4665,16 @@ def test_overrides_pin_the_rollout_resident_for_sleep_unsupported_models():
     on = build_opd_overrides(_config(sleep_unsupported=True))
     # both knobs, not one: free_cache_engine gates the sleep()/wake_up() rpcs
     # (vllm_async_server.py:626), enable_sleep_mode is what builds the sleep-capable engine (:265).
+    #
+    # the `+` on the second is load-bearing and asserted EXACTLY, not as a substring: only
+    # free_cache_engine is in trainer/config/rollout/rollout.yaml, so a bare override of
+    # enable_sleep_mode (dataclass-only, workers/config/rollout.py:277) raises `not in struct` and
+    # exits main_ppo 1 at parse time. asserting the bare substring matches BOTH spellings, so it
+    # passes against the form that kills the run -- which is how this shipped. see ISSUES.md
+    # VERL-148.
     assert "actor_rollout_ref.rollout.free_cache_engine=false" in on
-    assert "actor_rollout_ref.rollout.enable_sleep_mode=false" in on
+    assert "+actor_rollout_ref.rollout.enable_sleep_mode=false" in on
+    assert "actor_rollout_ref.rollout.enable_sleep_mode=false" not in on
 
 
 def test_the_resolved_sleep_flag_reaches_the_opd_verl_config():
