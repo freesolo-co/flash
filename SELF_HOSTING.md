@@ -43,6 +43,12 @@ flash login --api-url http://your-plane:8080 --api-key "$FREESOLO_INTERNAL_KEY"
 flash train run.toml
 ```
 
+Because `--api-url` points at your own plane, `flash login` stores the key and checks it
+against that plane. It does **not** send it to `api.freesolo.co` for verification: your
+plane authenticates `FREESOLO_INTERNAL_KEY` itself, and that key controls the plane, so it
+must not travel to a service you do not run. (If you operate your own Freesolo-compatible
+auth backend, pass `--freesolo-url` and verification happens against it.)
+
 Every run config needs a top-level `project` uuid - it groups runs and is required in
 standalone mode too (see [project ids](#what-flashstandalone1-does)). Any uuid works
 on a standalone plane, so you can pick one once and reuse it:
