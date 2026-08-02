@@ -23,8 +23,16 @@ class RunpodProvider:
     supports_weight_cache = True
 
     def is_configured(self) -> bool:
-        # Missing key surfaces at preflight, not here.
-        return True
+        # Gated on the operator key, exactly like the instance providers. A plane with no
+        # RUNPOD_API_KEY must not report runpod as available: the allocator would rank RunPod
+        # classes it can never provision and the run would die at submit instead of allocating
+        # on the provider the operator DID configure.
+        #
+        # Read the PARSED pool, not the raw env var: RUNPOD_API_KEY="," is set-but-unusable, and
+        # keys() is what every provisioning call actually draws from.
+        from flash.providers.runpod import keys
+
+        return bool(keys.keys())
 
     def preflight(self, require_hf: bool = True) -> list[str]:
         from flash.providers.runpod.preflight import missing_credentials

@@ -66,12 +66,26 @@ def _offline(monkeypatch):
     # Lambda and Vast are OPT-IN instance-based complements: leaving their keys set makes the
     # provider "available" and pulls live capacity/pricing into offline tests (allocation
     # candidates, registry). A provider test opts back in with ``monkeypatch.setenv(...)``.
+    # FREESOLO_API_KEY is scrubbed for a different reason than the rest: it is not forwarded to a
+    # job, it selects the ORGANIZATION every CLI command runs against. A box with a .env above the
+    # repo (the dotenv walk-up above) gets it refilled mid-suite, and the CLI then prepends its
+    # "this overrides your saved login" warning to stderr -- so tests asserting on exact stderr fail
+    # on a developer machine while passing in CI, which reads as a broken test rather than a leaked
+    # credential. Every test that wants the var sets it itself after this fixture.
     from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 
-    for _key in {"RUNPOD_API_KEY", "LAMBDA_API_KEY", "VAST_API_KEY"} | set(
+    for _key in {"FREESOLO_API_KEY", "LAMBDA_API_KEY", "VAST_API_KEY"} | set(
         DEFAULT_RUNTIME_SECRET_KEYS
     ):
         monkeypatch.delenv(_key, raising=False)
+
+    # RunPod is OVERWRITTEN, not deleted: same hygiene (no operator key ever reaches a test) with
+    # the default substrate intact. is_configured() is gated on the key pool, so deleting the var
+    # leaves the harness with NO provider at all -- every allocator test then fails "no allocatable
+    # GPU" for want of a credential rather than for the reason it is testing. Two fake accounts so
+    # the multi-account failover paths have a pool to walk. A test that wants runpod unconfigured
+    # (or a specific pool) sets its own value after this fixture.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test-a,rp-test-b")
 
     # Same hazard, one layer up: the client discovers runtime secrets from the process env at submit
     # time, so an operator shell that exports WANDB_API_KEY makes every dry-run test assert against
@@ -90,6 +104,13 @@ def _offline(monkeypatch):
 
     rp_keys.reset()
 
+    # Provider singletons are @cache'd per name, and is_configured() now reads the env, so a test
+    # that sets or clears a provider key would otherwise see the PREVIOUS test's answer. Clear
+    # around every test: the cache exists to avoid re-importing, not to freeze configuration.
+    import flash.providers as _providers
+
+    _providers._get_provider.cache_clear()
+
     # Always-on artifact GC: the control-plane lifespan sweeps ONCE on startup (when an operator
     # HF_TOKEN is set). Stub it to a no-op so offline TestClient startups never reach HF/serving;
     # tests/test_repo_cleanup.py restores the real function to exercise the genuine sweep.
@@ -99,6 +120,7 @@ def _offline(monkeypatch):
 
     yield
     rp_keys.reset()
+    _providers._get_provider.cache_clear()
 
 
 @pytest.fixture(autouse=True)

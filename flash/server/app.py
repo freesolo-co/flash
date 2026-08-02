@@ -428,7 +428,7 @@ def create_app():
             else None
         )
         # Periodic artifact GC: delete aged (>7d), undeployed run prefixes inside the per-environment
-        # HF repos (Freesolo-Co/flashrun-*) so old runs' checkpoints/adapters don't accumulate against
+        # HF repos (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up against
         # the org's storage quota. Only on a plane with an operator HF_TOKEN (it deletes operator-owned
         # repos); fails closed on any live-set uncertainty. See flash.server.repo_cleanup.
         from flash.server.repo_cleanup import repo_cleanup_enabled

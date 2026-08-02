@@ -20,14 +20,14 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import time
 import urllib.error
 import urllib.request
 
 from flash import runner
 from flash.providers.realized import realized_cost_for_remote
-from flash.server.auth import INTERNAL_KEY_ENV, freesolo_base_url
+from flash.server._internal_client import internal_key
+from flash.server.auth import freesolo_base_url
 
 _REPORT_PATH = "/api/billing/training-cost"
 _REPORT_TIMEOUT_S = 10.0
@@ -47,15 +47,19 @@ _RECONCILABLE_STATES = (runner.TERMINAL_STATES | {"deployed"}) - _FREE_TERMINAL_
 
 
 def reconcile_enabled() -> bool:
-    """Reconciliation (and its reporting) is on only when the operator internal key is set."""
-    return bool(os.environ.get(INTERNAL_KEY_ENV))
+    """Reconciliation (and its reporting) is on only when the operator internal key is set.
+
+    ``internal_key()`` is the shared gate for every backend reporter, so this is also off in
+    standalone mode: realized cost is reported to a Freesolo billing backend a self-hosted plane
+    has none of, and the loop would poll providers only to fail every POST."""
+    return internal_key() is not None
 
 
 def _report(body: dict) -> bool:
     """POST realized cost to the backend with the internal key (Bearer). Best-effort: returns
     True on a 2xx, False on any failure (never raises). Mirrors ``billing._post_billing`` but
     swallows errors -- a metering report must never affect anything."""
-    key = os.environ.get(INTERNAL_KEY_ENV)
+    key = internal_key()
     if not key:
         return False
     req = urllib.request.Request(

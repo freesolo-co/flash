@@ -303,3 +303,51 @@ def test_server_project_validation_rejects_cross_org_project(monkeypatch) -> Non
         )
     assert excinfo.value.status_code == 403
     assert "authenticated organization" in excinfo.value.detail
+
+
+def _no_network(monkeypatch) -> None:
+    """Any outbound call from a standalone path is the bug under test, so make one fail loudly."""
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("standalone must not call the Freesolo backend")
+
+    monkeypatch.setattr("urllib.request.urlopen", _boom)
+
+
+def test_standalone_accepts_a_well_formed_project_without_a_backend(monkeypatch) -> None:
+    """A self-hosted plane has no org directory to validate against, so the id is taken as given.
+
+    This is the gate that makes self-hosting work at all: without it every submit resolves
+    api.freesolo.co, fails, and is rejected 503.
+    """
+    monkeypatch.setenv("FLASH_STANDALONE", "1")
+    _no_network(monkeypatch)
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    assert (
+        require_project_access(
+            project_id=f" {project_id} ",
+            key={"auth_kind": "internal"},
+            authorization=None,
+        )
+        == project_id
+    )
+
+
+def test_standalone_still_requires_a_well_formed_project_id(monkeypatch) -> None:
+    """Standalone relaxes OWNERSHIP, not the requirement itself: runs stay grouped by project.
+
+    A malformed id must fail the same 400 it would against the backend, or self-hosting would
+    become the one mode where the explicit-project contract silently does not apply.
+    """
+    monkeypatch.setenv("FLASH_STANDALONE", "1")
+    _no_network(monkeypatch)
+
+    for bad in ("", "   ", "not-a-uuid"):
+        with pytest.raises(HTTPException) as excinfo:
+            require_project_access(
+                project_id=bad,
+                key={"auth_kind": "internal"},
+                authorization=None,
+            )
+        assert excinfo.value.status_code == 400

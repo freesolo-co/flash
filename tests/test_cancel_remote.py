@@ -493,6 +493,13 @@ def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
     monkeypatch.setattr(auth, "ensure_auth", lambda: None)
     monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda _: None)
 
+    # The registry-less REST sweep runs after the undeploy and would report every configured
+    # account as unreachable (offline suite), appending a failure row this assertion would then
+    # have to spell out. Stub it clear: this test is about the event loop, not the sweep.
+    import flash.providers.runpod.api as runpod_api
+
+    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda **_: ({}, []))
+
     async def fake_undeploy(uid, **_):
         return {"success": True, "name": resource_name}
 

@@ -5018,14 +5018,20 @@ def _make_runpod_flash_mocks(monkeypatch, FakeRM):
     monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", rm_mod)
 
 
-def _patch_deploy_deps(monkeypatch, jobs):
-    """Patch all module-level symbols in jobs that deploy_train_endpoint uses."""
-    import os
+def _patch_deploy_deps(monkeypatch, jobs, *, set_key: bool = True):
+    """Patch all module-level symbols in jobs that deploy_train_endpoint uses.
 
+    ``set_key=False`` for a caller that installed its OWN pool (the multi-account failover tests):
+    overwriting it here would collapse the pool to one account and there would be nothing to fail
+    over to.
+    """
     import flash.providers.runpod.auth as auth_mod
     import flash.providers.runpod.keys as keys
 
-    if not os.environ.get("RUNPOD_API_KEY"):
+    # Pin the pool for the default case rather than reading the ambient env: callers assert on the
+    # fingerprint of THIS key, and a real operator key would both leak into the assertion and
+    # change it.
+    if set_key:
         monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
         keys.reset()
     monkeypatch.setattr(jobs, "FLASH_SDK_LOCK", __import__("threading").Lock())
@@ -5123,7 +5129,7 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
                 )
             return FakeResource()
 
-    _patch_deploy_deps(monkeypatch, jobs)
+    _patch_deploy_deps(monkeypatch, jobs, set_key=False)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
     monkeypatch.setattr(
         jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
@@ -5156,7 +5162,7 @@ def test_deploy_fails_over_to_next_account_on_balance(monkeypatch):
                 )
             return FakeResource()
 
-    _patch_deploy_deps(monkeypatch, jobs)
+    _patch_deploy_deps(monkeypatch, jobs, set_key=False)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
 
     def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
@@ -5189,7 +5195,7 @@ def test_deploy_balance_error_single_account_raises_fast(monkeypatch):
                 "balance to create an endpoint."
             )
 
-    _patch_deploy_deps(monkeypatch, jobs)
+    _patch_deploy_deps(monkeypatch, jobs, set_key=False)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
     monkeypatch.setattr(
         jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
@@ -5233,7 +5239,7 @@ def test_deploy_captures_owner_before_concurrent_failover_after_sdk_create(monke
             failover.join()
             return False
 
-    _patch_deploy_deps(monkeypatch, jobs)
+    _patch_deploy_deps(monkeypatch, jobs, set_key=False)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
     monkeypatch.setattr(jobs, "FLASH_SDK_LOCK", FailoverAfterCreateLock())
 
@@ -5267,7 +5273,7 @@ def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
                 "your workers quota (30)"
             )
 
-    _patch_deploy_deps(monkeypatch, jobs)
+    _patch_deploy_deps(monkeypatch, jobs, set_key=False)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
     monkeypatch.setattr(
         jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
@@ -5312,7 +5318,7 @@ def test_deploy_failover_from_midpool_tries_every_remaining_account(monkeypatch)
                 )
             return FakeResource()
 
-    _patch_deploy_deps(monkeypatch, jobs)
+    _patch_deploy_deps(monkeypatch, jobs, set_key=False)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
     monkeypatch.setattr(
         jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0

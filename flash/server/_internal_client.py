@@ -11,7 +11,7 @@ from contextlib import suppress
 from logging import Logger
 from typing import Any
 
-from .auth import INTERNAL_KEY_ENV, freesolo_base_url
+from .auth import INTERNAL_KEY_ENV, freesolo_base_url, standalone
 
 DEFAULT_TIMEOUT_S = 10.0
 
@@ -20,7 +20,15 @@ def internal_key() -> str | None:
     """The operator INTERNAL key (whitespace-stripped), or ``None`` when unset OR blank (which
     disables internal reporting). Normalizing here means a stray trailing newline or a
     whitespace-only value can't masquerade as 'enabled' and emit an invalid
-    ``Authorization: Bearer <whitespace>`` header — every internal reporter shares this gate."""
+    ``Authorization: Bearer <whitespace>`` header - every internal reporter shares this gate.
+
+    ``None`` in standalone mode too: a self-hosted plane SETS this key (it is how its own clients
+    authenticate) but has no Freesolo backend to report to, so every reporter would otherwise send
+    the operator's key to ``api.freesolo.co``. Disabling at the shared gate turns billing,
+    checkpoint mirroring, and environment recording off together, rather than one caller at a
+    time."""
+    if standalone():
+        return None
     key = (os.environ.get(INTERNAL_KEY_ENV) or "").strip()
     return key or None
 
