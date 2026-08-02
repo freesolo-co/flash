@@ -6008,3 +6008,33 @@ def test_every_turn_is_spanned_when_none_of_them_abort(monkeypatch):
     assert env.recorded == ["ab", "cd", "ef", "gh"]
     assert len(out["extra_fields"]["flash_turn_spans"]) == 4
     assert out["extra_fields"]["flash_turn_rewards"] == [0.5, 0.5, 0.5, 0.5]
+
+
+def test_the_rl_trainer_stores_the_frozen_base_in_bf16():
+    """VERL-150: verl's fsdp.yaml default is fp32, which doubles the trainer's resident base.
+
+    the fp32 copy is storage-only -- FSDP already wraps the module MixedPrecision(param_dtype=bf16),
+    so params are cast to bf16 for compute either way -- and the base is FROZEN, since verl's
+    ref_in_actor (lora_rank > 0 or lora_adapter_path is not None) is always true here. what is
+    actually optimized stays fp32: peft's autocast_adapter_dtype casts lora_* weights UP to fp32.
+    so this frees ~51 GB at 27B and changes nothing about the gradient.
+
+    the opd driver's half of this lives in test_opd_train. asserted in both because the sft driver
+    has set a dtype since it was written and these two never did, which is exactly why g5's sft leg
+    succeeded and its grpo and opd legs failed on the same model and the same card.
+    """
+    overrides = rl_train.build_verl_overrides(_overrides_cfg())
+    want = "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16"
+    # exact, not substring: "x=bfloat16" is a substring of "+x=bfloat16", so the obvious `in`
+    # assertion passes against a spelling hydra REJECTS here ("Could not append to config. An item
+    # is already at ..."). the key is declared in the yaml and takes a BARE override -- the inverse
+    # of enable_sleep_mode, which is dataclass-only and requires `+`. neighbouring keys, opposite
+    # prefixes. see ISSUES.md VERL-150.
+    assert want in overrides
+    assert f"+{want}" not in overrides, "must not be + prefixed"
+    # ref is deliberately NOT set. it reads like a second resident copy and is not one:
+    # ray_trainer.py:897 aliases ref_policy_wg to the actor worker whenever ref_in_actor holds, and
+    # flash parses lora_rank with minimum=1 (schema/__init__.py:485) so it always holds. setting it
+    # would free nothing. this asserts the absence so a future reader has to re-derive the above
+    # rather than pattern-match it back in.
+    assert not [o for o in overrides if "ref.fsdp_config.model_dtype" in o]
