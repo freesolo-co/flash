@@ -157,7 +157,9 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
     """
     from flash.providers.allocator import allocate
 
-    # 9B on a 24 GB class does not fit alone, so this is the combination path, not the fit-alone one.
+    # 9B SFT on a 24 GB class does not fit alone, so this is the combination path, not the
+    # fit-alone one. the algorithm is load-bearing: the same model+class does not allocate AT ALL
+    # under grpo or opd, which the next test pins.
     allocated = [
         allocate(
             "Qwen/Qwen3.5-9B", "sft", provider="runpod", gpu_type="RTX 4090", max_gpu_count=asked
@@ -173,17 +175,75 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
     )
 
 
-def test_the_public_record_reports_the_ceiling_not_the_allocated_count():
-    """TRAINING.md tells users to read the allocated count off gpu_status, not spec.gpu.count.
+def test_a_pinned_class_that_fits_sft_can_fail_grpo_and_opd_outright():
+    """The doc's 9B/RTX 4090 example is labelled SFT because the fit test is per algorithm.
 
-    Both halves of that sentence are load-bearing and both are asserted here, because the doc
-    previously said to read `gpu.count` back off the run record -- which silently reports the
-    ceiling. A user who submits --gpus 4, reads 4 back and concludes they got 4 cards would size
-    throughput and cost off a number the allocator never honoured.
+    Asserted because an unlabelled example in a GRPO section reads as a GRPO example, and a user
+    copying it onto configs/grpo.toml does not get 2 cards -- they get UnsupportedGpuError, since
+    rollout memory puts 9B GRPO past even the 4-card combination. The failure is a hard raise, not
+    a silent downgrade, so the wrong doc costs a failed submit rather than a bad number.
+    """
+    import pytest
 
-    The allocated count IS recorded, but only in effective_preparation, which to_dict() pops as
-    server-internal. So the assertion is that the public record does NOT carry it -- if a future
-    change starts publishing it there, this fails and the doc gets rewritten with it.
+    from flash.providers.allocator import allocate
+    from flash.providers.base import UnsupportedGpuError
+
+    # same model, same pinned class, same ceiling -- only the algorithm differs.
+    assert (
+        allocate(
+            "Qwen/Qwen3.5-9B", "sft", provider="runpod", gpu_type="RTX 4090", max_gpu_count=4
+        ).gpu_count
+        == 2
+    )
+    for algorithm in ("grpo", "opd"):
+        with pytest.raises(UnsupportedGpuError):
+            allocate(
+                "Qwen/Qwen3.5-9B",
+                algorithm,
+                provider="runpod",
+                gpu_type="RTX 4090",
+                max_gpu_count=4,
+            )
+
+
+def test_the_allocation_log_line_carries_the_count_that_status_does_not():
+    """TRAINING.md points at the run log for the allocated count, so that line must carry it.
+
+    The doc previously pointed at gpu_status.device_count, which is a real worker observation but
+    an unreliable place to look: mid-run heartbeats collect diagnostics with include_torch=False
+    and record_heartbeat REPLACES gpu_status per heartbeat, so the field is normally absent while
+    a run is live. The runner's allocation line has neither problem -- it is written once at
+    placement, before any worker exists, into an append-only log.
+
+    Both spellings are asserted because the doc states both: multi-card carries the Nx prefix and
+    single-card does not, so a user grepping for "1x" on a one-card run would find nothing.
+    """
+    from flash.providers.allocator import Allocation, allocation_summary
+
+    def summarize(count: int) -> str:
+        return allocation_summary(
+            Allocation(
+                provider="runpod",
+                gpu="RTX 4090",
+                hourly_usd=0.69,
+                min_vram_gb=31,
+                candidates=(),
+                gpu_count=count,
+            )
+        )
+
+    assert summarize(2).startswith("allocated 2x RTX 4090 on runpod at $1.38/hr"), summarize(2)
+    # one card is spelled bare, and the hourly total is per-run rather than per-card.
+    assert summarize(1).startswith("allocated RTX 4090 on runpod at $0.69/hr"), summarize(1)
+
+
+def test_the_public_run_record_never_reports_the_allocated_count():
+    """The doc warns off spec.gpu.count, and that warning must stay true.
+
+    A user who submits --gpus 4, reads 4 back off `runs status` and concludes they got 4 cards
+    would size throughput and cost off a number the allocator never honoured. The allocated count
+    IS recorded, but only in effective_preparation, which to_dict() pops as server-internal -- so
+    if a future change starts publishing it there, this fails and the doc gets rewritten with it.
     """
     from flash.runner import RunStatus
 

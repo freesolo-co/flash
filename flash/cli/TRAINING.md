@@ -1286,14 +1286,27 @@ provider that rents all n cards on one machine.
 `gpu.count` is a **ceiling, not an exact count** — by either spelling. Allocation treats it as the
 most cards it may use, and it stops at the first count that fits: a class that fits the run on one
 card is allocated as one card, and a class that needs sharding gets the _smallest_ fitting
-combination, not the count you asked for. `--gpus 4` on a 9B run pinned to RTX 4090 allocates 2.
-Combinations are also capped at 4, so 5-8 only lower the count that would otherwise be chosen.
+combination, not the count you asked for. `--gpus 4` on a 9B **SFT** run pinned to a 24 GB class
+allocates 2. Combinations are also capped at 4, so 5-8 only lower the count that would otherwise be
+chosen.
+
+That example is SFT-specific on purpose. The fit test is per algorithm, and the same 9B pinned to
+the same 24 GB class does not allocate at all under GRPO or OPD — it raises `UnsupportedGpuError:
+... cannot fit this run even as a 4-card combination`, because rollout memory pushes it past what
+four such cards hold. Raising `--gpus` cannot rescue a pin the algorithm never fits on.
 
 **There is no exact-count mechanism.** Pinning a small `[gpu] type` raises the floor above one card
 but still does not pin n — it only moves which combination is smallest. To see what a submit
-actually chose, read `gpu_status.device_count` off `flash runs status`, which the worker reports
-from the cards it was actually given. `spec.gpu.count` there echoes the ceiling you submitted, so it
-shows 4 even on a run allocated 1 card.
+actually chose, read the `allocated 2x <class> on <provider> at $N/hr` line at the top of `flash runs
+log`: the runner writes it when it places the run, so it is there before a worker exists and stays
+there for the life of the run. A single card is spelled without the `Nx` prefix.
+
+Do **not** read the count off `spec.gpu.count` in `flash runs status` — that echoes the ceiling you
+submitted, so it shows 4 even on a run allocated 1 card. `gpu_status.device_count` is a genuine
+worker-side observation, but it is not a reliable place to look either: the mid-run heartbeats
+(`sft_train`, `opd_step`, `rl_step`) collect diagnostics without torch, and each heartbeat _replaces_
+`gpu_status` wholesale, so the field is usually absent while a run is live and reappears only on the
+terminal heartbeat.
 
 GRPO, SFT and OPD all shard across `gpu.count` with no backend key to set: the worker launches one
 rank per card with Ulysses sequence parallelism.
