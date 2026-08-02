@@ -5384,19 +5384,17 @@ def test_opd_delegates_to_verl_with_no_selector_left(monkeypatch):
 
 
 def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch):
-    """An OPD spec must resolve backend "verl" and a NON-expandable allocator conf.
+    """An OPD spec must build a NON-expandable allocator conf.
 
-    This is the regression the TRL deletion exposed. `effective_backend` defaulted to "trl" for any
-    phase whose worker_env carried no selector, and _worker.py maps a non-verl OPD run to
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. verl leaves rollout.enable_sleep_mode
-    defaulted True, so the engine always builds a CuMemAllocator, which asserts outright on
-    expandable_segments (cumem.py, pytorch#147851) -- the run would die before step 1.
+    verl leaves rollout.enable_sleep_mode defaulted True, so the engine always builds a
+    CuMemAllocator, which asserts outright on expandable_segments (cumem.py, pytorch#147851) -- the
+    run would die before step 1.
 
     A [worker_env] selector must not be able to reintroduce it either: run_opd delegates to verl
-    unconditionally, so honoring the key would pick an allocator for a backend that cannot run.
+    unconditionally, so honoring a stale key would pick an allocator for a backend that cannot run.
     """
     from flash.providers._worker import build_worker_env
-    from flash.spec import JobSpec, effective_backend
+    from flash.spec import JobSpec
 
     def _spec(worker_env=None):
         payload = {
@@ -5415,7 +5413,6 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
     for worker_env in (None, {"FLASH_OPD_BACKEND": "trl"}, {"FLASH_OPD_BACKEND": "bogus"}):
         spec = _spec(worker_env)
         assert spec.phase == "opd"
-        assert effective_backend(spec) == "verl", worker_env
         alloc = build_worker_env(spec, spec.seed)["PYTORCH_CUDA_ALLOC_CONF"]
         assert "expandable_segments" not in alloc, (worker_env, alloc)
 
@@ -5431,7 +5428,6 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
         }
     )
-    assert effective_backend(sft) == "verl"
     assert build_worker_env(sft, sft.seed)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 
