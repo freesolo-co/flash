@@ -29,6 +29,10 @@ concurrency:
 jobs:
   publish-pypi-dev:
     name: Publish freesolo-flash-dev to PyPI
+    # Upstream only -- see publish.yml. This one matters more for a fork: it fires on every push to
+    # `dev`, which is the branch a contributor actually works on, so without the guard a fork sees a
+    # failing run on ordinary development.
+    if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
     permissions:
       contents: read

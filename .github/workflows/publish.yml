@@ -23,6 +23,12 @@ concurrency:
 jobs:
   publish-pypi:
     name: Publish flash PyPI package
+    # Upstream only. A fork pushing to its own `main` would otherwise run this and fail on the
+    # absent PYPI_API_TOKEN, showing a red X on work that is fine -- and the job publishes to the
+    # `freesolo-flash` name on PyPI, which is ours, so there is nothing here a fork WANTS to run.
+    # Keyed on the repository rather than `github.event.repository.fork` so a rename or a
+    # clone-and-push (neither of which sets the fork flag) is covered too.
+    if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-latest
     permissions:
       contents: read
