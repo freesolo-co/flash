@@ -265,3 +265,36 @@ def test_the_public_run_record_never_reports_the_allocated_count():
     assert public["spec"]["gpu"]["count"] == submitted_ceiling, (
         "spec.gpu.count no longer echoes the submitted ceiling; the doc's warning is now wrong"
     )
+
+
+def test_a_pinned_class_below_the_whole_run_floor_is_only_rejected_on_one_card(tmp_path):
+    """The offline VRAM gate compares a WHOLE-RUN floor to ONE card, so it must respect gpu.count.
+
+    required_vram_gb is the memory the run needs in total. Comparing it to a single card's VRAM is
+    correct only when the run is confined to a single card; above that the allocator shards the run
+    and applies its own multi-card fit test (allocator.py:181), which guards the identical
+    comparison with `and max_gpu_count <= 1`.
+
+    Without that guard the gate rejects a pin the allocator would have accepted, and it does so
+    client-side before any allocation runs -- which makes --gpus useless for its main purpose,
+    since the reason to ask for more cards is precisely that one card is too small. Found on a 35B
+    GRPO run: a 141 GB class at count=2 holds 282 GB against a 180 GB floor and was still refused.
+    """
+    from flash.schema import ConfigError
+
+    # 35B MoE GRPO needs more than one 141 GB card holds, so the floor is above the pinned class.
+    big = (
+        'model = "Qwen/Qwen3.6-35B-A3B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
+        'algorithm = "grpo"\n'
+        '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+        "[train]\nepochs = 1\nmax_examples = 100\n"
+        '[gpu]\ntype = "H200"\nprovider = "runpod"\n'
+    )
+
+    # one card genuinely cannot hold it, so the gate must still fire and name the shortfall.
+    with pytest.raises(ConfigError, match="but this run requires at least"):
+        _spec(tmp_path, "--gpus", "1", config=big)
+
+    # two cards clear the floor, so the gate must stand aside and let the allocator decide.
+    assert _spec(tmp_path, "--gpus", "2", config=big).gpu.count == 2
