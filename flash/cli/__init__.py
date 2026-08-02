@@ -152,6 +152,21 @@ def _wait_seconds(value: str) -> float:
     return seconds
 
 
+def _gpu_count_override(value: str) -> str:
+    """Turn `--gpus N` into the `gpu.count=N` override it is sugar for.
+
+    the flag shares --set's dest, so it lands in the same override list and inherits one precedence
+    order (file < --config < --set/--gpus, left to right) and one validator: gpu.count's 1..8 bound
+    lives in JobSpec, so a bad --gpus is rejected by the code that already rejects a bad [gpu] count.
+    converting here rather than in the command keeps an absent flag indistinguishable from no flag,
+    so a multi-gpu count authored in the config file is never silently downgraded.
+    """
+    try:
+        return f"gpu.count={int(value)}"
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of gpus, got {value!r}") from None
+
+
 def _friendly_message(message: str) -> str:
     """Shorten argparse's verbose ``invalid choice: 'x' (choose from a, b, c, ...)`` into a concise
     ``unknown command 'x' (did you mean 'y'?)`` — the single closest match instead of dumping the
@@ -552,6 +567,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="key=value",
         help="override a config value; repeatable",
+    )
+    train.add_argument(
+        "--gpus",
+        dest="overrides",
+        action="append",
+        type=_gpu_count_override,
+        metavar="N",
+        help=(
+            "most cards to run the job on; sets [gpu] count (1-8). a ceiling, not an exact "
+            "count: allocation still picks one card when one fits the run alone. more than one "
+            "also needs an explicit [gpu] provider that rents n cards on one machine"
+        ),
     )
     train.add_argument("--dry-run", action="store_true")
     train.add_argument(
