@@ -152,6 +152,13 @@ Rotating is safe: a standalone plane records run ownership against a fixed singl
 owner, not against the key's value, so runs started under the old key stay listed,
 inspectable, and cancellable under the new one. The old key stops working immediately.
 
+The same applies when you turn `FLASH_STANDALONE` on for a state directory that already
+has runs in it: the single-tenant owner adopts them, so they stay listed and cancellable
+rather than becoming invisible. This is safe only because standalone is single-tenant -
+there is one principal, so every run in that store is already yours. Do not point a
+standalone plane at the state directory of a **multi-tenant** deployment: it has no way to
+tell whose runs those were, and it will treat all of them as the operator's.
+
 Do not expose a standalone plane to untrusted callers. Put it on a private network, behind
 a VPN, or behind an authenticating reverse proxy. If you need real multi-tenancy - separate
 organizations, per-user keys, project ownership enforcement - you need an identity backend

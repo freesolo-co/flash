@@ -447,3 +447,68 @@ def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
     doc = (pathlib.Path(__file__).resolve().parent.parent / "SELF_HOSTING.md").read_text()
     assert "in-process semaphore, which is the correct" not in doc
     assert "RunPod endpoint concurrency is not capped by Flash" in doc
+
+
+def test_enabling_standalone_adopts_runs_already_in_the_store(monkeypatch, tmp_path) -> None:
+    """Switching FLASH_STANDALONE on must not orphan the runs already recorded.
+
+    A plane that ran managed first -- or ran on an earlier build -- has runs pointing at whichever
+    key row created them. Provisioning the sentinel owner without adopting them reproduces exactly
+    the bug the sentinel exists to fix: empty listing, 404 on status/logs/cancel, and an in-flight
+    job still burning GPU hours that the operator's only credential cannot stop.
+
+    Adoption is sound because standalone is SINGLE-TENANT: one principal, so every run in this
+    store is already the operator's and there is no second identity to take a run away from.
+    """
+    from flash.server import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
+
+    # managed first: an internal-key run and an external user-key run.
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    managed = auth.authenticate("Bearer operator-key")
+    assert managed is not None
+    db.record_run("run-from-managed-internal", managed["id"])
+    external = db.ensure_external_key("user-key-abc", email="user@example.com")
+    db.record_run("run-from-managed-external", external["id"])
+
+    # flip to standalone against the SAME state directory.
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    owner = auth.authenticate("Bearer operator-key")
+    assert owner is not None
+    assert owner["id"] != managed["id"], "the sentinel row is deliberately not the key-hash row"
+
+    adopted = sorted(r["run_id"] for r in db.runs_for_key(owner["id"]))
+    assert adopted == ["run-from-managed-external", "run-from-managed-internal"]
+    assert db.run_owner("run-from-managed-internal") == owner["id"]
+    assert db.run_owner("run-from-managed-external") == owner["id"]
+
+    # idempotent: re-authenticating does not churn ownership or lose a later run.
+    db.record_run("run-from-standalone", owner["id"])
+    for _ in range(3):
+        auth.authenticate("Bearer operator-key")
+    assert len(db.runs_for_key(owner["id"])) == 3
+
+
+def test_managed_mode_never_reassigns_a_users_run(monkeypatch, tmp_path) -> None:
+    """The adoption above is standalone-ONLY. In managed mode two identities coexist, so pulling
+    runs onto one row would hand another user's run to the internal key."""
+    from flash.server import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+
+    internal = auth.authenticate("Bearer operator-key")
+    assert internal is not None
+    external = db.ensure_external_key("user-key-abc", email="user@example.com")
+    db.record_run("run-internal", internal["id"])
+    db.record_run("run-external", external["id"])
+
+    for _ in range(3):
+        auth.authenticate("Bearer operator-key")
+
+    assert db.run_owner("run-external") == external["id"]
+    assert [r["run_id"] for r in db.runs_for_key(internal["id"])] == ["run-internal"]
+    assert [r["run_id"] for r in db.runs_for_key(external["id"])] == ["run-external"]

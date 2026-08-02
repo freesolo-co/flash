@@ -196,6 +196,14 @@ def ensure_standalone_owner() -> dict:
 
     Not reachable by presenting a token: nothing hashes to the sentinel, so this row is only ever
     returned to a caller who already matched the operator key in ``authenticate``.
+
+    Runs already in the store are ADOPTED, not orphaned. A plane that ran managed first -- or ran
+    on an earlier build of this code -- has runs pointing at whichever key row created them, and
+    leaving them there would reproduce the bug this row exists to fix the moment standalone is
+    switched on: empty listing, 404 on status/logs/cancel, an in-flight job still spending. Adopting
+    is sound precisely because standalone is SINGLE-TENANT: there is exactly one principal, so
+    every run in this store is already the operator's, and there is no second identity that
+    reassignment could take a run away from.
     """
     now = time.time()
     with _connect() as conn:
@@ -207,8 +215,9 @@ def ensure_standalone_owner() -> dict:
         row = conn.execute(
             "SELECT * FROM api_keys WHERE key_hash = ?", (_STANDALONE_OWNER_HASH,)
         ).fetchone()
-    if row is None:  # pragma: no cover - the row was just inserted
-        raise RuntimeError("failed to provision the standalone owner row")
+        if row is None:  # pragma: no cover - the row was just inserted
+            raise RuntimeError("failed to provision the standalone owner row")
+        conn.execute("UPDATE runs SET key_id = ? WHERE key_id != ?", (row["id"], row["id"]))
     return dict(row)
 
 
