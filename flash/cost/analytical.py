@@ -7,6 +7,8 @@ policy/reference update.
 
 from __future__ import annotations
 
+import math
+
 from flash.providers.allocator import required_vram_gb, vram_headroom
 
 from .facts import (
@@ -128,7 +130,72 @@ _REQUIRED_SAVE_COMMITS = {"sft": 2, "grpo": 2, "opd": 1}
 # was wrong, and step sweeps falsified it: the per-step floor IS this block, divided by the step
 # count of the arms it was fitted on. the double-count is avoided by moving the block out of the
 # per-step term, not by refusing to model it -- see facts._RUN_BLOCK_S.
-SFT_RUN_STARTUP_S = 68.4
+# the flat block previously here is falsified by realized sft arms, and so is the bare flops term next to it.
+# scored fit-free -- each config bounded by the fastest run of that same config, monotone-enveloped
+# in tokens -- the shipped pair quotes 13 of 13 configs BELOW a run that actually happened, at geo
+# 0.401x. a whole-run quote cannot sit under a realized instance of that whole run, so this needs no
+# regression to reject and no step leverage to believe.
+#
+# WHICH mechanism is at fault was nearly unidentifiable: every sft arm in the corpus runs the same
+# (batch_size=8, seq_len=1024) shape, and at one shape tokens = steps x 8192 exactly, so a
+# per-token rate error and a per-step overhead are the same regressor. they make opposite
+# predictions only when the shape changes -- 4x the batch costs 4x the step under a rate, but
+# AMORTIZES a per-step overhead 4x.
+#
+# the discriminator is the batch-32 cold-start anchor below (test_cold_start_calibrated_to_real_
+# short_sft_run): a real 0.8B/26-step/RTX 4090 run whose train wall came in under its 449.5 s setup.
+# extrapolating the 4090 group's measured 6.1x rate error to batch 32 predicts 762 s and BLOWS that
+# bound; a per-step overhead predicts 333 s and holds it. so the missing term is per-step, and the
+# earlier rate-multiplier form is falsified rather than merely unsupported.
+#
+# that is the same mechanism the MoE path already prices (MOE_STEP_OVERHEAD_S, "routing/dispatch/
+# kernel-launch overhead an MoE pays every step"). dense sft simply had none, so its step was billed
+# as pure matmul while dataloading, packing, the optimizer and fsdp collectives all sit in the
+# realized wall. the two stack: an MoE sft step pays both.
+#
+# every coefficient here is MEASURED, not grid-searched. within a (card, model) group the card and
+# params are fixed, so the slope of realized wall vs steps IS the per-step cost and the intercept IS
+# the block:
+#   RTX 4090 / 0.8B   block  81.7 s   7.30 s/step measured
+#   H100     / 4B     block 178.6 s   9.93 s/step measured
+# K and the exponent solve exactly from those two blocks, which are y-intercepts of wall vs steps and
+# so do not depend on how the slope is modelled.
+#
+# the SLOPE is the part that needed care. charging the shortfall as a flat per-step overhead fits
+# both groups, but only by carrying two constants (6.23 and 8.08 s/step) with no account of why they
+# differ -- card and model change TOGETHER between the two groups, so "card-invariant" was assumed,
+# never measured. and a card-invariant term is not harmless here: at 7 s/step it makes over half a 4B
+# step stop responding to card speed, which flips the A10 ahead of a faster RTX 4090 on job cost.
+# breaking card ranking is the exact failure this module exists to prevent, so that form is rejected.
+#
+# what actually happens physically is that a step this small cannot fill the GPU. below a saturation
+# size the step is launch- and occupancy-bound, so it costs what SFT_SATURATION_TOKENS would cost
+# rather than what it carries. that is ONE constant, and it is over-determined: solved independently
+# from each group it gives 55,764 and 44,016 tokens, a 1.27x spread across a 5x param and 3x card
+# span. it also reproduces the flat form's one real success -- under saturation the step time is
+# constant in batch size, which is why it satisfies the batch-32 anchor below -- while remaining
+# proportional to params and INVERSELY proportional to card speed, so ranking survives.
+#
+# the anchor is what falsified the alternative to both: a real 0.8B/26-step/RTX 4090 run at batch 32
+# whose train wall came in under its 449.5 s setup (test_cold_start_calibrated_to_real_short_sft_run).
+# every sft arm in the corpus runs one (batch_size=8, seq_len=1024) shape, and at one shape
+# tokens = steps x 8192 exactly, so a per-token rate error and a per-step floor are the same
+# regressor. only a shape change separates them: 4x the batch costs 4x the step under a rate but
+# amortizes a floor 4x. extrapolating the 4090 group's measured 6.1x rate error to batch 32 predicts
+# 762 s and BLOWS that bound; the saturating floor predicts 249 s and holds it with 200 s to spare.
+#
+# scored fit-free on the monotone lower envelope (each config bounded by the fastest run at >= its
+# own token count), this takes the model from geo 0.401x / spread 4.71x / 13 of 13 configs quoted
+# BELOW a run that actually happened, to geo 1.033x / spread 1.90x. spread is the figure that
+# matters for a selection model -- a uniform bias cancels in a ranking, variation across configs
+# does not.
+#
+# reusing the already-calibrated per-card rollout block (facts.run_block_seconds) was tried first,
+# since it would have added no new constant at all. it overshoots (geo 1.855x, worst 4.74x) because
+# that block prices a vLLM engine build and first weight sync, which an sft run never performs.
+SFT_RUN_STARTUP_K = 85.9
+SFT_RUN_STARTUP_PARAMS_EXP = 0.473
+SFT_SATURATION_TOKENS = 49152
 
 DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
 
@@ -184,15 +251,18 @@ def run_startup_seconds(config: RunConfig, gpu: str) -> float:
     """One-time startup inside the billed train wall, paid once before the first optimizer step.
 
     SFT and the rollout methods pay different blocks for different reasons, so they are fitted
-    separately: sft's is a verl launch plus model load and fsdp wrap (SFT_RUN_STARTUP_S), while a
+    separately: sft's is a verl launch plus model load and fsdp wrap (SFT_RUN_STARTUP_K), while a
     rollout run also builds the vLLM engine and does its first weight sync
     (``facts.run_block_seconds``, keyed on card because the block is card-shaped).
 
-    ``gpu`` is only consulted for rollout methods; sft's block was fitted with card held fixed and
-    has no per-class table.
+    ``gpu`` is only consulted for rollout methods; sft's block has no per-class table (see
+    SFT_RUN_STARTUP_K -- reusing the rollout block overshoots, because it prices an engine build
+    sft never performs). sft's block scales with model size instead: a flat constant is the same
+    68.4 s for a 0.8B and a 27B run, while the realized arms need 81 s and 437 s respectively.
     """
     if config.method == "sft":
-        return SFT_RUN_STARTUP_S
+        params_b = total_params_b(config.normalized().model_id)
+        return SFT_RUN_STARTUP_K * (params_b**SFT_RUN_STARTUP_PARAMS_EXP)
     if not config.has_rollout:
         return 0.0
     return run_block_seconds(gpu, resident=rollout_is_resident(config.normalized().model_id))
@@ -380,7 +450,7 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # that argues against quoting the MEAN, not against quoting anything. the alternative on
         # offer is not "a right value vs a wrong one" -- it is 0s, which is wrong for every class by
         # more than any in-range value is wrong for any single one. so the block IS quoted, once per
-        # run, at the bottom of the measured range (SFT_RUN_STARTUP_S, charged in estimate_cost
+        # run, at the bottom of the measured range (SFT_RUN_STARTUP_K, charged in estimate_cost
         # rather than here because it is per run, not per step). the floor is the one value that
         # cannot overquote any class observed, and it strictly beats zero everywhere: over all 16
         # sft arms, quoted/realized moves from a median 0.46x to 0.83x, 14 of 16 arms land closer to
@@ -391,7 +461,11 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         #
         # the per-step SFT slope is a different question and stays unchanged: pooled it is still
         # unidentifiable (0.632..1.990 s/step across pairings), and nothing above resolves it.
-        flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
+        # a step below SFT_SATURATION_TOKENS cannot fill the card, so it costs what a saturated step
+        # costs. this stays in the gpu-bound half: it is still arithmetic on this card, just at an
+        # occupancy floor, so a faster card still shortens it and extra cards still shard it.
+        step_tokens = max(n.batch_size * n.seq_len, SFT_SATURATION_TOKENS)
+        flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * step_tokens
         return flops / (peak * sft_mfu), overhead
 
     # GRPO step = rollout (G completions/prompt) + serial reward grading + policy/ref update.
@@ -512,6 +586,11 @@ def sft_seconds_for_tokens(
 
     Unlike a step, this is pure arithmetic with no non-shardable floor in it, so the WHOLE quantity
     divides by the multi-card speedup rather than half of it.
+
+    The budget is charged per STEP at the SFT_SATURATION_TOKENS floor rather than as one bulk flops
+    figure, because a step carrying fewer tokens than that floor still costs a saturated step (see
+    that constant). Pricing the budget in bulk would let a token-budgeted quote come out an order of
+    magnitude under the same run priced from its padded shape by ``step_seconds_split``.
     """
     n = config.normalized()
     # MoE prices on total params at a reduced MFU (see seconds_per_step); dense keeps active.
@@ -519,7 +598,10 @@ def sft_seconds_for_tokens(
     params = (total_params_b(n.model_id) if moe else active_params_b(n.model_id)) * 1e9
     mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
     peak = effective_train_tflops(gpu) * 1e12
-    flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * train_tokens
+    step_tokens = max(1, n.batch_size * n.seq_len)
+    steps = max(1.0, math.ceil(train_tokens / step_tokens))
+    billed_tokens = steps * max(step_tokens, SFT_SATURATION_TOKENS)
+    flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * billed_tokens
     return flops / (peak * mfu) / multi_card_speedup(gpu_count, gpu)
 
 

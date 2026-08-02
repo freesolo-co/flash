@@ -10,7 +10,7 @@ import pytest
 from flash.cost import RunConfig, estimate_cost
 from flash.cost.analytical import (
     DEFAULT_WALL_CAP_S,
-    SFT_RUN_STARTUP_S,
+    SFT_RUN_STARTUP_K,
     VLLM_INIT_S,
     multi_card_speedup,
     run_startup_seconds,
@@ -42,16 +42,17 @@ def test_run_startup_is_charged_per_method_and_per_card():
     # carried it in their per-step floor. that was wrong: the per-step floor WAS this block divided
     # by the step count of the arms it was fitted on, which is why it is charged here now and no
     # longer charged per step.
-    assert run_startup_seconds(RunConfig(MID, "sft", 32), "H100") == SFT_RUN_STARTUP_S
-    # sft's block was fitted with the card held fixed, so it has no per-class table.
-    assert run_startup_seconds(RunConfig(MID, "sft", 32), "RTX 5090") == SFT_RUN_STARTUP_S
+    sft_block = run_startup_seconds(RunConfig(MID, "sft", 32), "H100")
+    assert sft_block > 0.0
+    # sft's block has no per-class table, so it is card-invariant (it DOES scale with model size).
+    assert run_startup_seconds(RunConfig(MID, "sft", 32), "RTX 5090") == sft_block
 
     # rollout methods build a vLLM engine and do a first weight sync on top, so their block is both
     # larger than sft's and card-shaped.
     for method in ("grpo", "opd"):
         h100 = run_startup_seconds(RunConfig(MID, method, 32), "H100")
         rtx = run_startup_seconds(RunConfig(MID, method, 32), "RTX 5090")
-        assert h100 > SFT_RUN_STARTUP_S, method
+        assert h100 > sft_block, method
         assert rtx > 0.0, method
         assert h100 != rtx, method
 
@@ -64,12 +65,16 @@ def test_run_startup_is_zero_for_a_resident_rollout_engine():
     assert run_startup_seconds(RunConfig(MID, "grpo", 32), "B200") > 0.0
 
 
-def test_sft_run_startup_stays_within_the_measured_range():
-    # 68.4s is the SMALLEST per-class intercept measured on the 4090 sft arms (classes fit at 68.4 /
-    # 105.3 / 123.0s). the quote cannot see which pod class it will land on, so the floor is the one
-    # value that cannot overquote any observed class. raising it above the floor would.
-    assert pytest.approx(68.4) == SFT_RUN_STARTUP_S
-    assert 0.0 < SFT_RUN_STARTUP_S <= 68.4
+def test_sft_run_startup_scales_with_model_size():
+    # a flat block was falsified: it charges a 0.8B run and a 27B run the same 68.4s, while the
+    # realized arms need ~81s and ~437s. the block is model-shaped, so the quote must be too.
+    small = run_startup_seconds(RunConfig("Qwen/Qwen3.5-0.8B", "sft", 32), "H100")
+    mid = run_startup_seconds(RunConfig("Qwen/Qwen3.5-4B", "sft", 32), "H100")
+    big = run_startup_seconds(RunConfig("Qwen/Qwen3.6-27B", "sft", 32), "H100")
+    assert small < mid < big
+    # sublinear: a 34x parameter span must not become a 34x block, or short big-model runs blow up.
+    assert big / small < 10.0
+    assert SFT_RUN_STARTUP_K > 0.0
 
 
 def test_cost_increases_with_steps():
@@ -453,11 +458,15 @@ def test_sft_run_startup_is_charged_once_per_run_not_per_step(monkeypatch):
     grpo_before = estimate_cost(RunConfig(SMALL, "grpo", 32)).train_seconds
 
     bump = 100.0
-    monkeypatch.setattr(analytical, "SFT_RUN_STARTUP_S", analytical.SFT_RUN_STARTUP_S + bump)
+    # perturb via the multiplicative constant, then convert to the wall delta it implies.
+    scale = (analytical.SFT_RUN_STARTUP_K + bump) / analytical.SFT_RUN_STARTUP_K
+    block = analytical.run_startup_seconds(RunConfig(SMALL, "sft", 32), "H100")
+    delta = block * (scale - 1.0)
+    monkeypatch.setattr(analytical, "SFT_RUN_STARTUP_K", analytical.SFT_RUN_STARTUP_K + bump)
 
     # charged once: the same delta at 32 and at 64 steps. a per-step term would double.
-    assert estimate_cost(RunConfig(SMALL, "sft", 32)).train_seconds == pytest.approx(base_32 + bump)
-    assert estimate_cost(RunConfig(SMALL, "sft", 64)).train_seconds == pytest.approx(base_64 + bump)
+    assert estimate_cost(RunConfig(SMALL, "sft", 32)).train_seconds == pytest.approx(base_32 + delta)
+    assert estimate_cost(RunConfig(SMALL, "sft", 64)).train_seconds == pytest.approx(base_64 + delta)
     # SFT-only: grpo and opd already price this through their per-step non-shardable floor, so
     # charging them again would double-count it.
     assert estimate_cost(RunConfig(SMALL, "grpo", 32)).train_seconds == pytest.approx(grpo_before)
@@ -469,8 +478,10 @@ def test_sft_run_startup_reaches_the_token_budgeted_branch(monkeypatch):
 
     cfg = RunConfig(SMALL, "sft", 32, train_tokens=200_000)
     before = estimate_cost(cfg).train_seconds
-    monkeypatch.setattr(analytical, "SFT_RUN_STARTUP_S", analytical.SFT_RUN_STARTUP_S + 100.0)
-    assert estimate_cost(cfg).train_seconds == pytest.approx(before + 100.0)
+    block = analytical.run_startup_seconds(cfg, "H100")
+    scale = (analytical.SFT_RUN_STARTUP_K + 100.0) / analytical.SFT_RUN_STARTUP_K
+    monkeypatch.setattr(analytical, "SFT_RUN_STARTUP_K", analytical.SFT_RUN_STARTUP_K + 100.0)
+    assert estimate_cost(cfg).train_seconds == pytest.approx(before + block * (scale - 1.0))
 
 
 def test_extra_cards_shorten_the_quoted_wall():

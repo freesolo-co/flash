@@ -129,24 +129,34 @@ def test_a_one_step_run_is_won_by_the_cheaper_rate():
 
     The counterpart to the test above, and the reason it no longer prices at ``steps=1``. A run's
     wall splits into a once-per-run block (launch, model load, framework init, save) and per-step
-    work. Only the second half is where a faster card can earn back a rate premium. At one step a
-    4B sft run is 68.4s of block against a 22-30s step, so most of the bill is card-FREE seconds
-    charged at the card's rate -- and the cheaper rate wins on the majority of the wall.
+    work. Only the second half is where a faster card can earn back a rate premium. At one step a 4B
+    sft run is ~179s of block against a 34-44s step, so most of the bill is card-FREE seconds charged
+    at the card's rate -- and the cheaper rate wins on the majority of the wall.
 
     The ordering therefore MOVES with the horizon, by construction. Asserting the fast card wins at
-    every length would be asserting the block does not exist.
+    every length would be asserting the block does not exist. Which STEP it turns over on is a
+    consequence of the block/step ratio, so it is derived here rather than hardcoded: pinning a
+    literal step index would make a recalibration of either term look like a ranking regression. What
+    is actually required is that the turnover happens, happens early, and never reverses.
     """
     from flash.cost.analytical import step_cost_key
     from flash.cost.types import RunConfig
 
-    short = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=1))
-    assert short("A10", 0.60) < short("RTX 4090", 0.69)
-
-    # by 4 steps the per-step half carries enough of the bill for throughput to decide it, and it
-    # stays decided from there -- the block's share only shrinks as the run grows.
-    for steps in (4, 8, 48, 200):
+    def wins_at(steps: int) -> str:
         key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=steps))
-        assert key("RTX 4090", 0.69) < key("A10", 0.60), f"flipped back at steps={steps}"
+        return "RTX 4090" if key("RTX 4090", 0.69) < key("A10", 0.60) else "A10"
+
+    assert wins_at(1) == "A10"  # block-dominated: card-free seconds billed at the higher rate
+
+    horizons = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 48, 200]
+    winners = [wins_at(s) for s in horizons]
+    crossover = next((s for s, w in zip(horizons, winners) if w == "RTX 4090"), None)
+    assert crossover is not None, "the faster card never wins, at any horizon"
+    # early enough to matter for real runs, and monotone: once throughput decides it, it stays
+    # decided, because the block's share of the bill only shrinks as the run grows.
+    assert crossover <= 8, f"faster card does not pay off until steps={crossover}"
+    after = [w for s, w in zip(horizons, winners) if s >= crossover]
+    assert set(after) == {"RTX 4090"}, f"ranking flips back after the crossover: {list(zip(horizons, winners))}"
 
 
 def test_step_cost_ranking_declines_unknown_classes():

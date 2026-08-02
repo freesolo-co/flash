@@ -227,16 +227,19 @@ def test_run_block_table_only_lists_real_classes():
 
 def test_run_block_applies_to_rollout_methods_only():
     # the block is vllm engine build + actor->rollout weight sync, paid once per run. sft runs
-    # neither, so it pays its own smaller verl/fsdp launch instead (SFT_RUN_STARTUP_S) rather than a
+    # neither, so it pays its own smaller verl/fsdp launch instead (SFT_RUN_STARTUP_K) rather than a
     # card-shaped rollout block.
-    from flash.cost.analytical import SFT_RUN_STARTUP_S, run_startup_seconds
+    from flash.cost.analytical import run_startup_seconds
     from flash.cost.facts import run_block_seconds
     from flash.cost.types import RunConfig
 
     sft = RunConfig("Qwen/Qwen3.5-0.8B", "sft", 6, seq_len=512, batch_size=8)
-    # sft's launch is card-FREE: same on every class, because there is no engine to build.
-    for card in ("H100", "H200", "RTX 5090"):
-        assert run_startup_seconds(sft, card) == pytest.approx(SFT_RUN_STARTUP_S)
+    # sft's launch is card-FREE: same on every class, because there is no engine to build. (it does
+    # scale with MODEL size -- see test_sft_run_startup_scales_with_model_size -- which is why this
+    # compares the classes to each other rather than to a constant.)
+    sft_block = run_startup_seconds(sft, "H100")
+    for card in ("H200", "RTX 5090"):
+        assert run_startup_seconds(sft, card) == pytest.approx(sft_block)
 
     # rollout methods carry the block, and by the card's own amount -- comparing two classes
     # isolates it from anything shape-dependent, which is identical on both.
@@ -246,7 +249,7 @@ def test_run_block_applies_to_rollout_methods_only():
         h200 = run_startup_seconds(config, "H200")
         assert h200 - h100 == pytest.approx(run_block_seconds("H200") - run_block_seconds("H100"))
         # and it is materially larger than the sft launch, which is the whole reason it is separate.
-        assert h100 > SFT_RUN_STARTUP_S
+        assert h100 > sft_block
 
 
 def test_run_block_is_charged_once_per_run_not_once_per_step():
@@ -696,3 +699,137 @@ def test_rollout_slope_is_per_completion_not_per_generated_token():
     from flash.cost.facts import rollout_step_seconds
 
     assert rollout_step_seconds(64) > rollout_step_seconds(32)
+
+
+def test_whole_run_quote_never_sits_below_the_fastest_run_of_that_config():
+    """A whole-run quote cannot be smaller than a run of that exact config that actually happened.
+
+    Fit-free counterpart to ``test_run_block_never_exceeds_the_shortest_run_measured_on_that_card``:
+    that one bounds a COMPONENT from above, this bounds the TOTAL from below. It needs no regression
+    and no step/token leverage, which is what makes it usable on a corpus too thin to fit anything.
+
+    The bound is the MONOTONE LOWER ENVELOPE, not the raw fastest wall: each config is bounded by the
+    fastest run at >= its own token count. Two SFT cells are non-monotone in tokens (H100/4B ran
+    527.9 s at 2081 tok but 210.3 s at 32197 tok; RTX 4090/0.8B ran 323.3 s at 128483 tok but 282.6 s
+    at 256052 tok). More work cannot take less time on the same card and model, so those walls carry
+    a pod-specific slug and bound nothing. Enveloping can only LOWER a bound, never invent headroom.
+
+    This caught the defect the SFT constants now correct: the shipped flat block plus a bare flops
+    term quoted 13 of 13 configs BELOW a realized run, at geo 0.401x with 4.71x spread. OPD, scored
+    the same way on the same corpus, was already sound at geo 1.005x -- which is what shows the check
+    measures something real instead of firing on whatever it is pointed at.
+    """
+    import math
+
+    from flash.cost.analytical import (
+        run_startup_seconds,
+        seconds_per_step,
+        sft_seconds_for_tokens,
+    )
+    from flash.cost.types import RunConfig
+
+    # (card, model, train_tokens) -> fastest realized TRAIN wall at >= that token count, on the
+    # canonical (batch_size=8, seq_len=1024) SFT cell. Worker metrics.json, completed runs only.
+    sft_envelope = {
+        ("H100", "Qwen/Qwen3.5-0.8B", 32197): 82.3,
+        ("H100", "Qwen/Qwen3.5-4B", 2081): 210.3,
+        ("H100", "Qwen/Qwen3.5-4B", 32197): 210.3,
+        ("H100", "Qwen/Qwen3.5-4B", 64576): 215.5,
+        ("H100", "Qwen/Qwen3.5-4B", 128483): 372.9,
+        ("H100", "Qwen/Qwen3.5-4B", 256052): 489.4,
+        ("H100", "Qwen/Qwen3.6-27B", 8048): 437.4,
+        ("RTX 4090", "Qwen/Qwen3.5-0.8B", 2081): 85.5,
+        ("RTX 4090", "Qwen/Qwen3.5-0.8B", 32197): 89.6,
+        ("RTX 4090", "Qwen/Qwen3.5-0.8B", 64576): 113.2,
+        ("RTX 4090", "Qwen/Qwen3.5-0.8B", 128483): 282.6,
+        ("RTX 4090", "Qwen/Qwen3.5-0.8B", 256052): 282.6,
+        ("RTX 4090", "Qwen/Qwen3.5-4B", 32197): 290.4,
+    }
+
+    ratios = []
+    for (card, model, tokens), fastest in sft_envelope.items():
+        cfg = RunConfig(model, "sft", 1, batch_size=8, seq_len=1024)
+        quote = run_startup_seconds(cfg, card) + sft_seconds_for_tokens(cfg, card, tokens, 1)
+        ratios.append(quote / fastest)
+
+    geo = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
+    spread = max(ratios) / min(ratios)
+
+    # The SFT replicate noise floor is 1.722x, so a single config landing under 1.0 is inside what
+    # pod variance explains. What is NOT allowed is the systematic shortfall the flat block produced:
+    # every config low at once, with a geometric mean far outside that floor.
+    assert 1.0 / 1.722 < geo < 1.722, (
+        f"sft geo {geo:.3f}x is outside the 1.722x replicate noise floor; the shipped flat block "
+        f"scored 0.401x here (13/13 configs quoted below a run that actually happened)"
+    )
+    assert sum(1 for r in ratios if r < 1.0) <= len(ratios) // 2, (
+        "more than half of sft configs are quoted below their own fastest realized run, which is "
+        "the systematic-underquote signature rather than run-to-run variance"
+    )
+    # Spread is the estimand that matters for a SELECTION model: a uniform bias cancels in a ranking,
+    # variation across configs does not. The flat block scored 4.71x.
+    assert spread < 2.5, f"sft error spread {spread:.2f}x across configs (flat block scored 4.71x)"
+
+    # OPD: the control. Same estimand, same corpus discipline, calibrated on grpo arms and never
+    # refitted -- so if the SFT assertions above ever fail, this passing shows the corpus and the
+    # scoring are intact and the defect is specific to sft.
+    opd_envelope = {
+        ("H100", "Qwen/Qwen3.5-0.8B", 8): 645.9,
+        ("RTX 4090", "Qwen/Qwen3.5-0.8B", 4): 461.6,
+        ("RTX 4090", "Qwen/Qwen3.5-0.8B", 8): 631.7,
+        ("RTX 4090", "Qwen/Qwen3.5-0.8B", 16): 966.5,
+        ("RTX 4090", "Qwen/Qwen3.5-0.8B", 48): 1962.3,
+    }
+    rollout_noise_floor = 1.194
+    for (card, model, steps), fastest in opd_envelope.items():
+        cfg = RunConfig(model, "opd", steps, batch_size=8, group_size=4, seq_len=1024)
+        quote = run_startup_seconds(cfg, card) + steps * seconds_per_step(cfg, card)
+        assert quote >= fastest / rollout_noise_floor, (
+            f"opd {card}/{model} x{steps}: quote {quote:.1f}s undercuts its fastest realized run "
+            f"{fastest:.1f}s by {fastest / quote:.2f}x, past the {rollout_noise_floor}x floor"
+        )
+
+
+def test_small_sft_step_prices_at_the_saturation_floor_but_still_tracks_card_speed():
+    """Pins BOTH halves of the mechanism the batch-32 anchor and card ranking jointly selected.
+
+    Every sft arm runs (batch_size=8, seq_len=1024), and at a single shape tokens = steps x 8192, so
+    a per-token rate error and a per-step floor are the same regressor. They diverge only when the
+    shape changes: 4x the batch costs 4x the step under a rate, but is absorbed by a floor.
+    Extrapolating the 4090 group's measured 6.1x rate error to the batch-32 anchor predicts a 762 s
+    train wall against a run recorded as cold-start dominated under 449.5 s of setup; the floor
+    predicts 249 s. So the correction is a floor, and a refit cannot move it back into the rate term.
+
+    A FLAT per-step overhead also clears that bar, and is the trap this second half exists to block:
+    being card-invariant it made over half a 4B step stop responding to card speed, which put the A10
+    ahead of a faster RTX 4090 on job cost and broke the ranking this module exists to produce. The
+    floor is an occupancy limit on real arithmetic, so it stays proportional to params and inverse in
+    card speed. Both properties are asserted here because satisfying only the first is what made the
+    wrong model look correct.
+    """
+    from flash.cost.analytical import SFT_SATURATION_TOKENS, step_seconds_split
+    from flash.cost.types import RunConfig
+
+    small = RunConfig("Qwen/Qwen3.5-0.8B", "sft", 26, batch_size=8, seq_len=1024)
+    wide = RunConfig("Qwen/Qwen3.5-0.8B", "sft", 26, batch_size=32, seq_len=1024)
+    assert 8 * 1024 < SFT_SATURATION_TOKENS and 32 * 1024 < SFT_SATURATION_TOKENS
+    small_gpu, small_fixed = step_seconds_split(small, "RTX 4090")
+    wide_gpu, wide_fixed = step_seconds_split(wide, "RTX 4090")
+
+    # both shapes sit under the floor, so 4x the tokens per step costs the SAME step. under a pure
+    # rate wide_gpu would be 4x small_gpu, which is what the anchor rejected.
+    assert wide_gpu == pytest.approx(small_gpu, rel=1e-6)
+    assert wide_fixed == pytest.approx(small_fixed, rel=1e-6)
+
+    # ...and yet the floored step is still arithmetic: a 3x faster card runs it ~3x quicker. a flat
+    # overhead would make these equal, which is precisely how it inverted the card ranking.
+    fast_gpu, _ = step_seconds_split(small, "H100")
+    assert small_gpu > 2.0 * fast_gpu, (
+        f"floored step must still track card speed: RTX 4090 {small_gpu:.2f}s vs H100 "
+        f"{fast_gpu:.2f}s is too flat to rank cards on"
+    )
+
+    # and still with model size, so a 27B step is not priced like a 0.8B one.
+    big = RunConfig("Qwen/Qwen3.6-27B", "sft", 26, batch_size=8, seq_len=1024)
+    big_gpu, _ = step_seconds_split(big, "RTX 4090")
+    assert big_gpu > 5.0 * small_gpu

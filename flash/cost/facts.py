@@ -192,7 +192,7 @@ ROLLOUT_SECONDS_PER_COMPLETION = 0.66
 
 # Per-RUN rollout block: vllm engine build, the first actor->rollout weight sync, and trainer/replay
 # init. Paid ONCE before the first step, not on every step. It lands after ``setup_seconds`` is
-# stamped, so like sft's SFT_RUN_STARTUP_S it is billed inside the train wall.
+# stamped, so like sft's SFT_RUN_STARTUP_K it is billed inside the train wall.
 #
 # This table replaces a per-STEP constant, and the replacement is the fix, not a re-tuning. That
 # constant was fitted per arm as median(realized - compute - slope*completions), and the corpus was
@@ -231,7 +231,7 @@ ROLLOUT_SECONDS_PER_COMPLETION = 0.66
 # Every arm is a ROLLOUT (grpo/opd) arm on RUNPOD. Two limits follow, both deliberate:
 #   - sft is excluded at the call site (see analytical.run_startup_seconds), on mechanism not
 #     measurement: sft runs no vllm engine and no weight sync, so the block this table measures has
-#     no source there. sft keeps its own SFT_RUN_STARTUP_S.
+#     no source there. sft keeps its own SFT_RUN_STARTUP_K.
 #   - it is keyed on card alone, not (card, provider). A matched lambda/vast replication returned
 #     zero usable timings (8/8 arms died in provisioning, step-0 wedge, or a trainer crash), so a
 #     provider term is unmeasured rather than measured-and-rejected. Card-only is the conservative
