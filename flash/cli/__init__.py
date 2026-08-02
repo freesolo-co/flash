@@ -553,6 +553,15 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="key=value",
         help="override a config value; repeatable",
     )
+    train.add_argument(
+        "--gpus",
+        type=int,
+        metavar="N",
+        help=(
+            "cards to run the job on; sets [gpu] count (1-8). "
+            "more than one also needs an explicit [gpu] provider that rents n cards on one machine"
+        ),
+    )
     train.add_argument("--dry-run", action="store_true")
     train.add_argument(
         "--cost",
