@@ -98,9 +98,10 @@ _TEXT_TEACHER_FLUSH_WAIT_S = 0.1
 _TEXT_TEACHER_SHUTDOWN_WAIT_S = 5.0
 _TEXT_TEACHER_REQUEST_BACKLOG = 64
 
-# opd supervises the teacher's distribution, not a task reward, so every rollout scores zero. this
-# exists only to keep verl's reward loop out of its builtin data_source registry -- see the call
-# site for why the loop runs at all when use_task_rewards is false.
+# opd supervises the teacher's distribution, not a task reward, so every rollout scores zero. the
+# score is unreachable either way: use_task_rewards=false makes verl zero the whole policy loss
+# (distillation/losses.py:211), so nothing a scorer returns can enter the gradient. this exists
+# only to keep the reward loop out of its builtin data_source registry -- see the call site.
 _OPD_ZERO_REWARD_SOURCE = '''"""flash opd reward shim (generated). opd carries no task reward."""
 
 
@@ -2410,12 +2411,12 @@ def run_opd_train(spec=None) -> None:
     entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
     with open(entry_path, "w", encoding="utf-8") as file:
         file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
-    # opd carries no task reward: the distillation loss sets use_task_rewards=false and the plugin
-    # assigns reward_score=0.0 itself. but verl's reward loop still runs, and with no custom
-    # function configured it falls through to the default rule-based scorer, which dispatches on
-    # data_source against a builtin registry that has never heard of "flash_opd" and raises
-    # NotImplementedError on every rollout (reward_loop.py:146-155). supply the zero function so
-    # the loop takes the custom branch and never consults that registry.
+    # opd carries no task reward: use_task_rewards=false makes verl discard the policy loss the
+    # score would feed. the reward loop still runs regardless, and with no custom function it falls
+    # through to the default rule-based scorer, which dispatches on data_source against a builtin
+    # registry that has never heard of "flash_opd" and raises NotImplementedError on every rollout
+    # (reward_loop.py:146-155). supply the zero function so the loop takes the custom branch and
+    # never consults that registry.
     reward_path = os.path.join(shim_dir, "flash_opd_reward.py")
     with open(reward_path, "w", encoding="utf-8") as file:
         file.write(_OPD_ZERO_REWARD_SOURCE)

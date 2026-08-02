@@ -4783,7 +4783,9 @@ def test_generated_opd_reward_shim_scores_every_rollout_zero():
     add signal the objective never asked for.
     """
     namespace: dict = {}
-    exec(opd_train._OPD_ZERO_REWARD_SOURCE, namespace)  # noqa: S102 - generated worker source
+    # exec, not import: the shim only exists on disk inside a live workdir, and the constant is
+    # what actually ships to the worker.
+    exec(opd_train._OPD_ZERO_REWARD_SOURCE, namespace)
 
     compute_score = namespace["compute_score"]
     assert compute_score("flash_opd", "any completion", "") == 0.0
