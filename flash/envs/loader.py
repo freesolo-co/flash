@@ -230,7 +230,14 @@ def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
 
 
 def _github_token() -> str | None:
-    return os.environ.get("GITHUB_TOKEN")
+    """The GitHub token, or ``None`` when unset OR blank.
+
+    Blank must collapse to ``None``, not fall through as a truthy string: a whitespace-only
+    GITHUB_TOKEN would otherwise build ``Authorization: Bearer <whitespace>``, and GitHub REJECTS a
+    malformed credential rather than treating the request as anonymous - so a public repo that
+    loads fine with no token at all would fail with one that is merely blank.
+    """
+    return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
 
 
 def _is_commit_sha(value: str) -> bool:

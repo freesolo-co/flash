@@ -132,8 +132,14 @@ With it set:
   reconciliation, checkpoint registration, the shared RunPod slot store, and the hosted
   artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
   (and, for the GC, `serve.freesolo.co`) and log a warning per run or per startup.
-  RunPod endpoint concurrency falls back to an in-process semaphore, which is the correct
-  cap for a single-replica deployment.
+
+> **RunPod endpoint concurrency is not capped by Flash**, on a self-hosted plane or a
+> managed one. The slot store and the in-process semaphore behind it are both claimed from
+> a code path the live deploy no longer uses, so neither enforces the intended 58-endpoint
+> ceiling; `flash/providers/runpod/train/endpoints.py` documents this at the constant. If
+> you expect many concurrent runs, cap them upstream of Flash or raise the worker quota on
+> your RunPod account - otherwise a large enough burst hits RunPod's account limit and the
+> excess deploys fail there.
 
 ### The security model
 

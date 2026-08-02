@@ -130,8 +130,12 @@ def test_standalone_disables_the_artifact_gc_sweep(monkeypatch) -> None:
     assert repo_cleanup_enabled() is False
 
 
-def test_standalone_falls_back_to_the_in_process_slot_semaphore(monkeypatch) -> None:
-    """The shared RunPod slot store is a backend table; standalone caps concurrency in-process."""
+def test_standalone_does_not_reach_for_the_shared_slot_store(monkeypatch) -> None:
+    """The shared RunPod slot store is a backend table, so standalone must not try to lease from it.
+
+    That is all this pins. It does NOT mean concurrency is capped instead: the in-process semaphore
+    behind the store is claimed from `get_train_endpoint`, which the live deploy path replaced, so
+    neither enforces the ceiling (see the note at RUNPOD_ENDPOINT_SLOT_CAP)."""
     from flash.providers.runpod import slots
 
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
@@ -365,3 +369,81 @@ def test_the_env_template_does_not_preset_the_hosted_serving_url() -> None:
                 f".env.example:{lineno} assigns FREESOLO_SERVING_URL={value!r}; it must stay "
                 "commented so a standalone plane's serving guard actually fires"
             )
+
+
+def test_the_serving_header_carries_the_same_key_the_plane_authenticates(monkeypatch) -> None:
+    """`authenticate` strips the operator key, so the client header must strip it too.
+
+    A trailing newline is routine in a `.env` file. Unstripped it authenticates against the plane
+    but is an ILLEGAL header value, so httpx rejects the request before it leaves; a stray space
+    authenticates and then presents a different credential to the serving backend. Either way
+    deploy/undeploy/chat break for a configuration the plane itself accepts."""
+    from flash.serve import deploy
+
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key\n")
+    assert deploy._internal_key_header() == {"X-Freesolo-Internal-Key": "operator-key"}
+
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "  operator-key  ")
+    header = deploy._internal_key_header()
+    assert header == {"X-Freesolo-Internal-Key": "operator-key"}
+    # the exact value the plane would accept, byte for byte.
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    row = auth.authenticate(f"Bearer {header['X-Freesolo-Internal-Key']}")
+    assert row is not None
+    assert row["auth_kind"] == "internal"
+
+    # blank collapses to NO header, matching what an unset key already does.
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "   ")
+    assert deploy._internal_key_header() == {}
+
+
+def test_a_blank_github_token_is_not_forwarded_as_a_credential(monkeypatch) -> None:
+    """GitHub REJECTS a malformed bearer token rather than falling back to anonymous, so a
+    whitespace-only GITHUB_TOKEN makes PUBLIC environment repos fail -- repos that load fine with
+    no token at all. Every consumer must read blank as absent."""
+    from flash.envs import loader
+    from flash.server import envs as server_envs
+
+    monkeypatch.setenv("GITHUB_TOKEN", "   \n  ")
+    assert loader._github_token() is None
+    assert server_envs._github_token() is None
+    assert "Authorization" not in loader._github_headers("application/vnd.github+json")
+
+    # a real token still authenticates, stripped.
+    monkeypatch.setenv("GITHUB_TOKEN", " ghp_real \n")
+    assert loader._github_token() == "ghp_real"
+    assert (
+        loader._github_headers("application/vnd.github+json")["Authorization"] == "Bearer ghp_real"
+    )
+
+
+def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
+    """The worker's git askpass branches on presence, so forwarding a blank token turns an
+    anonymous public clone into an authenticated one with an invalid credential."""
+    from flash.providers._worker import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+
+    monkeypatch.setenv("GITHUB_TOKEN", "  \t ")
+    monkeypatch.setenv("HF_TOKEN", " hf_real ")
+    env = build_worker_env(spec, 0)
+    assert "GITHUB_TOKEN" not in env
+    # the real token still travels, stripped: this is a blank-only rejection, not a blanket one.
+    assert env["HF_TOKEN"] == "hf_real"
+
+
+def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
+    """The slot store and its in-process fallback are both claimed from `get_train_endpoint`, which
+    the live `jobs.py::_deploy_once` path replaced. Telling a self-hoster the semaphore is "the
+    correct cap" invites them to run bursts that RunPod, not Flash, ends up rejecting."""
+    import pathlib
+
+    doc = (pathlib.Path(__file__).resolve().parent.parent / "SELF_HOSTING.md").read_text()
+    assert "in-process semaphore, which is the correct" not in doc
+    assert "RunPod endpoint concurrency is not capped by Flash" in doc

@@ -255,7 +255,13 @@ def serving_openai_base_url() -> str:
 
 
 def _internal_key_header() -> dict[str, str]:
-    key = os.environ.get("FREESOLO_INTERNAL_KEY") or ""
+    # Stripped for the same reason `authenticate` strips: the two must agree on what the key IS.
+    # A trailing newline (routine in a `.env` file) authenticates fine against the plane but is an
+    # illegal header value, so httpx rejects the request outright; a stray space authenticates and
+    # then presents a DIFFERENT credential to the serving backend. Either way deploy/undeploy/chat
+    # break for a config the plane itself accepts. Blank collapses to no header rather than an
+    # empty one, which is what an unset key already does.
+    key = (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
     return {"X-Freesolo-Internal-Key": key} if key else {}
 
 
