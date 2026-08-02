@@ -334,3 +334,73 @@ def test_multi_card_speedup_never_decreases_with_card_count():
     for name in ("A100 SXM", "RTX 4090", "H100", "unlisted-class"):
         vals = [multi_card_speedup(n, name) for n in range(1, 9)]
         assert vals == sorted(vals), f"{name} speedup decreases: {vals}"
+
+
+def test_resident_rollout_is_not_charged_the_engine_cycle():
+    # the constant is vllm engine entry/exit + weight sync. a sleep_unsupported model pins its
+    # rollout engine RESIDENT (catalog.py, backend_common.rollout_resident_overrides), so that cycle
+    # never runs and charging it extrapolates outside the fit: all 56 fitted arms are sleep-capable
+    # 0.8b/2b/4b models. the error is not marginal -- on qwen3.6-35b-a3b the h200 constant (126.4s)
+    # alone exceeds the ~24s realized grpo step analytical.py documents for that model.
+    from flash.cost.facts import rollout_is_resident, step_floor_seconds
+
+    assert rollout_is_resident("Qwen/Qwen3.6-35B-A3B")
+    assert not rollout_is_resident("Qwen/Qwen3.5-0.8B")
+
+    for card in ("B200", "H200"):
+        sleeping = step_floor_seconds(card, 0)
+        resident = step_floor_seconds(card, 0, resident=True)
+        assert resident == pytest.approx(0.0)
+        # guards the mutation "resident flag ignored": that returns the sleeping value here.
+        assert sleeping > 50.0
+
+
+def test_resident_rollout_still_pays_the_per_completion_slope():
+    # the opposite error, and the reason resident is not simply floor=0: a resident engine skips the
+    # entry/exit CYCLE, not the per-sequence sampling/detokenize/dispatch work. zeroing the whole
+    # wall would under-quote every resident step by slope*completions.
+    from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, step_floor_seconds
+
+    assert step_floor_seconds("H200", 64, resident=True) == pytest.approx(
+        64 * ROLLOUT_SECONDS_PER_COMPLETION
+    )
+
+
+def test_cost_and_worker_agree_on_which_rollouts_are_resident():
+    # two readers of one catalog flag. if they diverge the quote prices a mode the worker is not in,
+    # and nothing else in the suite would notice -- so compare them across the WHOLE catalog rather
+    # than on the one model that happens to be flagged today.
+    from flash.catalog import MODELS
+    from flash.cost.facts import rollout_is_resident
+    from flash.engine.worker.backend_common import rollout_sleep_unsupported
+
+    for model_id in MODELS:
+        assert rollout_is_resident(model_id) == rollout_sleep_unsupported(model_id), model_id
+
+
+def test_resident_flag_reaches_the_quote_not_just_the_helper():
+    # step_floor_seconds honouring `resident` is worthless if step_seconds_split never passes it.
+    # the helper-level tests above cannot see that wiring: they call the helper directly, so a
+    # call site that drops the argument leaves them all green. this asserts through the real quote.
+    from flash.cost.analytical import step_seconds_split
+    from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, step_floor_seconds
+    from flash.cost.types import RunConfig
+
+    shape = {"seq_len": 512, "completion_len": 128, "batch_size": 8, "group_size": 4}
+    completions = shape["batch_size"] * shape["group_size"]
+    slope = completions * ROLLOUT_SECONDS_PER_COMPLETION
+
+    for method in ("grpo", "opd"):
+        # reward/teacher wait zeroed so `fixed` is the rollout wall plus overhead only.
+        cfg = RunConfig(
+            "Qwen/Qwen3.6-35B-A3B",
+            method,
+            6,
+            reward_seconds_per_completion=0.0,
+            **shape,
+        )
+        _, fixed = step_seconds_split(cfg, "H200")
+        # the h200 constant is 126.4s; if it were still charged `fixed` would clear it outright.
+        assert fixed < step_floor_seconds("H200"), method
+        # and the slope is still in there -- this is not a "wall deleted" pass.
+        assert fixed >= slope, method

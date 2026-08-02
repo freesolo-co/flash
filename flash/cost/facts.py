@@ -232,16 +232,51 @@ _STEP_FLOOR_S: dict[str, float] = {
 _DEFAULT_STEP_FLOOR_S = 52.5
 
 
-def step_floor_seconds(name: str, completions: int = 0) -> float:
+def rollout_is_resident(model_id: str) -> bool:
+    """Whether ``model_id``'s rollout engine stays resident instead of sleeping between steps.
+
+    Reads the same ``sleep_unsupported`` catalog flag the worker does
+    (``engine.worker.backend_common.rollout_sleep_unsupported``), rather than importing it, to keep
+    the cost model off the worker import path. The flag is the single source of truth for both.
+    """
+    from flash.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    return bool(info is not None and getattr(info, "sleep_unsupported", False))
+
+
+def step_floor_seconds(name: str, completions: int = 0, resident: bool = False) -> float:
     """Wall time of one rollout step on ``name`` that no amount of FLOPs shortens.
 
     ``const_card + slope * completions``. The constant is engine entry/exit and the actor->rollout
     weight sync; the slope is per-sequence rollout work. Neither is arithmetic, so neither shrinks on
     a faster card, and (see ``providers.allocator``) neither shards across more of them.
+
+    ``resident=True`` drops the constant for a model the catalog flags ``sleep_unsupported``. Those
+    pin the rollout engine resident instead of sleeping it (catalog.py, backend_common.py), so the
+    engine entry/exit cycle the constant is made of never runs. Charging it anyway extrapolates well
+    past the fit: every one of the 56 arms is a sleep-capable 0.8B/2B/4B model, so a resident rollout
+    was never measured. It is not a small error -- on Qwen3.6-35B-A3B the constant alone (55.4s B200,
+    126.4s H200) exceeds this module's own ~24s realized-step figure for that model, so the quote is
+    dominated by a term whose mechanism is switched off.
+
+    The SLOPE is still charged: a resident engine skips the cycle, not the per-sequence sampling,
+    detokenization and dispatch work. Zero here would be the opposite error. The slope itself is
+    still fitted on sleeping arms, so a resident quote is bounded by measurement on one term and by
+    mechanism on the other -- documented rather than silently assumed.
+
+    Known under-quote, MULTI-TURN. ``completions`` is the episode count, but a multi-turn env issues
+    one vLLM ``generate`` per assistant turn (``worker/grpo_multiturn.py``), so turns 2..N escape the
+    slope and a long-episode run is under-quoted by roughly (turns - 1) x slope x completions. It is
+    not fixed here because the turn shape does not reach this layer: ``max_turns`` is read on the
+    worker via ``getattr(env, "max_turns", ...)`` off the user's loaded environment object, and
+    neither it nor ``multi_turn`` exists on ``RunConfig`` or in the spec. A blanket multiplier was
+    rejected as the wrong trade -- it would inflate every single-turn run, which is the entire fitted
+    corpus, to hedge a shape this layer cannot observe. Threading the turn shape into the pricing
+    config is the fix, and it is a spec-path change.
     """
-    return _STEP_FLOOR_S.get(name, _DEFAULT_STEP_FLOOR_S) + (
-        ROLLOUT_SECONDS_PER_COMPLETION * max(0, completions)
-    )
+    const = 0.0 if resident else _STEP_FLOOR_S.get(name, _DEFAULT_STEP_FLOOR_S)
+    return const + (ROLLOUT_SECONDS_PER_COMPLETION * max(0, completions))
 
 
 def gpu_hourly_usd(

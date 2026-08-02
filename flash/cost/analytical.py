@@ -20,6 +20,7 @@ from .facts import (
     model_quant,
     pick_gpu,
     reward_seconds_per_completion,
+    rollout_is_resident,
     step_floor_seconds,
     teacher_seconds_per_completion,
     teacher_token_cost_usd,
@@ -250,7 +251,12 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # per-completion sequences, so both the constant and the slope apply. that is the mechanism
         # the wall measures, but note every arm it was FITTED on is grpo, so the size of the opd wall
         # is inferred from a shared mechanism rather than measured on opd arms.
-        return gen_s + update_s, overhead + teacher_s + step_floor_seconds(gpu, completions)
+        #
+        # opd honours the resident flag for the same reason grpo does: opd_train pins the rollout
+        # resident off the same catalog flag, so the engine cycle is absent on both drivers.
+        return gen_s + update_s, overhead + teacher_s + step_floor_seconds(
+            gpu, completions, resident=rollout_is_resident(n.model_id)
+        )
 
     if not n.is_grpo:
         # NO rollout wall here, neither term. sft is a plain fwd/bwd loop: no vllm engine to enter and
@@ -280,7 +286,12 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     # conflated before: the rollout slope (0.81s) is close enough to the reward default (1.0s) that
     # one term could stand in for both, right up until a caller passed a MEASURED reward latency --
     # real graders here are ~0.0003s -- and the rollout cost vanished with it. see facts.py.
-    return gen_s + update_s, overhead + reward_s + step_floor_seconds(gpu, completions)
+    #
+    # a sleep_unsupported model keeps its rollout engine RESIDENT, so it never pays the entry/exit
+    # cycle the constant is made of -- see step_floor_seconds. the slope still applies.
+    return gen_s + update_s, overhead + reward_s + step_floor_seconds(
+        gpu, completions, resident=rollout_is_resident(n.model_id)
+    )
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
