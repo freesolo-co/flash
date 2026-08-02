@@ -203,7 +203,7 @@ def test_rollout_wall_survives_a_measured_reward_latency():
     # guess (1.0s/completion) that one term appeared to cover both -- until a caller supplied a
     # MEASURED reward latency. real graders in the calibration corpus grade in ~0.0003s, so passing
     # the true value used to delete ~32s of real rollout wall along with the fictitious reward and
-    # collapsed the quote from geo-bias 1.00x to 0.50x. the more accurate the caller's input, the
+    # collapsed the quote from geo-bias 1.017x to 0.517x. the more accurate the caller's input, the
     # worse the estimate.
     #
     # asserting the delta alone would be UNFALSIFIABLE: the drop equals the reward difference under

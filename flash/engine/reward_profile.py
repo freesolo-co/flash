@@ -2,11 +2,16 @@
 
 Single-turn grpo grades a step's completions one at a time (the verl bridge holds a lock to keep it
 that way), so grading is pure wall-clock the gpu spends idle. On an A100 PCIe at the default 64x8
-shape that is 80.8% of every step at a 1s grader and 92.7% at a 3s judge.
+shape that is 46.8% of every step at a 1s grader and 72.5% at a 3s judge.
 
-The cost model has to price that from a single ``AVG_REWARD_SECONDS_PER_COMPLETION = 1.0`` guess
+The cost model has to price that from a single ``AVG_REWARD_SECONDS_PER_COMPLETION = 0.05`` guess
 covering graders whose real span is ~0.01s (regex) to ~3s (llm judge). This measures the actual
 value on the actual env before training starts.
+
+That default is small on purpose, and passing a real measurement here is what makes it safe. It
+prices GRADING ONLY. The rollout wall a step also pays is priced separately by
+``step_floor_seconds``, so a measured latency now shrinks the grading term without deleting the
+rest of the step -- which is exactly what a single conflated constant used to do.
 
 Three things this deliberately does NOT do:
 

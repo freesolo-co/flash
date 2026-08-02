@@ -173,9 +173,15 @@ def effective_train_tflops(name: str) -> float:
 # per-completion ROLLOUT cost through the reward term. That is not a harmless mislabel -- envs that
 # profile their real grader (see engine/reward_profile.py) pass a measured
 # ``reward_seconds_per_completion``, and the real values here are ~0.0003s. Under the constant-only
-# model, supplying a measured reward latency collapsed the quote from geo-bias 1.00x (50/56 in band)
-# to 0.50x (11/56): the more accurate the caller's reward number, the worse the estimate. Splitting
-# the terms means reward and rollout are each priced by their own measurement.
+# model, supplying a measured reward latency collapsed the quote from geo-bias 1.017x (50/56 in
+# band) to 0.517x (15/56): the more accurate the caller's reward number, the worse the estimate.
+# Splitting the terms means reward and rollout are each priced by their own measurement.
+#
+# Honest scoring note: leave-one-out over the 56 arms puts two-term at 1.007x/50-56 against
+# const-only's 1.017x/50-56, so pooled this is a TIE on accuracy, not a win. It is kept for the
+# robustness above and for the high-completion bucket the first fit could not see (g>=129:
+# 1.183x -> 1.022x). Scored by LOOCV because the natural holdout contains the only two A100 SXM
+# arms, which are also the sole source of that class's constant.
 ROLLOUT_SECONDS_PER_COMPLETION = 0.81
 
 # Per-card constant, fitted as the MEDIAN of (realized - compute - slope*completions) so one
@@ -393,7 +399,7 @@ def download_weight_gb(model_id: str, revision: str = "") -> float:
 # value was doing a second, undeclared job: it was the only per-completion term in the model, so it
 # also stood in for rollout cost, which is ~0.81s/completion (see ROLLOUT_SECONDS_PER_COMPLETION).
 # The two are now separate, and leaving this at 1.0 would charge that rollout cost twice -- it
-# over-quotes the 56-arm corpus at geo-bias 1.46x, with only 28/56 arms in band.
+# over-quotes the 56-arm corpus at geo-bias 1.462x, with only 26/56 arms in band.
 #
 # 0.05s is a grading-only default. It is NOT the corpus minimum: every env measured here is a fast
 # programmatic grader (~0.0003s), and fitting to that would publish "grading is free" and badly
