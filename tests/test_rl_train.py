@@ -6024,12 +6024,17 @@ def test_the_rl_trainer_stores_the_frozen_base_in_bf16():
     succeeded and its grpo and opd legs failed on the same model and the same card.
     """
     overrides = rl_train.build_verl_overrides(_overrides_cfg())
-    for key in ("actor", "ref"):
-        want = f"actor_rollout_ref.{key}.fsdp_config.model_dtype=bfloat16"
-        # exact, not substring: "x=bfloat16" is a substring of "+x=bfloat16", so the obvious `in`
-        # assertion passes against a spelling hydra REJECTS here ("Could not append to config. An
-        # item is already at ..."). both keys are declared in the yaml and take a BARE override --
-        # the inverse of enable_sleep_mode, which is dataclass-only and requires `+`. neighbouring
-        # keys, opposite prefixes. see ISSUES.md VERL-150.
-        assert want in overrides, key
-        assert f"+{want}" not in overrides, f"{key} must not be + prefixed"
+    want = "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16"
+    # exact, not substring: "x=bfloat16" is a substring of "+x=bfloat16", so the obvious `in`
+    # assertion passes against a spelling hydra REJECTS here ("Could not append to config. An item
+    # is already at ..."). the key is declared in the yaml and takes a BARE override -- the inverse
+    # of enable_sleep_mode, which is dataclass-only and requires `+`. neighbouring keys, opposite
+    # prefixes. see ISSUES.md VERL-150.
+    assert want in overrides
+    assert f"+{want}" not in overrides, "must not be + prefixed"
+    # ref is deliberately NOT set. it reads like a second resident copy and is not one:
+    # ray_trainer.py:897 aliases ref_policy_wg to the actor worker whenever ref_in_actor holds, and
+    # flash parses lora_rank with minimum=1 (schema/__init__.py:485) so it always holds. setting it
+    # would free nothing. this asserts the absence so a future reader has to re-derive the above
+    # rather than pattern-match it back in.
+    assert not [o for o in overrides if "ref.fsdp_config.model_dtype" in o]

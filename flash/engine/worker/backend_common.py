@@ -545,17 +545,19 @@ def trainer_dtype_overrides() -> list[str]:
     (``peft/mapping_func.py:35``, not overridden by verl) and casts adapter weights UP to fp32 for
     training stability, so a bf16 base still yields fp32 ``lora_*`` params.
 
-    ``actor`` and ``ref`` are separate keys and both matter -- the reference model is a second
-    resident copy of the same base. both are declared in the yaml, so both take a BARE override and
-    ``+`` is REJECTED (``Could not append to config. An item is already at ...``). that is the exact
-    inverse of ``rollout_resident_overrides``' ``enable_sleep_mode``, which is dataclass-only and
-    requires ``+``. neighbouring keys, opposite prefixes: check the yaml per key, never pattern-match
-    off a nearby override.
+    only ``actor`` is set. ``ref`` looks like a second resident copy worth shrinking, and is not:
+    ``ray_trainer.py:897`` assigns ``self.ref_policy_wg = self.actor_rollout_wg`` -- literally the
+    same object -- whenever ``ref_in_actor`` holds, and the separate ref worker at :884 is built only
+    ``if not self.ref_in_actor``. the reference policy here is the actor with its adapter disabled,
+    so a ``ref`` dtype override would free nothing on any run flash submits.
+
+    the key is declared in the yaml, so it takes a BARE override and ``+`` is REJECTED (``Could not
+    append to config. An item is already at ...``). that is the exact inverse of
+    ``rollout_resident_overrides``' ``enable_sleep_mode``, which is dataclass-only and requires
+    ``+``. neighbouring keys, opposite prefixes: check the yaml per key, never pattern-match off a
+    nearby override.
     """
-    return [
-        "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16",
-        "actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16",
-    ]
+    return ["actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16"]
 
 
 def resolve_blackwell_attention_backends(
