@@ -195,6 +195,13 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
     conservative by construction: real fabrics degrade faster than geometrically as the collective
     fan-out grows, so this never credits a wide combination with more than it can deliver.
 
+    It is also, for now, unfalsifiable in-tree: no multi-card arm in the calibration campaign ever
+    reached a step timing (0 of 5), so there is no realized wall to compare against. Two runtime
+    defects outside this module cause that -- the allocator proposes card counts that fail verl's
+    num_attention_heads % ulysses_sp_size assertion (3 cards on a 16-head model), and counts that do
+    divide still die in NCCL because Ray is never told the container's GPU count. Neither is a cost
+    defect, but together they mean this curve should be read as an assumption, not a measurement.
+
     Clamped to be non-decreasing in ``gpu_count``. Below a scaling factor of ~0.72 the raw
     geometric curve turns back down (at 0.71: 3 cards 1.512x but 4 cards 1.432x), which would model
     a wider combination as SLOWER than a narrower one and let the allocator reject cards that do
