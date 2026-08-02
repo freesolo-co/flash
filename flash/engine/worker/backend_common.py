@@ -522,6 +522,42 @@ def rollout_resident_overrides(sleep_unsupported: bool) -> list[str]:
     ]
 
 
+def trainer_dtype_overrides() -> list[str]:
+    """verl overrides that store the frozen base in bf16 instead of verl's fp32 default.
+
+    verl's ``trainer/config/engine/fsdp.yaml`` (:33) declares ``model_dtype: fp32``, and that string
+    is handed straight to ``from_pretrained`` as ``torch_dtype``
+    (``workers/engine/fsdp/transformer_impl.py:234``). the ``if torch_dtype is None`` fallback just
+    below it never fires, because the yaml default is not None -- so an un-overridden RL or OPD run
+    loads the base at 4 bytes/param. measured at 27B: ``PeftModelForCausalLM contains 27.61B
+    parameters`` -> ``After FSDP, memory allocated (GB): 103.02``, which is 27.61e9 * 4 to within
+    0.1 GB. that is one fp32 copy, not optimizer state; a rank-32 adapter's moments are noise.
+
+    the fp32 copy buys nothing HERE, though the same key on a full fine-tune would be the master
+    weight copy and dropping it would be a real numerics regression. two things make it dead weight
+    on flash: FSDP is already wrapped ``MixedPrecision(param_dtype=bf16)`` (:346-356) so every
+    parameter is cast to bf16 for compute regardless, and the base is FROZEN -- verl's
+    ``ref_in_actor`` (``lora_rank > 0 or lora_adapter_path is not None``) is always true here, see
+    ``rl_train.render_kl_ref_adapter_shim``. storing never-updated weights at twice the width to
+    read them at half of it is pure residency.
+
+    what is actually optimized stays fp32: peft's ``autocast_adapter_dtype`` defaults True
+    (``peft/mapping_func.py:35``, not overridden by verl) and casts adapter weights UP to fp32 for
+    training stability, so a bf16 base still yields fp32 ``lora_*`` params.
+
+    ``actor`` and ``ref`` are separate keys and both matter -- the reference model is a second
+    resident copy of the same base. both are declared in the yaml, so both take a BARE override and
+    ``+`` is REJECTED (``Could not append to config. An item is already at ...``). that is the exact
+    inverse of ``rollout_resident_overrides``' ``enable_sleep_mode``, which is dataclass-only and
+    requires ``+``. neighbouring keys, opposite prefixes: check the yaml per key, never pattern-match
+    off a nearby override.
+    """
+    return [
+        "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16",
+        "actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16",
+    ]
+
+
 def resolve_blackwell_attention_backends(
     python_bin: str, cc: tuple[int, int] | None
 ) -> tuple[str | None, str | None]:

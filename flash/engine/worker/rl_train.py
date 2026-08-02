@@ -68,6 +68,7 @@ from flash.engine.worker.backend_common import (
     resolve_verl_python,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
+    trainer_dtype_overrides,
     verl_supports_rollout_field,
 )
 from flash.engine.worker.heartbeat import (
@@ -388,6 +389,8 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # ref (when kl is on) inherits this through dp_ref.yaml's oc.select on the actor key.
         # requires use_remove_padding, which this recipe already sets above.
         f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={cfg['n_gpus']}",
+        # store the frozen base in bf16, not verl's fp32 yaml default. shared with the opd driver.
+        *trainer_dtype_overrides(),
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
         # verl 0.8.0 hardcodes async rollout (ray_trainer.py:914), and AgentLoopManager splits the
