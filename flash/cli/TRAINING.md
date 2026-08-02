@@ -1284,10 +1284,14 @@ gpu.count=4`: the same 1..8 bound rejects a bad value, and the same submit gate 
 provider that rents all n cards on one machine.
 
 `gpu.count` is a **ceiling, not an exact count** — by either spelling. Allocation treats it as the
-most cards it may combine, so a class that fits the run on one card is still allocated as one card
-and the worker launches one rank. Combinations are also capped at 4, so 5-8 only lower the count
-that would otherwise be chosen. To guarantee n cards, pin a `[gpu] type` too small to fit the run
-alone; to see what a submit actually chose, read `gpu.count` back off the run record.
+most cards it may use, and it stops at the first count that fits: a class that fits the run on one
+card is allocated as one card, and a class that needs sharding gets the _smallest_ fitting
+combination, not the count you asked for. `--gpus 4` on a 9B run pinned to RTX 4090 allocates 2.
+Combinations are also capped at 4, so 5-8 only lower the count that would otherwise be chosen.
+
+**There is no exact-count mechanism.** Pinning a small `[gpu] type` raises the floor above one card
+but still does not pin n — it only moves which combination is smallest. To see what a submit
+actually chose, read `gpu.count` back off the run record.
 
 GRPO, SFT and OPD all shard across `gpu.count` with no backend key to set: the worker launches one
 rank per card with Ulysses sequence parallelism.

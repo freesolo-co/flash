@@ -143,3 +143,31 @@ def test_the_help_does_not_promise_an_exact_card_count():
     assert not window.startswith("--gpus n cards to run the job on"), (
         "that phrasing promises exact-count semantics the allocator does not provide"
     )
+
+
+def test_a_pinned_small_class_still_does_not_pin_the_card_count():
+    """There is no exact-count mechanism, so no doc may claim one.
+
+    _combination_candidates breaks at the FIRST count that fits (allocator.py:124), so pinning a
+    class too small to hold the run alone raises the floor above one card but does not pin n: the
+    run gets the smallest fitting combination instead. This is asserted because the docs previously
+    advised pinning a small [gpu] type "to guarantee n cards", which is false -- a user sizing an
+    experiment off it silently gets fewer ranks than they asked for. Driving the real allocator
+    rather than reading the doc string, so the claim is pinned to behavior and not to wording.
+    """
+    from flash.providers.allocator import allocate
+
+    # 9B on a 24 GB class does not fit alone, so this is the combination path, not the fit-alone one.
+    allocated = [
+        allocate(
+            "Qwen/Qwen3.5-9B", "sft", provider="runpod", gpu_type="RTX 4090", max_gpu_count=asked
+        ).gpu_count
+        for asked in (2, 3, 4)
+    ]
+
+    # asking for 2, 3 and 4 all land on the same smallest fitting count. if any of these ever equals
+    # what was asked for, an exact-count path exists and TRAINING.md's "no exact-count mechanism"
+    # paragraph has to be rewritten alongside it.
+    assert allocated == [2, 2, 2], (
+        f"expected the smallest fitting combination for every ask, got {allocated}"
+    )
