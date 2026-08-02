@@ -53,6 +53,12 @@ concurrency:
 
 jobs:
   build:
+    # Upstream only -- see publish.yml. Two reasons beyond the shared one: it pushes to
+    # `ghcr.io/freesolo-co/flash-worker` (our namespace, unwritable by a fork's token), and it asks
+    # for `ubuntu-24.04-8core`, an org-provisioned larger runner. A fork requesting a label it has
+    # no runner for leaves the job QUEUED indefinitely rather than failing, which is worse than a
+    # red X: nothing reports, and the PR just never settles.
+    if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-24.04-8core
     # Single source for the FlashAttention wheels: used BOTH as build-args and as fingerprint inputs
     # (so a wheel bump moves fp_base). Keep FA3_SPEC in sync with Dockerfile.worker's ARG default.

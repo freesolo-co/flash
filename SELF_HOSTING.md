@@ -43,6 +43,12 @@ flash login --api-url http://your-plane:8080 --api-key "$FREESOLO_INTERNAL_KEY"
 flash train run.toml
 ```
 
+Because `--api-url` points at your own plane, `flash login` stores the key and checks it
+against that plane. It does **not** send it to `api.freesolo.co` for verification: your
+plane authenticates `FREESOLO_INTERNAL_KEY` itself, and that key controls the plane, so it
+must not travel to a service you do not run. (If you operate your own Freesolo-compatible
+auth backend, pass `--freesolo-url` and verification happens against it.)
+
 Every run config needs a top-level `project` uuid - it groups runs and is required in
 standalone mode too (see [project ids](#what-flashstandalone1-does)). Any uuid works
 on a standalone plane, so you can pick one once and reuse it:
@@ -167,11 +173,11 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Optional pieces
 
-| Variable               | Effect if unset                                                                                                                                                                                   |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GITHUB_TOKEN`         | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                             |
-| `FIREWORKS_API_KEY`    | On-policy distillation (`opd`) runs fail inside the worker, after allocating and billing a GPU. Not covered by the startup preflight - set it before running opd. `sft` and `grpo` do not use it. |
-| `FREESOLO_SERVING_URL` | In standalone mode `flash deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app. Training is unaffected. See below.                             |
+| Variable               | Effect if unset                                                                                                                                                                                                             |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITHUB_TOKEN`         | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                                                       |
+| `FIREWORKS_API_KEY`    | On-policy distillation (`opd`) runs fail inside the worker, after allocating and billing a GPU. Not covered by the startup preflight - set it before running opd. `sft` and `grpo` do not use it.                           |
+| `FREESOLO_SERVING_URL` | In standalone mode `flash deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app - and refuse the same way if you point it AT that app. Training is unaffected. See below. |
 
 ## Serving
 
@@ -184,11 +190,15 @@ depend on it. Your trained adapters land in your own HuggingFace repos and can b
 by any stack that loads LoRA adapters - vLLM, TGI, or your own. Point `FREESOLO_SERVING_URL`
 at a compatible deployment if you want `flash deploy` and `flash chat` to work end to end.
 
-On a standalone plane those three commands **error out** until you set it, rather than
-falling back to the hosted default. Every serving request carries `FREESOLO_INTERNAL_KEY`,
-and on your plane that key is what grants full control of it - so the fallback would hand
-your plane's credential to a service you do not operate. Export the adapter and serve it
-yourself if you do not run a compatible backend.
+On a standalone plane those three commands **error out** until you point it at a backend
+you operate. Every serving request carries `FREESOLO_INTERNAL_KEY`, and on your plane that
+key is what grants full control of it - so reaching Freesolo's serving app would hand your
+plane's credential to a service you do not run. Export the adapter and serve it yourself if
+you do not have a compatible backend.
+
+Setting it to a Freesolo-hosted URL is refused exactly like leaving it unset: a value copied
+from a managed `.env` is the likelier way to end up there, so both paths raise rather than
+only the fallback. Any other host, including `localhost`, is yours to use.
 
 The catalog reports a `serving.serve_model_id` per model - the pre-quantized FP8 checkpoint
 Freesolo's serving app loads, and most of those repos are private. They are **informational
