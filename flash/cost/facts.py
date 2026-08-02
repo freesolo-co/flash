@@ -170,12 +170,18 @@ def effective_train_tflops(name: str) -> float:
 #
 # Why this matters beyond accuracy: at 0.81s/completion the slope is within 20% of the fictitious
 # 1.0s reward default, which is exactly why the constant-only revision looked right. It was pricing
-# per-completion ROLLOUT cost through the reward term. That is not a harmless mislabel -- envs that
-# profile their real grader (see engine/reward_profile.py) pass a measured
-# ``reward_seconds_per_completion``, and the real values here are ~0.0003s. Under the constant-only
-# model, supplying a measured reward latency collapsed the quote from geo-bias 1.017x (50/56 in
-# band) to 0.517x (15/56): the more accurate the caller's reward number, the worse the estimate.
-# Splitting the terms means reward and rollout are each priced by their own measurement.
+# per-completion ROLLOUT cost through the reward term. That is not a harmless mislabel: feed the
+# constant-only model a measured reward latency (real graders here are ~0.0003s) and the quote
+# collapses from geo-bias 1.017x (50/56 in band) to 0.517x (15/56) -- the more accurate the reward
+# number, the worse the estimate. Splitting the terms removes that coupling.
+#
+# To be exact about who can supply that number today: NOBODY on the submit path. RunConfig accepts
+# an override, but both construction sites (cost/spec.py, providers/base.py) leave it None, so the
+# persisted quote always uses the default below. engine/reward_profile.py measures the real grader
+# on the worker AFTER submission and only records it in run notes. The collapse above is therefore
+# a sensitivity result from the offline harness, not a live regression -- but it is the failure the
+# split makes structurally impossible, which is what makes wiring that measurement through safe to
+# do later. Until it is wired, see the judge-gap note on AVG_REWARD_SECONDS_PER_COMPLETION.
 #
 # Honest scoring note: leave-one-out over the 56 arms puts two-term at 1.007x/50-56 against
 # const-only's 1.017x/50-56, so pooled this is a TIE on accuracy, not a win. It is kept for the
@@ -402,10 +408,15 @@ def download_weight_gb(model_id: str, revision: str = "") -> float:
 # over-quotes the 56-arm corpus at geo-bias 1.462x, with only 26/56 arms in band.
 #
 # 0.05s is a grading-only default. It is NOT the corpus minimum: every env measured here is a fast
-# programmatic grader (~0.0003s), and fitting to that would publish "grading is free" and badly
-# under-quote the llm-judge envs the corpus contains none of. It sits two orders above the measured
-# programmatic graders and two below a judge, so it is wrong in the safe direction for both, and
-# envs that care measure their own (engine/reward_profile.py) and pass it explicitly.
+# programmatic grader (~0.0003s), and fitting to that would publish "grading is free". It sits two
+# orders above the measured programmatic graders and two below a judge.
+#
+# Known gap, stated rather than papered over: no submit-time path passes an override (see the note
+# above), so an llm-judge env at ~3s/completion is quoted at 0.05 and under-priced by ~1510s per
+# step at the default 64x8 shape. Restoring 1.0 does not fix that -- it still under-prices the same
+# judge by ~1024s -- while re-charging rollout cost twice on every programmatic env, which is what
+# put the corpus at 1.462x with only 26/56 in band. The real fix is to feed reward_profile's
+# measurement into the quote; that crosses into the submit path and belongs in its own change.
 AVG_REWARD_SECONDS_PER_COMPLETION = 0.05
 
 

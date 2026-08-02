@@ -8,10 +8,14 @@ The cost model has to price that from a single ``AVG_REWARD_SECONDS_PER_COMPLETI
 covering graders whose real span is ~0.01s (regex) to ~3s (llm judge). This measures the actual
 value on the actual env before training starts.
 
-That default is small on purpose, and passing a real measurement here is what makes it safe. It
-prices GRADING ONLY. The rollout wall a step also pays is priced separately by
-``step_floor_seconds``, so a measured latency now shrinks the grading term without deleting the
-rest of the step -- which is exactly what a single conflated constant used to do.
+That default prices GRADING ONLY. The rollout wall a step also pays is priced separately by
+``step_floor_seconds``, so a measured latency shrinks the grading term without deleting the rest of
+the step -- which is exactly what a single conflated constant used to do.
+
+What this measurement does NOT do yet: reach the quote. It runs on the worker after submission and
+lands in run notes, while the persisted estimate is built at submit time from a ``RunConfig`` whose
+``reward_seconds_per_completion`` no caller sets. So a judge env is still quoted at the default.
+Wiring this value through is the fix; it belongs with the submit path, not here.
 
 Three things this deliberately does NOT do:
 
