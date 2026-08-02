@@ -324,6 +324,67 @@ def test_the_standalone_owner_row_is_not_reachable_by_presenting_a_token(monkeyp
     assert db.ensure_standalone_owner()["id"] == owner["id"]
 
 
+def test_adoption_does_not_write_once_every_run_is_already_owned(monkeypatch, tmp_path):
+    """`ensure_standalone_owner` runs on EVERY authenticated request, so the adoption UPDATE must
+    not fire in the steady state.
+
+    `WHERE key_id != ?` cannot use `runs_key_idx` (it plans as `SCAN runs`), and SQLite takes its
+    single write slot for an UPDATE even when it matches zero rows -- so an unconditional adoption
+    would full-scan the run history on every status/logs/submit call and serialize them behind a
+    migration with nothing left to migrate.
+
+    Counted at the sqlite layer rather than timed: a timing assertion on a small fixture is noise,
+    and asserting "no UPDATE was issued" is what actually distinguishes the two implementations.
+    """
+    from flash.server import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+
+    # a run belonging to some OTHER key row -- the managed-history case adoption exists for.
+    stale = db.ensure_internal_key("a-previous-managed-key")
+    db.record_run("run-from-before-standalone", stale["id"])
+
+    # recorded through sqlite's own trace callback rather than by wrapping `execute`: it sees every
+    # statement the driver actually runs, and `sqlite3.Connection` is immutable so it cannot be
+    # patched anyway.
+    writes: list[str] = []
+    real_connect = db._connect
+
+    def tracing_connect():
+        conn = real_connect()
+        conn.set_trace_callback(
+            lambda sql: (
+                writes.append(" ".join(sql.split()))
+                if sql.lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
+                else None
+            )
+        )
+        return conn
+
+    monkeypatch.setattr(db, "_connect", tracing_connect)
+
+    # first call: there IS a foreign row, so the adoption must run and claim it.
+    owner = db.ensure_standalone_owner()
+    assert db.run_owner("run-from-before-standalone") == owner["id"]
+    assert any(w.upper().startswith("UPDATE RUNS") for w in writes), (
+        "the backlog was not adopted on the first call"
+    )
+
+    # steady state: everything is owned, so no further call may issue an UPDATE.
+    writes.clear()
+    for _ in range(3):
+        assert db.ensure_standalone_owner()["id"] == owner["id"]
+    assert [w for w in writes if w.upper().startswith("UPDATE RUNS")] == [], (
+        f"adoption re-ran with nothing to adopt: {writes}"
+    )
+
+    # a foreign row appearing LATER is still adopted -- the guard is a check, not a one-shot latch.
+    later = db.ensure_internal_key("another-key")
+    db.record_run("run-appearing-later", later["id"])
+    assert db.ensure_standalone_owner()["id"] == owner["id"]
+    assert db.run_owner("run-appearing-later") == owner["id"]
+
+
 def test_standalone_startup_requires_a_writable_artifact_namespace(monkeypatch) -> None:
     """Without FLASH_HF_NAMESPACE a self-hoster's artifacts default to a namespace their HF_TOKEN
     cannot write to, so every run dies at artifact upload -- AFTER preflight called the plane
