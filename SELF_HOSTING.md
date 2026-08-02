@@ -142,6 +142,10 @@ holding `FREESOLO_INTERNAL_KEY` can submit runs, read any run's status and logs,
 your GPU budget. Treat that key like a root password: generate it with
 `openssl rand -hex 32` (or equivalent), never commit it, and rotate it if it leaks.
 
+Rotating is safe: a standalone plane records run ownership against a fixed single-tenant
+owner, not against the key's value, so runs started under the old key stay listed,
+inspectable, and cancellable under the new one. The old key stops working immediately.
+
 Do not expose a standalone plane to untrusted callers. Put it on a private network, behind
 a VPN, or behind an authenticating reverse proxy. If you need real multi-tenancy - separate
 organizations, per-user keys, project ownership enforcement - you need an identity backend

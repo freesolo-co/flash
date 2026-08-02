@@ -47,6 +47,7 @@ def check_run_preflight() -> None:
     """Raise PreflightError if the plane cannot run a job; warn on degraded-but-workable config."""
     from flash.providers import available_providers
     from flash.providers.runpod import keys as runpod_keys
+    from flash.server.auth import standalone
 
     problems: list[str] = []
 
@@ -66,6 +67,18 @@ def check_run_preflight() -> None:
             "`[train] hf_repo`, e.g. `export HF_TOKEN=hf_...`. Flash streams code, "
             "checkpoints and adapters through HuggingFace dataset repos, so every run "
             "needs it regardless of GPU provider"
+        )
+    if standalone() and not _present("FLASH_HF_NAMESPACE"):
+        # Only in standalone. The managed plane's HF_TOKEN owns the default namespace; a
+        # self-hoster's does not, so leaving it unset defers a certain failure to the first
+        # submit, where it surfaces as an HF permission error on repo creation long after
+        # preflight reported the plane healthy.
+        problems.append(
+            "  - FLASH_HF_NAMESPACE: the HuggingFace user or org that run artifacts are "
+            "created under. Required with FLASH_STANDALONE=1: it defaults to Freesolo's "
+            "namespace, which your HF_TOKEN cannot write to, so every run would fail at "
+            "artifact upload before training starts. Set it to a namespace your HF_TOKEN "
+            "owns, e.g. `export FLASH_HF_NAMESPACE=your-hf-username`"
         )
     if not _present("FREESOLO_INTERNAL_KEY"):
         problems.append(

@@ -178,6 +178,40 @@ def ensure_internal_key(api_key: str) -> dict:
     return row
 
 
+# The standalone plane's owner row is keyed on this sentinel instead of a key hash, so its `id`
+# -- which every `runs.key_id` points at -- does NOT change when the operator rotates
+# FREESOLO_INTERNAL_KEY. A sha256 digest is 64 hex chars, so this can never collide with one.
+_STANDALONE_OWNER_HASH = "standalone-operator"
+
+
+def ensure_standalone_owner() -> dict:
+    """The single owner row for a standalone plane, independent of the operator key's VALUE.
+
+    Standalone is single-tenant: the operator key is the only credential, so it owns every run.
+    Deriving the owner row from the key's hash meant rotating that key (or regenerating it after
+    a restart) minted a NEW row with a new id, and every existing run -- matched by
+    ``runs.key_id`` -- became invisible: absent from the listing, 404 on status, logs, cancel.
+    An in-flight job would keep burning GPU hours with no supported way for the new credential to
+    stop it, which makes rotating a COMPROMISED key the thing that costs you control of the plane.
+
+    Not reachable by presenting a token: nothing hashes to the sentinel, so this row is only ever
+    returned to a caller who already matched the operator key in ``authenticate``.
+    """
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (_STANDALONE_OWNER_HASH, "standalone", "operator@localhost", now),
+        )
+        row = conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ?", (_STANDALONE_OWNER_HASH,)
+        ).fetchone()
+    if row is None:  # pragma: no cover - the row was just inserted
+        raise RuntimeError("failed to provision the standalone owner row")
+    return dict(row)
+
+
 def ensure_external_key(
     api_key: str, *, key_prefix: str | None = None, email: str | None = None
 ) -> dict | None:

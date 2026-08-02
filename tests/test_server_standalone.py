@@ -271,3 +271,97 @@ def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_pat
     lifecycle._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
     assert charged == ["called"]
     log.close()
+
+
+def test_standalone_run_ownership_survives_operator_key_rotation(monkeypatch, tmp_path) -> None:
+    """Rotating FREESOLO_INTERNAL_KEY must not orphan the runs the old key started.
+
+    Standalone is single-tenant, so the operator key owns every run. Deriving the owner row from
+    the key's HASH meant a rotation (or a re-run of the quickstart's `openssl rand`) minted a new
+    row with a new id, and every run -- matched by `runs.key_id` -- vanished: absent from the
+    listing, 404 on status/logs/cancel. An in-flight job would keep spending with no supported way
+    for the new credential to stop it, so rotating a COMPROMISED key was the thing that cost you
+    control of the plane.
+    """
+    from flash.server import db
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key-v1")
+    before = auth.authenticate("Bearer operator-key-v1")
+    assert before is not None
+    db.record_run("run-started-before-rotation", before["id"])
+
+    # the operator rotates the secret (leak, restart, policy) -- a different key VALUE entirely.
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key-v2")
+    after = auth.authenticate("Bearer operator-key-v2")
+    assert after is not None
+    assert after["auth_kind"] == "internal"
+
+    assert after["id"] == before["id"], "the rotated key must own the runs the old key started"
+    assert db.run_owner("run-started-before-rotation") == after["id"]
+    assert [r["run_id"] for r in db.runs_for_key(after["id"])] == ["run-started-before-rotation"]
+
+    # and the old secret stops working -- rotation still revokes.
+    assert auth.authenticate("Bearer operator-key-v1") is None
+
+
+def test_the_standalone_owner_row_is_not_reachable_by_presenting_a_token(monkeypatch, tmp_path):
+    """The owner row is keyed on a sentinel, not a hash, so no token can resolve to it directly."""
+    from flash.server import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    owner = db.ensure_standalone_owner()
+
+    assert db.lookup_key(db._STANDALONE_OWNER_HASH) is None
+    assert db.lookup_key("standalone-operator") is None
+    # idempotent: a second call returns the SAME row, never a second owner.
+    assert db.ensure_standalone_owner()["id"] == owner["id"]
+
+
+def test_standalone_startup_requires_a_writable_artifact_namespace(monkeypatch) -> None:
+    """Without FLASH_HF_NAMESPACE a self-hoster's artifacts default to a namespace their HF_TOKEN
+    cannot write to, so every run dies at artifact upload -- AFTER preflight called the plane
+    healthy. Fail at startup, where the operator can act on it."""
+    from flash.providers.preflight import PreflightError, check_run_preflight
+
+    monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
+    monkeypatch.setenv("VAST_API_KEY", "vast-key")
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
+    monkeypatch.delenv("FLASH_HF_NAMESPACE", raising=False)
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    with pytest.raises(PreflightError, match="FLASH_HF_NAMESPACE"):
+        check_run_preflight()
+
+    # set: boots.
+    monkeypatch.setenv("FLASH_HF_NAMESPACE", "self-hoster")
+    check_run_preflight()
+
+    # and it is standalone-ONLY: the managed plane's token owns the default namespace.
+    monkeypatch.delenv("FLASH_HF_NAMESPACE")
+    monkeypatch.delenv(auth.STANDALONE_ENV)
+    check_run_preflight()
+
+
+def test_the_env_template_does_not_preset_the_hosted_serving_url() -> None:
+    """`.env.example` is the documented starting point, and the standalone serving guard only
+    rejects an UNSET value. An active assignment in the template would satisfy that guard and ship
+    the plane's root credential to serve.freesolo.co on the first deploy -- the precise leak the
+    guard exists to prevent."""
+    import pathlib
+
+    template = pathlib.Path(__file__).resolve().parent.parent / ".env.example"
+    for lineno, line in enumerate(template.read_text().splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        name, _, value = stripped.partition("=")
+        if name.strip() == "FREESOLO_SERVING_URL":
+            raise AssertionError(
+                f".env.example:{lineno} assigns FREESOLO_SERVING_URL={value!r}; it must stay "
+                "commented so a standalone plane's serving guard actually fires"
+            )

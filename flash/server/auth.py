@@ -236,7 +236,13 @@ def authenticate(authorization: str | None) -> dict | None:
     # authenticate.
     internal = (os.environ.get(INTERNAL_KEY_ENV) or "").strip()
     if internal and token == internal:
-        row = db.lookup_key(token) or db.ensure_internal_key(token)
+        # Standalone owns its runs through a key-independent row: rotating the operator secret
+        # must not orphan the runs it started (see db.ensure_standalone_owner).
+        row = (
+            db.ensure_standalone_owner()
+            if standalone()
+            else (db.lookup_key(token) or db.ensure_internal_key(token))
+        )
         out = dict(row)
         out["auth_kind"] = "internal"
         return out

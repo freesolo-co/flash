@@ -194,6 +194,7 @@ pip install 'freesolo-flash[server]'   # the base install is client-only
 export FLASH_STANDALONE=1
 export FREESOLO_INTERNAL_KEY=$(openssl rand -hex 32)
 export HF_TOKEN=hf_...
+export FLASH_HF_NAMESPACE=your-hf-username   # a namespace your HF_TOKEN can write to
 export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
 
 flash-server --host 0.0.0.0 --port 8080
