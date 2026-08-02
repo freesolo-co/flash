@@ -46,6 +46,7 @@ from flash.engine.worker.backend_common import (
     rollout_sleep_unsupported,
     run_verl_training,
     stall_tail_fields,
+    trainer_dtype_overrides,
     verl_step_number,
 )
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -1533,6 +1534,8 @@ def build_opd_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.actor.optim.lr={_hydra_val(config['learning_rate'])}",
         "actor_rollout_ref.actor.optim.weight_decay=0.0",
         f"actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size={_hydra_val(config['ulysses_sequence_parallel_size'])}",
+        # store the frozen base in bf16, not verl's fp32 yaml default. shared with the rl driver.
+        *trainer_dtype_overrides(),
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.mode=async",
         # safetensors load format is required for lora rollout on vllm, exactly as on the grpo path.
