@@ -17,6 +17,7 @@ Two credentials and at least one GPU account:
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **One GPU provider**    | a RunPod, Lambda, **or** Vast account. One is enough.                                                                                                                         |
 | `HF_TOKEN`              | a HuggingFace token with **write** access. Flash streams code, checkpoints, and adapters through HuggingFace dataset repos, so every run needs it whichever provider you use. |
+| `FLASH_HF_NAMESPACE`    | the HuggingFace user or org those repos are created under - **set this to one your `HF_TOKEN` can write to.** It defaults to Freesolo's namespace, which you cannot write to. |
 | `FREESOLO_INTERNAL_KEY` | the key your clients present to your plane. Generate it yourself.                                                                                                             |
 
 Everything else is optional.
@@ -29,6 +30,7 @@ pip install 'freesolo-flash[server]'   # the base install is client-only
 export FLASH_STANDALONE=1
 export FREESOLO_INTERNAL_KEY=$(openssl rand -hex 32)
 export HF_TOKEN=hf_...
+export FLASH_HF_NAMESPACE=your-hf-username   # where run artifacts are created
 export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
 
 flash-server --host 0.0.0.0 --port 8080
@@ -80,6 +82,11 @@ a branch, tag, or commit sha; pin a sha if you want runs to be reproducible.
 Public repos work without credentials, subject to GitHub's unauthenticated rate limit. Set
 `GITHUB_TOKEN` for private repos. `flash env push` publishes to the managed hub and is not
 part of a self-hosted deployment.
+
+**A local directory is not a supported environment source.** The GPU worker fetches the
+environment itself, so it needs a source it can reach; an `[environment] path` is rejected
+at submit. Push your environment to a GitHub repository (public or private with
+`GITHUB_TOKEN`) and reference it with the `github:` form above.
 
 ## Choosing providers
 
@@ -145,9 +152,9 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 | Variable               | Effect if unset                                                                                                                                                                                   |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GITHUB_TOKEN`         | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Local and public environments still work. Warns at startup.                                       |
+| `GITHUB_TOKEN`         | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                             |
 | `FIREWORKS_API_KEY`    | On-policy distillation (`opd`) runs fail inside the worker, after allocating and billing a GPU. Not covered by the startup preflight - set it before running opd. `sft` and `grpo` do not use it. |
-| `FREESOLO_SERVING_URL` | `flash deploy`/`undeploy`/`chat` target the hosted multi-LoRA serving app. See below.                                                                                                             |
+| `FREESOLO_SERVING_URL` | In standalone mode `flash deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app. Training is unaffected. See below.                             |
 
 ## Serving
 
@@ -159,6 +166,12 @@ Training, checkpoint streaming, and adapter export are fully self-hostable and d
 depend on it. Your trained adapters land in your own HuggingFace repos and can be served
 by any stack that loads LoRA adapters - vLLM, TGI, or your own. Point `FREESOLO_SERVING_URL`
 at a compatible deployment if you want `flash deploy` and `flash chat` to work end to end.
+
+On a standalone plane those three commands **error out** until you set it, rather than
+falling back to the hosted default. Every serving request carries `FREESOLO_INTERNAL_KEY`,
+and on your plane that key is what grants full control of it - so the fallback would hand
+your plane's credential to a service you do not operate. Export the adapter and serve it
+yourself if you do not run a compatible backend.
 
 ## The worker image
 

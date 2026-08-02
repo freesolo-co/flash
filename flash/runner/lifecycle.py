@@ -1245,16 +1245,30 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
     persisted ``RunStatus`` (never a reparsed spec) is what lets a legacy/stale spec still be charged.
     """
     from flash.runner import get_status, record_billing_state
-    from flash.server.auth import INTERNAL_KEY_ENV
+    from flash.server._internal_client import internal_key as operator_internal_key
+    from flash.server.auth import INTERNAL_KEY_ENV, standalone
     from flash.server.billing import BillingError
 
     status = get_status(run_id)
     if not status.billing_context or status.billing_state == "charged":
         return
 
-    internal_key = os.environ.get(INTERNAL_KEY_ENV, "").strip()
+    # The shared gate, not a raw env read: it also returns None in standalone mode. A standalone
+    # plane started against an existing state directory can hold a run that still carries a
+    # managed-mode `billing_context`; charging it would send the operator's key to
+    # FREESOLO_BASE_URL (the hosted default when unset) and bill an organization this plane has no
+    # relationship with. Every other backend reporter is gated the same way, so billing turns off
+    # as a whole rather than one caller at a time.
+    internal_key = operator_internal_key()
     if not internal_key:
-        detail = f"{INTERNAL_KEY_ENV} is not configured; {noun} run was not billed"
+        # Name both causes: in standalone the key IS set, and reporting it as missing would send
+        # an operator looking for configuration that is already correct.
+        cause = (
+            "standalone mode has no billing backend"
+            if standalone()
+            else f"{INTERNAL_KEY_ENV} is not configured"
+        )
+        detail = f"{cause}; {noun} run was not billed"
         # Field-only billing write that re-reads state under the lock: never overwrite a `deployed`
         # that a concurrent /deploy may have written since we last read the run.
         record_billing_state(run_id, billing_state="failed", billing_error=detail)

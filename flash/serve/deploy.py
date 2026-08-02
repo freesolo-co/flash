@@ -221,8 +221,31 @@ def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
 
 
 def serving_base_url() -> str:
-    """Env-overridable serving control root."""
-    configured = os.environ.get("FREESOLO_SERVING_URL") or DEFAULT_FREESOLO_SERVING_URL
+    """Env-overridable serving control root.
+
+    A standalone plane must configure this explicitly. Every serving request carries
+    ``FREESOLO_INTERNAL_KEY`` (see ``_internal_key_header``), and on a self-hosted plane that key is
+    the credential granting full control of the plane itself. Falling back to the hosted default
+    would send it to a third party the operator has no relationship with, on an ordinary
+    ``flash deploy`` or ``flash chat``. Raising here covers every caller (including
+    ``serving_openai_base_url``) rather than stripping the header at one call site, and the error
+    names the fix.
+    """
+    # imported lazily: flash.serve is the CLIENT side, and a module-level import would pull
+    # flash.server into every CLI invocation.
+    from flash.server.auth import standalone
+
+    configured = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
+    if not configured:
+        if standalone():
+            raise ServingError(
+                "FREESOLO_SERVING_URL is not set. A standalone plane has no serving backend of its "
+                "own, and defaulting to the hosted one would send FREESOLO_INTERNAL_KEY - the key "
+                "that controls this plane - to a service you do not operate. Point "
+                "FREESOLO_SERVING_URL at your own multi-LoRA deployment, or export the adapter and "
+                "serve it yourself (see SELF_HOSTING.md). Training does not require this."
+            )
+        configured = DEFAULT_FREESOLO_SERVING_URL
     return serving_control_url(configured)
 
 

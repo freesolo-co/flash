@@ -228,7 +228,13 @@ def authenticate(authorization: str | None) -> dict | None:
     if not authorization or not authorization.startswith("Bearer "):
         return None
     token = authorization.removeprefix("Bearer ").strip()
-    internal = os.environ.get(INTERNAL_KEY_ENV)
+    # Stripped on BOTH sides. The bearer token arrives stripped (above) and the startup preflight
+    # tests the stripped env value, so comparing against the raw one would accept a key at startup
+    # and then reject it on every request -- on a standalone plane that key is the only accepted
+    # credential, so a stray trailing newline in an env file would 401 the entire deployment with a
+    # preflight that reported success. `or ""` keeps a whitespace-only value falsy so it can never
+    # authenticate.
+    internal = (os.environ.get(INTERNAL_KEY_ENV) or "").strip()
     if internal and token == internal:
         row = db.lookup_key(token) or db.ensure_internal_key(token)
         out = dict(row)

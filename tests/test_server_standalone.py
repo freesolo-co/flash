@@ -8,6 +8,8 @@ the direction it fails in: standalone must accept FEWER credentials than managed
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from flash.server import auth
@@ -138,3 +140,134 @@ def test_standalone_falls_back_to_the_in_process_slot_semaphore(monkeypatch) -> 
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
     assert slots.internal_key() is None
+
+
+def test_standalone_refuses_to_default_the_serving_url(monkeypatch) -> None:
+    """Every serving request carries FREESOLO_INTERNAL_KEY, which on a self-hosted plane is the
+    credential controlling that plane. Falling back to the hosted default would ship it to a
+    service the operator does not run, on an ordinary `flash deploy`/`chat`. Raising covers every
+    caller (serving_openai_base_url included) rather than stripping the header at one call site."""
+    from flash.serve import deploy
+
+    monkeypatch.delenv("FREESOLO_SERVING_URL", raising=False)
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    # managed: the hosted default is correct and stays
+    assert deploy.DEFAULT_FREESOLO_SERVING_URL in deploy.serving_base_url()
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    with pytest.raises(deploy.ServingError) as excinfo:
+        deploy.serving_base_url()
+    assert "FREESOLO_SERVING_URL" in str(excinfo.value)
+    # the OpenAI base url derives from the same resolver, so it is covered too
+    with pytest.raises(deploy.ServingError):
+        deploy.serving_openai_base_url()
+
+    # an explicitly configured backend is honoured in standalone
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serving.example.internal")
+    assert "serving.example.internal" in deploy.serving_base_url()
+
+
+def test_standalone_operator_key_survives_surrounding_whitespace(monkeypatch, tmp_path) -> None:
+    """The preflight tests the STRIPPED value, so an env file with a trailing newline starts a plane
+    that then rejects the only credential it accepts -- every request 401 behind a preflight that
+    reported success. Both sides strip, so startup and authentication agree."""
+    from flash.server import db
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key\n")
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+
+    row = auth.authenticate("Bearer operator-key")
+    assert row is not None
+    assert row["auth_kind"] == "internal"
+
+
+def test_a_whitespace_only_operator_key_authenticates_nothing(monkeypatch) -> None:
+    """A blank key must never become a usable credential once both sides strip."""
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "   ")
+    assert auth.authenticate("Bearer    ") is None
+    assert auth.authenticate("Bearer ") is None
+
+
+def test_artifact_namespace_is_operator_configurable(monkeypatch) -> None:
+    """Flash CREATES the HF dataset repos it streams artifacts through, so the namespace has to be
+    one the operator's HF_TOKEN can write to. Hardcoding Freesolo's made self-hosting impossible:
+    the assignment runs on every submit, and a self-hoster cannot create Freesolo-Co/flashrun-*, so
+    the run died at upload before training started."""
+    from flash import runner
+    from flash.server import repo_cleanup
+
+    monkeypatch.delenv("FLASH_HF_NAMESPACE", raising=False)
+    assert runner.artifact_namespace() == runner._DEFAULT_ARTIFACT_NAMESPACE
+    assert runner.managed_hf_repo_for_environment("env-1").startswith(
+        f"{runner._DEFAULT_ARTIFACT_NAMESPACE}/"
+    )
+
+    monkeypatch.setenv("FLASH_HF_NAMESPACE", "self-hoster")
+    assert runner.artifact_namespace() == "self-hoster"
+    assert runner.managed_hf_repo_for_environment("env-1").startswith("self-hoster/")
+    # the GC allowlist must follow the same namespace, or it silently stops matching
+    assert repo_cleanup._is_managed_env_repo("self-hoster/flashrun-env-1-abc") is True
+    assert repo_cleanup._is_managed_env_repo("someone-else/flashrun-env-1-abc") is False
+    # a blank override falls back rather than producing a "/flashrun-*" repo id
+    monkeypatch.setenv("FLASH_HF_NAMESPACE", "   ")
+    assert runner.artifact_namespace() == runner._DEFAULT_ARTIFACT_NAMESPACE
+
+
+def test_a_whitespace_only_provider_key_reads_as_unconfigured(monkeypatch) -> None:
+    """`is_configured()` decides whether a provider is advertised to the allocator and whether the
+    startup preflight passes. A whitespace-only key (a stray newline in an env file) must not make
+    a plane advertise a substrate every allocation then fails on."""
+    from flash.providers._auth import load_provider_key
+
+    monkeypatch.setenv("LAMBDA_API_KEY", "   \n ")
+    assert load_provider_key("LAMBDA_API_KEY") is None
+    monkeypatch.setenv("LAMBDA_API_KEY", "  real-key  ")
+    assert load_provider_key("LAMBDA_API_KEY") == "real-key"
+    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
+    assert load_provider_key("LAMBDA_API_KEY") is None
+
+
+def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_path) -> None:
+    """A standalone plane started against an existing state directory can hold a run that still
+    carries a managed-mode billing_context. Charging it would send the operator's key to
+    FREESOLO_BASE_URL and bill an organization this plane has no relationship with, so the inline
+    charge has to read the SHARED gate rather than the env var directly."""
+    from flash.runner import lifecycle
+
+    charged: list[str] = []
+
+    class _Status:
+        billing_context: ClassVar[dict[str, str]] = {"org_id": "org-from-the-managed-plane"}
+        billing_state = "pending"
+        state = "done"
+        cost_usd = 12.0
+
+    recorded: list[dict] = []
+    monkeypatch.setattr("flash.runner.get_status", lambda _run_id: _Status(), raising=False)
+    monkeypatch.setattr(
+        "flash.runner.record_billing_state",
+        lambda run_id, **kw: recorded.append(kw),
+        raising=False,
+    )
+
+    def _charge(_key, _status):
+        charged.append("called")
+        return {}
+
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
+    log = (tmp_path / "run.log").open("w")
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    lifecycle._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
+    assert charged == [], "standalone must not reach the Freesolo billing backend"
+    assert recorded
+    assert recorded[-1]["billing_state"] == "failed"
+    assert "standalone" in recorded[-1]["billing_error"]
+
+    # managed mode with the same key still charges -- the gate narrows standalone only
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    lifecycle._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
+    assert charged == ["called"]
+    log.close()

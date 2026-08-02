@@ -85,6 +85,15 @@ LEAKED_EMAIL_RE='internal[.]cloudapp[.]net'
 #
 # The canonical noreply address is deliberately ABSENT: it is already correct, and listing
 # it would make the mailmap map an identity onto itself.
+#
+# Listed in LOWERCASE, and every comparison against this list lowercases its input first.
+# The domain part of an address is case-insensitive and git preserves whatever case was
+# committed, so "DavidBShan@Gmail.com" is the same GitHub account as the entry below. An
+# exact-case test would leave that identity unremapped AND uncounted -- the residual gate
+# would report a clean history while GitHub still misattributed the commits, which is the
+# false-clean certificate this script exists to prevent. The trailer counter (git --grep
+# --regexp-ignore-case) and the message rewrite ((?i) below) are already case-insensitive;
+# the identity tests must agree with them or the gate and the rewrite disagree.
 MAINTAINER_ALIAS_EMAILS='davidbshan@gmail.com david@freesolo.co david@clado.ai d@d'
 
 # Message patterns, shared by the counters and (in spirit) the rewrite callback below.
@@ -173,10 +182,11 @@ count_identities() {
   git log --all --format='%H%x09%an <%ae>%x09%cn <%ce>' \
     | awk -F'\t' -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" \
           -v bot_mail_re="$ASSISTANT_EMAIL_RE" -v alias_list="$MAINTAINER_ALIAS_EMAILS" '
-        BEGIN { split(alias_list, a, " "); for (i in a) if (a[i] != "") alias[a[i]] = 1 }
+        BEGIN { split(alias_list, a, " "); for (i in a) if (a[i] != "") alias[tolower(a[i])] = 1 }
         function leaks(ident,   name, email) {
           name = ident; sub(/ *<.*/, "", name)
           email = ident; sub(/^[^<]*</, "", email); sub(/>.*$/, "", email)
+          email = tolower(email)
           return (name ~ names_re || email ~ bot_mail_re || email ~ mail_re || (email in alias))
         }
         leaks($2) || leaks($3) { n++ }
@@ -219,12 +229,13 @@ git log --all --format='%an <%ae>%n%cn <%ce>' \
   | sort -u \
   | awk -v canon="$CANONICAL_IDENTITY" -v names_re="$ASSISTANT_NAMES_RE" -v mail_re="$LEAKED_EMAIL_RE" \
         -v bot_mail_re="$ASSISTANT_EMAIL_RE" -v alias_list="$MAINTAINER_ALIAS_EMAILS" '
-      BEGIN { split(alias_list, a, " "); for (i in a) if (a[i] != "") alias[a[i]] = 1 }
+      BEGIN { split(alias_list, a, " "); for (i in a) if (a[i] != "") alias[tolower(a[i])] = 1 }
       {
         name = $0
         sub(/ *<.*/, "", name)          # identity name, minus the address
         email = $0
         sub(/^[^<]*</, "", email); sub(/>.*$/, "", email)
+        email = tolower(email)
         if (name ~ names_re || email ~ bot_mail_re || email ~ mail_re || (email in alias)) print canon " " $0
       }
     ' > "$MAILMAP"
@@ -286,8 +297,14 @@ message = commit.message
 scrubbed = message
 for pattern in patterns:
     scrubbed = re.sub(pattern, b"", scrubbed)
-# rewrite (not drop) the maintainer alias trailers onto the canonical identity
-scrubbed = _alias_trailer.sub(rb"\1 " + _canon.replace(b"\\", b"\\\\"), scrubbed)
+# rewrite (not drop) the maintainer alias trailers onto the canonical identity.
+# The replacement is a FUNCTION, so the canonical identity is returned as literal bytes
+# and is never parsed as a replacement template. The previous form doubled the backslashes
+# instead, which was also correct (every backreference begins with a backslash, so doubling
+# neutralizes "\1" and "\g<1>" alike) -- this is the same behaviour without the escaping
+# argument, since the identity is operator-editable and the next reader should not have to
+# re-derive that proof.
+scrubbed = _alias_trailer.sub(lambda m: m.group(1) + b" " + _canon, scrubbed)
 # folding several aliases onto one identity can leave the same trailer twice
 _seen, _kept = set(), []
 for _line in scrubbed.split(b"\n"):

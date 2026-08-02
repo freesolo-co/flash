@@ -65,7 +65,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from flash._logging import get_logger
-from flash.runner import _ARTIFACT_NAMESPACE
+from flash.runner import artifact_namespace
 
 logger = get_logger(__name__)
 
@@ -154,10 +154,14 @@ def repo_cleanup_enabled() -> bool:
 
 
 def _is_managed_env_repo(repo_id) -> bool:
-    """True only for ``Freesolo-Co/flashrun-*`` dataset repos (the hard allowlist)."""
+    """True only for ``<artifact namespace>/flashrun-*`` dataset repos (the hard allowlist).
+
+    Reads the namespace through ``artifact_namespace()`` so the allowlist always names the same
+    place ``managed_hf_repo_for_environment`` creates repos in; a fixed constant here would stop
+    matching the moment an operator sets ``FLASH_HF_NAMESPACE``, silently disabling the GC."""
     if not isinstance(repo_id, str):
         return False
-    return repo_id.startswith(f"{_ARTIFACT_NAMESPACE}/") and repo_id.split("/", 1)[-1].startswith(
+    return repo_id.startswith(f"{artifact_namespace()}/") and repo_id.split("/", 1)[-1].startswith(
         RUN_REPO_PREFIX
     )
 
@@ -298,7 +302,7 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
     prefixes to delete. Per-repo scan failures (HF rate-limit / transient) are skipped and logged, not
     fatal — the sweep reaps what it could read and tries the rest next cycle."""
     repos = [
-        d.id for d in api.list_datasets(author=_ARTIFACT_NAMESPACE) if _is_managed_env_repo(d.id)
+        d.id for d in api.list_datasets(author=artifact_namespace()) if _is_managed_env_repo(d.id)
     ]
     targets: list[_RunTarget] = []
     unknown_tops: set[str] = set()

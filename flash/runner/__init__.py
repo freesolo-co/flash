@@ -592,9 +592,24 @@ def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
     return d
 
 
-_ARTIFACT_NAMESPACE = "Freesolo-Co"
+_DEFAULT_ARTIFACT_NAMESPACE = "Freesolo-Co"
 _ARTIFACT_REPO_PREFIX = "flashrun-"
 _ARTIFACT_REPO_NAME_MAX = 96
+
+
+def artifact_namespace() -> str:
+    """The HuggingFace namespace run artifacts are created under.
+
+    Flash streams code, checkpoints and adapters through HF dataset repos that the control plane
+    CREATES, so the namespace has to be one the operator's ``HF_TOKEN`` can write to. Hardcoding
+    Freesolo's made self-hosting impossible: ``_assign_managed_hf_repo`` runs on every submit, and
+    a self-hoster's token cannot create ``Freesolo-Co/flashrun-*``, so the run failed at upload
+    before any training started.
+
+    ``FLASH_HF_NAMESPACE`` overrides it (a user or an org). Defaults to the managed namespace, so
+    the hosted deployment is unaffected.
+    """
+    return (os.environ.get("FLASH_HF_NAMESPACE") or "").strip() or _DEFAULT_ARTIFACT_NAMESPACE
 
 
 def _environment_artifact_repo_name(env_id: str) -> str:
@@ -609,7 +624,7 @@ def _environment_artifact_repo_name(env_id: str) -> str:
 
 def managed_hf_repo_for_environment(env_id: str) -> str:
     """Private HF dataset repo shared by runs that use the same environment id."""
-    return f"{_ARTIFACT_NAMESPACE}/{_environment_artifact_repo_name(env_id)}"
+    return f"{artifact_namespace()}/{_environment_artifact_repo_name(env_id)}"
 
 
 def _file_digest(path: str, digest) -> None:
