@@ -150,13 +150,14 @@ def test_a_one_step_run_is_won_by_the_cheaper_rate():
 
     horizons = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 48, 200]
     winners = [wins_at(s) for s in horizons]
-    crossover = next((s for s, w in zip(horizons, winners) if w == "RTX 4090"), None)
+    ladder = list(zip(horizons, winners, strict=True))
+    crossover = next((s for s, w in ladder if w == "RTX 4090"), None)
     assert crossover is not None, "the faster card never wins, at any horizon"
     # early enough to matter for real runs, and monotone: once throughput decides it, it stays
     # decided, because the block's share of the bill only shrinks as the run grows.
     assert crossover <= 8, f"faster card does not pay off until steps={crossover}"
-    after = [w for s, w in zip(horizons, winners) if s >= crossover]
-    assert set(after) == {"RTX 4090"}, f"ranking flips back after the crossover: {list(zip(horizons, winners))}"
+    after = [w for s, w in ladder if s >= crossover]
+    assert set(after) == {"RTX 4090"}, f"ranking flips back after the crossover: {ladder}"
 
 
 def test_step_cost_ranking_declines_unknown_classes():

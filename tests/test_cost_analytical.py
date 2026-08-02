@@ -465,8 +465,12 @@ def test_sft_run_startup_is_charged_once_per_run_not_per_step(monkeypatch):
     monkeypatch.setattr(analytical, "SFT_RUN_STARTUP_K", analytical.SFT_RUN_STARTUP_K + bump)
 
     # charged once: the same delta at 32 and at 64 steps. a per-step term would double.
-    assert estimate_cost(RunConfig(SMALL, "sft", 32)).train_seconds == pytest.approx(base_32 + delta)
-    assert estimate_cost(RunConfig(SMALL, "sft", 64)).train_seconds == pytest.approx(base_64 + delta)
+    assert estimate_cost(RunConfig(SMALL, "sft", 32)).train_seconds == pytest.approx(
+        base_32 + delta
+    )
+    assert estimate_cost(RunConfig(SMALL, "sft", 64)).train_seconds == pytest.approx(
+        base_64 + delta
+    )
     # SFT-only: grpo and opd already price this through their per-step non-shardable floor, so
     # charging them again would double-count it.
     assert estimate_cost(RunConfig(SMALL, "grpo", 32)).train_seconds == pytest.approx(grpo_before)

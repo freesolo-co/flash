@@ -812,7 +812,10 @@ def test_small_sft_step_prices_at_the_saturation_floor_but_still_tracks_card_spe
 
     small = RunConfig("Qwen/Qwen3.5-0.8B", "sft", 26, batch_size=8, seq_len=1024)
     wide = RunConfig("Qwen/Qwen3.5-0.8B", "sft", 26, batch_size=32, seq_len=1024)
-    assert 8 * 1024 < SFT_SATURATION_TOKENS and 32 * 1024 < SFT_SATURATION_TOKENS
+    # the premise of the comparison below: BOTH shapes must sit under the floor, or the equality
+    # asserted next would hold for the trivial reason that neither is floored.
+    assert SFT_SATURATION_TOKENS > 8 * 1024
+    assert SFT_SATURATION_TOKENS > 32 * 1024
     small_gpu, small_fixed = step_seconds_split(small, "RTX 4090")
     wide_gpu, wide_fixed = step_seconds_split(wide, "RTX 4090")
 
