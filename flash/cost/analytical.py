@@ -290,17 +290,18 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # within 5%) and did not survive leave-one-out: dropping one of five 4090 arms moved the
         # slope 1.021 -> 1.992 s/step and the intercept 70.9s -> 26.6s.
         #
-        # replicates were then run to settle it, and they settle it the other way. five arms
+        # replicates were then run to settle it, and they settle it the other way. six arms
         # identical in card, model, step count and seed -- differing only in run_name -- spread
-        # 99.2/148.1/150.4s at 32 steps and 291.9/404.1s at 256 steps: 39% and 32% of their means.
-        # refitting through every pairing of those replicates gives slope 0.632..1.361 s/step (a
-        # factor of 2.2) and intercept 55.6..130.2s. run-to-run pod variance alone reproduces the
-        # whole leave-one-out swing, so a per-step SFT coefficient is not identifiable at this
-        # sample size no matter how the arms are fitted. separating the fixed block from the slope
-        # needs either many more replicates or a timer inside the worker that brackets
-        # run_verl_training directly; the fit cannot recover it. the underquote is real -- it
-        # follows from the disjoint intervals above, not from any fit -- and its magnitude is
-        # unknown.
+        # 99.2/148.1/150.4s at 32 steps (39% of the mean) and 291.9/404.1/545.0s at 256 steps
+        # (61%). refitting through every pairing gives slope 0.632..1.990 s/step (a factor of 3.2)
+        # and intercept 35.5..130.2s. run-to-run pod variance alone reproduces the whole
+        # leave-one-out swing, so a per-step SFT coefficient is not identifiable at this sample
+        # size no matter how the arms are fitted -- and adding the third 256-step replicate WIDENED
+        # the spread rather than narrowing it, which is what a variance-dominated measurement does.
+        # separating the fixed block from the slope needs either far more replicates or a timer
+        # inside the worker that brackets run_verl_training directly; the fit cannot recover it.
+        # the underquote is real -- it follows from the disjoint intervals above, not from any fit
+        # -- and its magnitude is unknown.
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
