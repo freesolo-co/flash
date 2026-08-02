@@ -10,6 +10,7 @@ import pytest
 
 from flash.cost.facts import (
     GPU_COMPUTE_TFLOPS,
+    ROLLOUT_SECONDS_PER_COMPLETION,
     gpu_hourly_usd,
     gpu_tflops,
     gpu_vram_gb,
@@ -123,12 +124,17 @@ def test_effective_train_tflops_is_peak_for_uncapped_classes():
         assert effective_train_tflops(name) == expected
 
 
-def test_step_floor_dominates_a_small_rollout_step():
+def test_rollout_wall_dominates_a_small_rollout_step():
     # regression: the model used to quote a grpo step as compute + reward wait and nothing else,
-    # which ran ~0.48x of realized because it priced no per-step floor at all. a small 0.8B step is
-    # ~0.3s of arithmetic against a realized 60-140s, so the floor -- not the flops -- must be what
+    # which ran ~0.48x of realized because it priced no rollout wall at all. a small 0.8B step is
+    # ~0.3s of arithmetic against a realized 60-140s, so the wall -- not the flops -- must be what
     # the quote is made of. asserting the RATIO, so recalibrating any single constant cannot silently
     # return the model to a compute-only quote.
+    #
+    # the step's non-compute half is now the per-completion rollout slope only; the once-per-RUN
+    # block that used to be divided into it lives in run_block_seconds and is charged once by
+    # estimate_cost. that reattribution does not weaken this test: the slope alone still has to
+    # carry an order of magnitude more than the arithmetic.
     from flash.cost.analytical import step_seconds_split
     from flash.cost.types import RunConfig
 
@@ -137,65 +143,131 @@ def test_step_floor_dominates_a_small_rollout_step():
     )
     gpu_bound, fixed = step_seconds_split(config, "H100")
     assert gpu_bound < 5.0  # the arithmetic really is negligible at this size
-    assert fixed > 10 * gpu_bound  # ... so a quote that omits the floor is wrong by an order
-    # and the floor specifically, not the reward wall, has to be in there: the reward term alone is
-    # completions x reward_seconds, which this assert deliberately sits above.
-    assert fixed > config.normalized().batch_size * config.normalized().group_size
+    assert fixed > 10 * gpu_bound  # ... so a quote that omits the wall is wrong by an order
+    # and the rollout slope specifically, not the reward wall, has to be what is in there. isolate
+    # the reward term by differencing against a zero-reward config rather than restating it as a
+    # literal: it is completions x reward_seconds, and that default has moved before.
+    from dataclasses import replace
+
+    no_reward = step_seconds_split(replace(config, reward_seconds_per_completion=0.0), "H100")[1]
+    reward_share = fixed - no_reward
+    assert no_reward > 10 * reward_share  # the wall is rollout, not grading
+    n = config.normalized()
+    assert no_reward == pytest.approx(
+        n.batch_size * n.group_size * ROLLOUT_SECONDS_PER_COMPLETION
+    )
 
 
-def test_step_floor_is_charged_per_class_not_pooled():
-    from flash.cost.facts import _DEFAULT_STEP_FLOOR_S, step_floor_seconds
+def test_run_block_is_charged_per_class_not_pooled():
+    from flash.cost.facts import _DEFAULT_RUN_BLOCK_S, run_block_seconds
 
-    # measured classes carry their own floor; h200's is the outlier the pooled value would erase.
-    assert step_floor_seconds("H200") > step_floor_seconds("H100")
-    assert step_floor_seconds("RTX 5090") < step_floor_seconds("RTX 4090")
-    # an unmeasured class falls back to the pooled median rather than to no floor at all.
-    assert step_floor_seconds("some-unmeasured-class") == _DEFAULT_STEP_FLOOR_S
-    assert _DEFAULT_STEP_FLOOR_S > 0.0
+    # measured classes carry their own block; h200's is the outlier the pooled value would erase.
+    assert run_block_seconds("H200") > run_block_seconds("H100")
+    assert run_block_seconds("RTX 5090") < run_block_seconds("RTX 4090")
+    # an unmeasured class falls back to the pooled median rather than to no block at all.
+    assert run_block_seconds("some-unmeasured-class") == _DEFAULT_RUN_BLOCK_S
+    assert _DEFAULT_RUN_BLOCK_S > 0.0
 
 
-def test_step_floor_table_only_lists_real_classes():
+def test_run_block_table_only_lists_real_classes():
     # same drift guard the TFLOPS table gets. a typo'd key here does not raise -- it silently falls
     # through to the pooled default, so the measured value would be quietly discarded and the class
     # would go on being mispriced with nothing failing.
-    from flash.cost.facts import _STEP_FLOOR_S
+    from flash.cost.facts import _RUN_BLOCK_S
 
-    for name in _STEP_FLOOR_S:
+    for name in _RUN_BLOCK_S:
         assert name in GPU_INFO, f"{name} is not a managed GPU class"
 
 
-def test_step_floor_applies_to_rollout_methods_only():
-    # the floor is vllm engine entry/exit + actor->rollout weight sync. sft runs neither, and the
-    # floor was fitted on rollout arms only, so charging it to sft would invent ~45s per step.
-    from flash.cost.analytical import step_seconds_split
-    from flash.cost.facts import step_floor_seconds
+def test_run_block_applies_to_rollout_methods_only():
+    # the block is vllm engine build + actor->rollout weight sync, paid once per run. sft runs
+    # neither, so it pays its own smaller verl/fsdp launch instead (SFT_RUN_STARTUP_S) rather than a
+    # card-shaped rollout block.
+    from flash.cost.analytical import SFT_RUN_STARTUP_S, run_startup_seconds
+    from flash.cost.facts import run_block_seconds
     from flash.cost.types import RunConfig
 
     sft = RunConfig("Qwen/Qwen3.5-0.8B", "sft", 6, seq_len=512, batch_size=8)
-    assert step_seconds_split(sft, "H100")[1] == pytest.approx(0.0)
-    # rollout methods carry it, and by the card's own amount -- comparing two classes isolates the
-    # floor from the reward/teacher wait, which is identical on both.
+    # sft's launch is card-FREE: same on every class, because there is no engine to build.
+    for card in ("H100", "H200", "RTX 5090"):
+        assert run_startup_seconds(sft, card) == pytest.approx(SFT_RUN_STARTUP_S)
+
+    # rollout methods carry the block, and by the card's own amount -- comparing two classes
+    # isolates it from anything shape-dependent, which is identical on both.
     for method in ("grpo", "opd"):
         config = RunConfig("Qwen/Qwen3.5-0.8B", method, 6, seq_len=512, completion_len=128)
-        h100 = step_seconds_split(config, "H100")[1]
-        h200 = step_seconds_split(config, "H200")[1]
-        assert h200 - h100 == pytest.approx(step_floor_seconds("H200") - step_floor_seconds("H100"))
+        h100 = run_startup_seconds(config, "H100")
+        h200 = run_startup_seconds(config, "H200")
+        assert h200 - h100 == pytest.approx(run_block_seconds("H200") - run_block_seconds("H100"))
+        # and it is materially larger than the sft launch, which is the whole reason it is separate.
+        assert h100 > SFT_RUN_STARTUP_S
 
 
-def test_step_floor_is_not_shardable_across_cards():
-    # the allocator divides ONLY the first half by card count. engine init and weight sync do not
-    # get faster on more ranks, so a floor that leaked into the shardable half would make wide
-    # multi-card jobs look arbitrarily cheap.
-    from flash.cost.analytical import step_seconds_split
-    from flash.cost.facts import step_floor_seconds
+def test_run_block_is_charged_once_per_run_not_once_per_step():
+    """THE regression this model exists to fix, asserted end to end through the quote.
+
+    The block was previously divided into every step. That is invisible at a fixed horizon -- both
+    forms quote the same 6-step run -- so the only thing that separates them is how the quote MOVES
+    with the step count. Per-run, doubling the steps adds exactly the steady-state step twice; per-
+    step, it also re-charges the block, and the marginal cost of a step comes out inflated by it.
+
+    Asserted as a difference of differences so it cannot be satisfied by any single recalibration.
+    """
+    from dataclasses import replace
+
+    from flash.cost.analytical import (
+        compile_seconds,
+        run_startup_seconds,
+        seconds_per_step,
+        step_seconds_split,
+    )
+    from flash.cost.types import RunConfig
+
+    base = RunConfig(
+        "Qwen/Qwen3.5-0.8B", "grpo", 4, seq_len=512, completion_len=128, batch_size=8, group_size=4
+    )
+    card = "H200"  # the widest block, so a per-step charge would be unmissable here
+
+    def train_wall(steps: int) -> float:
+        cfg = replace(base, steps=steps)
+        return (
+            compile_seconds(cfg, card)
+            + run_startup_seconds(cfg, card)
+            + steps * seconds_per_step(cfg, card)
+        )
+
+    sps = sum(step_seconds_split(base, card))
+    # each extra step adds one steady-state step and nothing else, at every horizon.
+    for steps in (4, 8, 16, 48):
+        marginal = train_wall(steps * 2) - train_wall(steps)
+        assert marginal == pytest.approx(steps * sps), f"block re-charged at steps={steps}"
+
+
+def test_run_block_is_not_shardable_across_cards():
+    # the allocator divides ONLY the gpu-bound half by card count. engine build and weight sync do
+    # not get faster on more ranks, so a block that leaked into the shardable half would make wide
+    # multi-card jobs look arbitrarily cheap. the block is not in step_seconds_split at all now, so
+    # this asserts the property where it moved to: the per-card ranking key.
+    from flash.cost.analytical import multi_card_speedup, step_cost_key, step_seconds_split
     from flash.cost.types import RunConfig
 
     config = RunConfig(
-        "Qwen/Qwen3.5-0.8B", "grpo", 6, seq_len=512, completion_len=128, batch_size=8, group_size=4
+        "Qwen/Qwen3.5-0.8B", "grpo", 8, seq_len=512, completion_len=128, batch_size=8, group_size=4
     )
     gpu_bound, fixed = step_seconds_split(config, "H100")
-    assert fixed >= step_floor_seconds("H100")
-    assert gpu_bound < step_floor_seconds("H100")
+    # the non-shardable half stays non-shardable: it is the rollout slope, per completion, and more
+    # ranks do not sample fewer sequences.
+    assert fixed > 0.0
+    assert gpu_bound < fixed
+
+    key = step_cost_key(config)
+    # per card, 2 cards must not be cheaper than 1 by more than the gpu-bound half can explain --
+    # if the block sharded, the 2-card key would drop by ~half the block as well.
+    one = key("H100", 1.0, 1) / 1.0
+    two = key("H100", 1.0, 2) / 2.0  # per-card seconds, so the count factor is removed
+    saved = (one - two) * 3600.0
+    ceiling = gpu_bound * (1.0 - 1.0 / multi_card_speedup(2, "H100"))
+    assert saved == pytest.approx(ceiling, rel=1e-9)
 
 
 def test_rollout_wall_survives_a_measured_reward_latency():
@@ -210,54 +282,55 @@ def test_rollout_wall_survives_a_measured_reward_latency():
     # both the broken and the fixed model, since both subtract the same reward term. what separates
     # them is the ABSOLUTE floor left standing once the fictitious reward is gone, so that is what
     # this pins -- against the realized wall, not against the model's own arithmetic.
-    from flash.cost.analytical import step_seconds_split
-    from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, step_floor_seconds
+    from flash.cost.analytical import compile_seconds, run_startup_seconds, step_seconds_split
     from flash.cost.types import RunConfig
 
     shape = {"seq_len": 512, "completion_len": 128, "batch_size": 8, "group_size": 4}
     completions = shape["batch_size"] * shape["group_size"]
+    steps = 6
 
     measured = RunConfig(
-        "Qwen/Qwen3.5-0.8B", "grpo", 6, reward_seconds_per_completion=0.0003, **shape
+        "Qwen/Qwen3.5-0.8B", "grpo", steps, reward_seconds_per_completion=0.0003, **shape
     )
     gpu_bound, fixed = step_seconds_split(measured, "H100")
 
+    # the per-STEP survivor is the rollout slope: it is what stands once the fictitious reward is
+    # gone, and it is charged per completion regardless of how fast the grader is.
+    assert fixed >= completions * ROLLOUT_SECONDS_PER_COMPLETION
+
     # h100 arms at this shape realized 56-100s/step with graders this fast. the broken model quoted
-    # ~43s of constant and nothing per-completion, landing at ~0.5x realized; the rollout slope is
-    # what closes that gap, so it must survive the caller supplying a true reward latency.
-    assert fixed >= step_floor_seconds("H100") + completions * ROLLOUT_SECONDS_PER_COMPLETION
-    assert gpu_bound + fixed > 60.0
+    # ~43s of constant and nothing per-completion, landing at ~0.5x realized. the realized figure is
+    # a per-run wall over its step count, so compare against the same thing: the amortized quote,
+    # not the steady-state step alone, or this asserts a number the model never claimed.
+    per_run = compile_seconds(measured, "H100") + run_startup_seconds(measured, "H100")
+    assert per_run / steps + gpu_bound + fixed > 60.0
 
 
 def test_rollout_wall_scales_with_completion_count():
-    # the wall is const_card + slope*completions. fitted on 16-256 completions/step, where the
-    # per-card median rose ~3x (h100 77.8s at 32 -> 230.7s at 256). a constant-only model fitted on
-    # the original campaign missed this because 30 of its 32 arms ran exactly 32 completions.
-    from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, step_floor_seconds
+    # the per-step wall is slope*completions. fitted on 16-256 completions/step, where the per-card
+    # median rose ~3x (h100 77.8s at 32 -> 230.7s at 256). a constant-only model fitted on the
+    # original campaign missed this because 30 of its 32 arms ran exactly 32 completions.
+    from flash.cost.facts import rollout_step_seconds
 
-    base = step_floor_seconds("H100")
-    assert step_floor_seconds("H100", 0) == pytest.approx(base)
-    assert step_floor_seconds("H100", 256) == pytest.approx(
-        base + 256 * ROLLOUT_SECONDS_PER_COMPLETION
-    )
-    # the slope is a rollout-path property, so it is the SAME on every card; only the constant differs.
-    for card in ("H100", "H200", "RTX 5090"):
-        delta = step_floor_seconds(card, 100) - step_floor_seconds(card, 0)
-        assert delta == pytest.approx(100 * ROLLOUT_SECONDS_PER_COMPLETION)
+    assert rollout_step_seconds(0) == pytest.approx(0.0)
+    assert rollout_step_seconds(256) == pytest.approx(256 * ROLLOUT_SECONDS_PER_COMPLETION)
+    # the slope is a rollout-path property and does not vary by card: the per-class fits agreed
+    # inside the noise floor, so it takes no card argument at all to key it on.
+    assert rollout_step_seconds(100) == pytest.approx(100 * ROLLOUT_SECONDS_PER_COMPLETION)
     # a negative completion count cannot credit time back.
-    assert step_floor_seconds("H100", -5) == pytest.approx(base)
+    assert rollout_step_seconds(-5) == pytest.approx(0.0)
 
 
 def test_a100_sxm_40gb_inherits_its_siblings_wall():
-    # same SMs and tensor cores as the 80GB board, less hbm only -- and this wall is engine-entry and
-    # weight-sync bound, not capacity bound, so the 40GB variant cannot be ~2x cheaper per step than
-    # the board it is a memory-trimmed version of. left out of the table it fell through to the
-    # pooled default and under-priced the dominant per-step term on every lambda/vast quote in that
-    # band. the TFLOPS table inherits across this same pair for the same reason.
-    from flash.cost.facts import _DEFAULT_STEP_FLOOR_S, step_floor_seconds
+    # same SMs and tensor cores as the 80GB board, less hbm only -- and this block is engine-build
+    # and weight-sync bound, not capacity bound, so the 40GB variant cannot be ~2x cheaper per run
+    # than the board it is a memory-trimmed version of. left out of the table it fell through to the
+    # pooled default and under-priced a dominant term on every lambda/vast quote in that band. the
+    # TFLOPS table inherits across this same pair for the same reason.
+    from flash.cost.facts import _DEFAULT_RUN_BLOCK_S, run_block_seconds
 
-    assert step_floor_seconds("A100 SXM 40GB") == step_floor_seconds("A100 SXM")
-    assert step_floor_seconds("A100 SXM 40GB") != _DEFAULT_STEP_FLOOR_S
+    assert run_block_seconds("A100 SXM 40GB") == run_block_seconds("A100 SXM")
+    assert run_block_seconds("A100 SXM 40GB") != _DEFAULT_RUN_BLOCK_S
 
 
 def test_nvlink_classification_is_by_form_factor():
@@ -336,34 +409,33 @@ def test_multi_card_speedup_never_decreases_with_card_count():
         assert vals == sorted(vals), f"{name} speedup decreases: {vals}"
 
 
-def test_resident_rollout_is_not_charged_the_engine_cycle():
-    # the constant is vllm engine entry/exit + weight sync. a sleep_unsupported model pins its
-    # rollout engine RESIDENT (catalog.py, backend_common.rollout_resident_overrides), so that cycle
+def test_resident_rollout_is_not_charged_the_engine_build():
+    # the block is a vllm engine build + first weight sync. a sleep_unsupported model pins its
+    # rollout engine RESIDENT (catalog.py, backend_common.rollout_resident_overrides), so that build
     # never runs and charging it extrapolates outside the fit: all 56 fitted arms are sleep-capable
-    # 0.8b/2b/4b models. the error is not marginal -- on qwen3.6-35b-a3b the h200 constant (126.4s)
-    # alone exceeds the ~24s realized grpo step analytical.py documents for that model.
-    from flash.cost.facts import rollout_is_resident, step_floor_seconds
+    # 0.8b/2b/4b models. the error is not marginal -- on qwen3.6-35b-a3b the h200 block is 762.4s
+    # against a ~24s realized grpo step analytical.py documents for that model.
+    from flash.cost.facts import rollout_is_resident, run_block_seconds
 
     assert rollout_is_resident("Qwen/Qwen3.6-35B-A3B")
     assert not rollout_is_resident("Qwen/Qwen3.5-0.8B")
 
     for card in ("B200", "H200"):
-        sleeping = step_floor_seconds(card, 0)
-        resident = step_floor_seconds(card, 0, resident=True)
+        sleeping = run_block_seconds(card)
+        resident = run_block_seconds(card, resident=True)
         assert resident == pytest.approx(0.0)
         # guards the mutation "resident flag ignored": that returns the sleeping value here.
         assert sleeping > 50.0
 
 
 def test_resident_rollout_still_pays_the_per_completion_slope():
-    # the opposite error, and the reason resident is not simply floor=0: a resident engine skips the
-    # entry/exit CYCLE, not the per-sequence sampling/detokenize/dispatch work. zeroing the whole
-    # wall would under-quote every resident step by slope*completions.
-    from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, step_floor_seconds
+    # the opposite error, and the reason resident is not simply "no rollout cost": a resident engine
+    # skips the BUILD, not the per-sequence sampling/detokenize/dispatch work. zeroing the per-step
+    # wall too would under-quote every resident step by slope*completions. the two now live in
+    # different terms, which is what makes zeroing one unable to touch the other.
+    from flash.cost.facts import rollout_step_seconds
 
-    assert step_floor_seconds("H200", 64, resident=True) == pytest.approx(
-        64 * ROLLOUT_SECONDS_PER_COMPLETION
-    )
+    assert rollout_step_seconds(64) == pytest.approx(64 * ROLLOUT_SECONDS_PER_COMPLETION)
 
 
 def test_cost_and_worker_agree_on_which_rollouts_are_resident():
@@ -379,11 +451,10 @@ def test_cost_and_worker_agree_on_which_rollouts_are_resident():
 
 
 def test_resident_flag_reaches_the_quote_not_just_the_helper():
-    # step_floor_seconds honouring `resident` is worthless if step_seconds_split never passes it.
+    # run_block_seconds honouring `resident` is worthless if run_startup_seconds never passes it.
     # the helper-level tests above cannot see that wiring: they call the helper directly, so a
     # call site that drops the argument leaves them all green. this asserts through the real quote.
-    from flash.cost.analytical import step_seconds_split
-    from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, step_floor_seconds
+    from flash.cost.analytical import run_startup_seconds, step_seconds_split
     from flash.cost.types import RunConfig
 
     shape = {"seq_len": 512, "completion_len": 128, "batch_size": 8, "group_size": 4}
@@ -399,11 +470,17 @@ def test_resident_flag_reaches_the_quote_not_just_the_helper():
             reward_seconds_per_completion=0.0,
             **shape,
         )
+        # the h200 block is 762.4s; if it were still charged, startup would clear it outright.
+        assert run_startup_seconds(cfg, "H200") == pytest.approx(0.0), method
+        # and the per-step slope is still in there -- this is not a "wall deleted" pass. the block
+        # and the slope are separate terms, so zeroing the block must leave this one standing.
         _, fixed = step_seconds_split(cfg, "H200")
-        # the h200 constant is 126.4s; if it were still charged `fixed` would clear it outright.
-        assert fixed < step_floor_seconds("H200"), method
-        # and the slope is still in there -- this is not a "wall deleted" pass.
         assert fixed >= slope, method
+
+    # a sleep-capable model on the same card still pays it, so the assertion above cannot pass by
+    # the block having been dropped for everyone.
+    sleeps = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 6, **shape)
+    assert run_startup_seconds(sleeps, "H200") > 50.0
 
 
 def test_hardware_choice_is_not_a_restatement_of_the_hourly_rate():
@@ -416,26 +493,56 @@ def test_hardware_choice_is_not_a_restatement_of_the_hourly_rate():
     disagreeing with sorting on $/hr.
 
     Measured on the one campaign family that ran on all eight classes (Qwen3.5-0.8B, b8 g4, ctx512,
-    cap128), RTX 5090 is the cheapest per job at $0.0123/step despite RTX 4090 being cheaper per
-    hour ($0.69 vs $0.99): the 4090 takes 101.4s against the 5090's 44.6s. Ranking on rate alone
-    buys the 4090 and pays 1.59x more per step.
+    cap128), RTX 5090 is the cheapest per job despite RTX 4090 being cheaper per hour ($0.69 vs
+    $0.99): the 4090 takes 101.4s/step-equivalent against the 5090's 44.6s. Ranking on rate alone
+    buys the 4090 and pays 1.59x more.
+
+    WHERE that difference lives moved. Nearly all of it is the once-per-RUN block (RTX 4090 404.6s
+    vs RTX 5090 98.4s); the steady-state steps are within 1% of each other (23.60s vs 23.41s). So
+    this must price a JOB, not a step -- pricing one steady-state step compares two cards the model
+    now says are almost the same speed, and the disagreement it exists to assert disappears. That
+    is also exactly why the ranking key amortizes the block instead of ranking on the step alone.
     """
-    from flash.cost.analytical import step_seconds_split
+    from flash.cost.analytical import (
+        compile_seconds,
+        run_startup_seconds,
+        step_cost_key,
+        step_seconds_split,
+    )
     from flash.cost.types import RunConfig
 
+    steps = 8
     cfg = RunConfig(
-        "Qwen/Qwen3.5-0.8B", "grpo", 1, seq_len=512, completion_len=128, batch_size=8, group_size=4
+        "Qwen/Qwen3.5-0.8B",
+        "grpo",
+        steps,
+        seq_len=512,
+        completion_len=128,
+        batch_size=8,
+        group_size=4,
     )
     rates = {"RTX 4090": 0.69, "RTX 5090": 0.99}
-    seconds = {c: sum(step_seconds_split(cfg, c)) for c in rates}
 
-    # the two cards must not be quoted as interchangeable; the 4090's wall is 4.5x the 5090's.
-    assert seconds["RTX 4090"] > 2 * seconds["RTX 5090"]
+    def job_seconds(card: str) -> float:
+        return (
+            compile_seconds(cfg, card)
+            + run_startup_seconds(cfg, card)
+            + steps * sum(step_seconds_split(cfg, card))
+        )
+
+    seconds = {c: job_seconds(c) for c in rates}
+    # the two cards must not be quoted as interchangeable over a real run.
+    assert seconds["RTX 4090"] > 1.4 * seconds["RTX 5090"]
 
     dollars = {c: seconds[c] * rates[c] / 3600.0 for c in rates}
     # cheaper per hour, dearer per job -- so the two orderings genuinely disagree here.
     assert rates["RTX 4090"] < rates["RTX 5090"]
     assert dollars["RTX 5090"] < dollars["RTX 4090"]
+
+    # and the shipped ranking key must reproduce that disagreement, not just this local arithmetic:
+    # it is the thing selection actually calls.
+    key = step_cost_key(cfg)
+    assert key("RTX 5090", rates["RTX 5090"]) < key("RTX 4090", rates["RTX 4090"])
 
 
 def test_rollout_slope_is_per_completion_not_per_generated_token():
@@ -500,6 +607,6 @@ def test_rollout_slope_is_per_completion_not_per_generated_token():
 
     # the slope IS live, so this cannot pass by the wall being constant everywhere: it must still
     # scale with the COMPLETION count, which is what it actually prices.
-    from flash.cost.facts import step_floor_seconds
+    from flash.cost.facts import rollout_step_seconds
 
-    assert step_floor_seconds("H100", 64) > step_floor_seconds("H100", 32)
+    assert rollout_step_seconds(64) > rollout_step_seconds(32)

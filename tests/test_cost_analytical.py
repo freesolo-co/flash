@@ -14,7 +14,7 @@ from flash.cost.analytical import (
     seconds_per_step,
     select_gpu,
     setup_seconds,
-    sft_run_startup_seconds,
+    run_startup_seconds,
     step_seconds_split,
 )
 
@@ -34,12 +34,31 @@ def test_estimate_is_positive_and_self_consistent():
     assert e.gpu_vram_gb >= e.required_vram_gb
 
 
-def test_sft_run_startup_is_charged_once_to_sft_only():
-    # verl launch + model load + fsdp init land inside the billed train wall on sft. grpo and opd
-    # already carry that time in their per-step floor, so charging it again would double-count.
-    assert sft_run_startup_seconds(RunConfig(MID, "sft", 32)) == SFT_RUN_STARTUP_S
-    assert sft_run_startup_seconds(RunConfig(MID, "grpo", 32)) == 0.0
-    assert sft_run_startup_seconds(RunConfig(MID, "opd", 32)) == 0.0
+def test_run_startup_is_charged_per_method_and_per_card():
+    # verl launch + model load + framework init land inside the billed train wall for every method.
+    # an earlier revision charged this to sft ONLY, on the reasoning that grpo and opd already
+    # carried it in their per-step floor. that was wrong: the per-step floor WAS this block divided
+    # by the step count of the arms it was fitted on, which is why it is charged here now and no
+    # longer charged per step.
+    assert run_startup_seconds(RunConfig(MID, "sft", 32), "H100") == SFT_RUN_STARTUP_S
+    # sft's block was fitted with the card held fixed, so it has no per-class table.
+    assert run_startup_seconds(RunConfig(MID, "sft", 32), "RTX 5090") == SFT_RUN_STARTUP_S
+
+    # rollout methods build a vLLM engine and do a first weight sync on top, so their block is both
+    # larger than sft's and card-shaped.
+    for method in ("grpo", "opd"):
+        h100 = run_startup_seconds(RunConfig(MID, method, 32), "H100")
+        rtx = run_startup_seconds(RunConfig(MID, method, 32), "RTX 5090")
+        assert h100 > SFT_RUN_STARTUP_S, method
+        assert rtx > 0.0 and h100 != rtx, method
+
+
+def test_run_startup_is_zero_for_a_resident_rollout_engine():
+    # a sleep_unsupported model pins the rollout engine resident, so the engine build this block is
+    # mostly made of never runs. see facts.run_block_seconds for what that zero gives up.
+    resident = RunConfig("Qwen/Qwen3.6-35B-A3B", "grpo", 32)
+    assert run_startup_seconds(resident, "B200") == 0.0
+    assert run_startup_seconds(RunConfig(MID, "grpo", 32), "B200") > 0.0
 
 
 def test_sft_run_startup_stays_within_the_measured_range():
@@ -508,7 +527,17 @@ def test_ranker_and_quote_price_a_combination_identically():
     is the allocator's real closure, and the quote end is estimate_cost's own train_seconds. Pinning
     only ``seconds_per_step`` on both sides would leave the quote free to stop calling it (exactly
     the defect being fixed) while this still passed.
+
+    The ranker prices the whole billed wall over the step count, not the marginal step alone: the
+    per-run blocks (compile, framework/engine startup, required saves) are amortized into it so the
+    key orders candidates exactly as total job cost does. So parity here is against
+    ``(per_run / steps + per_step)``, and a ranker that dropped the amortized term would fail this.
     """
+    from flash.cost.analytical import (
+        compile_seconds,
+        required_save_overhead_seconds,
+        run_startup_seconds,
+    )
     from flash.providers.allocator import _step_cost_ranker
     from flash.providers.base import Candidate, run_config_for_ranking
 
@@ -522,7 +551,13 @@ def test_ranker_and_quote_price_a_combination_identically():
             candidate = Candidate(
                 provider="probe", gpu=gpu, hourly_usd=hourly, vram_gb=vram, gpu_count=n
             )
-            quoted = seconds_per_step(config, gpu, n) * candidate.total_hourly_usd / 3600.0
+            per_run = (
+                compile_seconds(config, gpu)
+                + run_startup_seconds(config, gpu)
+                + required_save_overhead_seconds(config)
+            )
+            wall = per_run / config.steps + seconds_per_step(config, gpu, n)
+            quoted = wall * candidate.total_hourly_usd / 3600.0
             assert ranker(candidate) == pytest.approx(quoted)
 
     # and the QUOTE has to be on that same curve. estimate_cost is the shipped surface; comparing
@@ -540,3 +575,146 @@ def test_ranker_and_quote_price_a_combination_identically():
         want = steps * (seconds_per_step(config, e.gpu, 1) - seconds_per_step(config, e.gpu, n))
         assert got == pytest.approx(want, rel=1e-6)
         assert got > 0, "adding cards must remove time from the quoted wall"
+
+
+def test_ranking_order_is_identical_to_total_job_cost_order():
+    """The ranking key must order candidates EXACTLY as total job cost does.
+
+    This is the contract the key exists to satisfy, and it is a property, not an example: for every
+    (method, model, shape, horizon) the argmin of ``key`` must be the argmin of what the job costs.
+    A per-step key has that property only while every term is per-step. Once-per-run terms break it
+    -- they are paid once regardless of length, so a key that adds one whole gives it the weight of
+    a single step and over-weights it by a factor of ``steps``.
+
+    Measured over this grid before the fix: 133 of 264 configurations picked a card that was not the
+    cheapest, worst case 1.40x overpay. After amortizing every per-run term: 0. Sweeping the STEP
+    COUNT is what makes it falsifiable -- at any single horizon the two agree often enough to look
+    fine, and the shipped key was wrong specifically at long ones.
+    """
+    from flash.cost.analytical import (
+        compile_seconds,
+        required_save_overhead_seconds,
+        run_startup_seconds,
+        seconds_per_step,
+        step_cost_key,
+    )
+
+    # real classes spanning a ~6x rate range and both interconnect families, so a mis-weighted term
+    # has somewhere to show up.
+    fleet = {
+        "RTX 4090": 0.69,
+        "RTX 5090": 0.99,
+        "A100 PCIe": 1.29,
+        "A100 SXM": 1.89,
+        "H100": 3.29,
+        "H200": 3.99,
+    }
+
+    def job_usd(config, gpu: str, rate: float) -> float:
+        """What the run bills end to end -- the same terms estimate_cost assembles."""
+        per_run = (
+            compile_seconds(config, gpu)
+            + run_startup_seconds(config, gpu)
+            + required_save_overhead_seconds(config)
+        )
+        return rate * (per_run + config.steps * seconds_per_step(config, gpu, 1)) / 3600.0
+
+    checked = 0
+    for method in ("sft", "grpo", "opd"):
+        for model in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-35B-A3B"):
+            for wants_save in (False, True):
+                for steps in (1, 2, 4, 8, 16, 32, 64, 128, 200):
+                    # a mid-run save, clamped into the horizon under test -- save_at_steps may not
+                    # exceed steps, and the point is to exercise the term at every length.
+                    saves = (max(1, steps // 2),) if wants_save else ()
+                    config = RunConfig(
+                        model,
+                        method,
+                        steps,
+                        seq_len=512,
+                        completion_len=128,
+                        batch_size=8,
+                        group_size=4,
+                        save_at_steps=saves,
+                    )
+                    key = step_cost_key(config)
+                    assert key is not None, model
+
+                    by_key = sorted(fleet, key=lambda g: (key(g, fleet[g]), g))
+                    by_job = sorted(fleet, key=lambda g: (job_usd(config, g, fleet[g]), g))
+                    assert by_key == by_job, f"{method} {model} steps={steps} saves={saves}"
+                    checked += 1
+
+    assert checked == 162  # the grid really ran, rather than an empty loop passing vacuously
+
+
+def test_ranking_key_is_exactly_job_cost_per_step():
+    """Not just order-preserving: the key IS the job cost divided by the step count.
+
+    The order test above passes for any monotone transform of job cost, so it cannot tell a correct
+    key from one that happens to sort the same way on this fleet. This pins the actual value, which
+    is also what makes the key comparable across candidates with different step counts.
+    """
+    from flash.cost.analytical import (
+        compile_seconds,
+        required_save_overhead_seconds,
+        run_startup_seconds,
+        seconds_per_step,
+        step_cost_key,
+    )
+
+    for method in ("sft", "grpo", "opd"):
+        for steps in (1, 8, 64):
+            config = RunConfig(
+                MID, method, steps, seq_len=512, completion_len=128, batch_size=8, group_size=4
+            )
+            key = step_cost_key(config)
+            for gpu, rate in (("H100", 3.29), ("RTX 5090", 0.99)):
+                per_run = (
+                    compile_seconds(config, gpu)
+                    + run_startup_seconds(config, gpu)
+                    + required_save_overhead_seconds(config)
+                )
+                job = rate * (per_run + steps * seconds_per_step(config, gpu, 1)) / 3600.0
+                assert key(gpu, rate) == pytest.approx(job / steps), f"{method} {gpu} {steps}"
+
+
+def test_ranking_choice_moves_with_the_horizon():
+    """The chosen card must be allowed to CHANGE with the step count, and must settle.
+
+    A guard against the fix being silently undone in either direction. If the block were re-divided
+    into every step, the key would be horizon-invariant and the winner would never move -- the old
+    behaviour. If the block were dropped entirely, the winner would also never move. Only charging
+    it once per run makes the short-run and long-run answers legitimately differ.
+
+    It must also CONVERGE: as steps grow the block's share falls monotonically toward zero, so past
+    some horizon the ranking stops changing. A key that kept moving would mean a term scaling with
+    the step count that should not.
+    """
+    from flash.cost.analytical import step_cost_key
+
+    fleet = {"RTX 4090": 0.69, "RTX 5090": 0.99, "H100": 3.29, "H200": 3.99}
+
+    def winner(steps: int) -> str:
+        config = RunConfig(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            steps,
+            seq_len=512,
+            completion_len=128,
+            batch_size=8,
+            group_size=4,
+        )
+        key = step_cost_key(config)
+        return min(fleet, key=lambda g: (key(g, fleet[g]), g))
+
+    horizons = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    picks = [winner(s) for s in horizons]
+
+    # the block is real: the short-run and long-run winners are not the same card.
+    assert picks[0] != picks[-1], f"winner never moved across {horizons}: {picks}"
+    # ... and it converges: no further change once the block's share is small.
+    assert picks[-4:] == [picks[-1]] * 4, f"ranking still moving at long horizons: {picks}"
+    # the winner changes at most once, monotonically -- no oscillation.
+    switches = sum(1 for a, b in zip(picks, picks[1:]) if a != b)
+    assert switches == 1, f"expected a single crossover, saw {switches}: {picks}"

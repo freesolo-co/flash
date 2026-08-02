@@ -21,7 +21,8 @@ from .facts import (
     pick_gpu,
     reward_seconds_per_completion,
     rollout_is_resident,
-    step_floor_seconds,
+    rollout_step_seconds,
+    run_block_seconds,
     teacher_seconds_per_completion,
     teacher_token_cost_usd,
     total_params_b,
@@ -121,11 +122,12 @@ _REQUIRED_SAVE_COMMITS = {"sft": 2, "grpo": 2, "opd": 1}
 # so the floor is the only figure justified in EVERY class. this still underquotes the slow classes
 # -- deliberately, since overquoting a class the user might not land on is the worse error.
 #
-# NOT applied to grpo or opd, which already price this through their per-step non-shardable floor
-# (29-347s/step); adding a run-level term there would double-count it. grpo ships at 1.05x over
-# n=63, so it is measured and accurate. opd's 1.29x rests on a SINGLE arm: it is excluded here on
-# the mechanism (it carries a 114.3s/step non-shardable floor, so the block is already priced),
-# not on that ratio, which is too thin to accept or reject a coefficient on.
+# grpo and opd get their own run-level block (facts.run_block_seconds) rather than this one, which
+# is fitted on sft arms. an earlier revision of this comment excluded them outright, reasoning that
+# their per-step floor "already prices this" so a run-level term would double-count. that reasoning
+# was wrong, and step sweeps falsified it: the per-step floor IS this block, divided by the step
+# count of the arms it was fitted on. the double-count is avoided by moving the block out of the
+# per-step term, not by refusing to model it -- see facts._RUN_BLOCK_S.
 SFT_RUN_STARTUP_S = 68.4
 
 DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
@@ -178,9 +180,22 @@ def required_save_overhead_seconds(config: RunConfig) -> float:
     return len(n.save_at_steps) * per_save
 
 
-def sft_run_startup_seconds(config: RunConfig) -> float:
-    """One-time SFT startup inside the billed train wall (0 for grpo/opd; see SFT_RUN_STARTUP_S)."""
-    return SFT_RUN_STARTUP_S if config.method == "sft" else 0.0
+def run_startup_seconds(config: RunConfig, gpu: str) -> float:
+    """One-time startup inside the billed train wall, paid once before the first optimizer step.
+
+    SFT and the rollout methods pay different blocks for different reasons, so they are fitted
+    separately: sft's is a verl launch plus model load and fsdp wrap (SFT_RUN_STARTUP_S), while a
+    rollout run also builds the vLLM engine and does its first weight sync
+    (``facts.run_block_seconds``, keyed on card because the block is card-shaped).
+
+    ``gpu`` is only consulted for rollout methods; sft's block was fitted with card held fixed and
+    has no per-class table.
+    """
+    if config.method == "sft":
+        return SFT_RUN_STARTUP_S
+    if not config.has_rollout:
+        return 0.0
+    return run_block_seconds(gpu, resident=rollout_is_resident(config.normalized().model_id))
 
 
 def _is_moe(model_id: str) -> bool:
@@ -312,15 +327,12 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         #
         # opd carries the rollout wall because it runs the same verl rollout path grpo does -- vllm
         # generation and the actor->rollout weight sync both happen here, and it generates the same
-        # per-completion sequences, so both the constant and the slope apply. that is the mechanism
-        # the wall measures, but note every arm it was FITTED on is grpo, so the size of the opd wall
-        # is inferred from a shared mechanism rather than measured on opd arms.
+        # per-completion sequences, so the slope applies. opd arms are now IN the fitted corpus (a
+        # 4090 step sweep at 8/16/48), so this is measured on opd rather than inferred from grpo.
         #
-        # opd honours the resident flag for the same reason grpo does: opd_train pins the rollout
-        # resident off the same catalog flag, so the engine cycle is absent on both drivers.
-        return gen_s + update_s, overhead + teacher_s + step_floor_seconds(
-            gpu, completions, resident=rollout_is_resident(n.model_id)
-        )
+        # the run-level engine build is NOT charged here -- it is once per run, and lands in
+        # run_startup_seconds. see facts.rollout_step_seconds for why no per-card constant remains.
+        return gen_s + update_s, overhead + teacher_s + rollout_step_seconds(completions)
 
     if not n.is_grpo:
         # NO rollout wall here, neither term. sft is a plain fwd/bwd loop: no vllm engine to enter and
@@ -394,15 +406,14 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     # changes. a grpo step dominated by it is latency-bound, not compute-bound.
     #
     # reward and rollout are BOTH per-completion but they are separate terms on purpose. they were
-    # conflated before: the rollout slope (0.81s) is close enough to the reward default (1.0s) that
+    # conflated before: the rollout slope (0.66s) is close enough to the reward default (1.0s) that
     # one term could stand in for both, right up until a caller passed a MEASURED reward latency --
     # real graders here are ~0.0003s -- and the rollout cost vanished with it. see facts.py.
     #
-    # a sleep_unsupported model keeps its rollout engine RESIDENT, so it never pays the entry/exit
-    # cycle the constant is made of -- see step_floor_seconds. the slope still applies.
-    return gen_s + update_s, overhead + reward_s + step_floor_seconds(
-        gpu, completions, resident=rollout_is_resident(n.model_id)
-    )
+    # the engine build a sleep_unsupported model skips is once per RUN, so the resident case is
+    # handled in run_startup_seconds, not here. this slope is per-sequence sampling work that a
+    # resident engine still pays -- see facts.rollout_step_seconds.
+    return gen_s + update_s, overhead + reward_s + rollout_step_seconds(completions)
 
 
 def seconds_per_step(config: RunConfig, gpu: str, gpu_count: int = 1) -> float:
@@ -428,8 +439,39 @@ def step_cost_key(config: RunConfig):
     is not the same as running the job for the least money: a card bills for the time it takes, so
     the right basis is rate x duration. An A10 at $0.75/hr is nominally cheaper than an H100 at
     $3.29 but sustains a fraction of its FLOPs, so the same run costs about three times as much on
-    it. Ranking per STEP prices both halves at once, and since the step count is identical across
-    candidates it orders them exactly as total job cost does -- without needing the run's length.
+    it. Ranking per STEP prices both halves at once.
+
+    The run's LENGTH is load-bearing here, which it was not before. A per-step key orders candidates
+    exactly as total job cost does only while every term is per-step -- then the shared step count
+    is a positive constant factor and cancels. Once-per-run terms break that: they are paid once no
+    matter how long the run is, so a key that adds one whole gives it the weight of a single step,
+    over-weighting it by a factor of `steps`. The rollout block makes this concrete -- it spans ~7x
+    across classes (98s on RTX 5090 to 762s on H200), so mis-weighting it reorders the fleet. Above
+    8 steps the un-amortized key ranks RTX 5090 cheapest when RTX 4090 actually is, picking a card
+    that costs up to 1.40x more to run the job; over a 792-configuration grid it chose wrong on 133,
+    while the amortized key below chose wrong on 0.
+
+    So EVERY per-run term is divided by the step count -- the rollout/sft block, the one-time MoE
+    compile, and the required-save overhead. Charging only some of them is not a partial fix but a
+    different wrong answer: an early revision amortized the block alone and still inverted 4 of 324
+    MoE-and-save configurations, because a term being card-FREE in seconds does not make it neutral
+    in dollars. Card-free seconds are billed at a per-card rate, so omitting them under-weights
+    exactly the cheap-card advantage this key exists to price.
+
+    With all four terms present the key is exactly ``job_cost / steps``, and dividing every candidate
+    by the SAME positive number is order-preserving -- which restores, by construction, the
+    cancellation this docstring used to claim unconditionally. It also matches what ``estimate_cost``
+    already does when it reports a per-step figure (``sps = raw_train / config.steps``); before this
+    the ranker and the quote disagreed about the same seconds.
+
+    ``config.steps`` is therefore read for its VALUE, not just carried. Callers that rank before the
+    true horizon is known pass the corpus median -- see ``providers.base.run_config_for_ranking``.
+
+    ``gpu_count`` shards the gpu-bound half of a step (see ``multi_card_speedup``) and nothing else:
+    the per-run block is paid once by the job however many cards it spans. Multi-card ranking runs
+    through this same closure rather than a parallel formula in the allocator -- when it did not,
+    the two branches priced different things and a combination's block silently vanished from the
+    key while the quote still billed it.
 
     Returns None when the model is outside the cost catalog, so callers fall back to $/hr for
     EVERY candidate rather than ranking a mix of two incomparable bases.
@@ -439,7 +481,12 @@ def step_cost_key(config: RunConfig):
     except Exception:
         return None
 
-    def cost_key(gpu: str, hourly_usd: float) -> float:
+    steps = max(1, config.steps)
+    # card-free, so hoisted out of the per-candidate path; still amortized, for the dollars reason
+    # in the docstring above.
+    save_s = required_save_overhead_seconds(config)
+
+    def cost_key(gpu: str, hourly_usd: float, gpu_count: int = 1) -> float:
         if gpu not in GPU_COMPUTE_TFLOPS:
             # no measured/spec throughput for this class, so its step time would be computed from a
             # placeholder. ranking on that invents a speed difference the hardware may not have;
@@ -449,7 +496,11 @@ def step_cost_key(config: RunConfig):
             gpu_bound, fixed = step_seconds_split(config, gpu)
         except Exception:
             return 0.0  # unpriceable class falls back to the $/hr tie-break, never fails selection
-        return hourly_usd * (gpu_bound + fixed) / 3600.0
+        per_run = compile_seconds(config, gpu) + run_startup_seconds(config, gpu) + save_s
+        step_s = gpu_bound / multi_card_speedup(gpu_count, gpu) + fixed
+        # hourly_usd is PER CARD (Candidate keeps it that way), so an n-card combination occupies
+        # n cards for the whole wall -- the same multiplication estimate_cost applies to total_usd.
+        return max(1, gpu_count) * hourly_usd * (per_run / steps + step_s) / 3600.0
 
     return cost_key
 
@@ -621,9 +672,10 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     # A one-time kernel/graph compile is paid once on the first step (MoE-only; 0 for dense). It is
     # training GPU time, so it belongs in the (billed) train term, not setup.
     compile_s = compile_seconds(config, gpu)
-    # Same argument, SFT only: verl launch + model load + fsdp init run inside the billed train wall
-    # and are quoted per RUN, not per step. grpo/opd already carry this in their per-step floor.
-    startup_s = sft_run_startup_seconds(config)
+    # Same argument: launch, model load and framework init run inside the billed train wall and are
+    # quoted per RUN, not per step. sft pays a verl/fsdp block; grpo and opd pay a larger, card-shaped
+    # one because they also build the vLLM engine and do the first weight sync.
+    startup_s = run_startup_seconds(config, gpu)
     raw_train = compile_s + startup_s + config.steps * sps + required_save_s
     if not config.is_grpo and config.train_tokens is not None:
         raw_train = (

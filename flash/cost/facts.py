@@ -188,48 +188,77 @@ def effective_train_tflops(name: str) -> float:
 # robustness above and for the high-completion bucket the first fit could not see (g>=129:
 # 1.183x -> 1.022x). Scored by LOOCV because the natural holdout contains the only two A100 SXM
 # arms, which are also the sole source of that class's constant.
-ROLLOUT_SECONDS_PER_COMPLETION = 0.81
+ROLLOUT_SECONDS_PER_COMPLETION = 0.66
 
-# Per-card constant, fitted as the MEDIAN of (realized - compute - slope*completions) so one
-# preempted or thermally-throttled arm cannot drag a class. Stable within a class across model size,
-# environment and batch shape; it varies ~7x across classes, which is why it is keyed on the card.
+# Per-RUN rollout block: vllm engine build, the first actor->rollout weight sync, and trainer/replay
+# init. Paid ONCE before the first step, not on every step. It lands after ``setup_seconds`` is
+# stamped, so like sft's SFT_RUN_STARTUP_S it is billed inside the train wall.
 #
-# Every arm is a ROLLOUT (grpo) arm on RUNPOD. Two limits follow, both deliberate:
-#   - sft is excluded at the call site (see analytical.step_seconds_split), on mechanism not
-#     measurement: sft runs no vllm engine and no weight sync, so the wall this table measures has
-#     no source there. sft keeps its pre-existing compute-only quote.
-#   - it is keyed on card alone, not (card, provider). A matched lambda/vast replication was
-#     attempted and returned zero usable timings (8/8 arms died in provisioning, step-0 wedge, or a
-#     trainer crash), so a provider term is unmeasured rather than measured-and-rejected. Card-only
-#     is the conservative choice: it is a strict improvement over pricing no wall at all on every
-#     provider, and if a provider offset does exist it shows up as a class being uniformly off on
-#     that provider, which is the same signal that would justify adding an entry.
-_STEP_FLOOR_S: dict[str, float] = {
-    "A100 PCIe": 45.9,
-    # ~2.3x its own PCIe sibling, which is why the two variants cannot share one entry.
-    "A100 SXM": 103.6,
-    # Same SMs and tensor cores as the 80GB board, less HBM only -- and this wall is engine-entry and
-    # weight-sync bound, not capacity bound. So it inherits the 80GB measurement for the same reason
-    # the TFLOPS table does. Left out, it fell through to the pooled default and under-priced the
-    # dominant per-step term by ~2x on every lambda/vast quote in that band.
-    "A100 SXM 40GB": 103.6,
-    "B200": 55.4,
-    "H100": 51.4,
-    # H200 is the outlier: ~2.5x the H100 constant on the same sm90 kernels. Consistent across all of
-    # its arms, so it is a property of the class as provisioned, not a bad sample.
-    "H200": 126.4,
-    "RTX 4090": 80.4,
-    "RTX 5090": 17.7,
-    # Its two arms disagree 4.1x on byte-identical configs (137.9s vs 58.1s realized), far outside the
-    # 1.39x same-config pod-to-pod noise floor. The median of the two is kept rather than the pooled
-    # default -- it is at least measured on this class -- but treat it as provisional until replicates
-    # agree. This is the one class whose own variance exceeds the error the table is correcting.
-    "RTX Pro 6000": 71.6,
+# This table replaces a per-STEP constant, and the replacement is the fix, not a re-tuning. That
+# constant was fitted per arm as median(realized - compute - slope*completions), and the corpus was
+# ~90% 6-8 step arms, so each arm's share of a once-per-run block entered the median ALREADY DIVIDED
+# by its own step count. The constant was therefore never a per-step quantity: it was this block
+# scaled by 1/steps. Two independent checks:
+#   - BLOCK/7 reproduces the old constant within a few seconds on three classes fitted separately.
+#   - After charging the block once, the RESIDUAL per-step constant is ~0 on every class in the
+#     fleet (0.00 H100, 0.00 RTX 5090, -0.00 B200, -0.00 H200, 0.00 A100 SXM, -0.24 A100 PCIe,
+#     0.66 RTX 4090, -1.72 RTX Pro 6000) against old constants of 17.7 to 126.4 s/step. There is
+#     nothing left for a per-step constant to explain, which is why one is no longer charged.
+#
+# Separating an intercept from a slope needs leverage: a class whose arms all sit at one step count
+# cannot do it, and a 6->8 step span is collinear enough to produce absurdities (a 2.26 s/step slope
+# on H100, a negative intercept on a 4090 pair). Every class below was measured across at least
+# three distinct step counts for that reason; the campaign that added steps 4 and 24 to the
+# short-span classes is what made A100 SXM, H200 and RTX Pro 6000 identifiable at all.
+#
+# SCORED BY LEAVE-ONE-OUT over all 88 rollout arms, refitting BOTH forms on the other 87 with each
+# one's own estimator -- comparing a whole-corpus-fitted incumbent against a held-out challenger
+# would have biased the result toward the change. Geo-bias 1.427x -> 1.295x, in band 42/88 -> 53/88,
+# 7 of 8 classes improved. The gain is concentrated exactly where the mechanism predicts, outside
+# the 6-8 step band the old constant was fitted in:
+#   steps <= 8 (n=77): 1.344x -> 1.313x   in band 41 -> 45
+#   steps 9-24 (n=7) : 2.016x -> 1.105x   in band  1 -> 7
+#   steps > 24 (n=4) : 2.011x -> 1.290x   in band  0 -> 1
+# For scale: replicate arms differing only in run_name spread 1.194x (median over 17 groups), so
+# 1.295x is at the measurement floor while 1.427x is well above it. Per-class differences smaller
+# than that floor are not distinguishable and are not claimed either way.
+#
+# This is load-bearing for card SELECTION, not just for the quote. Charging a per-run block per step
+# multiplies a ~7x class spread by `steps` and reorders the fleet: above 8 steps the old model ranks
+# RTX 5090 cheapest when RTX 4090 actually is, and the card it picks costs up to 1.34x more to run
+# the job. See ``analytical.step_cost_key`` for how the block enters ranking without that error.
+#
+# Every arm is a ROLLOUT (grpo/opd) arm on RUNPOD. Two limits follow, both deliberate:
+#   - sft is excluded at the call site (see analytical.run_startup_seconds), on mechanism not
+#     measurement: sft runs no vllm engine and no weight sync, so the block this table measures has
+#     no source there. sft keeps its own SFT_RUN_STARTUP_S.
+#   - it is keyed on card alone, not (card, provider). A matched lambda/vast replication returned
+#     zero usable timings (8/8 arms died in provisioning, step-0 wedge, or a trainer crash), so a
+#     provider term is unmeasured rather than measured-and-rejected. Card-only is the conservative
+#     choice, and a real provider offset would surface as a class being uniformly off on that
+#     provider -- the same signal that would justify adding an entry.
+_RUN_BLOCK_S: dict[str, float] = {
+    "A100 PCIe": 251.2,
+    # ~2.2x its own PCIe sibling, which is why the two variants cannot share one entry.
+    "A100 SXM": 543.4,
+    # Same SMs and tensor cores as the 80GB board, less HBM only -- and this block is engine-build
+    # and weight-sync bound, not capacity bound. So it inherits the 80GB measurement for the same
+    # reason the TFLOPS table does. Left out, it fell through to the pooled default and mis-priced
+    # every lambda/vast quote in that band.
+    "A100 SXM 40GB": 543.4,
+    "B200": 410.3,
+    "H100": 339.0,
+    # H200 is the outlier: ~2.2x the H100 block on the same sm90 kernels. Consistent across its arms,
+    # so it is a property of the class as provisioned, not a bad sample.
+    "H200": 762.4,
+    "RTX 4090": 404.6,
+    "RTX 5090": 98.4,
+    "RTX Pro 6000": 260.5,
 }
 # Unmeasured classes take the pooled median across the whole campaign rather than zero: charging no
-# wall at all is the failure this table exists to fix, and it under-quotes by 3-4x. A class here is
-# quoted low, so add a measured entry above once a class has replicates that agree.
-_DEFAULT_STEP_FLOOR_S = 52.5
+# block at all is the failure this table exists to fix, and it under-quotes by 3-4x. A class here is
+# quoted low, so add a measured entry above once a class has arms at three or more step counts.
+_DEFAULT_RUN_BLOCK_S = 344.8
 
 
 def rollout_is_resident(model_id: str) -> bool:
@@ -245,37 +274,27 @@ def rollout_is_resident(model_id: str) -> bool:
     return bool(info is not None and getattr(info, "sleep_unsupported", False))
 
 
-def step_floor_seconds(name: str, completions: int = 0, resident: bool = False) -> float:
-    """Wall time of one rollout step on ``name`` that no amount of FLOPs shortens.
+def rollout_step_seconds(completions: int = 0) -> float:
+    """Per-step rollout wall that no amount of FLOPs shortens: ``slope * completions``.
 
-    ``const_card + slope * completions``. The constant is engine entry/exit and the actor->rollout
-    weight sync; the slope is per-sequence rollout work. Neither is arithmetic, so neither shrinks on
-    a faster card, and (see ``providers.allocator``) neither shards across more of them.
+    This is per-sequence sampling, detokenization and dispatch work. It is not arithmetic, so it
+    does not shrink on a faster card and (see ``providers.allocator``) it does not shard across more
+    of them.
 
-    ``resident=True`` drops the constant for a model the catalog flags ``sleep_unsupported``. Those
-    pin the rollout engine resident instead of sleeping it (catalog.py, backend_common.py), so the
-    engine entry/exit cycle the constant is mostly made of never runs. Charging it anyway extrapolates
-    well past the fit: every one of the 56 arms is a sleep-capable 0.8B/2B/4B model, so a resident
-    rollout was never measured. It is not a small error -- on Qwen3.6-35B-A3B the constant alone
-    (55.4s B200, 126.4s H200) exceeds this module's own ~24s realized-step figure for that model, so
-    the quote was dominated by a term whose mechanism is switched off.
+    There is deliberately NO per-card constant term here. One used to be charged, but refitting with
+    the once-per-run block separated out (``_RUN_BLOCK_S``) drives the residual per-step constant to
+    ~0 on every class in the fleet -- the largest magnitude left anywhere is 1.72 s/step, against
+    old constants of 17.7 to 126.4. The constant was the run block divided by its arms' step count,
+    not a per-step quantity, so charging both terms would double-count the same seconds.
 
-    Being exact about what zero here gives up: the intercept is engine entry/exit AND the
-    actor->rollout weight sync, and the sync still runs every step on a resident engine -- the
-    resident overrides touch only ``free_cache_engine``/``enable_sleep_mode``, both sleep knobs, and
-    an on-policy step must push the updated policy into vLLM either way. So zero under-quotes by one
-    sync. The intercept is NOT split, because the corpus cannot split it: every fitted arm ran
-    sleep-enabled, so no measurement separates the two components. A guessed split ratio would be a
-    fabricated number wearing a measured one's clothes. Zero is chosen as the bounded, honest error:
-    a colocate sync is a same-device weight copy (~70GB bf16 for the 35B, tens of ms at HBM
-    bandwidth plus collective overhead), which is small against a 55-126s intercept, and it errs
-    toward under-quoting a single model rather than over-quoting it by ~5x its realized step.
-    Replace this with a measured resident intercept once a resident arm is calibrated.
+    Nor is the slope keyed on card, and that is measured rather than assumed: it is per-sequence
+    host-side and sampling work whose per-class fits agree within the corpus noise floor, so a
+    per-card table would be fitting run-to-run pod variance.
 
-    The SLOPE is still charged: a resident engine skips the cycle, not the per-sequence sampling,
-    detokenization and dispatch work. Zero here would be the opposite error. The slope itself is
-    still fitted on sleeping arms, so a resident quote is bounded by measurement on one term and by
-    mechanism on the other -- documented rather than silently assumed.
+    No ``resident`` parameter, for the same reason: what a resident engine skips is the engine
+    build/teardown cycle, which now lives entirely in the run block. It does not skip per-sequence
+    sampling, so this term is charged in full either way. Zeroing it for resident models would be
+    the opposite of the old error, not a correction to it.
 
     Known under-quote, MULTI-TURN. ``completions`` is the episode count, but a multi-turn env issues
     one vLLM ``generate`` per assistant turn (``worker/grpo_multiturn.py``), so turns 2..N escape the
@@ -287,8 +306,33 @@ def step_floor_seconds(name: str, completions: int = 0, resident: bool = False) 
     corpus, to hedge a shape this layer cannot observe. Threading the turn shape into the pricing
     config is the fix, and it is a spec-path change.
     """
-    const = 0.0 if resident else _STEP_FLOOR_S.get(name, _DEFAULT_STEP_FLOOR_S)
-    return const + (ROLLOUT_SECONDS_PER_COMPLETION * max(0, completions))
+    return ROLLOUT_SECONDS_PER_COMPLETION * max(0, completions)
+
+
+def run_block_seconds(name: str, resident: bool = False) -> float:
+    """One-time rollout setup inside the billed train wall on ``name`` (0 for a resident engine).
+
+    ``resident=True`` zeroes this for a model the catalog flags ``sleep_unsupported``. Those pin the
+    rollout engine resident instead of sleeping it (catalog.py, backend_common.py), so the engine
+    build and teardown this block is mostly made of never runs. Charging it anyway extrapolates well
+    past the fit: every fitted arm is a sleep-capable 0.8B/2B/4B model, so a resident rollout has
+    never been measured.
+
+    Being exact about what zero gives up: the block is engine build AND the first actor->rollout
+    weight sync, and that sync still happens on a resident engine -- the resident overrides touch
+    only ``free_cache_engine``/``enable_sleep_mode``, both sleep knobs, and an on-policy run must
+    push the policy into vLLM either way. So zero under-quotes by one sync. The block is NOT split,
+    because the corpus cannot split it: every fitted arm ran sleep-enabled, so no measurement
+    separates the two components, and a guessed split ratio would be a fabricated number wearing a
+    measured one's clothes. Zero is the bounded, honest error: a colocate sync is a same-device
+    weight copy (~70GB bf16 for the 35B, tens of ms at HBM bandwidth plus collective overhead),
+    small against a 250-760s block, and it errs toward under-quoting one model rather than
+    over-quoting it by a whole engine build. Replace this with a measured resident block once a
+    resident arm is calibrated.
+    """
+    if resident:
+        return 0.0
+    return _RUN_BLOCK_S.get(name, _DEFAULT_RUN_BLOCK_S)
 
 
 def gpu_hourly_usd(

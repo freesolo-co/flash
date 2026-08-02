@@ -9,8 +9,8 @@ covering graders whose real span is ~0.01s (regex) to ~3s (llm judge). This meas
 value on the actual env before training starts.
 
 That default prices GRADING ONLY. The rollout wall a step also pays is priced separately by
-``step_floor_seconds``, so a measured latency shrinks the grading term without deleting the rest of
-the step -- which is exactly what a single conflated constant used to do.
+``rollout_step_seconds``, so a measured latency shrinks the grading term without deleting the rest
+of the step -- which is exactly what a single conflated constant used to do.
 
 What this measurement does NOT do yet: reach the quote. It runs on the worker after submission and
 lands in run notes, while the persisted estimate is built at submit time from a ``RunConfig`` whose

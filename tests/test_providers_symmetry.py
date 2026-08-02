@@ -239,13 +239,19 @@ def test_vast_competes_purely_on_price(monkeypatch):
     # either way. RunPod's 4090 beats Lambda's nominally-cheaper A10 here because ranking is on
     # what the JOB costs: the A10 sustains ~125 TFLOPS against the 4090's ~165, so the run takes
     # long enough on it to more than erase the $0.09/hr saving.
+    #
+    # The horizon is passed EXPLICITLY. A throughput advantage is only worth a rate premium over
+    # the per-step half of a run, and a 0.8B sft job is ~68s of launch block against a ~4-6s step,
+    # so at a short horizon the block is most of the bill and the cheaper rate legitimately wins.
+    # Leaving max_steps unset here would rank on the fallback horizon and assert the opposite of
+    # what the model says -- see test_allocator.test_a_one_step_run_is_won_by_the_cheaper_rate.
     _stub_candidates(
         monkeypatch,
         runpod=[("runpod", "RTX 4090", 0.69, 24)],
         lambda_=[("lambda", "A10", 0.60, 24)],
         vast=[("vast", "RTX 4090", 0.80, 24)],
     )
-    b = allocate("Qwen/Qwen3.5-0.8B", "sft")
+    b = allocate("Qwen/Qwen3.5-0.8B", "sft", train={"max_steps": 200})
     assert b.provider == "runpod"
     assert b.hourly_usd == pytest.approx(0.69)
 

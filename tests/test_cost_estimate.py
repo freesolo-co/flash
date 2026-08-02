@@ -484,7 +484,7 @@ def test_b200_compute_is_h200_class_and_never_cheaper_for_grpo(monkeypatch):
     # exactly, and at its higher $/hr the run must never come out cheaper.
     #
     # total step time is deliberately NOT asserted equal. the two classes have different measured
-    # per-step floors (h200 111s vs b200 44.5s -- see facts._STEP_FLOOR_S), which is real wall time
+    # per-run blocks (h200 762.4s vs b200 410.3s -- see facts._RUN_BLOCK_S), which is real wall time
     # unrelated to peak flops: at matched g32/cap128 b200 realized 68-85 s/step against h200's
     # 129-172 s. asserting equal totals here would re-encode the modelling gap this test predates.
     from types import SimpleNamespace

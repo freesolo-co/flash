@@ -16,7 +16,6 @@ from flash.providers.base import (
     _run_cost_key,
     canonical_gpu,
     providers_for,
-    run_config_for_ranking,
 )
 
 logger = get_logger(__name__)
@@ -64,9 +63,12 @@ _MAX_COMBINATION_CARDS = 4
 def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
     """``candidate -> dollars for one optimizer step``, or None when the run cannot be priced.
 
-    Wraps the shared per-step cost key with the multi-card speedup, which is the one thing the
-    single-card paths (parse-time provisional, cost estimate) have no notion of: a combination
-    bills every card but only the gpu-bound half of a step is divided among them.
+    Card count is passed THROUGH the shared cost key rather than handled here. An earlier revision
+    branched: one card went through the key, several went through a locally rebuilt
+    ``total_hourly x seconds_per_step``. That local formula quietly dropped the once-per-run block
+    the key amortizes, so a combination was ranked on its steady-state step alone while the quote
+    still billed it the block -- the two branches priced different runs, and the omission grew with
+    the block, which spans ~7x across classes. One closure, one formula, both counts.
     """
     cost_key = _run_cost_key(
         model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
@@ -75,24 +77,11 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
         logger.debug("total-cost ranking unavailable; ranking on $/hr")
         return None
 
-    from flash.cost.analytical import seconds_per_step
-
-    # the same one-step config the cost key was built from, so the single- and multi-card branches
-    # below cannot price a run off different knobs.
-    config = run_config_for_ranking(
-        model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
-    )
-
     def cost_per_step(candidate: Candidate) -> float:
-        if candidate.gpu_count <= 1:
-            # identical to the single-card key the preview and estimate use, so the three paths
-            # agree exactly whenever one card is enough.
-            return cost_key(candidate.gpu, candidate.hourly_usd)
-        # scaling is per-class: an nvlink pair keeps ~0.88 of linear per card, a pcie pair ~0.71.
-        # this is the same call the quote prices the chosen combination with, so ranking and
-        # billing cannot disagree about what a second card buys.
-        seconds = seconds_per_step(config, candidate.gpu, candidate.gpu_count)
-        return candidate.total_hourly_usd * seconds / 3600.0
+        # hourly_usd is per-card and the key multiplies by the count itself, matching how
+        # estimate_cost scales total_usd. scaling is per-class inside the key: an nvlink pair keeps
+        # ~0.88 of linear per card, a pcie pair ~0.71, and only the gpu-bound half is shared.
+        return cost_key(candidate.gpu, candidate.hourly_usd, candidate.gpu_count)
 
     return cost_per_step
 

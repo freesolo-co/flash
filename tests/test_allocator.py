@@ -107,17 +107,46 @@ def test_total_cost_ranking_beats_hourly_rate():
     This is the whole point of ranking on job cost: the cheapest RENTAL and the cheapest RUN are
     different cards whenever throughput differs enough. Stubbed so the assertion is about the
     ranking rule and not about whichever real classes happen to be priced today.
+
+    Priced over a realistic horizon rather than one step. Speed can only pay for a rate premium out
+    of time it actually saves, and it saves time only on the per-STEP half of the wall -- see
+    ``test_a_one_step_run_is_won_by_the_cheaper_rate`` for the other end of that trade.
     """
     from flash.cost.analytical import step_cost_key
     from flash.cost.types import RunConfig
 
-    key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=1))
+    key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=8))
     assert key is not None
     # A10: 125 TFLOPS at $1.29. RTX 4090: 165 TFLOPS at $0.69. The 4090 is both cheaper and faster.
     assert key("RTX 4090", 0.69) < key("A10", 1.29)
     # Now price the A10 BELOW the 4090. It is still the more expensive way to run the job, because
     # the extra wall time costs more than the rate saves -- which $/hr ranking cannot see.
     assert key("RTX 4090", 0.69) < key("A10", 0.60)
+
+
+def test_a_one_step_run_is_won_by_the_cheaper_rate():
+    """On a run too short to amortize the block, the cheaper card wins -- and that is correct.
+
+    The counterpart to the test above, and the reason it no longer prices at ``steps=1``. A run's
+    wall splits into a once-per-run block (launch, model load, framework init, save) and per-step
+    work. Only the second half is where a faster card can earn back a rate premium. At one step a
+    4B sft run is 68.4s of block against a 22-30s step, so most of the bill is card-FREE seconds
+    charged at the card's rate -- and the cheaper rate wins on the majority of the wall.
+
+    The ordering therefore MOVES with the horizon, by construction. Asserting the fast card wins at
+    every length would be asserting the block does not exist.
+    """
+    from flash.cost.analytical import step_cost_key
+    from flash.cost.types import RunConfig
+
+    short = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=1))
+    assert short("A10", 0.60) < short("RTX 4090", 0.69)
+
+    # by 4 steps the per-step half carries enough of the bill for throughput to decide it, and it
+    # stays decided from there -- the block's share only shrinks as the run grows.
+    for steps in (4, 8, 48, 200):
+        key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=steps))
+        assert key("RTX 4090", 0.69) < key("A10", 0.60), f"flipped back at steps={steps}"
 
 
 def test_step_cost_ranking_declines_unknown_classes():
@@ -1535,6 +1564,82 @@ def test_combo_default_single_gpu_behavior_unchanged(monkeypatch):
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
     a = allocator.allocate("m", "sft")
     assert (a.gpu, a.gpu_count) == ("H200", 1)  # only class fitting 100 GB alone
+
+
+def test_multi_card_ranking_prices_the_same_run_the_quote_bills():
+    """A combination must be RANKED on what it will be BILLED, at every card count.
+
+    THE regression. The ranker used to branch: one card went through the shared cost key, several
+    went through a locally rebuilt ``total_hourly x seconds_per_step``. That local form omitted the
+    once-per-run block the key amortizes, so a 2-card candidate was ranked on its steady-state step
+    while the quote still billed it the block -- and the omission is not small, the block spans
+    98.4s (RTX 5090) to 762.4s (H200) across classes. Nothing caught it: every multi-card test
+    asserted which candidate won, and both branches agreed whenever the block happened not to
+    change the order.
+
+    So this asserts the two AGREE rather than asserting a winner, which is what a branch-shaped
+    defect can actually fail. Checked per card count, because the single-card path was correct
+    throughout -- a test that only exercised n=1 would have stayed green.
+    """
+    from flash.cost.analytical import (
+        compile_seconds,
+        multi_card_speedup,
+        required_save_overhead_seconds,
+        run_startup_seconds,
+        step_cost_key,
+        step_seconds_split,
+    )
+    from flash.providers.base import Candidate, run_config_for_ranking
+
+    for method in ("sft", "grpo", "opd"):
+        config = run_config_for_ranking(
+            "Qwen/Qwen3.5-4B", method, train={"max_steps": 32}, thinking=False
+        )
+        key = step_cost_key(config)
+        assert key is not None
+
+        for gpu, rate in (("H200", 3.99), ("RTX 5090", 0.99), ("A100 SXM", 1.89)):
+            per_run = (
+                compile_seconds(config, gpu)
+                + run_startup_seconds(config, gpu)
+                + required_save_overhead_seconds(config)
+            )
+            gpu_bound, fixed = step_seconds_split(config, gpu)
+            for n in (1, 2, 4):
+                # what a run of this shape on n cards actually bills: the block once, the gpu-bound
+                # half shared, the rest per step -- times n cards for the whole wall.
+                step_s = gpu_bound / multi_card_speedup(n, gpu) + fixed
+                billed_per_step = n * rate * (per_run / config.steps + step_s) / 3600.0
+                ranked = key(gpu, rate, n)
+                assert ranked == pytest.approx(billed_per_step), f"{method} {gpu} n={n}"
+
+                # and the block must be IN there: dropping it is the exact defect, and it changes
+                # the number by more than any tolerance above would absorb.
+                without_block = n * rate * step_s / 3600.0
+                assert ranked > without_block, f"{method} {gpu} n={n} lost the block"
+
+
+def test_multi_card_ranking_reaches_the_allocator_not_just_the_key():
+    """The allocator's ranker must be the shared key, not a second implementation of it.
+
+    The helper-level test above cannot see the wiring: it calls ``step_cost_key`` directly, so an
+    allocator that rebuilds its own multi-card formula leaves it green -- which is precisely how the
+    branch survived. This goes through ``_step_cost_ranker``, the closure selection actually sorts
+    on, and compares it to the key for the same candidate.
+    """
+    from flash.cost.analytical import step_cost_key
+    from flash.providers.allocator import _step_cost_ranker
+    from flash.providers.base import Candidate, run_config_for_ranking
+
+    train = {"max_steps": 32}
+    ranker = _step_cost_ranker("Qwen/Qwen3.5-4B", "grpo", train, False)
+    assert ranker is not None
+    key = step_cost_key(run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo", train=train, thinking=False))
+
+    for gpu, rate in (("H200", 3.99), ("RTX 5090", 0.99)):
+        for n in (1, 2, 4):
+            candidate = Candidate(provider="runpod", gpu=gpu, hourly_usd=rate, vram_gb=80, gpu_count=n)
+            assert ranker(candidate) == pytest.approx(key(gpu, rate, n)), f"{gpu} n={n}"
 
 
 def test_combo_two_cheap_cards_beat_one_expensive(monkeypatch):

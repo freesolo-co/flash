@@ -326,6 +326,23 @@ def min_cuda_modern(name: str) -> str:
     return get_gpu_info(name).min_cuda_modern or "12.8"
 
 
+# Assumed run length when a spec sets no max_steps, used only to amortize the once-per-run block
+# across a run whose true horizon is not knowable during selection (it derives from dataset row
+# counts, which the allocator does not have). It is the MEDIAN step count of the measured corpus
+# (88 rollout arms: min 3, median 8, max 48), so it is the length a typical run actually has.
+#
+# Its blast radius was measured rather than assumed. Sweeping the assumed horizon over 1..200 across
+# a grid of completion and context shapes, the winning card is stable across wide ranges and flips
+# at only a few points, so the worst-case overpay from assuming wrong is bounded:
+#   assumed   1: 1.367x   <- the old steps=1 behaviour, the worst end of the range
+#   assumed   8: 1.269x   <- this value, the best of the fixed choices tested
+#   assumed  16: 1.324x
+#   assumed  32: 1.395x
+#   assumed  64: 1.395x
+# A spec WITH max_steps never uses this: it ranks on its real horizon and none of the above applies.
+_RANKING_STEPS_FALLBACK = 8
+
+
 def run_config_for_ranking(
     model_id: str,
     algorithm: str,
@@ -334,12 +351,21 @@ def run_config_for_ranking(
     thinking: bool = False,
     model_revision: str = "",
 ):
-    """Raw train knobs -> a one-step ``RunConfig`` to rank hardware against.
+    """Raw train knobs -> a ``RunConfig`` to rank hardware against.
 
     The single place spec knobs become a priced run, so every selection path (parse-time
-    provisional, submit-time allocator, cost estimate) ranks on identical inputs. ``steps=1``: the
-    ranking key is per-step, so the run's real length never enters it. Imported lazily because the
-    cost model imports this module.
+    provisional, submit-time allocator, cost estimate) ranks on identical inputs. Imported lazily
+    because the cost model imports this module.
+
+    The step count is a real input, not a placeholder. It used to be pinned at 1 on the reasoning
+    that a per-step key never sees the run's length; that stopped being true once a once-per-run
+    block entered the model, because ``steps=1`` gives that block the weight of a single step (see
+    ``cost.analytical.step_cost_key``). ``max_steps`` is read through the same ``knob`` helper as
+    every other spec value, which reaches both call sites unchanged -- the schema path passes a dict
+    and the lifecycle path an object, and ``knob`` already handles both.
+
+    ``_RANKING_STEPS_FALLBACK`` covers a spec with no ``max_steps``, where the true horizon comes
+    from dataset row counts the allocator does not have and must not fetch mid-selection.
     """
     from flash.cost.types import RunConfig
 
@@ -365,7 +391,7 @@ def run_config_for_ranking(
     return RunConfig(
         model_id=model_id,
         method=algorithm,
-        steps=1,
+        steps=knob("max_steps") or _RANKING_STEPS_FALLBACK,
         seq_len=knob("max_context_tokens"),
         completion_len=knob("max_completion_tokens"),
         batch_size=knob("batch_size"),
