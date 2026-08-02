@@ -803,6 +803,71 @@ def test_push_single_py_module_carries_helpers_named_by_a_relative_import(monkey
     assert "utils.py" in files
 
 
+def test_push_relative_import_inside_a_package_does_not_name_a_root_module(monkeypatch, tmp_path):
+    """`from . import config` in graders/__init__.py names graders/config.py, not ./config.py.
+
+    Every name the closure collects is resolved against the env root, so reading a relative import
+    from a file nested inside a packaged subdirectory published an unrelated top-level module while
+    the real sibling was already shipped by the package walk (codex[bot]).
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("import graders\n\ndef load_environment(**k):\n    return None\n")
+    graders = tmp_path / "graders"
+    graders.mkdir()
+    (graders / "__init__.py").write_text("from . import config\n")
+    (graders / "config.py").write_text("THRESHOLD = 0.5\n")
+    # a root-level module of the same name that the entrypoint never imports. resolving the
+    # package's relative import against the env root shipped THIS file instead.
+    (tmp_path / "config.py").write_text("SECRET = 'do not publish'\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "graders/config.py" in files
+    assert "config.py" not in files
+
+
+def test_push_entrypoint_importing_evaluations_charges_the_sidecar_once(monkeypatch, tmp_path):
+    """The eval sidecar the entrypoint imports is published once, not twice.
+
+    The entrypoint closure runs first and shares `yielded` with the sidecar block below it. With no
+    membership guard the sidecar was yielded a second time, and `_check_env_push_limits` charged
+    those bytes and that member twice -- rejecting a tree that is actually under the limit
+    (codex[bot]).
+    """
+    from flash.cli import envpush
+
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("import evaluations\n\ndef load_environment(**k):\n    return None\n")
+    (tmp_path / "evaluations.py").write_text(
+        "import scorers\n\ndef load_evaluations(environment=None): return []\n"
+    )
+    (tmp_path / "scorers.py").write_text("def score(v): return 1.0\n")
+    # the walk runs once to charge `_check_env_push_limits` and again to copy, so yields are
+    # counted per walk: the defect was a path yielded twice WITHIN one walk.
+    walks: list[list[str]] = []
+    real = envpush._iter_env_sidecar_files
+
+    def _tracking(env_root, *, entrypoint, include_full_tree):
+        walk: list[str] = []
+        walks.append(walk)
+        for src, rel in real(env_root, entrypoint=entrypoint, include_full_tree=include_full_tree):
+            walk.append(rel.as_posix())
+            yield src, rel
+
+    monkeypatch.setattr(envpush, "_iter_env_sidecar_files", _tracking)
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    assert walks, "the sidecar walk never ran"
+    assert [w.count("evaluations.py") for w in walks] == [1] * len(walks)
+    # the sidecar's own imports are still followed even though its yield was skipped.
+    files = _members(cap["package_b64"])
+    assert "scorers.py" in files
+
+
 def test_push_alternate_py_keeps_packaged_entrypoint(monkeypatch, tmp_path):
     env_file = tmp_path / "custom_env.py"
     env_file.write_text("def load_environment(**k):\n    return 'custom'\n")

@@ -605,8 +605,15 @@ def _dynamic_import_name(node, callees: frozenset[str]) -> str | None:
     return first.value.split(".", 1)[0] or None
 
 
-def _imported_module_names(tree) -> set[str]:
-    """Top-level sibling names a parsed module imports, by statement or literal call."""
+def _imported_module_names(tree, *, relative_names_are_siblings: bool = True) -> set[str]:
+    """Top-level sibling names a parsed module imports, by statement or literal call.
+
+    Every name returned is resolved against the env root by the caller, so a relative import
+    only belongs here when the parsed file sits AT that root. Pass
+    `relative_names_are_siblings=False` for a file nested deeper: `from . import config` inside
+    `pkg/__init__.py` names `pkg/config.py`, which the package walk already ships, and reading it
+    as a root-level name published an unrelated top-level `config.py` instead (codex[bot]).
+    """
     import ast
 
     names: set[str] = set()
@@ -618,7 +625,7 @@ def _imported_module_names(tree) -> set[str]:
             if node.level == 0:
                 if node.module:
                     names.add(node.module.split(".", 1)[0])
-            elif node.level == 1:
+            elif node.level == 1 and relative_names_are_siblings:
                 # `from . import config` and `from .utils import load` name siblings of this file
                 # just as the absolute spellings do. an entrypoint written to work both as a
                 # package member and as a loose module puts the relative form first and falls back
@@ -637,19 +644,24 @@ def _imported_module_names(tree) -> set[str]:
     return names
 
 
-def _helper_imports(helper: Path) -> set[str]:
+def _helper_imports(helper: Path, *, env_root: Path) -> set[str]:
     """Top-level names a packaged helper imports, for following its own dependencies.
 
     A helper that fails to parse is still shipped verbatim: refusing the push over a file the
     sidecar may never execute would be a harsher failure than the ModuleNotFoundError this
-    lookahead exists to avoid, and the sidecar's own syntax is validated separately."""
+    lookahead exists to avoid, and the sidecar's own syntax is validated separately.
+
+    Only a helper sitting directly at `env_root` has root-level siblings, so a relative import
+    from deeper in a packaged subdirectory is dropped rather than resolved against the wrong
+    directory -- the package walk that reached it already ships its true siblings."""
     import ast
 
     if helper.suffix != ".py":
         return set()
     try:
         return _imported_module_names(
-            ast.parse(helper.read_text(encoding="utf-8"), filename=str(helper))
+            ast.parse(helper.read_text(encoding="utf-8"), filename=str(helper)),
+            relative_names_are_siblings=helper.parent == env_root,
         )
     except (OSError, SyntaxError, UnicodeDecodeError):
         return set()
@@ -721,7 +733,7 @@ def _iter_import_closure(
                     ):
                         continue
                     yielded.add(child)
-                    pending.extend(_helper_imports(child))
+                    pending.extend(_helper_imports(child, env_root=env_root))
                     yield child, child.relative_to(env_root)
             continue
         if (
@@ -731,7 +743,7 @@ def _iter_import_closure(
             and not _ignore_env_push_path(helper, env_root=env_root, entrypoint=entrypoint)
         ):
             yielded.add(helper)
-            pending.extend(_helper_imports(helper))
+            pending.extend(_helper_imports(helper, env_root=env_root))
             yield helper, helper.relative_to(env_root)
 
 
@@ -787,8 +799,14 @@ def _iter_env_sidecar_files(
             and sidecar != entrypoint
             and not _ignore_env_push_path(sidecar, env_root=env_root, entrypoint=entrypoint)
         ):
-            yielded.add(sidecar)
-            yield sidecar, sidecar.relative_to(env_root)
+            # the entrypoint closure above shares `yielded` and runs first, so an entrypoint that
+            # imports `evaluations` already shipped it. yielding it a second time made
+            # `_check_env_push_limits` charge those bytes and that member twice, rejecting a tree
+            # that is actually under the limit (codex[bot]). only the yield is skipped: the syntax
+            # check and import walk below must still run either way.
+            if sidecar not in yielded:
+                yielded.add(sidecar)
+                yield sidecar, sidecar.relative_to(env_root)
             try:
                 tree = ast.parse(sidecar.read_text(encoding="utf-8"), filename=str(sidecar))
             except SyntaxError as exc:
