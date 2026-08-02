@@ -1,8 +1,10 @@
-"""Always-on GC for aged run artifacts inside the per-environment HF repos (``Freesolo-Co/flashrun-*``).
+"""Always-on GC for aged run artifacts inside the per-environment HF repos (``<ns>/flashrun-*``).
 
-Every managed run stores its code snapshot, adapter, checkpoints, and telemetry under a per-run prefix
-``<phase>/<run_id>/`` inside a *private* HF dataset repo that is shared by every run of an environment
-(``managed_hf_repo_for_environment`` -> ``Freesolo-Co/flashrun-<slug>-<digest>``). The deployable
+``<ns>`` is ``artifact_namespace()`` -- ``Freesolo-Co`` on the managed plane, whatever a self-hoster
+set ``FLASH_HF_NAMESPACE`` to otherwise. Every managed run stores its code snapshot, adapter,
+checkpoints, and telemetry under a per-run prefix ``<phase>/<run_id>/`` inside a *private* HF dataset
+repo that is shared by every run of an environment (``managed_hf_repo_for_environment`` ->
+``<ns>/flashrun-<slug>-<digest>``). The deployable
 per-step adapters (``.../checkpoints/step-N/adapter``) are kept forever by the trainer and nothing else
 deletes old runs, so these repos grow without bound against the org's private-storage quota.
 
@@ -81,8 +83,8 @@ except ModuleNotFoundError:  # pragma: no cover - the test venv always has the s
 # Latch so a plane missing the extra warns ONCE (the sweep runs daily — don't spam the log).
 _warned_hf_unavailable = False
 
-# Hard allowlist: only Freesolo-Co/flashrun-* dataset repos are ever touched (never env packages,
-# paper-*/oracle/eval sets, or a user's own datasets).
+# Hard allowlist: only <artifact namespace>/flashrun-* dataset repos are ever touched (never env
+# packages, paper-*/oracle/eval sets, or a user's own datasets).
 RUN_REPO_PREFIX = "flashrun-"
 # Delete an undeployed run's prefix once its newest file was committed this long ago (fixed: 7 days).
 DELETE_AGE_SECONDS = 7.0 * 86400.0
