@@ -289,6 +289,44 @@ def test_lambda_catalog_suffix_fallback_preserves_the_managed_memory_class():
     assert instance_type_for("A100 SXM 40GB", 8, catalog) == forty
     # dictionary order is not a contract; reversing it must not change the selected memory class.
     assert instance_type_for("A100 SXM 40GB", 8, dict(reversed(catalog.items()))) == forty
+    # A sole explicit 80 GB entry is still the WRONG class, not a renamed 40 GB spelling.
+    assert instance_type_for("A100 SXM 40GB", 8, {eighty: catalog[eighty]}) == instance_type_for(
+        "A100 SXM 40GB", 8
+    )
+
+
+def test_lambda_missing_required_count_sku_is_terminal(monkeypatch):
+    """An absent 8-card SKU is structural, while an existing sold-out SKU remains retryable.
+
+    Without the catalog check both cases return no live candidates and the allocator retries them as
+    capacity failures. A shape Lambda does not sell can never recover by retrying.
+    """
+    from flash.providers.base import AllocationConstraints, UnsupportedGpuError
+    from flash.providers.lambdalabs import LambdaProvider
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs.gpus import instance_type_for
+
+    gpu = "A100 SXM 40GB"
+
+    def _catalog(counts):
+        return {
+            instance_type_for(gpu, count): {
+                "instance_type": {"gpu_description": "A100 (40 GB SXM4)"},
+                "regions_with_capacity_available": [],
+            }
+            for count in counts
+        }
+
+    provider = LambdaProvider()
+    constraints = AllocationConstraints(gpu_type=gpu, required_vram_gb=129, max_gpu_count=8)
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4)))
+    with pytest.raises(UnsupportedGpuError, match="does not offer the required 8-card"):
+        provider.live_candidates(19, constraints)
+
+    # The required SKU exists but has no live regions: return no candidates so allocate() classifies
+    # it as sold out/retryable rather than structurally impossible.
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4, 8)))
+    assert provider.live_candidates(19, constraints) == []
 
 
 def test_lambda_instance_type_never_reaches_the_network():
