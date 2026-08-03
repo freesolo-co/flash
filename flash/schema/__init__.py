@@ -424,6 +424,9 @@ def spec_from_dict(
                 f"gpu.provider {gpu_provider!r} cannot provision gpu.type {gpu_type!r}"
             )
 
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    preflight_gpu_count = geometry_safe_gpu_cap(model, gpu_count or 1)
     try:
         # offline sizing/display only; allocator re-resolves auto runs at submit time.
         provisional_type = provisional_gpu(
@@ -434,7 +437,7 @@ def spec_from_dict(
             # sized against the shape the allocator may actually rent. sizing a --gpus N run
             # against one card rejected it here before sharding was ever considered, which made
             # the flag inert for exactly the large runs it exists to serve.
-            gpu_count=gpu_count or 1,
+            gpu_count=preflight_gpu_count,
         )
         if gpu_type and not model_revision:
             from flash.providers.allocator import required_vram_gb
@@ -467,7 +470,7 @@ def spec_from_dict(
             # the provisional class above was already picked for this ceiling; resolving it as a
             # single card would reject a shardable run on the per-card class chosen BECAUSE it
             # shards.
-            gpu_count=gpu_count or 1,
+            gpu_count=preflight_gpu_count,
         )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc

@@ -320,13 +320,52 @@ def test_lambda_missing_required_count_sku_is_terminal(monkeypatch):
     provider = LambdaProvider()
     constraints = AllocationConstraints(gpu_type=gpu, required_vram_gb=129, max_gpu_count=8)
     monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4)))
-    with pytest.raises(UnsupportedGpuError, match="does not offer the required 8-card"):
+    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable.*8 cards"):
         provider.live_candidates(19, constraints)
 
     # The required SKU exists but has no live regions: return no candidates so allocate() classifies
     # it as sold out/retryable rather than structurally impossible.
     monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4, 8)))
     assert provider.live_candidates(19, constraints) == []
+
+    # Unpinned searches need the same distinction. Otherwise a Lambda-only run retries forever for
+    # a count-specific SKU Lambda does not sell.
+    unpinned = AllocationConstraints(required_vram_gb=129, max_gpu_count=8)
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4)))
+    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable.*8 cards"):
+        provider.live_candidates(19, unpinned)
+
+
+def test_lambda_sku_miss_is_provider_local_during_auto_allocation(monkeypatch):
+    """A missing Lambda count SKU must not discard a valid shape from another provider."""
+    import flash.providers.allocator as allocator
+    from flash.providers.base import Candidate, UnsupportedGpuError, gpu_classes_for
+
+    class _LambdaMiss:
+        live_capacity = True
+
+        def live_candidates(self, _need, _constraints):
+            raise UnsupportedGpuError("lambda does not sell this count-specific SKU")
+
+        def gpu_classes(self):
+            return gpu_classes_for("lambda_name")
+
+    class _RunPodHit:
+        live_capacity = False
+
+        def live_candidates(self, _need, _constraints):
+            return [Candidate("runpod", "H100", 3.29, 80, 2)]
+
+        def gpu_classes(self):
+            return gpu_classes_for("enum_member")
+
+    providers = {"lambda": _LambdaMiss(), "runpod": _RunPodHit()}
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda", "runpod"))
+    monkeypatch.setattr(allocator, "get_provider", providers.__getitem__)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
+
+    chosen = allocator.allocate("Qwen/Qwen3.5-4B", "sft", gpu_type="H100", max_gpu_count=2)
+    assert (chosen.provider, chosen.gpu, chosen.gpu_count) == ("runpod", "H100", 2)
 
 
 def test_lambda_instance_type_never_reaches_the_network():
@@ -811,12 +850,45 @@ def test_eight_cards_require_catalog_head_geometry():
     count divides by 8; open-model resolution currently fetches parameter/vocabulary geometry only,
     so an 8-card run could pay for a box and abort during sequence-parallel initialization.
     """
-    from flash.providers.allocator import _geometry_safe_gpu_cap
+    from flash.providers.allocator import geometry_safe_gpu_cap
 
-    assert _geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
-    assert _geometry_safe_gpu_cap("acme/open-12-head-model", 8) == 4
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
+    assert geometry_safe_gpu_cap("acme/open-12-head-model", 8) == 4
     # odd ceilings still normalize through the shared rentable-count helper.
-    assert _geometry_safe_gpu_cap("acme/open-12-head-model", 3) == 2
+    assert geometry_safe_gpu_cap("acme/open-12-head-model", 3) == 2
+
+
+def test_schema_preflight_applies_the_open_model_geometry_cap():
+    """Schema preview and resolution must judge an unknown model on four cards, not authored eight."""
+    from flash.catalog import MODELS
+    from flash.schema import spec_from_dict
+
+    seen: list[tuple[str, int]] = []
+
+    def _preview(_model, *args, gpu_count=1, **kwargs):
+        seen.append(("preview", gpu_count))
+        return "H100"
+
+    def _resolve(_model, *args, gpu_count=1, **kwargs):
+        seen.append(("resolve", gpu_count))
+        return MODELS["Qwen/Qwen3.5-0.8B"]
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("flash.schema.provisional_gpu", _preview)
+        monkey.setattr("flash.schema.resolve_model", _resolve)
+        spec_from_dict(
+            {
+                "model": "acme/open-12-head-model",
+                "algorithm": "sft",
+                "environment": {"id": "owner/env"},
+                "train": {"max_examples": 1},
+                "gpu": {"count": 8},
+            }
+        )
+        assert seen == [("preview", 4), ("resolve", 4)]
+    finally:
+        monkey.undo()
 
 
 def test_open_model_validation_is_judged_on_the_allocated_shape():
@@ -956,40 +1028,20 @@ def test_open_model_fit_sizes_on_the_rentable_count_not_the_raw_ceiling():
         monkey.undo()
 
 
-def test_unpinned_quote_bills_the_allocator_selected_count(monkeypatch):
-    """A submit-time quote must charge the selected shape, never the authored ceiling.
-
-    The quote is persisted and charged verbatim by `_status_estimated_charge`. A small unpinned run
-    with ceiling 8 is allocated on one card, so billing 8 would be a real eight-fold overcharge.
-    """
+def test_unpinned_quote_bills_the_allocator_selected_count():
+    """The exact lifecycle quote charges selected count and timing, never the authored ceiling."""
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
+    from flash.providers.base import Candidate
 
-    selected = {"count": 1}
-    seen: list[int] = []
-
-    def _allocate(*_a, **kwargs):
-        seen.append(kwargs["max_gpu_count"])
-        return SimpleNamespace(
-            gpu="H100",
-            provider="runpod",
-            hourly_usd=3.29,
-            min_vram_gb=29,
-            gpu_count=selected["count"],
-        )
-
-    monkeypatch.setattr("flash.providers.available_providers", lambda: ("runpod",))
-    monkeypatch.setattr("flash.providers.allocator.allocate", _allocate)
     config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=8)
+    one = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 1))
+    two = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
 
-    one = estimate_cost(config)
     assert one.gpu_count == 1
-    assert seen == [8], "the allocator must receive the authored ceiling"
-
-    selected["count"] = 2
-    two = estimate_cost(config)
     assert two.gpu_count == 2
-    assert two.total_usd == pytest.approx(2 * one.total_usd)
+    assert two.train_seconds < one.train_seconds
+    assert two.total_usd < 2 * one.total_usd
 
 
 def test_vast_keeps_confirmed_shapes_when_another_count_query_fails():
