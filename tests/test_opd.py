@@ -652,17 +652,17 @@ def test_opd_filtering_stage_is_setup_not_training():
     )  # progress count doesn't flip it
 
 
-def test_opd_filtering_prompts_is_throttled_like_sft_pretokenizing():
-    """Regression (codex[bot], heartbeat.py): opd_filtering_prompts emits a REAL progress heartbeat
-    per liveness tick while it renders+tokenizes the whole split. Unthrottled that is one HF commit
-    per tick -- ~120/hr on a large split before model load, blowing the 128/hr commit cap. It must be
-    registered in BOTH heartbeat sets its SFT analogue sft_pretokenizing lives in: the throttle set
-    (bounds commit rate) and the setup-liveness set (keeps the tighter cold-start upload cadence)."""
+def test_opd_liveness_stages_are_throttled_at_setup_cadence():
+    """opd liveness threads must use the throttled setup-liveness cadence."""
     from flash.engine.worker.heartbeat import _HB_SETUP_LIVENESS_STAGES, _HB_THROTTLED_STAGES
+
+    opd_liveness_stages = {"opd_prompt_scan", "opd_image_prep", "opd_finalizing"}
+    assert opd_liveness_stages <= _HB_SETUP_LIVENESS_STAGES
+    assert opd_liveness_stages <= _HB_THROTTLED_STAGES
 
     assert "opd_filtering_prompts" in _HB_THROTTLED_STAGES
     assert "opd_filtering_prompts" in _HB_SETUP_LIVENESS_STAGES
-    # parity with the SFT pre-tokenize stage this mirrors (same dual membership).
+    # parity with the sft pre-tokenize stage this mirrors (same dual membership).
     assert "sft_pretokenizing" in _HB_THROTTLED_STAGES
     assert "sft_pretokenizing" in _HB_SETUP_LIVENESS_STAGES
 
