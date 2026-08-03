@@ -28,8 +28,6 @@ _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
 _VOCAB_DEFAULT = 248_320
-_OPD_TRAINING_RESERVE_MULTIPLIER = 1.15
-_OPD_ALLOCATOR_MARGIN_MAX_GB = 6.0
 OPD_CE_CHUNK_SIZE = 64
 _OPD_CE_PEAK_BYTES_PER_LOGIT = 16
 
@@ -152,75 +150,6 @@ def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: 
 def _legacy_lora_floor_gb(lora_rank: int, effective_params_b: float) -> float:
     """Measured floor retained until the shape equation has broader live-GPU calibration."""
     return (lora_rank / 16.0) * (0.3 + 0.04 * effective_params_b)
-
-
-def opd_training_peak_gb(
-    params_b: float,
-    seq_len: int,
-    *,
-    max_tokens: int | None = None,
-    prompts_per_step: int = 1,
-    group_size: int = 1,
-    thinking: bool = False,
-    vocab: int = _VOCAB_DEFAULT,
-    active_params_b: float | None = None,
-) -> float:
-    """Additional OPD loss-forward/backward memory above the resident student model."""
-    eff_b = float(active_params_b) if active_params_b else float(params_b)
-    width = math.sqrt(max(eff_b, 0.1))
-    loss_mb = opd_loss_microbatch(params_b, prompts_per_step, group_size)
-    activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
-    completion = opd_completion_len(max_tokens, thinking)
-    # the backward peak holds both full-sequence bf16 logits and fp32 completion rows plus gradients.
-    dense_logits = 2 * loss_mb * (seq_len * 2 + completion * 4) * vocab / 1e9
-    return activations + dense_logits
-
-
-def opd_training_reserve_gb(
-    params_b: float,
-    seq_len: int,
-    *,
-    max_tokens: int | None = None,
-    prompts_per_step: int = 1,
-    group_size: int = 1,
-    thinking: bool = False,
-    vocab: int = _VOCAB_DEFAULT,
-    active_params_b: float | None = None,
-) -> float:
-    """OPD loss-forward/backward peak with the runtime safety multiplier."""
-    return _OPD_TRAINING_RESERVE_MULTIPLIER * opd_training_peak_gb(
-        params_b,
-        seq_len,
-        max_tokens=max_tokens,
-        prompts_per_step=prompts_per_step,
-        group_size=group_size,
-        thinking=thinking,
-        vocab=vocab,
-        active_params_b=active_params_b,
-    )
-
-
-def opd_allocator_margin_gb(total_vram_gb: float) -> float:
-    """Allocator fragmentation slack protected by the OPD startup budget."""
-    return max(2.0, min(_OPD_ALLOCATOR_MARGIN_MAX_GB, float(total_vram_gb) * 0.05))
-
-
-def opd_post_init_reserve_gb(params_b: float, lora_rank: int) -> float:
-    """Pending LoRA gradient, AdamW state, and persistent post-init growth above model residency.
-
-    OPD trains all linear layers with bf16 LoRA parameters. PyTorch AdamW lazily allocates two
-    parameter-dtype moment tensors on the first step, so each estimated trainable parameter needs
-    2 bytes for its pending gradient plus 4 bytes for optimizer state. Use total model parameters for
-    the rank-linear geometry so MoE experts are not undercounted, then reserve the measured 35B-class
-    first-generation and post-init growth with a size-scaled 12 GB ceiling.
-    """
-    model_params_b = max(0.1, float(params_b))
-    rank = max(1, int(lora_rank))
-    trainable_params_b = (rank / 16.0) * (0.05 + model_params_b / 150.0)
-    gradient_gb = trainable_params_b * 2.0
-    adamw_state_gb = trainable_params_b * 4.0
-    persistent_growth_gb = max(1.0, min(12.0, model_params_b * 0.35))
-    return gradient_gb + adamw_state_gb + persistent_growth_gb
 
 
 def _lora_memory_gb(
@@ -617,12 +546,25 @@ class VramEstimate:
     gpu: str
     gpu_gb: int
     verdict: str  # "fits" | "tight" | "too_big" | "unknown"
+    # cards the run was JUDGED on -- already clamped to a rentable power of two by check_fit, so
+    # describe() reports the shape the verdict was computed against rather than the raw ceiling.
+    gpu_count: int = 1
 
     def describe(self) -> str:
         if self.est_gb is None:
             return f"{self.gpu}: VRAM need unknown (could not read model size)"
+        # name the SHAPE, not just the class: "RTX 5090 (32 GB)" reads as a rejection the user
+        # could fix with a bigger card, when the run was actually judged on 4 of them.
+        shape = f"{self.gpu} ({self.gpu_gb} GB)"
+        if self.gpu_count > 1:
+            from flash.providers.base import combined_vram_gb
+
+            shape = (
+                f"{self.gpu_count}x {self.gpu} "
+                f"({combined_vram_gb(self.gpu_gb, self.gpu_count):.0f} GB combined)"
+            )
         return (
-            f"{self.gpu} ({self.gpu_gb} GB): estimated ~{self.est_gb:.0f} GB needed "
+            f"{shape}: estimated ~{self.est_gb:.0f} GB needed "
             f"({self.params_b:.1f}B params, {self.quant}, {self.algorithm}) -> {self.verdict}"
         )
 
@@ -1252,9 +1194,24 @@ def check_fit(
     quant: str = "bf16",
     params_b: float | None = None,
     model_revision: str = "",
+    gpu_count: int = 1,
 ) -> VramEstimate:
-    """Estimate whether ``model_id`` plausibly trains on ``gpu``; never raises."""
+    """Estimate whether ``model_id`` plausibly trains on ``gpu``; never raises.
+
+    ``gpu_count`` is the run's card ceiling. A run allowed to shard must be judged against the
+    capacity of the shape it will actually be allocated: sizing a multi-card run against one card
+    rejects the large models sharding exists to serve, and the per-card class picked for a wide
+    ceiling is deliberately SMALLER than the single-card one.
+    """
+    from flash.providers.base import combined_vram_gb, largest_rentable_count
+
     gpu_gb = GPU_VRAM_GB.get(gpu, 32)
+    # clamp to what the ceiling actually BUYS before sizing: only powers of two up to the
+    # combination cap are ever rented, so a ceiling of 3 provisions 2 cards. sizing on the raw
+    # ceiling would accept a shape submit can never allocate -- the parse/submit divergence this
+    # parameter exists to close, inverted.
+    cards = largest_rentable_count(gpu_count)
+    usable_gb = combined_vram_gb(gpu_gb, cards)
     if params_b is None:
         if model_revision:
             try:
@@ -1266,10 +1223,10 @@ def check_fit(
     if params_b is None:
         return VramEstimate(None, algorithm, quant, None, gpu, gpu_gb, "unknown")
     est = estimate_vram_gb(params_b, algorithm, quant)
-    if est > gpu_gb * 1.15:
+    if est > usable_gb * 1.15:
         verdict = "too_big"
-    elif est > gpu_gb * 0.85:
+    elif est > usable_gb * 0.85:
         verdict = "tight"
     else:
         verdict = "fits"
-    return VramEstimate(params_b, algorithm, quant, est, gpu, gpu_gb, verdict)
+    return VramEstimate(params_b, algorithm, quant, est, gpu, gpu_gb, verdict, cards)

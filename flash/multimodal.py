@@ -660,27 +660,6 @@ def decode_image_descriptors(
     return [_decode_image_bytes(data) for data in prepared]
 
 
-def collapse_image_pad_runs(ids: list[int], image_pad_id: int, num_images: int) -> list[int]:
-    """Collapse each maximal image-pad run to one token and verify the image count."""
-    collapsed: list[int] = []
-    run_count = 0
-    in_run = False
-    for token_id in ids:
-        if token_id == image_pad_id:
-            if not in_run:
-                collapsed.append(token_id)
-                run_count += 1
-            in_run = True
-        else:
-            collapsed.append(token_id)
-            in_run = False
-    if run_count != num_images:
-        raise ValueError(
-            f"found {run_count} image-pad run(s) in multimodal prompt; expected {num_images}"
-        )
-    return collapsed
-
-
 def resolve_image_pad_token_id(processor, tok) -> int:
     """Resolve the Qwen VL image-pad token id without assuming a model-specific constant."""
 

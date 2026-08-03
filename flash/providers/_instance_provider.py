@@ -1,7 +1,7 @@
-"""Shared template for rent-a-box (single-GPU instance) providers.
+"""Shared template for rent-a-box (instance) providers.
 
 Lambda and Vast are ~identical thin delegators over the shared ``base.Provider`` interface: they
-provision one GPU instance, boot it, and detect completion from the worker's HF artifacts. The only
+provision a GPU instance, boot it, and detect completion from the worker's HF artifacts. The only
 differences are per-substrate details (which auth/pricing/jobs module to call, the handle class, the
 reattach deadline formula, and how a reattached instance is torn down).
 
@@ -26,11 +26,17 @@ from flash.providers.base import GpuClass, JobHandle, PollResult
 
 
 class InstanceProvider(abc.ABC):
-    """Shared ``base.Provider`` template for single-GPU instance substrates (Lambda, Vast).
+    """Shared ``base.Provider`` template for rent-a-box instance substrates (Lambda, Vast).
 
     The hooks below are ``@abstractmethod``, so the ABC refuses to instantiate a subclass that
     forgets one — a mis-wired new provider fails at construction, not at a billing-critical teardown.
     """
+
+    # Optional capability (read via getattr, kept off the runtime_checkable Protocol like
+    # supports_weight_cache): these substrates price and stock from a LIVE market, so "no candidate
+    # right now" is a transient capacity miss the allocator should let a run retry, not proof the
+    # class is unsupported. Static-table providers omit it -> False.
+    live_capacity = True
 
     # --- subclass contract: class attrs + abstract hooks each substrate supplies ---
     name: str
