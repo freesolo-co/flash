@@ -1,4 +1,4 @@
-"""Vast.ai provider: verified-datacenter single-GPU containers (REST only).
+"""Vast.ai provider: verified-datacenter GPU containers (REST only).
 
 Opt-in live-market substrate (available only when ``VAST_API_KEY`` is set); detects completion
 from the worker's HF artifacts. Implements the shared ``base.Provider`` interface, so the
@@ -18,6 +18,7 @@ from flash.providers.base import (
     JobHandle,
     PollResult,
     Provider,
+    rentable_gpu_counts,
 )
 
 
@@ -125,10 +126,10 @@ class VastProvider(InstanceProvider):
 
         Capacity-aware like Lambda: a Vast class with no fitting offer on the market right now is EXCLUDED,
         so the allocator never hands the runner a Vast class that would immediately fail to rent. ONE market
-        search covers every class (offers carry their own gpu_name -> class), so we search once at the
-        smallest fitting class's VRAM and bucket the returned offers by class. A capacity-lookup failure
-        (market/API blip) raises ``CapacityLookupError`` -> ``allocate`` degrades to the other providers,
-        failing the run retryably (not terminally) only if Vast was the sole fitting source.
+        search covers every class AT ONE CARD COUNT (offers carry their own gpu_name -> class), so we search
+        once per allowed count at the smallest fitting class's VRAM and bucket the returned offers by class.
+        A capacity-lookup failure (market/API blip) raises ``CapacityLookupError`` -> ``allocate`` degrades to
+        the other providers, failing the run retryably (not terminally) only if Vast was the sole fitting source.
 
         ``constraints.disk_gb`` and ``constraints.max_wall_seconds`` are the run's requested disk and wall
         cap; the Vast package prices against the SAME effective disk/duration floors the submit path
@@ -140,25 +141,39 @@ class VastProvider(InstanceProvider):
         fitting = [g for g in self.gpu_classes() if g.vram_gb >= need_vram_gb]
         if not fitting:
             return []
-        try:
-            # Search once at the smallest fitting class's VRAM; the market covers every class at/above it.
-            rate_kwargs = {"gpu_type": constraints.gpu_type} if constraints.gpu_type else {}
-            rates = live_candidate_rates(
-                min(g.vram_gb for g in fitting),
-                constraints.disk_gb,
-                constraints.max_wall_seconds,
-                **rate_kwargs,
-            )
-        except Exception as exc:
-            # Transient market/API blip -> signal allocate() (see CapacityLookupError): a Vast-only run must
-            # infra-retry the outage, not terminally fail as if no GPU fit.
-            raise CapacityLookupError("vast live capacity lookup failed") from exc
         fitting_names = {g.name: g.vram_gb for g in fitting}
-        return [
-            Candidate("vast", name, rate, fitting_names[name])
-            for name, rate in rates.items()
-            if name in fitting_names
-        ]
+        rate_kwargs = {"gpu_type": constraints.gpu_type} if constraints.gpu_type else {}
+        out: list[Candidate] = []
+        failure: Exception | None = None
+        # Vast bakes the card count into the OFFER, so each count is its own market search; a count
+        # with no live multi-card host simply returns nothing and is not offered to the allocator.
+        for count in rentable_gpu_counts(constraints.max_gpu_count):
+            try:
+                # Search once at the smallest fitting class's VRAM; the market covers every class at/above it.
+                rates = live_candidate_rates(
+                    min(g.vram_gb for g in fitting),
+                    constraints.disk_gb,
+                    constraints.max_wall_seconds,
+                    num_gpus=count,
+                    **rate_kwargs,
+                )
+            except Exception as exc:
+                # One count's blip must not discard the shapes other counts already CONFIRMED rentable:
+                # raising here would fail a Vast-only run (especially at max_retries=0) that already has
+                # a live fitting offer in hand. Remember it and only surface it if nothing succeeded.
+                failure = exc
+                continue
+            out += [
+                Candidate("vast", name, rate, fitting_names[name], count)
+                for name, rate in rates.items()
+                if name in fitting_names
+            ]
+        if failure is not None and not out:
+            # Every query that could have found capacity failed -> transient market/API outage. Signal
+            # allocate() (see CapacityLookupError) so a Vast-only run infra-retries rather than
+            # terminally failing as if no GPU fit.
+            raise CapacityLookupError("vast live capacity lookup failed") from failure
+        return out
 
     def cancel(self, handle: JobHandle) -> None:
         from flash.providers.vast.jobs import cancel

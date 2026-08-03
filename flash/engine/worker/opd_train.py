@@ -1859,28 +1859,6 @@ def _read_classified_failure_fallback(base_path: str) -> tuple[str, str] | None:
     return None
 
 
-def _read_mutation_failure_fallback(base_path: str) -> tuple[str, str] | None:
-    return _read_classified_failure_fallback(base_path)
-
-
-def _read_score_delivery_failure_fallback(base_path: str) -> tuple[str, str] | None:
-    return _read_classified_failure_fallback(base_path)
-
-
-def _read_cycle_commit_failure_fallback(base_path: str) -> tuple[str, str] | None:
-    return _read_classified_failure_fallback(base_path)
-
-
-def _read_abandonment_failure_fallback(
-    base_path: str,
-) -> tuple[str, str] | None:
-    return _read_classified_failure_fallback(base_path)
-
-
-def _read_resample_failure_fallback(base_path: str) -> tuple[str, str] | None:
-    return _read_classified_failure_fallback(base_path)
-
-
 def _reconcile_score_delivery_failure(
     bridge: _TeacherAlignmentBridge,
     failure: tuple[str, str] | None,
@@ -2141,6 +2119,7 @@ def run_opd_train(spec=None) -> None:
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     from flash.opd_validation import validate_opd_structured_outputs
+    from flash.spec import gpu_count_of
 
     structured_validation = validate_opd_structured_outputs(
         knobs.structured_outputs,
@@ -2148,6 +2127,7 @@ def run_opd_train(spec=None) -> None:
         model_revision=model_revision,
         model_policy=getattr(spec, "model_policy", "catalog") if spec else "catalog",
         gpu=spec.gpu.type if spec else None,
+        gpu_count=gpu_count_of(spec) if spec else 1,
     )
     structured_outputs = structured_validation.constraint
     model_vocab_size = structured_validation.model_vocab_size
@@ -2639,19 +2619,19 @@ def run_opd_train(spec=None) -> None:
         peak_gpu_gb = gpu_sampler.stop_gb()
         score_delivery_failure = _reconcile_score_delivery_failure(
             bridge,
-            _read_score_delivery_failure_fallback(score_delivery_failure_path),
+            _read_classified_failure_fallback(score_delivery_failure_path),
         )
         no_signal_failure = _reconcile_no_signal_notification_failure(
             bridge,
             (
-                _read_resample_failure_fallback(resample_failure_path),
-                _read_abandonment_failure_fallback(abandonment_failure_path),
+                _read_classified_failure_fallback(resample_failure_path),
+                _read_classified_failure_fallback(abandonment_failure_path),
             ),
         )
-        fallback_mutation_failure = _read_mutation_failure_fallback(mutation_failure_path)
+        fallback_mutation_failure = _read_classified_failure_fallback(mutation_failure_path)
         if fallback_mutation_failure is not None:
             bridge._record_mutation_failure(*fallback_mutation_failure)
-        cycle_commit_failure = _read_cycle_commit_failure_fallback(cycle_commit_failure_path)
+        cycle_commit_failure = _read_classified_failure_fallback(cycle_commit_failure_path)
         _raise_verl_failure(
             return_code,
             bridge.teacher_failure,

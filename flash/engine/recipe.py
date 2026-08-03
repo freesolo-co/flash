@@ -26,8 +26,8 @@ class TeacherModel:
     display_name: str
     # Fireworks serverless list price, $/1M tokens as (input, output). OPD echo-scores completions
     # (max_tokens=0) so only the INPUT column is billed / feeds the estimate, but both are kept so a
-    # mispriced row is obvious. NOTE: the non-GLM entries are best-effort estimates for these next-gen
-    # serverless models — confirm against the live fireworks.ai pricing before relying on the
+    # mispriced row is obvious. note: the non-glm entry is a best-effort estimate for this next-gen
+    # serverless model — confirm against the live fireworks.ai pricing before relying on the
     # `flash train` cost quote.
     usd_per_1m: tuple[float, float]
     supports_images: bool = False
@@ -48,12 +48,6 @@ TEACHER_MODELS: dict[str, TeacherModel] = {
         model_id="accounts/fireworks/models/glm-5p2",
         display_name="GLM 5.2",
         usd_per_1m=(1.40, 4.40),
-    ),
-    "deepseek-v4-pro": TeacherModel(
-        alias="deepseek-v4-pro",
-        model_id="accounts/fireworks/models/deepseek-v4-pro",
-        display_name="DeepSeek V4 Pro",
-        usd_per_1m=(1.74, 3.48),
     ),
     "kimi-k2.6": TeacherModel(
         alias="kimi-k2.6",
