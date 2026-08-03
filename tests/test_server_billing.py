@@ -670,7 +670,7 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
     monkeypatch.setattr("flash.server.billing.charge_completed_run", fake_charge)
     log = io.StringIO()
 
-    lifecycle._charge_completed_run_best_effort(spec, log)
+    lifecycle._charge_completed_run_by_id(spec.run_id, log)
 
     assert calls == [("fslo-internal", "run-1", 1.23)]
     status = runner.get_status("run-1")
@@ -702,7 +702,7 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
         lambda **_: (_ for _ in ()).throw(AssertionError("must not charge without internal key")),
     )
 
-    lifecycle._charge_completed_run_best_effort(spec, io.StringIO())
+    lifecycle._charge_completed_run_by_id(spec.run_id, io.StringIO())
 
     status = runner.get_status("run-1")
     assert status.billing_state == "failed"
