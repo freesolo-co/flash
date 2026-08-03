@@ -1207,9 +1207,9 @@ def check_fit(
 
     gpu_gb = GPU_VRAM_GB.get(gpu, 32)
     # clamp to what the ceiling actually BUYS before sizing: only powers of two up to the
-    # combination cap are ever rented, so a ceiling of 3 provisions 2 cards and a ceiling of 8
-    # provisions 4. sizing on the raw ceiling would accept a shape submit can never allocate --
-    # the parse/submit divergence this parameter exists to close, inverted.
+    # combination cap are ever rented, so a ceiling of 3 provisions 2 cards. sizing on the raw
+    # ceiling would accept a shape submit can never allocate -- the parse/submit divergence this
+    # parameter exists to close, inverted.
     cards = largest_rentable_count(gpu_count)
     usable_gb = combined_vram_gb(gpu_gb, cards)
     if params_b is None:

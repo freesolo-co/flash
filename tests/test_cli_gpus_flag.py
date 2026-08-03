@@ -143,6 +143,7 @@ def test_the_help_does_not_promise_an_exact_card_count():
     start = rendered.rindex("--gpus")
     window = " ".join(rendered[start : start + 400].split()).lower()
     assert "ceiling" in window, "help must say the count is a ceiling, not an exact card count"
+    assert "1, 2, 4, 8" in window, "help must name the public maximum as a rentable shape"
     assert not window.startswith("--gpus n cards to run the job on"), (
         "that phrasing promises exact-count semantics the allocator does not provide"
     )
@@ -178,20 +179,19 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
     )
 
 
-def test_a_pinned_class_that_fits_sft_can_fail_grpo_and_opd_outright():
-    """The doc's 9B/RTX 4090 example is labelled SFT because the fit test is per algorithm.
+def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
+    """The doc's 9B/RTX 4090 example is labelled SFT because fit is per algorithm.
 
-    Asserted because an unlabelled example in a GRPO section reads as a GRPO example, and a user
-    copying it onto configs/grpo.toml does not get 2 cards -- they get UnsupportedGpuError, since
-    rollout memory puts 9B GRPO past even the 4-card combination. The failure is a hard raise, not
-    a silent downgrade, so the wrong doc costs a failed submit rather than a bad number.
+    SFT fits on two cards. GRPO and OPD exceed a four-card ceiling but fit at the public maximum of
+    eight, so copying the SFT example into a rollout config without widening the ceiling fails
+    loudly instead of silently selecting an undersized shape.
     """
     import pytest
 
     from flash.providers.allocator import allocate
     from flash.providers.base import UnsupportedGpuError
 
-    # same model, same pinned class, same ceiling -- only the algorithm differs.
+    # same model and class; only the algorithm and resulting memory floor differ.
     assert (
         allocate(
             "Qwen/Qwen3.5-9B", "sft", provider="runpod", gpu_type="RTX 4090", max_gpu_count=4
@@ -207,6 +207,16 @@ def test_a_pinned_class_that_fits_sft_can_fail_grpo_and_opd_outright():
                 gpu_type="RTX 4090",
                 max_gpu_count=4,
             )
+        assert (
+            allocate(
+                "Qwen/Qwen3.5-9B",
+                algorithm,
+                provider="runpod",
+                gpu_type="RTX 4090",
+                max_gpu_count=8,
+            ).gpu_count
+            == 8
+        )
 
 
 def test_the_allocation_log_line_carries_the_count_that_status_does_not():

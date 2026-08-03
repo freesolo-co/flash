@@ -1286,13 +1286,13 @@ gpu.count=4`, and the same 1..8 bound rejects a bad value.
 most cards it may use, and it stops at the first count that fits: a class that fits the run on one
 card is allocated as one card, and a class that needs sharding gets the _smallest_ fitting
 combination, not the count you asked for. `--gpus 4` on a 9B **SFT** run pinned to a 24 GB class
-allocates 2. Combinations are also capped at 4, so 5-8 only lower the count that would otherwise be
-chosen.
+allocates 2. Eight cards is the public and allocatable maximum; ceilings between powers of two round
+down to the next rentable count.
 
 That example is SFT-specific on purpose. The fit test is per algorithm, and the same 9B pinned to
-the same 24 GB class does not allocate at all under GRPO or OPD — it raises `UnsupportedGpuError:
-... cannot fit this run even as a 4-card combination`, because rollout memory pushes it past what
-four such cards hold. Raising `--gpus` cannot rescue a pin the algorithm never fits on.
+the same 24 GB class may need a wider combination under GRPO or OPD because rollout memory raises
+the whole-run floor. Raising `--gpus` still cannot rescue a pin the algorithm does not fit on even
+as an 8-card combination.
 
 **There is no exact-count mechanism.** Pinning a small `[gpu] type` raises the floor above one card
 but still does not pin n — it only moves which combination is smallest. To see what a submit
