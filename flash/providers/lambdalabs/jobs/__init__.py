@@ -101,7 +101,17 @@ def usable_instances(
     info = GPU_INFO[gpu_class]
     count = max(1, int(gpu_count))
     try:
-        itype = instance_type_for(gpu_class, count)
+        # resolve the count against Lambda's own catalog: a multi-card SKU can carry a different
+        # suffix than its 1x entry (gpu_1x_h100_pcie vs gpu_8x_h100_sxm5), and a name derived only
+        # from the 1x spelling would miss the real type and hide available capacity.
+        catalog = lambda_api.list_instance_types(
+            force=force,
+            **deadline_kwargs(lambda_api.list_instance_types, deadline_at),
+        )
+    except Exception:
+        catalog = None
+    try:
+        itype = instance_type_for(gpu_class, count, catalog)
     except UnsupportedGpuError:
         return []
     # price_cents_per_hour is per INSTANCE (all N cards); Candidate.hourly_usd is contractually
@@ -314,7 +324,7 @@ def launch_and_submit(
                         region=inst.region,
                         name=name,
                         gpu=inst.gpu,
-                        hourly_usd=inst.price_usd_hr,
+                        hourly_usd=inst.price_usd_hr * inst.gpu_count,
                         attempt=attempt,
                         started_ts=time.time(),
                     )
@@ -326,6 +336,9 @@ def launch_and_submit(
                     for c in usable_instances(
                         inst.gpu,
                         force=True,
+                        # refresh the SHAPE already being launched: dropping the count here would
+                        # fall back to a 1-card type while the worker still starts n ranks.
+                        gpu_count=inst.gpu_count,
                         **deadline_kwargs(usable_instances, absolute_deadline),
                     )
                     if c.region not in tried_regions
@@ -341,7 +354,10 @@ def launch_and_submit(
             region=inst.region,
             name=name,
             gpu=inst.gpu,
-            hourly_usd=inst.price_usd_hr,
+            # ``price_usd_hr`` is PER CARD (the allocator's contract); the handle's rate is billed
+            # against wall-clock once by both the cost stamp and realized COGS, so it must price the
+            # WHOLE instance or an n-card box under-reports by exactly n.
+            hourly_usd=inst.price_usd_hr * inst.gpu_count,
             attempt=attempt,
             started_ts=time.time(),
         )

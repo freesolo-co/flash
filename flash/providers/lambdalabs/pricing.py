@@ -39,11 +39,18 @@ def hourly_rate(gpu_name: str, *, gpu_count: int = 1, deadline_at: float | None 
     count = max(1, int(gpu_count))
     if info.lambda_name:
         try:
-            from flash.providers.lambdalabs.api import instance_type_price_usd_hr
+            from flash.providers.lambdalabs.api import (
+                instance_type_price_usd_hr,
+                list_instance_types,
+            )
             from flash.providers.lambdalabs.gpus import instance_type_for
 
+            # price the type Lambda actually lists: multi-card SKUs can carry a different suffix
+            # than the 1x entry, and a derived-only name would miss the live rate and fall back to
+            # the static list price.
+            catalog = list_instance_types(deadline_at=deadline_at)
             live = instance_type_price_usd_hr(
-                instance_type_for(name, count), deadline_at=deadline_at
+                instance_type_for(name, count, catalog), deadline_at=deadline_at
             )
             if live:
                 return live

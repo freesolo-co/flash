@@ -445,7 +445,9 @@ def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
     """
     # the allocator never proposes a wider combination, so sizing against one would admit a spec
     # here only for submit to reject it -- the same defect this parameter exists to fix, inverted.
-    cards = max(1, min(int(gpu_count), MAX_COMBINATION_CARDS))
+    # size against the largest count providers actually RENT (powers of two): a ceiling of 3 buys
+    # 2 cards at submit, so sizing on 3 would admit a shape that never gets provisioned.
+    cards = largest_rentable_count(gpu_count)
     pool = [
         g
         for g in GPU_INFO.values()
@@ -574,6 +576,16 @@ def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
         counts.append(count)
         count *= 2
     return tuple(reversed(counts))
+
+
+def largest_rentable_count(max_gpu_count: int) -> int:
+    """Widest shape a ``max_gpu_count`` ceiling can actually be provisioned as.
+
+    Sizing gates must use this rather than the raw ceiling: only powers of two up to
+    ``MAX_COMBINATION_CARDS`` are ever offered (see ``rentable_gpu_counts``), so a ceiling of 3
+    buys 2 cards. Sizing on 3 would admit a spec that submit can never rent.
+    """
+    return rentable_gpu_counts(min(max(1, int(max_gpu_count)), MAX_COMBINATION_CARDS))[0]
 
 
 @dataclass(frozen=True)

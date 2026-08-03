@@ -311,7 +311,7 @@ def _reconcile_ambiguous_create(
             machine_id=offer.machine_id,
             label=label,
             gpu=offer.gpu,
-            hourly_usd=offer.dph_total,
+            hourly_usd=offer.dph_total * offer.gpu_count,
             attempt=attempt,
             started_ts=started,
         )
@@ -358,6 +358,8 @@ def deploy_and_submit(
     5 ranked offers, then refresh the search once (re-excluding the machines we just tried so a fresh
     market re-search doesn't re-select one that just rejected us).
     """
+    from flash.spec import gpu_count_of
+
     say = make_say(log)
     absolute_deadline = require_deadline_at(deadline_at)
 
@@ -432,6 +434,9 @@ def deploy_and_submit(
                             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
                             # the transient attempt spec always carries the concrete allocated class.
                             gpu_type=spec.gpu.type,
+                            # refresh the SHAPE the allocator chose: dropping the count here would
+                            # rent a single-card offer while the worker still starts n ranks.
+                            num_gpus=gpu_count_of(spec),
                             **deadline_kwargs(usable_offers, absolute_deadline),
                         )
                         if o.gpu in allowed
@@ -450,7 +455,11 @@ def deploy_and_submit(
                     machine_id=offer.machine_id,
                     label=label,
                     gpu=offer.gpu,
-                    hourly_usd=offer.dph_total,
+                    # ``dph_total`` was divided down to a PER-CARD rate for allocator ranking; the
+                    # handle's rate is billed against wall-clock once by both the cost stamp and
+                    # realized COGS, so restore the whole-offer price or an n-card box
+                    # under-reports by exactly n.
+                    hourly_usd=offer.dph_total * offer.gpu_count,
                     attempt=attempt,
                     started_ts=time.time(),
                 )

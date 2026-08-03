@@ -238,6 +238,49 @@ def test_lambda_names_the_card_count_in_the_instance_type():
     assert instance_type_for("H100", 1) == one
 
 
+def test_lambda_resolves_a_multi_card_sku_that_renames_its_suffix():
+    """The count rewrite alone can name a type Lambda does not sell; the catalog is authoritative.
+
+    H100 is registered as ``gpu_1x_h100_pcie`` but Lambda's multi-card family is ``_sxm5``, so the
+    derived ``gpu_8x_h100_pcie`` does not exist. ``regions_with_capacity`` answers [] for an unknown
+    type, which reads as "sold out" rather than "wrong name" -- real capacity disappears silently.
+    """
+    from flash.providers.lambdalabs.gpus import instance_type_for
+
+    derived = instance_type_for("H100", 4)
+    real = derived.replace("_pcie", "_sxm5")
+    assert real != derived, "fixture must model a renamed suffix or it proves nothing"
+
+    # only the renamed spelling is stocked, so a rewrite-only answer cannot pass by accident.
+    assert instance_type_for("H100", 4, {real: {}}) == real
+    # a catalog that DOES stock the derived name must not be second-guessed.
+    assert instance_type_for("H100", 4, {derived: {}, real: {}}) == derived
+    # a count the catalog stocks at neither spelling still yields the derived name: naming is this
+    # function's job, and rentability is ``usable_instances``' check.
+    assert instance_type_for("H100", 2, {real: {}}) == instance_type_for("H100", 2)
+
+
+def test_lambda_instance_type_never_reaches_the_network():
+    """``instance_type_for`` must stay offline: it is called from pricing, which is called from it.
+
+    An in-function catalog fetch turns a pure name lookup into live I/O on every sizing call and
+    deadlocks the offline test path. Callers holding a catalog pass it; nobody else pays.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs.gpus import instance_type_for
+
+    def explode(*_a, **_k):
+        raise AssertionError("instance_type_for fetched the catalog")
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(lambda_api, "list_instance_types", explode)
+        monkey.setattr(lambda_api, "request_with_retries", explode)
+        assert instance_type_for("H100", 4)
+    finally:
+        monkey.undo()
+
+
 def test_lambda_price_is_per_card_not_per_instance():
     """``price_cents_per_hour`` prices the whole instance; ``Candidate.hourly_usd`` is per card.
 
@@ -384,6 +427,221 @@ def test_vast_submit_requests_the_allocated_card_count():
     finally:
         monkey.undo()
     assert seen["count"] == 4, "submit rented a shape other than the one allocated"
+
+
+def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
+    """The mid-walk capacity refresh must re-search the SAME shape, not fall back to one card.
+
+    ``usable_instances`` defaults ``gpu_count`` to 1, so a refresh that omits it silently rents a
+    1-card box while the worker still starts n ranks -- the exact billing exposure the submit-path
+    test guards, reached through the other door.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.lambdalabs.jobs.builders import LambdaInstance
+
+    def _inst(region: str) -> LambdaInstance:
+        return LambdaInstance(
+            gpu=_TRI_PROVIDER_GPU,
+            instance_type="gpu_4x_h100_sxm5",
+            region=region,
+            vram_gb=80,
+            price_usd_hr=3.0,
+            gpu_count=4,
+        )
+
+    refreshed_with: dict = {}
+
+    def fake_launch(*, region_name, **_kw):
+        if region_name != "us-fresh-1":
+            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
+        return "i-42"
+
+    def fake_usable(gpu_class, force=False, *, gpu_count=1, **_kw):
+        refreshed_with["count"] = gpu_count
+        return [_inst("us-fresh-1")]
+
+    spec = _submittable("grpo", count=4, provider="lambda")
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(lj, "resolve_ssh_key_names", lambda **_k: ["jk"])
+        monkey.setattr(lambda_api, "launch_instance", fake_launch)
+        monkey.setattr(lj, "usable_instances", fake_usable)
+        handle = lj.launch_and_submit(
+            spec,
+            seed=spec.seed,
+            instances=[_inst("us-east-1")],
+            deadline_at=9_999_999_999.0,
+        )
+    finally:
+        monkey.undo()
+
+    assert refreshed_with.get("count") == 4, "refresh dropped the count and would rent one card"
+    # the refresh is what produced the launch, so the assertion above cannot pass vacuously.
+    assert handle.instance_id == "i-42"
+
+
+def test_vast_capacity_refresh_keeps_the_allocated_card_count():
+    """Same contract on Vast: ``usable_offers`` defaults ``num_gpus`` to 1 on an omitted refresh."""
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vj
+    from flash.providers.vast.jobs.builders import VastOffer
+
+    def _offer(offer_id: int) -> VastOffer:
+        return VastOffer(
+            offer_id=offer_id,
+            machine_id=900 + offer_id,
+            gpu=_TRI_PROVIDER_GPU,
+            vram_gb=80,
+            dph_total=2.0,
+            cuda_max_good=99.0,
+            disk_space=2000.0,
+            reliability=0.999,
+            inet_down=5000.0,
+            geolocation="US",
+            gpu_count=4,
+        )
+
+    refreshed_with: dict = {}
+
+    def fake_create(offer_id, **_kw):
+        if offer_id != 7:
+            raise vast_api.VastCreateRejected(f"offer {offer_id} taken")
+        return 4242
+
+    def fake_usable(*_a, num_gpus=1, **_kw):
+        refreshed_with["count"] = num_gpus
+        return [_offer(7)]
+
+    spec = _submittable("grpo", count=4, provider="vast")
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(vast_api, "create_instance", fake_create)
+        monkey.setattr(vj, "usable_offers", fake_usable)
+        handle = vj.deploy_and_submit(
+            spec,
+            seed=spec.seed,
+            offers=[_offer(1)],
+            deadline_at=9_999_999_999.0,
+        )
+    finally:
+        monkey.undo()
+
+    assert refreshed_with.get("count") == 4, "refresh dropped the count and would rent one card"
+    assert handle.instance_id == 4242
+
+
+@pytest.mark.parametrize("provider", ["lambda", "vast"])
+def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
+    """The handle's ``hourly_usd`` is billed against wall-clock ONCE, so it must cover every card.
+
+    Both the metrics cost stamp and ``_instance_realized_cost`` compute ``wall_h * hourly_usd`` with
+    no card-count factor anywhere. Storing the per-card rate that ranking needs would under-report
+    an n-card box's COGS by exactly n -- invisible, because the number still looks like a price.
+    """
+    per_card = 3.0
+    cards = 4
+
+    if provider == "lambda":
+        from flash.providers.lambdalabs import api as lambda_api
+        from flash.providers.lambdalabs import jobs as lj
+        from flash.providers.lambdalabs.jobs.builders import LambdaInstance
+
+        inst = LambdaInstance(
+            gpu=_TRI_PROVIDER_GPU,
+            instance_type="gpu_4x_h100_sxm5",
+            region="us-east-1",
+            vram_gb=80,
+            price_usd_hr=per_card,
+            gpu_count=cards,
+        )
+        spec = _submittable("grpo", count=cards, provider="lambda")
+        monkey = pytest.MonkeyPatch()
+        try:
+            monkey.setattr(lj, "resolve_ssh_key_names", lambda **_k: ["jk"])
+            monkey.setattr(lambda_api, "launch_instance", lambda **_kw: "i-1")
+            handle = lj.launch_and_submit(
+                spec,
+                seed=spec.seed,
+                instances=[inst],
+                deadline_at=9_999_999_999.0,
+            )
+        finally:
+            monkey.undo()
+    else:
+        from flash.providers.vast import api as vast_api
+        from flash.providers.vast import jobs as vj
+        from flash.providers.vast.jobs.builders import VastOffer
+
+        offer = VastOffer(
+            offer_id=1,
+            machine_id=901,
+            gpu=_TRI_PROVIDER_GPU,
+            vram_gb=80,
+            dph_total=per_card,
+            cuda_max_good=99.0,
+            disk_space=2000.0,
+            reliability=0.999,
+            inet_down=5000.0,
+            geolocation="US",
+            gpu_count=cards,
+        )
+        spec = _submittable("grpo", count=cards, provider="vast")
+        monkey = pytest.MonkeyPatch()
+        try:
+            monkey.setattr(vast_api, "create_instance", lambda *_a, **_kw: 4242)
+            handle = vj.deploy_and_submit(
+                spec,
+                seed=spec.seed,
+                offers=[offer],
+                deadline_at=9_999_999_999.0,
+            )
+        finally:
+            monkey.undo()
+
+    assert handle.hourly_usd == pytest.approx(per_card * cards)
+    # and the realized-COGS reader must agree, since that is the consumer that would under-bill.
+    from flash.providers.realized import realized_cost_for_remote
+
+    realized = realized_cost_for_remote(
+        {
+            "provider": provider,
+            "hourly_usd": handle.hourly_usd,
+            "instance_id": handle.instance_id,
+            "started_ts": 0.0,
+        },
+        start=0.0,
+        end=3600.0,
+    )
+    assert realized is not None
+    assert realized.realized_usd == pytest.approx(per_card * cards), (
+        "one hour on an n-card box must bill the whole box"
+    )
+
+
+def test_retry_bookkeeping_distinguishes_card_counts_of_one_class():
+    """A class at 2 cards and the same class at 4 are different rentable shapes.
+
+    This PR made multiple counts per class reachable (the fit filter keeps every shape that fits),
+    so a 2-tuple ``(provider, gpu)`` retry key marks EVERY count tried the moment one fails and the
+    walk skips a wider shape that would have fit.
+    """
+    from flash.providers.base import Candidate
+    from flash.runner.lifecycle import _select_candidate, _shape_key
+
+    two = Candidate(
+        provider="runpod", gpu=_TRI_PROVIDER_GPU, hourly_usd=3.0, vram_gb=80, gpu_count=2
+    )
+    four = Candidate(
+        provider="runpod", gpu=_TRI_PROVIDER_GPU, hourly_usd=3.0, vram_gb=80, gpu_count=4
+    )
+
+    assert _shape_key(two) != _shape_key(four), "count must be part of the retry identity"
+
+    # having burned the 2-card shape, the walk must still reach the 4-card one rather than treat
+    # the whole class as exhausted.
+    chosen = _select_candidate([two, four], set(), {_shape_key(two)})
+    assert chosen is four
 
 
 def _submittable(

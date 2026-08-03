@@ -8,7 +8,6 @@ from flash._logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
     GPU_INFO,
-    MAX_COMBINATION_CARDS,
     SHARD_VRAM_EFFICIENCY,
     Allocation,
     AllocationConstraints,
@@ -18,6 +17,7 @@ from flash.providers.base import (
     _run_cost_key,
     canonical_gpu,
     combined_vram_gb,
+    largest_rentable_count,
     providers_for,
     run_config_for_ranking,
 )
@@ -144,7 +144,10 @@ def allocate(
                 f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
                 f"but this run requires at least {need} GB"
             )
-        _max_cards = min(max_gpu_count, MAX_COMBINATION_CARDS)
+        # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
+        # that only fits at a non-rentable count (3) must be rejected here with a precise reason
+        # rather than passing and dying later on a generic no-capacity error.
+        _max_cards = largest_rentable_count(max_gpu_count)
         if (
             exact_info.vram_gb < need
             and max_gpu_count > 1
@@ -158,7 +161,7 @@ def allocate(
             raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
         available = tuple(name for name in available if name in exact_providers)
 
-    cap = min(max(1, max_gpu_count), MAX_COMBINATION_CARDS)
+    cap = largest_rentable_count(max_gpu_count)
     constraints = AllocationConstraints(
         disk_gb=disk_gb,
         max_wall_seconds=max_wall_seconds,
