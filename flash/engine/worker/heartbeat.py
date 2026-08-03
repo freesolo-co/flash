@@ -60,11 +60,11 @@ _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAG
 # latest per-step GRPO backlog, exposed so a top-level error heartbeat can preserve it
 # for `flash runs log -f` when a short run raises before the throttled rl_step ping committed
 LATEST_GRPO_METRICS_LAST: list = []
-# Throttled to avoid blowing the 128/hr HF commit cap; terminal transitions are never throttled. Every
-# tight-liveness stage is throttled (⊂) PLUS the per-step training stages: opd_filtering_prompts alone
-# emits a REAL (non-liveness) heartbeat every scan tick — ~120/hr on a large split before model load —
-# so unthrottled the setup stages blow the cap; throttle them exactly like their sft_pretokenizing
-# analogue (codex[bot]). checkpoint_uploading keepalive re-emits every 30s too, so it MUST be throttled.
+# throttle these stages to protect the hf repository commit budget; terminal transitions are never throttled.
+# opd_filtering_prompts emits a real heartbeat on each scan tick, while opd_prompt_scan and
+# opd_image_prep emit one when progress advances. opd_finalizing emits one on every keepalive tick.
+# without throttling, these opd stages can make roughly 120 commit attempts per hour. tight-liveness,
+# per-step training, and checkpoint_uploading keepalive stages share the same throttle.
 _HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_step", "opd_step"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
