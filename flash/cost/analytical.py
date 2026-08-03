@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 
 from flash.providers.allocator import required_vram_gb, vram_headroom
+from flash.providers.base import largest_rentable_count
 
 from .facts import (
     GPU_COMPUTE_TFLOPS,
@@ -888,8 +889,11 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
         quote_provider = config.provider
         # no gpu_type pin means no allocate() call and so no combination search; this branch picks a
-        # single class that fits alone, and the run occupies the requested count of it.
-        billed_gpu_count = config.gpu_count
+        # single class that fits alone, and the run occupies that count of it. gpu.count is a CEILING
+        # though, and only rentable powers of two are ever provisioned -- billing the raw ceiling
+        # would charge a `--gpus 3` run for 3 cards when submit rents 2. this quote is persisted at
+        # submit and charged verbatim by _status_estimated_charge, so an over-count here overbills.
+        billed_gpu_count = largest_rentable_count(config.gpu_count)
         # quote the same vram-floored vast market pick_gpu selected under (min_vram_gb=need): without the
         # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
         # crowd a high-vram selection off the limited page -> it silently falls back to the static rate.

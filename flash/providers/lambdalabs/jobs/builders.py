@@ -32,13 +32,18 @@ __all__ = [
 
 @dataclass(frozen=True)
 class LambdaInstance:
-    """A launchable (region, instance_type, $/hr) for a managed GPU class."""
+    """A launchable (region, instance_type, $/hr) for a managed GPU class.
+
+    ``vram_gb`` and ``price_usd_hr`` are PER CARD (matching ``Candidate``), so an N-card box is
+    ``gpu_count * price_usd_hr`` per hour.
+    """
 
     gpu: str
     instance_type: str
     region: str
     vram_gb: int
     price_usd_hr: float
+    gpu_count: int = 1
 
 
 @dataclass

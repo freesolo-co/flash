@@ -1,4 +1,4 @@
-"""Lambda Cloud provider: single-GPU instances bootstrapped via cloud-init."""
+"""Lambda Cloud provider: GPU instances bootstrapped via cloud-init."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from flash.providers.base import (
     JobHandle,
     PollResult,
     Provider,
+    rentable_gpu_counts,
 )
 
 
@@ -122,17 +123,26 @@ class LambdaProvider(InstanceProvider):
 
         A capacity-lookup failure raises ``CapacityLookupError``; ``allocate`` degrades to the other
         providers, failing the run retryably only if this was the sole fitting source. Lambda's
-        capacity check needs neither disk nor wall, so ``constraints`` is ignored.
+        capacity check needs neither disk nor wall, so those constraints are ignored.
+
+        Lambda sells fixed card counts per class as distinct instance types, so each allowed count
+        is probed against the live catalog and only the counts with real capacity are reported. The
+        rate stays per-card (``usable_instances`` divides the per-instance price).
         """
         from flash.providers.lambdalabs.jobs import usable_instances
 
         out: list[Candidate] = []
+        counts = rentable_gpu_counts(constraints.max_gpu_count)
         try:
             for g in self.gpu_classes():
                 if g.vram_gb < need_vram_gb:
                     continue
-                if usable_instances(g.name):
-                    out.append(Candidate("lambda", g.name, self.hourly_rate(g.name), g.vram_gb))
+                for count in counts:
+                    live = usable_instances(g.name, gpu_count=count)
+                    if live:
+                        out.append(
+                            Candidate("lambda", g.name, live[0].price_usd_hr, g.vram_gb, count)
+                        )
         except Exception as exc:
             # Transient capacity-lookup blip -> signal allocate() so it degrades to the other providers but
             # can still tell "no fit" from "outage" if this was the only fitting source (see CapacityLookupError).
