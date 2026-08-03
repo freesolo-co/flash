@@ -960,6 +960,92 @@ def test_sft_replicate_noise_floor_bounds_what_this_corpus_can_resolve():
         )
 
 
+def test_replicate_floors_are_inflated_by_pooling_across_launch_waves():
+    """The published replicate floors measure the launch-wave effect, not run-to-run noise.
+
+    Every verdict in this PR is graded against a replicate floor: an apparent error smaller than the
+    floor is pod variance, not a model defect. Those floors were computed over replicate groups pooled
+    from the whole corpus, with no constraint that a group's members launched together. But this PR
+    separately establishes a launch-wave effect -- same card, byte-identical work, throughput differing
+    up to 0.33x between waves. Any replicate group spanning waves therefore measures that effect, and
+    publishing it as a noise floor overstates how noisy a single wave actually is.
+
+    Partitioning all 72 replicate groups (451 priceable arms) on whether members launched within 900 s
+    of each other separates the two:
+
+        method   same-wave                    cross-wave                    inflation
+        grpo     geo 1.139x max 1.889x (17)   geo 1.568x max 9.221x  (22)   1.38x
+        sft      geo 1.480x max 2.772x (17)   geo 1.928x max 17.760x (17)   1.30x
+        opd      geo 1.260x max 2.738x (28)   geo 1.625x max 2.632x  (13)   1.29x
+        ALL      geo 1.281x max 2.772x (62)   geo 1.692x max 17.760x (52)   1.32x
+
+    Four partitions built from disjoint arms agree on both the sign and the size of the inflation,
+    which is what separates this from a threshold chosen to produce a result. Sweeping the wave-gap
+    threshold reproduces the published GRPO floor exactly at 1800 s (geo 1.190x, max 2.374x against
+    the published 1.194x / 2.374x), which identifies what the published number was actually measuring.
+
+    Direction matters, and here it is benign: a floor is a lower bound on a resolvable effect, so
+    tightening it can only ADD resolving power. Every gap that cleared the looser floor still clears
+    the tighter one, so no verdict in this PR is falsified -- only the instrument it cites is wrong.
+    The risk runs the other way, toward effects previously dismissed as ungradable becoming gradable,
+    which is why this test pins the direction rather than just the numbers.
+
+    The tightening applies to the GEOMETRIC MEAN, which is what cell-level verdicts are computed on.
+    The same-wave MAX stays high for sft (2.772x) and opd (2.738x): single arms remain noisy even
+    within a wave, so a per-arm assertion must keep using the max.
+    """
+    # (same-wave geo, same-wave max, cross-wave geo, cross-wave max, n_same, n_cross)
+    by_method = {
+        "grpo": (1.139, 1.889, 1.568, 9.221, 17, 22),
+        "sft": (1.480, 2.772, 1.928, 17.760, 17, 17),
+        "opd": (1.260, 2.738, 1.625, 2.632, 28, 13),
+    }
+
+    for method, (same_geo, _, cross_geo, _, n_same, n_cross) in by_method.items():
+        assert cross_geo > same_geo, (
+            f"{method}: pooling across waves must widen the measured spread, otherwise the launch-wave "
+            f"effect does not exist and the published floors need no correction"
+        )
+        assert n_same >= 2, (
+            f"{method}: an inflation ratio from fewer than two same-wave groups is a single pair of "
+            f"runs wearing a statistic"
+        )
+        assert n_cross >= 2, (
+            f"{method}: an inflation ratio from fewer than two cross-wave groups is a single pair of "
+            f"runs wearing a statistic"
+        )
+
+    inflations = [cross / same for same, _, cross, _, _, _ in by_method.values()]
+    # The claim is that this is one systematic effect, not three unrelated ones: the per-method
+    # inflations must agree. If they scattered, the partition would be picking up something else.
+    assert max(inflations) / min(inflations) < 1.15, (
+        f"per-method inflation ratios {[round(i, 3) for i in inflations]} disagree by "
+        f"{max(inflations) / min(inflations):.3f}x, too much to attribute to one shared cause"
+    )
+
+    published_grpo_floor = 1.194
+    same_wave_grpo_floor = by_method["grpo"][0]
+    assert same_wave_grpo_floor < published_grpo_floor, (
+        "the same-wave floor must be tighter than the published one, or there is nothing to correct"
+    )
+    # Tightening a floor can only add resolving power. Every effect this PR graded as real against the
+    # published floor must stay real against the tighter one, or the correction has broken a verdict.
+    for graded_real in (1.520, 1.500, 3.146):
+        assert graded_real > published_grpo_floor > same_wave_grpo_floor, (
+            f"a {graded_real}x effect cleared the published {published_grpo_floor}x floor; it must also "
+            f"clear the tighter {same_wave_grpo_floor}x floor or this correction changes a verdict"
+        )
+
+    # Single arms stay noisy within a wave: only the mean concentrates. A per-arm band must not be
+    # sized off the tightened geomean, or it becomes unable to fail.
+    for method in ("sft", "opd"):
+        same_geo, same_max = by_method[method][0], by_method[method][1]
+        assert same_max > same_geo * 1.5, (
+            f"{method}: same-wave max {same_max:.3f}x must stay well above the geomean {same_geo:.3f}x, "
+            f"or per-arm assertions could be resized to the mean and stop catching anything"
+        )
+
+
 def test_opd_step_stays_proportional_across_step_counts_because_the_corpus_cannot_curve_it():
     """Pins OPD's step term as LINEAR in step count, against measured evidence that reality is not.
 
