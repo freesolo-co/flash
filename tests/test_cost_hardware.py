@@ -499,24 +499,24 @@ def test_multi_card_speedup_never_decreases_with_card_count():
 
 
 def test_end_to_end_multi_card_speedup_is_unmeasurable_by_construction(monkeypatch):
-    """Pin WHY ``multi_card_speedup`` cannot be validated end-to-end, so the reason cannot rot.
+    """Pin why ``multi_card_speedup`` cannot be validated end-to-end, so the reason cannot rot.
 
-    An earlier revision of that docstring justified the gap with "no multi-card arm ever reached a
-    step timing (0 of 6)". That was contingent, and it went stale silently the moment two 2-card
-    arms did complete -- the docstring kept asserting an obstacle that no longer existed. The real
-    obstacle is structural and lives HERE, in the allocator's partition, so assert it here.
+    An earlier revision justified the gap with "no multi-card arm ever reached a step timing (0 of
+    6)". That was contingent, and it went stale when two 2-card arms completed. The real obstacle
+    is structural and lives in the allocator's fit and ranking rules, so assert it here.
 
-    Measuring a speedup needs the SAME model on the SAME class at two card counts. ``allocate``
-    makes that pairing impossible: candidates are split into fit-alone (``vram_gb >= need``) and
-    undersized, and only the undersized ones reach ``_combination_candidates``. So a class either
-    fits alone -- and can never be proposed as a combination -- or does not, and can never run at
-    n=1. The halves are mutually exclusive; the ratio has no denominator.
+    Measuring a speedup needs the same model on the same class at two selected card counts.
+    Providers expose every rentable count up to the ceiling. ``_fits`` removes the one-card shape
+    when a class is undersized, forcing a combination. When a class fits alone, both shapes survive,
+    but total cost divided by a speedup no greater than card count cannot make the combination
+    cheaper; ties prefer fewer cards. A class therefore either needs multiple cards or selects one,
+    so the matched ratio has no denominator.
 
     Asserted against the real ``allocate`` with a stubbed provider (no network, no spend), for a
     need that straddles the classes, because that is the code path a fix to task #23 would change.
     """
     from flash.providers import allocator
-    from flash.providers.base import Candidate, UnsupportedGpuError
+    from flash.providers.base import Candidate, UnsupportedGpuError, rentable_gpu_counts
 
     # 100 GB is the real sized need for Qwen3.6-35B-A3B sft at bs 8 / ctx 4096, the only shape with
     # measured 2-card arms. 80 GB cards must combine; 141 GB cards must not.
@@ -530,7 +530,12 @@ def test_end_to_end_multi_card_speedup_is_unmeasurable_by_construction(monkeypat
         name = "runpod"
 
         def live_candidates(self, per_card_need, constraints):
-            return [c for c in cands if c.vram_gb >= per_card_need]
+            return [
+                Candidate(c.provider, c.gpu, c.hourly_usd, c.vram_gb, count)
+                for c in cands
+                if c.vram_gb >= per_card_need
+                for count in rentable_gpu_counts(constraints.max_gpu_count)
+            ]
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     monkeypatch.setattr(allocator, "get_provider", lambda name: _P())
@@ -550,8 +555,8 @@ def test_end_to_end_multi_card_speedup_is_unmeasurable_by_construction(monkeypat
             f"multi_card_speedup docstring calls impossible is now constructible. Measure the "
             f"curve and replace that paragraph."
         )
-    # and the mechanism, so a failure above is diagnosable: an 80 GB card is undersized (combines,
-    # cannot run alone) while a 141 GB card fits alone (runs alone, is never offered as a combo).
+    # and the mechanism, so a failure above is diagnosable: an 80 gb card is undersized (only the
+    # combination fits) while a 141 gb card fits alone (both are offered, but one card ranks first).
     assert allocator.allocate("m", "sft", gpu_type="A100 PCIe", max_gpu_count=2).gpu_count == 2
     with pytest.raises(UnsupportedGpuError):
         allocator.allocate("m", "sft", gpu_type="A100 PCIe", max_gpu_count=1)
