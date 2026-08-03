@@ -144,6 +144,7 @@ class VastProvider(InstanceProvider):
         fitting_names = {g.name: g.vram_gb for g in fitting}
         rate_kwargs = {"gpu_type": constraints.gpu_type} if constraints.gpu_type else {}
         out: list[Candidate] = []
+        failure: Exception | None = None
         # Vast bakes the card count into the OFFER, so each count is its own market search; a count
         # with no live multi-card host simply returns nothing and is not offered to the allocator.
         for count in rentable_gpu_counts(constraints.max_gpu_count):
@@ -157,14 +158,21 @@ class VastProvider(InstanceProvider):
                     **rate_kwargs,
                 )
             except Exception as exc:
-                # Transient market/API blip -> signal allocate() (see CapacityLookupError): a Vast-only run must
-                # infra-retry the outage, not terminally fail as if no GPU fit.
-                raise CapacityLookupError("vast live capacity lookup failed") from exc
+                # One count's blip must not discard the shapes other counts already CONFIRMED rentable:
+                # raising here would fail a Vast-only run (especially at max_retries=0) that already has
+                # a live fitting offer in hand. Remember it and only surface it if nothing succeeded.
+                failure = exc
+                continue
             out += [
                 Candidate("vast", name, rate, fitting_names[name], count)
                 for name, rate in rates.items()
                 if name in fitting_names
             ]
+        if failure is not None and not out:
+            # Every query that could have found capacity failed -> transient market/API outage. Signal
+            # allocate() (see CapacityLookupError) so a Vast-only run infra-retries rather than
+            # terminally failing as if no GPU fit.
+            raise CapacityLookupError("vast live capacity lookup failed") from failure
         return out
 
     def cancel(self, handle: JobHandle) -> None:

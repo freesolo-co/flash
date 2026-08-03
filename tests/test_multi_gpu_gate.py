@@ -801,3 +801,181 @@ def _validated_infos():
     from flash.providers.base import GPU_INFO
 
     return [info for info in GPU_INFO.values() if info.validated]
+
+
+def test_effective_spec_validation_accepts_an_allocator_narrowed_count():
+    """A ceiling satisfied with FEWER cards must survive the pre-provision persistence check.
+
+    gpu.count is a ceiling, and `_spec_with_gpu` writes the SELECTED count onto the worker spec (the
+    worker sizes its ranks from it, the provider payload rents it). `_validate_effective_spec`
+    compared that against the authored ceiling, so every narrowed run raised
+    "persisted effective preparation does not match the public run" and died before reaching any
+    provider -- newly reachable here because this PR removed the submit gate that used to reject
+    unpinned `count > 1` outright. Narrowing only: claiming MORE cards than authorized is still an
+    integrity failure.
+    """
+    from flash.runner import _validate_effective_spec
+    from flash.runner.lifecycle import _spec_with_gpu
+    from flash.spec import JobSpec, gpu_count_of
+
+    public = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3-4B",
+            "algorithm": "sft",
+            "seed": 42,
+            "environment": {"id": "will/gsm8k"},
+            "gpu": {"count": 4},
+        }
+    )
+    # the fixture must actually narrow, or it proves nothing about the comparison.
+    narrowed = _spec_with_gpu(public, _TRI_PROVIDER_GPU, 2)
+    assert gpu_count_of(narrowed) == 2 < gpu_count_of(public)
+    _validate_effective_spec(public, narrowed)  # must not raise
+    # the full ceiling is still fine, and so is a single card.
+    _validate_effective_spec(public, _spec_with_gpu(public, _TRI_PROVIDER_GPU, 4))
+    _validate_effective_spec(public, _spec_with_gpu(public, _TRI_PROVIDER_GPU, 1))
+    # widening past the authored ceiling is NOT an allocator narrowing -> still rejected.
+    with pytest.raises(ValueError, match="does not match the public run"):
+        _validate_effective_spec(public, _spec_with_gpu(public, _TRI_PROVIDER_GPU, 8))
+
+
+def test_open_model_fit_sizes_on_the_rentable_count_not_the_raw_ceiling():
+    """`check_fit` must clamp its count the same way sizing and submit do.
+
+    Only powers of two up to MAX_COMBINATION_CARDS are ever rented, so a ceiling of 3 buys 2 cards
+    and a ceiling of 8 buys 4. Sizing the open-model gate on the raw ceiling would accept a shape
+    allocation never provisions -- the parse/submit divergence this parameter exists to close,
+    pointing the other way.
+    """
+    from flash.engine.vram import check_fit
+    from flash.providers.base import MAX_COMBINATION_CARDS
+
+    model, card = "acme/open-32b", "RTX 5090"
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("flash.engine.vram.fetch_hf_params_b", lambda _m, **_k: 32.0)
+        # a ceiling of 3 must be judged as 2 cards, not 3.
+        assert check_fit(model, "sft", card, gpu_count=3).verdict == (
+            check_fit(model, "sft", card, gpu_count=2).verdict
+        )
+        # and above the combination cap, as the cap.
+        assert check_fit(model, "sft", card, gpu_count=8).verdict == (
+            check_fit(model, "sft", card, gpu_count=MAX_COMBINATION_CARDS).verdict
+        )
+        # the estimate reports the shape it JUDGED, so the message cannot contradict the verdict.
+        assert check_fit(model, "sft", card, gpu_count=3).gpu_count == 2
+        assert "2x" in check_fit(model, "sft", card, gpu_count=3).describe()
+    finally:
+        monkey.undo()
+
+
+def test_unpinned_quote_bills_the_rentable_count_not_the_ceiling():
+    """An unpinned multi-card quote must not charge for cards the ceiling never buys.
+
+    The unpinned branch skips `allocate()` and billed `config.gpu_count` verbatim, so a `--gpus 3`
+    run was quoted for 3 cards while submit rents 2. That quote is persisted at submit and charged
+    verbatim by `_status_estimated_charge`, so the over-count is a real overbill, and this path is
+    newly reachable because the PR removed the gate that rejected unpinned `count > 1`.
+    """
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.types import RunConfig
+
+    def _quote(count: int):
+        # no gpu_type -> the unpinned branch, which is the one that billed the raw ceiling.
+        # cost estimation is catalog-only, so the model has to be a catalog row.
+        return estimate_cost(
+            RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=count)
+        )
+
+    three, two = _quote(3), _quote(2)
+    # a ceiling of 3 buys 2 cards, so it must be quoted as 2 -- not as 3.
+    assert three.gpu_count == 2 == two.gpu_count
+    assert three.total_usd == pytest.approx(two.total_usd)
+    # and the quote still scales with a count that IS rentable, or the assertion above is vacuous.
+    assert _quote(4).gpu_count == 4
+    assert _quote(4).total_usd > two.total_usd
+
+
+def test_vast_keeps_confirmed_shapes_when_another_count_query_fails():
+    """One count's market blip must not discard shapes another count already confirmed rentable.
+
+    Each card count is its own Vast market search. Raising on the first failure threw away
+    candidates from earlier successful queries, so a Vast-only run holding a live 4-card offer still
+    failed allocation when the 2-card query blipped -- unrecoverable at `max_retries=0`. Only a
+    total lookup failure may raise.
+    """
+    from flash.providers.base import AllocationConstraints, CapacityLookupError
+    from flash.providers.vast import VastProvider
+
+    provider = VastProvider()
+    fitting_vram = min(g.vram_gb for g in provider.gpu_classes())
+    tri = {g.name for g in provider.gpu_classes()}
+    name = sorted(tri)[0]
+
+    calls: list[int] = []
+
+    def _flaky(_vram, _disk, _wall, *, num_gpus, **_kw):
+        calls.append(num_gpus)
+        if num_gpus == 4:
+            return {name: 1.5}
+        raise RuntimeError("market blip")
+
+    def _all_dead(_vram, _disk, _wall, *, num_gpus, **_kw):
+        calls.append(num_gpus)
+        raise RuntimeError("market blip")
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("flash.providers.vast.pricing.live_candidate_rates", _flaky)
+        got = provider.live_candidates(
+            fitting_vram, AllocationConstraints(max_gpu_count=4, disk_gb=100.0)
+        )
+        # the confirmed 4-card offer survives the 2-card and 1-card failures.
+        assert [c.gpu_count for c in got] == [4]
+        assert calls == [4, 2, 1]  # every count still attempted, none short-circuited
+
+        calls.clear()
+        monkey.setattr("flash.providers.vast.pricing.live_candidate_rates", _all_dead)
+        # nothing confirmed anywhere -> still retryable, not a terminal "no GPU fits".
+        with pytest.raises(CapacityLookupError):
+            provider.live_candidates(
+                fitting_vram, AllocationConstraints(max_gpu_count=4, disk_gb=100.0)
+            )
+    finally:
+        monkey.undo()
+
+
+def test_lambda_single_card_pricing_survives_a_catalog_outage():
+    """A catalog blip must not downgrade a 1x Lambda quote to the static list price.
+
+    ``instance_type_for`` returns the registry name unconditionally at count 1 -- the catalog is
+    only consulted to resolve a MULTI-card suffix (gpu_1x_h100_pcie vs gpu_8x_h100_sxm5). Fetching
+    it on every call put a second network round-trip on the single-card path and, worse, let one
+    ``/instance-types`` failure escape into the shared ``except`` and fall back to the static rate
+    for EVERY Lambda quote -- even though the per-type price lookup underneath would have answered
+    fine. Live pricing that silently reverts to a stale snapshot misprices allocation and billing.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs.pricing import _STATIC_RATES, hourly_rate
+
+    live_rate, calls = 2.49, []
+
+    def _dead_catalog(*_a, **_k):
+        calls.append("catalog")
+        raise RuntimeError("instance-types outage")
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(lambda_api, "list_instance_types", _dead_catalog)
+        monkey.setattr(
+            lambda_api, "instance_type_price_usd_hr", lambda *_a, **_k: live_rate
+        )
+        # the static fallback must actually differ, or this asserts nothing.
+        assert _STATIC_RATES["H100"] != live_rate
+        assert hourly_rate("H100") == live_rate
+        assert calls == []  # the 1x path never asked for the catalog at all
+        # multi-card still resolves through the catalog, so its outage still falls back.
+        assert hourly_rate("H100", gpu_count=4) == _STATIC_RATES["H100"] * 4
+        assert calls == ["catalog"]
+    finally:
+        monkey.undo()

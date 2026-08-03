@@ -933,13 +933,15 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
     # Attempt 0 (nothing failed): cheapest overall.
     assert _select_candidate(cands, set(), set()) is cands[0]
     # RunPod burned an infra attempt -> escape to the OTHER provider, not the next RunPod class.
-    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "H100")})
+    # the tried set is keyed by SHAPE (provider, class, card count), so a 2-tuple would never match
+    # and every candidate would read as untried.
+    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "H100", 1)})
     assert (chosen.provider, chosen.gpu) == ("lambda", "H100")
     # Both providers burned -> fall back to the cheapest class NOT yet tried (within-provider walk).
     chosen = _select_candidate(
         cands,
         {"runpod", "lambda"},
-        {("runpod", "H100"), ("lambda", "H100")},
+        {("runpod", "H100", 1), ("lambda", "H100", 1)},
     )
     assert (chosen.provider, chosen.gpu) == ("runpod", "RTX Pro 6000")
 
@@ -950,7 +952,7 @@ def test_select_candidate_single_provider_walks_classes():
     from flash.runner.lifecycle import _select_candidate
 
     cands = (Candidate("runpod", "RTX 4090", 0.39, 24), Candidate("runpod", "H100", 0.49, 48))
-    assert _select_candidate(cands, {"runpod"}, {("runpod", "RTX 4090")}).gpu == "H100"
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "RTX 4090", 1)}).gpu == "H100"
 
 
 def test_select_candidate_single_fitting_gpu_never_breaks():
@@ -967,7 +969,7 @@ def test_select_candidate_single_fitting_gpu_never_breaks():
     assert _select_candidate(cands, set(), set()) is only
     # After it failed infra-shaped (provider burned, class tried), the next retry re-picks the SAME
     # class — there is nowhere else to walk, and the picker must not break.
-    assert _select_candidate(cands, {"runpod"}, {("runpod", "H200")}) is only
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "H200", 1)}) is only
 
 
 def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):

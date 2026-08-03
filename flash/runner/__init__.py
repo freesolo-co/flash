@@ -1053,6 +1053,16 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
     effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
+    # gpu.count is a CEILING, and the allocator may satisfy it with fewer cards (2x of a class when
+    # 4 was allowed). _spec_with_gpu writes the SELECTED count onto the worker spec -- the worker
+    # sizes its rank count from it and the provider payload rents it -- so comparing it against the
+    # authored ceiling would fail every narrowed run here, before any provider is reached. narrowing
+    # only: a worker spec claiming MORE cards than the run authorized is a real integrity failure and
+    # still raises. the exact selected count is digest-protected and persisted for launch.
+    effective_count = int(effective_gpu.get("count", 1) or 1)
+    public_count = int(public_gpu.get("count", 1) or 1)
+    if 1 <= effective_count <= public_count:
+        effective_gpu["count"] = public_gpu.get("count")
     # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed
     # (MANAGED_GPU_KEYS) and stripped from the public spec, so the reconstructed public spec carries
     # only defaults for them. exclude them from the structural comparison; their integrity is covered

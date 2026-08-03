@@ -546,6 +546,8 @@ class VramEstimate:
     gpu: str
     gpu_gb: int
     verdict: str  # "fits" | "tight" | "too_big" | "unknown"
+    # cards the run was JUDGED on -- already clamped to a rentable power of two by check_fit, so
+    # describe() reports the shape the verdict was computed against rather than the raw ceiling.
     gpu_count: int = 1
 
     def describe(self) -> str:
@@ -1201,10 +1203,15 @@ def check_fit(
     rejects the large models sharding exists to serve, and the per-card class picked for a wide
     ceiling is deliberately SMALLER than the single-card one.
     """
-    from flash.providers.base import combined_vram_gb
+    from flash.providers.base import combined_vram_gb, largest_rentable_count
 
     gpu_gb = GPU_VRAM_GB.get(gpu, 32)
-    usable_gb = combined_vram_gb(gpu_gb, gpu_count)
+    # clamp to what the ceiling actually BUYS before sizing: only powers of two up to the
+    # combination cap are ever rented, so a ceiling of 3 provisions 2 cards and a ceiling of 8
+    # provisions 4. sizing on the raw ceiling would accept a shape submit can never allocate --
+    # the parse/submit divergence this parameter exists to close, inverted.
+    cards = largest_rentable_count(gpu_count)
+    usable_gb = combined_vram_gb(gpu_gb, cards)
     if params_b is None:
         if model_revision:
             try:
@@ -1222,4 +1229,4 @@ def check_fit(
         verdict = "tight"
     else:
         verdict = "fits"
-    return VramEstimate(params_b, algorithm, quant, est, gpu, gpu_gb, verdict, gpu_count)
+    return VramEstimate(params_b, algorithm, quant, est, gpu, gpu_gb, verdict, cards)
