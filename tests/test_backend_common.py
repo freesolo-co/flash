@@ -246,6 +246,31 @@ def test_latest_global_step_dir_raises_when_empty(tmp_path):
         vc.latest_global_step_dir(str(tmp_path))
 
 
+def test_resolve_verl_loggers_console_when_no_api_key(monkeypatch):
+    # no WANDB_API_KEY -> console only, and no wandb probe of the verl interpreter.
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setattr(
+        vc.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("must not probe verl env without an api key"),
+    )
+    assert vc.resolve_verl_loggers("/verl/bin/python") == ["console"]
+
+
+def test_resolve_verl_loggers_enables_wandb_only_when_verl_env_has_it(monkeypatch):
+    # api key set AND wandb importable in the verl interpreter -> wandb logger enabled.
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    monkeypatch.setattr(vc.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    assert vc.resolve_verl_loggers("/verl/bin/python") == ["console", "wandb"]
+
+
+def test_resolve_verl_loggers_falls_back_to_console_when_verl_env_lacks_wandb(monkeypatch):
+    # api key set but wandb missing in the verl interpreter -> console only (never aborts verl).
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    monkeypatch.setattr(vc.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
+    assert vc.resolve_verl_loggers("/verl/bin/python") == ["console"]
+
+
 def test_stamp_adapter_dir_provenance_sets_base_and_revision(tmp_path):
     cfg = tmp_path / "adapter_config.json"
     cfg.write_text(json.dumps({"base_model_name_or_path": None, "r": 16}))

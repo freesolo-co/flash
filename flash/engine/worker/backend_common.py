@@ -669,6 +669,26 @@ def latest_global_step_dir(local_dir: str) -> tuple[str, int]:
     return best, best_step
 
 
+def stage_verl_resume(resume_dir: str, local_dir: str, *, job_label: str) -> int:
+    """stage a downloaded ``checkpoint-N`` into local_dir where verl looks; return its step.
+
+    the resume artifact is keyed on the run prefix, not the job type, so the control plane hands
+    every trainer the same ``checkpoint-N`` layout. verl finds it via
+    latest_checkpointed_iteration.txt under trainer.default_local_dir once resume_mode=auto.
+
+    ``job_label`` only names the job in the error raised for an unparseable path, which is the sole
+    thing the trainers ever varied here.
+    """
+    match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume_dir))
+    if match is None:
+        raise RuntimeError(f"invalid {job_label} resume checkpoint path {resume_dir!r}")
+    step = int(match.group(1))
+    shutil.copytree(resume_dir, os.path.join(local_dir, f"global_step_{step}"), dirs_exist_ok=True)
+    with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
+        file.write(str(step))
+    return step
+
+
 def export_peft_adapter(
     ckpt_actor_dir: str,
     out_adapter_dir: str,

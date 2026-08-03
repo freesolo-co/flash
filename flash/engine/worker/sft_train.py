@@ -39,6 +39,7 @@ from flash.engine.worker.backend_common import (
     resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
+    stage_verl_resume,
     stamp_adapter_dir_provenance,
     verl_step_number,
 )
@@ -770,18 +771,6 @@ def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: i
     return adapter_dir
 
 
-def _message_contains_text(messages: list[dict], needle: str) -> bool:
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, str) and needle in content:
-            return True
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and needle in str(block.get("text") or ""):
-                    return True
-    return False
-
-
 def _verl_image_message_content(content) -> str:
     if isinstance(content, str):
         return content
@@ -821,15 +810,7 @@ def _restore_verl_resume(local_dir: str) -> int:
     resume = _w.hf_resume_checkpoint()
     if not resume:
         return 0
-    match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume))
-    if match is None:
-        raise RuntimeError(f"invalid SFT resume checkpoint path {resume!r}")
-    step = int(match.group(1))
-    target = os.path.join(local_dir, f"global_step_{step}")
-    shutil.copytree(resume, target, dirs_exist_ok=True)
-    with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
-        file.write(str(step))
-    return step
+    return stage_verl_resume(resume, local_dir, job_label="SFT")
 
 
 def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
