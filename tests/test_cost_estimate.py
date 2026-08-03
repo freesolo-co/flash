@@ -503,6 +503,23 @@ def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
         estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=4))
 
 
+def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
+    """A pinned revision must not receive an eight-card quote allocation will never honor."""
+    from flash.cost.analytical import _offline_gpu_shape
+
+    monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
+    config = RunConfig(
+        "Qwen/Qwen3.5-4B",
+        "sft",
+        1,
+        gpu_count=8,
+        model_revision="a" * 40,
+    )
+
+    with pytest.raises(ValueError, match="across up to 4 cards"):
+        _offline_gpu_shape(config)
+
+
 def test_allocator_selected_gpu_count_renders_and_applies_speedup():
     from flash.providers.base import Candidate
 
