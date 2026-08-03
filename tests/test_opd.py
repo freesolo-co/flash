@@ -1192,6 +1192,19 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink():
     assert "max_completion_tokens" in msg
 
 
+def test_opd_oversized_reject_reports_the_rentable_odd_ceiling(monkeypatch):
+    """A ceiling of 5-7 buys four cards, so the diagnostic must never claim a fictitious shape."""
+    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+
+    monkeypatch.setattr("flash.engine.vram.model_required_vram_gb", lambda *_a, **_k: 700)
+    with pytest.raises(UnsupportedGpuError) as exc:
+        provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", gpu_count=7)
+    msg = str(exc.value)
+    assert "any 4-card validated GPU combination" in msg
+    assert "7-card" not in msg
+    assert "592.8 GB max" in msg
+
+
 def test_opd_vram_keeps_chunked_text_peak_when_it_exceeds_dense_image_peak():
     """opd reserves the larger of one checkpointed text ce chunk and one dense image sample."""
     from flash.engine.vram import (

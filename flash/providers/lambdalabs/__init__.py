@@ -13,6 +13,8 @@ from flash.providers.base import (
     JobHandle,
     PollResult,
     Provider,
+    UnsupportedGpuError,
+    combined_vram_gb,
     rentable_gpu_counts,
 )
 
@@ -129,20 +131,47 @@ class LambdaProvider(InstanceProvider):
         is probed against the live catalog and only the counts with real capacity are reported. The
         rate stays per-card (``usable_instances`` divides the per-instance price).
         """
+        from flash.providers.lambdalabs import api as lambda_api
+        from flash.providers.lambdalabs.gpus import instance_type_for
         from flash.providers.lambdalabs.jobs import usable_instances
 
         out: list[Candidate] = []
         counts = rentable_gpu_counts(constraints.max_gpu_count)
         try:
+            catalog = lambda_api.list_instance_types()
+            structurally_fitting = False
             for g in self.gpu_classes():
+                if constraints.gpu_type and g.name != constraints.gpu_type:
+                    continue
                 if g.vram_gb < need_vram_gb:
                     continue
                 for count in counts:
+                    # The allocator passes a reduced per-card market floor. Keep the whole-run floor
+                    # too so both exact and unpinned searches can distinguish "Lambda does not sell
+                    # this shape" from "the sold SKU has no region free right now".
+                    if (
+                        constraints.required_vram_gb
+                        and combined_vram_gb(g.vram_gb, count) < constraints.required_vram_gb
+                    ):
+                        continue
+                    sku = instance_type_for(g.name, count, catalog)
+                    if sku not in catalog:
+                        continue
+                    structurally_fitting = True
                     live = usable_instances(g.name, gpu_count=count)
                     if live:
                         out.append(
                             Candidate("lambda", g.name, live[0].price_usd_hr, g.vram_gb, count)
                         )
+            if constraints.required_vram_gb and not structurally_fitting:
+                requested = f" {constraints.gpu_type}" if constraints.gpu_type else ""
+                raise UnsupportedGpuError(
+                    f"lambda does not offer a rentable{requested} shape up to "
+                    f"{constraints.max_gpu_count} cards large enough for "
+                    f"{constraints.required_vram_gb} GB"
+                )
+        except UnsupportedGpuError:
+            raise
         except Exception as exc:
             # Transient capacity-lookup blip -> signal allocate() so it degrades to the other providers but
             # can still tell "no fit" from "outage" if this was the only fitting source (see CapacityLookupError).

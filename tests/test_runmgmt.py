@@ -658,13 +658,14 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate, PollResult
     from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="attempt-sequence",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
+        train=TrainSpec(max_examples=1),
         gpu=GpuSpec(type="", max_retries=1),
     )
     runner._save_status(
@@ -729,13 +730,14 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate, PollResult
     from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="pre-handle-attempt",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
+        train=TrainSpec(max_examples=1),
         gpu=GpuSpec(type="", max_retries=1),
     )
     runner._save_status(
@@ -794,13 +796,14 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate, PollResult
     from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="wall-budget",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
+        train=TrainSpec(max_examples=1),
         gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
     )
     runner._save_status(
@@ -876,13 +879,14 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate
     from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="retry-deadline-minimum",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
+        train=TrainSpec(max_examples=1),
         gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
     )
     runner._save_status(
@@ -2474,13 +2478,14 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate
     from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id=f"terminal-handle-race-{cleanup_confirmed}",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
+        train=TrainSpec(max_examples=1),
         gpu=GpuSpec(type="", max_retries=2),
     )
     runner._save_status(
@@ -2562,13 +2567,14 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     import flash.runner as runner
     from flash.providers.base import Allocation, Candidate
     from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="terminal-handle-race-two-remotes",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
+        train=TrainSpec(max_examples=1),
         gpu=GpuSpec(type="", max_retries=0),
     )
     runner._save_status(
