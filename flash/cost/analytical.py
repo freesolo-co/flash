@@ -225,11 +225,31 @@ def setup_seconds(config: RunConfig) -> float:
 
 
 def _opd_step_shape(n: RunConfig) -> tuple[int, int]:
-    """(completions per step, prompt+completion tokens per step) for one OPD step, from a NORMALIZED
-    config. completions = batch x group; each is billed over the FULL n.seq_len (prompt+completion,
-    not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
+    """(completions per step, billed tokens per step) for one OPD step, from a NORMALIZED config.
+
+    Billed on ``n.completion_len``, the per-completion generation cap, exactly as GRPO bills its
+    ``gen_tokens``. This term used to bill ``n.seq_len``, which is ``max_context_tokens`` -- the
+    engine's context CAPACITY, not the tokens a step realizes. Capacity is a memory-sizing bound that
+    a user may raise without changing the work done, so billing it made the quote track a config knob
+    instead of the workload, and it over-quoted every arm whose context exceeded its completion cap.
+
+    MEASURED, 65 held-out OPD arms across 5 (card, model, completion, context) cells: billing
+    ``seq_len`` ran a geometric bias of 2.452x with 11/65 arms inside the band and a worst cell of
+    7.23x; billing ``completion_len`` gives 1.520x, 20/65, worst cell 5.40x. A third candidate that
+    split the prompt side onto the update term (prompt+cap on update, cap on generation) scored
+    1.590x/19-of-65, i.e. no better than the simple cap, so the extra term is not carried.
+
+    Known residual, deliberately NOT patched here. 1.520x is still outside this corpus's 1.194x
+    run-to-run noise floor, so a second OPD error remains. It is not in this token basis: the wall
+    is dominated by the card-independent fixed term (the FLOPs term is 2-15% of the OPD prediction),
+    and the teacher is charged as ``teacher_lat * ceil(completions / OPD_TEACHER_BATCH_SIZE)``
+    serial round trips while the measured blocking teacher wall
+    (``opd_phase_teacher_wait_seconds``) is a median 2.26% of the train wall -- the worker overlaps
+    the teacher with a prefetch pipeline instead of blocking on it. Fixing that is a change to the
+    fixed term, not to the token shape, and it needs its own fit.
+    """
     completions = n.batch_size * n.group_size
-    return completions, completions * n.seq_len
+    return completions, completions * n.completion_len
 
 
 def required_save_overhead_seconds(config: RunConfig) -> float:

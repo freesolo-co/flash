@@ -344,6 +344,28 @@ def test_nonpositive_run_knobs_rejected(knob, bad):
         RunConfig(MID, "grpo", 100, **{knob: bad})
 
 
+def test_opd_bills_the_completion_cap_not_the_context_capacity():
+    # OPD used to bill completions x seq_len, i.e. max_context_tokens -- the engine's context
+    # CAPACITY. Capacity is a memory-sizing bound: raising it does not make a step generate or train
+    # on more tokens, so a quote that tracks it moves with a config knob rather than with the work.
+    # Measured on 65 held-out arms, capacity-billing ran a 2.452x geometric over-quote against
+    # 1.520x for cap-billing, so this pins the basis rather than the magnitude.
+    from flash.cost.analytical import _opd_step_shape
+
+    wide = RunConfig(MID, "opd", 10, batch_size=4, group_size=2, completion_len=256, seq_len=8192)
+    narrow = RunConfig(MID, "opd", 10, batch_size=4, group_size=2, completion_len=256, seq_len=512)
+    assert _opd_step_shape(wide.normalized()) == _opd_step_shape(narrow.normalized()), (
+        "raising max_context_tokens must not change the billed token count"
+    )
+    # and the count is the generation cap x completions, the same basis GRPO bills.
+    completions, tokens = _opd_step_shape(wide.normalized())
+    assert completions == 8
+    assert tokens == 8 * 256
+    # the cap MUST still move the bill, or the term would be insensitive to the actual workload.
+    longer = RunConfig(MID, "opd", 10, batch_size=4, group_size=2, completion_len=512, seq_len=8192)
+    assert _opd_step_shape(longer.normalized())[1] == 2 * tokens
+
+
 def test_opd_teacher_scoring_bills_serial_batched_round_trips():
     # Teacher scoring is batched AND serial: _TextTeacherBatcher (opd_train.py) fills a batch of
     # OPD_TEACHER_BATCH_SIZE and hands it to ONE daemon thread, whose loop blocks in _score_batch
@@ -351,16 +373,23 @@ def test_opd_teacher_scoring_bills_serial_batched_round_trips():
     # wall is ceil(completions / batch) latencies -- not one wave, and not completions x latency.
     # Hold seq_tokens (hence gen_s/update_s) constant while doubling the completion count so the
     # only thing that can move the delta is per-completion scaling.
-    from flash.cost.analytical import OPD_TEACHER_BATCH_SIZE, seconds_per_step
+    from flash.cost.analytical import OPD_TEACHER_BATCH_SIZE, _opd_step_shape, seconds_per_step
     from flash.cost.facts import ROLLOUT_SECONDS_PER_COMPLETION, teacher_seconds_per_completion
 
     gpu = "RTX 5090"
     teacher_lat = teacher_seconds_per_completion()
     assert teacher_lat > 0  # else the isolation below is vacuous
-    # completions x seq_len is identical (8*2048 == 16*1024), so gen_s/update_s match and only the
-    # completion count (hence teacher round trips + rollout slope) differs.
-    few = RunConfig(MID, "opd", 10, batch_size=8, group_size=1, seq_len=2048)
-    many = RunConfig(MID, "opd", 10, batch_size=16, group_size=1, seq_len=1024)
+    # completions x completion_len is identical (8*2048 == 16*1024), so gen_s/update_s match and only
+    # the completion count (hence teacher round trips + rollout slope) differs. The cancelling knob is
+    # completion_len, NOT seq_len: OPD bills the generation cap, so holding seq_len equal would leave
+    # the FLOPs term free to move and the delta below would no longer isolate the teacher.
+    few = RunConfig(MID, "opd", 10, batch_size=8, group_size=1, completion_len=2048, seq_len=4096)
+    many = RunConfig(MID, "opd", 10, batch_size=16, group_size=1, completion_len=1024, seq_len=4096)
+    # the isolation is the whole point of this fixture, so assert it rather than trusting the
+    # arithmetic above: equal billed tokens is what makes the delta a pure teacher+rollout quantity.
+    assert _opd_step_shape(few.normalized())[1] == _opd_step_shape(many.normalized())[1], (
+        "fixture broken: the two configs must bill identical tokens per step"
+    )
     # 8 completions fill exactly one batch; 16 need two. pin that the fixture actually straddles a
     # batch boundary, or the assertion below passes for the wrong reason.
     assert 8 % OPD_TEACHER_BATCH_SIZE == 0, "8 completions must fill whole batches exactly"
