@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from flash import __version__
@@ -441,6 +442,10 @@ def cmd_train(args) -> int:
         extra_configs=args.extra_configs,
         project_required=True,
     )
+    # --no-upload is one-way: it can suppress a config that asked to be mirrored, but its absence
+    # never overrides `upload = false` in the config back to on.
+    if getattr(args, "no_upload", False):
+        spec = replace(spec, upload=False)
     payload = spec_payload(spec, authored_train_keys=authored_train_keys)
     client = client_from_config()
     client_train_schema = {

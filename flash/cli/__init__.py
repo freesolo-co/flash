@@ -582,6 +582,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--dry-run", action="store_true")
     train.add_argument(
+        "--no-upload",
+        action="store_true",
+        help=(
+            "do not mirror this run to the dashboard: no run record, no checkpoint metrics, and "
+            "no deployment made from it is shown. it still runs, bills, and is readable through "
+            "the cli. equivalent to `upload = false` in the config"
+        ),
+    )
+    train.add_argument(
         "--cost",
         action="store_true",
         help="print the pre-flight USD cost for the config and exit (no submit)",

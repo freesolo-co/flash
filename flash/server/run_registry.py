@@ -51,6 +51,17 @@ def _spec_from_status(status: Any) -> dict[str, Any]:
     return spec if isinstance(spec, dict) else {}
 
 
+def _upload_suppressed(spec: dict[str, Any]) -> bool:
+    """True when this run opted out of dashboard mirroring via `upload = false`.
+
+    Every reporter in this module funnels through here, so one check covers runs, checkpoint
+    metrics, deployments (which ride inside the run report's `deployment` field), and export
+    events. Only an explicit `False` suppresses: a spec that predates the field reports exactly
+    as it did before, and a malformed value can never silently hide a run that asked to be shown.
+    """
+    return spec.get("upload") is False
+
+
 def _managed_environment_slug(spec: dict[str, Any]) -> str | None:
     env = spec.get("environment") if isinstance(spec.get("environment"), dict) else {}
     env_id = env.get("id")
@@ -71,6 +82,8 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         return False
 
     spec = _spec_from_status(status)
+    if _upload_suppressed(spec):
+        return False
     try:
         project_id = require_project_id(spec.get("project"))
     except (TypeError, ValueError):
@@ -123,6 +136,8 @@ def record_model_exported(
     if not org_id:
         return False
     spec = _spec_from_status(status)
+    if _upload_suppressed(spec):
+        return False
     try:
         project_id = require_project_id(spec.get("project"))
     except (TypeError, ValueError):
@@ -163,6 +178,8 @@ def record_training_checkpoint(
     if not org_id:
         return False
     persisted_spec = _spec_from_status(status)
+    if _upload_suppressed(persisted_spec):
+        return False
     try:
         project_id = require_project_id(persisted_spec.get("project"))
     except (TypeError, ValueError):

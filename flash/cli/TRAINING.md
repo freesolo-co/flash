@@ -210,6 +210,7 @@ project = "PROJECT_UUID"  # required UUID from `flash projects create`
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
 # seed = 42                 # reproducible per-run seed; omitted defaults to 42
+# upload = false            # do not mirror this run to the dashboard (see `--no-upload`)
 
 [environment]
 id = "your-org/my-env"      # the id printed by `flash env push`
@@ -297,7 +298,24 @@ flash train configs/sft.toml --dry-run     # validate the config on the server �
 flash train configs/sft.toml --cost        # pre-flight USD estimate, then exit
 flash train configs/sft.toml               # submit and follow logs (Ctrl-C detaches)
 flash train configs/sft.toml --background  # submit and return immediately
+flash train configs/sft.toml --no-upload   # run it, but do not mirror it to the dashboard
 ```
+
+**`--no-upload` hides the run from the dashboard, not from you.** It trains, bills, and
+streams logs exactly as it always did, and `flash runs list` / `status` / `log` read it
+normally — the flag only stops the run being mirrored to the freesolo dashboard. One flag
+covers everything the run would have published there: the run record, its checkpoint
+metrics, any deployment made from it, and its export event. It is equivalent to
+`upload = false` in the config, and the flag can only turn mirroring _off_ — it never
+overrides a config that already set `upload = false` back on. The run still carries its
+`project`; visibility and grouping are separate. Two consequences worth knowing before you
+use it:
+
+- **It cannot be applied afterwards.** A run submitted without it is already reported, and
+  re-submitting to correct that pays for a second GPU run.
+- **`flash env eval --upload` refuses a `--no-upload` run**, because recording the
+  evaluation would publish the run id, its environment and its scores to the dashboard
+  anyway. Drop `--upload` to evaluate it and just print the verdict.
 
 > **Killing `flash train` does NOT cancel the run.** Submission happens server-side; the
 > command then merely _streams_ status. Interrupting it — or wrapping it in `timeout` —
@@ -1342,6 +1360,7 @@ flash train configs/sft.toml --dry-run # validate the config on the server (no G
 flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/sft.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
 flash train configs/grpo.toml --gpus 4 # shorthand for --set gpu.count=4; a CEILING (needs a multi-card provider)
+flash train configs/sft.toml --no-upload # run normally but do not mirror it (or any deployment of it) to the dashboard
 flash runs status <run-id>                 # state + accrued cost
 flash runs log <run-id>                    # reward/loss trend + worker console/error logs
 flash runs log <run-id> --follow           # stream a live run to completion

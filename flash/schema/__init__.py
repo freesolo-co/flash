@@ -259,6 +259,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "worker_env",
         "wandb",
         "project",
+        "upload",
     }
 )
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.spec) are excluded from the
@@ -345,6 +346,9 @@ def spec_from_dict(
     thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
+    upload = raw.get("upload", True)
+    if not isinstance(upload, bool):
+        raise ConfigError("upload must be a boolean")
 
     # Use `is None` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
     env_raw = raw.get("environment")
@@ -557,6 +561,7 @@ def spec_from_dict(
         thinking=thinking,
         wandb=wandb_spec,
         project=project,
+        upload=upload,
     )
     _validate_spec(spec)
     if spec.train.structured_outputs and thinking:

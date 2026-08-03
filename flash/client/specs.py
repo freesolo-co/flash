@@ -10,6 +10,7 @@ def spec_payload(
 ) -> dict:
     out = spec.to_dict()
     out["project"] = require_project_id(spec.project)
+    out["upload"] = bool(spec.upload)
     if not spec.environment.pip:
         from flash.envs.registry import worker_pip_for_env
 

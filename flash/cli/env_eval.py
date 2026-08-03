@@ -769,6 +769,19 @@ def cmd_env_eval(args) -> int:
             # unexpected client shape cannot crash a command the user asked for.
             _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
         thinking = bool(spec.get("thinking")) if isinstance(spec, dict) else False
+        # a run submitted with `upload = false` is not mirrored to the dashboard, so uploading an
+        # eval of it would put the run id, its environment and its scores there anyway -- exactly
+        # what the opt-out was asked for. refuse here, next to the thinking-mode read that already
+        # bought this spec, so it costs no extra lookup and lands before any generation is paid
+        # for. only an explicit False refuses: an older plane whose spec omits the field, or an
+        # unreadable spec, evaluates and uploads exactly as it did before.
+        if args.upload and isinstance(spec, dict) and spec.get("upload") is False:
+            _err(
+                f"env eval failed: cannot upload results for {args.target}: that run was "
+                "submitted with `upload = false`, so recording its evaluation would publish it "
+                "to the dashboard anyway. drop --upload to evaluate it and print the verdict"
+            )
+            return _err("overall: FAIL")
 
     reports: list[EvalSuiteReport] = []
     for suite in suites:

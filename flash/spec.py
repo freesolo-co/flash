@@ -61,6 +61,19 @@ def coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _coerce_upload(value: Any) -> bool:
+    """Parse the dashboard-mirroring flag, resolving every ambiguous case to ON.
+
+    Only a value that explicitly says false opts out. A null is not an opt-out: `coerce_bool`
+    would read it as False, which would invent a suppression nobody asked for and silently hide
+    a run from its owner's dashboard. Strings are still accepted because the worker round trip
+    carries the flag through the environment, so `upload = false` comes back as "false".
+    """
+    if value is None:
+        return True
+    return coerce_bool(value)
+
+
 def _coerce_str_map(value: Any) -> dict[str, str]:
     """Coerce to dict[str, str]; non-dict input returns empty dict."""
     if not isinstance(value, dict):
@@ -387,6 +400,10 @@ class JobSpec:
     # canonical freesolo project uuid. every config, control-plane record, and worker round trip
     # carries the same explicit identity; there is no name/default/sole-project resolution.
     project: str = ""
+    # when true, nothing about this run is mirrored to the freesolo dashboard: no run record, no
+    # checkpoint metrics, no deployment, no export event. the run still carries its project (identity
+    # is orthogonal to visibility) and is still billed, logged, and readable through the flash cli.
+    upload: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
@@ -547,6 +564,9 @@ class JobSpec:
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
             project=project,
+            # absent means an older spec that predates the field: keep reporting it, so the round
+            # trip can only ever preserve an opt-out, never invent one.
+            upload=_coerce_upload(data.get("upload", True)),
         )
 
     @classmethod
