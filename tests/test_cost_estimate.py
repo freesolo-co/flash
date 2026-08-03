@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,10 +106,10 @@ def test_runconfig_preserves_old_positional_constructor():
     assert config.gpu_type == ""
 
 
-def test_estimate_reports_the_runs_provider():
-    # Provider is reported as configured: the default is "auto", and an explicit substrate is
-    # passed through unchanged.
-    assert estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10)).provider == "auto"
+def test_estimate_reports_the_allocator_selected_provider():
+    # With a configured provider, "auto" is resolved through the same allocator launch uses and the
+    # estimate reports the selected substrate. An explicit substrate remains unchanged.
+    assert estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10)).provider == "runpod"
     assert (
         estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="runpod")).provider
         == "runpod"
@@ -242,6 +243,9 @@ def test_estimate_cost_vast_market_duration_mirrors_launch(monkeypatch):
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     monkeypatch.setattr(vast, "usable_offers", fake_usable)
+    # exercise the offline pricing fallback directly. Server-side estimates now call allocate(),
+    # whose duration threading is covered by the allocator/Vast provider tests.
+    monkeypatch.setattr("flash.providers.available_providers", lambda: ())
 
     def market_walls(cfg) -> set[float]:
         seen.clear()
@@ -513,20 +517,29 @@ def test_b200_not_cheaper_or_faster_than_h200_for_grpo(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_total_usd_scales_linearly_with_gpu_count():
+def test_offline_unpinned_estimate_does_not_bill_the_ceiling(monkeypatch):
+    monkeypatch.setattr("flash.providers.available_providers", lambda: ())
     single = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150))
-    dual = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=2))
+    wide = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=8))
     assert single.gpu_count == 1
-    assert dual.gpu_count == 2
-    # per-card rate and training time are unchanged; only the card-count multiplier moves the total.
-    assert dual.gpu_hourly_usd == single.gpu_hourly_usd
-    assert dual.train_seconds == pytest.approx(single.train_seconds)
-    assert dual.total_usd == pytest.approx(2 * single.total_usd)
+    assert wide.gpu_count == 1
+    # pick_gpu returns a class that fits the whole run alone, so an offline estimate has no basis for
+    # charging the ceiling. server-side submit uses allocate() and records the selected count instead.
+    assert wide.gpu_hourly_usd == single.gpu_hourly_usd
+    assert wide.train_seconds == pytest.approx(single.train_seconds)
+    assert wide.total_usd == pytest.approx(single.total_usd)
 
 
-def test_gpu_count_defaults_and_renders_in_breakdown():
-    est = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=2))
-    # the breakdown surfaces the multi-gpu shape (Nx prefix + per-card rate).
+def test_allocator_selected_gpu_count_renders_in_breakdown(monkeypatch):
+    monkeypatch.setattr("flash.providers.available_providers", lambda: ("runpod",))
+    monkeypatch.setattr(
+        "flash.providers.allocator.allocate",
+        lambda *_a, **_k: SimpleNamespace(
+            gpu="H100", provider="runpod", hourly_usd=3.29, min_vram_gb=80, gpu_count=2
+        ),
+    )
+    est = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=8))
+    # the breakdown surfaces the selected multi-gpu shape (Nx prefix + per-card rate).
     assert "2x" in est.breakdown()
     assert "per card" in est.breakdown()
 
