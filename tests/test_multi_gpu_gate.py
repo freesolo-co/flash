@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -967,9 +968,7 @@ def test_lambda_single_card_pricing_survives_a_catalog_outage():
     monkey = pytest.MonkeyPatch()
     try:
         monkey.setattr(lambda_api, "list_instance_types", _dead_catalog)
-        monkey.setattr(
-            lambda_api, "instance_type_price_usd_hr", lambda *_a, **_k: live_rate
-        )
+        monkey.setattr(lambda_api, "instance_type_price_usd_hr", lambda *_a, **_k: live_rate)
         # the static fallback must actually differ, or this asserts nothing.
         assert _STATIC_RATES["H100"] != live_rate
         assert hourly_rate("H100") == live_rate
@@ -977,5 +976,42 @@ def test_lambda_single_card_pricing_survives_a_catalog_outage():
         # multi-card still resolves through the catalog, so its outage still falls back.
         assert hourly_rate("H100", gpu_count=4) == _STATIC_RATES["H100"] * 4
         assert calls == ["catalog"]
+    finally:
+        monkey.undo()
+
+
+def test_structured_opd_validation_is_fit_checked_on_the_allocated_card_count():
+    """The worker's structured-OPD check must judge the model on the shape it was ALLOCATED.
+
+    Under ``model_policy="allow"`` an open model is fit-checked during ``resolve_model``. This path
+    resolved without ``gpu_count``, so it took the single-card default and re-raised "does not fit"
+    for a shardable run that submit had already placed -- on the worker, after the GPU instance was
+    rented and billed. Every other gate on this branch is count-aware; this one was not.
+    """
+    from flash.opd_validation import _resolve_compiler_vocab_size
+
+    seen: list[int] = []
+
+    def _fake_resolve(_model, _algo, **kwargs):
+        seen.append(int(kwargs.get("gpu_count", 1)))
+        return SimpleNamespace(vocab_size=151936)
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("flash.catalog.resolve_model", _fake_resolve)
+        _resolve_compiler_vocab_size(
+            model_id="acme/open-32b",
+            model_revision="",
+            model_policy="allow",
+            gpu="RTX 5090",
+            gpu_count=4,
+        )
+        # the allocated count reaches the fit check, rather than silently defaulting to one card.
+        assert seen == [4]
+        # and the default is still one card when nothing is threaded, so the assert above is real.
+        _resolve_compiler_vocab_size(
+            model_id="acme/open-32b", model_revision="", model_policy="allow", gpu="RTX 5090"
+        )
+        assert seen == [4, 1]
     finally:
         monkey.undo()

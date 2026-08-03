@@ -1274,14 +1274,13 @@ select:
 [gpu]
 type = "B200"
 count = 4
-# provider must also be pinned: not every provider puts all n cards on ONE machine, and
-# submit names the ones that qualify when it rejects an unpinned multi-gpu spec.
+# provider is optional: allocation compares multi-card shapes across every configured provider
+# and picks the cheapest that can rent n cards on one machine. pin one only to force a choice.
 ```
 
 `flash train configs/grpo.toml --gpus 4` sets the same key from the command line, so a config can
 stay at its authored count while one submit asks for more. The flag is exactly `--set
-gpu.count=4`: the same 1..8 bound rejects a bad value, and the same submit gate still demands a
-provider that rents all n cards on one machine.
+gpu.count=4`, and the same 1..8 bound rejects a bad value.
 
 `gpu.count` is a **ceiling, not an exact count** — by either spelling. Allocation treats it as the
 most cards it may use, and it stops at the first count that fits: a class that fits the run on one
