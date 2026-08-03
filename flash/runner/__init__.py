@@ -29,7 +29,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, JobSpec
+from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, JobSpec, gpu_count_of
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -1053,6 +1053,16 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
     effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
+    # gpu.count is a CEILING, and the allocator may satisfy it with fewer cards (2x of a class when
+    # 4 was allowed). _spec_with_gpu writes the SELECTED count onto the worker spec -- the worker
+    # sizes its rank count from it and the provider payload rents it -- so comparing it against the
+    # authored ceiling would fail every narrowed run here, before any provider is reached. narrowing
+    # only: a worker spec claiming MORE cards than the run authorized is a real integrity failure and
+    # still raises. the exact selected count is digest-protected and persisted for launch.
+    effective_count = int(effective_gpu.get("count", 1) or 1)
+    public_count = int(public_gpu.get("count", 1) or 1)
+    if 1 <= effective_count <= public_count:
+        effective_gpu["count"] = public_gpu.get("count")
     # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed
     # (MANAGED_GPU_KEYS) and stripped from the public spec, so the reconstructed public spec carries
     # only defaults for them. exclude them from the structural comparison; their integrity is covered
@@ -1160,6 +1170,11 @@ def prepare_job(
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
         elif not any(name in configured for name in providers_for(spec.gpu.type)):
             raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    preflight_gpu_count = geometry_safe_gpu_cap(
+        spec.model, gpu_count_of(spec), model_revision=spec.model_revision
+    )
     preflight_gpu = spec.gpu.type
     if not preflight_gpu and spec.model_policy == "allow":
         # open-model auto runs size this fit preflight against the provisional class the schema
@@ -1174,6 +1189,9 @@ def prepare_job(
             train=spec.train,
             thinking=spec.thinking,
             model_revision=spec.model_revision,
+            # same card ceiling the allocator will honour, so this preflight cannot reject a shape
+            # allocation would have accepted.
+            gpu_count=preflight_gpu_count,
         )
     info = resolve_model(
         spec.model,
@@ -1181,6 +1199,9 @@ def prepare_job(
         policy=spec.model_policy,
         gpu=preflight_gpu,
         model_revision=spec.model_revision,
+        # same ceiling the preflight class was chosen under, so this cannot reject a shape
+        # allocation would have accepted.
+        gpu_count=preflight_gpu_count,
     )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
@@ -1221,8 +1242,10 @@ def _reject_managed_volume_removal(snapshot: object, worker_spec: JobSpec) -> No
         raise ValueError("persisted effective preparation drops a non-shared weight-cache volume")
 
 
-def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
-    """Persist the selected worker spec before provider provisioning starts."""
+def _persist_effective_worker_spec(
+    worker_spec: JobSpec, *, estimated_cost_usd: float | None = None
+) -> bool:
+    """Persist the selected worker spec and exact quote before provider provisioning starts."""
     status = get_status(worker_spec.run_id)
     if status.state in TERMINAL_STATES:
         return False
@@ -1243,38 +1266,10 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
         "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
         "backend": TRAINER_BACKEND,
     }
-    return _update(
-        worker_spec.run_id,
-        status.state,
-        effective_preparation=effective_preparation,
-    )
-
-
-# providers that actually provision gpu.count cards on ONE machine. runpod forwards gpu_count into
-# its endpoint payload; vast's num_gpus search filter has no caller and every lambda instance type is
-# hardcoded gpu_1x_*, so a count > 1 spec there rents a SINGLE card while the trainer spawns n ranks.
-_MULTI_GPU_PROVIDERS: frozenset[str] = frozenset({"runpod"})
-
-
-def _require_supported_gpu_count(spec: JobSpec) -> None:
-    """reject gpu.count > 1 unless the provider actually rents n cards.
-
-    every backend shards now (the verl workers launch nproc-per-node == gpu.count ranks and set
-    ulysses sequence parallelism), so only the provider half remains: vast/lambda ignore the count
-    entirely, so an n-rank trainer would land on a single rented card and fail or thrash while
-    gpu.count billed for n.
-    """
-    count = getattr(spec.gpu, "count", 1)
-    if count <= 1:
-        return
-    provider = (getattr(spec.gpu, "provider", "") or "").strip().lower()
-    if provider not in _MULTI_GPU_PROVIDERS:
-        supported = ", ".join(sorted(_MULTI_GPU_PROVIDERS))
-        raise ValueError(
-            f"multi-gpu training (gpu.count={count}) requires an explicit gpu.provider that "
-            f"provisions multiple cards on one machine ({supported}); got "
-            f"{provider or 'unset'}. set gpu.count to 1 or pin gpu.provider"
-        )
+    fields = {"effective_preparation": effective_preparation}
+    if estimated_cost_usd is not None:
+        fields["estimated_cost_usd"] = float(estimated_cost_usd)
+    return _update(worker_spec.run_id, status.state, **fields)
 
 
 def submit_job(
@@ -1288,9 +1283,6 @@ def submit_job(
     prepared_job: PreparedJob | None = None,
 ) -> RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode."""
-    # fail closed on unsupported multi-gpu before any provisioning or billing (also in dry-run, so
-    # the user learns early). removed per-algorithm as each trainer gains sharding.
-    _require_supported_gpu_count(spec)
     prepared = prepared_job or prepare_job(
         spec,
         billing_context=billing_context,
@@ -1299,11 +1291,6 @@ def submit_job(
     )
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
-    # Re-gate on the EFFECTIVE worker spec: the check above validated the public ``spec``, but a caller
-    # can supply ``prepared_job`` whose worker_spec carries a different gpu.count, which is what
-    # allocation and training actually provision. Fail closed here too (dry-run included) so the
-    # mismatch can never provision or bill multiple cards.
-    _require_supported_gpu_count(worker_spec)
     estimated_cost_usd = prepared.estimated_cost_usd
     from flash.multimodal import preflight_validate_image_opd
 

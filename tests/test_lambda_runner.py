@@ -523,7 +523,9 @@ def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
 
     monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
     monkeypatch.setattr(
-        jobs, "usable_instances", lambda gpu, force=False: [_inst(region="us-fresh-1")]
+        jobs,
+        "usable_instances",
+        lambda gpu, force=False, gpu_count=1: [_inst(region="us-fresh-1")],
     )
     h = _launch(jobs, _spec(), seed=0, instances=[_inst(region="us-east-1")], attempt=0)
     assert created == ["us-fresh-1"]
@@ -754,7 +756,7 @@ def test_launch_raises_when_no_capacity(monkeypatch):
             lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")
         ),
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, gpu_count=1: [])
     with pytest.raises(lambda_api.LambdaApiError, match="no capacity"):
         _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
     with pytest.raises(lambda_api.LambdaApiError, match="no Lambda capacity"):
@@ -1031,7 +1033,9 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
     monkeypatch.setattr(
         jobs,
         "usable_instances",
-        lambda gpu, force=False: refresh_calls.append(force) or [_inst(region="us-fresh-9")],
+        lambda gpu, force=False, gpu_count=1: (
+            refresh_calls.append(force) or [_inst(region="us-fresh-9")]
+        ),
     )
 
     with pytest.raises(lambda_api.LambdaApiError):
@@ -1740,7 +1744,7 @@ def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeyp
         captured.append(deadline_at)
         return PollResult(True)
 
-    monkeypatch.setattr(jobs, "usable_instances", lambda _gpu: [_inst()])
+    monkeypatch.setattr(jobs, "usable_instances", lambda _gpu, **_k: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *_a, **_k: _handle(started_ts=1.0))
     monkeypatch.setattr(jobs, "heartbeat_reader_for", lambda _spec: None)
     monkeypatch.setattr(jobs, "poll_lambda_job", fake_poll)
@@ -1832,7 +1836,7 @@ def _wire_runner(monkeypatch, poll_outcome):
         "terminate_instance_confirmed",
         lambda instance_id: terminated.append([instance_id]),
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst()])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, gpu_count=1: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: _handle())
 
     def fake_poll(*a, **k):
@@ -2231,7 +2235,9 @@ def test_usable_instances_only_capacity_regions(monkeypatch):
     monkeypatch.setattr(
         lambda_api, "regions_with_capacity", lambda itype, force=False: ["us-east-1", "us-west-1"]
     )
-    monkeypatch.setattr("flash.providers.lambdalabs.pricing.hourly_rate", lambda g: 1.29)
+    monkeypatch.setattr(
+        "flash.providers.lambdalabs.pricing.hourly_rate", lambda g, *, gpu_count=1, **_k: 1.29
+    )
     out = usable_instances("A10")
     assert {i.region for i in out} == {"us-east-1", "us-west-1"}
     assert all(i.gpu == "A10" and i.instance_type == "gpu_1x_a10" for i in out)
@@ -2244,14 +2250,18 @@ def test_allocator_capacity_aware(monkeypatch):
     """Lambda joins the ranked candidate list only for classes with LIVE capacity; a class with no
     capacity is excluded so the runner never walks to a class that would immediately fail to launch."""
     from flash.providers import allocator
+    from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs.jobs.builders import LambdaInstance
 
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")  # make lambda "available"
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: {"gpu_1x_a10": {}})
 
-    def fake_usable(gpu):
+    def fake_usable(gpu, force=False, *, gpu_count=1, **_k):
         # A10 has capacity; A100 SXM 40GB does not (excluded from candidates).
+        # a signature that rejected gpu_count would raise inside the provider, and the allocator
+        # swallows that as a capacity blip -- so the class would vanish for the wrong reason.
         if gpu == "A10":
-            return [LambdaInstance("A10", "gpu_1x_a10", "us-east-1", 24, 1.29)]
+            return [LambdaInstance("A10", "gpu_1x_a10", "us-east-1", 24, 1.29, gpu_count=gpu_count)]
         return []
 
     monkeypatch.setattr("flash.providers.lambdalabs.jobs.usable_instances", fake_usable)

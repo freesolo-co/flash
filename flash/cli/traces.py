@@ -24,7 +24,7 @@ import json
 import sys
 from pathlib import Path
 
-from flash.client import ApiError, ClientError, export_trace_records, list_trace_projects
+from flash.client import ClientError, export_trace_records, list_trace_projects
 from flash.client.config import load_credentials
 
 from . import render
@@ -90,21 +90,6 @@ def fetch_records(
 def fetch_projects(api_key: str | None = None) -> list[dict]:
     """Projects in the caller's org that traces can be exported from."""
     return list_trace_projects(api_key or _require_api_key())
-
-
-def offer_projects() -> list[dict]:
-    """Projects to offer as a starting dataset, or [] when we can't or shouldn't ask.
-
-    Used by `flash env setup`, where traces are an optional head start rather than the point of
-    the command: not being logged in, being offline, or having no traces yet all mean "just
-    scaffold the starter dataset", so every such failure returns [] instead of raising."""
-    _api_url, api_key = load_credentials()
-    if not api_key:
-        return []
-    try:
-        return fetch_projects(api_key)
-    except (ApiError, ClientError, OSError, ValueError):
-        return []
 
 
 def _resolve_project_id(args, api_key: str) -> str:

@@ -285,10 +285,6 @@ class Deployment:
         return asdict(self)
 
 
-def adapter_revision_id(run_id: str, checkpoint_step: int | None, hf_revision: str) -> str:
-    return format_adapter_revision(run_id, checkpoint_step, hf_revision)
-
-
 def resolve_hf_revision(hf_repo: str) -> str:
     """Resolve the full immutable commit SHA for the uploaded adapter repository."""
     try:
@@ -482,7 +478,7 @@ def deploy_adapter(
         adapter_artifact_lora_rank(hf_repo, subfolder, hf_revision=hf_revision),
         rank_source="adapter artifact",
     )
-    revision = adapter_revision_id(run_id, checkpoint_step, hf_revision)
+    revision = format_adapter_revision(run_id, checkpoint_step, hf_revision)
     dep.adapter_revision = revision
     checkpoint = f"{run_id}/step-{checkpoint_step}" if checkpoint_step is not None else run_id
     so_default = parse_structured_outputs(structured_outputs) if structured_outputs else None

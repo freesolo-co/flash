@@ -246,6 +246,31 @@ def test_latest_global_step_dir_raises_when_empty(tmp_path):
         vc.latest_global_step_dir(str(tmp_path))
 
 
+def test_resolve_verl_loggers_console_when_no_api_key(monkeypatch):
+    # no WANDB_API_KEY -> console only, and no wandb probe of the verl interpreter.
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setattr(
+        vc.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("must not probe verl env without an api key"),
+    )
+    assert vc.resolve_verl_loggers("/verl/bin/python") == ["console"]
+
+
+def test_resolve_verl_loggers_enables_wandb_only_when_verl_env_has_it(monkeypatch):
+    # api key set AND wandb importable in the verl interpreter -> wandb logger enabled.
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    monkeypatch.setattr(vc.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    assert vc.resolve_verl_loggers("/verl/bin/python") == ["console", "wandb"]
+
+
+def test_resolve_verl_loggers_falls_back_to_console_when_verl_env_lacks_wandb(monkeypatch):
+    # api key set but wandb missing in the verl interpreter -> console only (never aborts verl).
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    monkeypatch.setattr(vc.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
+    assert vc.resolve_verl_loggers("/verl/bin/python") == ["console"]
+
+
 def test_stamp_adapter_dir_provenance_sets_base_and_revision(tmp_path):
     cfg = tmp_path / "adapter_config.json"
     cfg.write_text(json.dumps({"base_model_name_or_path": None, "r": 16}))
@@ -363,6 +388,84 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     # the stamp is written only after a successful install, so a crashed install is never reused.
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_VENV_STAMP
+
+
+def _flaky_wheel_install(calls, sleeps, *, failures: int):
+    """subprocess.run stand-in whose flash-attn install fails the first `failures` attempts."""
+    attempts = {"n": 0}
+
+    def fake_run(command, check):
+        calls.append(command)
+        if command[:2] == ["uv", "venv"]:
+            os.makedirs(os.path.join(command[-1], "bin"), exist_ok=True)
+            return
+        if "--no-build-isolation" not in command:
+            return
+        attempts["n"] += 1
+        if attempts["n"] <= failures:
+            # what uv actually exits with on `error sending request ... operation timed out`.
+            raise subprocess.CalledProcessError(1, command)
+
+    return fake_run, attempts
+
+
+def test_a_transient_wheel_download_failure_is_retried_rather_than_fatal(monkeypatch, tmp_path):
+    """uv exits 1 on a download timeout, and one attempt is not evidence the wheel is unreachable.
+
+    Measured: an arm died on `error sending request ... operation timed out` for FLASH_ATTN_SPEC,
+    and the identical url served 200 moments later. uv retries the DOWNLOAD 3x internally, so an
+    exit here means the fault outlived one uv lifetime -- a fresh invocation is the only retry that
+    can outlast it.
+    """
+    calls, sleeps = [], []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    fake_run, attempts = _flaky_wheel_install(
+        calls, sleeps, failures=vc.FLASH_ATTN_INSTALL_ATTEMPTS - 1
+    )
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    monkeypatch.setattr(vc.time, "sleep", sleeps.append)
+
+    python_bin = vc.resolve_verl_python(str(tmp_path))
+
+    assert python_bin.endswith("/verl-venv/bin/python")
+    # the whole budget is usable: the last attempt succeeding must still provision the run.
+    assert attempts["n"] == vc.FLASH_ATTN_INSTALL_ATTEMPTS
+    # and it BACKS OFF between attempts rather than hammering github at the speed of process spawn.
+    assert sleeps == [vc.FLASH_ATTN_INSTALL_BACKOFF_S * i for i in (1, 2)]
+    # the stamp is the proof the venv is complete -- a retried install still earns it.
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert stamp.read_text() == vc.VERL_VENV_STAMP
+
+
+def test_an_exhausted_wheel_install_hands_the_arm_back_instead_of_burning_it(monkeypatch, tmp_path):
+    """The failure must reach the plane as RETRIABLE, which is a claim about _worker_failure_flags.
+
+    Asserting the exception type alone would pass while the arm still died: what actually burns the
+    arm is `retriable: false` in the heartbeat, because _worker_failure_flags treats anything that
+    is not RetriableInfraError/GitHubRateLimitError as permanent and the poller then routes it to
+    job_failed rather than job_preempted. So assert the flag the plane reads, not the type we raise.
+    """
+    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    calls, sleeps = [], []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    fake_run, attempts = _flaky_wheel_install(calls, sleeps, failures=99)
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    monkeypatch.setattr(vc.time, "sleep", sleeps.append)
+
+    with pytest.raises(RetriableInfraError) as caught:
+        vc.resolve_verl_python(str(tmp_path))
+
+    # bounded: a genuinely broken wheel spec still terminates. the plane's own INFRA_RETRY_FLOOR
+    # bounds the reprovisioning, so a false-positive retry costs attempts, not an unbounded loop.
+    assert attempts["n"] == vc.FLASH_ATTN_INSTALL_ATTEMPTS
+    assert _worker_failure_flags(caught.value) == {"retriable": True, "oom": False}
+    # and the diagnostic must name the url, since that is what distinguishes a network fault from a
+    # bad pin when the console is the only artifact a failed arm leaves behind.
+    assert vc.FLASH_ATTN_SPEC in str(caught.value)
+    # a crashed install must never be reused: no stamp, so the next attempt rebuilds from clean.
+    assert not (tmp_path / "verl-venv" / "flash-verl-requirement").exists()
 
 
 def test_the_fallback_install_overrides_the_three_ceilings_it_violates(monkeypatch, tmp_path):

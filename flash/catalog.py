@@ -615,8 +615,13 @@ def resolve_model(
     policy: str = "catalog",
     gpu: str | None = None,
     model_revision: str = "",
+    gpu_count: int = 1,
 ) -> ModelInfo:
-    """Resolve a model under the configured policy; "allow" accepts any HF model."""
+    """Resolve a model under the configured policy; "allow" accepts any HF model.
+
+    ``gpu_count`` is the run's card ceiling, forwarded to the open-model fit check so a shardable
+    run is judged on the shape it will be allocated rather than on one card.
+    """
     algo = normalize_algorithm(algorithm)
     if model_id in MODELS:
         info = validate_model_for_algorithm(model_id, algo)
@@ -634,11 +639,18 @@ def resolve_model(
         return info
     if policy != "allow":
         return get_model(model_id)
-    return _resolve_open_model(model_id, algo, gpu, model_revision=model_revision)
+    return _resolve_open_model(
+        model_id, algo, gpu, model_revision=model_revision, gpu_count=gpu_count
+    )
 
 
 def _resolve_open_model(
-    model_id: str, algo: str, gpu: str | None, *, model_revision: str = ""
+    model_id: str,
+    algo: str,
+    gpu: str | None,
+    *,
+    model_revision: str = "",
+    gpu_count: int = 1,
 ) -> ModelInfo:
     """Synthesize a ModelInfo for the open-model "allow" policy via a coarse HF VRAM-fit estimate."""
     from flash.engine.vram import check_fit
@@ -649,6 +661,10 @@ def _resolve_open_model(
         algo,
         resolved_gpu,
         model_revision=model_revision,
+        # judge the run on the shape the allocator may rent. the per-card class chosen for a wide
+        # ceiling is deliberately smaller, so evaluating it as one card rejects exactly the large
+        # models the multi-card path exists to serve.
+        gpu_count=gpu_count,
     )
     if est.verdict == "too_big":
         raise ValueError(

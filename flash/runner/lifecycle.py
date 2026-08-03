@@ -31,6 +31,45 @@ class _CompletedAttemptPending(RuntimeError):
     """A strict success marker exists, but its metrics are not readable yet."""
 
 
+class _SelectedQuoteUnaffordable(RuntimeError):
+    """The selected live candidate costs more than the owning organization can afford."""
+
+
+def _recheck_selected_quote_affordability(status, selected_quote: float, log) -> None:
+    """Recheck only a live quote that increases the amount accepted before allocation."""
+    accepted_quote = float(getattr(status, "estimated_cost_usd", 0.0) or 0.0)
+    if selected_quote <= accepted_quote:
+        return
+    context = getattr(status, "billing_context", None)
+    if not isinstance(context, dict):
+        return
+    org_id = str(context.get("org_id") or "").strip()
+    if not org_id:
+        return
+
+    from flash.server._internal_client import internal_key
+
+    key = internal_key()
+    if not key:
+        return
+    try:
+        from flash.server.billing import precheck_training_run
+
+        precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=selected_quote)
+    except Exception as exc:
+        from flash.server.billing import BillingError
+
+        if isinstance(exc, BillingError) and exc.status_code == 402:
+            raise _SelectedQuoteUnaffordable(
+                "selected live GPU quote exceeds the organization's available training balance"
+            ) from exc
+        print(
+            f"budget recheck skipped for selected quote (billing service error: {type(exc).__name__})",
+            file=log,
+            flush=True,
+        )
+
+
 @dataclass
 class _RetryBudget:
     infra_retries: int
@@ -460,12 +499,24 @@ def _adopt_completed_attempt(
 
     applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
     if applied:
-        _charge_completed_run_best_effort(spec, log)
+        _charge_completed_run_by_id(spec.run_id, log)
         _register_checkpoints_best_effort(spec, log)
     return applied
 
 
-def _select_candidate(candidates, failed_providers: set[str], tried_classes: set[tuple[str, str]]):
+def _shape_key(candidate) -> tuple[str, str, int]:
+    """Retry-bookkeeping identity: a class at a CARD COUNT, not a class.
+
+    Providers report several counts for the same class (2x and 4x H100 are distinct rentable
+    shapes), so keying on (provider, gpu) alone would mark every count tried the moment one fails
+    and skip a wider shape that fits.
+    """
+    return (candidate.provider, candidate.gpu, int(getattr(candidate, "gpu_count", 1) or 1))
+
+
+def _select_candidate(
+    candidates, failed_providers: set[str], tried_classes: set[tuple[str, str, int]]
+):
     """Pick the next (provider, class) from the cross-provider ranked candidate list.
 
     Escapes a congested/sick provider cross-provider before walking classes within it.
@@ -475,8 +526,7 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
         candidates,
         key=lambda c: (
             c.provider in failed_providers,  # 1) escape providers that already failed this run
-            (c.provider, c.gpu, getattr(c, "gpu_count", 1)) in tried_classes
-            or (c.provider, c.gpu) in tried_classes,  # 2) then prefer a shape not yet tried
+            _shape_key(c) in tried_classes,  # 2) then prefer a shape not yet tried
             getattr(c, "gpu_count", 1) * c.hourly_usd,  # 3) then cheapest TOTAL cost
             getattr(c, "gpu_count", 1),  # 4) fewer cards on ties (less inter-card overhead)
             c.vram_gb,  # 5) then the smaller card (don't burn a big GPU on a small job)
@@ -504,7 +554,7 @@ def _projected_retry_class(
     return _select_candidate(
         candidates,
         failed_providers | {chosen.provider},
-        tried_classes | {(chosen.provider, chosen.gpu)},
+        tried_classes | {_shape_key(chosen)},
     )
 
 
@@ -691,7 +741,7 @@ def _submit_seed_supervised(
     retry_budget = _RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
     # Grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = set()
-    tried_classes: set[tuple[str, str]] = set()
+    tried_classes: set[tuple[str, str, int]] = set()
     oom_vram_floor = 0
     # Pin the environment ref ONCE, here, before any attempt runs -- not per attempt. Submit's pin
     # is best-effort, so a GitHub blip there leaves resolved_sha empty, and a managed slug points at
@@ -797,6 +847,7 @@ def _submit_seed_supervised(
         res = None
         alloc = None
         chosen = None
+        quote_refresh_failed = False
         # A cancel can land after _run_training's pre-submit check but while
         # allocation/pricing runs, when no handle exists yet for cancel_run() to
         # delete. Re-read state right before paid provisioning so a cancelled run
@@ -850,7 +901,7 @@ def _submit_seed_supervised(
                 )
                 break
             chosen = _select_candidate(cands, failed_providers, tried_classes)
-            untried = [c for c in cands if (c.provider, c.gpu) not in tried_classes]
+            untried = [c for c in cands if _shape_key(c) not in tried_classes]
             cache_fallback_available = (
                 retry_budget.cache_used < retry_budget.cache_fallbacks
                 and started_with_shared_cache
@@ -914,46 +965,84 @@ def _submit_seed_supervised(
                     raise _RunCancelled(
                         f"run {spec.run_id} already has a durable provider handle; not resubmitting"
                     )
-                if not _persist_effective_worker_spec(effective_spec):
-                    raise _cancel()
-                if get_status(spec.run_id).state in TERMINAL_STATES:
-                    raise _cancel()
-                provider = get_provider(chosen.provider)
+                # Preparation stays offline so a market outage cannot consume the lifecycle's first
+                # retry before the run exists. Now that allocation selected an exact live shape,
+                # replace the provisional quote atomically with the effective worker spec, before
+                # provisioning starts and before any billable work can occur.
+                from flash.cost.spec import estimate_for_spec
+                from flash.providers.base import Allocation as QuoteAllocation
+
+                quote_allocation = QuoteAllocation(
+                    provider=chosen.provider,
+                    gpu=chosen.gpu,
+                    hourly_usd=chosen.hourly_usd,
+                    min_vram_gb=alloc.min_vram_gb,
+                    candidates=(chosen,),
+                    gpu_count=getattr(chosen, "gpu_count", 1),
+                )
                 try:
-                    submit_kwargs = {
-                        "log": log,
-                        "on_handle": on_handle,
-                        "attempt": attempt,
-                        "on_last_gpu": on_last_gpu,
-                        "code_prefix": code_prefix,
-                        "_deadline_at": _load_run_deadline_at(spec.run_id),
-                    }
-                    if attempt_runtime_secrets:
-                        submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
-                    res = provider.submit_run(run_spec, seed, **submit_kwargs)
-                except _TerminalHandleRace:
+                    selected_quote = estimate_for_spec(
+                        effective_spec, allocation=quote_allocation
+                    ).total_usd
+                    _recheck_selected_quote_affordability(latest, selected_quote, log)
+                except _SelectedQuoteUnaffordable:
                     raise
                 except Exception as exc:
-                    from flash.providers.base import UnreconciledCreateError
+                    # revision-aware quote inputs can depend on remote metadata. a transient refresh
+                    # failure after allocation is infrastructure-shaped, not a terminal run defect.
+                    quote_refresh_failed = True
+                    res = PollResult(
+                        False,
+                        failure="poll_error",
+                        detail=f"selected quote refresh failed ({type(exc).__name__})",
+                    )
+                    if local_attempt < infra_budget:
+                        remaining = _load_run_deadline_at(spec.run_id) - time.time()
+                        if remaining > 0:
+                            retry_delay = min(10 * (local_attempt + 1), remaining)
+                else:
+                    if not _persist_effective_worker_spec(
+                        effective_spec, estimated_cost_usd=selected_quote
+                    ):
+                        raise _cancel()
+                    if get_status(spec.run_id).state in TERMINAL_STATES:
+                        raise _cancel()
+                    provider = get_provider(chosen.provider)
+                    try:
+                        submit_kwargs = {
+                            "log": log,
+                            "on_handle": on_handle,
+                            "attempt": attempt,
+                            "on_last_gpu": on_last_gpu,
+                            "code_prefix": code_prefix,
+                            "_deadline_at": _load_run_deadline_at(spec.run_id),
+                        }
+                        if attempt_runtime_secrets:
+                            submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
+                        res = provider.submit_run(run_spec, seed, **submit_kwargs)
+                    except _TerminalHandleRace:
+                        raise
+                    except Exception as exc:
+                        from flash.providers.base import UnreconciledCreateError
 
-                    if isinstance(exc, UnreconciledCreateError):
-                        res = PollResult(
-                            False,
-                            failure="job_failed",
-                            detail=(
-                                f"provider create could not be reconciled ({type(exc).__name__})"
-                            ),
-                        )
-                    else:
-                        res = PollResult(
-                            False,
-                            failure="poll_error",
-                            detail=f"provider submit failed ({type(exc).__name__})",
-                        )
-                        if local_attempt < infra_budget:
-                            remaining = _load_run_deadline_at(spec.run_id) - time.time()
-                            if remaining > 0:
-                                retry_delay = min(10 * (local_attempt + 1), remaining)
+                        if isinstance(exc, UnreconciledCreateError):
+                            res = PollResult(
+                                False,
+                                failure="job_failed",
+                                detail=(
+                                    f"provider create could not be reconciled ({type(exc).__name__})"
+                                ),
+                            )
+                        else:
+                            res = PollResult(
+                                False,
+                                failure="poll_error",
+                                detail=f"provider submit failed ({type(exc).__name__})",
+                            )
+                            if local_attempt < infra_budget:
+                                remaining = _load_run_deadline_at(spec.run_id) - time.time()
+                                if remaining > 0:
+                                    retry_delay = min(10 * (local_attempt + 1), remaining)
             finally:
                 lock = submission_lock
                 submission_lock = None
@@ -998,7 +1087,10 @@ def _submit_seed_supervised(
             and getattr(run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
         )
         first_cache_drop = (
-            run_had_cache and not drop_weight_cache and res.failure in ("no_capacity", "poll_error")
+            not quote_refresh_failed
+            and run_had_cache
+            and not drop_weight_cache
+            and res.failure in ("no_capacity", "poll_error")
         )
         oom_mode = oom_vram_floor > 0
         will_retry = retry_budget.can_retry(
@@ -1016,7 +1108,7 @@ def _submit_seed_supervised(
         # guarantee. a cache-drop retry projects too: it leaves both sets untouched and so reuses
         # this class cold, which is exactly the escalation the generic line failed to describe.
         projected = None
-        if will_retry and not oom_mode and chosen is not None:
+        if will_retry and not oom_mode and chosen is not None and not quote_refresh_failed:
             projected = _projected_retry_class(
                 cands, failed_providers, tried_classes, chosen, cache_drop=first_cache_drop
             )
@@ -1030,11 +1122,9 @@ def _submit_seed_supervised(
             # retry budget runs out with classes still untried, which is not exhaustion either
             # (codex[bot]).
             retry_tried = (
-                tried_classes
-                if first_cache_drop
-                else tried_classes | {(chosen.provider, chosen.gpu)}
+                tried_classes if first_cache_drop else tried_classes | {_shape_key(chosen)}
             )
-            exhausted = all((c.provider, c.gpu) in retry_tried for c in cands)
+            exhausted = all(_shape_key(c) in retry_tried for c in cands)
             no_escalation = ", no untried GPU class fits this run" if exhausted else ""
             retry_target = (
                 f"expecting to retry on {projected.gpu} @ {projected.provider}"
@@ -1063,10 +1153,10 @@ def _submit_seed_supervised(
             retry_budget.record_retry(res.failure, cache_drop=True)
         else:
             retry_budget.record_retry(res.failure, cache_drop=False)
-            if chosen is not None:
+            if chosen is not None and not quote_refresh_failed:
                 if not oom_shaped:
                     failed_providers.add(chosen.provider)
-                tried_classes.add((chosen.provider, chosen.gpu))
+                tried_classes.add(_shape_key(chosen))
     _gc_seen_endpoints()
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
 
@@ -1127,7 +1217,6 @@ def _run_training(
     from flash.runner import (
         TERMINAL_STATES,
         _persist_metrics,
-        _require_supported_gpu_count,
         _RunCancelled,
         _status_estimated_charge,
         _submit_seed_supervised,
@@ -1135,12 +1224,6 @@ def _run_training(
         artifacts_dir,
         get_status,
     )
-
-    # Fail closed on unsupported multi-gpu using the EFFECTIVE worker spec. This path is shared by a
-    # fresh submit and by post-restart recovery, and recovery rebuilds the spec from a persisted
-    # snapshot without re-running submit_job's gate -- so gating here is the single choke that keeps a
-    # count > 1 spec (however it was persisted) from re-provisioning and billing idle cards on resume.
-    _require_supported_gpu_count(spec)
 
     # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped into ANY
     # terminal state — not just `cancelled` — by a concurrent thread/process between the resume
@@ -1191,7 +1274,7 @@ def _run_training(
         flush=True,
     )
     if applied:
-        _charge_completed_run_best_effort(spec, log)
+        _charge_completed_run_by_id(spec.run_id, log)
         _register_checkpoints_best_effort(spec, log)
 
 
@@ -1209,11 +1292,6 @@ def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
             file=log,
             flush=True,
         )
-
-
-def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
-    """Bill a successfully completed external run without changing its training result."""
-    _charge_completed_run_by_id(spec.run_id, log)
 
 
 def _charge_completed_run_by_id(run_id: str, log) -> None:

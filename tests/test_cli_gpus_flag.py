@@ -106,17 +106,20 @@ def test_a_non_integer_gpus_is_refused_at_parse_time(bad, capsys):
     assert "--gpus" in capsys.readouterr().err
 
 
-def test_gpus_still_hits_the_multi_gpu_provider_gate(tmp_path):
-    from flash import runner
+@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
+def test_gpus_is_accepted_on_every_provider(tmp_path, provider):
+    """The flag carries no provider special-casing: 4 cards is a legal ask on all three.
 
-    # a convenient flag must not become a way AROUND the submit gate: vast/lambda ignore gpu_count,
-    # so 4 ranks would land on one rented card and be billed for four.
-    # H100 rather than the shared BASE's B200: vast does not list B200 at all, so that pairing
-    # would be rejected by the catalog before the multi-gpu gate this test is about.
-    vast = BASE.replace('type = "B200"', 'type = "H100"').replace("runpod", "vast")
-    spec = _spec(tmp_path, "--gpus", "4", config=vast)
-    with pytest.raises(ValueError, match=r"gpu\.provider"):
-        runner._require_supported_gpu_count(spec)
+    This replaces a test of the old RunPod-only submit gate. That gate existed because Lambda and
+    Vast ignored the count and would have landed 4 ranks on one rented card while billing for four;
+    both now rent the allocated shape (Lambda names the count in the instance type, Vast filters
+    offers by num_gpus), so rejecting the ask is no longer correct for any provider.
+
+    H100 rather than the shared BASE's B200: it is the one managed class all three stock, so the
+    spec is not rejected on catalog grounds before the count is ever considered.
+    """
+    config = BASE.replace('type = "B200"', 'type = "H100"').replace('"runpod"', f'"{provider}"')
+    assert _spec(tmp_path, "--gpus", "4", config=config).gpu.count == 4
 
 
 def test_the_help_does_not_promise_an_exact_card_count():
@@ -140,6 +143,7 @@ def test_the_help_does_not_promise_an_exact_card_count():
     start = rendered.rindex("--gpus")
     window = " ".join(rendered[start : start + 400].split()).lower()
     assert "ceiling" in window, "help must say the count is a ceiling, not an exact card count"
+    assert "1, 2, 4, 8" in window, "help must name the public maximum as a rentable shape"
     assert not window.startswith("--gpus n cards to run the job on"), (
         "that phrasing promises exact-count semantics the allocator does not provide"
     )
@@ -175,20 +179,19 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
     )
 
 
-def test_a_pinned_class_that_fits_sft_can_fail_grpo_and_opd_outright():
-    """The doc's 9B/RTX 4090 example is labelled SFT because the fit test is per algorithm.
+def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
+    """The doc's 9B/RTX 4090 example is labelled SFT because fit is per algorithm.
 
-    Asserted because an unlabelled example in a GRPO section reads as a GRPO example, and a user
-    copying it onto configs/grpo.toml does not get 2 cards -- they get UnsupportedGpuError, since
-    rollout memory puts 9B GRPO past even the 4-card combination. The failure is a hard raise, not
-    a silent downgrade, so the wrong doc costs a failed submit rather than a bad number.
+    SFT fits on two cards. GRPO and OPD exceed a four-card ceiling but fit at the public maximum of
+    eight, so copying the SFT example into a rollout config without widening the ceiling fails
+    loudly instead of silently selecting an undersized shape.
     """
     import pytest
 
     from flash.providers.allocator import allocate
     from flash.providers.base import UnsupportedGpuError
 
-    # same model, same pinned class, same ceiling -- only the algorithm differs.
+    # same model and class; only the algorithm and resulting memory floor differ.
     assert (
         allocate(
             "Qwen/Qwen3.5-9B", "sft", provider="runpod", gpu_type="RTX 4090", max_gpu_count=4
@@ -204,6 +207,16 @@ def test_a_pinned_class_that_fits_sft_can_fail_grpo_and_opd_outright():
                 gpu_type="RTX 4090",
                 max_gpu_count=4,
             )
+        assert (
+            allocate(
+                "Qwen/Qwen3.5-9B",
+                algorithm,
+                provider="runpod",
+                gpu_type="RTX 4090",
+                max_gpu_count=8,
+            ).gpu_count
+            == 8
+        )
 
 
 def test_the_allocation_log_line_carries_the_count_that_status_does_not():

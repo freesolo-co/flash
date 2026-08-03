@@ -771,7 +771,7 @@ def test_completion_hook_failure_is_recoverable_by_sweep(monkeypatch, tmp_path):
     monkeypatch.setattr("flash.server.billing.charge_completed_run", charge)
 
     # inline completion hook (runs right after `done`) hits the blip and records failure
-    lifecycle._charge_completed_run_best_effort(spec, io.StringIO())
+    lifecycle._charge_completed_run_by_id(spec.run_id, io.StringIO())
     assert runner.get_status("run-1").billing_state == "failed"
 
     # blip clears; the background sweep recovers the uncharged run
