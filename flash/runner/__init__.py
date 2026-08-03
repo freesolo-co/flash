@@ -1170,6 +1170,9 @@ def prepare_job(
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
         elif not any(name in configured for name in providers_for(spec.gpu.type)):
             raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    preflight_gpu_count = geometry_safe_gpu_cap(spec.model, gpu_count_of(spec))
     preflight_gpu = spec.gpu.type
     if not preflight_gpu and spec.model_policy == "allow":
         # open-model auto runs size this fit preflight against the provisional class the schema
@@ -1186,7 +1189,7 @@ def prepare_job(
             model_revision=spec.model_revision,
             # same card ceiling the allocator will honour, so this preflight cannot reject a shape
             # allocation would have accepted.
-            gpu_count=gpu_count_of(spec),
+            gpu_count=preflight_gpu_count,
         )
     info = resolve_model(
         spec.model,
@@ -1237,8 +1240,10 @@ def _reject_managed_volume_removal(snapshot: object, worker_spec: JobSpec) -> No
         raise ValueError("persisted effective preparation drops a non-shared weight-cache volume")
 
 
-def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
-    """Persist the selected worker spec before provider provisioning starts."""
+def _persist_effective_worker_spec(
+    worker_spec: JobSpec, *, estimated_cost_usd: float | None = None
+) -> bool:
+    """Persist the selected worker spec and exact quote before provider provisioning starts."""
     status = get_status(worker_spec.run_id)
     if status.state in TERMINAL_STATES:
         return False
@@ -1259,11 +1264,10 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
         "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
         "backend": TRAINER_BACKEND,
     }
-    return _update(
-        worker_spec.run_id,
-        status.state,
-        effective_preparation=effective_preparation,
-    )
+    fields = {"effective_preparation": effective_preparation}
+    if estimated_cost_usd is not None:
+        fields["estimated_cost_usd"] = float(estimated_cost_usd)
+    return _update(worker_spec.run_id, status.state, **fields)
 
 
 def submit_job(

@@ -147,22 +147,27 @@ class LambdaProvider(InstanceProvider):
                     continue
                 for count in counts:
                     # The allocator passes a reduced per-card market floor. Keep the whole-run floor
-                    # too so an exact pin can distinguish "this SKU does not exist" from "sold out".
+                    # too so both exact and unpinned searches can distinguish "Lambda does not sell
+                    # this shape" from "the sold SKU has no region free right now".
                     if (
-                        not constraints.required_vram_gb
-                        or combined_vram_gb(g.vram_gb, count) >= constraints.required_vram_gb
+                        constraints.required_vram_gb
+                        and combined_vram_gb(g.vram_gb, count) < constraints.required_vram_gb
                     ):
-                        sku = instance_type_for(g.name, count, catalog)
-                        structurally_fitting = structurally_fitting or sku in catalog
+                        continue
+                    sku = instance_type_for(g.name, count, catalog)
+                    if sku not in catalog:
+                        continue
+                    structurally_fitting = True
                     live = usable_instances(g.name, gpu_count=count)
                     if live:
                         out.append(
                             Candidate("lambda", g.name, live[0].price_usd_hr, g.vram_gb, count)
                         )
-            if constraints.gpu_type and constraints.required_vram_gb and not structurally_fitting:
+            if constraints.required_vram_gb and not structurally_fitting:
+                requested = f" {constraints.gpu_type}" if constraints.gpu_type else ""
                 raise UnsupportedGpuError(
-                    f"lambda does not offer the required {constraints.max_gpu_count}-card "
-                    f"{constraints.gpu_type} shape large enough for "
+                    f"lambda does not offer a rentable{requested} shape up to "
+                    f"{constraints.max_gpu_count} cards large enough for "
                     f"{constraints.required_vram_gb} GB"
                 )
         except UnsupportedGpuError:

@@ -14,11 +14,9 @@ from .facts import (
     active_params_b,
     download_weight_gb,
     effective_train_tflops,
-    gpu_hourly_usd,
     gpu_vram_gb,
     has_nvlink,
     model_quant,
-    pick_gpu,
     reward_seconds_per_completion,
     teacher_seconds_per_completion,
     teacher_token_cost_usd,
@@ -308,16 +306,18 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     return flops / (peak * mfu)
 
 
-def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str, int]:
-    """(chosen GPU class, required VRAM GB): the cheapest fitting class for the cost.
+def _offline_gpu_shape(
+    config: RunConfig, *, max_wall_seconds: float = 0.0
+) -> tuple[str, int, int, str, float]:
+    """Offline structural quote: (gpu, need, count, provider, per-card rate).
 
-    Uses ``pick_gpu``, which (unlike the submit-time allocator) intentionally stays gate-free —
-    it considers every fitting class, validated or not — so the estimate reflects the cheapest
-    card that *could* run the job. The live allocator restricts to the validated pool, so the
-    actually-provisioned class can be pricier than this. Catalog sizing is offline/deterministic."""
-    total_params_b(
-        config.model_id
-    )  # catalog-only: reject a non-catalog model before any (HF) sizing
+    Quote preparation must not query live capacity: a sold-out market or transient lookup failure is
+    exactly what the lifecycle retry machinery exists to survive, and consuming it here prevents the
+    run/status from being created at all. Rank the managed 1/2/4/8-card shapes on the same cost model
+    as allocation, then replace this provisional quote with the selected live candidate immediately
+    before provisioning.
+    """
+    total_params_b(config.model_id)  # catalog-only; no HF/network sizing in `--cost`
     need = required_vram_gb(
         config.model_id,
         config.method,
@@ -325,12 +325,62 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
         thinking=config.thinking,
         model_revision=config.model_revision,
     )
-    # rank on job cost, not rental rate, so the quote names the class the allocator will pick.
-    gpu = pick_gpu(
-        need,
-        provider=config.provider,
-        max_wall_seconds=max_wall_seconds,
-        cost_key=step_cost_key(config),
+    from flash.providers.base import (
+        GPU_INFO,
+        canonical_gpu,
+        combined_vram_gb,
+        providers_for,
+        rentable_gpu_counts,
+    )
+
+    provider = config.provider if config.provider != "auto" else "auto"
+    if config.gpu_type:
+        names = (canonical_gpu(config.gpu_type),)
+    else:
+        names = tuple(
+            info.name for info in GPU_INFO.values() if info.enum_member and info.validated
+        )
+    ranked = []
+    for gpu in names:
+        info = GPU_INFO[gpu]
+        if provider != "auto" and provider not in providers_for(gpu):
+            continue
+        for count in rentable_gpu_counts(config.gpu_count):
+            if combined_vram_gb(info.vram_gb, count) < need:
+                continue
+            # Provisional quoting is structural and must not touch a live market. Vast pricing is
+            # offer-backed (therefore capacity-backed), and Lambda's catalog can blip too. Use the
+            # managed static rate here; the lifecycle replaces it from the selected candidate before
+            # provisioning, so the persisted/charged quote still carries the exact provider rate.
+            hourly = info.hourly_usd
+            gpu_bound, fixed = step_seconds_split(config, gpu)
+            step_seconds = gpu_bound / multi_card_speedup(count, gpu) + fixed
+            ranked.append(
+                (
+                    hourly * count * step_seconds,
+                    count,
+                    combined_vram_gb(info.vram_gb, count),
+                    info.vram_gb,
+                    gpu,
+                    hourly,
+                )
+            )
+    if not ranked:
+        if config.gpu_type:
+            info = GPU_INFO[canonical_gpu(config.gpu_type)]
+            raise ValueError(
+                f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
+            )
+        shape = f" across up to {config.gpu_count} cards" if config.gpu_count > 1 else ""
+        raise ValueError(f"no GPU class fits >= {need} GB{shape}")
+    _cost, count, _combined, _per_card, gpu, hourly = min(ranked)
+    return gpu, need, count, provider, hourly
+
+
+def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str, int]:
+    """(chosen GPU class, required VRAM GB) from the offline structural quote."""
+    gpu, need, _count, _provider, _hourly = _offline_gpu_shape(
+        config, max_wall_seconds=max_wall_seconds
     )
     return gpu, need
 
@@ -384,8 +434,15 @@ def _notes(
     return tuple(notes)
 
 
-def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
-    """Deterministic pre-flight cost calculation."""
+def estimate_cost(
+    config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S, allocation=None
+) -> CostEstimate:
+    """Deterministic pre-flight cost calculation.
+
+    ``allocation`` is the exact live candidate selected by the retrying lifecycle. Preparation omits
+    it and stays offline; immediately before provisioning the persisted quote is replaced from this
+    candidate so successful billing uses the real provider, class, count, and per-card rate.
+    """
     # Billing cap: mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
     cap_s = (
         max(60.0, float(config.max_wall_seconds))
@@ -403,59 +460,45 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         market_wall_s = float(config.max_wall_seconds)
     else:
         market_wall_s = 0.0
-    # The submit-time quote is persisted and charged verbatim, so whenever the server has provider
-    # credentials it must use the SAME allocator-selected class and count as launch. This applies to
-    # unpinned runs too: gpu.count is a ceiling, and billing that ceiling charges 8 cards for a small
-    # run the allocator narrows to one.
-    from flash.providers import available_providers
-    from flash.providers.allocator import allocate
-
-    if config.gpu_type or available_providers():
-        allocation = allocate(
-            config.model_id,
-            config.method,
-            train=config.train_knobs(),
-            thinking=config.thinking,
-            max_wall_seconds=market_wall_s,
-            disk_gb=config.disk_gb,
-            provider=("" if config.provider == "auto" else config.provider),
-            gpu_type=config.gpu_type,
-            model_revision=config.model_revision,
-            max_gpu_count=config.gpu_count,
-        )
+    if allocation is not None:
         gpu = allocation.gpu
         quote_provider = allocation.provider
-        hourly = allocation.hourly_usd
-        need = allocation.min_vram_gb
-        billed_gpu_count = getattr(allocation, "gpu_count", 1) or 1
+        hourly = float(allocation.hourly_usd)
+        need = int(
+            getattr(allocation, "min_vram_gb", 0)
+            or required_vram_gb(
+                config.model_id,
+                config.method,
+                train=config.train_knobs(),
+                thinking=config.thinking,
+                model_revision=config.model_revision,
+            )
+        )
+        billed_gpu_count = int(getattr(allocation, "gpu_count", 1) or 1)
     else:
-        # Offline `flash train --cost` has no provider market to allocate against. pick_gpu returns a
-        # class that fits the WHOLE run alone, so quote one card rather than guessing the ceiling. A
-        # server-side submit never reaches this fallback because its provider credentials are present.
-        gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
-        quote_provider = config.provider
-        billed_gpu_count = 1
-        # quote the same vram-floored vast market pick_gpu selected under (min_vram_gb=need): without the
-        # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
-        # crowd a high-vram selection off the limited page -> it silently falls back to the static rate.
-        hourly = gpu_hourly_usd(
-            gpu,
-            provider=quote_provider,
-            max_wall_seconds=market_wall_s,
-            min_vram_gb=need,
-            gpu_type="",  # this branch is only reached when gpu_type is empty
+        # Preparation and `flash train --cost` must stay independent of live capacity. A provider
+        # lookup blip here would consume the first allocation failure before a run/status exists, so
+        # the lifecycle could never retry it. This provisional structural quote is replaced from the
+        # exact selected candidate immediately before provisioning.
+        gpu, need, billed_gpu_count, quote_provider, hourly = _offline_gpu_shape(
+            config, max_wall_seconds=market_wall_s
         )
 
     setup = setup_seconds(config)
-    sps = seconds_per_step(config, gpu)
+    gpu_bound_s, fixed_s = step_seconds_split(config, gpu)
+    speedup = multi_card_speedup(billed_gpu_count, gpu)
+    sps = gpu_bound_s / speedup + fixed_s
     required_save_s = required_save_overhead_seconds(config)
     # A one-time kernel/graph compile is paid once on the first step (MoE-only; 0 for dense). It is
-    # training GPU time, so it belongs in the (billed) train term, not setup.
+    # training GPU time, so it belongs in the (billed) train term, not setup. Required saves are also
+    # synchronous fixed overhead; neither is divided by the number of cards.
     compile_s = compile_seconds(config, gpu)
     raw_train = compile_s + config.steps * sps + required_save_s
     if not config.is_grpo and config.train_tokens is not None:
         raw_train = (
-            compile_s + sft_seconds_for_tokens(config, gpu, config.train_tokens) + required_save_s
+            compile_s
+            + sft_seconds_for_tokens(config, gpu, config.train_tokens) / speedup
+            + required_save_s
         )
     sps = raw_train / config.steps
 
