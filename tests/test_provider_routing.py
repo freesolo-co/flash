@@ -426,6 +426,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
 
     resolved_sha = "a" * 40
     resolved_refs = []
+    quote_allocations = []
     submitted = []
 
     def fake_resolve(parsed, *args, **kwargs):
@@ -444,8 +445,17 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         lambda model, *args, **kwargs: catalog.MODELS[model],
     )
 
+    def fake_estimate(_spec, *, allocation=None):
+        quote_allocations.append(allocation)
+        total_usd = 7.0 if allocation is not None else 1.0
+        return type("Estimate", (), {"total_usd": total_usd})()
+
     def fake_runpod_submit(run_spec, seed, **kwargs):
-        persisted = orch.get_status(run_spec.run_id).effective_preparation["worker_spec"]
+        status = orch.get_status(run_spec.run_id)
+        persisted = status.effective_preparation["worker_spec"]
+        assert status.estimated_cost_usd == 7.0
+        assert quote_allocations[-1] is not None
+        assert quote_allocations[-1].gpu == "RTX 5090"
         assert persisted["environment"]["resolved_sha"] == resolved_sha
         assert persisted["gpu"]["type"] == "RTX 5090"
         assert persisted["gpu"]["network_volume"] == "flash-weights"
@@ -461,10 +471,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1})
 
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
-    monkeypatch.setattr(
-        "flash.cost.spec.estimate_for_spec",
-        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
-    )
+    monkeypatch.setattr("flash.cost.spec.estimate_for_spec", fake_estimate)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     monkeypatch.setattr("flash.providers._worker.upload_code", lambda *a, **k: None)
@@ -549,7 +556,7 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
     monkeypatch.setattr(
         "flash.cost.spec.estimate_for_spec",
-        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
+        lambda _spec, **_kwargs: type("Estimate", (), {"total_usd": 1.0})(),
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
@@ -933,13 +940,15 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
     # Attempt 0 (nothing failed): cheapest overall.
     assert _select_candidate(cands, set(), set()) is cands[0]
     # RunPod burned an infra attempt -> escape to the OTHER provider, not the next RunPod class.
-    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "H100")})
+    # the tried set is keyed by SHAPE (provider, class, card count), so a 2-tuple would never match
+    # and every candidate would read as untried.
+    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "H100", 1)})
     assert (chosen.provider, chosen.gpu) == ("lambda", "H100")
     # Both providers burned -> fall back to the cheapest class NOT yet tried (within-provider walk).
     chosen = _select_candidate(
         cands,
         {"runpod", "lambda"},
-        {("runpod", "H100"), ("lambda", "H100")},
+        {("runpod", "H100", 1), ("lambda", "H100", 1)},
     )
     assert (chosen.provider, chosen.gpu) == ("runpod", "RTX Pro 6000")
 
@@ -950,7 +959,7 @@ def test_select_candidate_single_provider_walks_classes():
     from flash.runner.lifecycle import _select_candidate
 
     cands = (Candidate("runpod", "RTX 4090", 0.39, 24), Candidate("runpod", "H100", 0.49, 48))
-    assert _select_candidate(cands, {"runpod"}, {("runpod", "RTX 4090")}).gpu == "H100"
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "RTX 4090", 1)}).gpu == "H100"
 
 
 def test_select_candidate_single_fitting_gpu_never_breaks():
@@ -967,7 +976,7 @@ def test_select_candidate_single_fitting_gpu_never_breaks():
     assert _select_candidate(cands, set(), set()) is only
     # After it failed infra-shaped (provider burned, class tried), the next retry re-picks the SAME
     # class — there is nowhere else to walk, and the picker must not break.
-    assert _select_candidate(cands, {"runpod"}, {("runpod", "H200")}) is only
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "H200", 1)}) is only
 
 
 def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):

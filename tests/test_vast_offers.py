@@ -10,6 +10,10 @@ def _offer(**kw) -> dict:
         "machine_id": 1,
         "gpu_name": "RTX 4090",
         "gpu_ram": 24576,
+        # single-card box. the count is load-bearing twice over (it sizes the rented box and divides
+        # dph_total into the per-card rate), so usable_offers re-checks it client-side rather than
+        # trusting the server honoured the num_gpus filter -- a row without it is dropped.
+        "num_gpus": 1,
         "dph_total": 0.25,
         "verification": "verified",
         "hosting_type": 1,
@@ -72,6 +76,7 @@ def test_usable_offers_filters_and_order(monkeypatch):
         min_reliability=0.95,
         min_duration_seconds=0,
         limit=64,
+        num_gpus=1,
         extra_q=None,
     ):
         captured["min_vram_mb"] = min_vram_mb
@@ -140,6 +145,7 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
         min_reliability=0.95,
         min_duration_seconds=0,
         limit=64,
+        num_gpus=1,
         extra_q=None,
     ):
         captured["limit"] = limit
@@ -205,7 +211,7 @@ def test_usable_offers_threads_duration_floor(monkeypatch):
 
     captured = {}
 
-    def fake_search(min_vram_mb, *, min_duration_seconds=0, **k):
+    def fake_search(min_vram_mb, *, min_duration_seconds=0, num_gpus=1, **k):
         captured["min_duration_seconds"] = min_duration_seconds
         return []
 
@@ -305,3 +311,33 @@ def test_live_rates_caches_within_ttl_and_refresh_bypasses(monkeypatch):
     assert calls["n"] == 1
     pricing.live_rates(refresh=True)  # forced -> fetches again
     assert calls["n"] == 2
+
+
+def test_usable_offers_threads_and_rechecks_card_count(monkeypatch):
+    """The count reaches the search AND is re-checked on the rows that come back.
+
+    Vast bakes the card count into the offer (create_instance takes no count), so num_gpus is the
+    only way to reach a multi-card box. It is load-bearing twice: it sizes the rented box, and it
+    divides dph_total into the per-card rate the allocator ranks on. A server that ignored the
+    filter would otherwise hand back single-card rows that get priced as if they were multi-card.
+    """
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_search(min_vram_mb, **kwargs):
+        captured.update(kwargs)
+        # honour the filter for id=1, ignore it for id=2 (a server that lies about the count)
+        return [
+            _offer(id=1, num_gpus=int(kwargs.get("num_gpus", 1)), dph_total=0.25),
+            _offer(id=2, num_gpus=1, dph_total=0.20),
+        ]
+
+    monkeypatch.setattr(vast_api, "search_offers", fake_search)
+    out = vast.usable_offers(24, disk_gb=60, num_gpus=4)
+
+    assert captured["num_gpus"] == 4, "the count never reached the search"
+    # id=2 is cheaper and would sort first, so dropping it proves the client-side re-check fired
+    # rather than the ordering happening to hide it.
+    assert [o.offer_id for o in out] == [1], "a wrong-count row survived the client-side re-check"

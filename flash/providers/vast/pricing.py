@@ -36,14 +36,19 @@ def live_candidate_rates(
     disk_gb: float = 0.0,
     max_wall_seconds: float = 0.0,
     gpu_type: str = "",
+    num_gpus: int = 1,
 ) -> dict[str, float]:
-    """Friendly-name -> cheapest LIVE verified-datacenter $/hr per managed class that currently has a
-    rentable offer at/above ``min_vram_gb``, using the SAME effective disk floor
+    """Friendly-name -> cheapest LIVE verified-datacenter PER-CARD $/hr per managed class that
+    currently has a rentable offer at/above ``min_vram_gb``, using the SAME effective disk floor
     (``max(disk_gb, MIN_DISK_GB)``) and duration floor the submit path provisions with — so a class is
     only priced/advertised when a launch could actually rent it. ONE market search; offers are
     price-sorted so the first seen per class is cheapest. Raises on a fetch failure (callers decide the
     fallback); assumes ``VAST_API_KEY`` is set (callers gate on it). Shared by the ``flash gpus`` /
-    cost-estimate pricing path and the allocator's capacity check."""
+    cost-estimate pricing path and the allocator's capacity check.
+
+    ``num_gpus`` > 1 restricts the search to offers renting that many cards on one machine; the
+    returned rate stays per-card, so a class only appears when such a box is actually on the market.
+    """
     from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
 
     rates: dict[str, float] = {}
@@ -52,6 +57,7 @@ def live_candidate_rates(
         max(float(disk_gb or 0.0), MIN_DISK_GB),
         max_wall_seconds=max_wall_seconds,
         gpu_type=gpu_type,
+        num_gpus=num_gpus,
     ):
         rates.setdefault(
             offer.gpu, offer.dph_total
