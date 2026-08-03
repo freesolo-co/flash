@@ -816,9 +816,10 @@ def test_whole_run_quote_never_sits_below_the_fastest_run_of_that_config():
     geo = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
     spread = max(ratios) / min(ratios)
 
-    # The SFT replicate noise floor is 1.722x, so a single config landing under 1.0 is inside what
-    # pod variance explains. What is NOT allowed is the systematic shortfall the flat block produced:
-    # every config low at once, with a geometric mean far outside that floor.
+    # The SFT replicate noise floor is 1.722x (derived in
+    # test_sft_replicate_noise_floor_bounds_what_this_corpus_can_resolve), so a single config landing
+    # under 1.0 is inside what pod variance explains. What is NOT allowed is the systematic shortfall
+    # the flat block produced: every config low at once, with a geometric mean far outside that floor.
     assert 1.0 / 1.722 < geo < 1.722, (
         f"sft geo {geo:.3f}x is outside the 1.722x replicate noise floor; the shipped flat block "
         f"scored 0.401x here (13/13 configs quoted below a run that actually happened)"
@@ -860,6 +861,59 @@ def test_whole_run_quote_never_sits_below_the_fastest_run_of_that_config():
             f"opd {card}/{model} x{steps}: quote {quote:.1f}s undercuts its fastest realized run "
             f"{fastest:.1f}s by {fastest / quote:.2f}x, past the {rollout_noise_floor}x floor"
         )
+
+
+def test_sft_replicate_noise_floor_bounds_what_this_corpus_can_resolve():
+    """Pins the SFT run-to-run noise floor, and with it the smallest SFT effect this corpus can prove.
+
+    The 1.722x the whole-run envelope test compares against had no derivation anywhere in the tree,
+    so nothing stopped a later reading of a thinner corpus from quietly replacing it. It is the one
+    constant that decides which findings are real: an apparent error smaller than the floor is pod
+    variance, and a ranking whose two candidates sit closer than the floor is a coin flip.
+
+    Measured on runs identical by construction -- same model, card, batch, context, step count and
+    seed, differing only in ``wandb.run_name`` -- so the entire spread is pod-to-pod variance.
+    Twelve arms were launched for this (Qwen3.5-0.8B, RTX 4090, ctx 1024, 64 realized steps, n=4 at
+    each of batch 8/16/32):
+
+        batch  s/step across the 4 replicates            max/min
+        8      3.001  3.251  3.898  4.487                1.495x
+        16     2.267  2.643  3.882  4.749                2.095x
+        32     4.648  7.683  7.699  7.754                1.668x
+
+    Median 1.668x, max 2.095x. Widening to every SFT cell that has any replicate (14 sets, including
+    incidental ones) gives median 1.354x, max 2.772x.
+
+    Two consequences this test exists to keep true:
+
+    - SFT is far noisier than the 1.194x GRPO floor. Grading an SFT ranking against the GRPO number
+      manufactures findings: both alleged SFT ranking misses in this PR's history separated by 1.53x
+      and 1.68x, above 1.194x but comfortably inside SFT's own floor, so neither is gradable.
+    - 1.722x remains the right bound for the envelope test even though it sits below the 2.095x
+      per-config max, because that test asserts a GEOMETRIC MEAN over 13 configs. A mean concentrates:
+      a 2.095x per-config spread over n=13 is roughly a 1.23x band on the mean. Sizing that assertion
+      to a single arm's spread would make it unable to fail.
+    """
+    import math
+
+    designed_s_per_step = {
+        8: (3.001, 3.251, 3.898, 4.487),
+        16: (2.267, 2.643, 3.882, 4.749),
+        32: (4.648, 7.683, 7.699, 7.754),
+    }
+    spreads = sorted(max(v) / min(v) for v in designed_s_per_step.values())
+    measured_max = spreads[-1]
+
+    assert measured_max > 1.194, (
+        f"sft replicates spread {measured_max:.3f}x, so the 1.194x GRPO floor cannot be reused for "
+        f"sft: it would grade pod variance as a model defect"
+    )
+    # The envelope test's bound is on a 13-config geometric mean, which concentrates as sqrt(n).
+    concentrated = measured_max ** (1 / math.sqrt(13))
+    assert concentrated < 1.722, (
+        f"a {measured_max:.3f}x per-config spread implies a {concentrated:.3f}x band on a 13-config "
+        f"geometric mean; 1.722x is only meaningful while it stays wider than that band"
+    )
 
 
 def test_opd_step_stays_proportional_across_step_counts_because_the_corpus_cannot_curve_it():
