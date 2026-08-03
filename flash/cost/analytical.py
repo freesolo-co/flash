@@ -300,14 +300,34 @@ def _opd_step_shape(n: RunConfig) -> tuple[int, int]:
     split the prompt side onto the update term (prompt+cap on update, cap on generation) scored
     1.590x/19-of-65, i.e. no better than the simple cap, so the extra term is not carried.
 
-    Known residual, deliberately NOT patched here. 1.520x is still outside this corpus's 1.194x
-    run-to-run noise floor, so a second OPD error remains. It is not in this token basis: the wall
-    is dominated by the card-independent fixed term (the FLOPs term is 2-15% of the OPD prediction),
-    and the teacher is charged as ``teacher_lat * ceil(completions / OPD_TEACHER_BATCH_SIZE)``
-    serial round trips while the measured blocking teacher wall
-    (``opd_phase_teacher_wait_seconds``) is a median 2.26% of the train wall -- the worker overlaps
-    the teacher with a prefetch pipeline instead of blocking on it. Fixing that is a change to the
-    fixed term, not to the token shape, and it needs its own fit.
+    Known residual, deliberately NOT patched here, and MEASURED to be outside this token basis.
+    Holding step count fixed and varying the cap moves the bias almost not at all (at steps=2,
+    cap 128 scores 3.98x against cap 512 at 3.63x -- a 4x cap change); holding the cap fixed and
+    varying step count moves it a lot (at cap 512, steps 2/60/68/269 score 3.63x/1.38x/0.74x/1.31x).
+    So the residual tracks STEP COUNT, and no refinement of the completion-cap basis can reach it.
+
+    Two figures an earlier revision of this docstring asserted are corrected here, because both
+    understated how much room is left:
+
+      - the floor. 1.194x is the GRPO corpus's replicate spread and was borrowed without being
+        checked against OPD's own arms. Measured on 104 replicated OPD runs across 19 cells holding
+        (card, model, completions, cap, steps) fixed, OPD repeats at 1.32x median and 2.74x max.
+        1.520x against a 1.32x floor is close to this corpus's resolving power, not far outside it.
+      - the FLOPs share. It is 0.3-68.2% of the per-step quote (median 10.5%) across the measured
+        cells, not 2-15%: on a large-cap cell the token term is the majority of the step.
+
+    The teacher is charged as ``teacher_lat * ceil(completions / OPD_TEACHER_BATCH_SIZE)`` serial
+    round trips while the measured blocking teacher wall (``opd_phase_teacher_wait_seconds``) is a
+    median 2.26% of the train wall -- the worker overlaps the teacher with a prefetch pipeline
+    instead of blocking on it. Fixing that is a change to the fixed term, not to the token shape.
+
+    That fixed term cannot be refitted from this corpus, and the reason is worth recording so the
+    next attempt does not repeat it. On 2 of the 3 cells carrying >= 3 distinct step counts the wall
+    is NONLINEAR in steps: H200 / Qwen3.5-4B / 32 completions / cap 512 implies 59.6 s/step over
+    steps 2->68 but 18.3 s/step over 68->269, and a straight line through all three points reports a
+    1102s block where the near segment alone implies 86s. The intercept is absorbing curvature. A
+    two-step-count cell cannot show this at all, so it looks clean while being equally unidentified.
+    Refitting the OPD block needs cells with enough step counts to test linearity first.
     """
     completions = n.batch_size * n.group_size
     return completions, completions * n.completion_len

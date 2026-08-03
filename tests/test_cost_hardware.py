@@ -841,7 +841,18 @@ def test_whole_run_quote_never_sits_below_the_fastest_run_of_that_config():
         ("RTX 4090", "Qwen/Qwen3.5-0.8B", 16): 966.5,
         ("RTX 4090", "Qwen/Qwen3.5-0.8B", 48): 1962.3,
     }
-    rollout_noise_floor = 1.194
+    # 1.194x is the GRPO corpus's replicate spread and was borrowed for opd without being checked
+    # against opd's own arms. measured on 104 replicated opd runs across 19 cells holding
+    # (gpu, model, batch x group, completion cap, steps) all fixed, opd repeats at 1.32x median and
+    # 2.74x max: the largest cell alone -- h200 / Qwen3.5-4B / 32 completions / cap 512 / 269 steps,
+    # 23 byte-identical runs -- spans 4851s to 11693s (2.41x). opd carries a remote teacher and a
+    # vllm rollout that grpo's fitted cells do not exercise at this size, so its floor is genuinely
+    # looser rather than the same number measured twice.
+    #
+    # the bound below uses the MEDIAN, not the max. a floor is the spread a single arm may show
+    # without being a defect, and sizing it to the widest cell in the corpus would admit a 2.74x
+    # under-quote as normal.
+    rollout_noise_floor = 1.32
     for (card, model, steps), fastest in opd_envelope.items():
         cfg = RunConfig(model, "opd", steps, batch_size=8, group_size=4, seq_len=1024)
         quote = run_startup_seconds(cfg, card) + steps * seconds_per_step(cfg, card)
@@ -849,6 +860,45 @@ def test_whole_run_quote_never_sits_below_the_fastest_run_of_that_config():
             f"opd {card}/{model} x{steps}: quote {quote:.1f}s undercuts its fastest realized run "
             f"{fastest:.1f}s by {fastest / quote:.2f}x, past the {rollout_noise_floor}x floor"
         )
+
+
+def test_opd_step_stays_proportional_across_step_counts_because_the_corpus_cannot_curve_it():
+    """Pins OPD's step term as LINEAR in step count, against measured evidence that reality is not.
+
+    The measured OPD wall is nonlinear in steps on 2 of the 3 cells that carry >= 3 distinct step
+    counts. On H200 / Qwen3.5-4B / 32 completions / cap 512 (n=33 runs, 134x step span) the near
+    segment implies 59.6 s/step and the far segment 18.3 s/step -- the per-step rate FALLS as the run
+    grows. A straight line through all three points reports a 1102s run block where the near segment
+    alone implies 86s, i.e. the intercept absorbs the curvature.
+
+    That is a real effect, but it is NOT fitted here, and this test exists to keep it that way until
+    it can be. Fitting a decay needs cells whose step counts can distinguish curvature from pod
+    variance, and this corpus does not have them: the largest cell repeats at 2.41x across 23
+    byte-identical runs (4851s to 11693s), which is wider than the 3.26x segment disagreement is
+    clear of. The one cell that IS consistent with linear (B200 / Qwen3.5-27B / cap 512, 1.18x
+    segment agreement) shows the shape is not even stable across models.
+
+    So the quote stays linear, and a future refit has to break this test deliberately rather than
+    by accident. Doubling the steps must double the step half of the quote exactly -- no saturation,
+    no decay term smuggled in through the block.
+    """
+    from flash.cost.analytical import RunConfig, run_startup_seconds, seconds_per_step
+
+    for card in ("H200", "H100", "RTX 4090"):
+        cfg = RunConfig("Qwen/Qwen3.5-4B", "opd", 1, batch_size=8, group_size=4, seq_len=512)
+        per_step = seconds_per_step(cfg, card)
+        block = run_startup_seconds(cfg, card)
+
+        for steps in (2, 68, 269):
+            cfg_n = RunConfig(
+                "Qwen/Qwen3.5-4B", "opd", steps, batch_size=8, group_size=4, seq_len=512
+            )
+            quote = run_startup_seconds(cfg_n, card) + steps * seconds_per_step(cfg_n, card)
+            assert quote == pytest.approx(block + steps * per_step, rel=1e-9), (
+                f"opd {card} x{steps}: the step term is no longer proportional to step count. if "
+                f"this is a deliberate decay refit, it needs cells that separate curvature from a "
+                f"2.41x replicate spread first"
+            )
 
 
 def test_small_sft_step_prices_at_the_saturation_floor_but_still_tracks_card_speed():
