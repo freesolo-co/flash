@@ -618,7 +618,7 @@ def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_pa
         mm.preflight_validate_image_opd(unsupported)
 
 
-@pytest.mark.parametrize("teacher_model", ["", "glm-5.2", "deepseek-v4-pro"])
+@pytest.mark.parametrize("teacher_model", ["", "glm-5.2", "accounts/fireworks/models/glm-5p2"])
 def test_image_opd_preflight_requires_kimi_vision_teacher(tmp_path, teacher_model):
     root, _image = _package(tmp_path)
     env_file = root / "environment.py"

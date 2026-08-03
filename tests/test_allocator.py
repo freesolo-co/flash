@@ -1010,6 +1010,8 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             if need > max_managed_vram:
                 with pytest.raises(UnsupportedGpuError):
                     allocator.allocate(model_id, "opd", train=train)
+                # Cost preflight is deliberately offline so a capacity lookup cannot consume a
+                # lifecycle retry before the run exists. It still rejects the same impossible shape.
                 with pytest.raises(ValueError, match="no GPU class fits"):
                     estimate_cost(rc)
                 rejected.add((model_id, label))
@@ -1506,14 +1508,27 @@ def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
 
 
 def _stub_provider(monkeypatch, allocator, candidates_by_need):
-    """stub a single provider whose live_candidates returns fixed candidates filtered by per-card need."""
-    from flash.providers.base import Candidate
+    """stub a single provider whose live_candidates returns fixed candidates filtered by per-card need.
+
+    Each supplied candidate is offered at every rentable count up to ``constraints.max_gpu_count``,
+    which is what a real provider now does: providers report the shapes they can genuinely rent and
+    the allocator only decides which one fits. A stub that returned single-card shapes only could
+    never produce a multi-card candidate, so every combination assertion below would be unfailable.
+    """
+    from dataclasses import replace
+
+    from flash.providers.base import Candidate, rentable_gpu_counts
 
     class _P:
         name = "runpod"
 
         def live_candidates(self, need, constraints):
-            return [c for c in candidates_by_need if c.vram_gb >= need]
+            return [
+                replace(c, gpu_count=count)
+                for c in candidates_by_need
+                if c.vram_gb >= need
+                for count in rentable_gpu_counts(constraints.max_gpu_count)
+            ]
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     monkeypatch.setattr(allocator, "get_provider", lambda name: _P())
@@ -1568,8 +1583,17 @@ def test_combo_single_kept_when_cheaper_than_combination(monkeypatch):
 
 
 def test_combo_uses_smallest_fitting_count_and_shard_margin(monkeypatch):
-    # 200 GB need on 80 GB cards with the replicated-floor model:
-    # usable/card = (80-8)*0.85 = 61.2 -> 3 cards = 191.6 GB (too small), 4 cards = 252.8 (fits).
+    """The smallest RENTABLE count that fits, with the shard margin actually deciding the boundary.
+
+    Counts are powers of two (verl shards over them: num_attention_heads % sp_size != 0 aborts at
+    step 0), so on 80 GB cards with the replicated-floor model, usable = n*(80-8)*0.85 + 8:
+    2 cards = 130.4 GB, 4 cards = 252.8 GB.
+
+    Both needs are asserted because they pin different halves of the rule. 200 GB pins
+    smallest-fitting-count (2 is too small, so 4). 140 GB pins the shard MARGIN itself: it sits in
+    the gap between the discounted 2-card capacity (130.4) and the undiscounted one (152), so an
+    allocator that forgot to discount would rent 2 cards and OOM on a run that needs 4.
+    """
     from flash.providers import allocator
     from flash.providers.base import Candidate
 
@@ -1578,6 +1602,10 @@ def test_combo_uses_smallest_fitting_count_and_shard_margin(monkeypatch):
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
     a = allocator.allocate("m", "sft", max_gpu_count=4)
     assert (a.gpu, a.gpu_count) == ("A100 PCIe", 4)
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 140)
+    a = allocator.allocate("m", "sft", max_gpu_count=4)
+    assert (a.gpu, a.gpu_count) == ("A100 PCIe", 4), "the shard margin was not applied"
 
 
 def test_combo_replicated_floor_excludes_tiny_cards(monkeypatch):

@@ -134,10 +134,16 @@ def test_cheapest_gpu_policy(monkeypatch):
     assert (
         gpus.cheapest_gpu(48) == "A100 PCIe"
     )  # cheapest validated >=48G is the 80G A100 PCIe ($1.39)
-    # The error names the REAL constraint: this helper filters to validated RunPod classes,
-    # so a fitting unvalidated class doesn't make the message a lie.
-    with pytest.raises(gpus.UnsupportedGpuError, match="no validated RunPod-provisionable GPU"):
+    # The error names the REAL constraint -- validation, not provider. The pool is every validated
+    # class across all three providers, so naming RunPod here would be the special-casing the
+    # multi-provider contract removes, and would misdescribe a Lambda-only class like the A10.
+    with pytest.raises(gpus.UnsupportedGpuError, match="no validated GPU class has >= 4096 GB"):
         gpus.cheapest_gpu(4096)
+    # ...and the card count is part of that constraint: the same need a single card cannot hold is
+    # holdable across four, so sizing must say which shape it rejected.
+    assert gpus.cheapest_gpu(200, gpu_count=4) == "A100 PCIe"
+    with pytest.raises(gpus.UnsupportedGpuError, match="even as a 4-card combination"):
+        gpus.cheapest_gpu(4096, gpu_count=4)
     # static rates cover every RunPod-provisionable class
     rates = pricing.static_rates()
     assert set(rates) == {name for name, info in gpus.GPU_INFO.items() if info.enum_member}

@@ -78,6 +78,7 @@ def _resolve_compiler_vocab_size(
     model_revision: str,
     model_policy: str,
     gpu: str | None,
+    gpu_count: int = 1,
 ) -> int:
     from flash.catalog import resolve_model
 
@@ -87,6 +88,7 @@ def _resolve_compiler_vocab_size(
         policy=model_policy,
         gpu=gpu,
         model_revision=model_revision,
+        gpu_count=gpu_count,
     )
     return int(info.vocab_size)
 
@@ -126,9 +128,15 @@ def validate_opd_structured_outputs(
     model_revision: str = "",
     model_policy: str = "catalog",
     gpu: str | None = None,
+    gpu_count: int = 1,
     compiler_vocab_size: int | None = None,
 ) -> OpdVerlStructuredValidation:
-    """validate every assumption required for exact vllm generation and cpu replay."""
+    """validate every assumption required for exact vllm generation and cpu replay.
+
+    ``gpu_count`` is the run's allocated card count. an open model under ``model_policy="allow"``
+    is fit-checked during resolution, so judging it on one card here re-raises "does not fit" for a
+    shardable run that submit already placed -- on the worker, after the instance is rented.
+    """
     constraint = parse_structured_outputs(structured_outputs)
     if constraint is None:
         return OpdVerlStructuredValidation(constraint=None)
@@ -140,6 +148,7 @@ def validate_opd_structured_outputs(
             model_revision=model_revision,
             model_policy=model_policy,
             gpu=gpu,
+            gpu_count=gpu_count,
         )
     compiler_vocab_size = int(compiler_vocab_size)
     actual_vocab_size, repo_files = _resolve_structured_model_metadata(model_id, model_revision)
