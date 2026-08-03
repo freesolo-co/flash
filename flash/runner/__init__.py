@@ -1184,6 +1184,9 @@ def prepare_job(
         policy=spec.model_policy,
         gpu=preflight_gpu,
         model_revision=spec.model_revision,
+        # same ceiling the preflight class was chosen under, so this cannot reject a shape
+        # allocation would have accepted.
+        gpu_count=gpu_count_of(spec),
     )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})

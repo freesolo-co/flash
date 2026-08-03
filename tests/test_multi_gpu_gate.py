@@ -731,6 +731,72 @@ def test_gpu_count_above_the_combination_cap_does_not_oversell():
     assert cheapest_gpu(need, gpu_count=8) == cheapest_gpu(need, gpu_count=MAX_COMBINATION_CARDS)
 
 
+def test_open_model_validation_is_judged_on_the_allocated_shape():
+    """`model_policy = "allow"` must size an open model on its card COUNT, not on one card.
+
+    Threading the count into parse-time sizing deliberately picks a SMALLER per-card class as the
+    ceiling widens (a 32B run resolves to RTX Pro 6000 at 1 card, RTX 5090 at 4). If the open-model
+    fit check still evaluates one card, that smaller class is then rejected as `too_big` -- so
+    `--gpus 4` refuses a model `--gpus 1` accepts, and multi-card stays unusable for exactly the
+    large open models it exists to serve.
+    """
+    from flash.catalog import resolve_model
+    from flash.engine.vram import check_fit
+
+    model, card = "acme/open-32b", "RTX 5090"
+    monkey = pytest.MonkeyPatch()
+    try:
+        # size is stubbed so the assertion is about the COUNT, not about HF reachability.
+        monkey.setattr("flash.engine.vram.fetch_hf_params_b", lambda _m, **_k: 32.0)
+        # one card genuinely cannot hold it -> the count is what makes the wide shape legal.
+        assert check_fit(model, "sft", card, gpu_count=1).verdict == "too_big"
+        assert check_fit(model, "sft", card, gpu_count=4).verdict != "too_big"
+        # the real resolution path must follow: reject on one card, accept on four.
+        with pytest.raises(ValueError, match="does not fit"):
+            resolve_model(model, "sft", policy="allow", gpu=card, gpu_count=1)
+        assert resolve_model(model, "sft", policy="allow", gpu=card, gpu_count=4).params_b == 32.0
+    finally:
+        monkey.undo()
+
+
+def test_unpinned_sold_out_live_market_stays_retryable():
+    """An unpinned run on a live-market provider must not die terminally when stock runs out.
+
+    `live_capacity` was consulted only for an EXACT pin, so an auto-allocated run whose fitting
+    class was merely sold out fell through to `UnsupportedGpuError` -- which the lifecycle treats
+    as terminal, killing a run a retry would have placed. A genuinely oversized run must still fail
+    terminally, so the distinction is gated on whether any offered shape could hold the run at all.
+    """
+    import flash.providers.allocator as alloc
+    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+
+    class _SoldOutLiveMarket:
+        name = "lambda"
+        live_capacity = True
+
+        def live_candidates(self, need, constraints):
+            return []  # structurally offered, nothing free right now
+
+        def gpu_classes(self):
+            from flash.providers import base
+
+            return base.gpu_classes_for("lambda_name")
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(alloc, "get_provider", lambda _n: _SoldOutLiveMarket())
+        monkey.setattr(alloc, "available_providers", lambda: ("lambda",))
+        # a run that fits an offered shape: sold out now -> retryable.
+        with pytest.raises(CapacityLookupError):
+            alloc.allocate("Qwen/Qwen3-4B", "sft")
+        # a run no offered shape can ever hold -> still terminal, not an infinite retry.
+        monkey.setattr(alloc, "required_vram_gb", lambda *a, **k: 100_000)
+        with pytest.raises(UnsupportedGpuError):
+            alloc.allocate("Qwen/Qwen3-4B", "sft")
+    finally:
+        monkey.undo()
+
+
 def _validated_infos():
     from flash.providers.base import GPU_INFO
 

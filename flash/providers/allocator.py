@@ -19,6 +19,7 @@ from flash.providers.base import (
     combined_vram_gb,
     largest_rentable_count,
     providers_for,
+    rentable_gpu_counts,
     run_config_for_ranking,
 )
 
@@ -93,6 +94,25 @@ def _fits(candidate: Candidate, need: int) -> bool:
     sizing also accepted -- the two must not be able to disagree.
     """
     return combined_vram_gb(candidate.vram_gb, candidate.gpu_count) >= need
+
+
+def _structurally_fits(available, need: int, cap: int) -> bool:
+    """Whether any provider OFFERS a class that could hold the run, ignoring current stock.
+
+    Separates "sold out right now" (retryable) from "no such shape exists" (terminal) for an
+    unpinned search. Reads each provider's advertised class list, never live capacity, so it stays
+    truthful during the very outage it is called to interpret.
+    """
+    for name in available:
+        try:
+            classes = get_provider(name).gpu_classes()
+        except Exception:  # a provider that cannot even list classes proves nothing either way
+            continue
+        for gpu_class in classes:
+            for count in rentable_gpu_counts(cap):
+                if combined_vram_gb(gpu_class.vram_gb, count) >= need:
+                    return True
+    return False
 
 
 def allocate(
@@ -205,13 +225,15 @@ def allocate(
                 f"no allocatable GPU (>= {need} GB VRAM for {model_id}): a provider's live capacity lookup "
                 f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"
             )
+        # a provider whose capacity comes from a live market can be structurally able to rent a
+        # shape while having none free right now (retryable), unlike one priced off a static table
+        # where "no candidate" means the shape genuinely is not offered (terminal). this applies to
+        # an unpinned search too: sold out is sold out whether or not the user named the class.
+        live_only = bool(available) and all(
+            getattr(get_provider(name), "live_capacity", False) for name in available
+        )
         if exact:
-            # a provider whose capacity comes from a live market can be structurally able to rent a
-            # class while having none free right now (retryable), unlike one priced off a static
-            # table where "no candidate" means the class genuinely is not offered (terminal).
-            if available and all(
-                getattr(get_provider(name), "live_capacity", False) for name in available
-            ):
+            if live_only:
                 raise CapacityLookupError(
                     f"exact GPU {exact!r} is structurally supported but currently has no capacity on "
                     f"{', '.join(available)}"
@@ -219,6 +241,14 @@ def allocate(
             raise UnsupportedGpuError(
                 f"exact GPU {exact!r} has no allocatable capacity on the requested active provider set "
                 f"({', '.join(available) or '(none)'})"
+            )
+        # unpinned: only retryable when SOME structurally-offered shape could have held the run.
+        # without that guard a genuinely oversized run would retry until its infra budget ran out
+        # instead of failing immediately with the reason.
+        if live_only and _structurally_fits(available, need, cap):
+            raise CapacityLookupError(
+                f"no allocatable GPU (>= {need} GB VRAM for {model_id}) right now: a fitting class is "
+                f"structurally offered on {', '.join(available)} but has no capacity — retry may find it"
             )
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "

@@ -460,7 +460,14 @@ def spec_from_dict(
         raise ConfigError(str(exc)) from exc
     try:
         info = resolve_model(
-            model, algorithm, policy=model_policy, gpu=gpu_type or provisional_type
+            model,
+            algorithm,
+            policy=model_policy,
+            gpu=gpu_type or provisional_type,
+            # the provisional class above was already picked for this ceiling; resolving it as a
+            # single card would reject a shardable run on the per-card class chosen BECAUSE it
+            # shards.
+            gpu_count=gpu_count or 1,
         )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
