@@ -371,7 +371,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@ee327f43c87c031034ddb88c17fefe03d20a0505"
+        "verl @ git+https://github.com/freesolo-co/verl@723336cf5d2aa084a9308db1f774df2f84ad9f51"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     assert "liger-kernel" in install
@@ -548,6 +548,16 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     )
 
 
+def test_verl_spec_stays_in_lockstep_with_the_worker_image():
+    # the default image exports FLASH_VERL_PYTHON, so its baked interpreter bypasses the fallback
+    # resolver entirely. both paths must pin the same commit or live workers miss dependency fixes.
+    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+    expected = f"ARG VERL_SPEC=verl[vllm]@{vc.VERL_REQUIREMENT_URL}"
+    assert expected in dockerfile.read_text(), (
+        "Dockerfile.worker's VERL_SPEC drifted from backend_common.VERL_REQUIREMENT_URL"
+    )
+
+
 def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_path):
     # the stamp gates rebuilds. if it recorded the extra-bearing spec while the pin stayed bare,
     # every later call would see a mismatch and rebuild the venv from scratch on a paid pod.
@@ -652,14 +662,13 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
 
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
     # asserting the constant alone would let a newer-base commit land silently, so bind the pinned
-    # commit itself to that version. this is the sha of the truncation-mask and 3d position id
-    # commits cherry-picked onto the v0.8.0 tag, plus the agent-loop position-id pad fix; moving the
-    # pin must be a deliberate edit here, with the base re-verified. re-verified at ee327f43:
-    # verl/version/version still reads 0.8.0, verl/trainer/main_ppo_sync.py is still present, and the
-    # only diff against the previous pin is agent_loop.py.
+    # commit itself to that version. this is the sha of the truncation-mask and 3d position-id
+    # commits cherry-picked onto the v0.8.0 tag, plus the agent-loop position-id pad and fused-label
+    # shape fixes. moving the pin must be deliberate, with the base re-verified. at 723336cf,
+    # verl/version/version still reads 0.8.0 and verl/trainer/main_ppo_sync.py is still present.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
-    assert commit == "ee327f43c87c031034ddb88c17fefe03d20a0505"
+    assert commit == "723336cf5d2aa084a9308db1f774df2f84ad9f51"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):
