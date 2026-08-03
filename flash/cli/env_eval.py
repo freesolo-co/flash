@@ -775,7 +775,9 @@ def cmd_env_eval(args) -> int:
         # bought this spec, so it costs no extra lookup and lands before any generation is paid
         # for. only an explicit False refuses: an older plane whose spec omits the field, or an
         # unreadable spec, evaluates and uploads exactly as it did before.
-        if args.upload and isinstance(spec, dict) and spec.get("upload") is False:
+        from flash.spec import upload_suppressed
+
+        if args.upload and upload_suppressed(spec):
             _err(
                 f"env eval failed: cannot upload results for {args.target}: that run was "
                 "submitted with `upload = false`, so recording its evaluation would publish it "

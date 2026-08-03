@@ -21,7 +21,7 @@ import json
 import urllib.request
 
 from flash.runner.checkpoints import list_checkpoints
-from flash.spec import require_project_id
+from flash.spec import require_project_id, upload_suppressed
 
 from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, internal_key, run_org_id
 
@@ -81,6 +81,12 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
     token = internal_key()  # already whitespace-stripped; None when unset/blank
     if not token:
         return 0  # local/dev control plane: HF still has the checkpoints
+    if upload_suppressed(getattr(status, "spec", None)):
+        # `upload = false`: this batch names the run, its repo and every deployable step, so it is
+        # dashboard mirroring like the reporters in run_registry. Skipped BEFORE the HF listing for
+        # the same reason as the org case below -- no needless network work -- and quietly, because
+        # not reporting is what this run asked for, not a failure to report.
+        return 0
     try:
         # run_id + hf_repo are platform-managed and stripped from the public spec; read the
         # authoritative values from the internal worker-spec carrier (see _internal_spec_from_status).

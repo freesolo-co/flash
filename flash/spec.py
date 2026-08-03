@@ -61,17 +61,38 @@ def coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+# the exact values that opt a run out of dashboard mirroring. a real `False`, or one of the
+# strings the worker round trip can produce for it: the flag crosses into the worker through the
+# environment, so `upload = false` comes back as "false".
+_UPLOAD_OFF_STRINGS = {"false", "0", "no", "off"}
+
+
 def _coerce_upload(value: Any) -> bool:
     """Parse the dashboard-mirroring flag, resolving every ambiguous case to ON.
 
-    Only a value that explicitly says false opts out. A null is not an opt-out: `coerce_bool`
-    would read it as False, which would invent a suppression nobody asked for and silently hide
-    a run from its owner's dashboard. Strings are still accepted because the worker round trip
-    carries the flag through the environment, so `upload = false` comes back as "false".
+    Deliberately NOT `coerce_bool`. That helper answers "is this truthy", so every falsey value
+    it sees -- None, {}, [], 0, "" -- reads as False. Here False is not a neutral default but a
+    suppression: it hides a run from its owner's dashboard silently, with no error anywhere to
+    say so. A malformed or absent value is a value nobody chose, so it must never be read as a
+    choice to hide. Only an explicit `False` or an explicitly-false string opts out.
     """
-    if value is None:
-        return True
-    return coerce_bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() not in _UPLOAD_OFF_STRINGS
+    return value is not False
+
+
+def upload_suppressed(spec: Any) -> bool:
+    """True when a persisted run spec opted out of dashboard mirroring.
+
+    The canonical predicate for every backend reporter that carries a run id, in this repo:
+    the run/checkpoint/export reporters in `server/run_registry.py`, the deployable-checkpoint
+    registry in `server/checkpoints.py`, and the environment-use post in `routes/runs.py`. Any
+    new backend post that names a run belongs behind this too.
+
+    Takes the persisted dict rather than a JobSpec because that is what the reporters hold, and
+    reads only an explicit `False` so a spec predating the field reports exactly as it did.
+    """
+    return isinstance(spec, dict) and spec.get("upload") is False
 
 
 def _coerce_str_map(value: Any) -> dict[str, str]:
@@ -408,6 +429,9 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
+        # normalize here, not just in from_dict: `replace(spec, upload=None)` bypasses that parser
+        # and would otherwise serialize as an explicit `false` nobody asked for.
+        object.__setattr__(self, "upload", _coerce_upload(self.upload))
         validate_worker_env_reserved(self.worker_env)
 
     @property

@@ -305,7 +305,8 @@ flash train configs/sft.toml --no-upload   # run it, but do not mirror it to the
 streams logs exactly as it always did, and `flash runs list` / `status` / `log` read it
 normally — the flag only stops the run being mirrored to the freesolo dashboard. One flag
 covers everything the run would have published there: the run record, its checkpoint
-metrics, any deployment made from it, and its export event. It is equivalent to
+metrics, its deployable-checkpoint list, any deployment made from it, its export event, and
+the environment-use record written when it is submitted. It is equivalent to
 `upload = false` in the config, and the flag can only turn mirroring _off_ — it never
 overrides a config that already set `upload = false` back on. The run still carries its
 `project`; visibility and grouping are separate. Two consequences worth knowing before you

@@ -7,7 +7,7 @@ import urllib.request
 from datetime import UTC, datetime
 from typing import Any
 
-from flash.spec import require_project_id
+from flash.spec import require_project_id, upload_suppressed
 
 from ._internal_client import org_id_of, post_internal_json
 
@@ -51,21 +51,6 @@ def _spec_from_status(status: Any) -> dict[str, Any]:
     return spec if isinstance(spec, dict) else {}
 
 
-def _upload_suppressed(spec: dict[str, Any]) -> bool:
-    """True when this run opted out of dashboard mirroring via `upload = false`.
-
-    Every reporter in this module funnels through here, so one check covers runs, checkpoint
-    metrics, deployments (which ride inside the run report's `deployment` field), and export
-    events. Only an explicit `False` suppresses: a spec that predates the field reports exactly
-    as it did before, and a malformed value can never silently hide a run that asked to be shown.
-
-    One run-scoped report lives outside this module and is gated at its own call site:
-    `record_environment_use` in routes/runs.py, which posts the run id at submit time. Any new
-    backend post that carries a run id belongs behind one of these two checks.
-    """
-    return spec.get("upload") is False
-
-
 def _managed_environment_slug(spec: dict[str, Any]) -> str | None:
     env = spec.get("environment") if isinstance(spec.get("environment"), dict) else {}
     env_id = env.get("id")
@@ -86,7 +71,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         return False
 
     spec = _spec_from_status(status)
-    if _upload_suppressed(spec):
+    if upload_suppressed(spec):
         return False
     try:
         project_id = require_project_id(spec.get("project"))
@@ -140,7 +125,7 @@ def record_model_exported(
     if not org_id:
         return False
     spec = _spec_from_status(status)
-    if _upload_suppressed(spec):
+    if upload_suppressed(spec):
         return False
     try:
         project_id = require_project_id(spec.get("project"))
@@ -182,7 +167,7 @@ def record_training_checkpoint(
     if not org_id:
         return False
     persisted_spec = _spec_from_status(status)
-    if _upload_suppressed(persisted_spec):
+    if upload_suppressed(persisted_spec):
         return False
     try:
         project_id = require_project_id(persisted_spec.get("project"))

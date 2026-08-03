@@ -10,7 +10,9 @@ def spec_payload(
 ) -> dict:
     out = spec.to_dict()
     out["project"] = require_project_id(spec.project)
-    out["upload"] = bool(spec.upload)
+    # already a real bool: JobSpec.__post_init__ normalizes it, and coercing again here would
+    # re-open the falsey-value hole that normalization exists to close.
+    out["upload"] = spec.upload
     if not spec.environment.pip:
         from flash.envs.registry import worker_pip_for_env
 

@@ -992,6 +992,81 @@ def test_env_eval_project_without_upload_is_rejected(monkeypatch, tmp_path, caps
     assert "--project only applies with --upload" in capsys.readouterr().err
 
 
+def test_env_eval_refuses_to_upload_an_eval_of_an_opted_out_run(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    # the run asked not to be mirrored, and an uploaded eval carries its id, environment and
+    # scores to the dashboard anyway. refuse before buying any generation.
+    env_dir = _upload_env_dir(tmp_path)
+    uploader = _RecordingUpload()
+
+    class Client:
+        def get_run(self, run_id):
+            return {"spec": {"upload": False}}
+
+        def chat_stream(self, target, messages, **kwargs):
+            raise AssertionError("no generation may be paid for after the refusal")
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(
+            [
+                "env",
+                "eval",
+                _EXPLICIT_TARGET,
+                str(env_dir),
+                "--upload",
+                "--project",
+                _PROJECT_ID,
+            ]
+        )
+        == 1
+    )
+    assert "`upload = false`" in capsys.readouterr().err
+    assert uploader.calls == []
+
+
+@pytest.mark.parametrize(
+    "spec", [{}, {"upload": True}, None, "unreadable"], ids=["absent", "on", "null", "malformed"]
+)
+def test_env_eval_still_uploads_when_the_run_did_not_opt_out(monkeypatch, tmp_path, spec) -> None:
+    # an older plane whose spec omits the field, or a spec that cannot be read at all, evaluates
+    # and uploads exactly as it did before the flag existed. this is the control for the refusal
+    # above: without it, a guard that refused every run would still pass that test.
+    env_dir = _upload_env_dir(tmp_path)
+    uploader = _RecordingUpload()
+
+    class Client:
+        def get_run(self, run_id):
+            return {"spec": spec}
+
+        def chat_stream(self, target, messages, **kwargs):
+            yield "4"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+    _patch_upload(monkeypatch, uploader)
+
+    assert (
+        cli.main(
+            [
+                "env",
+                "eval",
+                _EXPLICIT_TARGET,
+                str(env_dir),
+                "--upload",
+                "--project",
+                _PROJECT_ID,
+            ]
+        )
+        == 0
+    )
+    assert len(uploader.calls) == 1
+
+
 def test_env_eval_without_upload_never_calls_the_api(monkeypatch, tmp_path) -> None:
     env_dir = _upload_env_dir(tmp_path)
 
