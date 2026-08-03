@@ -29,7 +29,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, JobSpec
+from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, JobSpec, upload_suppressed
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -915,6 +915,20 @@ def _prepare_init_from_adapter_inner(
             raise ValueError(
                 "train.init_from_adapter source run must belong to the same Freesolo org"
             )
+    # an uploaded child keeps the source alias in `train.init_from_adapter`, and record_training_run
+    # posts the child's whole spec -- so mirroring this run would publish the opted-out source's run
+    # id to the dashboard, exactly what that opt-out asked against. refuse rather than silently drop
+    # the alias: the reference is load-bearing for recovery and reallocation, so dropping it would
+    # corrupt the warm start in order to hide the id. this matches the `flash env eval --upload`
+    # refusal, which also declines the operation instead of quietly publishing the source. an
+    # opted-out CHILD warm-starting from an opted-out source stays allowed: nothing about it is
+    # mirrored, so there is nothing to disclose.
+    if spec.upload and upload_suppressed(src_status.spec):
+        raise ValueError(
+            f"train.init_from_adapter source run {src_run_id!r} was submitted with "
+            "`upload = false`, so recording this run would publish that run id to the dashboard "
+            "anyway. submit this run with `--no-upload` too, to warm-start from it"
+        )
     # hf_repo is platform-managed and stripped from the source run's public spec; its authoritative
     # value lives in that run's internal worker spec (see _internal_spec_from_status), which the
     # warm-start needs to locate the source adapter artifacts.

@@ -259,6 +259,98 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
         R._prepare_init_from_adapter(child, token="token")
 
 
+def _warmstart_pair(monkeypatch, *, source_upload, child_upload):
+    """Prepare a `child` warm-starting from `source`, with the artifact lookups stubbed out.
+
+    Only the two `upload` values vary; everything the warm start reads downstream of the
+    disclosure guard is stubbed identically, so a difference in outcome is a difference in
+    upload policy and nothing else.
+    """
+    import flash.lora_rank as rank_mod
+    import flash.runner as R
+    import flash.runner.checkpoints as checkpoints
+    from flash.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "upload": source_upload,
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(R, source, state="done")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "upload": child_upload,
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(
+        checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda adapter_ref, token, revision: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "r": 64,
+            "lora_alpha": 128,
+        },
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "adapter_artifact_identity",
+        lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+            "digest", "config", "adapter_model.safetensors", "weight:1"
+        ),
+    )
+    return R, child
+
+
+def test_uploaded_child_cannot_warm_start_from_an_opted_out_source(monkeypatch):
+    # `train.init_from_adapter` keeps the source run id, and record_training_run posts the child's
+    # whole spec -- so mirroring this child would publish the opted-out source's id to the dashboard,
+    # which is what that opt-out asked against. Refused rather than silently stripped: the reference
+    # is load-bearing for recovery, so dropping it would corrupt the warm start to hide an id.
+    R, child = _warmstart_pair(monkeypatch, source_upload=False, child_upload=True)
+
+    with pytest.raises(ValueError, match=r"source run 'source-run' was submitted with"):
+        R._prepare_init_from_adapter(child, token="token")
+
+
+def test_opted_out_child_may_warm_start_from_an_opted_out_source(monkeypatch):
+    # The guard is about disclosure, not about quarantining the source: nothing about this child
+    # reaches the dashboard either, so there is no id to leak and the warm start proceeds. Without
+    # this case the guard could be a blanket ban on opted-out sources and still pass the test above.
+    R, child = _warmstart_pair(monkeypatch, source_upload=False, child_upload=False)
+
+    public_spec, worker_spec, _ = R._prepare_init_from_adapter(child, token="token")
+
+    assert public_spec.train.init_from_adapter == "source-run"
+    assert worker_spec.train.init_from_adapter == "owner/source-runs:sft/source-run"
+
+
+def test_uploaded_child_may_warm_start_from_an_uploaded_source(monkeypatch):
+    # The other half: an ordinary warm start is untouched, so the guard reads the SOURCE's opt-out
+    # rather than firing on any run that happens to set `upload`.
+    R, child = _warmstart_pair(monkeypatch, source_upload=True, child_upload=True)
+
+    public_spec, worker_spec, _ = R._prepare_init_from_adapter(child, token="token")
+
+    assert public_spec.train.init_from_adapter == "source-run"
+    assert worker_spec.train.init_from_adapter == "owner/source-runs:sft/source-run"
+
+
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 
