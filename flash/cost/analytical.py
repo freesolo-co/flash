@@ -7,7 +7,7 @@ policy/reference update.
 
 from __future__ import annotations
 
-from flash.providers.allocator import required_vram_gb, vram_headroom
+from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
 
 from .facts import (
     GPU_COMPUTE_TFLOPS,
@@ -340,12 +340,15 @@ def _offline_gpu_shape(
         names = tuple(
             info.name for info in GPU_INFO.values() if info.enum_member and info.validated
         )
+    safe_gpu_count = geometry_safe_gpu_cap(
+        config.model_id, config.gpu_count, model_revision=config.model_revision
+    )
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
         if provider != "auto" and provider not in providers_for(gpu):
             continue
-        for count in rentable_gpu_counts(config.gpu_count):
+        for count in rentable_gpu_counts(safe_gpu_count):
             if combined_vram_gb(info.vram_gb, count) < need:
                 continue
             # Provisional quoting is structural and must not touch a live market. Vast pricing is
@@ -376,7 +379,7 @@ def _offline_gpu_shape(
             raise ValueError(
                 f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
             )
-        shape = f" across up to {config.gpu_count} cards" if config.gpu_count > 1 else ""
+        shape = f" across up to {safe_gpu_count} cards" if safe_gpu_count > 1 else ""
         raise ValueError(f"no GPU class fits >= {need} GB{shape}")
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)
     return gpu, need, count, provider, hourly
