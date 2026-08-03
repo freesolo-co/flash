@@ -667,7 +667,7 @@ def cmd_env_setup(args) -> int:
             f"{max_examples_line}"
             "lora_rank = 32\n"
             '# teacher_model = "glm-5.2"   # teacher to distil from: glm-5.2 (default) |\n'
-            "#                             # deepseek-v4-pro | kimi-k2.6 (key stays managed)\n"
+            "#                             # kimi-k2.6 (key stays managed)\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )

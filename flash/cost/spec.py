@@ -172,6 +172,6 @@ def runconfig_from_spec(spec) -> RunConfig:
     )
 
 
-def estimate_for_spec(spec) -> CostEstimate:
-    """The pre-flight ``CostEstimate`` for a parsed training ``JobSpec``."""
-    return estimate_cost(runconfig_from_spec(spec))
+def estimate_for_spec(spec, *, allocation=None) -> CostEstimate:
+    """Cost estimate for a parsed training spec, optionally pinned to the selected live candidate."""
+    return estimate_cost(runconfig_from_spec(spec), allocation=allocation)
