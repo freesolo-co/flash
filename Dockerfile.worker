@@ -268,7 +268,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # flash's, so a job that sets WANDB_API_KEY loses its curves and run link unless wandb is importable
 # in here; resolve_verl_loggers() degrades to console when it is not, which is the right behaviour
 # for a foreign FLASH_VERL_PYTHON but silently drops W&B on the default image (codex[bot]).
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@b7492fa3b7ab843294d06dbf754e887950f559c7
+ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@723336cf5d2aa084a9308db1f774df2f84ad9f51
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
