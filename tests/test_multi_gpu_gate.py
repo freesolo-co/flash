@@ -853,6 +853,7 @@ def test_eight_cards_require_catalog_head_geometry():
     from flash.providers.allocator import geometry_safe_gpu_cap
 
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40) == 4
     assert geometry_safe_gpu_cap("acme/open-12-head-model", 8) == 4
     # odd ceilings still normalize through the shared rentable-count helper.
     assert geometry_safe_gpu_cap("acme/open-12-head-model", 3) == 2
@@ -889,6 +890,43 @@ def test_schema_preflight_applies_the_open_model_geometry_cap():
         assert seen == [("preview", 4), ("resolve", 4)]
     finally:
         monkey.undo()
+
+
+def test_runner_preflight_applies_the_same_open_model_geometry_cap(monkeypatch):
+    """Preparation must pass the capped count to both provisional sizing and model resolution."""
+    import flash.catalog as catalog
+    import flash.runner as runner
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    seen: list[tuple[str, int]] = []
+    monkeypatch.setattr(runner, "_resolve_model_revision", lambda spec: spec)
+    monkeypatch.setattr(
+        "flash.providers.base.provisional_gpu",
+        lambda _model, *args, gpu_count=1, **kwargs: seen.append(("preview", gpu_count)) or "H100",
+    )
+    monkeypatch.setattr(
+        runner,
+        "resolve_model",
+        lambda _model, *args, gpu_count=1, **kwargs: (
+            seen.append(("resolve", gpu_count)) or catalog.MODELS["Qwen/Qwen3.5-0.8B"]
+        ),
+    )
+    monkeypatch.setattr(
+        "flash.cost.spec.estimate_for_spec",
+        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
+    )
+
+    runner.prepare_job(
+        JobSpec(
+            model="acme/open-12-head-model",
+            model_policy="allow",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(count=8),
+        )
+    )
+
+    assert seen == [("preview", 4), ("resolve", 4)]
 
 
 def test_open_model_validation_is_judged_on_the_allocated_shape():
