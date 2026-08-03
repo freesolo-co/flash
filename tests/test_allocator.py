@@ -1010,7 +1010,9 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             if need > max_managed_vram:
                 with pytest.raises(UnsupportedGpuError):
                     allocator.allocate(model_id, "opd", train=train)
-                with pytest.raises(ValueError, match="no GPU class fits"):
+                # server-side estimates now use the same allocator as launch, so they preserve its
+                # precise terminal failure instead of translating through offline pick_gpu.
+                with pytest.raises(UnsupportedGpuError, match="no allocatable GPU"):
                     estimate_cost(rc)
                 rejected.add((model_id, label))
                 continue

@@ -8,7 +8,6 @@ policy/reference update.
 from __future__ import annotations
 
 from flash.providers.allocator import required_vram_gb, vram_headroom
-from flash.providers.base import largest_rentable_count
 
 from .facts import (
     GPU_COMPUTE_TFLOPS,
@@ -404,12 +403,14 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         market_wall_s = float(config.max_wall_seconds)
     else:
         market_wall_s = 0.0
-    if config.gpu_type:
-        # gpu_type is provisioned at launch through allocate (disk-aware, live rate). quote the same
-        # path with either an automatic or pinned provider so the estimate matches the actual launch rate,
-        # and a disk floor lifts the quote off the wrong class.
-        from flash.providers.allocator import allocate
+    # The submit-time quote is persisted and charged verbatim, so whenever the server has provider
+    # credentials it must use the SAME allocator-selected class and count as launch. This applies to
+    # unpinned runs too: gpu.count is a ceiling, and billing that ceiling charges 8 cards for a small
+    # run the allocator narrows to one.
+    from flash.providers import available_providers
+    from flash.providers.allocator import allocate
 
+    if config.gpu_type or available_providers():
         allocation = allocate(
             config.model_id,
             config.method,
@@ -420,26 +421,20 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
             provider=("" if config.provider == "auto" else config.provider),
             gpu_type=config.gpu_type,
             model_revision=config.model_revision,
-            # quote the same card ceiling launch allocates under, so a multi-card run is estimated on
-            # the combination it will actually rent rather than on a single-class search that ignores it.
             max_gpu_count=config.gpu_count,
         )
         gpu = allocation.gpu
         quote_provider = allocation.provider
         hourly = allocation.hourly_usd
         need = allocation.min_vram_gb
-        # max_gpu_count is a CEILING, so the allocator may fit the run on fewer cards than requested
-        # (e.g. 2x of a class when 4 was allowed). bill the count it actually chose, not the ceiling.
         billed_gpu_count = getattr(allocation, "gpu_count", 1) or 1
     else:
+        # Offline `flash train --cost` has no provider market to allocate against. pick_gpu returns a
+        # class that fits the WHOLE run alone, so quote one card rather than guessing the ceiling. A
+        # server-side submit never reaches this fallback because its provider credentials are present.
         gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
         quote_provider = config.provider
-        # no gpu_type pin means no allocate() call and so no combination search; this branch picks a
-        # single class that fits alone, and the run occupies that count of it. gpu.count is a CEILING
-        # though, and only rentable powers of two are ever provisioned -- billing the raw ceiling
-        # would charge a `--gpus 3` run for 3 cards when submit rents 2. this quote is persisted at
-        # submit and charged verbatim by _status_estimated_charge, so an over-count here overbills.
-        billed_gpu_count = largest_rentable_count(config.gpu_count)
+        billed_gpu_count = 1
         # quote the same vram-floored vast market pick_gpu selected under (min_vram_gb=need): without the
         # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
         # crowd a high-vram selection off the limited page -> it silently falls back to the static rate.

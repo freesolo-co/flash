@@ -115,6 +115,20 @@ def _structurally_fits(available, need: int, cap: int) -> bool:
     return False
 
 
+def _geometry_safe_gpu_cap(model_id: str, max_gpu_count: int) -> int:
+    """Rentable ceiling whose sequence-parallel divisibility is known before paid allocation.
+
+    Catalog models have curated attention-head geometry and every row is divisible by 8. Open-policy
+    models currently resolve only parameter/vocabulary geometry, so their head count is unknown; keep
+    them at the pre-existing four-card ceiling rather than newly renting 8 cards that verl may reject
+    at startup. ALLOC-004 tracks validating arbitrary open-model head counts at every width.
+    """
+    cap = largest_rentable_count(max_gpu_count)
+    from flash.catalog import MODELS
+
+    return cap if model_id in MODELS else min(cap, 4)
+
+
 def allocate(
     model_id: str,
     algorithm: str,
@@ -153,6 +167,7 @@ def allocate(
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
         available = (provider,)
 
+    cap = _geometry_safe_gpu_cap(model_id, max_gpu_count)
     exact = ""
     if gpu_type:
         exact = canonical_gpu(gpu_type)
@@ -167,21 +182,19 @@ def allocate(
         # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
         # that only fits at a non-rentable count (3) must be rejected here with a precise reason
         # rather than passing and dying later on a generic no-capacity error.
-        _max_cards = largest_rentable_count(max_gpu_count)
         if (
             exact_info.vram_gb < need
             and max_gpu_count > 1
-            and combined_vram_gb(exact_info.vram_gb, _max_cards) < need
+            and combined_vram_gb(exact_info.vram_gb, cap) < need
         ):
             raise UnsupportedGpuError(
-                f"exact GPU {exact!r} cannot fit this run even as a {_max_cards}-card combination"
+                f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
             )
         exact_providers = providers_for(exact)
         if provider and provider not in exact_providers:
             raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
         available = tuple(name for name in available if name in exact_providers)
 
-    cap = largest_rentable_count(max_gpu_count)
     constraints = AllocationConstraints(
         disk_gb=disk_gb,
         max_wall_seconds=max_wall_seconds,
