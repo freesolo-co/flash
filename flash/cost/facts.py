@@ -240,8 +240,38 @@ ROLLOUT_SECONDS_PER_COMPLETION = 0.66
 #     measured-and-rejected. Card-only is the conservative choice, and a real provider offset would
 #     surface as a class being uniformly off on that provider -- the same signal that would justify
 #     adding an entry.
+# Four entries below were re-fitted a second time, on the cell that has real step leverage on that
+# card rather than the pooled campaign fit. The first refit centred each class on its own arms but
+# left every class under-quoted at low step counts, where the block is most of the run: pooled over
+# slow environments the model scored 0.903x with 70 of 132 arms in band, and the miss concentrated
+# at few steps (0.823x at <=8 steps) exactly as an under-sized fixed term does.
+#
+# Eligibility is deliberately narrow, because most cells cannot identify a block at all:
+#   - >=3 distinct step counts and >=4x leverage between the shortest and longest run. A cell
+#     spanning 6->8 steps divides noise, not signal.
+#   - within-cell replicate spread below 2.0x. The H100 and RTX 4090 ascii-tree cells spread
+#     453..1987 s at a FIXED 8 steps (4.4x) across a 1.33x step lever, and fitting them returns
+#     intercepts of -490.9 s and -306.2 s. A negative block is a fit artifact, not a measurement.
+#   - slow environments only. Fast environments carry a separate, known defect (the model is blind
+#     to environment generation speed), and including them drags every card up for the wrong reason.
+# That leaves four cells. B200, H200, A100 SXM and RTX Pro 6000 are NOT moved: B200's only
+# high-leverage cell is a fast environment, H200's replicates spread 2.4x, and the other two have
+# no qualifying cell.
+#
+# What the refit is NOT evidence for: the fixed term is not purely card-shaped. Holding environment
+# and model fixed, the intercept across cards is stable (1.1x on both gsm8k cells), but holding CARD
+# and model fixed it swings 13.5x across environments (H200/4B/opd: 150.8 s vs 2041.6 s). So this
+# table is being fitted on the card-shaped part of a term that also has an environment-shaped part
+# it cannot see. Values are taken from slow-environment cells for that reason -- they are the
+# conservative end -- and the environment term stays a separate open defect.
+#
+# Scored through the real estimator, paired per arm (same arm, both constant sets, so pod noise
+# cancels): slow-environment rollout arms move 0.903x -> 0.944x, in band 70 -> 79 of 132, and 52
+# arms land closer against 21 farther. Guards: sft is byte-identical on all 85 sft arms (sft reads
+# SFT_RUN_STARTUP_K, never this table), and card ranking is unchanged at 8, 64 and 256 steps.
 _RUN_BLOCK_S: dict[str, float] = {
-    "A100 PCIe": 251.2,
+    # Fitted 306.8 on 0.8B/gsm8k/grpo (n=3, steps 4..24, 6.0x lever). Was 251.2.
+    "A100 PCIe": 306.8,
     # ~2.2x its own PCIe sibling, which is why the two variants cannot share one entry.
     "A100 SXM": 543.4,
     # Same SMs and tensor cores as the 80GB board, less HBM only -- and this block is engine-build
@@ -257,7 +287,10 @@ _RUN_BLOCK_S: dict[str, float] = {
     # least-squares point because on B200's own arms 235.7 overshoots to 0.823x while 302.8 lands at
     # 0.932x and gains an arm into band (4/6 -> 5/6).
     "B200": 302.8,
-    "H100": 339.0,
+    # Fitted 349.1 on 0.8B/gsm8k/grpo (n=4, steps 4..24, 6.0x lever, replicates within 1.3x). Was
+    # 339.0. The smallest move in the table, and it is kept for exactly that reason: this is the
+    # class with the most arms, so it is the one whose fit is least likely to be a lucky cell.
+    "H100": 349.1,
     # H200 is the outlier: ~2.2x the H100 block on the same sm90 kernels. Consistent across its arms,
     # so it is a property of the class as provisioned, not a bad sample.
     #
@@ -267,8 +300,18 @@ _RUN_BLOCK_S: dict[str, float] = {
     # scores 1.016x on them. Every candidate replacement is worse (457.7 -> 0.726x). One low arm on a
     # wide-spread class is a leverage point, not a measurement.
     "H200": 762.4,
-    "RTX 4090": 404.6,
-    "RTX 5090": 98.4,
+    # Fitted 465.7 on 0.8B/gsm8k/opd (n=7, steps 2..24, 12.0x lever, replicates within 1.1x). Was
+    # 404.6. Best-identified cell in the table: widest lever, tightest replicates, most arms.
+    "RTX 4090": 465.7,
+    # Fitted 177.1 on 0.8B/ascii-tree/grpo (n=11, steps 2..24, 12.0x lever, replicates within 1.6x).
+    # Was 98.4, the largest relative under-quote in the table at 1.80x.
+    #
+    # The value is the sweep optimum, NOT that cell's raw least-squares intercept (268.6). The raw
+    # intercept is worse when priced through the estimator: in band 70 -> 66 and over-quotes 19 -> 28,
+    # because a single-cell intercept also absorbs the environment-shaped term described above, so it
+    # over-corrects every other environment on this card. 177.1 keeps the direction the cell
+    # identifies without importing that cell's environment.
+    "RTX 5090": 177.1,
     "RTX Pro 6000": 260.5,
 }
 # Unmeasured classes take the pooled median across the whole campaign rather than zero: charging no
