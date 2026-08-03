@@ -548,6 +548,16 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     )
 
 
+def test_verl_spec_stays_in_lockstep_with_the_worker_image():
+    # the default image exports FLASH_VERL_PYTHON, so its baked interpreter bypasses the fallback
+    # resolver entirely. both paths must pin the same commit or live workers miss dependency fixes.
+    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+    expected = f"ARG VERL_SPEC=verl[vllm]@{vc.VERL_REQUIREMENT_URL}"
+    assert expected in dockerfile.read_text(), (
+        "Dockerfile.worker's VERL_SPEC drifted from backend_common.VERL_REQUIREMENT_URL"
+    )
+
+
 def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_path):
     # the stamp gates rebuilds. if it recorded the extra-bearing spec while the pin stayed bare,
     # every later call would see a mismatch and rebuild the venv from scratch on a paid pod.
