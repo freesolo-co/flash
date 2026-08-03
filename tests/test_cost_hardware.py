@@ -498,6 +498,67 @@ def test_multi_card_speedup_never_decreases_with_card_count():
         assert vals == sorted(vals), f"{name} speedup decreases: {vals}"
 
 
+def test_end_to_end_multi_card_speedup_is_unmeasurable_by_construction(monkeypatch):
+    """Pin WHY ``multi_card_speedup`` cannot be validated end-to-end, so the reason cannot rot.
+
+    An earlier revision of that docstring justified the gap with "no multi-card arm ever reached a
+    step timing (0 of 6)". That was contingent, and it went stale silently the moment two 2-card
+    arms did complete -- the docstring kept asserting an obstacle that no longer existed. The real
+    obstacle is structural and lives HERE, in the allocator's partition, so assert it here.
+
+    Measuring a speedup needs the SAME model on the SAME class at two card counts. ``allocate``
+    makes that pairing impossible: candidates are split into fit-alone (``vram_gb >= need``) and
+    undersized, and only the undersized ones reach ``_combination_candidates``. So a class either
+    fits alone -- and can never be proposed as a combination -- or does not, and can never run at
+    n=1. The halves are mutually exclusive; the ratio has no denominator.
+
+    Asserted against the real ``allocate`` with a stubbed provider (no network, no spend), for a
+    need that straddles the classes, because that is the code path a fix to task #23 would change.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, UnsupportedGpuError
+
+    # 100 GB is the real sized need for Qwen3.6-35B-A3B sft at bs 8 / ctx 4096, the only shape with
+    # measured 2-card arms. 80 GB cards must combine; 141 GB cards must not.
+    need = 100
+    cands = [
+        Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80),
+        Candidate(provider="runpod", gpu="H200", hourly_usd=4.0, vram_gb=141),
+    ]
+
+    class _P:
+        name = "runpod"
+
+        def live_candidates(self, per_card_need, constraints):
+            return [c for c in cands if c.vram_gb >= per_card_need]
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    monkeypatch.setattr(allocator, "get_provider", lambda name: _P())
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: need)
+
+    for gpu in ("A100 PCIe", "H200"):
+        counts = set()
+        for ask in (1, 2):
+            try:
+                a = allocator.allocate("m", "sft", gpu_type=gpu, max_gpu_count=ask)
+            except UnsupportedGpuError:
+                continue  # cannot run this class at this count at all
+            counts.add(a.gpu_count)
+        # the whole claim: no class is reachable at BOTH 1 and 2 cards, so no matched pair exists.
+        assert counts != {1, 2}, (
+            f"{gpu} now admits both 1 and 2 cards at a {need} GB need -- the matched pairing the "
+            f"multi_card_speedup docstring calls impossible is now constructible. Measure the "
+            f"curve and replace that paragraph."
+        )
+    # and the mechanism, so a failure above is diagnosable: an 80 GB card is undersized (combines,
+    # cannot run alone) while a 141 GB card fits alone (runs alone, is never offered as a combo).
+    assert allocator.allocate("m", "sft", gpu_type="A100 PCIe", max_gpu_count=2).gpu_count == 2
+    with pytest.raises(UnsupportedGpuError):
+        allocator.allocate("m", "sft", gpu_type="A100 PCIe", max_gpu_count=1)
+    assert allocator.allocate("m", "sft", gpu_type="H200", max_gpu_count=2).gpu_count == 1
+    assert allocator.allocate("m", "sft", gpu_type="H200", max_gpu_count=1).gpu_count == 1
+
+
 def test_resident_rollout_is_not_charged_the_engine_build():
     # the block is a vllm engine build + first weight sync. a sleep_unsupported model pins its
     # rollout engine RESIDENT (catalog.py, backend_common.rollout_resident_overrides), so that build

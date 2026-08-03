@@ -111,11 +111,20 @@ def test_total_cost_ranking_beats_hourly_rate():
     Priced over a realistic horizon rather than one step. Speed can only pay for a rate premium out
     of time it actually saves, and it saves time only on the per-STEP half of the wall -- see
     ``test_a_one_step_run_is_won_by_the_cheaper_rate`` for the other end of that trade.
+
+    The horizon here is 48 steps, not 8. It was 8 while the step term billed ``batch x seq_len``
+    (8 x 1024 = 8192 tokens) regardless of realized work; verl removes padding and the canonical cell
+    actually realizes ~1006 tokens/step, so that basis over-billed the step ~8x and let a rate premium
+    look like it paid back almost immediately. With the step priced at its MEASURED marginal rate
+    (1.237 s/step, from a 16-run 2-to-256-step fit on RTX 4090/0.8B), a 4B sft run is ~179s of
+    card-invariant block against a ~6.5s step, so 8 steps is ~97% block and no honest step model
+    makes the premium pay back there. Restoring an 8-step turnover would need the step inflated 4.3x
+    past measurement -- i.e. asserting the defect this module was changed to remove.
     """
     from flash.cost.analytical import step_cost_key
     from flash.cost.types import RunConfig
 
-    key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=8))
+    key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=48))
     assert key is not None
     # A10: 125 TFLOPS at $1.29. RTX 4090: 165 TFLOPS at $0.69. The 4090 is both cheaper and faster.
     assert key("RTX 4090", 0.69) < key("A10", 1.29)
@@ -137,27 +146,50 @@ def test_a_one_step_run_is_won_by_the_cheaper_rate():
     every length would be asserting the block does not exist. Which STEP it turns over on is a
     consequence of the block/step ratio, so it is derived here rather than hardcoded: pinning a
     literal step index would make a recalibration of either term look like a ranking regression. What
-    is actually required is that the turnover happens, happens early, and never reverses.
+    is actually required is that the turnover happens, never reverses, and arrives SOONER for a model
+    whose steps are more expensive relative to the same block.
+
+    The bar used to be ``crossover <= 8``. That number was not a requirement about ranking; it was an
+    artifact of the step term billing ``batch x seq_len`` capacity instead of realized tokens, which
+    over-billed the canonical step ~8x. Priced at the measured marginal rate the crossovers are 0.8B
+    at 59 steps, 4B at 25, 27B at 10 -- ordered by exactly the mechanism this test describes, since a
+    bigger model buys more per-step work against the same card-invariant block. Reinstating 8 would
+    require inflating the step 4.3x past what the hardware does.
     """
     from flash.cost.analytical import step_cost_key
     from flash.cost.types import RunConfig
 
-    def wins_at(steps: int) -> str:
-        key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=steps))
+    def wins_at(steps: int, model: str = "Qwen/Qwen3.5-4B") -> str:
+        key = step_cost_key(RunConfig(model_id=model, method="sft", steps=steps))
         return "RTX 4090" if key("RTX 4090", 0.69) < key("A10", 0.60) else "A10"
 
     assert wins_at(1) == "A10"  # block-dominated: card-free seconds billed at the higher rate
 
-    horizons = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 48, 200]
+    horizons = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 48, 200, 1000]
     winners = [wins_at(s) for s in horizons]
     ladder = list(zip(horizons, winners, strict=True))
     crossover = next((s for s, w in ladder if w == "RTX 4090"), None)
     assert crossover is not None, "the faster card never wins, at any horizon"
-    # early enough to matter for real runs, and monotone: once throughput decides it, it stays
-    # decided, because the block's share of the bill only shrinks as the run grows.
-    assert crossover <= 8, f"faster card does not pay off until steps={crossover}"
+    # monotone: once throughput decides it, it stays decided, because the block's share of the bill
+    # only shrinks as the run grows.
     after = [w for s, w in ladder if s >= crossover]
     assert set(after) == {"RTX 4090"}, f"ranking flips back after the crossover: {ladder}"
+
+    # the turnover is driven by per-step work outgrowing a card-invariant block, so a larger model
+    # -- more step, same block -- must cross over sooner. this is the property the literal step index
+    # was standing in for, and unlike that index it cannot be satisfied by mis-sizing the step.
+    def crossover_for(model: str) -> int:
+        return next(s for s in range(1, 4001) if wins_at(s, model) == "RTX 4090")
+
+    small, mid, large = (
+        crossover_for("Qwen/Qwen3.5-0.8B"),
+        crossover_for("Qwen/Qwen3.5-4B"),
+        crossover_for("Qwen/Qwen3.6-27B"),
+    )
+    assert small > mid > large, (
+        f"crossover must fall as the step grows against a fixed block: 0.8B={small}, 4B={mid}, "
+        f"27B={large}"
+    )
 
 
 def test_step_cost_ranking_declines_unknown_classes():

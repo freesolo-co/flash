@@ -200,21 +200,30 @@ _REQUIRED_SAVE_COMMITS = {"sft": 2, "grpo": 2, "opd": 1}
 # NOT fitted from the batch sweep: a 9-arm matched replicate sweep on this card measured within-cell
 # spread W = 1.71x against a between-cell batch effect B = 1.69x, so W >= B and the batch dimension
 # of the step is not resolvable with that design (a preregistered rule, fixed before the data
-# landed). this constant therefore stays a single saturation size and is deliberately NOT given a
-# batch-dependent form, even though quoting 2.349 s/step (the step term plus the run block amortized
-# over 64 steps, the same basis as the measurement) under-predicts the measured batch-32 cell mean of
-# 6.695 s/step by 2.85x. that under-quote now EXCEEDS the cell's own 1.67x internal spread (three
-# arms at an identical config ran 4.648 / 7.683 / 7.754 s/step), so it is a real shortfall rather
-# than replicate noise -- but the batch DIMENSION is still unresolvable per the rule above, so the
-# fix is not a batch-dependent step. resolving that needs ~n=12 per cell.
+# landed). a second 9-arm replicate sweep reproduced that verdict: W = 2.120x against B = 1.900x.
+# this constant therefore stays a single saturation size and is deliberately NOT given a
+# batch-dependent form. the batch-32 cell does run slower per step than batch 8 (6.526 vs 3.435 s/step
+# cell means), but with W >= B twice over, that gap is not separable from pod variance on this design.
+# resolving it needs ~n=12 per cell.
 #
 # scored fit-free on the monotone lower envelope (each config bounded by the fastest run at >= its
 # own token count), adding this block took the model from geo 0.401x / spread 4.71x / 13 of 13
 # configs quoted BELOW a run that actually happened, to geo 1.033x / spread 1.90x at the time it was
 # fitted. those two figures are the block's own before/after and were measured under the capacity
-# basis; the current envelope for the model as a whole is geo 1.133x / spread 1.80x (see
+# basis; the current envelope for the model as a whole is geo 1.198x / spread 1.74x (see
 # SFT_SATURATION_TOKENS). spread is the figure that matters for a selection model -- a uniform bias
 # cancels in a ranking, variation across configs does not.
+#
+# the envelope's target is NOT 1.0x. its bound is the MINIMUM realized wall of a config while the
+# model quotes an EXPECTED one, and across 20 sft configs with >= 2 matched observations the measured
+# mean/min ratio is geo 1.174x. a correctly-centred model therefore scores ~1.17x there by
+# construction, so 1.198x is on target rather than a 20% over-quote.
+#
+# this block is measured at 104.7s on the canonical cell against the 81.7s the constants below
+# produce (0.78x). it is left as fitted: the one other sft cell with step leverage (H100 / 4B, 5 runs
+# over a 128x span) fits a 322.2s block against the model's 178.6s, so both measured cells say the
+# block is if anything understated, and correcting it moves every ranking crossover LATER, never
+# earlier. refitting it needs per-card leverage the corpus does not yet have on more than two cells.
 #
 # reusing the already-calibrated per-card rollout block (facts.run_block_seconds) was tried first,
 # since it would have added no new constant at all. it overshoots (geo 1.855x, worst 4.74x) because
@@ -233,7 +242,21 @@ SFT_RUN_STARTUP_PARAMS_EXP = 0.473
 # realize the full prior; raising capacity above 128 never raises billed work.
 SFT_TYPICAL_TOKENS_PER_EXAMPLE = 128
 
-SFT_SATURATION_TOKENS = 8192
+# the smallest step a card is billed for. sized so the quoted step reproduces the MARGINAL cost of
+# one step -- the slope of train_wall against step count -- because the quote adds run_startup_seconds
+# separately and charging an AVERAGE s/step here would bill the run block twice.
+#
+# measured on the canonical cell (RTX 4090 / Qwen3.5-0.8B / batch 8 / ctx 1024), 16 completed runs
+# spanning 2 to 256 steps (128x leverage), least squares on the per-step-count means:
+#   train_wall = 104.7s + 1.237 s/step
+# the average s/step at 64 steps is 3.435, which is 2.8x the marginal rate: that gap IS the block,
+# amortized. an earlier revision of this constant was derived from that average and so double-counted
+# the block, which is what put it at 24576.
+#
+# 9450 tokens is the value at which the quoted canonical step equals the measured 1.237 s/step
+# marginal. 8192 (the corpus's own billed step size) lands at 0.87x of it and is within the
+# replicate noise; 9450 is used because it is the measurement rather than a coincidence of shape.
+SFT_SATURATION_TOKENS = 9450
 
 DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
 
@@ -397,10 +420,25 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
     conservative by construction: real fabrics degrade faster than geometrically as the collective
     fan-out grows, so this never credits a wide combination with more than it can deliver.
 
-    It is also, for now, unfalsifiable in-tree: no multi-card arm in the calibration campaign ever
-    reached a step timing (0 of 6), so there is no realized wall to compare against. Three runtime
-    defects outside this module cause that, and none of them is a cost defect -- but together they
-    mean this curve should be read as an assumption, not a measurement.
+    It is also unfalsifiable in-tree, and for a STRUCTURAL reason rather than a contingent one.
+    Measuring a speedup requires the same model on the same card class at two card counts, and no
+    catalog model admits that pairing: a run is only submittable at n>1 when the model does NOT fit
+    one card of that class (the allocator treats gpu.count as a ceiling, keeps single-card candidates
+    that fit alone, downgrades to 1, and ``_validate_effective_spec`` then rejects the mismatch). So
+    the two halves of the comparison are mutually exclusive by construction. Swept live for
+    35B-A3B at bs 8 / ctx 4096: A100 PCIe, A100 SXM, H100 and RTX Pro 6000 all raise
+    ``UnsupportedGpuError`` at n=1 (the model needs 100 GB, those cards have 80) while accepting
+    n=2; H200 and B200 accept n=1 and silently downgrade n=2 back to 1. Zero cards do both.
+
+    Multi-card arms DO now reach step timings -- v2/v3_mc_35b_sft_n2 completed on A100 PCIe n=2 at
+    64 and 256 steps, giving a measured 5.443 s/step and a 519.6 s block -- so the earlier "no arm
+    ever reached a step timing" is no longer the obstacle. What those arms cannot supply is the
+    RATIO, because there is no matched single-card arm to divide by, and the nearest single-card
+    arms (H200, 35B-A3B) differ in both card and context length. The absolute walls are also
+    unusable as a check on their own: the MoE params basis over-quotes these same arms 1.9-3.8x
+    even at n=1, so an absolute comparison scores that error, not this curve.
+
+    Three further runtime defects, none of them cost defects, keep multi-card fragile:
 
     1. The allocator proposes card counts verl rejects. The gate is KV heads, not attention heads,
        and it is a disjunction: ``kv % sp == 0 or sp % kv == 0``. Under grouped-query attention the
@@ -421,7 +459,8 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
     2501/2806), and ``ray_kwargs.ray_init`` passes num_cpus but never num_gpus (rl_train.py:454,
     opd_train.py:1622). So the 2-card CONSTANTS are measured (one fsdp benchmark per interconnect)
     while the end-to-end CURVE is not, and this docstring is the place that says so. Fixing any of
-    them is trainer work, not cost work.
+    them is trainer work, not cost work -- but note that fixing the gpu.count ceiling is also what
+    would make this curve measurable at all, since that is what forbids the matched pairing above.
 
     What this module can and does guarantee meanwhile is SELF-CONSISTENCY: the ranker that picks a
     combination and the quote that prices it now share one call (``seconds_per_step``), so whatever
