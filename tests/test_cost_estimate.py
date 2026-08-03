@@ -115,6 +115,21 @@ def test_provisional_estimate_preserves_auto_provider():
     )
 
 
+def test_explicit_lambda_quote_uses_lambda_offline_list_price():
+    estimate = estimate_cost(
+        RunConfig(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            10,
+            provider="lambda",
+            gpu_type="B200",
+        )
+    )
+
+    assert estimate.provider == "lambda"
+    assert estimate.gpu_hourly_usd == 6.99
+
+
 def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
     unconstrained = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10))
     exact = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100"))

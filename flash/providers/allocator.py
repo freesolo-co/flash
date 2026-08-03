@@ -115,18 +115,20 @@ def _structurally_fits(available, need: int, cap: int) -> bool:
     return False
 
 
-def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int) -> int:
+def geometry_safe_gpu_cap(model_id: str, max_gpu_count: int, *, model_revision: str = "") -> int:
     """Rentable ceiling whose sequence-parallel divisibility is known before paid allocation.
 
-    Catalog models have curated attention-head geometry and every row is divisible by 8. Open-policy
-    models currently resolve only parameter/vocabulary geometry, so their head count is unknown; keep
-    them at the pre-existing four-card ceiling rather than newly renting 8 cards that verl may reject
-    at startup. ALLOC-004 tracks validating arbitrary open-model head counts at every width.
+    Catalog default revisions have curated attention-head geometry and every row is divisible by 8.
+    Open-policy models and pinned catalog revisions currently validate coarse geometry but not the
+    pinned config's attention-head count, so keep them at the pre-existing four-card ceiling rather
+    than renting 8 cards that verl may reject at startup. ALLOC-004 tracks validating arbitrary and
+    pinned head geometry at every width.
     """
     cap = largest_rentable_count(max_gpu_count)
     from flash.catalog import MODELS
 
-    return cap if model_id in MODELS else min(cap, 4)
+    default_catalog_revision = model_id in MODELS and not model_revision
+    return cap if default_catalog_revision else min(cap, 4)
 
 
 def allocate(
@@ -167,7 +169,7 @@ def allocate(
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
         available = (provider,)
 
-    cap = geometry_safe_gpu_cap(model_id, max_gpu_count)
+    cap = geometry_safe_gpu_cap(model_id, max_gpu_count, model_revision=model_revision)
     exact = ""
     if gpu_type:
         exact = canonical_gpu(gpu_type)

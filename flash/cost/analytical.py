@@ -350,9 +350,14 @@ def _offline_gpu_shape(
                 continue
             # Provisional quoting is structural and must not touch a live market. Vast pricing is
             # offer-backed (therefore capacity-backed), and Lambda's catalog can blip too. Use the
-            # managed static rate here; the lifecycle replaces it from the selected candidate before
-            # provisioning, so the persisted/charged quote still carries the exact provider rate.
-            hourly = info.hourly_usd
+            # provider's offline static rate here; the lifecycle replaces it from the selected candidate
+            # before provisioning, so the persisted/charged quote still carries the exact live rate.
+            if provider == "lambda":
+                from flash.providers.lambdalabs.pricing import static_hourly_rate
+
+                hourly = static_hourly_rate(gpu)
+            else:
+                hourly = info.hourly_usd
             gpu_bound, fixed = step_seconds_split(config, gpu)
             step_seconds = gpu_bound / multi_card_speedup(count, gpu) + fixed
             ranked.append(
