@@ -12,6 +12,7 @@ from flash.providers.base import (
     JobHandle,
     PollResult,
     Provider,
+    rentable_gpu_counts,
 )
 
 
@@ -52,11 +53,16 @@ class RunpodProvider:
     def live_candidates(
         self, need_vram_gb: int, constraints: AllocationConstraints
     ) -> list[Candidate]:
-        """RunPod validated classes fitting the VRAM requirement, priced by the static table."""
+        """RunPod validated classes fitting the VRAM requirement, priced by the static table.
+
+        RunPod takes the card count as a launch parameter and bills per card, so every allowed count
+        is offered at the same per-card rate; the allocator picks which one the run actually needs.
+        """
         return [
-            Candidate("runpod", g.name, self.hourly_rate(g.name), g.vram_gb)
+            Candidate("runpod", g.name, self.hourly_rate(g.name), g.vram_gb, count)
             for g in self.gpu_classes()
             if g.vram_gb >= need_vram_gb and g.validated
+            for count in rentable_gpu_counts(constraints.max_gpu_count)
         ]
 
     def submit_run(

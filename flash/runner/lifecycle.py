@@ -465,7 +465,19 @@ def _adopt_completed_attempt(
     return applied
 
 
-def _select_candidate(candidates, failed_providers: set[str], tried_classes: set[tuple[str, str]]):
+def _shape_key(candidate) -> tuple[str, str, int]:
+    """Retry-bookkeeping identity: a class at a CARD COUNT, not a class.
+
+    Providers report several counts for the same class (2x and 4x H100 are distinct rentable
+    shapes), so keying on (provider, gpu) alone would mark every count tried the moment one fails
+    and skip a wider shape that fits.
+    """
+    return (candidate.provider, candidate.gpu, int(getattr(candidate, "gpu_count", 1) or 1))
+
+
+def _select_candidate(
+    candidates, failed_providers: set[str], tried_classes: set[tuple[str, str, int]]
+):
     """Pick the next (provider, class) from the cross-provider ranked candidate list.
 
     Escapes a congested/sick provider cross-provider before walking classes within it.
@@ -475,8 +487,7 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
         candidates,
         key=lambda c: (
             c.provider in failed_providers,  # 1) escape providers that already failed this run
-            (c.provider, c.gpu, getattr(c, "gpu_count", 1)) in tried_classes
-            or (c.provider, c.gpu) in tried_classes,  # 2) then prefer a shape not yet tried
+            _shape_key(c) in tried_classes,  # 2) then prefer a shape not yet tried
             getattr(c, "gpu_count", 1) * c.hourly_usd,  # 3) then cheapest TOTAL cost
             getattr(c, "gpu_count", 1),  # 4) fewer cards on ties (less inter-card overhead)
             c.vram_gb,  # 5) then the smaller card (don't burn a big GPU on a small job)
@@ -504,7 +515,7 @@ def _projected_retry_class(
     return _select_candidate(
         candidates,
         failed_providers | {chosen.provider},
-        tried_classes | {(chosen.provider, chosen.gpu)},
+        tried_classes | {_shape_key(chosen)},
     )
 
 
@@ -691,7 +702,7 @@ def _submit_seed_supervised(
     retry_budget = _RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
     # Grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = set()
-    tried_classes: set[tuple[str, str]] = set()
+    tried_classes: set[tuple[str, str, int]] = set()
     oom_vram_floor = 0
     # Pin the environment ref ONCE, here, before any attempt runs -- not per attempt. Submit's pin
     # is best-effort, so a GitHub blip there leaves resolved_sha empty, and a managed slug points at
@@ -850,7 +861,7 @@ def _submit_seed_supervised(
                 )
                 break
             chosen = _select_candidate(cands, failed_providers, tried_classes)
-            untried = [c for c in cands if (c.provider, c.gpu) not in tried_classes]
+            untried = [c for c in cands if _shape_key(c) not in tried_classes]
             cache_fallback_available = (
                 retry_budget.cache_used < retry_budget.cache_fallbacks
                 and started_with_shared_cache
@@ -1030,11 +1041,9 @@ def _submit_seed_supervised(
             # retry budget runs out with classes still untried, which is not exhaustion either
             # (codex[bot]).
             retry_tried = (
-                tried_classes
-                if first_cache_drop
-                else tried_classes | {(chosen.provider, chosen.gpu)}
+                tried_classes if first_cache_drop else tried_classes | {_shape_key(chosen)}
             )
-            exhausted = all((c.provider, c.gpu) in retry_tried for c in cands)
+            exhausted = all(_shape_key(c) in retry_tried for c in cands)
             no_escalation = ", no untried GPU class fits this run" if exhausted else ""
             retry_target = (
                 f"expecting to retry on {projected.gpu} @ {projected.provider}"
@@ -1066,7 +1075,7 @@ def _submit_seed_supervised(
             if chosen is not None:
                 if not oom_shaped:
                     failed_providers.add(chosen.provider)
-                tried_classes.add((chosen.provider, chosen.gpu))
+                tried_classes.add(_shape_key(chosen))
     _gc_seen_endpoints()
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
 
@@ -1127,7 +1136,6 @@ def _run_training(
     from flash.runner import (
         TERMINAL_STATES,
         _persist_metrics,
-        _require_supported_gpu_count,
         _RunCancelled,
         _status_estimated_charge,
         _submit_seed_supervised,
@@ -1135,12 +1143,6 @@ def _run_training(
         artifacts_dir,
         get_status,
     )
-
-    # Fail closed on unsupported multi-gpu using the EFFECTIVE worker spec. This path is shared by a
-    # fresh submit and by post-restart recovery, and recovery rebuilds the spec from a persisted
-    # snapshot without re-running submit_job's gate -- so gating here is the single choke that keeps a
-    # count > 1 spec (however it was persisted) from re-provisioning and billing idle cards on resume.
-    _require_supported_gpu_count(spec)
 
     # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped into ANY
     # terminal state — not just `cancelled` — by a concurrent thread/process between the resume

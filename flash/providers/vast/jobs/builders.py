@@ -44,7 +44,12 @@ __all__ = [
 
 @dataclass(frozen=True)
 class VastOffer:
-    """A normalized, fully-vetted offer (passed every ``usable_offers`` filter)."""
+    """A normalized, fully-vetted offer (passed every ``usable_offers`` filter).
+
+    ``vram_gb`` and ``dph_total`` are PER CARD. Vast's raw ``dph_total`` prices the whole offer, so
+    ``usable_offers`` divides it by the offer's card count on the way in; the whole-box rate is
+    ``gpu_count * dph_total``.
+    """
 
     offer_id: int
     machine_id: int
@@ -56,6 +61,7 @@ class VastOffer:
     reliability: float
     inet_down: float
     geolocation: str
+    gpu_count: int = 1
 
 
 @dataclass
