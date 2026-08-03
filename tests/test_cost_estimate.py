@@ -143,6 +143,11 @@ def test_estimate_exact_h100_matches_cheapest_live_allocator_candidate(monkeypat
         return 2.49
 
     monkeypatch.setattr(lambda_api, "instance_type_price_usd_hr", advertised_price)
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *args, **kwargs: {"gpu_1x_h100_pcie": {}},
+    )
     monkeypatch.setattr(lambda_api, "regions_with_capacity", lambda *args, **kwargs: [])
 
     config = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100")
