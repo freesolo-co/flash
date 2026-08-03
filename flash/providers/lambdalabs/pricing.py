@@ -26,19 +26,39 @@ def _static_rate(name: str) -> float:
     return _STATIC_RATES.get(name) or get_gpu_info(name).hourly_usd
 
 
-def hourly_rate(gpu_name: str, *, deadline_at: float | None = None) -> float:
-    """$/hr for one friendly GPU name on Lambda (live ``/instance-types`` if available, else static)."""
+def hourly_rate(gpu_name: str, *, gpu_count: int = 1, deadline_at: float | None = None) -> float:
+    """$/hr for a Lambda INSTANCE of this class (live ``/instance-types`` if available, else static).
+
+    ``gpu_count`` > 1 prices the N-card instance type, whose live rate is for the whole box. The
+    static fallback is a 1x list price, so it is scaled by the count to stay in the same units.
+    """
     from flash.providers.base import canonical_gpu, get_gpu_info
 
     name = canonical_gpu(gpu_name)
     info = get_gpu_info(name)
+    count = max(1, int(gpu_count))
     if info.lambda_name:
         try:
-            from flash.providers.lambdalabs.api import instance_type_price_usd_hr
+            from flash.providers.lambdalabs.api import (
+                instance_type_price_usd_hr,
+                list_instance_types,
+            )
+            from flash.providers.lambdalabs.gpus import instance_type_for
 
-            live = instance_type_price_usd_hr(info.lambda_name, deadline_at=deadline_at)
+            # price the type Lambda actually lists: multi-card SKUs can carry a different suffix
+            # than the 1x entry, and a derived-only name would miss the live rate and fall back to
+            # the static list price.
+            #
+            # only the multi-card rewrite needs the catalog -- instance_type_for returns the
+            # registry name unconditionally at count 1. fetching it anyway put a second network
+            # call on the single-card path and made a catalog blip downgrade EVERY lambda quote to
+            # the static list price, even though the per-type lookup below would have succeeded.
+            catalog = list_instance_types(deadline_at=deadline_at) if count > 1 else None
+            live = instance_type_price_usd_hr(
+                instance_type_for(name, count, catalog), deadline_at=deadline_at
+            )
             if live:
                 return live
         except Exception as exc:
             logger.debug("live lambda pricing unavailable for %s (%s); using static", name, exc)
-    return _static_rate(name)
+    return _static_rate(name) * count

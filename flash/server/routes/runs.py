@@ -241,8 +241,6 @@ def create_run(
         # "insufficient balance" (402) for a run it can never launch at any balance -- sending the
         # user to top up instead of to the real defect. both are pure and raise ValueError, which the
         # handler below turns into the 400 submit_job would have produced.
-        _runner._require_supported_gpu_count(prepared.public_spec)
-        _runner._require_supported_gpu_count(prepared.worker_spec)
         preflight_validate_image_opd(prepared.worker_spec)
         # run the affordability check for dry runs too. it is verify-only (moves no money), so a
         # `--dry-run` that passes now also proves the org can cover the estimate, instead of the run
