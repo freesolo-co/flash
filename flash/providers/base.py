@@ -504,7 +504,7 @@ def provisional_gpu(
         )
     except UnsupportedGpuError as exc:
         if (algorithm or "").lower() == "opd":
-            cards = max(1, min(int(gpu_count), MAX_COMBINATION_CARDS))
+            cards = largest_rentable_count(gpu_count)
             biggest = max(
                 (
                     combined_vram_gb(g.vram_gb, cards)
@@ -628,6 +628,9 @@ class AllocationConstraints:
     disk_gb: float = 0.0
     max_wall_seconds: float = 0.0
     gpu_type: str = ""
+    # Whole-run fit floor before the allocator reduces it to a per-card market query. Capacity-aware
+    # providers use this to distinguish a missing rentable shape from a sold-out one.
+    required_vram_gb: int = 0
     # Ceiling on cards per machine the caller can use (1 = single-card only). Each provider reports
     # the counts it can ACTUALLY rent on one box, which differ in kind: RunPod takes a count
     # parameter, Lambda names the count in the instance type, Vast has it baked into the offer. The

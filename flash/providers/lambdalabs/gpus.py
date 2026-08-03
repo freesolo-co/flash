@@ -73,6 +73,8 @@ def instance_type_for(name: str, gpu_count: int = 1, catalog=None) -> str:
     memory_matches = sorted(entry for entry, vram_gb in family_matches if vram_gb == info.vram_gb)
     if memory_matches:
         return memory_matches[0]
-    if len(family_matches) == 1:
+    if len(family_matches) == 1 and family_matches[0][1] is None:
+        # Preserve the legacy suffix fallback only when the catalog gives no memory metadata. An
+        # explicit mismatch is a different managed class, not merely a renamed spelling.
         return family_matches[0][0]
     return rewritten

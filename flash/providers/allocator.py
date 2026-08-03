@@ -199,6 +199,7 @@ def allocate(
         disk_gb=disk_gb,
         max_wall_seconds=max_wall_seconds,
         gpu_type=exact,
+        required_vram_gb=need,
         max_gpu_count=cap,
     )
     # with multiple cards allowed, a card can contribute as one of N; query providers at the reduced

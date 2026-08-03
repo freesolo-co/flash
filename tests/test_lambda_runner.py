@@ -2250,9 +2250,11 @@ def test_allocator_capacity_aware(monkeypatch):
     """Lambda joins the ranked candidate list only for classes with LIVE capacity; a class with no
     capacity is excluded so the runner never walks to a class that would immediately fail to launch."""
     from flash.providers import allocator
+    from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs.jobs.builders import LambdaInstance
 
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")  # make lambda "available"
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: {"gpu_1x_a10": {}})
 
     def fake_usable(gpu, force=False, *, gpu_count=1, **_k):
         # A10 has capacity; A100 SXM 40GB does not (excluded from candidates).
