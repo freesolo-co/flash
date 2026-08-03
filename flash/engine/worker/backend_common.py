@@ -63,6 +63,44 @@ VERL_VENV_PYTHON = "3.12"
 VERL_VENV_STAMP = f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}"
 
 
+# how many times the prebuilt-wheel install is attempted before the arm is handed back to the plane.
+# uv already retries the download 3x internally, so each attempt here is a fresh uv invocation, not a
+# fresh request: the point is to outlast an outage that spans one uv lifetime, not to hammer github.
+FLASH_ATTN_INSTALL_ATTEMPTS = 3
+FLASH_ATTN_INSTALL_BACKOFF_S = 15.0
+
+
+def _install_flash_attn(py: str) -> None:
+    """Install the prebuilt FA2 wheel, raising RetriableInfraError rather than dying on a network fault.
+
+    The install is required (verl's cuda path imports flash_attn.bert_padding unguarded), so this
+    cannot fail soft. But failing PERMANENTLY is wrong: uv exits 1 on a download timeout, which
+    surfaces as CalledProcessError, and _worker_failure_flags classifies anything that is not
+    RetriableInfraError/GitHubRateLimitError as retriable=false -- so the plane routes a transient
+    github fetch failure to job_failed and burns the arm at attempt=0 on a paid gpu. Measured: an arm
+    died on `error sending request ... operation timed out` for this exact url, and the identical url
+    served 200 on retry moments later, so "cannot succeed on another worker" was simply false.
+    """
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    command = ["uv", "pip", "install", "--python", py, "--no-build-isolation", FLASH_ATTN_SPEC]
+    for attempt in range(FLASH_ATTN_INSTALL_ATTEMPTS):
+        try:
+            subprocess.run(command, check=True)
+            return
+        except subprocess.CalledProcessError as e:
+            if attempt == FLASH_ATTN_INSTALL_ATTEMPTS - 1:
+                # hand the arm back to the plane as infra-shaped: it retries as job_preempted on a
+                # fresh worker instead of failing the run. bounded by the plane's own retry budget
+                # (INFRA_RETRY_FLOOR), so a genuinely broken wheel spec still terminates rather than
+                # looping -- it just costs a few provisioning attempts to establish that.
+                raise RetriableInfraError(
+                    f"prebuilt flash-attn wheel install failed {FLASH_ATTN_INSTALL_ATTEMPTS}x "
+                    f"(exit {e.returncode}): {FLASH_ATTN_SPEC}"
+                ) from e
+            time.sleep(FLASH_ATTN_INSTALL_BACKOFF_S * (attempt + 1))
+
+
 def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
     """the engine length verl will accept: the job's context, capped at the model's own limit.
 
@@ -368,18 +406,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # above. required, not best-effort -- all three backends hard-enable remove-padding and verl's
         # cuda path imports flash_attn.bert_padding unguarded with no sdpa fallback, so a venv without
         # it dies at the first training batch on a paid gpu rather than degrading.
-        subprocess.run(
-            [
-                "uv",
-                "pip",
-                "install",
-                "--python",
-                py,
-                "--no-build-isolation",
-                FLASH_ATTN_SPEC,
-            ],
-            check=True,
-        )
+        _install_flash_attn(py)
         # written only after BOTH installs succeed, so a venv that died between them is unstamped
         # and the next attempt rebuilds it rather than reusing a half-provisioned interpreter.
         with open(stamp, "w") as f:
