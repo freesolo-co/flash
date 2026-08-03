@@ -925,7 +925,16 @@ def _submit_seed_supervised(
                     raise _RunCancelled(
                         f"run {spec.run_id} already has a durable provider handle; not resubmitting"
                     )
-                if not _persist_effective_worker_spec(effective_spec):
+                # Preparation stays offline so a market outage cannot consume the lifecycle's first
+                # retry before the run exists. Now that allocation selected an exact live shape,
+                # replace the provisional quote atomically with the effective worker spec, before
+                # provisioning starts and before any billable work can occur.
+                from flash.cost.spec import estimate_for_spec
+
+                selected_quote = estimate_for_spec(effective_spec, allocation=chosen).total_usd
+                if not _persist_effective_worker_spec(
+                    effective_spec, estimated_cost_usd=selected_quote
+                ):
                     raise _cancel()
                 if get_status(spec.run_id).state in TERMINAL_STATES:
                     raise _cancel()

@@ -426,6 +426,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
 
     resolved_sha = "a" * 40
     resolved_refs = []
+    quote_allocations = []
     submitted = []
 
     def fake_resolve(parsed, *args, **kwargs):
@@ -444,8 +445,17 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         lambda model, *args, **kwargs: catalog.MODELS[model],
     )
 
+    def fake_estimate(_spec, *, allocation=None):
+        quote_allocations.append(allocation)
+        total_usd = 7.0 if allocation is not None else 1.0
+        return type("Estimate", (), {"total_usd": total_usd})()
+
     def fake_runpod_submit(run_spec, seed, **kwargs):
-        persisted = orch.get_status(run_spec.run_id).effective_preparation["worker_spec"]
+        status = orch.get_status(run_spec.run_id)
+        persisted = status.effective_preparation["worker_spec"]
+        assert status.estimated_cost_usd == 7.0
+        assert quote_allocations[-1] is not None
+        assert quote_allocations[-1].gpu == "RTX 5090"
         assert persisted["environment"]["resolved_sha"] == resolved_sha
         assert persisted["gpu"]["type"] == "RTX 5090"
         assert persisted["gpu"]["network_volume"] == "flash-weights"
@@ -461,10 +471,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1})
 
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
-    monkeypatch.setattr(
-        "flash.cost.spec.estimate_for_spec",
-        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
-    )
+    monkeypatch.setattr("flash.cost.spec.estimate_for_spec", fake_estimate)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     monkeypatch.setattr("flash.providers._worker.upload_code", lambda *a, **k: None)
@@ -549,7 +556,7 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
     monkeypatch.setattr(
         "flash.cost.spec.estimate_for_spec",
-        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
+        lambda _spec, **_kwargs: type("Estimate", (), {"total_usd": 1.0})(),
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
