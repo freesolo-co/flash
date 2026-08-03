@@ -409,9 +409,10 @@ SHARD_VRAM_EFFICIENCY = 0.85
 # individually hold this floor on top of its parameter shard, so tiny cards cannot fake a fit by
 # count alone (e.g. 4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
 REPLICATED_PER_CARD_GB = 8
-# combinations larger than this are never proposed: shard-efficiency loss and inter-card overhead
-# grow with count, and cost estimates get less reliable.
-MAX_COMBINATION_CARDS = 4
+# the public gpu.count maximum is 8, and every managed model's attention-head count is divisible by
+# 8. keep the allocator aligned with that contract so a live 8-card provider SKU is reachable rather
+# than silently clamping the authored ceiling to 4.
+MAX_COMBINATION_CARDS = 8
 
 
 def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
