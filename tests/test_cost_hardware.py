@@ -931,9 +931,9 @@ def test_sft_replicate_noise_floor_bounds_what_this_corpus_can_resolve():
 
     # The n=16 Vast group that produced the withdrawn 2.772x, walls in seconds. Kept as data because
     # the retraction is only checkable against the numbers that produced it.
+    absent_backend_walls = (175.3, 201.5, 203.5, 204.8, 205.9, 206.8, 207.1, 210.8, 211.2, 211.4)
     vast_walls_by_backend = {
-        "absent": (175.3, 201.5, 203.5, 204.8, 205.9, 206.8, 207.1, 210.8, 211.2, 211.4, 213.2,
-                   214.7, 250.3),
+        "absent": (*absent_backend_walls, 213.2, 214.7, 250.3),
         "free": (208.6, 214.5),
         "pydelta": (485.9,),
     }
