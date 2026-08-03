@@ -61,10 +61,12 @@ def coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
-# the exact values that opt a run out of dashboard mirroring. a real `False`, or one of the
-# strings the worker round trip can produce for it: the flag crosses into the worker through the
-# environment, so `upload = false` comes back as "false".
-_UPLOAD_OFF_STRINGS = {"false", "0", "no", "off"}
+# the only string that opts a run out, and only because the flag can cross into the worker as
+# text: `upload = false` serializes to "false" and has to come back meaning what it said. the
+# other spellings `coerce_bool` accepts ("0", "no", "off") are NOT here -- no writer produces
+# them (the config schema rejects a non-bool `upload`, and the worker carrier is JSON), so
+# accepting them only widens what can turn into a silent suppression.
+_UPLOAD_OFF_STRINGS = {"false"}
 
 
 def _coerce_upload(value: Any) -> bool:

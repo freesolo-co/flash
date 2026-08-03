@@ -84,14 +84,17 @@ def test_upload_roundtrips_through_dict():
     assert JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B"}).upload is True
 
 
-@pytest.mark.parametrize("value", [None, True, "true", 1])
+@pytest.mark.parametrize("value", [None, True, "true", 1, "0", "no", "off"])
 def test_from_dict_never_invents_an_opt_out(value):
     # the only failure direction that hides a user's run from their own dashboard. a plain
-    # coerce_bool reads None as False, which would suppress a run nobody opted out.
+    # coerce_bool reads None as False, which would suppress a run nobody opted out -- and reads
+    # the last three as False too, though no writer can produce them: the config schema rejects a
+    # non-bool `upload` and the worker carrier is JSON, so a run carrying one is corrupt, not
+    # opted out. see _coerce_upload for why only "false" is honored.
     assert JobSpec.from_dict({"model": "m", "upload": value}).upload is True
 
 
-@pytest.mark.parametrize("value", [False, "false", "False"])
+@pytest.mark.parametrize("value", [False, "false", "False", " FALSE "])
 def test_from_dict_preserves_a_real_opt_out(value):
     # the worker round trip carries the spec through the environment, so False arrives as a string.
     assert JobSpec.from_dict({"model": "m", "upload": value}).upload is False
