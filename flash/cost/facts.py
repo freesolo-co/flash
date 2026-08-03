@@ -135,12 +135,14 @@ def effective_train_tflops(name: str) -> float:
 #   - sft is excluded at the call site (see analytical.step_seconds_split), on mechanism not
 #     measurement: sft runs no vllm engine and no weight sync, so the wall this table measures has
 #     no source there. sft keeps its pre-existing compute-only quote.
-#   - the floor is keyed on card alone, not (card, provider). A matched lambda/vast replication was
-#     attempted and returned zero usable timings (8/8 arms died in provisioning, step-0 wedge, or a
-#     trainer crash), so a provider term is unmeasured rather than measured-and-rejected. Card-only
-#     is the conservative choice: it is a strict improvement over pricing no floor at all on every
-#     provider, and if a provider offset does exist it shows up as a class being uniformly off on
-#     that provider, which is the same signal that would justify adding an entry.
+#   - the floor is keyed on card alone, not (card, provider). Lambda and Vast have since been
+#     validated on real GPUs, but every timing they returned is an SFT arm, and SFT does not reach
+#     this table at all (previous bullet). So the replication that would key THIS table on provider
+#     still has n=0 rollout arms off RunPod: a provider term here remains unmeasured rather than
+#     measured-and-rejected. Card-only is the conservative choice: it is a strict improvement over
+#     pricing no floor at all on every provider, and if a provider offset does exist it shows up as
+#     a class being uniformly off on that provider, which is the same signal that would justify
+#     adding an entry.
 #
 # The wall has TWO terms, and separating them is the whole subtlety here.
 #
@@ -232,11 +234,12 @@ ROLLOUT_SECONDS_PER_COMPLETION = 0.66
 #   - sft is excluded at the call site (see analytical.run_startup_seconds), on mechanism not
 #     measurement: sft runs no vllm engine and no weight sync, so the block this table measures has
 #     no source there. sft keeps its own SFT_RUN_STARTUP_K.
-#   - it is keyed on card alone, not (card, provider). A matched lambda/vast replication returned
-#     zero usable timings (8/8 arms died in provisioning, step-0 wedge, or a trainer crash), so a
-#     provider term is unmeasured rather than measured-and-rejected. Card-only is the conservative
-#     choice, and a real provider offset would surface as a class being uniformly off on that
-#     provider -- the same signal that would justify adding an entry.
+#   - it is keyed on card alone, not (card, provider). Lambda and Vast have since been validated on
+#     real GPUs, but every timing they returned is an SFT arm, and SFT does not reach this table
+#     (previous bullet), so a provider term here is still unmeasured rather than
+#     measured-and-rejected. Card-only is the conservative choice, and a real provider offset would
+#     surface as a class being uniformly off on that provider -- the same signal that would justify
+#     adding an entry.
 _RUN_BLOCK_S: dict[str, float] = {
     "A100 PCIe": 251.2,
     # ~2.2x its own PCIe sibling, which is why the two variants cannot share one entry.
