@@ -34,9 +34,9 @@ _TRI_PROVIDER_GPU = "H100"
 
 
 # a fake Lambda catalog covering the counts the tests ask for. Lambda names the count in the type,
-# so 1x/2x/4x are three separate entries and an absent one means "Lambda does not sell that shape".
+# so 1x/2x/4x/8x are separate entries and an absent one means "Lambda does not sell that shape".
 def _fake_lambda_types() -> dict:
-    """A Lambda catalog stocking 1/2/4-card boxes of the tri-provider class.
+    """A Lambda catalog stocking 1/2/4/8-card boxes of the tri-provider class.
 
     Keys are derived through ``instance_type_for`` rather than spelled out, so the fixture cannot
     drift from the real naming (the class is ``gpu_1x_h100_pcie``, not the ``_sxm5`` one might
@@ -50,7 +50,7 @@ def _fake_lambda_types() -> dict:
             "instance_type": {"price_cents_per_hour": 300 * n},
             "regions_with_capacity_available": [{"name": "us-west-1"}],
         }
-        for n in (1, 2, 4)
+        for n in (1, 2, 4, 8)
     }
 
 
@@ -191,27 +191,27 @@ def test_provider_only_offers_counts_it_can_rent(all_providers_configured, provi
 
     # spelled out rather than taken from rentable_gpu_counts: the providers call that same helper, so
     # comparing candidates against it would compare the code to itself and could never disagree.
-    assert rentable_gpu_counts(4) == (4, 2, 1), "powers of two, largest first"
+    assert rentable_gpu_counts(8) == (8, 4, 2, 1), "powers of two, largest first"
 
     prov = get_provider(provider)
-    constraints = AllocationConstraints(disk_gb=100.0, max_wall_seconds=3600.0, max_gpu_count=4)
+    constraints = AllocationConstraints(disk_gb=100.0, max_wall_seconds=3600.0, max_gpu_count=8)
     candidates = prov.live_candidates(24, constraints)
     counts = {c.gpu_count for c in candidates}
 
-    assert counts <= {1, 2, 4}, (
-        f"{provider} offered {sorted(counts - {1, 2, 4})} cards, a shape verl cannot shard over "
+    assert counts <= {1, 2, 4, 8}, (
+        f"{provider} offered {sorted(counts - {1, 2, 4, 8})} cards, a shape verl cannot shard over "
         f"(num_attention_heads % sp_size != 0 aborts at step 0)"
     )
-    # the load-bearing half: a provider that quietly ignored the constraint and returned only
-    # single-card shapes would satisfy the subset check above without supporting multi-gpu at all.
-    assert max(counts) > 1, f"{provider} offered no multi-card shape at max_gpu_count=4"
+    # the load-bearing half: the public maximum must reach every provider. A provider that quietly
+    # capped itself at 4 would satisfy the subset check while leaving its live 8-card SKUs unreachable.
+    assert 8 in counts, f"{provider} offered no 8-card shape at max_gpu_count=8"
 
 
 def test_single_card_constraint_yields_only_single_card_offers(all_providers_configured):
     """max_gpu_count=1 must produce no multi-card candidate on any provider.
 
     The pairing that makes the count-aware path failable: with the cap at 1 a provider that ignored
-    the constraint entirely would still look correct in the max_gpu_count=4 test above.
+    the constraint entirely would still look correct in the max_gpu_count=8 test above.
     """
     from flash.providers import available_providers, get_provider
     from flash.providers.base import AllocationConstraints
@@ -259,6 +259,113 @@ def test_lambda_resolves_a_multi_card_sku_that_renames_its_suffix():
     # a count the catalog stocks at neither spelling still yields the derived name: naming is this
     # function's job, and rentability is ``usable_instances``' check.
     assert instance_type_for("H100", 2, {real: {}}) == instance_type_for("H100", 2)
+
+
+def test_lambda_catalog_suffix_fallback_preserves_the_managed_memory_class():
+    """Family matching must not turn A100 40 GB into the costlier A100 80 GB SKU.
+
+    Lambda stocks both as 8-card boxes. Matching only the ``a100`` family makes catalog order choose
+    arbitrarily; in the live catalog that selected the 80 GB box at $22.32/hr instead of the fitting
+    40 GB box at $15.92/hr while still labelling the candidate ``A100 SXM 40GB``.
+    """
+    from flash.providers.lambdalabs.gpus import instance_type_for
+
+    forty = "gpu_8x_a100"
+    eighty = "gpu_8x_a100_80gb_sxm4"
+    catalog = {
+        eighty: {
+            "instance_type": {
+                "gpu_description": "A100 (80 GB SXM4)",
+                "price_cents_per_hour": 2232,
+            }
+        },
+        forty: {
+            "instance_type": {
+                "gpu_description": "A100 (40 GB SXM4)",
+                "price_cents_per_hour": 1592,
+            }
+        },
+    }
+    assert instance_type_for("A100 SXM 40GB", 8, catalog) == forty
+    # dictionary order is not a contract; reversing it must not change the selected memory class.
+    assert instance_type_for("A100 SXM 40GB", 8, dict(reversed(catalog.items()))) == forty
+    # A sole explicit 80 GB entry is still the WRONG class, not a renamed 40 GB spelling.
+    assert instance_type_for("A100 SXM 40GB", 8, {eighty: catalog[eighty]}) == instance_type_for(
+        "A100 SXM 40GB", 8
+    )
+
+
+def test_lambda_missing_required_count_sku_is_terminal(monkeypatch):
+    """An absent 8-card SKU is structural, while an existing sold-out SKU remains retryable.
+
+    Without the catalog check both cases return no live candidates and the allocator retries them as
+    capacity failures. A shape Lambda does not sell can never recover by retrying.
+    """
+    from flash.providers.base import AllocationConstraints, UnsupportedGpuError
+    from flash.providers.lambdalabs import LambdaProvider
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs.gpus import instance_type_for
+
+    gpu = "A100 SXM 40GB"
+
+    def _catalog(counts):
+        return {
+            instance_type_for(gpu, count): {
+                "instance_type": {"gpu_description": "A100 (40 GB SXM4)"},
+                "regions_with_capacity_available": [],
+            }
+            for count in counts
+        }
+
+    provider = LambdaProvider()
+    constraints = AllocationConstraints(gpu_type=gpu, required_vram_gb=129, max_gpu_count=8)
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4)))
+    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable.*8 cards"):
+        provider.live_candidates(19, constraints)
+
+    # The required SKU exists but has no live regions: return no candidates so allocate() classifies
+    # it as sold out/retryable rather than structurally impossible.
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4, 8)))
+    assert provider.live_candidates(19, constraints) == []
+
+    # Unpinned searches need the same distinction. Otherwise a Lambda-only run retries forever for
+    # a count-specific SKU Lambda does not sell.
+    unpinned = AllocationConstraints(required_vram_gb=129, max_gpu_count=8)
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4)))
+    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable.*8 cards"):
+        provider.live_candidates(19, unpinned)
+
+
+def test_lambda_sku_miss_is_provider_local_during_auto_allocation(monkeypatch):
+    """A missing Lambda count SKU must not discard a valid shape from another provider."""
+    import flash.providers.allocator as allocator
+    from flash.providers.base import Candidate, UnsupportedGpuError, gpu_classes_for
+
+    class _LambdaMiss:
+        live_capacity = True
+
+        def live_candidates(self, _need, _constraints):
+            raise UnsupportedGpuError("lambda does not sell this count-specific SKU")
+
+        def gpu_classes(self):
+            return gpu_classes_for("lambda_name")
+
+    class _RunPodHit:
+        live_capacity = False
+
+        def live_candidates(self, _need, _constraints):
+            return [Candidate("runpod", "H100", 3.29, 80, 2)]
+
+        def gpu_classes(self):
+            return gpu_classes_for("enum_member")
+
+    providers = {"lambda": _LambdaMiss(), "runpod": _RunPodHit()}
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda", "runpod"))
+    monkeypatch.setattr(allocator, "get_provider", providers.__getitem__)
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
+
+    chosen = allocator.allocate("Qwen/Qwen3.5-4B", "sft", gpu_type="H100", max_gpu_count=2)
+    assert (chosen.provider, chosen.gpu, chosen.gpu_count) == ("runpod", "H100", 2)
 
 
 def test_lambda_instance_type_never_reaches_the_network():
@@ -716,20 +823,110 @@ def test_gpu_count_is_honoured_by_parse_time_sizing():
         assert combined_vram_gb(get_gpu_info(chosen).vram_gb, count) >= need
 
 
-def test_gpu_count_above_the_combination_cap_does_not_oversell():
-    """A count the allocator will never combine must not be honoured by sizing either.
+def test_public_max_gpu_count_is_rentable_not_silently_clamped():
+    """The public 8-card maximum must buy an 8-card shape, not quietly behave like 4.
 
-    gpu.count accepts up to 8 but the allocator caps combinations at MAX_COMBINATION_CARDS. Sizing
-    against 8 would admit a spec at parse time only for submit to reject it -- the same parse/submit
-    divergence this fix removes, pointing the other way.
+    Lambda can have live 8x inventory while every 2x/4x SKU is sold out. The schema already accepts
+    ``gpu.count = 8``; clamping it to 4 makes that provider capacity unreachable and contradicts the
+    authored ceiling without an error.
     """
-    from flash.providers.base import MAX_COMBINATION_CARDS, cheapest_gpu, combined_vram_gb
+    from flash.providers.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
 
-    # a need the cap can hold but a smaller shape cannot, so "sized as 8" and "sized as the cap"
-    # would pick different classes and the assertion is failable.
-    need = 500
-    assert combined_vram_gb(180, MAX_COMBINATION_CARDS) >= need > combined_vram_gb(180, 2)
-    assert cheapest_gpu(need, gpu_count=8) == cheapest_gpu(need, gpu_count=MAX_COMBINATION_CARDS)
+    # above the widest 4-card shape but below 8x B200, so restoring the old cap to 4 kills this test.
+    need = 700
+    assert combined_vram_gb(180, 4) < need <= combined_vram_gb(180, 8)
+    with pytest.raises(UnsupportedGpuError):
+        cheapest_gpu(need, gpu_count=4)
+    chosen = cheapest_gpu(need, gpu_count=8)
+    from flash.providers.base import get_gpu_info
+
+    assert combined_vram_gb(get_gpu_info(chosen).vram_gb, 8) >= need
+
+
+def test_eight_cards_require_catalog_head_geometry():
+    """Open models must not newly rent 8 cards before their attention-head count is validated.
+
+    verl requires ``num_attention_heads % sp_size == 0``. Catalog rows are curated and every head
+    count divides by 8; open-model resolution currently fetches parameter/vocabulary geometry only,
+    so an 8-card run could pay for a box and abort during sequence-parallel initialization.
+    """
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40) == 4
+    assert geometry_safe_gpu_cap("acme/open-12-head-model", 8) == 4
+    # odd ceilings still normalize through the shared rentable-count helper.
+    assert geometry_safe_gpu_cap("acme/open-12-head-model", 3) == 2
+
+
+def test_schema_preflight_applies_the_open_model_geometry_cap():
+    """Schema preview and resolution must judge an unknown model on four cards, not authored eight."""
+    from flash.catalog import MODELS
+    from flash.schema import spec_from_dict
+
+    seen: list[tuple[str, int]] = []
+
+    def _preview(_model, *args, gpu_count=1, **kwargs):
+        seen.append(("preview", gpu_count))
+        return "H100"
+
+    def _resolve(_model, *args, gpu_count=1, **kwargs):
+        seen.append(("resolve", gpu_count))
+        return MODELS["Qwen/Qwen3.5-0.8B"]
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("flash.schema.provisional_gpu", _preview)
+        monkey.setattr("flash.schema.resolve_model", _resolve)
+        spec_from_dict(
+            {
+                "model": "acme/open-12-head-model",
+                "algorithm": "sft",
+                "environment": {"id": "owner/env"},
+                "train": {"max_examples": 1},
+                "gpu": {"count": 8},
+            }
+        )
+        assert seen == [("preview", 4), ("resolve", 4)]
+    finally:
+        monkey.undo()
+
+
+def test_runner_preflight_applies_the_same_open_model_geometry_cap(monkeypatch):
+    """Preparation must pass the capped count to both provisional sizing and model resolution."""
+    import flash.catalog as catalog
+    import flash.runner as runner
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    seen: list[tuple[str, int]] = []
+    monkeypatch.setattr(runner, "_resolve_model_revision", lambda spec: spec)
+    monkeypatch.setattr(
+        "flash.providers.base.provisional_gpu",
+        lambda _model, *args, gpu_count=1, **kwargs: seen.append(("preview", gpu_count)) or "H100",
+    )
+    monkeypatch.setattr(
+        runner,
+        "resolve_model",
+        lambda _model, *args, gpu_count=1, **kwargs: (
+            seen.append(("resolve", gpu_count)) or catalog.MODELS["Qwen/Qwen3.5-0.8B"]
+        ),
+    )
+    monkeypatch.setattr(
+        "flash.cost.spec.estimate_for_spec",
+        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
+    )
+
+    runner.prepare_job(
+        JobSpec(
+            model="acme/open-12-head-model",
+            model_policy="allow",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(count=8),
+        )
+    )
+
+    assert seen == [("preview", 4), ("resolve", 4)]
 
 
 def test_open_model_validation_is_judged_on_the_allocated_shape():
@@ -841,60 +1038,48 @@ def test_effective_spec_validation_accepts_an_allocator_narrowed_count():
 
 
 def test_open_model_fit_sizes_on_the_rentable_count_not_the_raw_ceiling():
-    """`check_fit` must clamp its count the same way sizing and submit do.
+    """`check_fit` must judge odd ceilings and the public maximum on rentable shapes.
 
-    Only powers of two up to MAX_COMBINATION_CARDS are ever rented, so a ceiling of 3 buys 2 cards
-    and a ceiling of 8 buys 4. Sizing the open-model gate on the raw ceiling would accept a shape
-    allocation never provisions -- the parse/submit divergence this parameter exists to close,
-    pointing the other way.
+    A ceiling of 3 buys 2 cards, while 8 is itself rentable. The 48B fixture is too large for four
+    RTX 5090s but fits on eight, so silently restoring the old four-card cap changes the verdict and
+    kills the test rather than comparing the cap to itself.
     """
     from flash.engine.vram import check_fit
-    from flash.providers.base import MAX_COMBINATION_CARDS
 
-    model, card = "acme/open-32b", "RTX 5090"
+    model, card = "acme/open-48b", "RTX 5090"
     monkey = pytest.MonkeyPatch()
     try:
-        monkey.setattr("flash.engine.vram.fetch_hf_params_b", lambda _m, **_k: 32.0)
+        monkey.setattr("flash.engine.vram.fetch_hf_params_b", lambda _m, **_k: 48.0)
         # a ceiling of 3 must be judged as 2 cards, not 3.
         assert check_fit(model, "sft", card, gpu_count=3).verdict == (
             check_fit(model, "sft", card, gpu_count=2).verdict
         )
-        # and above the combination cap, as the cap.
-        assert check_fit(model, "sft", card, gpu_count=8).verdict == (
-            check_fit(model, "sft", card, gpu_count=MAX_COMBINATION_CARDS).verdict
-        )
-        # the estimate reports the shape it JUDGED, so the message cannot contradict the verdict.
+        assert check_fit(model, "sft", card, gpu_count=4).verdict == "too_big"
+        eight = check_fit(model, "sft", card, gpu_count=8)
+        assert eight.verdict != "too_big"
+        assert eight.gpu_count == 8
+        assert "8x" in eight.describe()
+        # odd-ceiling messages still report the shape actually judged.
         assert check_fit(model, "sft", card, gpu_count=3).gpu_count == 2
         assert "2x" in check_fit(model, "sft", card, gpu_count=3).describe()
     finally:
         monkey.undo()
 
 
-def test_unpinned_quote_bills_the_rentable_count_not_the_ceiling():
-    """An unpinned multi-card quote must not charge for cards the ceiling never buys.
-
-    The unpinned branch skips `allocate()` and billed `config.gpu_count` verbatim, so a `--gpus 3`
-    run was quoted for 3 cards while submit rents 2. That quote is persisted at submit and charged
-    verbatim by `_status_estimated_charge`, so the over-count is a real overbill, and this path is
-    newly reachable because the PR removed the gate that rejected unpinned `count > 1`.
-    """
+def test_unpinned_quote_bills_the_allocator_selected_count():
+    """The exact lifecycle quote charges selected count and timing, never the authored ceiling."""
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
+    from flash.providers.base import Candidate
 
-    def _quote(count: int):
-        # no gpu_type -> the unpinned branch, which is the one that billed the raw ceiling.
-        # cost estimation is catalog-only, so the model has to be a catalog row.
-        return estimate_cost(
-            RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=count)
-        )
+    config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=8)
+    one = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 1))
+    two = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
 
-    three, two = _quote(3), _quote(2)
-    # a ceiling of 3 buys 2 cards, so it must be quoted as 2 -- not as 3.
-    assert three.gpu_count == 2 == two.gpu_count
-    assert three.total_usd == pytest.approx(two.total_usd)
-    # and the quote still scales with a count that IS rentable, or the assertion above is vacuous.
-    assert _quote(4).gpu_count == 4
-    assert _quote(4).total_usd > two.total_usd
+    assert one.gpu_count == 1
+    assert two.gpu_count == 2
+    assert two.train_seconds < one.train_seconds
+    assert two.total_usd < 2 * one.total_usd
 
 
 def test_vast_keeps_confirmed_shapes_when_another_count_query_fails():
