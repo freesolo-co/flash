@@ -766,6 +766,21 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     assert combined_vram_gb(get_gpu_info(chosen).vram_gb, 8) >= need
 
 
+def test_eight_cards_require_catalog_head_geometry():
+    """Open models must not newly rent 8 cards before their attention-head count is validated.
+
+    verl requires ``num_attention_heads % sp_size == 0``. Catalog rows are curated and every head
+    count divides by 8; open-model resolution currently fetches parameter/vocabulary geometry only,
+    so an 8-card run could pay for a box and abort during sequence-parallel initialization.
+    """
+    from flash.providers.allocator import _geometry_safe_gpu_cap
+
+    assert _geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
+    assert _geometry_safe_gpu_cap("acme/open-12-head-model", 8) == 4
+    # odd ceilings still normalize through the shared rentable-count helper.
+    assert _geometry_safe_gpu_cap("acme/open-12-head-model", 3) == 2
+
+
 def test_open_model_validation_is_judged_on_the_allocated_shape():
     """`model_policy = "allow"` must size an open model on its card COUNT, not on one card.
 
@@ -903,31 +918,40 @@ def test_open_model_fit_sizes_on_the_rentable_count_not_the_raw_ceiling():
         monkey.undo()
 
 
-def test_unpinned_quote_bills_the_rentable_count_not_the_ceiling():
-    """An unpinned multi-card quote must not charge for cards the ceiling never buys.
+def test_unpinned_quote_bills_the_allocator_selected_count(monkeypatch):
+    """A submit-time quote must charge the selected shape, never the authored ceiling.
 
-    The unpinned branch skips `allocate()` and billed `config.gpu_count` verbatim, so a `--gpus 3`
-    run was quoted for 3 cards while submit rents 2. That quote is persisted at submit and charged
-    verbatim by `_status_estimated_charge`, so the over-count is a real overbill, and this path is
-    newly reachable because the PR removed the gate that rejected unpinned `count > 1`.
+    The quote is persisted and charged verbatim by `_status_estimated_charge`. A small unpinned run
+    with ceiling 8 is allocated on one card, so billing 8 would be a real eight-fold overcharge.
     """
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
 
-    def _quote(count: int):
-        # no gpu_type -> the unpinned branch, which is the one that billed the raw ceiling.
-        # cost estimation is catalog-only, so the model has to be a catalog row.
-        return estimate_cost(
-            RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=count)
+    selected = {"count": 1}
+    seen: list[int] = []
+
+    def _allocate(*_a, **kwargs):
+        seen.append(kwargs["max_gpu_count"])
+        return SimpleNamespace(
+            gpu="H100",
+            provider="runpod",
+            hourly_usd=3.29,
+            min_vram_gb=29,
+            gpu_count=selected["count"],
         )
 
-    three, two = _quote(3), _quote(2)
-    # a ceiling of 3 buys 2 cards, so it must be quoted as 2 -- not as 3.
-    assert three.gpu_count == 2 == two.gpu_count
-    assert three.total_usd == pytest.approx(two.total_usd)
-    # and the quote still scales with a count that IS rentable, or the assertion above is vacuous.
-    assert _quote(4).gpu_count == 4
-    assert _quote(4).total_usd > two.total_usd
+    monkeypatch.setattr("flash.providers.available_providers", lambda: ("runpod",))
+    monkeypatch.setattr("flash.providers.allocator.allocate", _allocate)
+    config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=8)
+
+    one = estimate_cost(config)
+    assert one.gpu_count == 1
+    assert seen == [8], "the allocator must receive the authored ceiling"
+
+    selected["count"] = 2
+    two = estimate_cost(config)
+    assert two.gpu_count == 2
+    assert two.total_usd == pytest.approx(2 * one.total_usd)
 
 
 def test_vast_keeps_confirmed_shapes_when_another_count_query_fails():
