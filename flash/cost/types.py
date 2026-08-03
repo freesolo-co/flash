@@ -37,8 +37,8 @@ class RunConfig:
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
     environment: str | None = None  # Freesolo environment id; descriptive only
-    # sft only: actual training tokens across all epochs. when present, sft dollars are priced
-    # from this token count instead of the padded batch_size * seq_len slot estimate.
+    # sft only: actual training tokens across all epochs. when present, sft dollars use the measured
+    # average tokens per step instead of the pre-flight typical-length fallback.
     train_tokens: int | None = None
     save_at_steps: tuple[int, ...] = ()
     gpu_type: str = ""

@@ -793,12 +793,13 @@ def test_whole_run_quote_never_sits_below_the_fastest_run_of_that_config():
 def test_small_sft_step_prices_at_the_saturation_floor_but_still_tracks_card_speed():
     """Pins BOTH halves of the mechanism the batch-32 anchor and card ranking jointly selected.
 
-    Every sft arm runs (batch_size=8, seq_len=1024), and at a single shape tokens = steps x 8192, so
-    a per-token rate error and a per-step floor are the same regressor. They diverge only when the
-    shape changes: 4x the batch costs 4x the step under a rate, but is absorbed by a floor.
-    Extrapolating the 4090 group's measured 6.1x rate error to the batch-32 anchor predicts a 762 s
-    train wall against a run recorded as cold-start dominated under 449.5 s of setup; the floor
-    predicts 249 s. So the correction is a floor, and a refit cannot move it back into the rate term.
+    Every sft arm in the corpus runs (batch_size=8, seq_len=1024) at a single shape, so a per-token
+    rate error and a per-step floor are the same regressor there. They diverge only when the shape
+    changes: 4x the batch costs 4x the step under a rate, but is absorbed by a floor. The matched
+    batch sweep that would separate them came back underpowered -- its within-cell replicate spread
+    (1.71x) exceeded the between-cell b32/b8 ratio it was meant to resolve (1.69x) -- so the floor is
+    NOT fitted from batch data. It is the corpus's own billed step size, batch 8 x ctx 1024 = 8192,
+    which is why a shape at or below the canonical one prices identically.
 
     A FLAT per-step overhead also clears that bar, and is the trap this second half exists to block:
     being card-invariant it made over half a 4B step stop responding to card speed, which put the A10
@@ -807,15 +808,26 @@ def test_small_sft_step_prices_at_the_saturation_floor_but_still_tracks_card_spe
     card speed. Both properties are asserted here because satisfying only the first is what made the
     wrong model look correct.
     """
-    from flash.cost.analytical import SFT_SATURATION_TOKENS, step_seconds_split
+    from flash.cost.analytical import (
+        SFT_SATURATION_TOKENS,
+        _sft_step_shape,
+        step_seconds_split,
+    )
     from flash.cost.types import RunConfig
 
     small = RunConfig("Qwen/Qwen3.5-0.8B", "sft", 26, batch_size=8, seq_len=1024)
     wide = RunConfig("Qwen/Qwen3.5-0.8B", "sft", 26, batch_size=32, seq_len=1024)
     # the premise of the comparison below: BOTH shapes must sit under the floor, or the equality
-    # asserted next would hold for the trivial reason that neither is floored.
-    assert SFT_SATURATION_TOKENS > 8 * 1024
-    assert SFT_SATURATION_TOKENS > 32 * 1024
+    # asserted next would hold for the trivial reason that neither is floored. asserted against the
+    # REALIZED step shape, not batch x seq_len -- seq_len is a capacity ceiling that verl's
+    # remove-padding never bills, so re-deriving the premise from it would assert on a quantity the
+    # model no longer prices and would pass or fail for the wrong reason.
+    for shape in (small, wide):
+        _, realized = _sft_step_shape(shape)
+        assert realized < SFT_SATURATION_TOKENS, (
+            f"batch {shape.batch_size} realizes {realized} tokens/step, at or above the "
+            f"{SFT_SATURATION_TOKENS}-token floor: the equality below would then be trivial"
+        )
     small_gpu, small_fixed = step_seconds_split(small, "RTX 4090")
     wide_gpu, wide_fixed = step_seconds_split(wide, "RTX 4090")
 

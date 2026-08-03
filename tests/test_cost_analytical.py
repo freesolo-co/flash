@@ -82,14 +82,72 @@ def test_cost_increases_with_steps():
     assert costs[0] < costs[1] < costs[2]
 
 
-def test_sft_train_tokens_price_actual_tokens_instead_of_padded_slots():
-    padded = estimate_cost(RunConfig(MID, "sft", 10, batch_size=16, seq_len=2048))
-    actual = estimate_cost(
-        RunConfig(MID, "sft", 10, batch_size=16, seq_len=2048, train_tokens=50_000)
-    )
-    assert actual.train_seconds < padded.train_seconds
-    assert actual.total_usd < padded.total_usd
+def test_sft_train_tokens_price_the_measured_average_step_shape():
+    from flash.cost.analytical import _sft_step_shape
+
+    fallback_config = RunConfig(MID, "sft", 10, batch_size=16, seq_len=2048)
+    actual_config = RunConfig(MID, "sft", 10, batch_size=16, seq_len=2048, train_tokens=50_000)
+    assert _sft_step_shape(fallback_config.normalized()) == (16, 16 * 128)
+    assert _sft_step_shape(actual_config.normalized()) == (16, 5_000)
+
+    fallback = estimate_cost(fallback_config)
+    actual = estimate_cost(actual_config)
+    # both shapes remain below the separately calibrated saturation floor, so their quoted wall is
+    # intentionally equal. the old strict-less assertion passed only on floating-point roundoff.
+    assert actual.train_seconds == pytest.approx(fallback.train_seconds)
     assert any("50,000 actual train tokens" in n for n in actual.notes)
+
+    # once the measured average clears the floor, the known token count must move the quote.
+    larger = estimate_cost(
+        RunConfig(MID, "sft", 10, batch_size=16, seq_len=2048, train_tokens=1_000_000)
+    )
+    assert larger.train_seconds > actual.train_seconds
+
+
+def test_sft_bills_realized_shape_not_context_capacity():
+    # verl remove-padding makes context a capacity bound, not step work. these are all 12 completed
+    # sft arms that exposed the defect: realized tokens stay flat across context and scale with batch.
+    from flash.cost.analytical import _sft_step_shape
+
+    measured = (
+        (1024, 8, 1009.0),
+        (4096, 8, 1009.0),
+        (1024, 8, 1009.0),
+        (2048, 8, 1009.0),
+        (4096, 8, 1009.0),
+        (1024, 8, 1006.15625),
+        (4096, 8, 1000.203125),
+        (1024, 8, 1006.0),
+        (1024, 8, 1009.0),
+        (1024, 16, 2018.0),
+        (1024, 32, 4015.09375),
+        (1024, 8, 1006.15625),
+    )
+    ratios = []
+    for context, batch, realized in measured:
+        examples, billed = _sft_step_shape(
+            RunConfig(SMALL, "sft", 64, batch_size=batch, seq_len=context).normalized()
+        )
+        assert examples == batch
+        ratios.append(billed / realized)
+    assert min(ratios) >= 1.0
+    assert max(ratios) <= 1.025
+
+    # raising only max_context_tokens must not move the fixed-card quote, including above the
+    # saturation floor where the old batch_size * context basis made 16k cost 2.67x as much as 1k.
+    gpu = "RTX 4090"
+    contexts = (1024, 2048, 4096, 16_384)
+    walls = [
+        seconds_per_step(RunConfig(SMALL, "sft", 64, batch_size=8, seq_len=context), gpu)
+        for context in contexts
+    ]
+    assert walls == pytest.approx([walls[0]] * len(walls))
+
+    # once a run reports actual tokens, that measured per-step average supersedes the fallback prior.
+    measured_config = RunConfig(
+        SMALL, "sft", 64, batch_size=8, seq_len=4096, train_tokens=64_576
+    ).normalized()
+    assert _sft_step_shape(measured_config) == (8, 1009)
 
 
 def test_grpo_costs_more_than_sft():
@@ -177,10 +235,23 @@ def test_cold_start_calibrated_to_real_short_sft_run():
 
 
 def test_cold_start_negligible_for_long_runs():
-    # The bigger cold start must NOT regress long runs: when training wall dominates, setup is a
-    # small single-digit fraction of elapsed wall time.
-    e = estimate_cost(RunConfig(SMALL, "sft", 5000))
-    assert e.setup_seconds / e.wall_clock_seconds < 0.05
+    # The bigger cold start must NOT regress long runs: setup is a fixed block, so its share of the
+    # wall has to fall toward zero as training grows. Asserted as a trend plus a bar rather than one
+    # threshold at one step count -- a single bar silently tracks whatever the train wall happens to
+    # be, and passed for years only because the ctx-ceiling basis inflated that wall ~48x, which made
+    # every run look long enough to drown any setup cost.
+    short = estimate_cost(RunConfig(SMALL, "sft", 5000))
+    long = estimate_cost(RunConfig(SMALL, "sft", 20_000))
+    assert short.setup_seconds == pytest.approx(long.setup_seconds), "setup must be a fixed block"
+    assert not long.wall_capped, "the wall cap would truncate the trend this asserts"
+
+    short_share = short.setup_seconds / short.wall_clock_seconds
+    long_share = long.setup_seconds / long.wall_clock_seconds
+    assert long_share < short_share / 2.0, (
+        f"setup share must amortize with run length: {short_share:.3f} at 5k steps vs "
+        f"{long_share:.3f} at 20k is not falling like a fixed block"
+    )
+    assert long_share < 0.05, f"setup is {long_share:.3f} of a 20k-step run's wall"
 
 
 def test_wall_clock_cap_bounds_runaway_runs():

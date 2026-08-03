@@ -176,26 +176,64 @@ _REQUIRED_SAVE_COMMITS = {"sft": 2, "grpo": 2, "opd": 1}
 # constant in batch size, which is why it satisfies the batch-32 anchor below -- while remaining
 # proportional to params and INVERSELY proportional to card speed, so ranking survives.
 #
-# the anchor is what falsified the alternative to both: a real 0.8B/26-step/RTX 4090 run at batch 32
-# whose train wall came in under its 449.5 s setup (test_cold_start_calibrated_to_real_short_sft_run).
-# every sft arm in the corpus runs one (batch_size=8, seq_len=1024) shape, and at one shape
-# tokens = steps x 8192 exactly, so a per-token rate error and a per-step floor are the same
-# regressor. only a shape change separates them: 4x the batch costs 4x the step under a rate but
-# amortizes a floor 4x. extrapolating the 4090 group's measured 6.1x rate error to batch 32 predicts
-# 762 s and BLOWS that bound; the saturating floor predicts 249 s and holds it with 200 s to spare.
+# the anchor is a real 0.8B/26-step/RTX 4090 run at batch 32 whose train wall came in under its
+# 449.5 s setup (test_cold_start_calibrated_to_real_short_sft_run). every sft arm in the corpus that
+# solved this constant ran one (batch_size=8, seq_len=1024) shape, and under the OLD basis that
+# billed the context capacity, such a step was billed at exactly 8192 tokens.
+#
+# that is where 8192 comes from, and it is a derivation rather than a fit: the constant is solved
+# against a corpus whose every member has the same billed step size, so the saturation point cannot
+# come out anywhere except that size. the previous 49152 was solved the same way but against the
+# capacity-inflated basis (batch x max_context_tokens), which is why it landed 6x higher. once
+# _sft_step_shape bills realized tokens (~1024 for these arms), a 49152 floor multiplies every small
+# step by 48x, and the whole-run envelope check went to geo 3.093x / spread 6.01x with 0 of 12
+# configs quoted below a run that actually happened. the floor and the capacity basis were
+# COMPENSATING ERRORS: the inflated basis sat above the floor and hid it.
+#
+# scored on that same fit-free lower envelope, 8192 is the only value that passes: geo 1.133x,
+# spread 1.80x, 3 of 12 under 1.0 (49152 -> 3.093x/6.01x/0; 16384 -> 1.564x/2.51x/1;
+# 4096 -> 0.895x/2.09x/8). the batch-32 anchor holds either way and holds on real data: a measured
+# batch-32 sweep on this exact card ran 6.695 s/step (n=3 cell mean, raw wall/steps), so 26 steps is
+# 174 s against 449.5 s of setup. the 762 s rate extrapolation the 49152 floor was introduced to
+# rescue was 4.4x higher than what the hardware actually did.
+#
+# NOT fitted from the batch sweep: a 9-arm matched replicate sweep on this card measured within-cell
+# spread W = 1.71x against a between-cell batch effect B = 1.69x, so W >= B and the batch dimension
+# of the step is not resolvable with that design (a preregistered rule, fixed before the data
+# landed). this constant therefore stays a single saturation size and is deliberately NOT given a
+# batch-dependent form, even though quoting 2.349 s/step (the step term plus the run block amortized
+# over 64 steps, the same basis as the measurement) under-predicts the measured batch-32 cell mean of
+# 6.695 s/step by 2.85x. that under-quote now EXCEEDS the cell's own 1.67x internal spread (three
+# arms at an identical config ran 4.648 / 7.683 / 7.754 s/step), so it is a real shortfall rather
+# than replicate noise -- but the batch DIMENSION is still unresolvable per the rule above, so the
+# fix is not a batch-dependent step. resolving that needs ~n=12 per cell.
 #
 # scored fit-free on the monotone lower envelope (each config bounded by the fastest run at >= its
-# own token count), this takes the model from geo 0.401x / spread 4.71x / 13 of 13 configs quoted
-# BELOW a run that actually happened, to geo 1.033x / spread 1.90x. spread is the figure that
-# matters for a selection model -- a uniform bias cancels in a ranking, variation across configs
-# does not.
+# own token count), adding this block took the model from geo 0.401x / spread 4.71x / 13 of 13
+# configs quoted BELOW a run that actually happened, to geo 1.033x / spread 1.90x at the time it was
+# fitted. those two figures are the block's own before/after and were measured under the capacity
+# basis; the current envelope for the model as a whole is geo 1.133x / spread 1.80x (see
+# SFT_SATURATION_TOKENS). spread is the figure that matters for a selection model -- a uniform bias
+# cancels in a ranking, variation across configs does not.
 #
 # reusing the already-calibrated per-card rollout block (facts.run_block_seconds) was tried first,
 # since it would have added no new constant at all. it overshoots (geo 1.855x, worst 4.74x) because
 # that block prices a vLLM engine build and first weight sync, which an sft run never performs.
 SFT_RUN_STARTUP_K = 85.9
 SFT_RUN_STARTUP_PARAMS_EXP = 0.473
-SFT_SATURATION_TOKENS = 49152
+
+# sft uses verl remove-padding, so max_context_tokens is capacity, not realized work. in the current
+# calibration corpus, twelve completed runs measured 1000.2-1009.0 tokens per step at batch 8 across
+# context caps 1024, 2048 and 4096, while a matched batch sweep measured 1006.2, 2018.0 and 4015.1
+# tokens per step at batch 8, 16 and 32. the batch dimension is therefore real and nearly linear; the
+# context dimension is not. dividing these corpus arms by batch gives 125.0-126.1 tokens per example,
+# so 128 is a conservative fallback for quotes that cannot inspect the dataset, not a general property
+# of sft workloads. when post-run train_tokens exists, _sft_step_shape uses its measured average
+# instead. the fallback is capped only for an authored context below 128, where the tokenizer cannot
+# realize the full prior; raising capacity above 128 never raises billed work.
+SFT_TYPICAL_TOKENS_PER_EXAMPLE = 128
+
+SFT_SATURATION_TOKENS = 8192
 
 DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
 
@@ -250,6 +288,32 @@ def _opd_step_shape(n: RunConfig) -> tuple[int, int]:
     """
     completions = n.batch_size * n.group_size
     return completions, completions * n.completion_len
+
+
+def _sft_step_shape(n: RunConfig) -> tuple[int, int]:
+    """(examples per step, realized tokens per step) for one sft step from a normalized config.
+
+    when actual ``train_tokens`` are available, their per-step average is the strongest basis and is
+    rounded up to a whole token. pre-flight quotes cannot inspect or tokenize user data, so they use
+    ``SFT_TYPICAL_TOKENS_PER_EXAMPLE`` times the effective batch, capped only when the authored context
+    is shorter than that prior.
+
+    this term used to bill ``n.seq_len``, which is ``max_context_tokens`` -- the engine's context
+    capacity, not the tokens a step realizes. verl removes padding, so a user may raise capacity
+    without changing the work done; billing the capacity made the quote track a config knob instead
+    of the workload.
+
+    in the current 12-run calibration corpus, batch 8 realized 1000.2-1009.0 tokens per step across
+    context caps 1024, 2048 and 4096. the old basis billed 8192, 16384 and 32768 tokens for that
+    flat work; the 128-token prior bills 1024, only 1.015-1.024x the observed work. a matched sweep at
+    context 1024 realized 1006.2, 2018.0 and 4015.1 tokens per step for batch 8, 16 and 32, so the
+    batch multiplier remains while the context-cap multiplier is removed.
+    """
+    examples = n.batch_size
+    if n.train_tokens is not None:
+        return examples, max(1, math.ceil(n.train_tokens / n.steps))
+    tokens_per_example = min(n.seq_len, SFT_TYPICAL_TOKENS_PER_EXAMPLE)
+    return examples, examples * tokens_per_example
 
 
 def required_save_overhead_seconds(config: RunConfig) -> float:
@@ -496,7 +560,8 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # a step below SFT_SATURATION_TOKENS cannot fill the card, so it costs what a saturated step
         # costs. this stays in the gpu-bound half: it is still arithmetic on this card, just at an
         # occupancy floor, so a faster card still shortens it and extra cards still shard it.
-        step_tokens = max(n.batch_size * n.seq_len, SFT_SATURATION_TOKENS)
+        _, realized_step_tokens = _sft_step_shape(n)
+        step_tokens = max(realized_step_tokens, SFT_SATURATION_TOKENS)
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * step_tokens
         return flops / (peak * sft_mfu), overhead
 
@@ -622,7 +687,7 @@ def sft_seconds_for_tokens(
     The budget is charged per STEP at the SFT_SATURATION_TOKENS floor rather than as one bulk flops
     figure, because a step carrying fewer tokens than that floor still costs a saturated step (see
     that constant). Pricing the budget in bulk would let a token-budgeted quote come out an order of
-    magnitude under the same run priced from its padded shape by ``step_seconds_split``.
+    magnitude under the same run priced from its realized shape by ``step_seconds_split``.
     """
     n = config.normalized()
     # MoE prices on total params at a reduced MFU (see seconds_per_step); dense keeps active.
@@ -630,7 +695,8 @@ def sft_seconds_for_tokens(
     params = (total_params_b(n.model_id) if moe else active_params_b(n.model_id)) * 1e9
     mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
     peak = effective_train_tflops(gpu) * 1e12
-    step_tokens = max(1, n.batch_size * n.seq_len)
+    _, realized_step_tokens = _sft_step_shape(n)
+    step_tokens = max(1, realized_step_tokens)
     steps = max(1.0, math.ceil(train_tokens / step_tokens))
     billed_tokens = steps * max(step_tokens, SFT_SATURATION_TOKENS)
     flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * billed_tokens
