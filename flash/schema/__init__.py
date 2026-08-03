@@ -426,7 +426,9 @@ def spec_from_dict(
 
     from flash.providers.allocator import geometry_safe_gpu_cap
 
-    preflight_gpu_count = geometry_safe_gpu_cap(model, gpu_count or 1)
+    preflight_gpu_count = geometry_safe_gpu_cap(
+        model, gpu_count or 1, model_revision=model_revision
+    )
     try:
         # offline sizing/display only; allocator re-resolves auto runs at submit time.
         provisional_type = provisional_gpu(

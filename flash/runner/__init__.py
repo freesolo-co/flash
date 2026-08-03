@@ -1172,7 +1172,9 @@ def prepare_job(
             raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
     from flash.providers.allocator import geometry_safe_gpu_cap
 
-    preflight_gpu_count = geometry_safe_gpu_cap(spec.model, gpu_count_of(spec))
+    preflight_gpu_count = geometry_safe_gpu_cap(
+        spec.model, gpu_count_of(spec), model_revision=spec.model_revision
+    )
     preflight_gpu = spec.gpu.type
     if not preflight_gpu and spec.model_policy == "allow":
         # open-model auto runs size this fit preflight against the provisional class the schema
@@ -1199,7 +1201,7 @@ def prepare_job(
         model_revision=spec.model_revision,
         # same ceiling the preflight class was chosen under, so this cannot reject a shape
         # allocation would have accepted.
-        gpu_count=gpu_count_of(spec),
+        gpu_count=preflight_gpu_count,
     )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
