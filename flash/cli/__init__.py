@@ -577,7 +577,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "most cards to run the job on; sets [gpu] count (1-8). a ceiling, not an exact "
             "count: allocation still picks one card when one fits the run alone, and only "
-            "rentable counts (1, 2, 4) are ever provisioned"
+            "rentable counts (1, 2, 4, 8) are ever provisioned"
         ),
     )
     train.add_argument("--dry-run", action="store_true")
