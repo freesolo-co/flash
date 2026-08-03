@@ -460,7 +460,7 @@ def _adopt_completed_attempt(
 
     applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
     if applied:
-        _charge_completed_run_best_effort(spec, log)
+        _charge_completed_run_by_id(spec.run_id, log)
         _register_checkpoints_best_effort(spec, log)
     return applied
 
@@ -1191,7 +1191,7 @@ def _run_training(
         flush=True,
     )
     if applied:
-        _charge_completed_run_best_effort(spec, log)
+        _charge_completed_run_by_id(spec.run_id, log)
         _register_checkpoints_best_effort(spec, log)
 
 
@@ -1209,11 +1209,6 @@ def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
             file=log,
             flush=True,
         )
-
-
-def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
-    """Bill a successfully completed external run without changing its training result."""
-    _charge_completed_run_by_id(spec.run_id, log)
 
 
 def _charge_completed_run_by_id(run_id: str, log) -> None:
