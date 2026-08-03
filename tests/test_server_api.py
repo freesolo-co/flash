@@ -8573,6 +8573,31 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
     assert calls[0]["key"]["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
 
 
+def test_no_upload_run_records_no_managed_environment_use(api, monkeypatch):
+    # This post carries the run id, so it is a run-scoped dashboard record like the three in
+    # run_registry and is suppressed with them. test_create_run_records_managed_environment_use
+    # directly above is the control: it proves the same request DOES post without the opt-out.
+    import flash.server.environment_registry as registry
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_environment_use",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    spec = {**SPEC, "environment": {"id": "acme/my-env"}, "upload": False}
+    key = _login()
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert calls == []
+
+
 def test_internal_run_environment_use_merges_header_org(api, monkeypatch):
     import flash.server.environment_registry as registry
 

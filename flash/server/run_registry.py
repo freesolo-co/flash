@@ -58,6 +58,10 @@ def _upload_suppressed(spec: dict[str, Any]) -> bool:
     metrics, deployments (which ride inside the run report's `deployment` field), and export
     events. Only an explicit `False` suppresses: a spec that predates the field reports exactly
     as it did before, and a malformed value can never silently hide a run that asked to be shown.
+
+    One run-scoped report lives outside this module and is gated at its own call site:
+    `record_environment_use` in routes/runs.py, which posts the run id at submit time. Any new
+    backend post that carries a run id belongs behind one of these two checks.
     """
     return spec.get("upload") is False
 

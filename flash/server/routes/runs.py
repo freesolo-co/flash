@@ -275,7 +275,10 @@ def create_run(
     try:
         from flash.server.environment_registry import record_environment_use
 
-        if environment_slug is not None:
+        # `upload = false` opts the run out of dashboard mirroring, and this post carries the run
+        # id, so it is suppressed with the reporters in run_registry. `spec` is a parsed JobSpec
+        # here, so this reads a real bool rather than a raw dict value.
+        if environment_slug is not None and spec.upload:
             record_environment_use(
                 slug=environment_slug,
                 project_id=project_id,
