@@ -881,8 +881,22 @@ def test_sft_replicate_noise_floor_bounds_what_this_corpus_can_resolve():
         16     2.267  2.643  3.882  4.749                2.095x
         32     4.648  7.683  7.699  7.754                1.668x
 
-    Median 1.668x, max 2.095x. Widening to every SFT cell that has any replicate (14 sets, including
-    incidental ones) gives median 1.354x, max 2.772x.
+    Median 1.668x, max 2.095x. Widening to every SFT cell that has any replicate (21 sets, including
+    incidental ones) gives median 1.088x, max 2.095x -- the same cell, so the designed sets bind.
+
+    That widened figure was first published here as median 1.354x / max 2.772x, and the correction is
+    worth keeping because of how the 2.772x was wrong. It came from one n=16 Vast group carrying no
+    batch size, context, tokens/step or example count at all, so identical shape could not be read off
+    the record. It was not run-to-run noise: the group splits on ``FLASH_FLA_SM120``, the sm_120
+    linear-attention kernel backend (13 absent, 2 ``free``, 1 ``pydelta``), and the single ``pydelta``
+    arm IS the 485.9 s maximum against a 14-arm cluster at 175-215 s. Its submit-second twin ran 214.5 s
+    and differs in exactly that variable and in the loss curve from the first logged step -- different
+    numerics, not a slow host. Putting the backend in the replicate key fixes it uniformly for every
+    cell rather than hand-patching one group, and moves exactly one set's spread.
+
+    Direction matters here: this floor is used to argue that effects below it are not gradable, so an
+    inflated floor hides real findings. The two alleged ranking misses stay ungradable either way
+    (1.53x and 1.68x, inside 2.095x), so only the number moved, not the conclusion.
 
     Two consequences this test exists to keep true:
 
@@ -914,6 +928,36 @@ def test_sft_replicate_noise_floor_bounds_what_this_corpus_can_resolve():
         f"a {measured_max:.3f}x per-config spread implies a {concentrated:.3f}x band on a 13-config "
         f"geometric mean; 1.722x is only meaningful while it stays wider than that band"
     )
+
+    # The n=16 Vast group that produced the withdrawn 2.772x, walls in seconds. Kept as data because
+    # the retraction is only checkable against the numbers that produced it.
+    vast_walls_by_backend = {
+        "absent": (175.3, 201.5, 203.5, 204.8, 205.9, 206.8, 207.1, 210.8, 211.2, 211.4, 213.2,
+                   214.7, 250.3),
+        "free": (208.6, 214.5),
+        "pydelta": (485.9,),
+    }
+    pooled = [w for group in vast_walls_by_backend.values() for w in group]
+    assert max(pooled) / min(pooled) > 2.7, (
+        "the withdrawn figure must stay reproducible from the arms that produced it, or this "
+        "retraction cannot be checked"
+    )
+    # The maximum is the sole arm of its backend, so pooling measures a backend difference at n=1.
+    assert vast_walls_by_backend["pydelta"] == (max(pooled),), (
+        "the 2.772x pooled spread is only a noise floor if its extreme is not a treatment cell of one"
+    )
+    within_backend = [max(g) / min(g) for g in vast_walls_by_backend.values() if len(g) > 1]
+    assert max(within_backend) < measured_max, (
+        f"with the kernel backend in the replicate key this group spreads {max(within_backend):.3f}x, "
+        f"below the designed {measured_max:.3f}x, so the designed sets remain the binding floor"
+    )
+    # An inflated floor hides real effects, so the retraction must not rescue what it was used to
+    # dismiss: both alleged sft ranking misses stay inside the designed floor on their own.
+    for alleged_miss in (1.53, 1.68):
+        assert alleged_miss < measured_max, (
+            f"a {alleged_miss}x gap is inside sft's own {measured_max:.3f}x floor and is not gradable "
+            f"regardless of which widened figure is quoted"
+        )
 
 
 def test_opd_step_stays_proportional_across_step_counts_because_the_corpus_cannot_curve_it():
