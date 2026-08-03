@@ -261,6 +261,36 @@ def test_lambda_resolves_a_multi_card_sku_that_renames_its_suffix():
     assert instance_type_for("H100", 2, {real: {}}) == instance_type_for("H100", 2)
 
 
+def test_lambda_catalog_suffix_fallback_preserves_the_managed_memory_class():
+    """Family matching must not turn A100 40 GB into the costlier A100 80 GB SKU.
+
+    Lambda stocks both as 8-card boxes. Matching only the ``a100`` family makes catalog order choose
+    arbitrarily; in the live catalog that selected the 80 GB box at $22.32/hr instead of the fitting
+    40 GB box at $15.92/hr while still labelling the candidate ``A100 SXM 40GB``.
+    """
+    from flash.providers.lambdalabs.gpus import instance_type_for
+
+    forty = "gpu_8x_a100"
+    eighty = "gpu_8x_a100_80gb_sxm4"
+    catalog = {
+        eighty: {
+            "instance_type": {
+                "gpu_description": "A100 (80 GB SXM4)",
+                "price_cents_per_hour": 2232,
+            }
+        },
+        forty: {
+            "instance_type": {
+                "gpu_description": "A100 (40 GB SXM4)",
+                "price_cents_per_hour": 1592,
+            }
+        },
+    }
+    assert instance_type_for("A100 SXM 40GB", 8, catalog) == forty
+    # dictionary order is not a contract; reversing it must not change the selected memory class.
+    assert instance_type_for("A100 SXM 40GB", 8, dict(reversed(catalog.items()))) == forty
+
+
 def test_lambda_instance_type_never_reaches_the_network():
     """``instance_type_for`` must stay offline: it is called from pricing, which is called from it.
 
