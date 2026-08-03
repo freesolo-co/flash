@@ -29,7 +29,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, JobSpec
+from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, JobSpec, gpu_count_of
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -1174,6 +1174,9 @@ def prepare_job(
             train=spec.train,
             thinking=spec.thinking,
             model_revision=spec.model_revision,
+            # same card ceiling the allocator will honour, so this preflight cannot reject a shape
+            # allocation would have accepted.
+            gpu_count=gpu_count_of(spec),
         )
     info = resolve_model(
         spec.model,

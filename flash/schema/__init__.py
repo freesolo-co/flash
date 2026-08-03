@@ -431,6 +431,10 @@ def spec_from_dict(
             algorithm=algorithm,
             train=train_raw,
             thinking=thinking,
+            # sized against the shape the allocator may actually rent. sizing a --gpus N run
+            # against one card rejected it here before sharding was ever considered, which made
+            # the flag inert for exactly the large runs it exists to serve.
+            gpu_count=gpu_count or 1,
         )
         if gpu_type and not model_revision:
             from flash.providers.allocator import required_vram_gb

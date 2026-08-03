@@ -425,3 +425,55 @@ def test_submit_records_the_resolved_backend(monkeypatch, algorithm, backend):
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         status = runner.submit_job(_submittable(algorithm, backend), dry_run=True)
         assert (status.effective_preparation or {}).get("backend") == expected
+
+
+def test_gpu_count_is_honoured_by_parse_time_sizing():
+    """`--gpus N` must reach parse-time sizing, or a large run is rejected before sharding.
+
+    This is the half of "multi-card works" that lives before the allocator. `provisional_gpu` sized
+    every run against ONE card, so a 27B run needing 234 GB was rejected at parse time with "no
+    validated GPU class has >= 234 GB VRAM" no matter what the user passed to `--gpus`: the flag
+    was inert for exactly the runs that need it. The allocator would happily have rented 2 x H200.
+
+    Pinned to a need no single validated class holds (180 GB max) but four cards do, so the
+    assertion cannot pass by accident on a run that fits one card anyway.
+    """
+    from flash.providers.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
+
+    need = 234
+    assert all(info.vram_gb < need for info in _validated_infos()), (
+        "need must exceed every single card, or the multi-card path is not what is being tested"
+    )
+
+    with pytest.raises(UnsupportedGpuError):
+        cheapest_gpu(need)  # one card cannot, and must still say so
+
+    for count in (2, 4):
+        chosen = cheapest_gpu(need, gpu_count=count)
+        # the shape it names must genuinely hold the run under the SAME fit model the allocator
+        # applies at submit time -- naming a class that does not fit would just move the failure.
+        from flash.providers.base import get_gpu_info
+
+        assert combined_vram_gb(get_gpu_info(chosen).vram_gb, count) >= need
+
+
+def test_gpu_count_above_the_combination_cap_does_not_oversell():
+    """A count the allocator will never combine must not be honoured by sizing either.
+
+    gpu.count accepts up to 8 but the allocator caps combinations at MAX_COMBINATION_CARDS. Sizing
+    against 8 would admit a spec at parse time only for submit to reject it -- the same parse/submit
+    divergence this fix removes, pointing the other way.
+    """
+    from flash.providers.base import MAX_COMBINATION_CARDS, cheapest_gpu, combined_vram_gb
+
+    # a need the cap can hold but a smaller shape cannot, so "sized as 8" and "sized as the cap"
+    # would pick different classes and the assertion is failable.
+    need = 500
+    assert combined_vram_gb(180, MAX_COMBINATION_CARDS) >= need > combined_vram_gb(180, 2)
+    assert cheapest_gpu(need, gpu_count=8) == cheapest_gpu(need, gpu_count=MAX_COMBINATION_CARDS)
+
+
+def _validated_infos():
+    from flash.providers.base import GPU_INFO
+
+    return [info for info in GPU_INFO.values() if info.validated]

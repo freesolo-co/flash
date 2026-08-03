@@ -401,20 +401,59 @@ def _run_cost_key(
         return None
 
 
-def cheapest_gpu(min_vram_gb: int, *, cost_key=None) -> str:
-    """Cheapest validated RunPod GPU class with at least ``min_vram_gb`` VRAM.
+# FSDP shards parameters/optimizer across cards but replicates activations and adds collective
+# buffers; a combination only counts as fitting when the combined VRAM clears the need with this
+# margin. conservative on purpose: a too-optimistic shard model OOMs a paid run.
+SHARD_VRAM_EFFICIENCY = 0.85
+# activations/buffers replicate PER CARD regardless of sharding; every card in a combination must
+# individually hold this floor on top of its parameter shard, so tiny cards cannot fake a fit by
+# count alone (e.g. 4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
+REPLICATED_PER_CARD_GB = 8
+# combinations larger than this are never proposed: shard-efficiency loss and inter-card overhead
+# grow with count, and cost estimates get less reliable.
+MAX_COMBINATION_CARDS = 4
+
+
+def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
+    """Run-usable VRAM across ``gpu_count`` cards of ``vram_gb`` each.
+
+    THE single fit model: parse-time sizing, the submit-time allocator's candidate filter, and its
+    pinned-class check all call this. They used to carry three copies of the arithmetic, which is
+    how parse-time drifted into rejecting shapes submit-time would have accepted.
+
+    Returns 0.0 for a multi-card box whose cards cannot individually clear the replicated floor --
+    such a box has no usable capacity at all, rather than a small amount.
+    """
+    if gpu_count <= 1:
+        return float(vram_gb)
+    if vram_gb <= REPLICATED_PER_CARD_GB:
+        return 0.0
+    return gpu_count * (vram_gb - REPLICATED_PER_CARD_GB) * SHARD_VRAM_EFFICIENCY + (
+        REPLICATED_PER_CARD_GB
+    )
+
+
+def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
+    """Cheapest validated GPU class whose ``gpu_count``-card shape holds ``min_vram_gb``.
+
+    ``gpu_count`` is the run's card ceiling. Sizing a multi-card run against one card is what made
+    ``--gpus 4`` inert: the spec was rejected here before the allocator ever got to shard it.
 
     ``cost_key`` is ``(gpu_name, hourly_rate) -> comparable``; when given, classes are ranked by
     what the JOB costs on each rather than by rental rate, matching the submit-time allocator.
     Omitted, this ranks on $/hr for callers with no run to price.
     """
+    # the allocator never proposes a wider combination, so sizing against one would admit a spec
+    # here only for submit to reject it -- the same defect this parameter exists to fix, inverted.
+    cards = max(1, min(int(gpu_count), MAX_COMBINATION_CARDS))
     pool = [
-        g for g in GPU_INFO.values() if g.enum_member and g.vram_gb >= min_vram_gb and g.validated
+        g
+        for g in GPU_INFO.values()
+        if g.enum_member and g.validated and combined_vram_gb(g.vram_gb, cards) >= min_vram_gb
     ]
     if not pool:
-        raise UnsupportedGpuError(
-            f"no validated RunPod-provisionable GPU class has >= {min_vram_gb} GB VRAM"
-        )
+        shape = f" even as a {cards}-card combination" if cards > 1 else ""
+        raise UnsupportedGpuError(f"no validated GPU class has >= {min_vram_gb} GB VRAM{shape}")
     from flash.providers.runpod.pricing import hourly_rate
 
     if cost_key is not None:
@@ -432,8 +471,13 @@ def provisional_gpu(
     train=None,
     thinking: bool = False,
     model_revision: str = "",
+    gpu_count: int = 1,
 ) -> str:
-    """Cheapest validated GPU for this model: parse-time provisional used by the schema for sizing/display."""
+    """Cheapest validated GPU for this model: parse-time provisional used by the schema for sizing/display.
+
+    ``gpu_count`` is the run's card ceiling, so a run allowed to shard is sized against the shape it
+    will actually be allocated. The returned class name is per-card either way.
+    """
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
 
@@ -450,22 +494,34 @@ def provisional_gpu(
         # the class that actually gets provisioned; falls back to $/hr for an unpriceable run.
         return cheapest_gpu(
             min_vram,
+            gpu_count=gpu_count,
             cost_key=_run_cost_key(
                 model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
             ),
         )
     except UnsupportedGpuError as exc:
         if (algorithm or "").lower() == "opd":
+            cards = max(1, min(int(gpu_count), MAX_COMBINATION_CARDS))
             biggest = max(
-                (g.vram_gb for g in GPU_CLASSES if g.enum_member and g.validated), default=0
+                (
+                    combined_vram_gb(g.vram_gb, cards)
+                    for g in GPU_CLASSES
+                    if g.enum_member and g.validated
+                ),
+                default=0,
             )
             # OPD is resident-only: the HF/PEFT trainer AND the colocated vLLM student rollout engine
             # both stay resident, so the card must hold two model-weight copies plus the rollout KV
             # cache (which scales with batch_size x group_size) at the loss backward peak. Point the
             # user at the knobs that shrink it instead of the opaque "no GPU that big" message.
+            shape = (
+                f"any {cards}-card validated GPU combination"
+                if cards > 1
+                else ("any single validated GPU")
+            )
             raise UnsupportedGpuError(
-                f"opd needs >= {min_vram} GB VRAM, more than any single validated GPU "
-                f"({biggest} GB max). opd is resident-only: the trainer and the colocated vLLM student "
+                f"opd needs >= {min_vram} GB VRAM, more than {shape} "
+                f"({biggest:g} GB max). opd is resident-only: the trainer and the colocated vLLM student "
                 f"rollout engine hold two model-weight copies plus the rollout KV cache at once. "
                 f"Lower [train].group_size and/or [train].batch_size (rollout concurrency = "
                 f"batch_size x group_size; distillation needs no group variance, so group_size=1 is "
@@ -507,8 +563,10 @@ def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
 
     Powers of two only. Every provider sells multi-card boxes in powers of two, and the trainer
     shards over exactly the cards it rents: verl asserts ``num_attention_heads % sp_size == 0``, so
-    a 3-card box aborts at step 0 on any model whose head count is a power of two (all of them).
-    Offering only power-of-two counts keeps an unrunnable shape from ever being allocated.
+    a count that does not divide the head count aborts at step 0 rather than training slowly.
+    Catalog head counts are 8, 16, or 24 -- every one divisible by 1, 2, 4, and 8, and none by an
+    odd count above 1 (24 % 3 == 0 but 8 % 3 != 0). Powers of two are therefore the counts that are
+    safe for every model, so no unrunnable shape is ever allocated.
     """
     cap = max(1, int(max_gpu_count))
     counts, count = [], 1

@@ -8,6 +8,8 @@ from flash._logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
     GPU_INFO,
+    MAX_COMBINATION_CARDS,
+    SHARD_VRAM_EFFICIENCY,
     Allocation,
     AllocationConstraints,
     Candidate,
@@ -15,6 +17,7 @@ from flash.providers.base import (
     UnsupportedGpuError,
     _run_cost_key,
     canonical_gpu,
+    combined_vram_gb,
     providers_for,
     run_config_for_ranking,
 )
@@ -46,19 +49,6 @@ def required_vram_gb(
         headroom=vram_headroom(),
         model_revision=model_revision,
     )
-
-
-# FSDP shards parameters/optimizer across cards but replicates activations and adds collective
-# buffers; a combination only counts as fitting when the combined VRAM clears the need with this
-# margin. conservative on purpose: a too-optimistic shard model OOMs a paid run.
-_SHARD_VRAM_EFFICIENCY = 0.85
-# activations/buffers replicate PER CARD regardless of sharding; every card in a combination must
-# individually hold this floor on top of its parameter shard, so tiny cards cannot fake a fit by
-# count alone (e.g. 4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
-_REPLICATED_PER_CARD_GB = 8
-# combinations larger than this are never proposed: shard-efficiency loss and inter-card overhead
-# grow with count, and cost estimates get less reliable.
-_MAX_COMBINATION_CARDS = 4
 
 
 def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
@@ -99,19 +89,10 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
 def _fits(candidate: Candidate, need: int) -> bool:
     """Whether this rentable shape can actually hold the run.
 
-    One card fits when its VRAM covers the need outright. A multi-card box shards parameters and
-    optimizer state but REPLICATES activations and collective buffers, so every card must clear
-    ``_REPLICATED_PER_CARD_GB`` on top of its shard — tiny cards cannot fake a fit by count alone
-    (4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
+    ``combined_vram_gb`` is the shared fit model, so a shape accepted here is a shape parse-time
+    sizing also accepted -- the two must not be able to disagree.
     """
-    if candidate.gpu_count <= 1:
-        return candidate.vram_gb >= need
-    if candidate.vram_gb <= _REPLICATED_PER_CARD_GB:
-        return False
-    usable = (
-        candidate.gpu_count * (candidate.vram_gb - _REPLICATED_PER_CARD_GB) * _SHARD_VRAM_EFFICIENCY
-    )
-    return usable + _REPLICATED_PER_CARD_GB >= need
+    return combined_vram_gb(candidate.vram_gb, candidate.gpu_count) >= need
 
 
 def allocate(
@@ -163,24 +144,21 @@ def allocate(
                 f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
                 f"but this run requires at least {need} GB"
             )
-        _max_cards = min(max_gpu_count, _MAX_COMBINATION_CARDS)
-        _pin_usable = (
-            _max_cards
-            * max(0, exact_info.vram_gb - _REPLICATED_PER_CARD_GB)
-            * _SHARD_VRAM_EFFICIENCY
-            + _REPLICATED_PER_CARD_GB
-        )
-        if exact_info.vram_gb < need and max_gpu_count > 1 and _pin_usable < need:
+        _max_cards = min(max_gpu_count, MAX_COMBINATION_CARDS)
+        if (
+            exact_info.vram_gb < need
+            and max_gpu_count > 1
+            and combined_vram_gb(exact_info.vram_gb, _max_cards) < need
+        ):
             raise UnsupportedGpuError(
-                f"exact GPU {exact!r} cannot fit this run even as a "
-                f"{min(max_gpu_count, _MAX_COMBINATION_CARDS)}-card combination"
+                f"exact GPU {exact!r} cannot fit this run even as a {_max_cards}-card combination"
             )
         exact_providers = providers_for(exact)
         if provider and provider not in exact_providers:
             raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
         available = tuple(name for name in available if name in exact_providers)
 
-    cap = min(max(1, max_gpu_count), _MAX_COMBINATION_CARDS)
+    cap = min(max(1, max_gpu_count), MAX_COMBINATION_CARDS)
     constraints = AllocationConstraints(
         disk_gb=disk_gb,
         max_wall_seconds=max_wall_seconds,
@@ -192,7 +170,7 @@ def allocate(
     # actually fit below.
     per_card_need = need
     if cap > 1:
-        per_card_need = max(1, math.ceil(need / (cap * _SHARD_VRAM_EFFICIENCY)))
+        per_card_need = max(1, math.ceil(need / (cap * SHARD_VRAM_EFFICIENCY)))
     candidates: list[Candidate] = []
     lookup_failed = False
     # runpod prices off a static table (no live lookup), so it never blips; lambda/vast query live
