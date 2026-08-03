@@ -467,11 +467,8 @@ def test_opd_selects_managed_teacher_and_rejects_unknown():
             run_id="x",
         )
 
-    # Supported aliases parse and are stored as the canonical Fireworks model id.
+    # supported aliases parse and are stored as the canonical fireworks model id.
     assert _spec("kimi-k2.6").train.teacher_model == "accounts/fireworks/models/kimi-k2p6"
-    assert (
-        _spec("deepseek-v4-pro").train.teacher_model == "accounts/fireworks/models/deepseek-v4-pro"
-    )
     # A spaced / mixed-case form normalizes to the same model id.
     assert _spec("GLM 5.2").train.teacher_model == "accounts/fireworks/models/glm-5p2"
     # The raw Fireworks model id is also accepted (identity), including with stray surrounding
@@ -487,11 +484,15 @@ def test_opd_selects_managed_teacher_and_rejects_unknown():
     # Omitting/blank leaves it unset ("" => the worker uses the default GLM 5.2 teacher).
     assert _spec("").train.teacher_model == ""
 
-    # An unsupported teacher is rejected at parse time with a teacher-specific ConfigError.
+    # an unsupported teacher is rejected at parse time with a teacher-specific configerror.
     with pytest.raises(ConfigError, match="teacher_model"):
         _spec("gpt-5.5")
+    with pytest.raises(ConfigError, match="teacher_model"):
+        _spec("deepseek-v4-pro")
+    with pytest.raises(ConfigError, match="teacher_model"):
+        _spec("accounts/fireworks/models/deepseek-v4-pro")
     # qwen-3.7-max (on-demand only) and minimax-m3 (serverless chat, but its /completions echo
-    # endpoint OPD needs does not respond) are NOT allow-listed teachers, so both are rejected.
+    # endpoint opd needs does not respond) are not allow-listed teachers, so both are rejected.
     with pytest.raises(ConfigError, match="teacher_model"):
         _spec("qwen-3.7-max")
     with pytest.raises(ConfigError, match="teacher_model"):
@@ -652,17 +653,17 @@ def test_opd_filtering_stage_is_setup_not_training():
     )  # progress count doesn't flip it
 
 
-def test_opd_filtering_prompts_is_throttled_like_sft_pretokenizing():
-    """Regression (codex[bot], heartbeat.py): opd_filtering_prompts emits a REAL progress heartbeat
-    per liveness tick while it renders+tokenizes the whole split. Unthrottled that is one HF commit
-    per tick -- ~120/hr on a large split before model load, blowing the 128/hr commit cap. It must be
-    registered in BOTH heartbeat sets its SFT analogue sft_pretokenizing lives in: the throttle set
-    (bounds commit rate) and the setup-liveness set (keeps the tighter cold-start upload cadence)."""
+def test_opd_liveness_stages_are_throttled_at_setup_cadence():
+    """opd liveness threads must use the throttled setup-liveness cadence."""
     from flash.engine.worker.heartbeat import _HB_SETUP_LIVENESS_STAGES, _HB_THROTTLED_STAGES
+
+    opd_liveness_stages = {"opd_prompt_scan", "opd_image_prep", "opd_finalizing"}
+    assert opd_liveness_stages <= _HB_SETUP_LIVENESS_STAGES
+    assert opd_liveness_stages <= _HB_THROTTLED_STAGES
 
     assert "opd_filtering_prompts" in _HB_THROTTLED_STAGES
     assert "opd_filtering_prompts" in _HB_SETUP_LIVENESS_STAGES
-    # parity with the SFT pre-tokenize stage this mirrors (same dual membership).
+    # parity with the sft pre-tokenize stage this mirrors (same dual membership).
     assert "sft_pretokenizing" in _HB_THROTTLED_STAGES
     assert "sft_pretokenizing" in _HB_SETUP_LIVENESS_STAGES
 
@@ -1281,8 +1282,8 @@ def test_opd_teacher_rate_matches_fireworks_glm5p2_input_price():
 
 def test_opd_teacher_price_table_covers_every_allowlisted_teacher():
     """Every allow-listed teacher is priced by its exact row (pricing routes through resolve_teacher
-    over recipe.TEACHER_MODELS, so there is no unpriced teacher), the new teachers carry their own
-    input prices (not silently GLM-priced), and an unknown teacher falls back to the default rate."""
+    over recipe.TEACHER_MODELS, so there is no unpriced teacher), Kimi carries its own input price
+    (not silently GLM-priced), and an unknown teacher falls back to the default rate."""
     from flash.cost.facts import teacher_price_per_1m
     from flash.engine.recipe import TEACHER_MODELS
 
@@ -1290,11 +1291,10 @@ def test_opd_teacher_price_table_covers_every_allowlisted_teacher():
     for info in TEACHER_MODELS.values():
         assert teacher_price_per_1m(info.model_id) == info.usd_per_1m
 
-    # The two added teachers carry their own input prices (distinct from GLM's $1.40/M).
-    assert teacher_price_per_1m("accounts/fireworks/models/deepseek-v4-pro")[0] == 1.74
+    # kimi carries its own input price (distinct from glm's $1.40/m).
     assert teacher_price_per_1m("accounts/fireworks/models/kimi-k2p6")[0] == 0.95
-    # Removed teachers (qwen-3.7-max on-demand only; minimax-m3 no echo support) are unknown ids
-    # now -> priced defensively at the default (GLM) rate.
+    # removed teachers are unknown ids and price defensively at the default glm rate.
+    assert teacher_price_per_1m("accounts/fireworks/models/deepseek-v4-pro")[0] == 1.40
     assert teacher_price_per_1m("accounts/fireworks/models/qwen3p7-max")[0] == 1.40
     assert teacher_price_per_1m("accounts/fireworks/models/minimax-m3")[0] == 1.40
 
@@ -2225,17 +2225,21 @@ def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
         )
         return opd_mod._resolve_opd_knobs()
 
-    # A friendly alias resolves to the provider model id.
+    # a friendly alias resolves to the provider model id.
     assert _knobs("kimi-k2.6").teacher_model == "accounts/fireworks/models/kimi-k2p6"
-    assert _knobs("deepseek-v4-pro").teacher_model == "accounts/fireworks/models/deepseek-v4-pro"
-    # Unset / blank / None -> the default GLM 5.2 teacher (historical behavior preserved).
+    # unset / blank / none -> the default glm 5.2 teacher (historical behavior preserved).
     assert _knobs("").teacher_model == "accounts/fireworks/models/glm-5p2"
     assert _knobs(None).teacher_model == "accounts/fireworks/models/glm-5p2"
-    # base_url is shared across every allow-listed teacher (one Fireworks endpoint + one managed key).
-    assert _knobs("deepseek-v4-pro").teacher_base_url == opd_mod.RECIPE.opd.teacher_base_url
-    # An unsupported teacher fails loudly on the worker (defensive guard, mirrors the kl_coef check).
-    with pytest.raises(RuntimeError, match="teacher_model"):
-        _knobs("gpt-5.5")
+    # base_url is shared across every allow-listed teacher (one fireworks endpoint + one managed key).
+    assert _knobs("kimi-k2.6").teacher_base_url == opd_mod.RECIPE.opd.teacher_base_url
+    # unsupported teachers fail loudly on the worker (defensive guard, mirrors the kl_coef check).
+    for teacher in (
+        "gpt-5.5",
+        "deepseek-v4-pro",
+        "accounts/fireworks/models/deepseek-v4-pro",
+    ):
+        with pytest.raises(RuntimeError, match="teacher_model"):
+            _knobs(teacher)
 
 
 def test_groupwise_alignment_emits_no_empty_student_group():
@@ -2384,8 +2388,8 @@ class _TinyLM:
     "teacher_model",
     [
         "",
+        "glm-5.2",
         "accounts/fireworks/models/glm-5p2",
-        "accounts/fireworks/models/deepseek-v4-pro",
     ],
 )
 def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(monkeypatch, teacher_model):
