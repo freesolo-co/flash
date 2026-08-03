@@ -129,7 +129,7 @@ def _send_malformed_json_response(handler, status, _payload):
 
 def _capture_client_only_score_delivery_loss(bridge, monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_score_delivery_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     failure_path = str(tmp_path / "score-delivery-failure")
     monkeypatch.setenv("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", failure_path)
@@ -156,7 +156,7 @@ def _capture_client_only_score_delivery_loss(bridge, monkeypatch, tmp_path):
             )
         with pytest.raises(ChildExit) as actor_exit:
             plugin._exit_for_score_failure(transport_error.value)
-        fallback = _read_score_delivery_failure_fallback(failure_path)
+        fallback = _read_classified_failure_fallback(failure_path)
         records = list(tmp_path.glob("score-delivery-failure.*.transient.json"))
     finally:
         bridge.close()
@@ -1699,7 +1699,7 @@ def test_client_only_score_loss_preserves_authoritative_permanent_failure(monkey
 def test_malformed_score_success_is_transient_delivery_unknown(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_train import (
-        _read_score_delivery_failure_fallback,
+        _read_classified_failure_fallback,
         _reconcile_score_delivery_failure,
     )
     from flash.engine.worker.perf import RetriableInfraError
@@ -1730,7 +1730,7 @@ def test_malformed_score_success_is_transient_delivery_unknown(monkeypatch, tmp_
             )
         with pytest.raises(ChildExit) as actor_exit:
             plugin._exit_for_score_failure(transport_error.value)
-        fallback = _read_score_delivery_failure_fallback(failure_path)
+        fallback = _read_classified_failure_fallback(failure_path)
     finally:
         bridge.close()
 
@@ -1760,7 +1760,7 @@ def test_explicit_score_rejection_keeps_classification_without_delivery_fallback
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_score_delivery_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher import TeacherError
 
     class PermanentTeacher:
@@ -1797,7 +1797,7 @@ def test_explicit_score_rejection_keeps_classification_without_delivery_fallback
     assert rejection.value.classification == "permanent"
     assert not rejection.value.delivery_unknown
     assert actor_exit.value.code == 86
-    assert _read_score_delivery_failure_fallback(failure_path) is None
+    assert _read_classified_failure_fallback(failure_path) is None
     assert not list(tmp_path.iterdir())
     assert bridge.teacher_failure == ("permanent", "bad credentials")
     assert bridge.score_requests == 1
@@ -2676,7 +2676,7 @@ def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
 
 def test_abandonment_transport_fallback_promotes_pending_teacher_failure(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_abandonment_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher import TeacherError
 
     class TransientTeacher:
@@ -2699,7 +2699,7 @@ def test_abandonment_transport_fallback_promotes_pending_teacher_failure(monkeyp
     with pytest.raises(FlashTeacherBridgeError):
         plugin._post_no_signal_abandoned("http://bridge", "token")
 
-    assert _read_abandonment_failure_fallback(failure_path)
+    assert _read_classified_failure_fallback(failure_path)
     bridge._promote_pending_teacher_failure()
     assert bridge.teacher_failure == ("transient", "teacher unavailable")
     assert bridge.teacher_transient == 1
@@ -2708,7 +2708,7 @@ def test_abandonment_transport_fallback_promotes_pending_teacher_failure(monkeyp
 
 def test_accepted_abandonment_lost_response_does_not_duplicate_accounting(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_abandonment_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher import TeacherError
 
     class TransientTeacher:
@@ -2729,7 +2729,7 @@ def test_accepted_abandonment_lost_response_does_not_duplicate_accounting(monkey
     try:
         with pytest.raises(FlashTeacherBridgeError):
             plugin._post_no_signal_abandoned(bridge.url, bridge.token)
-        assert _read_abandonment_failure_fallback(failure_path)
+        assert _read_classified_failure_fallback(failure_path)
         bridge._promote_pending_teacher_failure()
     finally:
         bridge.close()
@@ -2743,7 +2743,7 @@ def test_resample_transport_failure_before_acceptance_promotes_without_replaceme
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_resample_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher import TeacherError
 
     class TransientTeacher:
@@ -2777,7 +2777,7 @@ def test_resample_transport_failure_before_acceptance_promotes_without_replaceme
             lambda: None,
         )
 
-    assert _read_resample_failure_fallback(failure_path)
+    assert _read_classified_failure_fallback(failure_path)
     bridge._promote_pending_teacher_failure()
     assert bridge.teacher_failure == ("transient", "teacher unavailable")
     assert bridge.no_signal_resamples == 0
@@ -2787,7 +2787,7 @@ def test_resample_transport_failure_before_acceptance_promotes_without_replaceme
 
 def test_accepted_resample_lost_response_counts_once_and_promotes(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_resample_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher import TeacherError
 
     class TransientTeacher:
@@ -2808,7 +2808,7 @@ def test_accepted_resample_lost_response_counts_once_and_promotes(monkeypatch, t
     try:
         with pytest.raises(FlashTeacherBridgeError):
             plugin._post_no_signal_resample(bridge.url, bridge.token)
-        assert _read_resample_failure_fallback(failure_path)
+        assert _read_classified_failure_fallback(failure_path)
         bridge._promote_pending_teacher_failure()
     finally:
         bridge.close()
@@ -2820,7 +2820,7 @@ def test_accepted_resample_lost_response_counts_once_and_promotes(monkeypatch, t
 
 def test_resample_fallback_without_pending_transient_does_not_promote(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_resample_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     bridge = _text_bridge(_BridgeTeacher())
     bridge.score(0, 2, [10, 11, 65, 66])
@@ -2839,7 +2839,7 @@ def test_resample_fallback_without_pending_transient_does_not_promote(monkeypatc
     with pytest.raises(FlashTeacherBridgeError):
         plugin._post_no_signal_resample("http://bridge", "token")
 
-    assert _read_resample_failure_fallback(failure_path)
+    assert _read_classified_failure_fallback(failure_path)
     bridge._promote_pending_teacher_failure()
     assert bridge.teacher_failure is None
     assert bridge.no_signal_resamples == 0
@@ -2848,7 +2848,7 @@ def test_resample_fallback_without_pending_transient_does_not_promote(monkeypatc
 
 def test_successful_teacher_signal_suppresses_resample_fallback_promotion(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_resample_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher import TeacherError
 
     class TransientThenSuccessTeacher:
@@ -2879,7 +2879,7 @@ def test_successful_teacher_signal_suppresses_resample_fallback_promotion(monkey
     with pytest.raises(FlashTeacherBridgeError):
         plugin._post_no_signal_resample("http://bridge", "token")
 
-    assert _read_resample_failure_fallback(failure_path)
+    assert _read_classified_failure_fallback(failure_path)
     bridge._promote_pending_teacher_failure()
     assert bridge.teacher_failure is None
     assert bridge.teacher_transient == 1
@@ -2888,7 +2888,7 @@ def test_successful_teacher_signal_suppresses_resample_fallback_promotion(monkey
 
 def test_successful_resample_creates_no_marker_and_prepares_replacement(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_resample_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     bridge = _text_bridge(_BridgeTeacher())
     failure_path = str(tmp_path / "resample-failure")
@@ -2918,7 +2918,7 @@ def test_successful_resample_creates_no_marker_and_prepares_replacement(monkeypa
     assert attempts == [0, 1]
     assert replacements == [True]
     assert bridge.no_signal_resamples == 1
-    assert not _read_resample_failure_fallback(failure_path)
+    assert not _read_classified_failure_fallback(failure_path)
 
 
 @pytest.mark.parametrize(
@@ -2989,13 +2989,13 @@ def test_authoritative_teacher_failure_precedes_transient_no_signal_evidence(
         (
             "resample",
             "FLASH_OPD_RESAMPLE_FAILURE_PATH",
-            "_read_resample_failure_fallback",
+            "_read_classified_failure_fallback",
             "no_signal_resamples",
         ),
         (
             "abandoned",
             "FLASH_OPD_ABANDONMENT_FAILURE_PATH",
-            "_read_abandonment_failure_fallback",
+            "_read_classified_failure_fallback",
             "no_signal_skipped_steps",
         ),
     ],
@@ -3042,7 +3042,7 @@ def test_malformed_accepted_no_signal_notification_is_transient_once(
 
 def test_malformed_accepted_cycle_commit_exhaustion_is_transient(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
 
     failure_path = str(tmp_path / "cycle-commit-failure")
@@ -3069,7 +3069,7 @@ def test_malformed_accepted_cycle_commit_exhaustion_is_transient(monkeypatch, tm
     try:
         with pytest.raises(FlashTeacherBridgeError) as error:
             plugin._post_teacher_cycle_committed(bridge.url, bridge.token)
-        fallback = _read_cycle_commit_failure_fallback(failure_path)
+        fallback = _read_classified_failure_fallback(failure_path)
     finally:
         bridge.close()
 
@@ -3092,17 +3092,17 @@ def test_malformed_accepted_cycle_commit_exhaustion_is_transient(monkeypatch, tm
         (
             "_post_no_signal_resample",
             "FLASH_OPD_RESAMPLE_FAILURE_PATH",
-            "_read_resample_failure_fallback",
+            "_read_classified_failure_fallback",
         ),
         (
             "_post_no_signal_abandoned",
             "FLASH_OPD_ABANDONMENT_FAILURE_PATH",
-            "_read_abandonment_failure_fallback",
+            "_read_classified_failure_fallback",
         ),
         (
             "_post_teacher_cycle_committed",
             "FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH",
-            "_read_cycle_commit_failure_fallback",
+            "_read_classified_failure_fallback",
         ),
     ],
 )
@@ -3145,19 +3145,19 @@ def test_explicit_notification_rejection_remains_permanent(
         (
             "_post_no_signal_resample",
             "FLASH_OPD_RESAMPLE_FAILURE_PATH",
-            "_read_resample_failure_fallback",
+            "_read_classified_failure_fallback",
             "unexpected resample bridge failure",
         ),
         (
             "_post_no_signal_abandoned",
             "FLASH_OPD_ABANDONMENT_FAILURE_PATH",
-            "_read_abandonment_failure_fallback",
+            "_read_classified_failure_fallback",
             "unexpected abandonment bridge failure",
         ),
         (
             "_post_teacher_cycle_committed",
             "FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH",
-            "_read_cycle_commit_failure_fallback",
+            "_read_classified_failure_fallback",
             "unexpected cycle commitment bridge failure",
         ),
     ],
@@ -3304,7 +3304,7 @@ def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher import TeacherError
 
     class SuccessThenTransientTeacher:
@@ -3371,13 +3371,13 @@ def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback
     assert actor_updates == [batch]
     assert bridge.mutation_failure is None
     assert not list(tmp_path.glob("mutation-failure.*.json"))
-    assert _read_cycle_commit_failure_fallback(cycle_failure_path) is None
+    assert _read_classified_failure_fallback(cycle_failure_path) is None
     assert bridge.teacher_failure == ("transient", "teacher unavailable")
 
 
 def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
 
     attempts = []
@@ -3404,7 +3404,7 @@ def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(monkey
             ActorGroup(), object(), "http://bridge", "token"
         )
 
-    fallback = _read_cycle_commit_failure_fallback(failure_path)
+    fallback = _read_classified_failure_fallback(failure_path)
     assert attempts == [True, True]
     assert actor_updates == []
     assert fallback == ("transient", "cycle bridge unavailable")
@@ -3414,7 +3414,7 @@ def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(monkey
 
 def test_explicit_cycle_commit_rejection_aborts_before_actor_update(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     attempts = []
     actor_updates = []
@@ -3439,7 +3439,7 @@ def test_explicit_cycle_commit_rejection_aborts_before_actor_update(monkeypatch,
             ActorGroup(), object(), "http://bridge", "token"
         )
 
-    fallback = _read_cycle_commit_failure_fallback(failure_path)
+    fallback = _read_classified_failure_fallback(failure_path)
     assert attempts == [True]
     assert actor_updates == []
     assert fallback == ("permanent", "cycle commit rejected")
@@ -3449,7 +3449,7 @@ def test_explicit_cycle_commit_rejection_aborts_before_actor_update(monkeypatch,
 
 def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
 
     bridge = _text_bridge(_BridgeTeacher())
@@ -3487,7 +3487,7 @@ def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch,
     finally:
         bridge.close()
 
-    fallback = _read_cycle_commit_failure_fallback(failure_path)
+    fallback = _read_classified_failure_fallback(failure_path)
     assert error.value.classification == "transient"
     assert error.value.delivery_unknown
     assert sends == [200, 200]
@@ -3524,7 +3524,7 @@ def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch,
 )
 def test_failure_fallback_serialization_is_valid_and_within_reader_limit(tmp_path, message):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     failure_path = str(tmp_path / "cycle-commit-failure")
     plugin._write_failure_fallback(failure_path, "transient", message)
@@ -3540,7 +3540,7 @@ def test_failure_fallback_serialization_is_valid_and_within_reader_limit(tmp_pat
     assert record["classification"] == "transient"
     assert record["message"]
     assert normalized_message.startswith(record["message"])
-    assert _read_cycle_commit_failure_fallback(failure_path) == (
+    assert _read_classified_failure_fallback(failure_path) == (
         "transient",
         record["message"].strip(),
     )
@@ -3548,7 +3548,7 @@ def test_failure_fallback_serialization_is_valid_and_within_reader_limit(tmp_pat
 
 def test_cycle_commit_fallback_reader_ignores_incomplete_records(monkeypatch, tmp_path):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_cycle_commit_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     failure_path = str(tmp_path / "cycle-commit-failure")
     monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", failure_path)
@@ -3561,7 +3561,7 @@ def test_cycle_commit_fallback_reader_ignores_incomplete_records(monkeypatch, tm
 
     completed = list(tmp_path.glob("cycle-commit-failure.*.transient.json"))
     assert len(completed) == 1
-    assert _read_cycle_commit_failure_fallback(failure_path) == (
+    assert _read_classified_failure_fallback(failure_path) == (
         "transient",
         "cycle timeout",
     )
@@ -3654,7 +3654,7 @@ def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monk
     import flash.engine.worker.opd_plugin as plugin
     from flash.engine.worker.opd_multiturn import _post_multiturn_score
     from flash.engine.worker.opd_train import (
-        _read_score_delivery_failure_fallback,
+        _read_classified_failure_fallback,
         _reconcile_score_delivery_failure,
     )
     from flash.engine.worker.perf import RetriableInfraError
@@ -3692,7 +3692,7 @@ def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monk
                 bridge.token,
                 "session-1",
             )
-        fallback = _read_score_delivery_failure_fallback(failure_path)
+        fallback = _read_classified_failure_fallback(failure_path)
     finally:
         bridge.close()
 
@@ -3754,7 +3754,7 @@ def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_statu
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_mutation_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
 
     failure_path = str(tmp_path / "mutation-failure")
@@ -3780,7 +3780,7 @@ def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_statu
     with pytest.raises(ChildExit) as actor_exit:
         plugin._post_mutation_notice("http://bridge", "token")
 
-    mutation_failure = _read_mutation_failure_fallback(failure_path)
+    mutation_failure = _read_classified_failure_fallback(failure_path)
     assert actor_exit.value.code == 87
     assert mutation_failure == (
         "transient",
@@ -3791,7 +3791,7 @@ def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_statu
 
 
 def test_mutation_failure_fallback_publishes_one_atomic_record_per_process(monkeypatch, tmp_path):
-    from flash.engine.worker.opd_train import _read_mutation_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     failure_path = str(tmp_path / "mutation-failure")
     messages = [f"bridge timeout {index}" for index in range(4)]
@@ -3816,7 +3816,7 @@ def test_mutation_failure_fallback_publishes_one_atomic_record_per_process(monke
     records = sorted(tmp_path.glob("mutation-failure.*.transient.json"))
     assert len(records) == len(messages)
     assert {json.loads(record.read_text())["message"] for record in records} == set(messages)
-    selected = _read_mutation_failure_fallback(failure_path)
+    selected = _read_classified_failure_fallback(failure_path)
     expected_message = json.loads(records[0].read_text())["message"]
     assert selected == ("transient", expected_message)
     assert not [path for path in tmp_path.iterdir() if path.name.endswith(".tmp")]
@@ -3841,7 +3841,7 @@ def test_mutation_failure_fallback_removes_temp_when_publication_fails(monkeypat
 def test_mutation_failure_fallback_selects_permanent_and_ignores_incomplete_records(
     tmp_path,
 ):
-    from flash.engine.worker.opd_train import _read_mutation_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     failure_path = str(tmp_path / "mutation-failure")
     Path(f"{failure_path}.100.transient.json").write_text(
@@ -3860,7 +3860,7 @@ def test_mutation_failure_fallback_selects_permanent_and_ignores_incomplete_reco
         json.dumps({"classification": "transient", "message": "incomplete"})
     )
 
-    assert _read_mutation_failure_fallback(failure_path) == (
+    assert _read_classified_failure_fallback(failure_path) == (
         "permanent",
         "invalid marker configuration",
     )
@@ -4367,7 +4367,7 @@ def test_persistent_incomplete_mutation_response_fails_closed_after_one_retry(
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_mutation_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     callback_calls = []
     optimizer_steps = []
@@ -4395,7 +4395,7 @@ def test_persistent_incomplete_mutation_response_fails_closed_after_one_retry(
     try:
         with pytest.raises(ChildExit) as exit_error:
             plugin._post_mutation_notice(bridge.url, bridge.token)
-        fallback = _read_mutation_failure_fallback(failure_path)
+        fallback = _read_classified_failure_fallback(failure_path)
     finally:
         bridge.close()
 
@@ -4412,7 +4412,7 @@ def test_persistent_mutation_response_loss_writes_fallback_without_optimizer_ste
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.opd_plugin as plugin
-    from flash.engine.worker.opd_train import _read_mutation_failure_fallback
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
 
     callback_calls = []
     optimizer_steps = []
@@ -4436,7 +4436,7 @@ def test_persistent_mutation_response_loss_writes_fallback_without_optimizer_ste
     try:
         with pytest.raises(ChildExit):
             plugin._post_mutation_notice(bridge.url, bridge.token)
-        fallback = _read_mutation_failure_fallback(failure_path)
+        fallback = _read_classified_failure_fallback(failure_path)
         assert fallback is not None
         bridge._record_mutation_failure(*fallback)
     finally:

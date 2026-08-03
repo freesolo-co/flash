@@ -1,7 +1,7 @@
 """Retry/recover completion-time CUSTOMER charges so a transient blip never leaks revenue.
 
 The run hot path charges a completed run exactly ONCE, inline, right after it goes ``done``
-(runner.lifecycle._charge_completed_run_best_effort). On a transient backend blip there -- or a
+(runner.lifecycle._charge_completed_run_by_id). On a transient backend blip there -- or a
 control-plane crash between the ``done`` write and the charge -- the run is left billed-never:
 ``billing_state`` stuck in ``pending``/``charging``/``failed`` while the user still holds a
 deployable adapter (a silent revenue leak). recover_runs cannot help: it only re-attaches in-flight
