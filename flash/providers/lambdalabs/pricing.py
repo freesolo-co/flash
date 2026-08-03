@@ -26,19 +26,27 @@ def _static_rate(name: str) -> float:
     return _STATIC_RATES.get(name) or get_gpu_info(name).hourly_usd
 
 
-def hourly_rate(gpu_name: str, *, deadline_at: float | None = None) -> float:
-    """$/hr for one friendly GPU name on Lambda (live ``/instance-types`` if available, else static)."""
+def hourly_rate(gpu_name: str, *, gpu_count: int = 1, deadline_at: float | None = None) -> float:
+    """$/hr for a Lambda INSTANCE of this class (live ``/instance-types`` if available, else static).
+
+    ``gpu_count`` > 1 prices the N-card instance type, whose live rate is for the whole box. The
+    static fallback is a 1x list price, so it is scaled by the count to stay in the same units.
+    """
     from flash.providers.base import canonical_gpu, get_gpu_info
 
     name = canonical_gpu(gpu_name)
     info = get_gpu_info(name)
+    count = max(1, int(gpu_count))
     if info.lambda_name:
         try:
             from flash.providers.lambdalabs.api import instance_type_price_usd_hr
+            from flash.providers.lambdalabs.gpus import instance_type_for
 
-            live = instance_type_price_usd_hr(info.lambda_name, deadline_at=deadline_at)
+            live = instance_type_price_usd_hr(
+                instance_type_for(name, count), deadline_at=deadline_at
+            )
             if live:
                 return live
         except Exception as exc:
             logger.debug("live lambda pricing unavailable for %s (%s); using static", name, exc)
-    return _static_rate(name)
+    return _static_rate(name) * count

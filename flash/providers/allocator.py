@@ -96,33 +96,22 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
     return cost_per_step
 
 
-def _combination_candidates(
-    singles: list[Candidate], need: int, max_gpu_count: int
-) -> list[Candidate]:
-    """Expand single-card candidates into fitting multi-card combinations (same class x count).
+def _fits(candidate: Candidate, need: int) -> bool:
+    """Whether this rentable shape can actually hold the run.
 
-    Per-card fields stay per-card; a combination fits when count * vram * _SHARD_VRAM_EFFICIENCY
-    covers the need. Only the smallest fitting count per class is proposed (larger counts of the
-    same class only cost more).
+    One card fits when its VRAM covers the need outright. A multi-card box shards parameters and
+    optimizer state but REPLICATES activations and collective buffers, so every card must clear
+    ``_REPLICATED_PER_CARD_GB`` on top of its shard — tiny cards cannot fake a fit by count alone
+    (4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
     """
-    combos: list[Candidate] = []
-    for c in singles:
-        if c.vram_gb <= _REPLICATED_PER_CARD_GB:
-            continue  # card too small to hold the replicated working set at all
-        for count in range(2, min(max_gpu_count, _MAX_COMBINATION_CARDS) + 1):
-            usable = count * (c.vram_gb - _REPLICATED_PER_CARD_GB) * _SHARD_VRAM_EFFICIENCY
-            if usable + _REPLICATED_PER_CARD_GB >= need:
-                combos.append(
-                    Candidate(
-                        provider=c.provider,
-                        gpu=c.gpu,
-                        hourly_usd=c.hourly_usd,
-                        vram_gb=c.vram_gb,
-                        gpu_count=count,
-                    )
-                )
-                break
-    return combos
+    if candidate.gpu_count <= 1:
+        return candidate.vram_gb >= need
+    if candidate.vram_gb <= _REPLICATED_PER_CARD_GB:
+        return False
+    usable = (
+        candidate.gpu_count * (candidate.vram_gb - _REPLICATED_PER_CARD_GB) * _SHARD_VRAM_EFFICIENCY
+    )
+    return usable + _REPLICATED_PER_CARD_GB >= need
 
 
 def allocate(
@@ -191,18 +180,18 @@ def allocate(
             raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
         available = tuple(name for name in available if name in exact_providers)
 
+    cap = min(max(1, max_gpu_count), _MAX_COMBINATION_CARDS)
     constraints = AllocationConstraints(
         disk_gb=disk_gb,
         max_wall_seconds=max_wall_seconds,
         gpu_type=exact,
+        max_gpu_count=cap,
     )
-    allow_combos = max_gpu_count > 1
-    # with combinations allowed, a card can contribute as one of N; query providers at the reduced
-    # per-card floor so classes too small to fit alone still surface, then split fit-alone singles
-    # from combination material below.
+    # with multiple cards allowed, a card can contribute as one of N; query providers at the reduced
+    # per-card floor so classes too small to fit alone still surface, then keep only the shapes that
+    # actually fit below.
     per_card_need = need
-    if allow_combos:
-        cap = min(max_gpu_count, _MAX_COMBINATION_CARDS)
+    if cap > 1:
         per_card_need = max(1, math.ceil(need / (cap * _SHARD_VRAM_EFFICIENCY)))
     candidates: list[Candidate] = []
     lookup_failed = False
@@ -223,10 +212,9 @@ def allocate(
             logger.warning(
                 "%s capacity lookup failed (%s); allocating without it", name, exc.__cause__
             )
-    if allow_combos:
-        fit_alone = [c for c in candidates if c.vram_gb >= need]
-        undersized = [c for c in candidates if c.vram_gb < need]
-        candidates = fit_alone + _combination_candidates(undersized, need, max_gpu_count)
+    # providers report the shapes they can genuinely rent (RunPod takes a count, Lambda names it in
+    # the instance type, Vast bakes it into the offer); the allocator owns only whether a shape fits.
+    candidates = [c for c in candidates if _fits(c, need)]
     if not candidates:
         if lookup_failed:
             # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
@@ -237,8 +225,12 @@ def allocate(
                 f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"
             )
         if exact:
-            dynamic_capacity_providers = {"lambda", "vast"}
-            if available and set(available).issubset(dynamic_capacity_providers):
+            # a provider whose capacity comes from a live market can be structurally able to rent a
+            # class while having none free right now (retryable), unlike one priced off a static
+            # table where "no candidate" means the class genuinely is not offered (terminal).
+            if available and all(
+                getattr(get_provider(name), "live_capacity", False) for name in available
+            ):
                 raise CapacityLookupError(
                     f"exact GPU {exact!r} is structurally supported but currently has no capacity on "
                     f"{', '.join(available)}"

@@ -502,6 +502,22 @@ class PollResult:
     detail: str | None = None
 
 
+def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
+    """Card counts worth asking a provider about, largest first, up to ``max_gpu_count``.
+
+    Powers of two only. Every provider sells multi-card boxes in powers of two, and the trainer
+    shards over exactly the cards it rents: verl asserts ``num_attention_heads % sp_size == 0``, so
+    a 3-card box aborts at step 0 on any model whose head count is a power of two (all of them).
+    Offering only power-of-two counts keeps an unrunnable shape from ever being allocated.
+    """
+    cap = max(1, int(max_gpu_count))
+    counts, count = [], 1
+    while count <= cap:
+        counts.append(count)
+        count *= 2
+    return tuple(reversed(counts))
+
+
 @dataclass(frozen=True)
 class Candidate:
     provider: str
@@ -536,11 +552,17 @@ class Allocation:
 class AllocationConstraints:
     """Run-scoped extras a capacity/market-aware provider's ``live_candidates`` needs (Vast prices
     against the run's disk/duration floors) — carried here so they don't leak into ``allocate``'s
-    signature per-provider. RunPod/Lambda ignore them."""
+    signature per-provider. A provider ignores the fields it has no use for."""
 
     disk_gb: float = 0.0
     max_wall_seconds: float = 0.0
     gpu_type: str = ""
+    # Ceiling on cards per machine the caller can use (1 = single-card only). Each provider reports
+    # the counts it can ACTUALLY rent on one box, which differ in kind: RunPod takes a count
+    # parameter, Lambda names the count in the instance type, Vast has it baked into the offer. The
+    # allocator owns the fit/cost policy and never assumes a count is rentable just because the
+    # single-card class exists.
+    max_gpu_count: int = 1
 
 
 @runtime_checkable

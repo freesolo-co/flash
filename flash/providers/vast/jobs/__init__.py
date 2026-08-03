@@ -129,9 +129,14 @@ def usable_offers(
     limit: int = 256,
     max_wall_seconds: float = 0,
     gpu_type: str = "",
+    num_gpus: int = 1,
     deadline_at: float | None = None,
 ) -> list[VastOffer]:
     """Verified-datacenter offers able to run the job, cheapest first.
+
+    ``num_gpus`` filters to hosts renting exactly that many cards on ONE machine. Vast bakes the
+    count into the offer (there is no count parameter at create time), so this is the only way to
+    reach a multi-card box.
 
     Server-side filters do the heavy lifting; everything load-bearing is re-checked client-side.
 
@@ -159,12 +164,14 @@ def usable_offers(
     search_kwargs = {"gpu_names": gpu_names} if gpu_names else {}
     if exact_info is not None:
         search_kwargs["max_vram_mb"] = int(exact_info.vram_gb * 1024)
+    cards = max(1, int(num_gpus))
     rows = vast_api.search_offers(
         int(search_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
         min_duration_seconds=min_duration,
         limit=int(limit),
+        num_gpus=cards,
         **search_kwargs,
         **deadline_kwargs(vast_api.search_offers, deadline_at),
     )
@@ -189,6 +196,10 @@ def usable_offers(
             or float(r.get("inet_down") or 0) < MIN_INET_MBPS
             or cuda < float(min_cuda_modern(gpu))  # Blackwell needs CUDA-13 drivers
             or dph <= 0
+            # the card count is load-bearing twice over (it sizes the rented box AND divides
+            # dph_total into the per-card rate), so re-check it rather than trusting the server
+            # honoured the num_gpus filter.
+            or int(r.get("num_gpus") or 0) != cards
             or int(r.get("machine_id") or 0) in exclude_machine_ids
         ):
             continue
@@ -198,12 +209,17 @@ def usable_offers(
                 machine_id=int(r.get("machine_id") or 0),
                 gpu=gpu,
                 vram_gb=info.vram_gb,
-                dph_total=dph,
+                # dph_total prices the WHOLE offer (all `cards` GPUs); every consumer of dph_total
+                # treats it as one card's rate, so divide here at the single boundary where the
+                # count is known. Skipping this prices an N-card box N times over and the allocator
+                # would never choose one.
+                dph_total=dph / cards,
                 cuda_max_good=cuda,
                 disk_space=float(r.get("disk_space") or 0),
                 reliability=float(r.get("reliability2") or 0),
                 inet_down=float(r.get("inet_down") or 0),
                 geolocation=str(r.get("geolocation") or ""),
+                gpu_count=cards,
             )
         )
     return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
@@ -630,6 +646,8 @@ def submit_run_vast(
         raise vast_api.VastApiError(
             f"submit_run_vast needs a concrete gpu class, got {spec.gpu.type!r}"
         )
+    from flash.spec import gpu_count_of
+
     absolute_deadline = require_deadline_at(deadline_at)
     info = GPU_INFO[spec.gpu.type]
     offers = [
@@ -640,6 +658,9 @@ def submit_run_vast(
             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
             # the transient attempt spec always carries the concrete allocated class.
             gpu_type=spec.gpu.type,
+            # rent the SHAPE the allocator chose: the worker spawns gpu.count ranks, so a
+            # single-card offer would oversubscribe one card with n ranks while billing for n.
+            num_gpus=gpu_count_of(spec),
             **deadline_kwargs(usable_offers, absolute_deadline),
         )
         if o.gpu == spec.gpu.type

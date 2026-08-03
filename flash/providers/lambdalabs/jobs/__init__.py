@@ -34,7 +34,12 @@ from flash.providers._poll import (
     make_say,
     preload_box_reap_due,
 )
-from flash.providers.base import GPU_INFO, PollResult, UnreconciledCreateError
+from flash.providers.base import (
+    GPU_INFO,
+    PollResult,
+    UnreconciledCreateError,
+    UnsupportedGpuError,
+)
 from flash.providers.lambdalabs import api as lambda_api
 from flash.providers.lambdalabs.jobs.builders import (
     LambdaInstance,
@@ -80,17 +85,34 @@ def usable_instances(
     gpu_class: str,
     force: bool = False,
     *,
+    gpu_count: int = 1,
     deadline_at: float | None = None,
 ) -> list[LambdaInstance]:
-    """Regions currently advertising capacity for the given GPU class. Empty = no Lambda capacity now."""
+    """Regions currently advertising capacity for the given GPU class. Empty = no Lambda capacity now.
+
+    ``gpu_count`` selects the N-card instance type for the class (Lambda names the count in the
+    type). A count Lambda does not sell for this class has no catalog entry and therefore no
+    capacity, so it drops out here exactly like a sold-out region — the caller never gets an
+    unrentable shape back.
+    """
     from flash.providers.lambdalabs.gpus import instance_type_for
     from flash.providers.lambdalabs.pricing import hourly_rate
 
     info = GPU_INFO[gpu_class]
-    itype = instance_type_for(gpu_class)
-    rate = hourly_rate(
-        gpu_class,
-        **deadline_kwargs(hourly_rate, deadline_at),
+    count = max(1, int(gpu_count))
+    try:
+        itype = instance_type_for(gpu_class, count)
+    except UnsupportedGpuError:
+        return []
+    # price_cents_per_hour is per INSTANCE (all N cards); Candidate.hourly_usd is contractually
+    # per-card, so divide. Without this an N-card box prices N^2 and the allocator never picks it.
+    rate = (
+        hourly_rate(
+            gpu_class,
+            gpu_count=count,
+            **deadline_kwargs(hourly_rate, deadline_at),
+        )
+        / count
     )
     return [
         LambdaInstance(
@@ -99,6 +121,7 @@ def usable_instances(
             region=region,
             vram_gb=info.vram_gb,
             price_usd_hr=rate,
+            gpu_count=count,
         )
         for region in lambda_api.regions_with_capacity(
             itype,
@@ -495,9 +518,14 @@ def submit_run_lambda(
         raise lambda_api.LambdaApiError(
             f"submit_run_lambda needs a concrete gpu class, got {spec.gpu.type!r}"
         )
+    from flash.spec import gpu_count_of
+
     absolute_deadline = require_deadline_at(deadline_at)
+    # rent the SHAPE the allocator chose: the worker spawns gpu.count ranks, so a single-card box
+    # here would oversubscribe one card with n ranks while billing for n.
     instances = usable_instances(
         spec.gpu.type,
+        gpu_count=gpu_count_of(spec),
         **deadline_kwargs(usable_instances, absolute_deadline),
     )
     handle = launch_and_submit(

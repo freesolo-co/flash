@@ -1250,33 +1250,6 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     )
 
 
-# providers that actually provision gpu.count cards on ONE machine. runpod forwards gpu_count into
-# its endpoint payload; vast's num_gpus search filter has no caller and every lambda instance type is
-# hardcoded gpu_1x_*, so a count > 1 spec there rents a SINGLE card while the trainer spawns n ranks.
-_MULTI_GPU_PROVIDERS: frozenset[str] = frozenset({"runpod"})
-
-
-def _require_supported_gpu_count(spec: JobSpec) -> None:
-    """reject gpu.count > 1 unless the provider actually rents n cards.
-
-    every backend shards now (the verl workers launch nproc-per-node == gpu.count ranks and set
-    ulysses sequence parallelism), so only the provider half remains: vast/lambda ignore the count
-    entirely, so an n-rank trainer would land on a single rented card and fail or thrash while
-    gpu.count billed for n.
-    """
-    count = getattr(spec.gpu, "count", 1)
-    if count <= 1:
-        return
-    provider = (getattr(spec.gpu, "provider", "") or "").strip().lower()
-    if provider not in _MULTI_GPU_PROVIDERS:
-        supported = ", ".join(sorted(_MULTI_GPU_PROVIDERS))
-        raise ValueError(
-            f"multi-gpu training (gpu.count={count}) requires an explicit gpu.provider that "
-            f"provisions multiple cards on one machine ({supported}); got "
-            f"{provider or 'unset'}. set gpu.count to 1 or pin gpu.provider"
-        )
-
-
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -1288,9 +1261,6 @@ def submit_job(
     prepared_job: PreparedJob | None = None,
 ) -> RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode."""
-    # fail closed on unsupported multi-gpu before any provisioning or billing (also in dry-run, so
-    # the user learns early). removed per-algorithm as each trainer gains sharding.
-    _require_supported_gpu_count(spec)
     prepared = prepared_job or prepare_job(
         spec,
         billing_context=billing_context,
@@ -1299,11 +1269,6 @@ def submit_job(
     )
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
-    # Re-gate on the EFFECTIVE worker spec: the check above validated the public ``spec``, but a caller
-    # can supply ``prepared_job`` whose worker_spec carries a different gpu.count, which is what
-    # allocation and training actually provision. Fail closed here too (dry-run included) so the
-    # mismatch can never provision or bill multiple cards.
-    _require_supported_gpu_count(worker_spec)
     estimated_cost_usd = prepared.estimated_cost_usd
     from flash.multimodal import preflight_validate_image_opd
 

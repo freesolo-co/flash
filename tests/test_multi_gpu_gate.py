@@ -1,9 +1,15 @@
-"""CPU tests for the multi-gpu submit gate: gpu.count > 1 needs a provider that actually rents n
-cards on one machine.
+"""CPU tests for multi-gpu parity: every provider rents n cards on one machine, none is special.
 
-Every phase shards now -- sft, grpo and opd all delegate to verl, whose workers launch
-nproc-per-node == gpu.count ranks -- so the backend half of this gate is gone and only the provider
-half can reject.
+There is no submit-time multi-gpu gate any more. Every phase shards (sft, grpo and opd all delegate
+to verl, whose workers launch nproc-per-node == gpu.count ranks) and all three providers can reach a
+real n-card box, so a rejection would have nothing left to reject. What replaces the gate is a
+contract each provider must hold up, and that is what these tests pin:
+
+  * a provider only ever OFFERS a count it can actually rent (``live_candidates``), and
+  * the submit path actually RENTS the count that was allocated.
+
+The second half is the one that costs money if it breaks: an allocated 4-card shape that rents one
+card still bills for four ranks' worth of wall time while oversubscribing a single card.
 """
 
 from __future__ import annotations
@@ -20,6 +26,74 @@ _STALE_BACKEND_ENV = {
     "opd": "FLASH_OPD_BACKEND",
 }
 
+_PROVIDERS = ("runpod", "lambda", "vast")
+# the only managed class all three providers stock. a parity test needs one class every provider can
+# actually provision, or the spec is rejected on catalog grounds before parity is ever exercised.
+_TRI_PROVIDER_GPU = "H100"
+
+
+# a fake Lambda catalog covering the counts the tests ask for. Lambda names the count in the type,
+# so 1x/2x/4x are three separate entries and an absent one means "Lambda does not sell that shape".
+def _fake_lambda_types() -> dict:
+    """A Lambda catalog stocking 1/2/4-card boxes of the tri-provider class.
+
+    Keys are derived through ``instance_type_for`` rather than spelled out, so the fixture cannot
+    drift from the real naming (the class is ``gpu_1x_h100_pcie``, not the ``_sxm5`` one might
+    guess) and quietly stock a catalog nothing ever looks up.
+    """
+    from flash.providers.lambdalabs.gpus import instance_type_for
+
+    return {
+        instance_type_for(_TRI_PROVIDER_GPU, n): {
+            # per INSTANCE, so a 4-card box lists at 4x the 1-card price
+            "instance_type": {"price_cents_per_hour": 300 * n},
+            "regions_with_capacity_available": [{"name": "us-west-1"}],
+        }
+        for n in (1, 2, 4)
+    }
+
+
+def _fake_vast_row(cards: int) -> dict:
+    """One verified-datacenter H100 offer carrying ``cards`` GPUs, priced for the WHOLE box."""
+    return {
+        "id": 100 + cards,
+        "gpu_name": "H100 SXM",
+        "gpu_ram": 81920,
+        "num_gpus": cards,
+        "dph_total": 2.0 * cards,
+        "cuda_max_good": 99.0,
+        "hosting_type": 1,
+        "verification": "verified",
+        "reliability2": 0.999,
+        "disk_space": 2000.0,
+        "inet_down": 5000.0,
+        "machine_id": 900 + cards,
+    }
+
+
+@pytest.fixture
+def all_providers_configured(monkeypatch):
+    """Enable lambda/vast AND stub their markets so a parity assertion really covers all three.
+
+    Two separate problems, both of which would otherwise turn a three-way parity test into a
+    runpod-only one. ``is_configured`` is keyed on an operator API key and this box carries only
+    RunPod's, so lambda/vast would fail on credentials. But a key alone sends the real client at the
+    network, which a CPU test must never do (and which fails here as a 404). So the catalog/market
+    calls are stubbed at their single entry points -- ``list_instance_types`` and ``search_offers``
+    -- leaving every line of the count-aware provider code under test and only the transport faked.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("LAMBDA_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("VAST_API_KEY", "test-key-not-used")
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _fake_lambda_types())
+    monkeypatch.setattr(
+        vast_api,
+        "search_offers",
+        lambda *a, num_gpus=1, **k: [_fake_vast_row(int(num_gpus))],
+    )
+
 
 def _spec(count: int, algorithm: str = "grpo", backend: str = "", provider: str = "runpod"):
     from flash.spec import JobSpec
@@ -34,116 +108,293 @@ def _spec(count: int, algorithm: str = "grpo", backend: str = "", provider: str 
     return JobSpec.from_dict(body)
 
 
-def test_gate_helper_allows_single_gpu():
-    from flash import runner
+def test_no_multi_gpu_gate_survives_anywhere():
+    """The runpod-only gate is gone from every layer it used to fire in.
 
-    # count == 1 is the default single-gpu path; must not raise.
-    assert runner._require_supported_gpu_count(_spec(1)) is None
+    Asserted by NAME across the source tree rather than by calling it: the gate had five call sites
+    (the two submit_job specs, the server route's two, and the recovery path), and a test that only
+    exercised one of them would pass while a survivor still rejected lambda/vast in production.
+    """
+    import pathlib
+
+    import flash
+
+    root = pathlib.Path(flash.__file__).parent
+    survivors = [
+        f"{path.relative_to(root)}:{n}"
+        for path in root.rglob("*.py")
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if "_require_supported_gpu_count" in line or "_MULTI_GPU_PROVIDERS" in line
+    ]
+    assert survivors == [], f"multi-gpu gate survives at {survivors}"
 
 
+@pytest.mark.parametrize("provider", _PROVIDERS)
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
-def test_gate_allows_multi_gpu_on_a_provider_that_rents_n_cards(algorithm):
-    # no phase has a selector left: run_sft, run_rl and run_opd all delegate to verl, whose worker
-    # launches nproc-per-node == gpu.count ranks. so multi-gpu needs no opt-in beyond the provider.
+def test_submit_accepts_multi_gpu_on_every_provider(
+    monkeypatch, all_providers_configured, provider, algorithm
+):
+    """No provider is special: a multi-gpu spec reaches preparation on all three.
+
+    dry_run stops before provisioning, so this asserts only that nothing rejects the shape up front.
+    """
     from flash import runner
 
-    assert runner._require_supported_gpu_count(_spec(4, algorithm)) is None
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        status = runner.submit_job(
+            _submittable(algorithm, count=4, provider=provider), dry_run=True
+        )
+        assert status is not None
 
 
 @pytest.mark.parametrize("stale", ["verl", "trl", "bogus"])
-@pytest.mark.parametrize("provider", ["runpod", "vast"])
-def test_a_stale_backend_key_changes_no_gate_outcome(stale, provider):
-    """A [worker_env] selector carried over from the trl era must not move this gate either way.
+@pytest.mark.parametrize("provider", _PROVIDERS)
+def test_a_stale_backend_key_changes_no_submit_outcome(
+    monkeypatch, all_providers_configured, stale, provider
+):
+    """A [worker_env] selector carried over from the trl era must not move the outcome either way.
 
-    Asserted as "same outcome as the identical spec WITHOUT the key" rather than as a fixed verdict:
-    a bare `is None` on a runpod spec passes no matter what the gate does with the key, since the
-    provider alone already decides it. Pairing against the no-key baseline on BOTH an accepting and
-    a rejecting provider is what makes the claim able to fail -- it breaks the moment the gate starts
-    reading worker_env, in either direction.
+    Asserted as "same outcome as the identical spec WITHOUT the key" rather than as a fixed verdict,
+    so it fails the moment anything starts reading worker_env again, in either direction.
     """
     from flash import runner
 
     def outcome(backend: str) -> str:
-        try:
-            runner._require_supported_gpu_count(
-                _spec(4, "grpo", backend=backend, provider=provider)
-            )
-        except ValueError as exc:
-            return f"rejected: {exc}"
-        return "allowed"
+        with tempfile.TemporaryDirectory() as tmp:
+            monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+            try:
+                runner.submit_job(
+                    _submittable("grpo", count=4, provider=provider, backend=backend),
+                    dry_run=True,
+                )
+            except ValueError as exc:
+                return f"rejected: {exc}"
+            return "allowed"
 
     assert outcome(stale) == outcome("")
 
 
-def test_gate_rejects_multi_gpu_on_providers_that_ignore_count():
-    from flash import runner
+@pytest.mark.parametrize("provider", _PROVIDERS)
+def test_provider_only_offers_counts_it_can_rent(all_providers_configured, provider):
+    """``live_candidates`` never advertises a shape the provider cannot actually rent.
 
-    # vast's num_gpus filter has no caller and lambda instance types are hardcoded gpu_1x_*, so a
-    # 4-rank verl trainer would land on ONE rented card. unset is rejected for the same reason.
-    for provider in ("vast", "lambda", ""):
-        with pytest.raises(ValueError, match=r"gpu\.provider"):
-            runner._require_supported_gpu_count(_spec(4, backend="verl", provider=provider))
-
-
-def test_submit_job_rejects_multi_gpu_at_boundary(monkeypatch):
-    from flash import runner
-
-    # the gate fires at the top of submit_job, before any provisioning or billing (even in dry-run).
-    with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-        with pytest.raises(ValueError, match=r"gpu\.provider"):
-            runner.submit_job(_spec(2, provider="vast"), dry_run=True)
-
-
-def test_submit_job_rejects_multi_gpu_prepared_worker_spec(monkeypatch):
-    from flash import runner
-    from flash.runner import PreparedJob
-
-    # a single-gpu public spec paired with a prepared_job whose EFFECTIVE worker_spec is multi-gpu must
-    # still be rejected: allocation and training provision the worker_spec, not the public spec.
-    with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-        prepared = PreparedJob(
-            public_spec=_spec(1),
-            worker_spec=_spec(2, provider="vast"),
-            estimated_cost_usd=0.0,
-        )
-        with pytest.raises(ValueError, match=r"gpu\.provider"):
-            runner.submit_job(_spec(1), dry_run=True, prepared_job=prepared)
-
-
-def test_run_training_gates_effective_spec_on_recovery():
-    import io
-
-    from flash.runner.lifecycle import _run_training
-
-    # recovery rebuilds the worker spec from a persisted snapshot and calls _run_training directly,
-    # bypassing submit_job's gate; the shared submit+recovery path must fail closed on a multi-gpu spec
-    # before any provisioning (the gate precedes the first get_status/allocation touch).
-    with pytest.raises(ValueError, match=r"gpu\.provider"):
-        _run_training(_spec(2, provider="vast"), io.StringIO(), prior_cost=0.0)
-
-
-def test_gate_message_names_the_field_that_enables_sharding():
-    from flash import runner
-
-    # the remaining rejection is the provider half, and gpu.provider is the field that fixes it. a
-    # message offering only "set gpu.count to 1" would leave multi-gpu undiscoverable, so assert the
-    # remedy travels with the rejection.
-    with pytest.raises(ValueError, match=r"gpu\.provider") as excinfo:
-        runner._require_supported_gpu_count(_spec(4, "grpo", provider="vast"))
-
-    message = str(excinfo.value)
-    assert "gpu.provider" in message
-    assert "runpod" in message, "the message must name a provider that actually rents n cards"
-
-
-def _submittable(algorithm: str, backend: str = ""):
-    """a spec that survives a full submit, unlike _spec (which only needs to reach the gate).
-
-    the gate raises before model/train validation, so the gate helper can use a fake model id and no
-    train table. recording the backend happens at the END of submit, so this one must be real.
+    Each provider reaches a count differently (runpod passes it at launch, lambda names it in the
+    instance type, vast has it baked into the offer), so the allocator cannot synthesise n-card
+    combinations on its own -- it must take what the provider reports. Counts are powers of two
+    because verl asserts ``num_attention_heads % sp_size == 0``, and every managed model's head
+    count is a power of two: a 3-card box would abort at step 0.
     """
+    from flash.providers import get_provider
+    from flash.providers.base import AllocationConstraints, rentable_gpu_counts
+
+    # spelled out rather than taken from rentable_gpu_counts: the providers call that same helper, so
+    # comparing candidates against it would compare the code to itself and could never disagree.
+    assert rentable_gpu_counts(4) == (4, 2, 1), "powers of two, largest first"
+
+    prov = get_provider(provider)
+    constraints = AllocationConstraints(disk_gb=100.0, max_wall_seconds=3600.0, max_gpu_count=4)
+    candidates = prov.live_candidates(24, constraints)
+    counts = {c.gpu_count for c in candidates}
+
+    assert counts <= {1, 2, 4}, (
+        f"{provider} offered {sorted(counts - {1, 2, 4})} cards, a shape verl cannot shard over "
+        f"(num_attention_heads % sp_size != 0 aborts at step 0)"
+    )
+    # the load-bearing half: a provider that quietly ignored the constraint and returned only
+    # single-card shapes would satisfy the subset check above without supporting multi-gpu at all.
+    assert max(counts) > 1, f"{provider} offered no multi-card shape at max_gpu_count=4"
+
+
+def test_single_card_constraint_yields_only_single_card_offers(all_providers_configured):
+    """max_gpu_count=1 must produce no multi-card candidate on any provider.
+
+    The pairing that makes the count-aware path failable: with the cap at 1 a provider that ignored
+    the constraint entirely would still look correct in the max_gpu_count=4 test above.
+    """
+    from flash.providers import available_providers, get_provider
+    from flash.providers.base import AllocationConstraints
+
+    checked = []
+    for name in available_providers():
+        prov = get_provider(name)
+        candidates = prov.live_candidates(24, AllocationConstraints(max_gpu_count=1))
+        assert candidates, f"{name} returned nothing, so it asserts nothing about the cap"
+        assert all(c.gpu_count == 1 for c in candidates), f"{name} ignored max_gpu_count=1"
+        checked.append(name)
+    # without this the loop would pass on a box where no provider is enabled, reporting coverage of
+    # three providers while having checked none.
+    assert checked == list(_PROVIDERS), f"expected all three providers enabled, checked {checked}"
+
+
+def test_lambda_names_the_card_count_in_the_instance_type():
+    """Lambda reaches an n-card box only by rewriting the count segment of the type name."""
+    from flash.providers.lambdalabs.gpus import instance_type_for
+
+    one = instance_type_for("H100")
+    assert one.startswith("gpu_1x_")
+    assert instance_type_for("H100", 4) == one.replace("gpu_1x_", "gpu_4x_", 1)
+    # count 1 must be byte-identical to the no-count call, or single-gpu runs change shape.
+    assert instance_type_for("H100", 1) == one
+
+
+def test_lambda_price_is_per_card_not_per_instance():
+    """``price_cents_per_hour`` prices the whole instance; ``Candidate.hourly_usd`` is per card.
+
+    Without the division an n-card box prices n^2 (the allocator re-multiplies by gpu_count via
+    total_hourly_usd) and would never be chosen -- a silent, permanent multi-gpu outage.
+    """
+    import flash.providers.lambdalabs.jobs as lj
+
+    seen: dict = {}
+
+    def fake_rate(name, *, gpu_count=1, **kwargs):
+        seen["count"] = gpu_count
+        return 4.0 * gpu_count  # a real 4-card instance costs 4x a 1-card instance
+
+    def fake_regions(itype, **kwargs):
+        return ["us-west-1"]
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("flash.providers.lambdalabs.pricing.hourly_rate", fake_rate)
+        monkey.setattr(lj.lambda_api, "regions_with_capacity", fake_regions)
+        four = lj.usable_instances("H100", gpu_count=4)
+    finally:
+        monkey.undo()
+    assert seen["count"] == 4, "the n-card instance type must be the one priced"
+    assert four, "no instance came back, so the rate assertion below would never run"
+    assert four[0].gpu_count == 4
+    assert four[0].price_usd_hr == pytest.approx(4.0), "per-card rate, not the instance total"
+
+
+def test_vast_price_is_per_card_not_per_offer():
+    """``dph_total`` prices the WHOLE offer; the per-card rate is what Candidate carries.
+
+    Same failure mode as lambda's: an undivided 4-card offer prices 4x too high and loses every
+    ranking, so multi-gpu on vast would look supported and never actually be selected.
+    """
+    import flash.providers.vast.jobs as vj
+
+    row = {
+        "id": 1,
+        "gpu_name": "H100 SXM",
+        "gpu_ram": 81920,
+        "num_gpus": 4,
+        "dph_total": 8.0,  # whole 4-card box
+        "cuda_max_good": 99.0,
+        "hosting_type": 1,
+        "verification": "verified",
+        "reliability2": 0.999,
+        "disk_space": 500.0,
+        "inet_down": 5000.0,
+        "machine_id": 7,
+    }
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(vj.vast_api, "search_offers", lambda *a, **k: [row])
+        offers = vj.usable_offers(80, 100.0, num_gpus=4)
+    finally:
+        monkey.undo()
+    assert offers, "a fitting verified 4-card offer must survive the filter"
+    assert offers[0].gpu_count == 4
+    assert offers[0].dph_total == pytest.approx(2.0), "per-card rate, not the offer total"
+
+
+def test_vast_rejects_an_offer_whose_card_count_disagrees():
+    """A row that does not carry the requested count is dropped client-side.
+
+    The server-side num_gpus filter is an {"eq": n} query, but the count divides dph_total into the
+    per-card rate -- trusting it would mis-price a mismatched row by exactly the ratio of counts.
+    """
+    import flash.providers.vast.jobs as vj
+
+    row = {
+        "id": 1,
+        "gpu_name": "H100 SXM",
+        "gpu_ram": 81920,
+        "num_gpus": 1,  # server ignored the filter
+        "dph_total": 8.0,
+        "cuda_max_good": 99.0,
+        "hosting_type": 1,
+        "verification": "verified",
+        "reliability2": 0.999,
+        "disk_space": 500.0,
+        "inet_down": 5000.0,
+        "machine_id": 7,
+    }
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(vj.vast_api, "search_offers", lambda *a, **k: [row])
+        assert vj.usable_offers(80, 100.0, num_gpus=4) == []
+        # the SAME row is accepted when the count matches, so the rejection is the count and not
+        # some other filter in the chain quietly failing.
+        assert vj.usable_offers(80, 100.0, num_gpus=1)
+    finally:
+        monkey.undo()
+
+
+def test_lambda_submit_requests_the_allocated_card_count():
+    """``submit_run_lambda`` must ask for gpu.count cards, not one.
+
+    This is the expensive half of the contract: the worker spawns gpu.count ranks regardless, so a
+    single-card rental oversubscribes one card while the run bills for the full wall time.
+    """
+    import flash.providers.lambdalabs.jobs as lj
+
+    seen: dict = {}
+
+    def fake_usable(gpu_class, force=False, *, gpu_count=1, **kwargs):
+        seen["count"] = gpu_count
+        raise lj.lambda_api.LambdaApiError("stop before launching")
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(lj, "usable_instances", fake_usable)
+        with pytest.raises(lj.lambda_api.LambdaApiError):
+            lj.submit_run_lambda(
+                _submittable("grpo", count=4, provider="lambda"),
+                42,
+                deadline_at=9_999_999_999.0,
+            )
+    finally:
+        monkey.undo()
+    assert seen["count"] == 4, "submit rented a shape other than the one allocated"
+
+
+def test_vast_submit_requests_the_allocated_card_count():
+    """``submit_run_vast`` must search for gpu.count cards, not one. Same billing exposure."""
+    import flash.providers.vast.jobs as vj
+
+    seen: dict = {}
+
+    def fake_offers(*args, num_gpus=1, **kwargs):
+        seen["count"] = num_gpus
+        raise vj.vast_api.VastApiError("stop before renting")
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(vj, "usable_offers", fake_offers)
+        with pytest.raises(vj.vast_api.VastApiError):
+            vj.submit_run_vast(
+                _submittable("grpo", count=4, provider="vast"),
+                42,
+                deadline_at=9_999_999_999.0,
+            )
+    finally:
+        monkey.undo()
+    assert seen["count"] == 4, "submit rented a shape other than the one allocated"
+
+
+def _submittable(
+    algorithm: str,
+    backend: str = "",
+    *,
+    count: int = 1,
+    provider: str = "runpod",
+    gpu: str = _TRI_PROVIDER_GPU,
+):
+    """a spec that survives a full submit, unlike a bare gate fixture."""
     from flash.spec import JobSpec
 
     train: dict = {"max_examples": 4}
@@ -152,7 +403,7 @@ def _submittable(algorithm: str, backend: str = ""):
     body: dict = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": algorithm,
-        "gpu": {"type": "H200", "count": 1, "provider": "runpod"},
+        "gpu": {"type": gpu, "count": count, "provider": provider},
         "train": train,
     }
     if backend:

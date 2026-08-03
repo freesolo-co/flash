@@ -84,9 +84,9 @@ def search_offers(
 ) -> list[dict]:
     """Rentable offers from verified datacenter hosts, cheapest first.
 
-    ``num_gpus`` filters to hosts advertising exactly that many cards on one machine (1 = the
-    historical single-card search). Threading it from the job spec is left to the multi-gpu
-    allocator work; callers default to 1 today.
+    ``num_gpus`` filters to hosts advertising exactly that many cards on one machine (1 = a
+    single-card search). Vast has no card-count parameter at create time -- the count is baked into
+    the offer -- so this filter is the only way to reach a multi-card box.
 
     ``min_duration_seconds`` applies Vast's ``duration`` filter (offer available for at least
     this long from now); prevents renting a short-lived offer that preempts mid-run. 0 = off.
