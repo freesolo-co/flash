@@ -37,11 +37,14 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
         "sft_configuring",
         "opd_configuring",
         "opd_filtering_prompts",
+        "opd_prompt_scan",
+        "opd_image_prep",
         "sft_initializing",
         "rl_initializing",
         "opd_initializing",
         "sft_finalizing",
         "rl_finalizing",
+        "opd_finalizing",
     }
 )
 # Mid-training the per-step checkpoint upload runs SYNCHRONOUSLY on the trainer thread (dev #445),
