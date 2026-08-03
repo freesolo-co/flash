@@ -105,14 +105,29 @@ def test_runconfig_preserves_old_positional_constructor():
     assert config.gpu_type == ""
 
 
-def test_estimate_reports_the_runs_provider():
-    # Provider is reported as configured: the default is "auto", and an explicit substrate is
-    # passed through unchanged.
+def test_provisional_estimate_preserves_auto_provider():
+    # Preparation stays offline: it cannot truthfully name a live substrate before allocation. The
+    # lifecycle replaces this provisional provider/count/rate from the selected candidate.
     assert estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10)).provider == "auto"
     assert (
         estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="runpod")).provider
         == "runpod"
     )
+
+
+def test_explicit_lambda_quote_uses_lambda_offline_list_price():
+    estimate = estimate_cost(
+        RunConfig(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            10,
+            provider="lambda",
+            gpu_type="B200",
+        )
+    )
+
+    assert estimate.provider == "lambda"
+    assert estimate.gpu_hourly_usd == 6.99
 
 
 def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
@@ -124,7 +139,7 @@ def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
     assert exact.gpu_hourly_usd > unconstrained.gpu_hourly_usd
 
 
-def test_estimate_exact_h100_matches_cheapest_live_allocator_candidate(monkeypatch):
+def test_selected_candidate_replaces_the_provisional_quote(monkeypatch):
     from flash.providers import allocator, get_provider
     from flash.providers.base import Candidate
     from flash.providers.lambdalabs import api as lambda_api
@@ -142,6 +157,11 @@ def test_estimate_exact_h100_matches_cheapest_live_allocator_candidate(monkeypat
         return 2.49
 
     monkeypatch.setattr(lambda_api, "instance_type_price_usd_hr", advertised_price)
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *args, **kwargs: {"gpu_1x_h100_pcie": {}},
+    )
     monkeypatch.setattr(lambda_api, "regions_with_capacity", lambda *args, **kwargs: [])
 
     config = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100")
@@ -155,7 +175,7 @@ def test_estimate_exact_h100_matches_cheapest_live_allocator_candidate(monkeypat
         gpu_type=config.gpu_type,
         model_revision=config.model_revision,
     )
-    estimate = estimate_cost(config)
+    estimate = estimate_cost(config, allocation=allocation)
 
     assert "gpu_1x_h100_pcie" in advertised
     assert (allocation.provider, allocation.gpu, allocation.hourly_usd) == (
@@ -207,30 +227,24 @@ def test_runconfig_from_spec_preserves_gpu_constraints():
     assert config.disk_gb == 200.0
 
 
-def test_estimate_exact_auto_threads_disk_floor_into_allocation(monkeypatch):
-    # The exact-auto quote must allocate at the run's real disk floor (parity with the launch allocate
-    # call) so the persisted quote reflects the disk the run is actually provisioned with, not 0.
-    from types import SimpleNamespace
-
+def test_quote_preparation_never_calls_live_allocate(monkeypatch):
+    """A market/API failure belongs to the retrying lifecycle, never quote preparation."""
     import flash.providers.allocator as allocator_mod
 
-    seen: dict = {}
+    def explode(*_args, **_kwargs):
+        raise AssertionError("quote preparation called live allocate")
 
-    def fake_allocate(model_id, method, **kwargs):
-        seen.update(kwargs)
-        return SimpleNamespace(gpu="H100", provider="runpod", hourly_usd=3.29, min_vram_gb=80)
-
-    monkeypatch.setattr(allocator_mod, "allocate", fake_allocate)
-    estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100", disk_gb=200.0))
-    assert seen["disk_gb"] == 200.0
+    monkeypatch.setattr(allocator_mod, "allocate", explode)
+    estimate = estimate_cost(
+        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100", disk_gb=200.0)
+    )
+    assert estimate.gpu == "H100"
 
 
-def test_estimate_cost_vast_market_duration_mirrors_launch(monkeypatch):
-    # Cursor MuXiS: the Vast market duration filter used for pricing/GPU-selection must mirror
-    # usable_offers at LAUNCH, NOT the 60s-floored billing cap. Launch passes
-    # `spec.gpu.max_wall_seconds or 0.0` and treats a NON-POSITIVE wall as "no duration filter"; a
-    # positive one is floored at 60s inside usable_offers. So an explicit 0 must price with NO filter
-    # (0.0), not 60. Capture what reaches usable_offers for explicit-0 vs a positive wall.
+def test_vast_live_pricing_duration_mirrors_launch(monkeypatch):
+    # The live pricing API remains duration-aware when called explicitly; provisional run quoting no
+    # longer calls it because offer lookup is also a capacity lookup.
+    from flash.cost.facts import gpu_hourly_usd
     from flash.providers.vast import jobs as vast
     from flash.providers.vast import pricing
 
@@ -243,20 +257,14 @@ def test_estimate_cost_vast_market_duration_mirrors_launch(monkeypatch):
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     monkeypatch.setattr(vast, "usable_offers", fake_usable)
 
-    def market_walls(cfg) -> set[float]:
+    def market_walls(wall: float) -> set[float]:
         seen.clear()
-        monkeypatch.setattr(pricing, "_rates_cache", {"ts": 0.0, "data": None})  # isolate cache
-        estimate_cost(cfg)
+        monkeypatch.setattr(pricing, "_rates_cache", {"ts": 0.0, "data": None})
+        gpu_hourly_usd("H100", provider="vast", max_wall_seconds=wall)
         return set(seen)
 
-    # explicit 0 -> usable_offers gets 0.0 (NO duration filter), NOT the 60s-floored cap
-    assert market_walls(
-        RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="vast", max_wall_seconds=0)
-    ) == {0.0}
-    # a positive wall -> that wall reaches the market query (usable_offers floors at 60s itself)
-    assert market_walls(
-        RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="vast", max_wall_seconds=7200)
-    ) == {7200.0}
+    assert market_walls(0) == {0.0}
+    assert market_walls(7200) == {7200.0}
 
 
 def test_pick_gpu_vast_duration_bound_fetches_market_once(monkeypatch):
@@ -384,49 +392,34 @@ def test_gpu_hourly_usd_vast_exact_threads_class_constraint(monkeypatch):
     assert seen == ["A100 SXM 40GB", ""]
 
 
-def test_estimate_exact_vast_explicit_and_auto_use_same_live_class(monkeypatch):
-    from types import SimpleNamespace
-
-    from flash.providers import allocator
+def test_explicit_vast_quote_stays_offline(monkeypatch):
+    from flash.providers.base import get_gpu_info
     from flash.providers.vast import jobs as vast
 
-    seen: list[str] = []
-
-    def fake_usable(min_vram_gb, disk_gb, *args, gpu_type="", **kwargs):
-        seen.append(gpu_type)
-        return [SimpleNamespace(gpu="H100", dph_total=2.17)]
+    def explode(*args, **kwargs):
+        raise AssertionError("provisional quote queried Vast capacity")
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    monkeypatch.setattr(vast, "usable_offers", fake_usable)
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("vast",))
-
+    monkeypatch.setattr(vast, "usable_offers", explode)
     explicit = estimate_cost(
-        RunConfig(
-            "Qwen/Qwen3.5-0.8B",
-            "grpo",
-            10,
-            provider="vast",
-            gpu_type="H100",
-        )
+        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, provider="vast", gpu_type="H100")
     )
-    automatic = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100"))
+    assert (explicit.provider, explicit.gpu_hourly_usd) == (
+        "vast",
+        get_gpu_info("H100").hourly_usd,
+    )
 
-    assert (explicit.provider, explicit.gpu_hourly_usd) == ("vast", 2.17)
-    assert (automatic.provider, automatic.gpu_hourly_usd) == ("vast", 2.17)
-    assert seen == ["H100", "H100"]
 
-
-def test_estimate_auto_exact_vast_requires_constrained_live_capacity(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import CapacityLookupError
+def test_auto_quote_does_not_require_live_vast_capacity(monkeypatch):
     from flash.providers.vast import jobs as vast
 
-    monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    monkeypatch.setattr(vast, "usable_offers", lambda *args, **kwargs: [])
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("vast",))
+    def explode(*args, **kwargs):
+        raise AssertionError("provisional quote queried Vast capacity")
 
-    with pytest.raises(CapacityLookupError, match="currently has no capacity"):
-        estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100"))
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", explode)
+    estimate = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100"))
+    assert (estimate.provider, estimate.gpu) == ("auto", "H100")
 
 
 def test_a100_sxm_40gb_has_real_tflops_not_default():
@@ -449,61 +442,33 @@ def test_pick_gpu_vast_offline_falls_back_to_static(monkeypatch):
     assert gpu  # a fitting class is still chosen from the static fallback
 
 
-def test_estimate_exact_pinned_provider_routes_through_disk_aware_allocate(monkeypatch):
-    # regression (PR #538 finding 1): a PINNED provider + gpu_type must quote through the same
-    # disk-aware allocate path as launch, forwarding the pinned provider and the run's disk floor.
-    # pre-fix only provider="auto" + gpu_type took this path, so a pinned provider was quoted off the
-    # non-disk-aware gpu_hourly_usd branch and could misprice against the wrong class.
-    from types import SimpleNamespace
+def test_selected_live_candidate_overrides_provisional_provider_rate_and_count():
+    from flash.providers.base import Candidate
 
-    import flash.providers.allocator as allocator_mod
-
-    seen: dict = {}
-
-    def fake_allocate(model_id, method, **kwargs):
-        seen.update(kwargs)
-        return SimpleNamespace(gpu="H100", provider="runpod", hourly_usd=3.29, min_vram_gb=80)
-
-    monkeypatch.setattr(allocator_mod, "allocate", fake_allocate)
+    candidate = Candidate("vast", "H100", 2.17, 80, gpu_count=2)
     est = estimate_cost(
-        RunConfig(
-            "Qwen/Qwen3.5-0.8B", "grpo", 10, provider="runpod", gpu_type="H100", disk_gb=200.0
-        )
+        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100", gpu_count=8),
+        allocation=candidate,
     )
-    # the pinned provider and disk floor thread through to allocate (not "" and not 0).
-    assert seen["provider"] == "runpod"
-    assert seen["gpu_type"] == "H100"
-    assert seen["disk_gb"] == 200.0
-    # and the quote reflects the live allocation rather than a static gpu_hourly_usd lookup.
-    assert (est.provider, est.gpu, est.gpu_hourly_usd) == ("runpod", "H100", 3.29)
+    assert (est.provider, est.gpu, est.gpu_hourly_usd, est.gpu_count) == (
+        "vast",
+        "H100",
+        2.17,
+        2,
+    )
 
 
-def test_b200_compute_is_h200_class_and_never_cheaper_for_grpo(monkeypatch):
-    # regression: the estimator must not advertise b200 as faster/cheaper than h200 ON PEAK FLOPS.
-    # b200/sm100 training is h200-class (portable kernels), so its COMPUTE half must match h200's
+def test_b200_compute_is_h200_class_and_never_cheaper_for_grpo():
+    # regression: the estimator must not advertise b200 as faster/cheaper than h200 on peak flops.
+    # b200/sm100 training is h200-class (portable kernels), so its compute half must match h200's
     # exactly, and at its higher $/hr the run must never come out cheaper.
     #
-    # total step time is deliberately NOT asserted equal. the two classes have different measured
-    # per-run blocks (h200 762.4s vs b200 410.3s -- see facts._RUN_BLOCK_S), which is real wall time
-    # unrelated to peak flops: at matched g32/cap128 b200 realized 68-85 s/step against h200's
-    # 129-172 s. asserting equal totals here would re-encode the modelling gap this test predates.
-    from types import SimpleNamespace
-
-    import flash.providers.allocator as allocator_mod
+    # total step time is deliberately not asserted equal. the two classes have different measured
+    # per-run blocks (h200 762.4s vs b200 410.3s), which is real wall time unrelated to peak flops.
     from flash.cost.analytical import step_seconds_split
     from flash.cost.facts import gpu_hourly_usd
 
-    def alloc_as(gpu):
-        rate = gpu_hourly_usd(gpu)
-
-        def fake_allocate(model_id, method, **kwargs):
-            return SimpleNamespace(gpu=gpu, provider="runpod", hourly_usd=rate, min_vram_gb=80)
-
-        return fake_allocate
-
-    monkeypatch.setattr(allocator_mod, "allocate", alloc_as("H200"))
     h200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, gpu_type="H200"))
-    monkeypatch.setattr(allocator_mod, "allocate", alloc_as("B200"))
     b200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, gpu_type="B200"))
 
     assert gpu_hourly_usd("B200") > gpu_hourly_usd("H200")  # b200 is the pricier card
@@ -521,33 +486,59 @@ def test_b200_compute_is_h200_class_and_never_cheaper_for_grpo(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_second_card_bills_two_rates_against_a_shorter_wall():
-    """Two cards bill two per-card rates, but not for the same duration as one card.
-
-    This test previously asserted ``dual.train_seconds == single.train_seconds`` and a flat 2x on
-    total_usd. That encoded a defect as the contract: the wall really was card-invariant, so the
-    quote charged a second card for time it modelled as buying nothing, and one card always won a
-    job-cost ranking by construction. Sharding halves only the gpu-bound part of a step (the
-    teacher/reward/routing floor is paid on every card), so the honest expectation is 1x < total <
-    2x -- strictly more than one card, strictly less than naive linear.
-    """
+def test_offline_unpinned_estimate_does_not_bill_the_ceiling():
     single = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150))
-    dual = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=2))
+    wide = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=8))
     assert single.gpu_count == 1
-    assert dual.gpu_count == 2
-    # the per-card rate is what stays fixed; the wall is what a second card is supposed to move.
-    assert dual.gpu_hourly_usd == single.gpu_hourly_usd
-    assert dual.train_seconds < single.train_seconds
-    assert single.total_usd < dual.total_usd < 2 * single.total_usd
-    # the whole discrepancy is the wall: cost is still exactly rate x time x cards.
-    assert dual.total_usd == pytest.approx(dual.train_seconds / 3600.0 * dual.gpu_hourly_usd * 2)
+    assert wide.gpu_count == 1
+    # the offline estimate has no basis for charging the ceiling when one card fits. server-side
+    # submit uses allocate() and records the selected count instead.
+    assert wide.gpu_hourly_usd == single.gpu_hourly_usd
+    assert wide.train_seconds == pytest.approx(single.train_seconds)
+    assert wide.total_usd == pytest.approx(single.total_usd)
 
 
-def test_gpu_count_defaults_and_renders_in_breakdown():
-    est = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=2))
-    # the breakdown surfaces the multi-gpu shape (Nx prefix + per-card rate).
-    assert "2x" in est.breakdown()
-    assert "per card" in est.breakdown()
+def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
+    """`flash train --cost` must price a run that fits eight cards but no four-card shape."""
+    monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
+    config = RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=8)
+    estimate = estimate_cost(config)
+    assert estimate.required_vram_gb == 700
+    assert estimate.gpu_count == 8
+    with pytest.raises(ValueError, match="no GPU class fits"):
+        estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "sft", 1, gpu_count=4))
+
+
+def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
+    """A pinned revision must not receive an eight-card quote allocation will never honor."""
+    from flash.cost.analytical import _offline_gpu_shape
+
+    monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
+    config = RunConfig(
+        "Qwen/Qwen3.5-4B",
+        "sft",
+        1,
+        gpu_count=8,
+        model_revision="a" * 40,
+    )
+
+    with pytest.raises(ValueError, match="across up to 4 cards"):
+        _offline_gpu_shape(config)
+
+
+def test_allocator_selected_gpu_count_renders_and_applies_speedup():
+    from flash.providers.base import Candidate
+
+    config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=8)
+    one = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 1))
+    two = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
+    # the breakdown surfaces the selected multi-gpu shape and the persisted timing credits the
+    # measured sharding speedup instead of billing two cards for a one-card runtime.
+    assert "2x" in two.breakdown()
+    assert "per card" in two.breakdown()
+    assert two.seconds_per_step < one.seconds_per_step
+    assert two.train_seconds < one.train_seconds
+    assert two.total_usd < 2 * one.total_usd
 
 
 @pytest.mark.parametrize(("bad", "exc"), [(0, ValueError), (-1, ValueError), (True, TypeError)])

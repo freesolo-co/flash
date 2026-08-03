@@ -485,7 +485,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
             # authoritative seed 0 matches the literal seed threaded into _submit_seed_supervised below.
             "seed": 0,
             "run_id": run_id,
-            "train": {"epochs": 1, "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "max_examples": 1, "hf_repo": "owner/runs"},
             "gpu": gpu,
         }
     )

@@ -589,15 +589,16 @@ def test_sft_run_startup_reaches_the_token_budgeted_branch(monkeypatch):
 
 
 def test_extra_cards_shorten_the_quoted_wall():
-    """A billed card that buys no modelled time is a card charged for nothing.
+    """A selected billed card must shorten the modelled wall."""
+    from flash.providers.base import Candidate
 
-    total_usd multiplies by gpu_count, so if the wall were card-invariant the quote would rank one
-    card cheapest by construction rather than by any measurement. Regression for the state before
-    this change, where wall_s was bit-identical at 1/2/4 cards while cost scaled exactly 4.00x.
-    """
     for method in ("sft", "grpo", "opd"):
+        config = RunConfig(SMALL, method, 32, gpu_count=4)
         walls = [
-            estimate_cost(RunConfig(SMALL, method, 32, gpu_count=n)).wall_clock_seconds
+            estimate_cost(
+                config,
+                allocation=Candidate("probe", "H100", 3.29, 80, gpu_count=n),
+            ).wall_clock_seconds
             for n in (1, 2, 4)
         ]
         assert walls[1] < walls[0], f"{method}: a 2nd card must shorten the modelled wall"
@@ -606,12 +607,16 @@ def test_extra_cards_shorten_the_quoted_wall():
 
 def test_extra_cards_shorten_the_token_budgeted_wall():
     """train_tokens takes the other raw_train branch; sharding must reach it too."""
-    tokens = 2_000_000
+    from flash.providers.base import Candidate
+
+    config = RunConfig(SMALL, "sft", 32, gpu_count=2, train_tokens=2_000_000)
     one = estimate_cost(
-        RunConfig(SMALL, "sft", 32, gpu_count=1, train_tokens=tokens)
+        config,
+        allocation=Candidate("probe", "H100", 3.29, 80, gpu_count=1),
     ).wall_clock_seconds
     two = estimate_cost(
-        RunConfig(SMALL, "sft", 32, gpu_count=2, train_tokens=tokens)
+        config,
+        allocation=Candidate("probe", "H100", 3.29, 80, gpu_count=2),
     ).wall_clock_seconds
     assert two < one
 
@@ -682,9 +687,16 @@ def test_ranker_and_quote_price_a_combination_identically():
     # its realized per-step wall against the shared helper is what fails if the quote ever stops
     # calling it, which the ranker-side assertion above cannot see on its own.
     steps = 64
-    single = estimate_cost(RunConfig(MID, method, steps, gpu_count=1))
+    quote_config = RunConfig(MID, method, steps, gpu_count=4)
+    single = estimate_cost(
+        quote_config,
+        allocation=Candidate("probe", "H100", 3.29, 80, gpu_count=1),
+    )
     for n in (2, 4):
-        e = estimate_cost(RunConfig(MID, method, steps, gpu_count=n))
+        e = estimate_cost(
+            quote_config,
+            allocation=Candidate("probe", "H100", 3.29, 80, gpu_count=n),
+        )
         assert e.gpu == single.gpu, "same class, or the deltas below compare different hardware"
         # estimate_cost REDEFINES seconds_per_step as raw_train/steps, so it also carries the
         # per-run compile/startup/save blocks -- which do not shard. those are identical across

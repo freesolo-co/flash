@@ -20,7 +20,7 @@ _STATIC_RATES: dict[str, float] = {
 }
 
 
-def _static_rate(name: str) -> float:
+def static_hourly_rate(name: str) -> float:
     from flash.providers.base import get_gpu_info
 
     return _STATIC_RATES.get(name) or get_gpu_info(name).hourly_usd
@@ -61,4 +61,4 @@ def hourly_rate(gpu_name: str, *, gpu_count: int = 1, deadline_at: float | None 
                 return live
         except Exception as exc:
             logger.debug("live lambda pricing unavailable for %s (%s); using static", name, exc)
-    return _static_rate(name) * count
+    return static_hourly_rate(name) * count

@@ -435,9 +435,10 @@ SHARD_VRAM_EFFICIENCY = 0.85
 # individually hold this floor on top of its parameter shard, so tiny cards cannot fake a fit by
 # count alone (e.g. 4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
 REPLICATED_PER_CARD_GB = 8
-# combinations larger than this are never proposed: shard-efficiency loss and inter-card overhead
-# grow with count, and cost estimates get less reliable.
-MAX_COMBINATION_CARDS = 4
+# the public gpu.count maximum is 8, and every managed model's attention-head count is divisible by
+# 8. keep the allocator aligned with that contract so a live 8-card provider SKU is reachable rather
+# than silently clamping the authored ceiling to 4.
+MAX_COMBINATION_CARDS = 8
 
 
 def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
@@ -529,7 +530,7 @@ def provisional_gpu(
         )
     except UnsupportedGpuError as exc:
         if (algorithm or "").lower() == "opd":
-            cards = max(1, min(int(gpu_count), MAX_COMBINATION_CARDS))
+            cards = largest_rentable_count(gpu_count)
             biggest = max(
                 (
                     combined_vram_gb(g.vram_gb, cards)
@@ -653,6 +654,9 @@ class AllocationConstraints:
     disk_gb: float = 0.0
     max_wall_seconds: float = 0.0
     gpu_type: str = ""
+    # Whole-run fit floor before the allocator reduces it to a per-card market query. Capacity-aware
+    # providers use this to distinguish a missing rentable shape from a sold-out one.
+    required_vram_gb: int = 0
     # Ceiling on cards per machine the caller can use (1 = single-card only). Each provider reports
     # the counts it can ACTUALLY rent on one box, which differ in kind: RunPod takes a count
     # parameter, Lambda names the count in the instance type, Vast has it baked into the offer. The

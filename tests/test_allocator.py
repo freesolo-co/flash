@@ -1084,6 +1084,8 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             if need > max_managed_vram:
                 with pytest.raises(UnsupportedGpuError):
                     allocator.allocate(model_id, "opd", train=train)
+                # Cost preflight is deliberately offline so a capacity lookup cannot consume a
+                # lifecycle retry before the run exists. It still rejects the same impossible shape.
                 with pytest.raises(ValueError, match="no GPU class fits"):
                     estimate_cost(rc)
                 rejected.add((model_id, label))
