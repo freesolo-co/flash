@@ -106,17 +106,20 @@ def test_a_non_integer_gpus_is_refused_at_parse_time(bad, capsys):
     assert "--gpus" in capsys.readouterr().err
 
 
-def test_gpus_still_hits_the_multi_gpu_provider_gate(tmp_path):
-    from flash import runner
+@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
+def test_gpus_is_accepted_on_every_provider(tmp_path, provider):
+    """The flag carries no provider special-casing: 4 cards is a legal ask on all three.
 
-    # a convenient flag must not become a way AROUND the submit gate: vast/lambda ignore gpu_count,
-    # so 4 ranks would land on one rented card and be billed for four.
-    # H100 rather than the shared BASE's B200: vast does not list B200 at all, so that pairing
-    # would be rejected by the catalog before the multi-gpu gate this test is about.
-    vast = BASE.replace('type = "B200"', 'type = "H100"').replace("runpod", "vast")
-    spec = _spec(tmp_path, "--gpus", "4", config=vast)
-    with pytest.raises(ValueError, match=r"gpu\.provider"):
-        runner._require_supported_gpu_count(spec)
+    This replaces a test of the old RunPod-only submit gate. That gate existed because Lambda and
+    Vast ignored the count and would have landed 4 ranks on one rented card while billing for four;
+    both now rent the allocated shape (Lambda names the count in the instance type, Vast filters
+    offers by num_gpus), so rejecting the ask is no longer correct for any provider.
+
+    H100 rather than the shared BASE's B200: it is the one managed class all three stock, so the
+    spec is not rejected on catalog grounds before the count is ever considered.
+    """
+    config = BASE.replace('type = "B200"', 'type = "H100"').replace('"runpod"', f'"{provider}"')
+    assert _spec(tmp_path, "--gpus", "4", config=config).gpu.count == 4
 
 
 def test_the_help_does_not_promise_an_exact_card_count():

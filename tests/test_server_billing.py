@@ -529,24 +529,53 @@ def test_billable_dry_run_without_an_org_is_rejected_like_a_real_submit(api, mon
 
 
 def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, monkeypatch):
-    # gpu.count > 1 is unsupported at ANY balance, so 402 would send the user to top up over a spec
-    # that can never launch. submit_job rejects it too, but only after this point -- so with the
-    # precheck ahead of the gate, the payment error won the race and hid the real cause.
+    # a spec that cannot launch at ANY balance must say so: 402 would send the user to top up over a
+    # defect topping up cannot fix. submit_job runs the same gates, but only after this point, so
+    # with the precheck ahead of them the payment error won the race and hid the real cause.
+    #
+    # the example is image-bearing OPD on a multi-turn environment. it used to be gpu.count > 1,
+    # which is now legal on every provider -- the ORDERING is what this test is about, so it needs
+    # any spec that is still statically rejectable, not that particular one.
     import flash.server.billing as billing_mod
 
     def _block(**k):
         raise billing_mod.BillingError(402, "insufficient balance")
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
-    multi_gpu_spec = {**SPEC, "gpu": {**SPEC["gpu"], "count": 2}}
+    unsupported_spec = {
+        **SPEC,
+        # image-bearing OPD is single-turn only, so a multi-turn environment carrying an image
+        # record can never launch regardless of the org's balance.
+        "algorithm": "opd",
+        "environment": {
+            **SPEC["environment"],
+            "params": {
+                # multi_turn rides in params, not as an [environment] key: the spec schema rejects
+                # unknown top-level environment keys, and the validator reads either.
+                "multi_turn": True,
+                "records": [
+                    {
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
+                                ],
+                            }
+                        ]
+                    }
+                ],
+            },
+        },
+    }
     res = api.post(
         "/v1/runs",
-        json={"spec": multi_gpu_spec, "dry_run": True},
+        json={"spec": unsupported_spec, "dry_run": True},
         headers=_bearer("fslo-user-1"),
     )
 
     assert res.status_code == 400, res.text
-    assert "multi-gpu" in res.text
+    assert "single-turn" in res.text
     assert "insufficient" not in res.text
 
 
