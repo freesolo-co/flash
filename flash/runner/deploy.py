@@ -278,15 +278,13 @@ def cancel_run(run_id: str) -> RunStatus:
                 RuntimeError(f"run {run_id} cancellation fence was not persisted")
             )
 
-    if initial_status.remote:
-        _persist_cancellation_fence()
-
     deploy_lock = _deploy_lock(run_id)
     captured_contended_attempt: dict | None = None
     contended_active_attempt = False
     contended_predecessor: dict | None = None
     contended_predecessor_recommitted = False
     lock_acquired = deploy_lock.acquire(blocking=False)
+    requires_early_cancellation_fence = bool(initial_status.remote) or not lock_acquired
     try:
         if not lock_acquired:
             prelock_status = get_status(run_id)
@@ -364,7 +362,6 @@ def cancel_run(run_id: str) -> RunStatus:
                                 raise DeploymentStatePersistenceError(
                                     run_id, str(exc), backend_outcome="not_attempted"
                                 ) from exc
-            _persist_cancellation_fence()
             deploy_lock.acquire()
             lock_acquired = True
 
@@ -374,6 +371,8 @@ def cancel_run(run_id: str) -> RunStatus:
             server_db.revoke_teacher_capabilities_for_run(run_id)
         except Exception as exc:
             deferred_fencing_errors.append(exc)
+        if requires_early_cancellation_fence:
+            _persist_cancellation_fence()
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"
 
