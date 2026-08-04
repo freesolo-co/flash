@@ -15,7 +15,10 @@ from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.spec import (
+    MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
     RESERVED_WORKER_ENV_KEYS,
+    TEACHER_BROKER_URL_ENV,
+    TEACHER_CAPABILITY_ENV,
     JobSpec,
     require_matching_seed,
     validate_worker_env_reserved,
@@ -229,6 +232,14 @@ def build_worker_env(
     """Per-run env passed to the worker (platform creds + recipe overrides)."""
     canonical_seed = require_matching_seed(spec, seed)
     validate_worker_env_reserved(spec.worker_env)
+    declared_managed_credentials = sorted(
+        set(spec.environment.secrets) & MANAGED_TEACHER_CREDENTIAL_ENV_KEYS
+    )
+    if declared_managed_credentials:
+        raise ValueError(
+            "environment secrets must not include managed teacher credential names: "
+            + ", ".join(declared_managed_credentials)
+        )
     # GRPO and OPD run a verl vLLM rollout (`actor_rollout_ref.rollout.name=vllm`), and verl leaves
     # rollout.enable_sleep_mode defaulted True, so the engine always builds a CuMemAllocator -- which
     # asserts outright on "expandable_segments:True" (vllm/device_allocator/cumem.py:132,
@@ -298,12 +309,20 @@ def build_worker_env(
     resume_revision = (runtime_secrets or {}).get(OPD_RESUME_REVISION_ENV)
     if resume_revision:
         env[OPD_RESUME_REVISION_ENV] = str(resume_revision)
-    # The opd GLM teacher key is a platform-owned credential injected from the control-plane env for
-    # opd runs — like HF_TOKEN/GITHUB_TOKEN above, not a user secret. Set it LAST so the platform
-    # value is authoritative: bring-your-own teacher keys are not supported, so no user-routed
-    # runtime_secret can override it.
-    if str(getattr(spec, "algorithm", "")).lower() == "opd" and os.environ.get("FIREWORKS_API_KEY"):
-        env["FIREWORKS_API_KEY"] = os.environ["FIREWORKS_API_KEY"]
+
+    # managed teacher provider credentials stay control-plane-only even if a caller declares or
+    # supplies the same names as runtime secrets. opd receives only its attempt-scoped broker transport.
+    for key in MANAGED_TEACHER_CREDENTIAL_ENV_KEYS:
+        env.pop(key, None)
+    env.pop(TEACHER_BROKER_URL_ENV, None)
+    env.pop(TEACHER_CAPABILITY_ENV, None)
+    if str(getattr(spec, "algorithm", "")).lower() == "opd":
+        broker_url = str((runtime_secrets or {}).get(TEACHER_BROKER_URL_ENV) or "").strip()
+        capability = str((runtime_secrets or {}).get(TEACHER_CAPABILITY_ENV) or "").strip()
+        if not broker_url or not capability:
+            raise RuntimeError("managed opd teacher broker transport is missing")
+        env[TEACHER_BROKER_URL_ENV] = broker_url
+        env[TEACHER_CAPABILITY_ENV] = capability
     return env
 
 

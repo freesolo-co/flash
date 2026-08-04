@@ -33,7 +33,6 @@ class OpdKnobs:
     always sets every field explicitly — kept so partial construction stays ergonomic for tests."""
 
     teacher_model: str = ""
-    teacher_base_url: str = ""
     epochs: int = RECIPE.opd.num_epochs
     learning_rate: float = 0.0
     temperature: float = 0.0
@@ -82,15 +81,13 @@ def _resolve_opd_knobs() -> OpdKnobs:
     # the GLM 5.2 default). Parse already validated + canonicalized it, but JobSpec.from_dict is a
     # tolerant deserializer, so re-validate at this boundary (like the kl_coef guard above): resolve
     # is idempotent for a canonical model id, and a spec that reaches the worker with an unsupported
-    # teacher fails loudly here rather than as an opaque Fireworks 404 mid-run. base_url is shared by
-    # every allow-listed teacher (one Fireworks endpoint + one managed key), so it stays d.teacher_base_url.
+    # teacher fails loudly here rather than as an opaque broker scope rejection mid-run.
     try:
         teacher = resolve_teacher(opt("teacher_model", ""))
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e
     return OpdKnobs(
         teacher_model=teacher.model_id,
-        teacher_base_url=d.teacher_base_url,
         epochs=int(t.epochs) if t and t.epochs is not None else d.num_epochs,
         learning_rate=float(opt("learning_rate", 0) or d.learning_rate),
         temperature=float(

@@ -5047,8 +5047,11 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
     assert _resolve_image_token_id(SimpleNamespace(), fallback) == 42
 
 
-def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tmp_path):
+def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypatch, tmp_path):
     monkeypatch.setenv("FIREWORKS_API_KEY", "teacher-secret")
+    monkeypatch.setenv("PARASAIL_API_KEY", "parasail-secret")
+    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "capability-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     child = _build_opd_child_env(
@@ -5080,6 +5083,9 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "FIREWORKS_API_KEY" not in child
+    assert "PARASAIL_API_KEY" not in child
+    assert "FLASH_TEACHER_BROKER_URL" not in child
+    assert "FLASH_TEACHER_CAPABILITY" not in child
     assert "HF_TOKEN" not in child
     assert "FLASH_OPD_STRUCTURED_OUTPUTS" not in child
     assert "FLASH_OPD_MODEL_VOCAB_SIZE" not in child
@@ -5457,10 +5463,18 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             payload["worker_env"] = worker_env
         return JobSpec.from_dict(payload)
 
+    teacher_runtime = {
+        "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+        "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+    }
     for worker_env in (None, {"FLASH_OPD_BACKEND": "trl"}, {"FLASH_OPD_BACKEND": "bogus"}):
         spec = _spec(worker_env)
         assert spec.phase == "opd"
-        alloc = build_worker_env(spec, spec.seed)["PYTORCH_CUDA_ALLOC_CONF"]
+        alloc = build_worker_env(
+            spec,
+            spec.seed,
+            runtime_secrets=teacher_runtime,
+        )["PYTORCH_CUDA_ALLOC_CONF"]
         assert "expandable_segments" not in alloc, (worker_env, alloc)
 
     # sft is verl-only too, but it builds no rollout engine at all, so expandable segments stay.
@@ -5674,7 +5688,7 @@ def test_stalled_thread_probe_reports_a_thread_that_is_gone_instead_of_raising()
     assert plugin._describe_stalled_thread(None) == "stack unavailable"
 
 
-def test_opd_missing_managed_teacher_key_fails_before_the_gpu_probe(monkeypatch):
+def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypatch):
     """A missing managed teacher key must fail before any paid GPU work starts.
 
     Ported from the TRL OPD suite (`test_opd_missing_teacher_key_raises_platform_managed_error`),
@@ -5732,9 +5746,10 @@ def test_opd_missing_managed_teacher_key_fails_before_the_gpu_probe(monkeypatch)
     )
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
     monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
-    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    monkeypatch.delenv("FLASH_TEACHER_BROKER_URL", raising=False)
+    monkeypatch.delenv("FLASH_TEACHER_CAPABILITY", raising=False)
 
-    with pytest.raises(RuntimeError, match="managed teacher api key is missing"):
+    with pytest.raises(RuntimeError, match="managed teacher broker transport is missing"):
         opd_mod.run_opd_train()
 
 

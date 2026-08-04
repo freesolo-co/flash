@@ -173,11 +173,11 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Optional pieces
 
-| Variable               | Effect if unset                                                                                                                                                                                                             |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GITHUB_TOKEN`         | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                                                       |
-| `FIREWORKS_API_KEY`    | On-policy distillation (`opd`) runs fail inside the worker, after allocating and billing a GPU. Not covered by the startup preflight - set it before running opd. `sft` and `grpo` do not use it.                           |
-| `FREESOLO_SERVING_URL` | In standalone mode `flash deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app - and refuse the same way if you point it AT that app. Training is unaffected. See below. |
+| Variable                                         | Effect if unset                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITHUB_TOKEN`                                   | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                                                                                                                                                                  |
+| `FLASH_TEACHER_BROKER_URL` + `FIREWORKS_API_KEY` | Required only for on-policy distillation (`opd`). The URL must be the worker-reachable HTTPS origin for this control plane. Missing configuration rejects the attempt before GPU creation. The Fireworks key remains control-plane-only; workers receive a revocable per-attempt capability instead. `sft` and `grpo` receive neither. |
+| `FREESOLO_SERVING_URL`                           | In standalone mode `flash deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app - and refuse the same way if you point it AT that app. Training is unaffected. See below.                                                                                                            |
 
 ## Serving
 

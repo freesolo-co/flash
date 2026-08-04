@@ -1,7 +1,7 @@
-"""Fireworks-hosted teacher client for on-policy distillation.
+"""Managed teacher-broker client for on-policy distillation.
 
-Reaches the GLM-5.2 teacher over the OpenAI-compatible API using only the Python standard library (no
-``openai``/``requests`` dependency — the worker runs on stdlib here). One operation:
+Reaches the control-plane broker using only the Python standard library. The worker receives an
+attempt-scoped bearer capability and never receives the upstream Fireworks credential. One operation:
 
 - ``score``: echo-score a student completion (``echo=true, logprobs=1, max_tokens=0``) to get the
   teacher's per-token REALIZED logprobs + CHARACTER offsets over the completion region only. This is
@@ -17,6 +17,7 @@ import io
 import json
 import math
 import os
+import secrets
 import threading
 import time
 import urllib.error
@@ -26,6 +27,7 @@ import urllib.request
 from flash.engine.worker.tokenizer_align import TeacherToken
 
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
+_PREDISPATCH_RETRYABLE_BROKER_CODES = frozenset({"broker_busy", "provider_unavailable"})
 
 
 class TeacherError(RuntimeError):
@@ -370,19 +372,23 @@ def _validate_multimodal_echo(
 class TeacherClient:
     def __init__(
         self,
-        api_key: str,
-        base_url: str,
+        capability: str,
+        broker_url: str,
         model: str,
         *,
         timeout: float = 90.0,
         max_retries: int = 4,
     ) -> None:
-        if not api_key:
+        if not capability:
             raise TeacherError(
-                "no teacher API key (FIREWORKS_API_KEY) available on the worker", permanent=True
+                "no managed teacher capability available on the worker", permanent=True
             )
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        if not broker_url:
+            raise TeacherError(
+                "no managed teacher broker URL available on the worker", permanent=True
+            )
+        self.capability = capability
+        self.base_url = broker_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
@@ -390,10 +396,12 @@ class TeacherClient:
 
     # -- transport -------------------------------------------------------------------------------
     def _post(self, path: str, body: dict) -> dict:
-        data = json.dumps(body).encode()
+        data = json.dumps(body, allow_nan=False, separators=(",", ":")).encode()
+        request_id = secrets.token_urlsafe(24)
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.capability}",
             "Content-Type": "application/json",
+            "X-Flash-Teacher-Request-Id": request_id,
         }
         last_err: Exception | None = None
         for attempt in range(self.max_retries):
@@ -405,36 +413,52 @@ class TeacherClient:
             try:
                 with self._transport.urlopen(req, timeout=timeout) as resp:
                     return json.loads(resp.read().decode())
-            except urllib.error.HTTPError as e:
-                # HTTP response bodies may contain arbitrary private provider text. Classify only from
-                # the structural status and request path, which are sufficient for retry policy.
-                retryable = e.code in (408, 409, 425, 429, 500, 502, 503, 504)
-                classification = "retryable" if retryable else "permanent"
-                last_err = TeacherError(
-                    f"teacher HTTP {e.code} on {path} ({classification})",
+            except urllib.error.HTTPError as error:
+                code = "broker_http_error"
+                broker_classification = "permanent"
+                try:
+                    payload = json.loads(error.read(64 * 1024 + 1).decode("utf-8"))
+                    broker_error = payload.get("error") if isinstance(payload, dict) else None
+                    if isinstance(broker_error, dict):
+                        raw_code = broker_error.get("code")
+                        classification = broker_error.get("classification")
+                        if isinstance(raw_code, str) and raw_code:
+                            code = raw_code
+                        if classification in {"permanent", "transient"}:
+                            broker_classification = classification
+                except (
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    OSError,
+                    http.client.IncompleteRead,
+                ):
+                    pass
+                retryable = (
+                    broker_classification == "transient"
+                    and code in _PREDISPATCH_RETRYABLE_BROKER_CODES
+                )
+                effective_classification = "transient" if retryable else "permanent"
+                broker_error = TeacherError(
+                    f"teacher broker HTTP {error.code} for {request_id} on {path}: "
+                    f"{code} ({effective_classification})",
                     permanent=not retryable,
                 )
-                if not retryable:  # bad key (401/403) / model id (404) / bad request (400)
-                    raise last_err from None
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
-                last_err = TeacherError(f"teacher transport error on {path}: {e}")
-            except http.client.IncompleteRead as e:
-                # The server sent an HTTP 200 header but the body was truncated mid-read() (dropped
-                # connection / short Content-Length). IncompleteRead is an http.client.HTTPException,
-                # NOT an OSError, so without this clause it escapes the retry loop. A stream of truncated
-                # 200s could then burn every OPD step and fail as a permanent no-signal run instead of
-                # retrying. Classify as TRANSIENT teacher infra, like the unparseable-body case below
-                # (codex[bot]).
-                last_err = TeacherError(f"teacher HTTP 200 body truncated mid-read on {path}: {e}")
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                # HTTP 200 with a malformed / non-JSON body (a flaky proxy or gateway returning an
-                # error page under a 200, a truncated read). The teacher contract is 200 => JSON, so
-                # classify this as TRANSIENT teacher infra: retry in the loop, and if it persists the
-                # exhausted last_err surfaces as a TeacherError -- NOT a raw JSONDecodeError, so a run
-                # hammered by malformed 200s is retried as teacher infra instead of failing as permanent
-                # no-signal.
+                if retryable:
+                    last_err = broker_error
+                else:
+                    raise broker_error from None
+            except (urllib.error.URLError, TimeoutError, OSError) as error:
                 last_err = TeacherError(
-                    f"teacher returned HTTP 200 with unparseable body on {path}: {e}"
+                    f"teacher broker transport error for {request_id} on {path}: "
+                    f"{type(error).__name__}"
+                )
+            except http.client.IncompleteRead:
+                last_err = TeacherError(
+                    f"teacher broker response was truncated for {request_id} on {path}"
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                last_err = TeacherError(
+                    f"teacher broker returned an unparseable response for {request_id} on {path}"
                 )
             if attempt + 1 >= self.max_retries:
                 break
@@ -446,7 +470,7 @@ class TeacherClient:
                 delay = min(delay, remaining)
             if delay > 0:
                 time.sleep(delay)
-        raise last_err or TeacherError(f"teacher call to {path} failed")
+        raise last_err or TeacherError(f"teacher broker call to {path} failed")
 
     # -- echo scoring (gkd) ----------------------------------------------------------------------
     def score_many(self, items: list[tuple[str, str]]) -> list[list[TeacherToken]]:
@@ -461,7 +485,7 @@ class TeacherClient:
         fulls = [prompt_text + completion_text for prompt_text, completion_text in items]
         plens = [len(prompt_text) for prompt_text, _completion_text in items]
         resp = self._post(
-            "/completions",
+            "/v1/teacher/completions",
             {
                 "model": self.model,
                 "prompt": fulls if len(fulls) > 1 else fulls[0],
@@ -517,7 +541,7 @@ class TeacherClient:
         completions = [completion_text for _prompt_text, completion_text, _images in items]
         images = [list(item_images) for _prompt, _completion, item_images in items]
         resp = self._post(
-            "/completions",
+            "/v1/teacher/completions",
             {
                 "model": self.model,
                 "prompt": fulls if len(fulls) > 1 else fulls[0],

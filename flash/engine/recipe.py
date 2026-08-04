@@ -7,12 +7,6 @@ from dataclasses import dataclass, field
 # Keep in sync with catalog.DEFAULT_MODEL.
 HF_MODEL_ID = "Qwen/Qwen3.5-4B"
 
-# The single Fireworks OpenAI-compatible endpoint every managed OPD teacher is reached over. ONE
-# base_url + ONE platform-managed FIREWORKS_API_KEY authorize every teacher below (all are Fireworks
-# serverless models), so selecting a teacher swaps only the ``model`` string the TeacherClient sends —
-# no new secret, no per-teacher base_url.
-TEACHER_BASE_URL = "https://api.fireworks.ai/inference/v1"
-
 
 @dataclass(frozen=True)
 class TeacherModel:
@@ -136,10 +130,9 @@ class OPDConfig:
     reverse-KL loss (the collinear-ai spider / Tinker cross-tokenizer method) trains the student."""
 
     # The DEFAULT teacher (GLM 5.2), used when [train] omits teacher_model. The teacher is now
-    # selectable from the managed TEACHER_MODELS allow-list via [train].teacher_model; its Fireworks
-    # key + base_url stay platform-managed (one key authorizes every allow-listed model).
+    # selectable from the managed teacher_models allow-list via [train].teacher_model; the control
+    # plane broker owns provider routing and credentials for every allow-listed model.
     teacher_model: str = TEACHER_MODELS[DEFAULT_TEACHER_ALIAS].model_id
-    teacher_base_url: str = TEACHER_BASE_URL
     learning_rate: float = 1e-5
     max_prompt_len: int = 1024
     max_completion_len: int = 512

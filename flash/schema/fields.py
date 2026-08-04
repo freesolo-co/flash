@@ -11,6 +11,7 @@ from flash.envs.adapter import is_freesolo_environment_id
 from flash.spec import (
     CREDIT_ASSIGNMENTS,
     DEFAULT_CREDIT_ASSIGNMENT,
+    RESERVED_WORKER_ENV_KEYS,
     CreditAssignment,
     WandbSpec,
     validate_worker_env_reserved,
@@ -305,10 +306,7 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
         "GITHUB_TOKEN",
         "FREESOLO_API_KEY",
         "FREESOLO_INTERNAL_KEY",
-        "RUN_ID",
-        "HF_REPO",
-        "FLASH_ARM",
-        "SEED",
+        *RESERVED_WORKER_ENV_KEYS,
     }
 )
 

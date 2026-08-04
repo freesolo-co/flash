@@ -74,9 +74,15 @@ def _offline(monkeypatch):
     # credential. Every test that wants the var sets it itself after this fixture.
     from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 
-    for _key in {"FREESOLO_API_KEY", "LAMBDA_API_KEY", "VAST_API_KEY"} | set(
-        DEFAULT_RUNTIME_SECRET_KEYS
-    ):
+    for _key in {
+        "FREESOLO_API_KEY",
+        "LAMBDA_API_KEY",
+        "VAST_API_KEY",
+        "FIREWORKS_API_KEY",
+        "PARASAIL_API_KEY",
+        "FLASH_TEACHER_BROKER_URL",
+        "FLASH_TEACHER_CAPABILITY",
+    } | set(DEFAULT_RUNTIME_SECRET_KEYS):
         monkeypatch.delenv(_key, raising=False)
 
     # RunPod is OVERWRITTEN, not deleted: same hygiene (no operator key ever reaches a test) with

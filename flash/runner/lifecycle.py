@@ -749,6 +749,15 @@ def _submit_seed_supervised(
     # attempt (post-restart recovery), so resolving now could pin a commit different from the one
     # that attempt used; _pin_environment_for_run fails closed on that.
     spec = _pin_environment_for_run(spec, log, attempt_started=attempt_start > 0)
+    if spec.algorithm == "opd":
+        from flash.server.teacher_broker import require_teacher_broker_configuration
+
+        # configuration and absolute policy fail before allocation can create a paid worker.
+        require_teacher_broker_configuration(spec)
+        require_teacher_broker_configuration(
+            spec,
+            deadline_at=_load_run_deadline_at(spec.run_id),
+        )
     for local_attempt in range(retry_budget.max_attempts):
         attempt = attempt_start + local_attempt
         try:
@@ -1009,17 +1018,25 @@ def _submit_seed_supervised(
                         raise _cancel()
                     provider = get_provider(chosen.provider)
                     try:
-                        submit_kwargs = {
-                            "log": log,
-                            "on_handle": on_handle,
-                            "attempt": attempt,
-                            "on_last_gpu": on_last_gpu,
-                            "code_prefix": code_prefix,
-                            "_deadline_at": _load_run_deadline_at(spec.run_id),
-                        }
-                        if attempt_runtime_secrets:
-                            submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
-                        res = provider.submit_run(run_spec, seed, **submit_kwargs)
+                        from flash.server.teacher_broker import teacher_attempt_transport
+
+                        with teacher_attempt_transport(
+                            run_spec,
+                            attempt=attempt,
+                            deadline_at=_load_run_deadline_at(spec.run_id),
+                        ) as teacher_secrets:
+                            attempt_runtime_secrets.update(teacher_secrets)
+                            submit_kwargs = {
+                                "log": log,
+                                "on_handle": on_handle,
+                                "attempt": attempt,
+                                "on_last_gpu": on_last_gpu,
+                                "code_prefix": code_prefix,
+                                "_deadline_at": _load_run_deadline_at(spec.run_id),
+                            }
+                            if attempt_runtime_secrets:
+                                submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
+                            res = provider.submit_run(run_spec, seed, **submit_kwargs)
                     except _TerminalHandleRace:
                         raise
                     except Exception as exc:

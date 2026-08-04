@@ -192,8 +192,20 @@ def parse_max_steps(value: Any) -> int | None:
     return value if value > 0 else None
 
 
+TEACHER_BROKER_URL_ENV = "FLASH_TEACHER_BROKER_URL"
+TEACHER_CAPABILITY_ENV = "FLASH_TEACHER_CAPABILITY"
+MANAGED_TEACHER_CREDENTIAL_ENV_KEYS = frozenset({"FIREWORKS_API_KEY", "PARASAIL_API_KEY"})
 RESERVED_WORKER_ENV_KEYS = frozenset(
-    {"RUN_ID", "HF_REPO", "FLASH_ARM", "SEED", OPD_RESUME_REVISION_ENV}
+    {
+        "RUN_ID",
+        "HF_REPO",
+        "FLASH_ARM",
+        "SEED",
+        OPD_RESUME_REVISION_ENV,
+        TEACHER_BROKER_URL_ENV,
+        TEACHER_CAPABILITY_ENV,
+        *MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
+    }
 )
 
 

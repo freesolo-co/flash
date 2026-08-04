@@ -1,9 +1,10 @@
-"""SQLite store for the managed control plane: API keys + run ownership."""
+"""SQLite store for control-plane keys, run ownership, and teacher capabilities."""
 
 from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -26,6 +27,55 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
+CREATE TABLE IF NOT EXISTS teacher_capabilities (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_hash            TEXT NOT NULL UNIQUE,
+  run_id                TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  attempt               INTEGER NOT NULL,
+  teacher_alias         TEXT NOT NULL,
+  provider              TEXT NOT NULL,
+  model                 TEXT NOT NULL,
+  scoring_mode          TEXT NOT NULL,
+  expires_at            REAL NOT NULL,
+  revoked_at            REAL,
+  max_requests          INTEGER NOT NULL,
+  max_score_items       INTEGER NOT NULL,
+  max_request_bytes     INTEGER NOT NULL,
+  max_response_bytes    INTEGER NOT NULL,
+  max_concurrency       INTEGER NOT NULL,
+  max_upstream_attempts INTEGER NOT NULL,
+  max_request_tokens    INTEGER NOT NULL,
+  max_total_tokens      INTEGER NOT NULL,
+  request_count         INTEGER NOT NULL DEFAULT 0,
+  score_item_count      INTEGER NOT NULL DEFAULT 0,
+  token_count           INTEGER NOT NULL DEFAULT 0,
+  in_flight             INTEGER NOT NULL DEFAULT 0,
+  created_at            REAL NOT NULL,
+  UNIQUE(run_id, attempt)
+);
+CREATE INDEX IF NOT EXISTS teacher_capabilities_run_idx
+  ON teacher_capabilities(run_id, attempt);
+CREATE TABLE IF NOT EXISTS teacher_score_requests (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  capability_id          INTEGER NOT NULL REFERENCES teacher_capabilities(id) ON DELETE CASCADE,
+  request_id             TEXT NOT NULL,
+  request_fingerprint    TEXT NOT NULL,
+  request_bytes          INTEGER NOT NULL,
+  score_items            INTEGER NOT NULL,
+  state                  TEXT NOT NULL,
+  upstream_attempt_count INTEGER NOT NULL DEFAULT 0,
+  provider_status        INTEGER,
+  error_class            TEXT,
+  input_tokens           INTEGER,
+  output_tokens          INTEGER,
+  created_at             REAL NOT NULL,
+  updated_at             REAL NOT NULL,
+  started_at             REAL,
+  completed_at           REAL,
+  UNIQUE(capability_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS teacher_score_requests_state_idx
+  ON teacher_score_requests(state, updated_at);
 """
 
 
@@ -316,3 +366,404 @@ def all_runs() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute("SELECT run_id, key_id, kind, created_at FROM runs").fetchall()
         return [dict(r) for r in rows]
+
+
+class TeacherLedgerError(RuntimeError):
+    def __init__(self, code: str, *, retryable: bool = False) -> None:
+        super().__init__(code)
+        self.code = code
+        self.retryable = retryable
+
+
+def _immediate(conn: sqlite3.Connection) -> None:
+    conn.execute("BEGIN IMMEDIATE")
+
+
+def _teacher_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_teacher_capability(
+    *,
+    run_id: str,
+    attempt: int,
+    teacher_alias: str,
+    provider: str,
+    model: str,
+    scoring_mode: str,
+    expires_at: float,
+    limits: dict[str, int],
+    now: float | None = None,
+) -> str:
+    issued_at = time.time() if now is None else float(now)
+    token = secrets.token_urlsafe(32)
+    token_hash = _teacher_token_hash(token)
+    conn = _connect()
+    try:
+        _immediate(conn)
+        conn.execute(
+            "UPDATE teacher_capabilities SET revoked_at = ? "
+            "WHERE run_id = ? AND attempt != ? AND revoked_at IS NULL",
+            (issued_at, run_id, attempt),
+        )
+        conn.execute(
+            "INSERT INTO teacher_capabilities ("
+            "token_hash, run_id, attempt, teacher_alias, provider, model, scoring_mode, "
+            "expires_at, max_requests, max_score_items, max_request_bytes, max_response_bytes, "
+            "max_concurrency, max_upstream_attempts, max_request_tokens, max_total_tokens, "
+            "created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                token_hash,
+                run_id,
+                int(attempt),
+                teacher_alias,
+                provider,
+                model,
+                scoring_mode,
+                float(expires_at),
+                int(limits["max_requests"]),
+                int(limits["max_score_items"]),
+                int(limits["max_request_bytes"]),
+                int(limits["max_response_bytes"]),
+                int(limits["max_concurrency"]),
+                int(limits["max_upstream_attempts"]),
+                int(limits["max_request_tokens"]),
+                int(limits["max_total_tokens"]),
+                issued_at,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return token
+
+
+def teacher_capability_binding(token: str) -> dict:
+    token_hash = _teacher_token_hash(token)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM teacher_capabilities WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+    if row is None:
+        raise TeacherLedgerError("invalid_capability")
+    return dict(row)
+
+
+def revoke_teacher_capability(token: str, *, now: float | None = None) -> bool:
+    revoked_at = time.time() if now is None else float(now)
+    conn = _connect()
+    try:
+        _immediate(conn)
+        cursor = conn.execute(
+            "UPDATE teacher_capabilities SET revoked_at = COALESCE(revoked_at, ?) "
+            "WHERE token_hash = ?",
+            (revoked_at, _teacher_token_hash(token)),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def revoke_teacher_capabilities_for_run(run_id: str, *, now: float | None = None) -> int:
+    revoked_at = time.time() if now is None else float(now)
+    conn = _connect()
+    try:
+        _immediate(conn)
+        cursor = conn.execute(
+            "UPDATE teacher_capabilities SET revoked_at = ? "
+            "WHERE run_id = ? AND revoked_at IS NULL",
+            (revoked_at, run_id),
+        )
+        conn.commit()
+        return cursor.rowcount
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def reserve_teacher_request(
+    *,
+    token: str,
+    request_id: str,
+    request_fingerprint: str,
+    request_bytes: int,
+    score_items: int,
+    expected_run_id: str,
+    expected_attempt: int,
+    now: float | None = None,
+) -> dict:
+    admitted_at = time.time() if now is None else float(now)
+    conn = _connect()
+    try:
+        _immediate(conn)
+        capability = conn.execute(
+            "SELECT * FROM teacher_capabilities WHERE token_hash = ?",
+            (_teacher_token_hash(token),),
+        ).fetchone()
+        if capability is None:
+            raise TeacherLedgerError("invalid_capability")
+        if capability["run_id"] != expected_run_id or capability["attempt"] != expected_attempt:
+            raise TeacherLedgerError("capability_scope_mismatch")
+        if capability["revoked_at"] is not None:
+            raise TeacherLedgerError("revoked_capability")
+        if admitted_at >= capability["expires_at"]:
+            raise TeacherLedgerError("expired_capability")
+        existing = conn.execute(
+            "SELECT * FROM teacher_score_requests WHERE capability_id = ? AND request_id = ?",
+            (capability["id"], request_id),
+        ).fetchone()
+        if existing is not None:
+            if existing["request_fingerprint"] != request_fingerprint:
+                raise TeacherLedgerError("request_body_changed")
+            state = existing["state"]
+            if state == "retryable":
+                if capability["in_flight"] >= capability["max_concurrency"]:
+                    raise TeacherLedgerError("broker_busy", retryable=True)
+                request_token_limit = existing["score_items"] * capability["max_request_tokens"]
+                if capability["token_count"] + request_token_limit > capability["max_total_tokens"]:
+                    raise TeacherLedgerError("token_quota_exhausted")
+                conn.execute(
+                    "UPDATE teacher_score_requests SET state = 'reserved', updated_at = ?, "
+                    "provider_status = NULL, error_class = NULL WHERE id = ?",
+                    (admitted_at, existing["id"]),
+                )
+                conn.execute(
+                    "UPDATE teacher_capabilities SET in_flight = in_flight + 1, "
+                    "token_count = token_count + ? WHERE id = ?",
+                    (request_token_limit, capability["id"]),
+                )
+                conn.commit()
+                return {
+                    "capability": dict(capability),
+                    "request": {
+                        **dict(existing),
+                        "state": "reserved",
+                        "updated_at": admitted_at,
+                    },
+                }
+            if state in {"reserved", "started"}:
+                raise TeacherLedgerError("request_in_progress", retryable=True)
+            if state == "succeeded":
+                raise TeacherLedgerError("replay_unavailable")
+            raise TeacherLedgerError(state)
+        if request_bytes > capability["max_request_bytes"]:
+            raise TeacherLedgerError("request_too_large")
+        request_token_limit = int(score_items) * capability["max_request_tokens"]
+        if request_token_limit <= 0:
+            raise TeacherLedgerError("invalid_score_items")
+        if capability["token_count"] + request_token_limit > capability["max_total_tokens"]:
+            raise TeacherLedgerError("token_quota_exhausted")
+        if capability["request_count"] >= capability["max_requests"]:
+            raise TeacherLedgerError("request_quota_exhausted")
+        if capability["score_item_count"] + score_items > capability["max_score_items"]:
+            raise TeacherLedgerError("score_item_quota_exhausted")
+        if capability["in_flight"] >= capability["max_concurrency"]:
+            raise TeacherLedgerError("broker_busy", retryable=True)
+        cursor = conn.execute(
+            "INSERT INTO teacher_score_requests ("
+            "capability_id, request_id, request_fingerprint, request_bytes, score_items, state, "
+            "created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)",
+            (
+                capability["id"],
+                request_id,
+                request_fingerprint,
+                int(request_bytes),
+                int(score_items),
+                admitted_at,
+                admitted_at,
+            ),
+        )
+        conn.execute(
+            "UPDATE teacher_capabilities SET request_count = request_count + 1, "
+            "score_item_count = score_item_count + ?, in_flight = in_flight + 1, "
+            "token_count = token_count + ? WHERE id = ?",
+            (int(score_items), request_token_limit, capability["id"]),
+        )
+        conn.commit()
+        request = conn.execute(
+            "SELECT * FROM teacher_score_requests WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        return {"capability": dict(capability), "request": dict(request)}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def mark_teacher_request_started(
+    capability_id: int, request_id: str, *, now: float | None = None
+) -> None:
+    started_at = time.time() if now is None else float(now)
+    conn = _connect()
+    try:
+        _immediate(conn)
+        row = conn.execute(
+            "SELECT r.state, r.upstream_attempt_count, c.max_upstream_attempts, c.revoked_at, "
+            "c.expires_at FROM teacher_score_requests r JOIN teacher_capabilities c "
+            "ON c.id = r.capability_id WHERE r.capability_id = ? AND r.request_id = ?",
+            (capability_id, request_id),
+        ).fetchone()
+        if row is None or row["state"] != "reserved":
+            raise TeacherLedgerError("request_not_reserved")
+        if row["revoked_at"] is not None or started_at >= row["expires_at"]:
+            raise TeacherLedgerError("capability_fenced")
+        if row["upstream_attempt_count"] >= row["max_upstream_attempts"]:
+            raise TeacherLedgerError("upstream_attempt_quota_exhausted")
+        conn.execute(
+            "UPDATE teacher_score_requests SET state = 'started', "
+            "upstream_attempt_count = upstream_attempt_count + 1, started_at = ?, updated_at = ? "
+            "WHERE capability_id = ? AND request_id = ?",
+            (started_at, started_at, capability_id, request_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def complete_teacher_request(
+    capability_id: int,
+    request_id: str,
+    *,
+    state: str,
+    provider_status: int | None = None,
+    error_class: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    now: float | None = None,
+) -> None:
+    if state not in {
+        "succeeded",
+        "provider_rejected",
+        "provider_contract_error",
+        "outcome_unknown",
+    }:
+        raise ValueError(f"invalid teacher request terminal state: {state}")
+    completed_at = time.time() if now is None else float(now)
+    input_count = max(0, int(input_tokens or 0))
+    output_count = max(0, int(output_tokens or 0))
+    conn = _connect()
+    try:
+        _immediate(conn)
+        row = conn.execute(
+            "SELECT r.state, r.score_items, c.max_request_tokens FROM teacher_score_requests r "
+            "JOIN teacher_capabilities c ON c.id = r.capability_id "
+            "WHERE r.capability_id = ? AND r.request_id = ?",
+            (capability_id, request_id),
+        ).fetchone()
+        if row is None or row["state"] not in {"reserved", "started"}:
+            raise TeacherLedgerError("request_not_active")
+        actual_tokens = input_count + output_count
+        request_token_limit = row["score_items"] * row["max_request_tokens"]
+        if state == "succeeded" and actual_tokens > request_token_limit:
+            raise TeacherLedgerError("request_token_limit_exceeded")
+        token_delta = actual_tokens - request_token_limit if state == "succeeded" else 0
+        conn.execute(
+            "UPDATE teacher_score_requests SET state = ?, provider_status = ?, error_class = ?, "
+            "input_tokens = ?, output_tokens = ?, completed_at = ?, updated_at = ? "
+            "WHERE capability_id = ? AND request_id = ?",
+            (
+                state,
+                provider_status,
+                error_class,
+                input_count,
+                output_count,
+                completed_at,
+                completed_at,
+                capability_id,
+                request_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE teacher_capabilities SET in_flight = MAX(0, in_flight - 1), "
+            "token_count = MAX(0, token_count + ?) WHERE id = ?",
+            (token_delta, capability_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def retry_teacher_request_before_dispatch(
+    capability_id: int,
+    request_id: str,
+    *,
+    error_class: str,
+    now: float | None = None,
+) -> None:
+    updated_at = time.time() if now is None else float(now)
+    conn = _connect()
+    try:
+        _immediate(conn)
+        row = conn.execute(
+            "SELECT r.state, r.score_items, c.max_request_tokens FROM teacher_score_requests r "
+            "JOIN teacher_capabilities c ON c.id = r.capability_id "
+            "WHERE r.capability_id = ? AND r.request_id = ?",
+            (capability_id, request_id),
+        ).fetchone()
+        if row is None or row["state"] != "reserved":
+            raise TeacherLedgerError("request_not_reserved")
+        conn.execute(
+            "UPDATE teacher_score_requests SET state = 'retryable', error_class = ?, updated_at = ? "
+            "WHERE capability_id = ? AND request_id = ?",
+            (error_class, updated_at, capability_id, request_id),
+        )
+        conn.execute(
+            "UPDATE teacher_capabilities SET in_flight = MAX(0, in_flight - 1), "
+            "token_count = MAX(0, token_count - ?) WHERE id = ?",
+            (row["score_items"] * row["max_request_tokens"], capability_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def recover_teacher_request_ledger(*, now: float | None = None) -> dict[str, int]:
+    recovered_at = time.time() if now is None else float(now)
+    conn = _connect()
+    try:
+        _immediate(conn)
+        conn.execute(
+            "UPDATE teacher_capabilities SET token_count = MAX(0, token_count - "
+            "max_request_tokens * COALESCE((SELECT SUM(r.score_items) "
+            "FROM teacher_score_requests r WHERE r.capability_id = teacher_capabilities.id "
+            "AND r.state = 'reserved'), 0))"
+        )
+        reserved = conn.execute(
+            "UPDATE teacher_score_requests SET state = 'retryable', "
+            "error_class = 'broker_restart_before_dispatch', updated_at = ? "
+            "WHERE state = 'reserved'",
+            (recovered_at,),
+        ).rowcount
+        started = conn.execute(
+            "UPDATE teacher_score_requests SET state = 'outcome_unknown', "
+            "error_class = 'broker_restart_after_dispatch', completed_at = ?, updated_at = ? "
+            "WHERE state = 'started'",
+            (recovered_at, recovered_at),
+        ).rowcount
+        conn.execute("UPDATE teacher_capabilities SET in_flight = 0")
+        conn.commit()
+        return {"retryable": reserved, "outcome_unknown": started}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def teacher_capability_usage(token: str) -> dict:
+    capability = teacher_capability_binding(token)
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT state, COUNT(*) AS count FROM teacher_score_requests "
+            "WHERE capability_id = ? GROUP BY state",
+            (capability["id"],),
+        ).fetchall()
+    return {
+        "capability": capability,
+        "outcomes": {row["state"]: row["count"] for row in rows},
+    }

@@ -7,10 +7,7 @@ CI, which has the training stack).
 
 from __future__ import annotations
 
-import base64
-import io
 import json
-import os
 import sys
 import types
 from types import SimpleNamespace
@@ -902,7 +899,6 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         "_resolve_opd_knobs",
         lambda: opd_mod.OpdKnobs(
             teacher_model="accounts/fireworks/models/glm-5p2",
-            teacher_base_url="http://teacher.invalid",
             epochs=1,
             learning_rate=1e-4,
             temperature=0.0,
@@ -932,7 +928,8 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     import flash.engine.worker.teacher as tmod
 
     monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
-    monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
+    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "unit-test-teacher-capability")
 
     # The all-over-budget guard (RuntimeError) must fire; _student_model's AssertionError would
     # escape pytest.raises(RuntimeError) and fail the test (its "before the fix" behavior).
@@ -1326,6 +1323,7 @@ def _mock_urlopen(monkeypatch, payload, capture=None):
         if capture is not None:
             capture["url"] = req.full_url
             capture["body"] = json.loads(req.data.decode())
+            capture["headers"] = dict(req.header_items())
         return _FakeResp(payload)
 
     monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", fake_urlopen)
@@ -1394,6 +1392,9 @@ def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatc
         "logprobs": 1,
         "temperature": 0,
     }
+    assert capture["url"] == "https://api.example/v1/v1/teacher/completions"
+    assert capture["headers"]["Authorization"] == "Bearer k"
+    assert capture["headers"]["X-flash-teacher-request-id"]
     assert [[t.text for t in toks] for toks in out] == [["A"], ["B"]]
     assert [out[0][0].logprob, out[1][0].logprob] == [-0.1, -0.2]
 
@@ -1733,7 +1734,7 @@ def test_teacher_score_rejects_null_logprob_on_completion_token_as_permanent(mon
     assert toks[0].logprob == -0.5
 
 
-def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
+def test_teacher_http_status_without_safe_broker_code_is_permanent(monkeypatch):
     import urllib.error
 
     import flash.engine.worker.teacher as tm
@@ -1746,16 +1747,11 @@ def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
         monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", fake_urlopen)
 
     client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=1)
-    # 401 (bad key) is permanent -> raised immediately so the worker aborts, not burns every step.
-    raise_http(401)
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is True
-    # 503 is transient -> retries exhaust to a non-permanent error (a skipped sample, run continues).
-    raise_http(503)
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is False
+    for status in (401, 503):
+        raise_http(status)
+        with pytest.raises(TeacherError) as error:
+            client.score("P", "hi")
+        assert error.value.permanent is True
 
 
 def test_teacher_http_error_diagnostic_omits_opaque_response_body(monkeypatch):
@@ -1786,7 +1782,7 @@ def test_teacher_http_error_diagnostic_omits_opaque_response_body(monkeypatch):
     detail = str(exc_info.value)
     formatted = "".join(traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb))
     assert exc_info.value.permanent is True
-    assert "teacher HTTP 403" in detail
+    assert "teacher broker HTTP 403" in detail
     assert "/completions" in detail
     assert "permanent" in detail
     assert private.decode() not in detail
@@ -2133,11 +2129,8 @@ def test_teacher_score_rejects_echo_with_no_completion_tokens_as_permanent(monke
     assert "no completion-region tokens" in str(ei.value).lower()
 
 
-def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkeypatch):
-    """Regression (codex[bot], teacher.py:62): a retryable 5xx whose error body is truncated makes
-    e.read() raise IncompleteRead BEFORE last_err is set — without a guard it escapes _post as a generic
-    exception before classification, so repeated retryable errors end as permanent no-signal. The
-    preview read must be guarded and the error still classified by e.code."""
+def test_teacher_http_error_with_unreadable_body_is_permanent(monkeypatch):
+    """An unreadable broker error body cannot prove that failure occurred before dispatch."""
     import http.client
     import urllib.error
 
@@ -2159,9 +2152,7 @@ def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkey
     client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
     with pytest.raises(TeacherError) as ei:
         client.score("P", "hi")
-    assert (
-        ei.value.permanent is False
-    )  # 503 retryable -> transient TeacherError, not a raw exception
+    assert ei.value.permanent is True
     assert "503" in str(ei.value)
 
 
@@ -2203,9 +2194,9 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
 def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
     """_resolve_opd_knobs defensively re-resolves [train].teacher_model at the worker's (tolerant)
     deserialization boundary: parse already canonicalized it to a Fireworks model id, but the worker
-    still validates — accepting an alias or the model id — so the TeacherClient sends a supported model.
-    An unset value keeps the default GLM 5.2 teacher; the shared base_url is unchanged; an unsupported
-    teacher fails loudly on the worker."""
+    still validates, accepting an alias or the model id, so the broker request names a supported
+    model. An unset value keeps the default GLM 5.2 teacher; an unsupported teacher fails loudly on
+    the worker."""
     from flash.engine.worker import opd as opd_mod
 
     class _Train:  # any [train] field not set returns None (falls back to the recipe default)
@@ -2230,8 +2221,6 @@ def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
     # unset / blank / none -> the default glm 5.2 teacher (historical behavior preserved).
     assert _knobs("").teacher_model == "accounts/fireworks/models/glm-5p2"
     assert _knobs(None).teacher_model == "accounts/fireworks/models/glm-5p2"
-    # base_url is shared across every allow-listed teacher (one fireworks endpoint + one managed key).
-    assert _knobs("kimi-k2.6").teacher_base_url == opd_mod.RECIPE.opd.teacher_base_url
     # unsupported teachers fail loudly on the worker (defensive guard, mirrors the kl_coef check).
     for teacher in (
         "gpt-5.5",
@@ -2252,41 +2241,7 @@ def test_groupwise_alignment_emits_no_empty_student_group():
     assert [s_idx for s_idx, _ in groups] == [[0, 1]]
 
 
-@pytest.mark.live
-@pytest.mark.skipif(
-    os.environ.get("FLASH_LIVE") != "1" or not os.environ.get("FIREWORKS_API_KEY"),
-    reason="set FLASH_LIVE=1 and FIREWORKS_API_KEY to run the live Fireworks teacher test",
-)
-def test_live_kimi_multimodal_teacher_conditions_red_completion_on_image():
-    image_module = pytest.importorskip("PIL.Image")
-
-    def data_uri(color):
-        image = image_module.new("RGB", (48, 48), color)
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
-
-    prompt = (
-        "User: <|media_pad|>\nWhat color is this image? Reply with one lowercase word.\nAssistant: "
-    )
-    client = TeacherClient(
-        os.environ["FIREWORKS_API_KEY"],
-        "https://api.fireworks.ai/inference/v1",
-        "accounts/fireworks/models/kimi-k2p6",
-    )
-    red_tokens, blue_tokens = client.score_many_multimodal(
-        [
-            (prompt, "red", [data_uri((220, 20, 20))]),
-            (prompt, "red", [data_uri((20, 20, 220))]),
-        ]
-    )
-    delta = sum(token.logprob for token in red_tokens) - sum(token.logprob for token in blue_tokens)
-
-    assert delta > 0.05
-
-
-def test_teacher_client_requires_key():
+def test_teacher_client_requires_capability():
     from flash.engine.worker.teacher import TeacherError
 
     with pytest.raises(TeacherError):
@@ -2316,8 +2271,7 @@ def test_opd_spec_json_round_trip():
     restored = JobSpec.from_json(spec.to_json())
     assert restored == spec
     assert restored.phase == "opd"
-    # The teacher key is platform-managed (control-plane-injected into the worker env, like
-    # HF_TOKEN) — NOT a user secret, so it is never added to environment.secrets.
+    # the provider credential is control-plane-only and is never added to environment.secrets.
     assert "FIREWORKS_API_KEY" not in restored.environment.secrets
 
 

@@ -602,17 +602,24 @@ def test_environment_subfields_reject_wrong_types() -> None:
         spec_from_dict(raw)
 
 
-def test_grpo_environment_can_declare_fireworks_key() -> None:
+@pytest.mark.parametrize(
+    "key",
+    [
+        "FIREWORKS_API_KEY",
+        "PARASAIL_API_KEY",
+        "FLASH_TEACHER_BROKER_URL",
+        "FLASH_TEACHER_CAPABILITY",
+    ],
+)
+def test_environment_cannot_declare_managed_teacher_transport_or_credentials(key) -> None:
     raw = _raw()
     raw["environment"] = {
         "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
-        "secrets": ["FIREWORKS_API_KEY"],
+        "secrets": [key],
     }
 
-    spec = spec_from_dict(raw)
-
-    assert spec.algorithm == "grpo"
-    assert spec.environment.secrets == ("FIREWORKS_API_KEY",)
+    with pytest.raises(ConfigError, match="platform-managed"):
+        spec_from_dict(raw)
 
 
 def test_environment_subfields_accept_valid_and_missing() -> None:

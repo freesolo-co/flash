@@ -2158,17 +2158,20 @@ def run_opd_train(spec=None) -> None:
     random.Random(_w.SEED).shuffle(train)
 
     started_at = time.time()
-    # validate the teacher credential BEFORE the gpu probe + model prefetch: a missing key fails
-    # in milliseconds instead of after minutes of paid setup.
-    api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("the managed teacher api key is missing from the OPD parent worker")
+    # validate broker transport before the gpu probe and model prefetch so a malformed attempt fails
+    # before any additional paid setup. raw managed-teacher provider credentials never enter the worker.
+    from flash.spec import TEACHER_BROKER_URL_ENV, TEACHER_CAPABILITY_ENV
+
+    broker_url = os.environ.get(TEACHER_BROKER_URL_ENV, "").strip()
+    capability = os.environ.get(TEACHER_CAPABILITY_ENV, "").strip()
+    if not broker_url or not capability:
+        raise RuntimeError("managed teacher broker transport is missing from the OPD parent worker")
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
+    teacher = TeacherClient(capability, broker_url, knobs.teacher_model)
     processor = None
     if multimodal:
         from transformers import AutoProcessor

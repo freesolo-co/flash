@@ -180,7 +180,11 @@ def cancel_run(run_id: str) -> RunStatus:
         read_verified_adapter_revisions,
         verified_adapter_revision_generation,
     )
+    from flash.server import db as server_db
     from flash.server._locks import _deploy_lock
+
+    # fence teacher authority before waiting on deployment locks or slow provider teardown.
+    server_db.revoke_teacher_capabilities_for_run(run_id)
 
     def _clear_exact_remote(expected_remote: dict) -> bool:
         expected_identity = _remote_resource_identity(expected_remote)
@@ -330,6 +334,9 @@ def cancel_run(run_id: str) -> RunStatus:
             deploy_lock.acquire()
             lock_acquired = True
 
+        # close the race where submission held the deploy lock, minted a capability after the
+        # pre-lock fence, and released the lock only after persisting its provider handle.
+        server_db.revoke_teacher_capabilities_for_run(run_id)
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"
 
