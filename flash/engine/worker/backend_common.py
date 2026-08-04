@@ -29,13 +29,13 @@ from http.server import ThreadingHTTPServer
 
 from flash.diagnostics import sanitize_diagnostic
 
-# verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and remove-padding fused-label fixes.
+# verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes.
 # it must stay on the 0.8.0 base: the opd plugin patches 0.8.0 internals and imports
 # verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, and opd's exact-version gate reads the
 # version file this branch pins to the release value.
 VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
-    "git+https://github.com/freesolo-co/verl@723336cf5d2aa084a9308db1f774df2f84ad9f51"
+    "git+https://github.com/freesolo-co/verl@1bea7d6825bbb9d2164e86e379b3680e7c53bb8a"
 )
 # the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
 # same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
