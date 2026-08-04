@@ -424,8 +424,14 @@ def test_kimi_k3_encoding_matches_independent_remote_prompt_vectors(case_name):
     assert "".join(token.text for token in encoded.completion_tokens) == case["completion_text"]
 
 
+class _ProductionSizedRanks(dict):
+    def __len__(self):
+        return 163584
+
+
 def test_real_pinned_kimi_k3_tokenizer_matches_all_remote_prompt_vectors(monkeypatch):
     import huggingface_hub
+    import tiktoken.load
 
     from flash.engine.recipe import TEACHER_MODELS
     from flash.engine.worker import kimi_k3_encoding as encoding_mod
@@ -433,7 +439,7 @@ def test_real_pinned_kimi_k3_tokenizer_matches_all_remote_prompt_vectors(monkeyp
     teacher = TEACHER_MODELS["kimi-k3"]
     fixture_dir = Path(__file__).with_name("fixtures") / "kimi_k3_tokenizer"
     config_path = fixture_dir / "tokenizer_config.json"
-    model_path = fixture_dir / "tiktoken.model"
+    reduced_model_path = fixture_dir / "golden_prompt_ranks.tiktoken"
 
     assert teacher.encoding_repo == "moonshotai/Kimi-K3"
     assert teacher.encoding_revision == "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
@@ -446,22 +452,37 @@ def test_real_pinned_kimi_k3_tokenizer_matches_all_remote_prompt_vectors(monkeyp
         == "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103"
     )
     assert hashlib.sha256(config_path.read_bytes()).hexdigest() == teacher.tokenizer_config_sha256
-    assert hashlib.sha256(model_path.read_bytes()).hexdigest() == teacher.tokenizer_model_sha256
+    assert reduced_model_path.stat().st_size < 10_000
+    reduced_model_sha256 = hashlib.sha256(reduced_model_path.read_bytes()).hexdigest()
 
     calls = []
+    fixture_paths = {
+        "tokenizer_config.json": config_path,
+        "tiktoken.model": reduced_model_path,
+    }
 
     def local_download(*, repo_id, filename, revision):
         calls.append((repo_id, filename, revision))
         assert repo_id == teacher.encoding_repo
         assert revision == teacher.encoding_revision
-        return str(fixture_dir / filename)
+        assert filename in fixture_paths
+        return str(fixture_paths[filename])
+
+    load_tiktoken_bpe = tiktoken.load.load_tiktoken_bpe
+
+    def load_reduced_ranks(path):
+        ranks = load_tiktoken_bpe(path)
+        assert len(ranks) == 518
+        assert all(bytes([value]) in ranks for value in range(256))
+        return _ProductionSizedRanks(ranks)
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", local_download)
+    monkeypatch.setattr(tiktoken.load, "load_tiktoken_bpe", load_reduced_ranks)
     encoding = encoding_mod._download_and_build(
         repo_id=teacher.encoding_repo,
         revision=teacher.encoding_revision,
         tokenizer_config_sha256=teacher.tokenizer_config_sha256,
-        tokenizer_model_sha256=teacher.tokenizer_model_sha256,
+        tokenizer_model_sha256=reduced_model_sha256,
     )
 
     assert calls == [
@@ -477,6 +498,7 @@ def test_real_pinned_kimi_k3_tokenizer_matches_all_remote_prompt_vectors(monkeyp
         )
         encoded = encoding.encode_request(request)
         assert encoded.token_ids == tuple(case["prompt_token_ids"])
+        assert "".join(token.text for token in encoded.completion_tokens) == case["completion_text"]
 
 
 @pytest.mark.parametrize("role", ["tool", "tool-result", "unknown-role"])
