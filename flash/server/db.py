@@ -451,6 +451,16 @@ def teacher_capability_binding(token: str) -> dict:
     return dict(row)
 
 
+def active_teacher_capability(token: str, *, now: float | None = None) -> dict:
+    capability = teacher_capability_binding(token)
+    checked_at = time.time() if now is None else float(now)
+    if capability["revoked_at"] is not None:
+        raise TeacherLedgerError("revoked_capability")
+    if checked_at >= capability["expires_at"]:
+        raise TeacherLedgerError("expired_capability")
+    return capability
+
+
 def revoke_teacher_capability(token: str, *, now: float | None = None) -> bool:
     revoked_at = time.time() if now is None else float(now)
     conn = _connect()

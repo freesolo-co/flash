@@ -10,10 +10,13 @@ from fastapi.responses import JSONResponse
 from flash.server.teacher_broker import (
     MAX_REQUEST_BODY_BYTES,
     TeacherBrokerError,
+    authenticate_teacher_capability,
     complete_fireworks_request,
 )
 
 router = APIRouter()
+MAX_CONCURRENT_BODY_READERS = 8
+_BODY_INGRESS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BODY_READERS)
 
 
 async def _bounded_body(request: Request) -> bytes:
@@ -25,14 +28,12 @@ async def _bounded_body(request: Request) -> bytes:
             raise TeacherBrokerError("invalid_content_length", status_code=400) from exc
         if declared < 0 or declared > MAX_REQUEST_BODY_BYTES:
             raise TeacherBrokerError("request_too_large", status_code=413)
-    chunks: list[bytes] = []
-    size = 0
+    body = bytearray()
     async for chunk in request.stream():
-        size += len(chunk)
-        if size > MAX_REQUEST_BODY_BYTES:
+        if len(chunk) > MAX_REQUEST_BODY_BYTES - len(body):
             raise TeacherBrokerError("request_too_large", status_code=413)
-        chunks.append(chunk)
-    return b"".join(chunks)
+        body.extend(chunk)
+    return bytes(body)
 
 
 def _bearer(request: Request) -> str:
@@ -51,7 +52,13 @@ async def teacher_completions(request: Request):
         if content_type != "application/json":
             raise TeacherBrokerError("unsupported_content_type", status_code=415)
         capability = _bearer(request)
-        body = await _bounded_body(request)
+        await asyncio.to_thread(
+            authenticate_teacher_capability,
+            capability_token=capability,
+            request_id=request_id,
+        )
+        async with _BODY_INGRESS_SEMAPHORE:
+            body = await _bounded_body(request)
         response = await asyncio.to_thread(
             complete_fireworks_request,
             capability_token=capability,

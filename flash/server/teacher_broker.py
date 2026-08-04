@@ -436,6 +436,26 @@ def _map_ledger_error(error: db.TeacherLedgerError, request_id: str) -> TeacherB
     )
 
 
+def authenticate_teacher_capability(
+    *, capability_token: str, request_id: str
+) -> tuple[str, str, dict[str, Any]]:
+    request_id = validate_request_id(request_id)
+    capability_token = validate_capability_token(capability_token)
+    try:
+        capability = db.active_teacher_capability(capability_token)
+    except db.TeacherLedgerError as exc:
+        raise _map_ledger_error(exc, request_id) from exc
+    except sqlite3.OperationalError as exc:
+        raise TeacherBrokerError(
+            "broker_busy",
+            status_code=503,
+            retryable=True,
+            request_id=request_id,
+        ) from exc
+    _require_current_attempt(capability)
+    return request_id, capability_token, capability
+
+
 def _provider_timeout(capability: dict[str, Any]) -> float:
     remaining = float(capability["expires_at"]) - time.time()
     if remaining <= 0:
@@ -533,20 +553,10 @@ def complete_fireworks_request(
     request_id: str,
     raw_body: bytes,
 ) -> dict[str, Any]:
-    request_id = validate_request_id(request_id)
-    capability_token = validate_capability_token(capability_token)
-    try:
-        capability = db.teacher_capability_binding(capability_token)
-    except db.TeacherLedgerError as exc:
-        raise _map_ledger_error(exc, request_id) from exc
-    except sqlite3.OperationalError as exc:
-        raise TeacherBrokerError(
-            "broker_busy",
-            status_code=503,
-            retryable=True,
-            request_id=request_id,
-        ) from exc
-    _require_current_attempt(capability)
+    request_id, capability_token, capability = authenticate_teacher_capability(
+        capability_token=capability_token,
+        request_id=request_id,
+    )
     request = validate_completion_request(parse_strict_json(raw_body), capability)
     fingerprint = request_fingerprint(capability_token, request.canonical_body)
     try:

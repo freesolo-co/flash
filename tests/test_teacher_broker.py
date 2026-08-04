@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import sqlite3
@@ -804,6 +805,11 @@ def test_operation_specific_route_requires_bearer_json_and_request_id(monkeypatc
         captured.update(kwargs)
         return {"choices": []}
 
+    monkeypatch.setattr(
+        teacher_route,
+        "authenticate_teacher_capability",
+        lambda **_kwargs: None,
+    )
     monkeypatch.setattr(teacher_route, "complete_fireworks_request", complete)
     app = fastapi.FastAPI()
     app.include_router(teacher_route.router)
@@ -832,6 +838,82 @@ def test_operation_specific_route_requires_bearer_json_and_request_id(monkeypatc
         "request_id": "request-route-000001",
         "raw_body": b"{}",
     }
+
+
+@pytest.mark.parametrize("state", ["invalid", "revoked"])
+def test_route_rejects_inactive_capability_before_consuming_stream(broker_db, state):
+    from flash.server.routes import teacher as teacher_route
+
+    token = "a" * 43
+    if state == "revoked":
+        token = _issue()
+        db.revoke_teacher_capability(token)
+    consumed = False
+
+    class Request:
+        def __init__(self):
+            self.headers = {
+                "authorization": f"Bearer {token}",
+                "content-type": "application/json",
+                "x-flash-teacher-request-id": f"request-route-{state}-001",
+            }
+
+        async def stream(self):
+            nonlocal consumed
+            consumed = True
+            yield b"{}"
+
+    response = asyncio.run(teacher_route.teacher_completions(Request()))
+
+    assert response.status_code == 401
+    assert consumed is False
+    assert json.loads(response.body)["error"]["code"] == f"{state}_capability"
+
+
+def test_route_bounds_concurrent_body_readers(monkeypatch):
+    from flash.server.routes import teacher as teacher_route
+
+    active = 0
+    max_active = 0
+
+    class Request:
+        def __init__(self, index):
+            self.headers = {
+                "authorization": f"Bearer {'a' * 43}",
+                "content-type": "application/json",
+                "x-flash-teacher-request-id": f"request-ingress-{index:04d}",
+            }
+
+        async def stream(self):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.01)
+                yield b"{}"
+            finally:
+                active -= 1
+
+    async def exercise():
+        monkeypatch.setattr(teacher_route, "_BODY_INGRESS_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr(
+            teacher_route,
+            "authenticate_teacher_capability",
+            lambda **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            teacher_route,
+            "complete_fireworks_request",
+            lambda **_kwargs: {"choices": []},
+        )
+        return await asyncio.gather(
+            *(teacher_route.teacher_completions(Request(index)) for index in range(6))
+        )
+
+    responses = asyncio.run(exercise())
+
+    assert all(response.status_code == 200 for response in responses)
+    assert max_active == 2
 
 
 def test_current_nonterminal_attempt_is_checked_on_every_admission(monkeypatch):
