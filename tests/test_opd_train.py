@@ -1294,6 +1294,64 @@ def test_text_teacher_batcher_counts_deduplicated_provider_usage_once(monkeypatc
     assert bridge.teacher_output_tokens == 1
 
 
+def test_text_teacher_batcher_uses_fireworks_wire_identity_for_deduplication():
+    from flash.engine.worker.teacher import (
+        TeacherClient,
+        _ScoredTeacherTokens,
+        _TeacherScoreRequest,
+    )
+
+    teacher = TeacherClient("managed-key", "https://api.example/v1", "glm")
+    calls = []
+
+    def score_many(requests):
+        calls.append(list(requests))
+        return [
+            _ScoredTeacherTokens(
+                [TeacherToken(text="AB", logprob=-1.0, start=0, end=2)],
+                input_tokens=50,
+                output_tokens=0,
+            )
+        ]
+
+    teacher.score_many = score_many
+    requests = [
+        _TeacherScoreRequest.from_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "prior",
+                    "reasoning_content": reasoning,
+                }
+            ],
+            fireworks_prompt="User: same\nAssistant: ",
+            assistant_prefill="",
+            completion_text="AB",
+        )
+        for reasoning in ("first ignored reasoning", "second ignored reasoning")
+    ]
+    batcher = _TextTeacherBatcher(teacher, max_batch_size=8, flush_wait_s=1.0)
+    batcher.start()
+    barrier = threading.Barrier(2)
+
+    def score(request):
+        barrier.wait(timeout=2.0)
+        return batcher.score(request)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(score, requests))
+    finally:
+        batcher.close()
+
+    assert len(calls) == 1
+    assert len(calls[0]) == 1
+    assert calls[0][0].fireworks_prompt == "User: same\nAssistant: "
+    assert sorted(result.input_tokens for result in results) == [0, 50]
+    assert sum(result.input_tokens for result in results) == 50
+    assert sum(result.output_tokens for result in results) == 0
+
+
 def test_text_teacher_batcher_keeps_nonidentical_inputs_separate_and_ordered(monkeypatch):
     from flash.engine.worker import opd_train as opd_train_mod
 
@@ -5797,6 +5855,82 @@ def test_opd_missing_managed_teacher_key_fails_before_the_gpu_probe(monkeypatch)
 
     with pytest.raises(RuntimeError, match="managed fireworks teacher credential is missing"):
         opd_mod.run_opd_train()
+
+
+@pytest.mark.parametrize("role", ["tool", "unknown-role"])
+def test_kimi_k3_role_validation_finishes_before_gpu_diagnostics_and_probe(monkeypatch, role):
+    from flash.engine.worker import opd_train as opd_mod
+    from flash.engine.worker.teacher import TeacherError
+
+    env = SimpleNamespace(
+        is_tool_env=False,
+        multi_turn=False,
+        dataset=lambda: [{"question": "2+2"}],
+        prompt_messages=lambda _record: [{"role": role, "content": "2+2"}],
+    )
+    train = SimpleNamespace(
+        init_from_adapter="",
+        max_examples=1,
+        teacher_model="parasail-kimi-k3",
+        epochs=1,
+        temperature=None,
+        save_at_steps=(),
+        stop_sequences=(),
+        structured_outputs="",
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(
+            SEED=0,
+            THINKING=False,
+            require_active_env=lambda: env,
+            JOB_SPEC=SimpleNamespace(
+                train=train,
+                model="Qwen/Qwen3.5-4B",
+                model_revision="",
+                model_policy="catalog",
+                gpu=SimpleNamespace(type=None),
+            ),
+            heartbeat=lambda *args, **kwargs: None,
+            gpu_diagnostics=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("gpu diagnostics must not be reached")
+            ),
+            prefetch_model=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("model prefetch must not be reached")
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_resolve_opd_knobs",
+        lambda: SimpleNamespace(
+            structured_outputs="",
+            teacher_model="parasail-kimi-k3",
+            teacher_provider="parasail",
+            teacher_base_url="https://api.parasail.io/v1",
+            teacher_credential_env="PARASAIL_API_KEY",
+            teacher_scoring_mode="kimi_k3_chat_prompt_logprobs",
+            teacher_encoding_repo="moonshotai/Kimi-K3",
+            teacher_encoding_revision="pinned-revision",
+            teacher_tokenizer_config_sha256="config-hash",
+            teacher_tokenizer_model_sha256="model-hash",
+        ),
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_probe_gpu_in_subprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("gpu probe must not be reached")
+        ),
+    )
+    monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setenv("PARASAIL_API_KEY", "test-managed-teacher-key")
+
+    with pytest.raises(TeacherError, match="supports only") as error:
+        opd_mod.run_opd_train()
+
+    assert error.value.permanent is True
 
 
 def test_kimi_k3_encoding_preflight_finishes_before_the_gpu_probe(monkeypatch):

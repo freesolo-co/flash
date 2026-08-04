@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,8 +12,14 @@ from types import SimpleNamespace
 import pytest
 
 from flash.engine.worker.kimi_k3_encoding import KimiK3Encoding
+from flash.engine.worker.opd_train import _TextTeacherBatcher
 from flash.engine.worker.parasail_teacher import ParasailTeacherClient
-from flash.engine.worker.teacher import TeacherError, _TeacherScoreRequest
+from flash.engine.worker.teacher import (
+    TeacherError,
+    _ScoredTeacherTokens,
+    _TeacherScoreRequest,
+)
+from flash.engine.worker.tokenizer_align import TeacherToken
 
 
 class _ByteEncoding:
@@ -136,6 +143,48 @@ def test_parasail_request_shape_and_exact_usage():
     assert tokens[-1].end == len("Hà Nội")
 
 
+def test_parasail_text_blocks_match_string_content_in_request_and_encoding():
+    client = _client(_ByteEncoding())
+    string_request = _TeacherScoreRequest.from_messages(
+        [{"role": "user", "content": "hello world"}],
+        fireworks_prompt="unused",
+        assistant_prefill="",
+        completion_text="done",
+    )
+    block_request = _TeacherScoreRequest.from_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello "},
+                    {"type": "text", "text": "world"},
+                ],
+            }
+        ],
+        fireworks_prompt="unused",
+        assistant_prefill="",
+        completion_text="done",
+    )
+    captured = {}
+    response = _response(client, block_request)
+
+    def post(path, body):
+        captured.update({"path": path, "body": body})
+        return response
+
+    client._post = post
+    client.score(block_request)
+
+    assert string_request.messages == block_request.messages
+    assert client.encoding.encode_request(string_request) == client.encoding.encode_request(
+        block_request
+    )
+    assert captured["body"]["messages"] == [
+        {"role": "user", "content": "hello world"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+
 def test_parasail_uses_numeric_ids_and_local_unicode_spans():
     client = _client(_ByteEncoding())
     request = _request(completion="თბილისი")
@@ -239,6 +288,74 @@ def test_parasail_score_many_is_bounded_and_ordered():
     assert peak > 1
 
 
+def test_parasail_mixed_batch_preserves_successes_usage_and_failure_scope():
+    client = _client(_ByteEncoding())
+    requests = [replace(_request(), completion_text=str(index)) for index in range(8)]
+    requests[3] = replace(requests[3], completion_text="fail")
+
+    def score_request(request):
+        if request.completion_text == "fail":
+            raise TeacherError("transient item failure", permanent=False)
+        return _ScoredTeacherTokens(
+            [
+                TeacherToken(
+                    text=request.completion_text,
+                    logprob=-0.5,
+                    start=0,
+                    end=len(request.completion_text),
+                )
+            ],
+            input_tokens=10,
+            output_tokens=1,
+        )
+
+    client._score_request = score_request
+    batcher = _TextTeacherBatcher(client, max_batch_size=8, flush_wait_s=1.0)
+    batcher.start()
+    barrier = threading.Barrier(8)
+
+    def score(index):
+        barrier.wait(timeout=2.0)
+        try:
+            return "ok", batcher.score(requests[index])
+        except TeacherError as error:
+            return "error", error
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(score, index) for index in range(8)]
+            outcomes = [future.result(timeout=5.0) for future in futures]
+    finally:
+        batcher.close()
+
+    assert [status for status, _result in outcomes] == [
+        "ok",
+        "ok",
+        "ok",
+        "error",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+    ]
+    failed = outcomes[3][1]
+    assert isinstance(failed, TeacherError)
+    assert failed.permanent is False
+    assert "transient item failure" in str(failed)
+    successful = [result for status, result in outcomes if status == "ok"]
+    assert ["".join(token.text for token in result) for result in successful] == [
+        "0",
+        "1",
+        "2",
+        "4",
+        "5",
+        "6",
+        "7",
+    ]
+    assert sum(result.input_tokens for result in successful) == 70
+    assert sum(result.output_tokens for result in successful) == 7
+
+
 def test_parasail_requires_structured_messages_without_leaking_key():
     client = _client(_ByteEncoding())
 
@@ -307,19 +424,91 @@ def test_kimi_k3_encoding_matches_independent_remote_prompt_vectors(case_name):
     assert "".join(token.text for token in encoded.completion_tokens) == case["completion_text"]
 
 
-def test_kimi_k3_local_rendering_preserves_nonstandard_roles():
+def test_real_pinned_kimi_k3_tokenizer_matches_all_remote_prompt_vectors(monkeypatch):
+    import huggingface_hub
+
+    from flash.engine.recipe import TEACHER_MODELS
+    from flash.engine.worker import kimi_k3_encoding as encoding_mod
+
+    teacher = TEACHER_MODELS["kimi-k3"]
+    fixture_dir = Path(__file__).with_name("fixtures") / "kimi_k3_tokenizer"
+    config_path = fixture_dir / "tokenizer_config.json"
+    model_path = fixture_dir / "tiktoken.model"
+
+    assert teacher.encoding_repo == "moonshotai/Kimi-K3"
+    assert teacher.encoding_revision == "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
+    assert (
+        teacher.tokenizer_config_sha256
+        == "5d0803c94db9cd78763499e0956c95fd5a225c14a727e5a6cf5db3f96f010a6e"
+    )
+    assert (
+        teacher.tokenizer_model_sha256
+        == "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103"
+    )
+    assert hashlib.sha256(config_path.read_bytes()).hexdigest() == teacher.tokenizer_config_sha256
+    assert hashlib.sha256(model_path.read_bytes()).hexdigest() == teacher.tokenizer_model_sha256
+
+    calls = []
+
+    def local_download(*, repo_id, filename, revision):
+        calls.append((repo_id, filename, revision))
+        assert repo_id == teacher.encoding_repo
+        assert revision == teacher.encoding_revision
+        return str(fixture_dir / filename)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", local_download)
+    encoding = encoding_mod._download_and_build(
+        repo_id=teacher.encoding_repo,
+        revision=teacher.encoding_revision,
+        tokenizer_config_sha256=teacher.tokenizer_config_sha256,
+        tokenizer_model_sha256=teacher.tokenizer_model_sha256,
+    )
+
+    assert calls == [
+        (teacher.encoding_repo, "tokenizer_config.json", teacher.encoding_revision),
+        (teacher.encoding_repo, "tiktoken.model", teacher.encoding_revision),
+    ]
+    for case in _GOLDEN["cases"].values():
+        request = _TeacherScoreRequest.from_messages(
+            case["messages"],
+            fireworks_prompt="unused",
+            assistant_prefill=case["assistant_prefill"],
+            completion_text=case["completion_text"],
+        )
+        encoded = encoding.encode_request(request)
+        assert encoded.token_ids == tuple(case["prompt_token_ids"])
+
+
+@pytest.mark.parametrize("role", ["tool", "tool-result", "unknown-role"])
+def test_kimi_k3_local_rendering_rejects_unsupported_roles(role):
     request = _TeacherScoreRequest.from_messages(
-        [{"role": "tool-result", "content": "result text"}],
-        fireworks_prompt="Tool: result text\nAssistant: ",
+        [{"role": role, "content": "result text"}],
+        fireworks_prompt="unused",
         assistant_prefill="",
         completion_text="done",
     )
 
-    encoded = KimiK3Encoding(_ByteEncoding()).encode_request(request)
-    rendered = bytes(token_id - 1 for token_id in encoded.token_ids).decode()
+    with pytest.raises(TeacherError, match="supports only") as error:
+        KimiK3Encoding(_ByteEncoding()).encode_request(request)
 
-    assert 'role="tool-result"' in rendered
-    assert "result text" in rendered
+    assert error.value.permanent is True
+
+
+def test_parasail_dedup_key_includes_messages_prefill_and_completion():
+    client = _client(_ByteEncoding())
+    request = _request(completion="done", prefill="prefix ")
+    other_messages = _TeacherScoreRequest.from_messages(
+        [{"role": "user", "content": "different"}],
+        fireworks_prompt="unused",
+        assistant_prefill="prefix ",
+        completion_text="done",
+    ).messages
+
+    base_key = client.score_request_key(request)
+
+    assert client.score_request_key(replace(request, messages=other_messages)) != base_key
+    assert client.score_request_key(replace(request, assistant_prefill="other ")) != base_key
+    assert client.score_request_key(replace(request, completion_text="other")) != base_key
 
 
 def test_parasail_preflight_forces_pinned_encoding_load(monkeypatch):

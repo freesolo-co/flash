@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 
+from flash.engine.worker.teacher import _normalize_teacher_message_content
 from flash.engine.worker.tokenizer_align import StudentToken
 
 
@@ -24,9 +25,12 @@ def _teacher_prompt_text(prompt_messages: list[dict], thinking_prefill: str = ""
     default) when thinking is off or the template ignores it -- the plain ``Assistant: `` already
     matches."""
     parts = []
-    for m in prompt_messages:
-        role = str(m.get("role", "user")).capitalize()
-        parts.append(f"{role}: {m.get('content', '')!s}")
+    for index, message in enumerate(prompt_messages):
+        role = str(message.get("role", "user")).capitalize()
+        content = _normalize_teacher_message_content(
+            message.get("content", ""), message_index=index
+        )
+        parts.append(f"{role}: {content}")
     parts.append("Assistant: " + thinking_prefill)
     return "\n".join(parts)
 

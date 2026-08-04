@@ -40,6 +40,22 @@ _INTERNAL_THINKING_EFFORT = (
     "`medium`, `high`, and `max`.\n"
     "Now the system is invoked with `thinking_effort=max`."
 )
+_KIMI_K3_MESSAGE_ROLES = frozenset({"user", "system", "assistant"})
+
+
+def validate_kimi_k3_message_roles(messages: object, *, source: str) -> None:
+    if not isinstance(messages, (list, tuple)):
+        raise TeacherError(f"{source} messages must be a list", permanent=True)
+    for index, message in enumerate(messages):
+        role = message.role if isinstance(message, _TeacherMessage) else None
+        if isinstance(message, dict):
+            role = message.get("role")
+        if not isinstance(role, str) or role not in _KIMI_K3_MESSAGE_ROLES:
+            raise TeacherError(
+                f"{source} message {index} has unsupported role {role!r}; "
+                "Kimi K3 supports only 'user', 'system', and 'assistant' roles",
+                permanent=True,
+            )
 
 
 @dataclass(frozen=True)
@@ -61,6 +77,7 @@ class KimiK3Encoding:
         self._encoding = encoding
 
     def encode_request(self, request: _TeacherScoreRequest) -> EncodedKimiK3Prompt:
+        validate_kimi_k3_message_roles(request.messages, source="Kimi K3 teacher request")
         messages = [
             *request.messages,
             _TeacherMessage("assistant", request.assistant_prefill + request.completion_text),

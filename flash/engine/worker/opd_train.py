@@ -175,7 +175,7 @@ def _teacher_batch_error(error: Exception) -> Exception:
 def _validate_text_teacher_batch(
     scored,
     items: list[_TeacherScoreRequest],
-) -> list[list[TeacherToken]]:
+) -> list[list[TeacherToken] | TeacherError]:
     expected = len(items)
     if not isinstance(scored, list) or len(scored) != expected:
         actual = len(scored) if isinstance(scored, list) else type(scored).__name__
@@ -184,6 +184,8 @@ def _validate_text_teacher_batch(
             permanent=True,
         )
     for result_index, (tokens, item) in enumerate(zip(scored, items, strict=True)):
+        if isinstance(tokens, TeacherError):
+            continue
         completion_text = item.completion_text
         if not isinstance(tokens, list):
             raise TeacherError(
@@ -317,13 +319,15 @@ class _TextTeacherBatcher:
 
     def _score_batch(self, batch: list[_TextTeacherWaiter]) -> None:
         unique_items: list[_TeacherScoreRequest] = []
-        item_indexes: dict[_TeacherScoreRequest, int] = {}
+        item_indexes: dict[object, int] = {}
         scatter_indexes: list[int] = []
+        request_key = getattr(self.teacher, "score_request_key", None)
         for waiter in batch:
-            index = item_indexes.get(waiter.item)
+            key = request_key(waiter.item) if callable(request_key) else waiter.item
+            index = item_indexes.get(key)
             if index is None:
                 index = len(unique_items)
-                item_indexes[waiter.item] = index
+                item_indexes[key] = index
                 unique_items.append(waiter.item)
             scatter_indexes.append(index)
         teacher_items = (
@@ -338,6 +342,9 @@ class _TextTeacherBatcher:
         usage_claimed: set[int] = set()
         for waiter, index in zip(batch, scatter_indexes, strict=True):
             result = scored[index]
+            if isinstance(result, TeacherError):
+                waiter.complete(error=_teacher_batch_error(result))
+                continue
             if hasattr(result, "input_tokens"):
                 if index in usage_claimed:
                     result = _ScoredTeacherTokens(
@@ -2239,6 +2246,11 @@ def run_opd_train(spec=None) -> None:
         for example in train:
             prompt_rows.append((example, env.prompt_messages(example)))
             _scanned[0] += 1
+    if knobs.teacher_scoring_mode == KIMI_K3_CHAT_PROMPT_LOGPROBS:
+        from flash.engine.worker.kimi_k3_encoding import validate_kimi_k3_message_roles
+
+        for index, (_example, messages) in enumerate(prompt_rows):
+            validate_kimi_k3_message_roles(messages, source=f"OPD prompt record {index}")
     multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
     if multimodal:
         validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)

@@ -1038,17 +1038,11 @@ def test_resume_validator_rejects_corrupt_alignment_granularity(overrides):
         validate_opd_resume_state_metadata(state, expected_seed=42, checkpoint_step=2)
 
 
-def test_resume_state_version_rejects_states_predating_alignment_granularity():
-    # the verl worker resumes align_group_sum/align_group_n and publishes their ratio as
-    # mean_align_granularity. a state written before those accumulators existed carries neither, so
-    # resuming one restarts the accumulator at zero and the ratio would describe only the
-    # post-resume samples while being reported as the whole run's alignment health. the contract
-    # version is the enforcement point: it must have moved past 2 so the existing fail-closed check
-    # refuses those states outright.
-    assert OPD_RESUME_STATE_VERSION > 2
+def test_resume_state_version_rejects_version_three_states():
+    assert OPD_RESUME_STATE_VERSION == 4
 
     stale = _valid_resume_state(2)
-    stale["contract_version"] = 2
+    stale["contract_version"] = 3
 
     with pytest.raises(ValueError, match="contract_version"):
         validate_opd_resume_state_metadata(stale, expected_seed=42, checkpoint_step=2)

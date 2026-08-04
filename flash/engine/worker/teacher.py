@@ -42,6 +42,43 @@ class _TeacherMessage:
         return payload
 
 
+def _normalize_teacher_message_content(content: object, *, message_index: int) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise TeacherError(
+            f"teacher message {message_index} content must be text or text blocks",
+            permanent=True,
+        )
+    normalized: list[str] = []
+    for block_index, block in enumerate(content):
+        if not isinstance(block, dict):
+            raise TeacherError(
+                f"teacher message {message_index} content block {block_index} must be an object",
+                permanent=True,
+            )
+        if block.get("type") != "text":
+            raise TeacherError(
+                f"teacher message {message_index} content block {block_index} must have type 'text'",
+                permanent=True,
+            )
+        text = block.get("text")
+        if not isinstance(text, str):
+            raise TeacherError(
+                f"teacher message {message_index} content block {block_index} text must be a string",
+                permanent=True,
+            )
+        if set(block) != {"type", "text"}:
+            raise TeacherError(
+                f"teacher message {message_index} content block {block_index} has unsupported fields",
+                permanent=True,
+            )
+        normalized.append(text)
+    return "".join(normalized)
+
+
 @dataclass(frozen=True)
 class _TeacherScoreRequest:
     messages: tuple[_TeacherMessage, ...]
@@ -66,18 +103,13 @@ class _TeacherScoreRequest:
                     permanent=True,
                 )
             role = message.get("role")
-            content = message.get("content", "")
+            content = _normalize_teacher_message_content(
+                message.get("content", ""), message_index=index
+            )
             reasoning = message.get("reasoning_content", message.get("reasoning"))
             if not isinstance(role, str) or not role:
                 raise TeacherError(
                     f"teacher message {index} role must be a nonempty string",
-                    permanent=True,
-                )
-            if content is None:
-                content = ""
-            if not isinstance(content, str):
-                raise TeacherError(
-                    f"teacher message {index} content must be text",
                     permanent=True,
                 )
             if reasoning is not None and not isinstance(reasoning, str):
@@ -463,6 +495,9 @@ class TeacherClient:
 
     def preflight(self) -> None:
         return None
+
+    def score_request_key(self, request: _TeacherScoreRequest) -> tuple[str, str]:
+        return request.fireworks_prompt, request.completion_text
 
     # -- transport -------------------------------------------------------------------------------
     def _post(self, path: str, body: dict) -> dict:

@@ -60,9 +60,14 @@ class ParasailTeacherClient(TeacherClient):
     def preflight(self) -> None:
         _ = self.encoding
 
+    def score_request_key(
+        self, request: _TeacherScoreRequest
+    ) -> tuple[tuple[_TeacherMessage, ...], str, str]:
+        return request.messages, request.assistant_prefill, request.completion_text
+
     def score_many(
         self, items: list[_TeacherScoreRequest | tuple[str, str]]
-    ) -> list[list[TeacherToken]]:
+    ) -> list[list[TeacherToken] | TeacherError]:
         if not items:
             return []
         requests: list[_TeacherScoreRequest] = []
@@ -75,7 +80,14 @@ class ParasailTeacherClient(TeacherClient):
             requests.append(item)
         workers = min(_MAX_CONCURRENCY, len(requests))
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            return list(executor.map(self._score_request, requests))
+            futures = [executor.submit(self._score_request, request) for request in requests]
+            outcomes: list[list[TeacherToken] | TeacherError] = []
+            for future in futures:
+                try:
+                    outcomes.append(future.result())
+                except TeacherError as error:
+                    outcomes.append(error)
+            return outcomes
 
     def score(
         self,

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.teacher import TeacherClient, _TeacherScoreRequest
+from flash.engine.worker.teacher import TeacherClient, TeacherError, _TeacherScoreRequest
 from flash.engine.worker.tokenizer_align import (
     StudentToken,
     TeacherToken,
@@ -1384,6 +1384,82 @@ def test_fireworks_scoring_preserves_requests_with_nonstandard_message_roles(mon
     assert request.messages[0].role == "tool-result"
     assert capture["body"]["prompt"] == "P: hi"
     assert [token.text for token in tokens] == ["hi"]
+
+
+def test_fireworks_text_blocks_match_string_content_on_the_wire(monkeypatch):
+    from flash.engine.worker.opd_gkd import _teacher_prompt_text
+
+    string_messages = [{"role": "user", "content": "hello world"}]
+    block_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ],
+        }
+    ]
+    string_prompt = _teacher_prompt_text(string_messages)
+    block_prompt = _teacher_prompt_text(block_messages)
+    payload = {
+        "choices": [
+            {
+                "index": index,
+                "logprobs": {
+                    "tokens": [string_prompt, "hi"],
+                    "token_logprobs": [0.0, -0.5],
+                    "text_offset": [0, len(string_prompt)],
+                },
+            }
+            for index in range(2)
+        ]
+    }
+    capture = {}
+    _mock_urlopen(monkeypatch, payload, capture)
+    string_request = _TeacherScoreRequest.from_messages(
+        string_messages,
+        fireworks_prompt=string_prompt,
+        assistant_prefill="",
+        completion_text="hi",
+    )
+    block_request = _TeacherScoreRequest.from_messages(
+        block_messages,
+        fireworks_prompt=block_prompt,
+        assistant_prefill="",
+        completion_text="hi",
+    )
+
+    tokens = TeacherClient("k", "https://api.example/v1", "glm").score_many(
+        [string_request, block_request]
+    )
+
+    assert string_request.messages == block_request.messages
+    assert string_prompt == block_prompt == "User: hello world\nAssistant: "
+    assert capture["body"]["prompt"] == [string_prompt + "hi", block_prompt + "hi"]
+    assert [[token.text for token in result] for result in tokens] == [["hi"], ["hi"]]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}],
+        [{"type": "unknown", "text": "x"}],
+        [{"type": "text"}],
+        [{"type": "text", "text": 1}],
+        [{"type": "text", "text": "x", "extra": True}],
+        ["plain text"],
+    ],
+)
+def test_teacher_score_request_rejects_non_text_content_blocks(content):
+    with pytest.raises(TeacherError, match="content block") as error:
+        _TeacherScoreRequest.from_messages(
+            [{"role": "user", "content": content}],
+            fireworks_prompt="unused",
+            assistant_prefill="",
+            completion_text="answer",
+        )
+
+    assert error.value.permanent is True
 
 
 def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatch):
