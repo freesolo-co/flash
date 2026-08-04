@@ -184,7 +184,11 @@ def cancel_run(run_id: str) -> RunStatus:
     from flash.server._locks import _deploy_lock
 
     # fence teacher authority before waiting on deployment locks or slow provider teardown.
-    server_db.revoke_teacher_capabilities_for_run(run_id)
+    deferred_fencing_errors: list[Exception] = []
+    try:
+        server_db.revoke_teacher_capabilities_for_run(run_id)
+    except Exception as exc:
+        deferred_fencing_errors.append(exc)
 
     def _clear_exact_remote(expected_remote: dict) -> bool:
         expected_identity = _remote_resource_identity(expected_remote)
@@ -232,6 +236,8 @@ def cancel_run(run_id: str) -> RunStatus:
         initial_status = get_status(run_id)
     _, initial_active = _deployment_state_and_requires_revocation(initial_status.deployment)
     if initial_status.state in TERMINAL_STATES and not initial_active:
+        if deferred_fencing_errors:
+            raise deferred_fencing_errors[0]
         return initial_status
 
     entered_deployed = initial_status.state == "deployed"
@@ -247,6 +253,33 @@ def cancel_run(run_id: str) -> RunStatus:
         and initial_status.state not in TERMINAL_STATES
         and not entered_deployed
     )
+
+    cancellation_fence_attempted = False
+
+    def _persist_cancellation_fence() -> None:
+        nonlocal cancellation_fence_attempted
+        if cancellation_fence_attempted:
+            return
+        cancellation_fence_attempted = True
+        try:
+            fence_applied = _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
+        except Exception as exc:
+            deferred_fencing_errors.append(exc)
+            return
+        if fence_applied:
+            return
+        try:
+            fenced_status = get_status(run_id)
+        except Exception as exc:
+            deferred_fencing_errors.append(exc)
+            return
+        if fenced_status.state not in TERMINAL_STATES:
+            deferred_fencing_errors.append(
+                RuntimeError(f"run {run_id} cancellation fence was not persisted")
+            )
+
+    if initial_status.remote:
+        _persist_cancellation_fence()
 
     deploy_lock = _deploy_lock(run_id)
     captured_contended_attempt: dict | None = None
@@ -331,12 +364,16 @@ def cancel_run(run_id: str) -> RunStatus:
                                 raise DeploymentStatePersistenceError(
                                     run_id, str(exc), backend_outcome="not_attempted"
                                 ) from exc
+            _persist_cancellation_fence()
             deploy_lock.acquire()
             lock_acquired = True
 
         # close the race where submission held the deploy lock, minted a capability after the
         # pre-lock fence, and released the lock only after persisting its provider handle.
-        server_db.revoke_teacher_capabilities_for_run(run_id)
+        try:
+            server_db.revoke_teacher_capabilities_for_run(run_id)
+        except Exception as exc:
+            deferred_fencing_errors.append(exc)
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"
 
@@ -571,6 +608,8 @@ def cancel_run(run_id: str) -> RunStatus:
             raise DeploymentStatePersistenceError(
                 run_id, str(error), backend_outcome=backend_outcome
             ) from error
+        if deferred_fencing_errors:
+            raise deferred_fencing_errors[0]
         return get_status(run_id)
     finally:
         if lock_acquired:

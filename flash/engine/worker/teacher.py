@@ -27,6 +27,8 @@ import urllib.request
 from flash.engine.worker.tokenizer_align import TeacherToken
 
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
+_BROKER_PROVIDER_TIMEOUT_CEILING_S = 90.0
+_DEFAULT_TEACHER_TIMEOUT_S = 105.0
 _PREDISPATCH_RETRYABLE_BROKER_CODES = frozenset({"broker_busy", "provider_unavailable"})
 
 
@@ -376,7 +378,7 @@ class TeacherClient:
         broker_url: str,
         model: str,
         *,
-        timeout: float = 90.0,
+        timeout: float = _DEFAULT_TEACHER_TIMEOUT_S,
         max_retries: int = 4,
     ) -> None:
         if not capability:

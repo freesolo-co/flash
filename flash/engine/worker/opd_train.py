@@ -1125,7 +1125,11 @@ class _TeacherAlignmentBridge:
                     )
                     for position in scorable
                 ]
-                teacher_batches = self.teacher.score_many(items)
+                teacher_batches = []
+                for start in range(0, len(items), _TEXT_TEACHER_BATCH_SIZE):
+                    teacher_batches.extend(
+                        self.teacher.score_many(items[start : start + _TEXT_TEACHER_BATCH_SIZE])
+                    )
                 if len(teacher_batches) != len(scorable):
                     raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
                 with self._stats_lock:

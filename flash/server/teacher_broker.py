@@ -258,7 +258,7 @@ def _reject_nonfinite(_value: str) -> None:
     raise TeacherBrokerError("non_finite_number", status_code=400)
 
 
-def parse_strict_json(raw: bytes) -> dict[str, Any]:
+def parse_strict_json(raw: bytes | bytearray) -> dict[str, Any]:
     if len(raw) > MAX_REQUEST_BODY_BYTES:
         raise TeacherBrokerError("request_too_large", status_code=413)
     try:
@@ -551,7 +551,7 @@ def complete_fireworks_request(
     *,
     capability_token: str,
     request_id: str,
-    raw_body: bytes,
+    raw_body: bytes | bytearray,
 ) -> dict[str, Any]:
     request_id, capability_token, capability = authenticate_teacher_capability(
         capability_token=capability_token,

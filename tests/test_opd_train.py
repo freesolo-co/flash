@@ -3618,6 +3618,57 @@ def test_deterministic_empty_alignment_exhaustion_remains_permanent():
     assert bridge.empty_alignments == 3
 
 
+def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
+    class OrderedTeacher:
+        def __init__(self):
+            self.batch_sizes = []
+            self.next_index = 0
+
+        def score_many(self, items):
+            self.batch_sizes.append(len(items))
+            results = []
+            for _item in items:
+                self.next_index += 1
+                results.append(
+                    [
+                        TeacherToken(
+                            text="AB",
+                            logprob=-float(self.next_index),
+                            start=0,
+                            end=2,
+                        )
+                    ]
+                )
+            return results
+
+    teacher = OrderedTeacher()
+    bridge = _text_bridge(teacher)
+    monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
+    bridge._sessions["session-1"] = {
+        "turns": [
+            {
+                "prompt_ids": [10, 11],
+                "response_ids": [65, 66],
+                "completion_text": "AB",
+                "context_messages": [{"role": "user", "content": "question"}],
+                "truncated": False,
+                "skip_reason": "",
+            }
+            for _index in range(15)
+        ],
+        "score_cache": None,
+        "score_lock": threading.Lock(),
+        "lease_deadline": time.monotonic() + 60,
+    }
+
+    result = bridge.score_multiturn("session-1")
+
+    assert teacher.batch_sizes == [8, 7]
+    assert [_teacher_logsum(turn) for turn in result["turns"]] == [
+        -float(index) for index in range(1, 16)
+    ]
+
+
 def test_multiturn_transient_bridge_failure_latches_terminal_cause():
     from flash.engine.worker.perf import RetriableInfraError
     from flash.engine.worker.teacher import TeacherError

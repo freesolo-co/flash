@@ -683,6 +683,18 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
     assert token not in dump
 
 
+def test_worker_default_timeout_exceeds_broker_provider_ceiling():
+    from flash.engine.worker import teacher as worker_teacher
+
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "accounts/fireworks/models/glm-5p2"
+    )
+
+    assert worker_teacher._BROKER_PROVIDER_TIMEOUT_CEILING_S == 90.0
+    assert client.timeout == worker_teacher._DEFAULT_TEACHER_TIMEOUT_S
+    assert client.timeout > worker_teacher._BROKER_PROVIDER_TIMEOUT_CEILING_S
+
+
 def test_worker_reuses_one_logical_request_id_across_transport_retries(monkeypatch):
     import urllib.error
 
@@ -758,6 +770,39 @@ def test_worker_retries_predispatch_http_error_with_same_request_id(monkeypatch)
     assert client.score("question", "answer")
     assert len(request_ids) == 2
     assert len(set(request_ids)) == 1
+
+
+def test_worker_does_not_retry_request_in_progress(monkeypatch):
+    import urllib.error
+
+    from flash.engine.worker import teacher as worker_teacher
+
+    request_ids = []
+
+    def urlopen(_transport, request, timeout=None):
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "request_in_progress",
+                    "classification": "transient",
+                }
+            }
+        ).encode()
+        raise urllib.error.HTTPError(request.full_url, 409, "conflict", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "accounts/fireworks/models/glm-5p2"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert "request_in_progress (permanent)" in str(error.value)
+    assert len(request_ids) == 1
 
 
 def test_worker_does_not_retry_postdispatch_http_error(monkeypatch):
@@ -836,8 +881,38 @@ def test_operation_specific_route_requires_bearer_json_and_request_id(monkeypatc
     assert captured == {
         "capability_token": "capability-value",
         "request_id": "request-route-000001",
-        "raw_body": b"{}",
+        "raw_body": bytearray(b"{}"),
     }
+    assert isinstance(captured["raw_body"], bytearray)
+
+
+def test_bounded_body_accepts_exact_limit_without_copy_and_rejects_next_chunk(monkeypatch):
+    from flash.server.routes import teacher as teacher_route
+
+    monkeypatch.setattr(teacher_route, "MAX_REQUEST_BODY_BYTES", 4)
+
+    class Request:
+        def __init__(self, chunks):
+            self.headers = {}
+            self._chunks = chunks
+
+        async def stream(self):
+            for chunk in self._chunks:
+                yield chunk
+
+    body = asyncio.run(teacher_route._bounded_body(Request([b"ab", b"cd"])))
+    assert type(body) is bytearray
+    assert body == b"abcd"
+
+    with pytest.raises(teacher_broker.TeacherBrokerError, match="request_too_large"):
+        asyncio.run(teacher_route._bounded_body(Request([b"ab", b"cd", b"e"])))
+
+
+def test_strict_json_accepts_bytearray_without_converting_input():
+    raw = bytearray(b'{"model":"accounts/fireworks/models/glm-5p2"}')
+
+    assert teacher_broker.parse_strict_json(raw) == {"model": "accounts/fireworks/models/glm-5p2"}
+    assert type(raw) is bytearray
 
 
 @pytest.mark.parametrize("state", ["invalid", "revoked"])

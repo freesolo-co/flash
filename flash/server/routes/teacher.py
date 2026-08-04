@@ -19,7 +19,7 @@ MAX_CONCURRENT_BODY_READERS = 8
 _BODY_INGRESS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BODY_READERS)
 
 
-async def _bounded_body(request: Request) -> bytes:
+async def _bounded_body(request: Request) -> bytearray:
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -33,7 +33,7 @@ async def _bounded_body(request: Request) -> bytes:
         if len(chunk) > MAX_REQUEST_BODY_BYTES - len(body):
             raise TeacherBrokerError("request_too_large", status_code=413)
         body.extend(chunk)
-    return bytes(body)
+    return body
 
 
 def _bearer(request: Request) -> str:
