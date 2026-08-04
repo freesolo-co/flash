@@ -34,6 +34,13 @@ class OpdKnobs:
 
     teacher_model: str = ""
     teacher_base_url: str = ""
+    teacher_provider: str = "fireworks"
+    teacher_credential_env: str = "FIREWORKS_API_KEY"
+    teacher_scoring_mode: str = "fireworks_completion_echo"
+    teacher_encoding_repo: str = ""
+    teacher_encoding_revision: str = ""
+    teacher_tokenizer_config_sha256: str = ""
+    teacher_tokenizer_model_sha256: str = ""
     epochs: int = RECIPE.opd.num_epochs
     learning_rate: float = 0.0
     temperature: float = 0.0
@@ -78,19 +85,21 @@ def _resolve_opd_knobs() -> OpdKnobs:
             "0 makes every optimizer step a no-op (zero gradient) yet still counts toward `steps` and "
             "publishes an untrained adapter. Omit the field to use the default, or set a positive value."
         )
-    # Resolve the managed teacher from [train].teacher_model (the resolved Fireworks model id, "" =>
-    # the GLM 5.2 default). Parse already validated + canonicalized it, but JobSpec.from_dict is a
-    # tolerant deserializer, so re-validate at this boundary (like the kl_coef guard above): resolve
-    # is idempotent for a canonical model id, and a spec that reaches the worker with an unsupported
-    # teacher fails loudly here rather than as an opaque Fireworks 404 mid-run. base_url is shared by
-    # every allow-listed teacher (one Fireworks endpoint + one managed key), so it stays d.teacher_base_url.
+    # re-resolve the closed managed teacher at the tolerant worker boundary.
     try:
         teacher = resolve_teacher(opt("teacher_model", ""))
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e
     return OpdKnobs(
         teacher_model=teacher.model_id,
-        teacher_base_url=d.teacher_base_url,
+        teacher_base_url=teacher.base_url,
+        teacher_provider=teacher.provider,
+        teacher_credential_env=teacher.credential_env,
+        teacher_scoring_mode=teacher.scoring_mode,
+        teacher_encoding_repo=teacher.encoding_repo,
+        teacher_encoding_revision=teacher.encoding_revision,
+        teacher_tokenizer_config_sha256=teacher.tokenizer_config_sha256,
+        teacher_tokenizer_model_sha256=teacher.tokenizer_model_sha256,
         epochs=int(t.epochs) if t and t.epochs is not None else d.num_epochs,
         learning_rate=float(opt("learning_rate", 0) or d.learning_rate),
         temperature=float(

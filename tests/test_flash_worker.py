@@ -78,6 +78,7 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
 
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
     opd_spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
@@ -116,23 +117,52 @@ def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
 
-def test_build_worker_env_forwards_managed_teacher_key_for_opd_only(monkeypatch):
-    """The opd GLM teacher key is a platform-owned credential injected from the control-plane env
-    (like GITHUB_TOKEN) — but ONLY for opd runs, since only opd uses it. sft/grpo workers never
-    receive it."""
+def test_build_worker_env_forwards_only_selected_managed_teacher_key(monkeypatch):
     from flash.providers.runpod.train import build_worker_env
     from flash.spec import JobSpec, TrainSpec
 
-    monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
-    opd_spec = JobSpec(
+    monkeypatch.setenv("FIREWORKS_API_KEY", "platform-fireworks")
+    monkeypatch.setenv("PARASAIL_API_KEY", "platform-parasail")
+    fireworks_spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
-    assert build_worker_env(opd_spec, 0).get("FIREWORKS_API_KEY") == "platform-managed-teacher"
-    # grpo/sft don't use a teacher, so the key is not forwarded to those workers.
-    assert "FIREWORKS_API_KEY" not in build_worker_env(_spec(), 0)
+    parasail_spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(
+            epochs=1,
+            max_examples=10,
+            hf_repo="owner/runs",
+            teacher_model="parasail-kimi-k3",
+        ),
+        seed=0,
+    )
+
+    assert build_worker_env(fireworks_spec, 0)["FIREWORKS_API_KEY"] == "platform-fireworks"
+    assert "PARASAIL_API_KEY" not in build_worker_env(fireworks_spec, 0)
+    assert build_worker_env(parasail_spec, 0)["PARASAIL_API_KEY"] == "platform-parasail"
+    assert "FIREWORKS_API_KEY" not in build_worker_env(parasail_spec, 0)
+    grpo_env = build_worker_env(_spec(), 0)
+    assert "FIREWORKS_API_KEY" not in grpo_env
+    assert "PARASAIL_API_KEY" not in grpo_env
+
+
+def test_build_worker_env_rejects_missing_selected_teacher_key(monkeypatch):
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
+
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    spec = JobSpec(
+        algorithm="opd",
+        train=TrainSpec(hf_repo="owner/runs"),
+        seed=0,
+    )
+
+    with pytest.raises(RuntimeError, match="FIREWORKS_API_KEY"):
+        build_worker_env(spec, 0)
 
 
 def test_build_worker_env_managed_teacher_key_is_authoritative_no_byo(monkeypatch):

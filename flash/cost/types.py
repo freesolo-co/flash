@@ -29,9 +29,7 @@ class RunConfig:
     thinking: bool = False
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
-    # OPD only: the Fireworks teacher model id (already resolved from [train].teacher_model at parse).
-    # Prices the teacher-API estimate; an empty value resolves to the default GLM 5.2 teacher (an
-    # omitted [train].teacher_model).
+    # opd only: the resolved managed teacher model id used for the api estimate.
     teacher_model: str = ""
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
@@ -219,8 +217,8 @@ class CostEstimate:
         ]
         if self.teacher_api_usd > 0:
             lines.append(
-                f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks teacher token spend on the "
-                "platform-managed teacher key — tracked separately, NOT included in TOTAL)"
+                f"Teacher API: ${self.teacher_api_usd:.2f} (managed teacher token spend on the "
+                "selected provider key; tracked separately, NOT included in TOTAL)"
             )
         lines.append(f"TOTAL      : ${self.total_usd:.2f}")
         if self.notes:

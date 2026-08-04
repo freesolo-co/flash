@@ -262,10 +262,12 @@ def _worker_env_for(algorithm: str, phase: str) -> dict:
 
 
 @pytest.mark.parametrize(("algorithm", "phase"), [("grpo", "rl"), ("opd", "opd")])
-def test_verl_rollout_never_gets_expandable_segments(algorithm, phase):
+def test_verl_rollout_never_gets_expandable_segments(algorithm, phase, monkeypatch):
     """GRPO and OPD are the algorithms that build a vLLM rollout, so they are the ones whose
     CuMemAllocator asserts on expandable_segments. SFT is covered below: it has no rollout and must
     KEEP the expandable conf."""
+    if algorithm == "opd":
+        monkeypatch.setenv("FIREWORKS_API_KEY", "test-managed-teacher-key")
     env = _worker_env_for(algorithm, phase)
     for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
         assert "expandable_segments" not in env[key], (
@@ -282,7 +284,7 @@ def test_verl_sft_keeps_the_expandable_allocator():
 
 
 @pytest.mark.parametrize("stale_backend", ["trl", "verl", "bogus"])
-def test_a_stale_backend_key_cannot_change_the_allocator(stale_backend):
+def test_a_stale_backend_key_cannot_change_the_allocator(stale_backend, monkeypatch):
     """[worker_env] no longer selects a backend: every phase delegates to verl unconditionally. A
     stale key left in a config must therefore be inert -- honoring one would pick an allocator for a
     trainer that cannot run, and "trl" on grpo/opd would hand verl's rollout the expandable conf that
@@ -290,6 +292,7 @@ def test_a_stale_backend_key_cannot_change_the_allocator(stale_backend):
     from flash.providers._worker import build_worker_env
     from flash.spec import JobSpec
 
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-managed-teacher-key")
     for algorithm, phase, expect_expandable in (
         ("grpo", "rl", False),
         ("opd", "opd", False),

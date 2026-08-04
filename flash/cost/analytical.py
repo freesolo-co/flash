@@ -517,17 +517,24 @@ def estimate_cost(
     train = max(0.0, cap_s - setup) if wall_capped else raw_train
     wall = setup + train
 
-    # OPD: add the external Fireworks teacher token spend. The teacher echo-scores every
-    # sampled completion (input ~ prompt+completion per completion), so bill INPUT tokens over the
-    # EFFECTIVE (wall-capped) step count — not the uncapped `steps` — so a wall-capped run's teacher
-    # bill tracks the GPU time it is actually billed for.
+    # opd adds the selected managed teacher's input and required generated-token spend.
     teacher_api_usd = 0.0
     if config.is_opd:
         n = config.normalized()
         effective_steps = (train / sps) if sps > 0 else config.steps
-        _, tokens_per_step = _opd_step_shape(n)
+        completions_per_step, tokens_per_step = _opd_step_shape(n)
         teacher_input_tokens = effective_steps * tokens_per_step
-        teacher_api_usd = teacher_token_cost_usd(teacher_input_tokens, 0.0, config.teacher_model)
+        from flash.engine.recipe import resolve_teacher
+
+        teacher = resolve_teacher(config.teacher_model)
+        teacher_output_tokens = (
+            effective_steps * completions_per_step * teacher.billed_output_tokens_per_score
+        )
+        teacher_api_usd = teacher_token_cost_usd(
+            teacher_input_tokens,
+            teacher_output_tokens,
+            config.teacher_model,
+        )
 
     return CostEstimate(
         model_id=config.model_id,

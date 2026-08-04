@@ -815,12 +815,12 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   lets you pick the teacher that best fits your task without changing anything else.
 
   **How to check, given the key is managed.** Flash has no command that generates teacher
-  rollouts — the platform's Fireworks key is used only inside the paid OPD worker, to score the
-  student's own tokens — so there is nothing to run locally with your Flash credentials alone.
+  rollouts. The selected provider key is used only inside the paid OPD parent worker to score the
+  student's own tokens, so there is nothing to run locally with your Flash credentials alone.
   Two workable routes:
 
-  - _Best, if you can:_ get your own access to the same model (the allow-list is Fireworks-hosted,
-    and these are widely available elsewhere too), point your environment's scorer at it, and grade
+  - _Best, if you can:_ get your own access to the same model, point your environment's scorer at
+    it, and grade
     a held-out split exactly as you would a student. Read the score _and_ a sample of trajectories —
     a teacher that is right for the wrong reasons transfers the wrong reasons.
   - _Cheapest, always available:_ run a deliberately short OPD probe (a small `max_steps` on a
@@ -847,13 +847,14 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
     it stops the run from starting.
 
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
-  the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
-  `glm-5.2` (default) or `kimi-k2.6`. Every option is
-  a Fireworks-hosted model reached with the platform's own key, so there is nothing to export or
-  declare — an opd run submits like any other, and a `FIREWORKS_API_KEY` in your shell is ignored.
-  Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
-  teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
-  at serving time; teacher token cost varies by model and is shown in the pre-flight estimate.
+  managed **GLM 5.2**. The fixed allow-list is `glm-5.2` (default), `kimi-k2.6`, or `kimi-k3`.
+  GLM 5.2 and Kimi K2.6 use Fireworks completion echo scoring. Kimi K3 is text-only and uses
+  Parasail chat prompt logprobs with a pinned local encoder; Kimi K2.6 remains the image-capable
+  choice. Flash injects only the selected provider's platform key into the OPD parent, and neither
+  key reaches SFT, GRPO, or the isolated verl child. Keys from your shell or environment config
+  cannot override the managed credential. Arbitrary bring-your-own teacher models or keys are not
+  supported. The key is never stored in the spec or needed at serving time; teacher token cost varies
+  by model and is shown in the pre-flight estimate.
 - **The student (Qwen) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai _spider_ / Tinker
   method): it aligns the two tokenizations by shared decoded-text spans and applies per-span reverse
@@ -883,8 +884,8 @@ epochs = 1
 max_examples = 2
 lora_rank = 32
 # teacher_model = "glm-5.2"                             # managed teacher to distil from; one of
-#                                                       # glm-5.2 (default) | kimi-k2.6
-#                                                       # (key stays managed)
+#                                                       # glm-5.2 (default) | kimi-k2.6 | kimi-k3
+#                                                       # kimi-k2.6 supports images; kimi-k3 is text-only
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 ```
 

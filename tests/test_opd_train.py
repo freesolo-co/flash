@@ -763,6 +763,7 @@ def _resume_accounting(step=2):
         "prompt_pool_fingerprint": "a" * 64,
         "generated_tokens": 41,
         "teacher_input_tokens": 37,
+        "teacher_output_tokens": 5,
         "truncated_rollouts": 3,
         "forced_tokens": 9,
         "dropped_forced_groups": 4,
@@ -1092,6 +1093,29 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
         bridge.score(0, 2, [10, 12, 65, 99])
 
 
+def test_bridge_uses_exact_provider_teacher_usage_when_attached():
+    from flash.engine.worker.teacher import _ScoredTeacherTokens
+
+    class _MeasuredTeacher:
+        def score(self, prompt_text, completion_text):
+            assert prompt_text == "User: question\nAssistant: "
+            assert completion_text == "AB"
+            return _ScoredTeacherTokens(
+                [
+                    TeacherToken(text="A", logprob=-0.4, start=0, end=1),
+                    TeacherToken(text="B", logprob=-0.7, start=1, end=2),
+                ],
+                input_tokens=123,
+                output_tokens=1,
+            )
+
+    bridge = _text_bridge(_MeasuredTeacher())
+    bridge.score(0, 2, [10, 11, 65, 66, 99])
+
+    assert bridge.teacher_input_tokens == 123
+    assert bridge.teacher_output_tokens == 1
+
+
 def test_bridge_granularity_separates_a_collapsed_alignment_from_a_healthy_one():
     # both teachers cover every student token, so coverage is 1.0 for BOTH and cannot tell them
     # apart. the merged teacher returns one span where the healthy one returns two, which is the
@@ -1237,6 +1261,37 @@ def test_text_teacher_batcher_deduplicates_exact_pairs_and_scatters_to_all_waite
     assert [_teacher_logsum(result) for _status, result in outcomes] == [-1.0] * 8
     assert bridge.score_requests == 8
     assert bridge.teacher_ok == 8
+
+
+def test_text_teacher_batcher_counts_deduplicated_provider_usage_once(monkeypatch):
+    from flash.engine.worker import opd_train as opd_train_mod
+    from flash.engine.worker.teacher import _ScoredTeacherTokens
+
+    monkeypatch.setattr(opd_train_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+
+    class _MeasuredBatchTeacher:
+        structured_score_requests = True
+
+        def score_many(self, requests):
+            assert len(requests) == 1
+            return [
+                _ScoredTeacherTokens(
+                    [TeacherToken(text="AB", logprob=-1.0, start=0, end=2)],
+                    input_tokens=50,
+                    output_tokens=1,
+                )
+            ]
+
+    bridge = _batching_bridge(_MeasuredBatchTeacher(), ["same question"] * 8)
+    bridge.start()
+    try:
+        outcomes = _concurrent_bridge_scores(bridge, range(8), via_http=False)
+    finally:
+        bridge.close()
+
+    assert all(status == "ok" for status, _result in outcomes)
+    assert bridge.teacher_input_tokens == 50
+    assert bridge.teacher_output_tokens == 1
 
 
 def test_text_teacher_batcher_keeps_nonidentical_inputs_separate_and_ordered(monkeypatch):
@@ -2376,6 +2431,7 @@ def test_retry_sidecar_persists_real_accumulated_accounting(tmp_path):
     assert state["coverage_curve"] == [0.5, 0.7]
     assert state["generated_tokens"] == 41
     assert state["teacher_input_tokens"] == 37
+    assert state["teacher_output_tokens"] == 5
     assert state["teacher_ok"] == 6
     assert state["teacher_transient"] == 1
     assert state["forced_tokens"] == 9
@@ -2415,6 +2471,7 @@ def test_resume_restores_bridge_counters_and_extends_full_curves():
     assert restored["coverage_curve"] == [0.5, 0.7, 1.0]
     assert restored["generated_tokens"] == 44
     assert restored["teacher_input_tokens"] == 42
+    assert restored["teacher_output_tokens"] == 5
     assert restored["teacher_ok"] == 7
     assert restored["forced_tokens"] == 9
     assert restored["dropped_forced_groups"] == 4
@@ -5080,6 +5137,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "FIREWORKS_API_KEY" not in child
+    assert "PARASAIL_API_KEY" not in child
     assert "HF_TOKEN" not in child
     assert "FLASH_OPD_STRUCTURED_OUTPUTS" not in child
     assert "FLASH_OPD_MODEL_VOCAB_SIZE" not in child
@@ -5131,6 +5189,7 @@ def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path)
         "rollout_done",
     ]
     assert "FIREWORKS_API_KEY" not in child
+    assert "PARASAIL_API_KEY" not in child
 
 
 def test_structured_validator_rejects_vllm_mistral_tokenizer_models(monkeypatch):
@@ -5443,6 +5502,8 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
     from flash.providers._worker import build_worker_env
     from flash.spec import JobSpec
 
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-managed-teacher-key")
+
     def _spec(worker_env=None):
         payload = {
             "run_id": "r-alloc",
@@ -5734,8 +5795,94 @@ def test_opd_missing_managed_teacher_key_fails_before_the_gpu_probe(monkeypatch)
     monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
     monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
 
-    with pytest.raises(RuntimeError, match="managed teacher api key is missing"):
+    with pytest.raises(RuntimeError, match="managed fireworks teacher credential is missing"):
         opd_mod.run_opd_train()
+
+
+def test_kimi_k3_encoding_preflight_finishes_before_the_gpu_probe(monkeypatch):
+    from flash.engine.worker import opd_train as opd_mod
+    from flash.engine.worker import parasail_teacher as parasail_mod
+
+    events = []
+    env = SimpleNamespace(
+        is_tool_env=False,
+        multi_turn=False,
+        dataset=lambda: [{"question": "2+2"}],
+        prompt_messages=lambda _record: [{"role": "user", "content": "2+2"}],
+    )
+    train = SimpleNamespace(
+        init_from_adapter="",
+        max_examples=1,
+        teacher_model="parasail-kimi-k3",
+        epochs=1,
+        temperature=None,
+        save_at_steps=(),
+        stop_sequences=(),
+        structured_outputs="",
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(
+            SEED=0,
+            THINKING=False,
+            require_active_env=lambda: env,
+            JOB_SPEC=SimpleNamespace(
+                train=train,
+                model="Qwen/Qwen3.5-4B",
+                model_revision="",
+                model_policy="catalog",
+                gpu=SimpleNamespace(type=None),
+            ),
+            heartbeat=lambda *args, **kwargs: None,
+            gpu_diagnostics=lambda **_kwargs: {},
+            prefetch_model=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("model prefetch must not be reached")
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(
+        opd_mod,
+        "_resolve_opd_knobs",
+        lambda: SimpleNamespace(
+            structured_outputs="",
+            teacher_model="parasail-kimi-k3",
+            teacher_provider="parasail",
+            teacher_base_url="https://api.parasail.io/v1",
+            teacher_credential_env="PARASAIL_API_KEY",
+            teacher_scoring_mode="kimi_k3_chat_prompt_logprobs",
+            teacher_encoding_repo="moonshotai/Kimi-K3",
+            teacher_encoding_revision="pinned-revision",
+            teacher_tokenizer_config_sha256="config-hash",
+            teacher_tokenizer_model_sha256="model-hash",
+        ),
+    )
+
+    class FakeParasailTeacher:
+        def __init__(self, *_args, **_kwargs):
+            events.append("teacher_constructed")
+
+        def preflight(self):
+            events.append("encoding_preflight")
+
+    class StopAfterProbe(RuntimeError):
+        pass
+
+    def probe(*_args, **_kwargs):
+        events.append("gpu_probe")
+        assert events == ["teacher_constructed", "encoding_preflight", "gpu_probe"]
+        raise StopAfterProbe
+
+    monkeypatch.setattr(parasail_mod, "ParasailTeacherClient", FakeParasailTeacher)
+    monkeypatch.setattr(opd_mod, "_probe_gpu_in_subprocess", probe)
+    monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setenv("PARASAIL_API_KEY", "test-managed-teacher-key")
+
+    with pytest.raises(StopAfterProbe):
+        opd_mod.run_opd_train()
+
+    assert events == ["teacher_constructed", "encoding_preflight", "gpu_probe"]
 
 
 def test_the_opd_trainer_stores_the_frozen_base_in_bf16():

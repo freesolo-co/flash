@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.teacher import TeacherClient
+from flash.engine.worker.teacher import TeacherClient, _TeacherScoreRequest
 from flash.engine.worker.tokenizer_align import (
     StudentToken,
     TeacherToken,
@@ -451,9 +451,7 @@ def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
 
 
 def test_opd_selects_managed_teacher_and_rejects_unknown():
-    """[train].teacher_model selects the managed teacher from a fixed allow-list: a supported alias
-    (or the raw Fireworks id, or a spaced/mixed-case form) parses and is stored as its canonical
-    Fireworks model id; an unsupported teacher is rejected at PARSE time (before a paid GPU)."""
+    """The managed teacher allow-list canonicalizes aliases and rejects unknown entries."""
     from flash.schema import ConfigError, spec_from_dict
 
     def _spec(teacher):
@@ -467,8 +465,9 @@ def test_opd_selects_managed_teacher_and_rejects_unknown():
             run_id="x",
         )
 
-    # supported aliases parse and are stored as the canonical fireworks model id.
+    # supported aliases parse to their canonical provider model ids.
     assert _spec("kimi-k2.6").train.teacher_model == "accounts/fireworks/models/kimi-k2p6"
+    assert _spec("kimi-k3").train.teacher_model == "parasail-kimi-k3"
     # A spaced / mixed-case form normalizes to the same model id.
     assert _spec("GLM 5.2").train.teacher_model == "accounts/fireworks/models/glm-5p2"
     # The raw Fireworks model id is also accepted (identity), including with stray surrounding
@@ -1359,6 +1358,34 @@ def test_teacher_score_returns_completion_region_with_rebased_offsets_and_logpro
     assert capture["body"]["logprobs"] == 1
 
 
+def test_fireworks_scoring_preserves_requests_with_nonstandard_message_roles(monkeypatch):
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["P", ":", " ", "hi"],
+                    "token_logprobs": [0.0, -1.0, -2.0, -0.5],
+                    "text_offset": [0, 1, 2, 3],
+                }
+            }
+        ]
+    }
+    capture = {}
+    _mock_urlopen(monkeypatch, payload, capture)
+    request = _TeacherScoreRequest.from_messages(
+        [{"role": "tool-result", "content": "result text"}],
+        fireworks_prompt="P: ",
+        assistant_prefill="",
+        completion_text="hi",
+    )
+
+    tokens = TeacherClient("k", "https://api.example/v1", "glm").score(request)
+
+    assert request.messages[0].role == "tool-result"
+    assert capture["body"]["prompt"] == "P: hi"
+    assert [token.text for token in tokens] == ["hi"]
+
+
 def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatch):
     payload = {
         "choices": [
@@ -2201,11 +2228,7 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
 
 
 def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
-    """_resolve_opd_knobs defensively re-resolves [train].teacher_model at the worker's (tolerant)
-    deserialization boundary: parse already canonicalized it to a Fireworks model id, but the worker
-    still validates — accepting an alias or the model id — so the TeacherClient sends a supported model.
-    An unset value keeps the default GLM 5.2 teacher; the shared base_url is unchanged; an unsupported
-    teacher fails loudly on the worker."""
+    """The worker re-resolves aliases and provider model ids into closed teacher metadata."""
     from flash.engine.worker import opd as opd_mod
 
     class _Train:  # any [train] field not set returns None (falls back to the recipe default)
@@ -2225,12 +2248,16 @@ def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
         )
         return opd_mod._resolve_opd_knobs()
 
-    # a friendly alias resolves to the provider model id.
+    # aliases resolve to provider-specific metadata.
     assert _knobs("kimi-k2.6").teacher_model == "accounts/fireworks/models/kimi-k2p6"
-    # unset / blank / none -> the default glm 5.2 teacher (historical behavior preserved).
+    kimi_k3 = _knobs("kimi-k3")
+    assert kimi_k3.teacher_model == "parasail-kimi-k3"
+    assert kimi_k3.teacher_provider == "parasail"
+    assert kimi_k3.teacher_base_url == "https://api.parasail.io/v1"
+    assert kimi_k3.teacher_credential_env == "PARASAIL_API_KEY"
+    # unset / blank / none preserves the default glm 5.2 teacher.
     assert _knobs("").teacher_model == "accounts/fireworks/models/glm-5p2"
     assert _knobs(None).teacher_model == "accounts/fireworks/models/glm-5p2"
-    # base_url is shared across every allow-listed teacher (one fireworks endpoint + one managed key).
     assert _knobs("kimi-k2.6").teacher_base_url == opd_mod.RECIPE.opd.teacher_base_url
     # unsupported teachers fail loudly on the worker (defensive guard, mirrors the kl_coef check).
     for teacher in (
@@ -2390,6 +2417,8 @@ class _TinyLM:
         "",
         "glm-5.2",
         "accounts/fireworks/models/glm-5p2",
+        "kimi-k3",
+        "parasail-kimi-k3",
     ],
 )
 def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(monkeypatch, teacher_model):

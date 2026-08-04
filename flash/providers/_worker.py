@@ -52,6 +52,7 @@ WORKER_DEPS = [
     # run path; this list only installs on the no-image/live-function path) -- see
     # tests/test_kernel_fingerprint.py::test_huggingface_hub_floor_is_in_lockstep.
     "huggingface_hub>=1.2.0",
+    "tiktoken==0.13.0",
     "accelerate>=1.4",
     # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
     "wandb>=0.17",
@@ -298,12 +299,18 @@ def build_worker_env(
     resume_revision = (runtime_secrets or {}).get(OPD_RESUME_REVISION_ENV)
     if resume_revision:
         env[OPD_RESUME_REVISION_ENV] = str(resume_revision)
-    # The opd GLM teacher key is a platform-owned credential injected from the control-plane env for
-    # opd runs — like HF_TOKEN/GITHUB_TOKEN above, not a user secret. Set it LAST so the platform
-    # value is authoritative: bring-your-own teacher keys are not supported, so no user-routed
-    # runtime_secret can override it.
-    if str(getattr(spec, "algorithm", "")).lower() == "opd" and os.environ.get("FIREWORKS_API_KEY"):
-        env["FIREWORKS_API_KEY"] = os.environ["FIREWORKS_API_KEY"]
+    from flash.engine.recipe import TEACHER_CREDENTIAL_ENV_KEYS, resolve_teacher
+
+    for key in TEACHER_CREDENTIAL_ENV_KEYS:
+        env.pop(key, None)
+    if str(getattr(spec, "algorithm", "")).lower() == "opd":
+        teacher = resolve_teacher(getattr(spec.train, "teacher_model", "") or "")
+        credential = (os.environ.get(teacher.credential_env) or "").strip()
+        if not credential:
+            raise RuntimeError(
+                f"the managed {teacher.provider} teacher credential {teacher.credential_env} is missing"
+            )
+        env[teacher.credential_env] = credential
     return env
 
 

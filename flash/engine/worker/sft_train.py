@@ -888,6 +888,8 @@ def _build_verl_child_env(*, shim_dir: str, wandb_enabled: bool) -> dict[str, st
     }
     if wandb_enabled:
         child.update({key: value for key, value in os.environ.items() if key.startswith("WANDB_")})
+    for key in ("FIREWORKS_API_KEY", "PARASAIL_API_KEY"):
+        child.pop(key, None)
     child["PYTHONPATH"] = os.pathsep.join(
         item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
     )

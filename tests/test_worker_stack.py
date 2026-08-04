@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sys
+import tomllib
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -45,6 +47,20 @@ def test_worker_stack_pins_qwen35_capable_versions():
     assert "vllm==0.19" in joined  # first transformers-5-compatible vllm line
     assert "transformers>=5" in joined  # qwen3_5 model types need transformers 5.x
     assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
+    assert "tiktoken==0.13.0" in joined
+
+
+def test_tiktoken_is_worker_and_test_only_not_a_server_extra():
+    pyproject = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    optional = pyproject["project"]["optional-dependencies"]
+    dependency_groups = pyproject["dependency-groups"]
+
+    assert "tiktoken==0.13.0" in optional["gpu"]
+    assert "tiktoken==0.13.0" in optional["dev"]
+    assert "tiktoken==0.13.0" in dependency_groups["dev"]
+    assert "tiktoken==0.13.0" not in optional["server"]
 
 
 # ---------------------------------------------------------------------------

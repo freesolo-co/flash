@@ -13,6 +13,7 @@ import re
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -84,7 +85,12 @@ from flash.engine.worker.sft_train import (
     _VerlCheckpointWatcher,
     _warmstart_adapter_path,
 )
-from flash.engine.worker.teacher import _MAX_LOGPROB_ROUNDING_ERROR, TeacherError
+from flash.engine.worker.teacher import (
+    _MAX_LOGPROB_ROUNDING_ERROR,
+    TeacherError,
+    _ScoredTeacherTokens,
+    _TeacherScoreRequest,
+)
 from flash.engine.worker.tokenizer_align import (
     TeacherToken,
     groupwise_alignment,
@@ -131,7 +137,7 @@ class _TeacherBridgeHTTPServer(BoundedThreadingHTTPServer):
 
 @dataclass
 class _TextTeacherWaiter:
-    item: tuple[str, str]
+    item: _TeacherScoreRequest
     enqueued_at: float
     done: threading.Event = field(default_factory=threading.Event)
     result: list[TeacherToken] | None = None
@@ -168,7 +174,7 @@ def _teacher_batch_error(error: Exception) -> Exception:
 
 def _validate_text_teacher_batch(
     scored,
-    items: list[tuple[str, str]],
+    items: list[_TeacherScoreRequest],
 ) -> list[list[TeacherToken]]:
     expected = len(items)
     if not isinstance(scored, list) or len(scored) != expected:
@@ -177,9 +183,8 @@ def _validate_text_teacher_batch(
             f"teacher text batch returned {actual} result(s) for {expected} unique input(s)",
             permanent=True,
         )
-    for result_index, (tokens, (_prompt_text, completion_text)) in enumerate(
-        zip(scored, items, strict=True)
-    ):
+    for result_index, (tokens, item) in enumerate(zip(scored, items, strict=True)):
+        completion_text = item.completion_text
         if not isinstance(tokens, list):
             raise TeacherError(
                 f"teacher text batch result {result_index} is not a token list",
@@ -263,17 +268,33 @@ class _TextTeacherBatcher:
             thread = self._thread
         thread.start()
 
-    def score(self, prompt_text: str, completion_text: str) -> list[TeacherToken]:
+    def score(
+        self,
+        request: _TeacherScoreRequest | str,
+        completion_text: str | None = None,
+    ) -> list[TeacherToken]:
+        if not isinstance(request, _TeacherScoreRequest):
+            if completion_text is None:
+                raise TypeError("completion_text is required with a flattened prompt")
+            request = _TeacherScoreRequest(
+                messages=(),
+                fireworks_prompt=request,
+                assistant_prefill="",
+                completion_text=completion_text,
+            )
         with self._condition:
             if self._closed:
                 raise TeacherError("text teacher batcher shut down", permanent=True)
-            waiter = _TextTeacherWaiter(
-                (prompt_text, completion_text),
-                enqueued_at=time.monotonic(),
-            )
+            waiter = _TextTeacherWaiter(request, enqueued_at=time.monotonic())
             self._pending.append(waiter)
             self._condition.notify_all()
         return waiter.wait()
+
+    def score_many(self, requests: list[_TeacherScoreRequest]) -> list[list[TeacherToken]]:
+        if not requests:
+            return []
+        with ThreadPoolExecutor(max_workers=min(self.max_batch_size, len(requests))) as executor:
+            return list(executor.map(self.score, requests))
 
     def _take_batch(self) -> list[_TextTeacherWaiter] | None:
         with self._condition:
@@ -295,8 +316,8 @@ class _TextTeacherBatcher:
             return batch
 
     def _score_batch(self, batch: list[_TextTeacherWaiter]) -> None:
-        unique_items: list[tuple[str, str]] = []
-        item_indexes: dict[tuple[str, str], int] = {}
+        unique_items: list[_TeacherScoreRequest] = []
+        item_indexes: dict[_TeacherScoreRequest, int] = {}
         scatter_indexes: list[int] = []
         for waiter in batch:
             index = item_indexes.get(waiter.item)
@@ -305,12 +326,28 @@ class _TextTeacherBatcher:
                 item_indexes[waiter.item] = index
                 unique_items.append(waiter.item)
             scatter_indexes.append(index)
+        teacher_items = (
+            unique_items
+            if getattr(self.teacher, "structured_score_requests", False)
+            else [(item.fireworks_prompt, item.completion_text) for item in unique_items]
+        )
         scored = _validate_text_teacher_batch(
-            self.teacher.score_many(unique_items),
+            self.teacher.score_many(teacher_items),
             unique_items,
         )
+        usage_claimed: set[int] = set()
         for waiter, index in zip(batch, scatter_indexes, strict=True):
-            waiter.complete(result=scored[index])
+            result = scored[index]
+            if hasattr(result, "input_tokens"):
+                if index in usage_claimed:
+                    result = _ScoredTeacherTokens(
+                        list(result),
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
+                else:
+                    usage_claimed.add(index)
+            waiter.complete(result=result)
 
     def _run(self) -> None:
         try:
@@ -370,6 +407,21 @@ class _BridgePrompt:
     image_descriptors: tuple[str, ...]
     package_root: str | None
     example: dict | None = None
+
+
+def _teacher_score_request(
+    teacher_messages: list[dict],
+    *,
+    fireworks_prompt: str,
+    assistant_prefill: str,
+    completion_text: str,
+) -> _TeacherScoreRequest:
+    return _TeacherScoreRequest.from_messages(
+        teacher_messages,
+        fireworks_prompt=fireworks_prompt,
+        assistant_prefill=assistant_prefill,
+        completion_text=completion_text,
+    )
 
 
 def _prompt_pool_fingerprint(prompts: list[_BridgePrompt]) -> str:
@@ -549,6 +601,7 @@ class _TeacherAlignmentBridge:
         self._stats_lock = threading.Lock()
         self.generated_tokens = int(state.get("generated_tokens", 0))
         self.teacher_input_tokens = int(state.get("teacher_input_tokens", 0))
+        self.teacher_output_tokens = int(state.get("teacher_output_tokens", 0))
         self.aligned_sequences = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
         self.empty_alignments = int(
             state.get(
@@ -676,6 +729,7 @@ class _TeacherAlignmentBridge:
             return {
                 "generated_tokens": self.generated_tokens,
                 "teacher_input_tokens": self.teacher_input_tokens,
+                "teacher_output_tokens": self.teacher_output_tokens,
                 "truncated_rollouts": self.truncated_rollouts,
                 "forced_tokens": self.forced_tokens,
                 "dropped_forced_groups": self.dropped_forced_groups,
@@ -762,6 +816,12 @@ class _TeacherAlignmentBridge:
         if not completion_text.strip() or "�" in completion_text:
             return self._empty(prompt_length, len(response_ids))
         teacher_prompt = _teacher_prompt_text(prompt.teacher_messages, self.thinking_prefill)
+        score_request = _teacher_score_request(
+            prompt.teacher_messages,
+            fireworks_prompt=teacher_prompt,
+            assistant_prefill=self.thinking_prefill,
+            completion_text=completion_text,
+        )
         teacher_images = None
         if prompt.image_descriptors:
             from flash.multimodal import image_descriptors_to_data_uris
@@ -776,11 +836,12 @@ class _TeacherAlignmentBridge:
                 )
             else:
                 if self._text_teacher_batcher is None:
-                    teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+                    if getattr(self.teacher, "structured_score_requests", False):
+                        teacher_tokens = self.teacher.score(score_request)
+                    else:
+                        teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
                 else:
-                    teacher_tokens = self._text_teacher_batcher.score(
-                        teacher_prompt, completion_text
-                    )
+                    teacher_tokens = self._text_teacher_batcher.score(score_request)
         except TeacherError as error:
             if error.permanent:
                 raise
@@ -791,17 +852,18 @@ class _TeacherAlignmentBridge:
             return self._empty(prompt_length, len(response_ids))
         if teacher_images is not None:
             teacher_tokens = teacher_batches[0]
-            teacher_input_tokens = int(getattr(teacher_tokens, "input_tokens", 0) or 0)
-        else:
-            teacher_input_tokens = 0
         with self._stats_lock:
             self.teacher_ok += 1
             self._pending_teacher_success = True
         student_ids, student_tokens = student_tokens_with_offsets(
             self.tokenizer, kept_ids, completion_text
         )
-        if not prompt.image_descriptors:
+        if hasattr(teacher_tokens, "input_tokens"):
+            teacher_input_tokens = int(teacher_tokens.input_tokens)
+            teacher_output_tokens = int(getattr(teacher_tokens, "output_tokens", 0))
+        else:
             teacher_input_tokens = prompt_length + len(student_ids)
+            teacher_output_tokens = 0
         groups = groupwise_alignment(student_tokens, teacher_tokens)
         groups = [(indices, logsum) for indices, logsum in groups if indices]
         aligned_group_count = len(groups)
@@ -810,6 +872,7 @@ class _TeacherAlignmentBridge:
         granularity = _align_granularity(groups, student_tokens)
         with self._stats_lock:
             self.teacher_input_tokens += teacher_input_tokens
+            self.teacher_output_tokens += teacher_output_tokens
             self.dropped_forced_groups += aligned_group_count - len(groups)
             self.coverage_sum += coverage
             if groups:
@@ -1116,16 +1179,33 @@ class _TeacherAlignmentBridge:
                 if not turn["truncated"] and not turn["skip_reason"] and turn["response_ids"]
             ]
             if scorable:
-                items = [
-                    (
-                        _teacher_prompt_text(
-                            turns[position]["context_messages"], self.thinking_prefill
-                        ),
-                        turns[position]["completion_text"],
+                requests = []
+                for position in scorable:
+                    context_messages = turns[position]["context_messages"]
+                    teacher_prompt = _teacher_prompt_text(
+                        context_messages,
+                        self.thinking_prefill,
                     )
-                    for position in scorable
-                ]
-                teacher_batches = self.teacher.score_many(items)
+                    requests.append(
+                        _teacher_score_request(
+                            context_messages,
+                            fireworks_prompt=teacher_prompt,
+                            assistant_prefill=self.thinking_prefill,
+                            completion_text=turns[position]["completion_text"],
+                        )
+                    )
+                if self._text_teacher_batcher is None:
+                    teacher_items = (
+                        requests
+                        if getattr(self.teacher, "structured_score_requests", False)
+                        else [
+                            (request.fireworks_prompt, request.completion_text)
+                            for request in requests
+                        ]
+                    )
+                    teacher_batches = self.teacher.score_many(teacher_items)
+                else:
+                    teacher_batches = self._text_teacher_batcher.score_many(requests)
                 if len(teacher_batches) != len(scorable):
                     raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
                 with self._stats_lock:
@@ -1140,8 +1220,15 @@ class _TeacherAlignmentBridge:
                     groups = [(indices, logsum) for indices, logsum in groups if indices]
                     coverage = groupwise_coverage(groups, student_tokens)
                     granularity = _align_granularity(groups, student_tokens)
+                    if hasattr(teacher_tokens, "input_tokens"):
+                        teacher_input_tokens = int(teacher_tokens.input_tokens)
+                        teacher_output_tokens = int(getattr(teacher_tokens, "output_tokens", 0))
+                    else:
+                        teacher_input_tokens = len(turn["prompt_ids"]) + len(student_ids)
+                        teacher_output_tokens = 0
                     with self._stats_lock:
-                        self.teacher_input_tokens += len(turn["prompt_ids"]) + len(student_ids)
+                        self.teacher_input_tokens += teacher_input_tokens
+                        self.teacher_output_tokens += teacher_output_tokens
                         self.coverage_sum += coverage
                         if groups:
                             self.aligned_sequences += 1
@@ -2080,6 +2167,7 @@ def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -
 
 def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
+    from flash.engine.recipe import FIREWORKS_COMPLETION_ECHO, KIMI_K3_CHAT_PROMPT_LOGPROBS
     from flash.engine.worker.teacher import TeacherClient
     from flash.multimodal import (
         image_teacher_prompt_messages,
@@ -2158,17 +2246,36 @@ def run_opd_train(spec=None) -> None:
     random.Random(_w.SEED).shuffle(train)
 
     started_at = time.time()
-    # validate the teacher credential BEFORE the gpu probe + model prefetch: a missing key fails
-    # in milliseconds instead of after minutes of paid setup.
-    api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
+    # validate the selected credential before the gpu probe and model prefetch.
+    api_key = os.environ.get(knobs.teacher_credential_env, "").strip()
     if not api_key:
-        raise RuntimeError("the managed teacher api key is missing from the OPD parent worker")
+        raise RuntimeError(
+            f"the managed {knobs.teacher_provider} teacher credential is missing from the OPD parent worker"
+        )
+    if knobs.teacher_scoring_mode == FIREWORKS_COMPLETION_ECHO:
+        teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
+    elif knobs.teacher_scoring_mode == KIMI_K3_CHAT_PROMPT_LOGPROBS:
+        from flash.engine.worker.parasail_teacher import ParasailTeacherClient
+
+        teacher = ParasailTeacherClient(
+            api_key,
+            knobs.teacher_base_url,
+            knobs.teacher_model,
+            encoding_repo=knobs.teacher_encoding_repo,
+            encoding_revision=knobs.teacher_encoding_revision,
+            tokenizer_config_sha256=knobs.teacher_tokenizer_config_sha256,
+            tokenizer_model_sha256=knobs.teacher_tokenizer_model_sha256,
+        )
+    else:
+        raise RuntimeError(
+            f"unsupported managed teacher scoring mode {knobs.teacher_scoring_mode!r}"
+        )
+    teacher.preflight()
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
     processor = None
     if multimodal:
         from transformers import AutoProcessor
@@ -2746,6 +2853,7 @@ def run_opd_train(spec=None) -> None:
                 "forced_tokens": int(final_accounting["forced_tokens"]),
                 "dropped_forced_groups": int(final_accounting["dropped_forced_groups"]),
                 "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
+                "teacher_output_tokens": int(final_accounting["teacher_output_tokens"]),
                 "aligned_sequences": int(final_accounting["aligned_sequences"]),
                 "empty_alignments": int(final_accounting["empty_alignments"]),
                 "teacher_ok": int(final_accounting["teacher_ok"]),

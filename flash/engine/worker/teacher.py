@@ -22,10 +22,76 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 
 from flash.engine.worker.tokenizer_align import TeacherToken
 
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
+
+
+@dataclass(frozen=True)
+class _TeacherMessage:
+    role: str
+    content: str
+    reasoning_content: str | None = None
+
+    def to_payload(self) -> dict[str, str]:
+        payload = {"role": self.role, "content": self.content}
+        if self.reasoning_content is not None:
+            payload["reasoning_content"] = self.reasoning_content
+        return payload
+
+
+@dataclass(frozen=True)
+class _TeacherScoreRequest:
+    messages: tuple[_TeacherMessage, ...]
+    fireworks_prompt: str
+    assistant_prefill: str
+    completion_text: str
+
+    @classmethod
+    def from_messages(
+        cls,
+        messages: list[dict],
+        *,
+        fireworks_prompt: str,
+        assistant_prefill: str,
+        completion_text: str,
+    ) -> _TeacherScoreRequest:
+        normalized: list[_TeacherMessage] = []
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise TeacherError(
+                    f"teacher message {index} is not an object",
+                    permanent=True,
+                )
+            role = message.get("role")
+            content = message.get("content", "")
+            reasoning = message.get("reasoning_content", message.get("reasoning"))
+            if not isinstance(role, str) or not role:
+                raise TeacherError(
+                    f"teacher message {index} role must be a nonempty string",
+                    permanent=True,
+                )
+            if content is None:
+                content = ""
+            if not isinstance(content, str):
+                raise TeacherError(
+                    f"teacher message {index} content must be text",
+                    permanent=True,
+                )
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise TeacherError(
+                    f"teacher message {index} reasoning content must be text",
+                    permanent=True,
+                )
+            normalized.append(_TeacherMessage(role, content, reasoning))
+        return cls(
+            messages=tuple(normalized),
+            fireworks_prompt=str(fireworks_prompt),
+            assistant_prefill=str(assistant_prefill),
+            completion_text=str(completion_text),
+        )
 
 
 class TeacherError(RuntimeError):
@@ -284,11 +350,18 @@ class _ThreadLocalHttpsTransport:
 
 
 class _ScoredTeacherTokens(list[TeacherToken]):
-    """Completion tokens carrying the real echoed input-token count for image accounting."""
+    """Completion tokens with exact provider usage attached."""
 
-    def __init__(self, tokens: list[TeacherToken], *, input_tokens: int) -> None:
+    def __init__(
+        self,
+        tokens: list[TeacherToken],
+        *,
+        input_tokens: int,
+        output_tokens: int = 0,
+    ) -> None:
         super().__init__(tokens)
         self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 def _validate_multimodal_echo(
@@ -368,6 +441,8 @@ def _validate_multimodal_echo(
 
 
 class TeacherClient:
+    structured_score_requests = True
+
     def __init__(
         self,
         api_key: str,
@@ -378,15 +453,16 @@ class TeacherClient:
         max_retries: int = 4,
     ) -> None:
         if not api_key:
-            raise TeacherError(
-                "no teacher API key (FIREWORKS_API_KEY) available on the worker", permanent=True
-            )
+            raise TeacherError("no managed teacher API key available on the worker", permanent=True)
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
         self._transport = _ThreadLocalHttpsTransport()
+
+    def preflight(self) -> None:
+        return None
 
     # -- transport -------------------------------------------------------------------------------
     def _post(self, path: str, body: dict) -> dict:
@@ -449,17 +525,20 @@ class TeacherClient:
         raise last_err or TeacherError(f"teacher call to {path} failed")
 
     # -- echo scoring (gkd) ----------------------------------------------------------------------
-    def score_many(self, items: list[tuple[str, str]]) -> list[list[TeacherToken]]:
-        """Batch echo-score ``[(prompt_text, completion_text), ...]``.
-
-        Fireworks' OpenAI-compatible completions endpoint accepts ``prompt`` as a list while still
-        honoring ``echo=true`` and ``max_tokens=0``. OPD's hot path uses this to collapse many remote
-        teacher round-trips into one request without changing the per-sample GKD signal.
-        """
+    def score_many(
+        self, items: list[_TeacherScoreRequest | tuple[str, str]]
+    ) -> list[list[TeacherToken]]:
+        """Batch Fireworks completion-echo scoring in one request."""
         if not items:
             return []
-        fulls = [prompt_text + completion_text for prompt_text, completion_text in items]
-        plens = [len(prompt_text) for prompt_text, _completion_text in items]
+        pairs = [
+            (item.fireworks_prompt, item.completion_text)
+            if isinstance(item, _TeacherScoreRequest)
+            else item
+            for item in items
+        ]
+        fulls = [prompt_text + completion_text for prompt_text, completion_text in pairs]
+        plens = [len(prompt_text) for prompt_text, _completion_text in pairs]
         resp = self._post(
             "/completions",
             {
@@ -571,9 +650,20 @@ class TeacherClient:
             for index in range(len(fulls))
         ]
 
-    def score(self, prompt_text: str, completion_text: str) -> list[TeacherToken]:
+    def score(
+        self,
+        request: _TeacherScoreRequest | str,
+        completion_text: str | None = None,
+    ) -> list[TeacherToken]:
         """Echo-score one completion and return completion-region teacher tokens."""
-        return self.score_many([(prompt_text, completion_text)])[0]
+        item: _TeacherScoreRequest | tuple[str, str]
+        if isinstance(request, _TeacherScoreRequest):
+            item = request
+        else:
+            if completion_text is None:
+                raise TypeError("completion_text is required with a flattened prompt")
+            item = (request, completion_text)
+        return self.score_many([item])[0]
 
     def _tokens_from_choice(self, choice: dict, *, full: str, plen: int) -> list[TeacherToken]:
         completion_text = full[plen:]

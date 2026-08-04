@@ -1140,8 +1140,11 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     # The teacher key is platform-managed: the scaffold neither declares it as a secret nor tells
     # the user to export it, so the generated config must not mention FIREWORKS_API_KEY at all.
     assert "FIREWORKS_API_KEY" not in opd_text
+    assert "PARASAIL_API_KEY" not in opd_text
     assert "secrets" not in opd_text
     assert "platform-managed" in opd_text
+    assert "kimi-k2.6 (images)" in opd_text
+    assert "kimi-k3 (text-only)" in opd_text
     # single-turn opd runs fine, so it carries NO multi-turn "fails fast" warning
     assert "fail fast" not in opd_text
     training = tmp_path / "TRAINING.md"

@@ -22,6 +22,11 @@ from tests._helpers.runner import provisioned_status
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
+@pytest.fixture(autouse=True)
+def _managed_teacher_key(monkeypatch):
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-managed-teacher-key")
+
+
 def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
     state = {
         "contract_version": OPD_RESUME_STATE_VERSION,
@@ -34,6 +39,7 @@ def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
         "coverage_curve": [1.0] * step,
         "generated_tokens": step,
         "teacher_input_tokens": step,
+        "teacher_output_tokens": step,
         "truncated_rollouts": 0,
         "granularity_sum": 0.0,
         "granularity_n": 0,

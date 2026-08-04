@@ -947,14 +947,14 @@ def cost_panel(est) -> str:
         ("wall clock", f"{est.wall_clock_hours:.2f} h"),
         ("billable", f"{est.billable_hours:.2f} h  {_dim('(training only)')}"),
     ]
-    # opd teacher spend is itemized but NOT part of total_usd (billed by Fireworks on the managed key).
-    # Mirror CostEstimate.breakdown() so the styled panel doesn't silently drop it (cursor[bot]).
+    # opd teacher spend is itemized but not part of total_usd and is billed by the selected provider.
+    # mirror CostEstimate.breakdown() so the styled panel does not silently drop it.
     if getattr(est, "teacher_api_usd", 0) > 0:
         pairs.append(
             (
                 "teacher api",
                 f"{money(est.teacher_api_usd, 2)}  "
-                f"{_dim('(Fireworks teacher token spend on the managed key — billed by Fireworks, NOT in TOTAL)')}",
+                f"{_dim('(managed teacher token spend on the selected provider key; NOT in TOTAL)')}",
             )
         )
     panel = _kv(pairs)

@@ -193,7 +193,15 @@ def parse_max_steps(value: Any) -> int | None:
 
 
 RESERVED_WORKER_ENV_KEYS = frozenset(
-    {"RUN_ID", "HF_REPO", "FLASH_ARM", "SEED", OPD_RESUME_REVISION_ENV}
+    {
+        "RUN_ID",
+        "HF_REPO",
+        "FLASH_ARM",
+        "SEED",
+        "FIREWORKS_API_KEY",
+        "PARASAIL_API_KEY",
+        OPD_RESUME_REVISION_ENV,
+    }
 )
 
 
@@ -308,9 +316,7 @@ class TrainSpec:
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
-    # OPD only: the managed teacher to distil from, stored as its resolved Fireworks model id (parse
-    # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
-    # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
+    # opd only: the managed teacher, stored as its resolved provider model id.
     teacher_model: str = field(default="", metadata={"introduced_in": "0.2.56"})
     stop_sequences: tuple[str, ...] = field(default=(), metadata={"introduced_in": "0.2.0"})
     # canonical json of vllm structured-output kwargs ("" = unconstrained). normalized once

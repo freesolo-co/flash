@@ -665,10 +665,11 @@ def test_runtime_secret_cannot_override_control_plane_seed():
     assert env["SEED"] == "987"
 
 
-def test_provider_worker_env_carries_control_plane_resume_revision():
+def test_provider_worker_env_carries_control_plane_resume_revision(monkeypatch):
     from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
     from flash.providers._worker import build_worker_env
 
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-managed-teacher-key")
     spec = JobSpec(model="m", algorithm="opd", seed=987)
     env = build_worker_env(
         spec,

@@ -115,6 +115,30 @@ def test_setup_opd_includes_vllm_init():
     )
 
 
+def test_kimi_k3_quote_includes_one_output_token_per_score_request():
+    from flash.cost.analytical import _opd_step_shape
+    from flash.cost.facts import teacher_token_cost_usd
+
+    config = RunConfig(
+        MID,
+        "opd",
+        2,
+        batch_size=3,
+        group_size=2,
+        teacher_model="parasail-kimi-k3",
+    )
+    estimate = estimate_cost(config, wall_cap_s=10**9)
+    normalized = config.normalized()
+    completions_per_step, input_tokens_per_step = _opd_step_shape(normalized)
+    expected = teacher_token_cost_usd(
+        config.steps * input_tokens_per_step,
+        config.steps * completions_per_step,
+        config.teacher_model,
+    )
+
+    assert estimate.teacher_api_usd == pytest.approx(expected)
+
+
 def test_cold_start_calibrated_to_real_short_sft_run():
     # Calibration anchor: a real fresh-worker run (0.8B SFT, 391 examples -> 26 priced steps at
     # the recipe batch) was cold-start-dominated (a fresh worker spent ~12.5 min in model load).

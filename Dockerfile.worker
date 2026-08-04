@@ -55,6 +55,7 @@ RUN pip install --no-cache-dir \
     "bitsandbytes>=0.49" \
     "datasets>=4.7,<6" \
     "huggingface_hub>=1.2.0" \
+    "tiktoken==0.13.0" \
     "accelerate>=1.4" \
     "wandb>=0.17" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \
@@ -200,7 +201,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # is imported optionally here: a missing FA must NOT abort the build, or the SDPA-fallback image
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
-import torch, transformers, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
+import torch, transformers, peft, vllm, datasets, huggingface_hub, tiktoken, accelerate, wandb, \
 fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
 import importlib; \
 fa_ok = False; \
@@ -213,7 +214,7 @@ cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into t
 ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)', '| flashinfer', 'present (B200 MoE/attn)' if fi_ok else 'ABSENT (Triton fused-MoE fallback)'); \
 [print('  ', d, ver(d)) for d in ['transformers','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
-'accelerate','wandb','flash-linear-attention','bitsandbytes', \
+'accelerate','wandb','tiktoken','flash-linear-attention','bitsandbytes', \
 'hf-transfer','freesolo','runpod']]"
 
 # ---------------------------------------------------------------------------------------------

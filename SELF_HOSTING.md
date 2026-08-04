@@ -176,7 +176,8 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 | Variable               | Effect if unset                                                                                                                                                                                                             |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GITHUB_TOKEN`         | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                                                       |
-| `FIREWORKS_API_KEY`    | On-policy distillation (`opd`) runs fail inside the worker, after allocating and billing a GPU. Not covered by the startup preflight - set it before running opd. `sft` and `grpo` do not use it.                           |
+| `FIREWORKS_API_KEY`    | Required for the managed `glm-5.2` and `kimi-k2.6` OPD teachers. A selected teacher with no key fails before GPU probing. `sft`, `grpo`, and the verl child do not receive it.                                              |
+| `PARASAIL_API_KEY`     | Required for the text-only managed `kimi-k3` OPD teacher. A selected teacher with no key fails before GPU probing. `sft`, `grpo`, and the verl child do not receive it.                                                     |
 | `FREESOLO_SERVING_URL` | In standalone mode `flash deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app - and refuse the same way if you point it AT that app. Training is unaffected. See below. |
 
 ## Serving

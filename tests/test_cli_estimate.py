@@ -188,9 +188,7 @@ def test_opd_positive_max_steps_is_authoritative():
 
 
 def test_opd_runconfig_carries_selected_teacher_and_prices_it():
-    """runconfig_from_spec resolves [train].teacher_model to the Fireworks model id so the estimate
-    prices the CHOSEN teacher; a cheaper teacher lowers teacher_api_usd vs the default GLM 5.2, and
-    sft/grpo carry no teacher."""
+    """The estimate prices the selected managed teacher while sft and grpo carry none."""
     from flash.cost.analytical import estimate_cost
 
     def _opd(teacher=None):
@@ -208,10 +206,13 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
     kimi_cfg = _runconfig_from_spec(_opd("kimi-k2.6"))
     assert kimi_cfg.teacher_model == "accounts/fireworks/models/kimi-k2p6"
 
-    # kimi-k2.6 input price ($0.95/M) < glm-5.2 ($1.40/M), so its teacher-API estimate is smaller.
+    # kimi-k2.6 is cheaper than the default. kimi-k3 includes one billed output token per score.
     default_teacher_usd = estimate_cost(_runconfig_from_spec(_opd())).teacher_api_usd
     kimi_teacher_usd = estimate_cost(kimi_cfg).teacher_api_usd
-    assert 0 < kimi_teacher_usd < default_teacher_usd
+    kimi_k3_cfg = _runconfig_from_spec(_opd("kimi-k3"))
+    kimi_k3_teacher_usd = estimate_cost(kimi_k3_cfg).teacher_api_usd
+    assert kimi_k3_cfg.teacher_model == "parasail-kimi-k3"
+    assert 0 < kimi_teacher_usd < default_teacher_usd < kimi_k3_teacher_usd
 
     # sft/grpo carry no teacher.
     assert _runconfig_from_spec(_spec()).teacher_model == ""
