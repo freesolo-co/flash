@@ -11,7 +11,9 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
+import subprocess
 import sys
 import textwrap
 import threading
@@ -46,6 +48,117 @@ def test_run_rl_always_delegates_to_verl(monkeypatch, stale):
         monkeypatch.setenv("FLASH_RL_BACKEND", stale)
     rl.run_rl()
     assert called == [True]
+
+
+class _FakeGrpoProcess:
+    def __init__(self, lines, *, wait_code, stale_return_code):
+        self.stdout = iter(lines)
+        self.pid = 424242
+        self.returncode = stale_return_code
+        self._wait_code = wait_code
+        self.wait_calls = 0
+
+    def wait(self):
+        self.wait_calls += 1
+        return self._wait_code
+
+
+def test_grpo_subprocess_stream_classifies_the_recorded_nonzero_exit(monkeypatch):
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    terminated = []
+    monkeypatch.setattr(
+        rl_train,
+        "kill_process_group",
+        lambda proc, *, process_group_id: terminated.append((proc, process_group_id)),
+    )
+    signature = "cudaErrorDevicesUnavailable\n"
+    lines = [signature, *(f"filler-{i}\n" for i in range(150))]
+    proc = _FakeGrpoProcess(lines, wait_code=17, stale_return_code=0)
+    stream = rl_train._GrpoSubprocessStream(proc)
+
+    assert list(stream) == lines
+    with pytest.raises(RetriableInfraError) as exc_info:
+        stream.wait_and_classify()
+
+    assert "cudaErrorDevicesUnavailable" in str(exc_info.value)
+    assert proc.wait_calls == 1
+    assert terminated == [(proc, proc.pid)]
+
+
+def test_grpo_subprocess_stream_does_not_classify_a_zero_exit():
+    lines = ["cudaErrorDevicesUnavailable\n"]
+    proc = _FakeGrpoProcess(lines, wait_code=0, stale_return_code=17)
+    stream = rl_train._GrpoSubprocessStream(proc)
+
+    assert list(stream) == lines
+    assert stream.wait_and_classify() == 0
+    assert proc.wait_calls == 1
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="requires linux process groups")
+def test_grpo_classified_exit_drains_group_after_leader_is_reaped(tmp_path, monkeypatch):
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    if not backend_common.adopt_orphaned_descendants():
+        pytest.skip("child subreaper unavailable")
+    monkeypatch.setattr(backend_common, "_TEARDOWN_GRACE_S", 0.5)
+    marker = tmp_path / "grpo-classified-grandchild.pid"
+    grandchild = (
+        "import signal,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    leader = (
+        "import pathlib,subprocess,sys\n"
+        f"g = subprocess.Popen([sys.executable, '-c', {grandchild!r}], "
+        "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)\n"
+        "assert g.stdout.readline().strip() == 'ready'\n"
+        "g.stdout.close()\n"
+        f"pathlib.Path({str(marker)!r}).write_text(str(g.pid))\n"
+        "print('cudaErrorDevicesUnavailable', flush=True)\n"
+        "raise SystemExit(1)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", leader],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    grandchild_pid = None
+    try:
+        stream = rl_train._GrpoSubprocessStream(proc)
+        assert "cudaErrorDevicesUnavailable\n" in list(stream)
+        with pytest.raises(RetriableInfraError, match="cudaErrorDevicesUnavailable"):
+            stream.wait_and_classify()
+
+        assert proc.poll() == 1, "test did not exercise classification after leader reaping"
+        assert marker.exists(), "leader exited before recording its surviving grandchild"
+        grandchild_pid = int(marker.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and os.path.exists(f"/proc/{grandchild_pid}"):
+            time.sleep(0.05)
+        assert not os.path.exists(f"/proc/{grandchild_pid}"), (
+            f"classified grpo exit left grandchild {grandchild_pid} alive or unreaped"
+        )
+    finally:
+        if grandchild_pid is not None:  # pragma: no cover - only on an unexpected failure
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(grandchild_pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(grandchild_pid, 0)
+        if proc.poll() is None:  # pragma: no cover - only on an unexpected failure
+            backend_common.kill_process_group(proc)
+
+
+def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
+    source = inspect.getsource(rl_train.run_rl_train)
+
+    assert "child_stream = _GrpoSubprocessStream(proc)" in source
+    assert "for line in child_stream" in source
+    assert "rc = child_stream.wait_and_classify()" in source
 
 
 # ------------------------------- data conversion -------------------------------

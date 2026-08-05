@@ -49,6 +49,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
     VERL_REQUIREMENT,
     BoundedThreadingHTTPServer,
+    ChildOutputTail,
     adopt_orphaned_descendants,
     agent_loop_workers,
     append_step_metrics,
@@ -60,6 +61,7 @@ from flash.engine.worker.backend_common import (
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    raise_for_classified_verl_exit,
     ray_num_cpus,
     reap_stragglers,
     render_wandb_link_shim,
@@ -3029,6 +3031,38 @@ def _resolve_grpo_inputs():
     }
 
 
+class _GrpoSubprocessStream:
+    """one grpo child stream and the evidence latched from that same stream."""
+
+    def __init__(self, proc) -> None:
+        self._proc = proc
+        # the caller uses start_new_session, so the leader pid remains the group's stable identity.
+        self._process_group_id = proc.pid
+        self._tail = ChildOutputTail()
+        self._terminated = False
+
+    def __iter__(self):
+        assert self._proc.stdout is not None
+        for line in self._proc.stdout:
+            self._tail.record(line)
+            yield line
+
+    def terminate(self) -> None:
+        if self._terminated:
+            return
+        kill_process_group(self._proc, process_group_id=self._process_group_id)
+        self._terminated = True
+
+    def wait_and_classify(self) -> int:
+        return_code = int(self._proc.wait())
+        try:
+            raise_for_classified_verl_exit(return_code, self._tail)
+        except BaseException:
+            self.terminate()
+            raise
+        return return_code
+
+
 def run_rl_train():
     """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
     t_start = time.time()
@@ -3415,8 +3449,9 @@ def run_rl_train():
                 env=env_for_verl,
                 start_new_session=True,
             )
+            child_stream = _GrpoSubprocessStream(proc)
             try:
-                for line in proc.stdout:
+                for line in child_stream:
                     print(f"[verl] {line}", end="", flush=True)
                     link = parse_wandb_link(line)
                     if link is not None:
@@ -3490,14 +3525,14 @@ def run_rl_train():
                         adv_min = parse_verl_metric(line, "critic/advantages/min")
                         if adv_max is not None and adv_min is not None:
                             adv_spread_history.append(adv_max - adv_min)
-                rc = proc.wait()
+                rc = child_stream.wait_and_classify()
             except BaseException:
                 # the stream loop died (upload error, cancel, oom in the parent): a still-running
                 # verl child would keep burning the gpu unattended, so kill its whole process group.
                 # this escalates to SIGKILL after the grace period, which a bare SIGTERM does not: a
                 # vllm EngineCore that ignores the term keeps its cuda context and strands the gpu
                 # for every later job on a reusable worker.
-                kill_process_group(proc)
+                child_stream.terminate()
                 raise
         if rc != 0:
             raise RuntimeError(
