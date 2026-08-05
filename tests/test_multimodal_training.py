@@ -592,7 +592,7 @@ def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
     assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in entry
 
 
-def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_path):
+def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path):
     root, _image = _package(tmp_path)
     env_file = root / "environment.py"
     env_file.write_text("def load_environment(**kwargs):\n    return None\n")
@@ -604,22 +604,23 @@ def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_pa
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="kimi-k2.6"),
+        train=SimpleNamespace(teacher_model="kimi-k3"),
     )
-    mm.preflight_validate_image_opd(supported)
+    with pytest.raises(ValueError, match="not supported by managed Parasail teachers"):
+        mm.preflight_validate_image_opd(supported)
 
     unsupported = SimpleNamespace(
         model="meta-llama/Llama-3.2-1B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="kimi-k2.6"),
+        train=SimpleNamespace(teacher_model="kimi-k3"),
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
         mm.preflight_validate_image_opd(unsupported)
 
 
-@pytest.mark.parametrize("teacher_model", ["", "glm-5.2", "accounts/fireworks/models/glm-5p2"])
-def test_image_opd_preflight_requires_kimi_vision_teacher(tmp_path, teacher_model):
+@pytest.mark.parametrize("teacher_model", ["", "kimi-k3", "glm-5.2", "qwen3.5-397b-a17b"])
+def test_image_opd_preflight_rejects_every_managed_teacher(tmp_path, teacher_model):
     root, _image = _package(tmp_path)
     env_file = root / "environment.py"
     env_file.write_text("def load_environment(**kwargs):\n    return None\n")
@@ -633,7 +634,7 @@ def test_image_opd_preflight_requires_kimi_vision_teacher(tmp_path, teacher_mode
         train=SimpleNamespace(teacher_model=teacher_model),
     )
 
-    with pytest.raises(ValueError, match=r"requires .*kimi-k2\.6"):
+    with pytest.raises(ValueError, match="not supported by managed Parasail teachers"):
         mm.preflight_validate_image_opd(spec)
 
 
@@ -648,7 +649,7 @@ def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}, multi_turn=True),
-        train=SimpleNamespace(teacher_model="kimi-k2.6"),
+        train=SimpleNamespace(teacher_model="kimi-k3"),
     )
 
     with pytest.raises(ValueError, match="single-turn"):
@@ -687,22 +688,22 @@ def test_image_opd_preflight_limits_scan_to_max_examples(tmp_path, record_source
 
 
 @pytest.mark.parametrize("background", [False, True])
-def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
+def test_image_opd_submit_preflight_rejects_supported_single_turn_records(
     monkeypatch, tmp_path, background
 ):
     from flash import runner
     from flash.spec import JobSpec
 
-    class _ReachedSubmitBoundary(RuntimeError):
-        pass
-
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
-    def reached_submit_boundary(*args, **kwargs):
-        raise _ReachedSubmitBoundary
+    def fail(*args, **kwargs):
+        raise AssertionError("rejected submit must not mutate warm-start state or reach providers")
 
-    monkeypatch.setattr(runner, "_mark_warmstart_source", reached_submit_boundary)
+    monkeypatch.setattr(runner, "_mark_warmstart_source", fail)
+    monkeypatch.setattr(runner, "_run_job", fail)
+    monkeypatch.setattr(runner, "_run_job_background", fail)
+    monkeypatch.setattr(runner.threading, "Thread", fail)
 
     spec = JobSpec.from_dict(
         {
@@ -715,11 +716,11 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
                     "records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]
                 },
             },
-            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
+            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k3"},
         }
     )
 
-    with pytest.raises(_ReachedSubmitBoundary):
+    with pytest.raises(ValueError, match="not supported by managed Parasail teachers"):
         runner.submit_job(spec, background=background)
     with pytest.raises(FileNotFoundError):
         runner.get_status(spec.run_id)
@@ -758,7 +759,7 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
             "model": model,
             "algorithm": algorithm,
             "environment": {"id": "local", "params": params},
-            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
+            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k3"},
         }
     )
     prepared = runner.PreparedJob(public_spec=spec, worker_spec=spec, estimated_cost_usd=0.0)

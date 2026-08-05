@@ -11,6 +11,7 @@ from flash.envs.adapter import is_freesolo_environment_id
 from flash.spec import (
     CREDIT_ASSIGNMENTS,
     DEFAULT_CREDIT_ASSIGNMENT,
+    RESERVED_WORKER_ENV_KEYS,
     CreditAssignment,
     WandbSpec,
     validate_worker_env_reserved,
@@ -80,9 +81,8 @@ def _train_teacher(train_raw: dict) -> str:
     """Validate [train] teacher_model against the managed OPD teacher allow-list -> ConfigError (400).
 
     Missing/None/blank -> "" (the worker then uses the default GLM 5.2 teacher). A supported value is
-    resolved to its canonical Fireworks model id and stored, so a spaced ("GLM 5.2") or alias form is
-    canonicalized once here and every downstream layer reads one representation; an unsupported teacher
-    is rejected at PARSE time (before a paid GPU is provisioned), listing the allowed aliases."""
+    stored as its canonical friendly alias. Provider and repository identifiers are never accepted as
+    user input. An unsupported teacher is rejected before a paid GPU is provisioned."""
     v = train_raw.get("teacher_model")
     if v is None:
         return ""
@@ -96,11 +96,10 @@ def _train_teacher(train_raw: dict) -> str:
     # resolve_teacher owns the allow-list + its enumeration; reuse its message so the choices are
     # listed in exactly one place (recipe.py).
     try:
-        return resolve_teacher(v).model_id
+        return resolve_teacher(v).alias
     except ValueError as exc:
         raise ConfigError(
-            f"train.{exc}. The teacher is a managed Fireworks model — "
-            f"bring-your-own teachers are not supported."
+            f"train.{exc}. The teacher is platform-managed; bring-your-own teachers are not supported."
         ) from None
 
 
@@ -305,10 +304,7 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
         "GITHUB_TOKEN",
         "FREESOLO_API_KEY",
         "FREESOLO_INTERNAL_KEY",
-        "RUN_ID",
-        "HF_REPO",
-        "FLASH_ARM",
-        "SEED",
+        *RESERVED_WORKER_ENV_KEYS,
     }
 )
 

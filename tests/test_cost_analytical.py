@@ -297,11 +297,39 @@ def test_nonpositive_run_knobs_rejected(knob, bad):
         RunConfig(MID, "grpo", 100, **{knob: bad})
 
 
+@pytest.mark.parametrize(
+    ("multi_turn", "max_turns", "multiplier"),
+    [(False, None, 3), (True, 24, 72), (True, 64, 192), (True, None, 192)],
+)
+def test_opd_teacher_cost_uses_authoritative_request_multiplier(multi_turn, max_turns, multiplier):
+    from flash.cost.facts import teacher_token_cost_usd
+
+    config = RunConfig(
+        MID,
+        "opd",
+        1,
+        seq_len=1024,
+        batch_size=2,
+        group_size=1,
+        teacher_model="glm-5.2",
+        opd_multi_turn=multi_turn,
+        opd_max_turns=max_turns,
+    )
+
+    estimate = estimate_cost(config)
+
+    input_tokens = 2 * 1024 * multiplier
+    output_tokens = 2 * multiplier
+    assert estimate.teacher_api_usd == pytest.approx(
+        teacher_token_cost_usd(input_tokens, output_tokens, "glm-5.2")
+    )
+
+
 def test_opd_teacher_scoring_is_one_parallel_wave():
-    # Teacher scoring fans a step's completions across prompts_per_step*group_size concurrent Fireworks
-    # calls (opd.py Phase 2), so EVERY completion in a step is scored in one parallel wave -- the
-    # teacher wall is a single latency regardless of completion count, NOT the serial (completions x
-    # latency) sum. Hold seq_tokens (hence gen_s/update_s) constant while doubling the completion count;
+    # teacher scoring fans a step's completions across prompts_per_step*group_size concurrent parasail
+    # calls (opd.py phase 2), so every completion in a step is scored in one parallel wave -- the
+    # teacher wall is a single latency regardless of completion count, not the serial (completions x
+    # latency) sum. hold seq_tokens (hence gen_s/update_s) constant while doubling the completion count;
     # since scoring is now fully parallel the teacher term is unchanged, so the per-step delta is 0.
     from flash.cost.analytical import seconds_per_step
     from flash.cost.facts import teacher_seconds_per_completion

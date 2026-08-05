@@ -173,11 +173,12 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Optional pieces
 
-| Variable               | Effect if unset                                                                                                                                                                                                             |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GITHUB_TOKEN`         | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                                                       |
-| `FIREWORKS_API_KEY`    | On-policy distillation (`opd`) runs fail inside the worker, after allocating and billing a GPU. Not covered by the startup preflight - set it before running opd. `sft` and `grpo` do not use it.                           |
-| `FREESOLO_SERVING_URL` | In standalone mode `flash deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app - and refuse the same way if you point it AT that app. Training is unaffected. See below. |
+| Variable                   | Effect if unset                                                                                                                                                                                                             |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITHUB_TOKEN`             | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                                                       |
+| `PARASAIL_API_KEY`         | On-policy distillation (`opd`) submissions fail before GPU allocation. Set it on the control plane; workers never receive it. `sft` and `grpo` do not use it.                                                               |
+| `FLASH_TEACHER_BROKER_URL` | OPD submissions fail before GPU allocation. Set it to this control plane's worker-reachable HTTPS origin.                                                                                                                   |
+| `FREESOLO_SERVING_URL`     | In standalone mode `flash deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app - and refuse the same way if you point it AT that app. Training is unaffected. See below. |
 
 ## Serving
 

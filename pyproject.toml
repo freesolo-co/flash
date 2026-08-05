@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.0.81"
+version = "1.0.82"
 description = "Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -29,6 +29,8 @@ dependencies = []
 gpu = [
     "torch==2.10.0",
     "transformers>=5.6,<5.11",
+    "tokenizers>=0.22",
+    "tiktoken>=0.12",
     "peft>=0.19",
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
@@ -87,6 +89,8 @@ dev = [
     "datasets>=2.19",
     "freesolo>=0.4.0",
     "transformers>=5.6,<5.11",
+    "tokenizers>=0.22",
+    "tiktoken>=0.12",
     # flash/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. test-only, hence dev and not server -- the control
@@ -123,7 +127,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.0.81"
+version = "1.0.82"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -146,6 +150,8 @@ dev = [
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
     "freesolo>=0.4.0",
+    "tokenizers>=0.22",
+    "tiktoken>=0.12",
     # flash/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. test-only, hence dev and not server -- the control
