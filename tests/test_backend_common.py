@@ -26,6 +26,7 @@ import pytest
 
 from flash.engine.worker import backend_common as vc
 from flash.engine.worker import rl_train
+from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
 # several tests below drive real subprocesses that import flash from a checkout, not from the venv.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -860,6 +861,93 @@ def test_run_verl_training_without_a_tail_is_unchanged():
     assert lines == ["step: 4\n"]
 
 
+@pytest.mark.parametrize(
+    "signature",
+    [
+        "cudaErrorDevicesUnavailable",
+        "CUDA-capable device(s) is/are busy or unavailable",
+    ],
+)
+def test_run_verl_training_retries_nested_cuda_device_unavailable_after_tail_eviction(
+    signature,
+):
+    tail = vc.ChildOutputTail(limit=3)
+    command = [
+        "bash",
+        "-c",
+        "printf '%s\\n' \"$TEST_SIGNATURE\"; "
+        "for i in $(seq 1 70); do echo filler-$i; done; "
+        "exit 1",
+    ]
+    env = {**os.environ, "TEST_SIGNATURE": signature}
+
+    with pytest.raises(RetriableInfraError) as exc_info:
+        vc.run_verl_training(command, env=env, tail=tail)
+
+    assert signature in str(exc_info.value)
+    assert signature not in tail.tail()
+
+
+def test_child_output_tail_latches_signature_before_line_truncation():
+    signature = "cudaErrorDevicesUnavailable"
+    tail = vc.ChildOutputTail()
+    tail.record("x" * vc._CHILD_TAIL_LINE_CHARS + signature + "\n")
+
+    assert signature not in tail.tail()[0]
+    assert tail.retriable_infra_signature == signature
+
+
+def test_run_verl_training_does_not_reclassify_a_zero_exit():
+    code = vc.run_verl_training(
+        ["bash", "-c", "echo 'cudaErrorDevicesUnavailable'; exit 0"],
+        env=dict(os.environ),
+    )
+
+    assert code == 0
+
+
+@pytest.mark.parametrize("message", ["CUDA out of memory", "unrelated child failure"])
+def test_run_verl_training_leaves_other_nonzero_exits_terminal(message):
+    code = vc.run_verl_training(
+        ["bash", "-c", "printf '%s\\n' \"$TEST_MESSAGE\" >&2; exit 9"],
+        env={**os.environ, "TEST_MESSAGE": message},
+    )
+
+    assert code == 9
+
+
+@pytest.mark.parametrize("oom_first", [False, True])
+def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
+    monkeypatch, oom_first
+):
+    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.perf import lifecycle
+
+    monkeypatch.setattr(lifecycle, "cuda_oom_count", lambda: 0)
+    device_line = "cudaErrorDevicesUnavailable"
+    oom_line = "x" * vc._CHILD_TAIL_LINE_CHARS + "No available memory for the cache blocks"
+    first, second = (oom_line, device_line) if oom_first else (device_line, oom_line)
+    command = [
+        "bash",
+        "-c",
+        "printf '%s\\n' \"$FIRST\" \"$SECOND\"; "
+        "for i in $(seq 1 70); do echo filler-$i; done; "
+        "exit 1",
+    ]
+    tail = vc.ChildOutputTail(limit=3)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        vc.run_verl_training(
+            command,
+            env={**os.environ, "FIRST": first, "SECOND": second},
+            tail=tail,
+        )
+
+    assert not isinstance(exc_info.value, RetriableInfraError)
+    assert _worker_failure_flags(exc_info.value) == {"retriable": False, "oom": True}
+    assert tail.tail() == ["filler-68", "filler-69", "filler-70"]
+
+
 def test_stall_tail_fields_reports_only_before_the_first_step():
     tail = vc.ChildOutputTail()
     tail.record("ray: placement group pending\n")
@@ -1107,6 +1195,56 @@ def test_kill_process_group_reaps_a_grandchild_that_outlives_the_leader(quick_te
             leader.wait(timeout=10)
         if leader.stdout is not None:
             leader.stdout.close()
+
+
+def _classified_exit_command(marker: pathlib.Path) -> list[str]:
+    grandchild = (
+        "import signal,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    leader = (
+        "import pathlib,subprocess,sys\n"
+        f"g = subprocess.Popen([sys.executable, '-c', {grandchild!r}], "
+        "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)\n"
+        "assert g.stdout.readline().strip() == 'ready'\n"
+        "g.stdout.close()\n"
+        f"pathlib.Path({str(marker)!r}).write_text(str(g.pid))\n"
+        "print('cudaErrorDevicesUnavailable', flush=True)\n"
+        "raise SystemExit(1)\n"
+    )
+    return [sys.executable, "-c", leader]
+
+
+def _assert_process_reaped(pid: int) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not os.path.exists(f"/proc/{pid}"):
+            return
+        time.sleep(0.05)
+    pytest.fail(f"classified exit left grandchild {pid} alive or unreaped")
+
+
+@_needs_process_teardown
+def test_classified_run_verl_exit_drains_group_after_leader_is_reaped(
+    tmp_path, quick_teardown_grace
+):
+    marker = tmp_path / "classified-grandchild.pid"
+    grandchild_pid = None
+    try:
+        with pytest.raises(RetriableInfraError, match="cudaErrorDevicesUnavailable"):
+            vc.run_verl_training(_classified_exit_command(marker), env=dict(os.environ))
+
+        assert marker.exists(), "leader exited before recording its surviving grandchild"
+        grandchild_pid = int(marker.read_text())
+        _assert_process_reaped(grandchild_pid)
+    finally:
+        if grandchild_pid is not None:  # pragma: no cover - only on an unexpected failure
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(grandchild_pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(grandchild_pid, 0)
 
 
 @_needs_process_teardown
@@ -1664,7 +1802,7 @@ def test_grpo_teardown_uses_the_shared_escalating_kill():
     # EngineCore that ignored the term kept its cuda context and stranded the gpu for later jobs.
     # pin the call site: a bare killpg here would reintroduce exactly that.
     source = inspect.getsource(rl_train)
-    assert "kill_process_group(proc)" in source
+    assert "kill_process_group(self._proc, process_group_id=self._process_group_id)" in source
     assert "os.killpg" not in source, "grpo teardown must not hand-roll a non-escalating killpg"
 
 

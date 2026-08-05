@@ -808,6 +808,10 @@ _CHILD_TAIL_LINE_CHARS = 300
 # how many retained lines ride along on a pre-first-step heartbeat. narrower than what is retained:
 # this payload is uploaded every tick, so it stays small enough not to bloat the snapshot.
 STALL_TAIL_LINES = 15
+_RETRIABLE_VERL_CHILD_SIGNATURES = (
+    "cudaErrorDevicesUnavailable",
+    "CUDA-capable device(s) is/are busy or unavailable",
+)
 
 
 class ChildOutputTail:
@@ -826,12 +830,33 @@ class ChildOutputTail:
     def __init__(self, limit: int = CHILD_TAIL_LINES) -> None:
         self._lines: collections.deque[str] = collections.deque(maxlen=limit)
         self._written = 0
+        self._retriable_infra_signature: str | None = None
+        self._cuda_oom_evidence: str | None = None
 
     def record(self, line: str) -> None:
+        if self._retriable_infra_signature is None:
+            self._retriable_infra_signature = next(
+                (signature for signature in _RETRIABLE_VERL_CHILD_SIGNATURES if signature in line),
+                None,
+            )
+        if self._cuda_oom_evidence is None:
+            from flash.engine.worker.perf.lifecycle import cuda_oom_message_evidence
+
+            self._cuda_oom_evidence = cuda_oom_message_evidence(line)
         text = line.rstrip("\n")
         if text:
             self._lines.append(text[:_CHILD_TAIL_LINE_CHARS])
             self._written += 1
+
+    @property
+    def retriable_infra_signature(self) -> str | None:
+        """the first stable retriable-infrastructure signature observed in child output."""
+        return self._retriable_infra_signature
+
+    @property
+    def cuda_oom_evidence(self) -> str | None:
+        """the first authoritative cuda oom message evidence observed in child output."""
+        return self._cuda_oom_evidence
 
     @property
     def written(self) -> int:
@@ -849,6 +874,25 @@ class ChildOutputTail:
         if limit is not None and limit >= 0:
             lines = lines[len(lines) - limit :] if limit < len(lines) else lines
         return lines
+
+
+def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> None:
+    """raise a classified failure when a nonzero verl child reported authoritative evidence."""
+    if return_code == 0:
+        return
+    oom_evidence = tail.cuda_oom_evidence
+    if oom_evidence is not None:
+        raise RuntimeError(
+            f"verl subprocess exited with status {return_code} after reporting {oom_evidence}"
+        )
+    signature = tail.retriable_infra_signature
+    if signature is None:
+        return
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    raise RetriableInfraError(
+        f"verl subprocess exited with status {return_code} after reporting {signature}"
+    )
 
 
 class ChildTailStaleness:
@@ -1073,6 +1117,7 @@ def run_verl_training(
     device memory that nothing will release.
     """
     step_re = re.compile(step_pattern)
+    child_tail = tail if tail is not None else ChildOutputTail()
     # before the child exists, so any grandchild it orphans reparents here and can actually be
     # reaped. this process is not pid 1 -- the runpod handler is -- so without it every wait below
     # answers ChildProcessError for a zombie nobody will collect.
@@ -1086,13 +1131,14 @@ def run_verl_training(
         bufsize=1,
         start_new_session=True,
     )
+    # start_new_session makes the leader pid the stable group id even after that leader is reaped.
+    process_group_id = proc.pid
     last_hb = 0.0
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
             print(line, end="", flush=True)
-            if tail is not None:
-                tail.record(line)
+            child_tail.record(line)
             if on_line is not None:
                 on_line(line)
             m = step_re.search(line)
@@ -1104,7 +1150,7 @@ def run_verl_training(
                     heartbeat()
                     last_hb = now
     except BaseException:
-        kill_process_group(proc)
+        kill_process_group(proc, process_group_id=process_group_id)
         raise
     finally:
         if proc.poll() is None:
@@ -1114,7 +1160,13 @@ def run_verl_training(
         # caller of this -- runs on exceptions alone: a worker whose later jobs all succeed would
         # hold that zombie for its whole life, as pid 1 with nothing else to reap it (codex[bot]).
         reap_stragglers()
-    return int(proc.returncode)
+    return_code = int(proc.returncode)
+    try:
+        raise_for_classified_verl_exit(return_code, child_tail)
+    except BaseException:
+        kill_process_group(proc, process_group_id=process_group_id)
+        raise
+    return return_code
 
 
 _TEARDOWN_GRACE_S = 10.0
@@ -1373,13 +1425,16 @@ def _process_group_members(pgid: int) -> list[int] | None:
     return members
 
 
-def kill_process_group(proc: subprocess.Popen) -> None:
+def kill_process_group(
+    proc: subprocess.Popen, *, process_group_id: int | None = None
+) -> None:
     """signal the child's whole process group, escalating to SIGKILL if anything survives.
 
     signalling the group rather than the pid is what reaches vllm's EngineCore grandchild; a survivor
     holds its cuda context and strands the gpu for every later run. the escalation is driven off the
     group, not off the direct child: the usual shape of this failure is the trainer dying on the term
     while the EngineCore ignores it, so waiting only on the child returns before the survivor is gone.
+    a captured ``process_group_id`` keeps the group addressable after the direct child is reaped.
     """
     # grpo drives its own subprocess and calls this directly, never through `run_verl_training`, so
     # the adoption is claimed here too rather than only at the other entry point. idempotent.
@@ -1388,13 +1443,15 @@ def kill_process_group(proc: subprocess.Popen) -> None:
     # entry rather than on exit because that is when such a process has had the longest to die, and
     # it runs before the early returns below so no path through this function skips it.
     reap_stragglers()
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        # already reaped, so there is no group id left to address the survivors by.
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=_TEARDOWN_GRACE_S)
-        return
+    pgid = process_group_id
+    if pgid is None:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            # already reaped, so there is no group id left to address the survivors by.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=_TEARDOWN_GRACE_S)
+            return
 
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(pgid, signal.SIGTERM)

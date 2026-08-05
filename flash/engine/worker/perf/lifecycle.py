@@ -6,6 +6,10 @@ import contextlib
 import re
 
 RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
+_CUDA_OOM_PREFLIGHT_RE = re.compile(
+    r"free memory on device\s+cuda:\d+.*less than desired gpu memory utilization"
+)
+_CUDA_OOM_CACHE_BLOCKS = "no available memory for the cache blocks"
 
 
 class RetriableInfraError(RuntimeError):
@@ -30,6 +34,17 @@ def cuda_oom_count() -> int:
         return 0
 
 
+def cuda_oom_message_evidence(message: str) -> str | None:
+    """the authoritative text evidence for a deterministic cuda oom, if present."""
+    normalized = message.lower()
+    preflight = _CUDA_OOM_PREFLIGHT_RE.search(normalized)
+    if preflight is not None:
+        return preflight.group(0)
+    if _CUDA_OOM_CACHE_BLOCKS in normalized:
+        return _CUDA_OOM_CACHE_BLOCKS
+    return None
+
+
 def is_cuda_oom(exc: BaseException | None) -> bool:
     """Whether a failure was a CUDA OOM.
 
@@ -46,13 +61,7 @@ def is_cuda_oom(exc: BaseException | None) -> bool:
             return True
     except Exception:
         pass
-    msg = str(exc).lower()
-    if (
-        re.search(
-            r"free memory on device\s+cuda:\d+.*less than desired gpu memory utilization", msg
-        )
-        or "no available memory for the cache blocks" in msg
-    ):
+    if cuda_oom_message_evidence(str(exc)) is not None:
         return True
     return cuda_oom_count() > 0
 
