@@ -1282,6 +1282,46 @@ def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypat
     )
 
 
+def test_github_publish_once_pushes_toml_configs(tmp_path, monkeypatch):
+    remote = tmp_path / "training.git"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "--initial-branch", "main")
+    _git(seed, "config", "user.name", "test")
+    _git(seed, "config", "user.email", "test@example.com")
+    (seed / "README.md").write_text("hub\n")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "seed")
+    _git(seed, "init", "--bare", str(remote))
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "origin", "main")
+
+    package = tmp_path / "package"
+    configs = package / "configs"
+    configs.mkdir(parents=True)
+    (package / "environment.py").write_text("def load_environment(**k): pass\n")
+    sft_config = "[training]\nalgorithm = 'sft'\n"
+    opd_config = "[teacher]\nthinking = true\n"
+    (configs / "sft.toml").write_text(sft_config)
+    (configs / "opd_thinking.toml").write_text(opd_config)
+
+    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+
+    envs._github_publish_once(
+        dest=package,
+        repo="ignored/repo",
+        token="tok",
+        publish_root="ns/env/publish-1",
+        message="Upload test env",
+    )
+
+    verify = tmp_path / "verify"
+    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
+    published = verify / "ns/env/publish-1/configs"
+    assert (published / "sft.toml").read_text() == sft_config
+    assert (published / "opd_thinking.toml").read_text() == opd_config
+
+
 # ---------------------------------------------------------------------------
 # delete
 # ---------------------------------------------------------------------------
