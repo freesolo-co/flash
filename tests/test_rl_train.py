@@ -366,6 +366,7 @@ def test_run_rl_train_sizes_the_run_from_the_spec_gpu_count(count, expected):
 
 def test_build_verl_overrides_single_gpu_is_the_unchanged_default():
     o = rl_train.build_verl_overrides(_overrides_cfg(n_gpus=1))
+    assert "+ray_kwargs.ray_init.num_gpus=1" in o
     assert "trainer.n_gpus_per_node=1" in o
     assert "trainer.nnodes=1" in o
     assert "actor_rollout_ref.rollout.tensor_model_parallel_size=1" in o
@@ -378,6 +379,7 @@ def test_build_verl_overrides_shards_every_card_along_the_sequence(n_gpus):
     # global batch of prompts_per_step * group_size. sharding the BATCH instead would change the
     # gradient, which is why sp/tp track the card count rather than leaving dp to absorb it.
     o = rl_train.build_verl_overrides(_overrides_cfg(n_gpus=n_gpus))
+    assert f"+ray_kwargs.ray_init.num_gpus={n_gpus}" in o
     assert f"trainer.n_gpus_per_node={n_gpus}" in o
     assert f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={n_gpus}" in o
     assert f"actor_rollout_ref.rollout.tensor_model_parallel_size={n_gpus}" in o
