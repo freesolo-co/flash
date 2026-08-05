@@ -121,6 +121,23 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
     assert "data.messages_key" not in overrides
 
 
+def test_overrides_carry_fused_expert_target_parameters():
+    overrides = _as_map(
+        build_sft_overrides(
+            _cfg(
+                target_parameters=[
+                    "mlp.experts.gate_up_proj",
+                    "mlp.experts.down_proj",
+                ]
+            )
+        )
+    )
+
+    assert overrides["++model.target_parameters"] == (
+        "[mlp.experts.gate_up_proj,mlp.experts.down_proj]"
+    )
+
+
 def test_verl_sft_optimizer_is_dtensor_safe():
     """the fsdp2 engine hands DTensor params to the optimizer.
 
