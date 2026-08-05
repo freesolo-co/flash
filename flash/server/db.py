@@ -10,6 +10,8 @@ import threading
 import time
 from pathlib import Path
 
+from .._paths import data_dir
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS api_keys (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +83,10 @@ CREATE INDEX IF NOT EXISTS teacher_score_requests_state_idx
 
 
 # Tests override with monkeypatch.setattr(db, "DB_PATH", tmp).
-DB_PATH = str(Path.home() / ".flash" / "server.db")
+DB_PATH = str(data_dir() / "server.db")
+
+BUSY_TIMEOUT_ENV = "FLASH_SQLITE_BUSY_TIMEOUT_SECONDS"
+_DEFAULT_BUSY_TIMEOUT_S = 30.0
 _LAST_USED_WRITE_INTERVAL_S = 60.0
 _INITIALIZATION_LOCK = threading.Lock()
 _INITIALIZED_DATABASES: dict[tuple[int, str], tuple[int, int]] = {}
@@ -90,6 +95,25 @@ _CONNECTIONS = threading.local()
 
 def db_path() -> str:
     return DB_PATH
+
+
+def busy_timeout_s() -> float:
+    """How long to wait for a lock held by another writer before giving up.
+
+    Networked storage can hold a lock far longer than a local volume, and the only symptom is a
+    "database is locked" error surfacing as a failed API call. This raises the patience, not the
+    durability: journal mode, ``synchronous``, and foreign keys are correctness choices and are
+    deliberately not configurable. A non-positive or unparseable value falls back to the default
+    rather than disabling the wait, since a zero timeout turns ordinary contention into errors.
+    """
+    raw = os.environ.get(BUSY_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_BUSY_TIMEOUT_S
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return _DEFAULT_BUSY_TIMEOUT_S
+    return seconds if seconds > 0 else _DEFAULT_BUSY_TIMEOUT_S
 
 
 def _database_file_identity(path: str) -> tuple[int, int] | None:
@@ -123,7 +147,7 @@ def _initialize_database(path: str) -> None:
         if identity is not None and _INITIALIZED_DATABASES.get(database) == identity:
             return
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + busy_timeout_s()
         backoff = 0.01
         schema_identity = None
         while True:
@@ -201,7 +225,7 @@ def _connect() -> sqlite3.Connection:
         _CONNECTIONS.file_identity = None
         if conn is not None:
             conn.close()
-        conn = sqlite3.connect(path, timeout=30.0)
+        conn = sqlite3.connect(path, timeout=busy_timeout_s())
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         opened_identity = _database_file_identity(path)
