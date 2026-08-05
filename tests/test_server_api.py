@@ -747,7 +747,7 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
 
 @pytest.mark.parametrize(
     ("max_completion_tokens", "status_code"),
-    [(3500, 400), (2950, 200)],
+    [(32000, 400), (2950, 200)],
 )
 def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
     api, monkeypatch, tmp_path, max_completion_tokens, status_code
@@ -786,14 +786,14 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
         "train": {
             **SPEC["train"],
             # the 35b is a gdn hybrid, so opd sizes it with a bf16 kv cache (the worker refuses fp8
-            # for them). at the default 8 prompts/step this config needs 186 gb and no card fits, so
-            # the valid-context case would fail allocation instead of exercising the ordering this
-            # test is about. 4 fits the b200 and leaves the context contract unchanged.
+            # for them). training the routed experts puts this past every single card at any batch
+            # size, so the run is pinned to two below; otherwise the valid-context case would fail
+            # allocation instead of exercising the ordering this test is about.
             "batch_size": 4,
             "max_completion_tokens": max_completion_tokens,
             "structured_outputs": {"choice": ["4"]},
         },
-        "gpu": {},
+        "gpu": {"count": 2},
     }
 
     response = api.post(
@@ -805,8 +805,8 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
     assert response.status_code == status_code, response.text
     if status_code == 400:
         detail = response.json()["detail"]
-        assert "OPD rollout prompt+completion)=4524" in detail
-        assert "serving max_model_len=4096" in detail
+        assert "OPD rollout prompt+completion)=33024" in detail
+        assert "serving max_model_len=32768" in detail
     else:
         assert response.json()["state"] == "dry_run"
 

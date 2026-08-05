@@ -631,17 +631,28 @@ def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path
     assert cap["name"] == "math"
 
 
-def test_push_single_py_ships_only_entrypoint_and_sibling_datasets(monkeypatch, tmp_path):
+def test_push_single_py_ships_only_entrypoint_and_selected_sidecars(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "dataset").mkdir()
     (tmp_path / "dataset" / "train.jsonl").write_text('{"x": 1}\n')
     (tmp_path / "datasets").mkdir()
     (tmp_path / "datasets" / "eval.jsonl").write_text('{"x": 2}\n')
+    (tmp_path / "runtime.TOML").write_text('model = "qwen"\n')
+    (tmp_path / "pyproject.toml").write_text("[project]\n")
+    (tmp_path / "credentials.toml").write_text('token = "secret"\n')
+    (tmp_path / "not-a-file.toml").mkdir()
+    (tmp_path / "not-a-file.toml" / "nested.toml").write_text("[nested]\n")
+    configs = tmp_path / "configs"
+    (configs / "nested").mkdir(parents=True)
+    (configs / "base.toml").write_text("batch_size = 8\n")
+    (configs / "nested" / "tuning.TOML").write_text("learning_rate = 0.001\n")
+    (configs / "ignored.yaml").write_text("mode: prod\n")
     (tmp_path / "helper.py").write_text("VALUE = 1\n")
     (tmp_path / "config.yaml").write_text("mode: prod\n")
     (tmp_path / "unrelated").mkdir()
     (tmp_path / "unrelated" / "data.json").write_text("{}\n")
+    (tmp_path / "unrelated" / "other.toml").write_text("publish = false\n")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
@@ -649,9 +660,12 @@ def test_push_single_py_ships_only_entrypoint_and_sibling_datasets(monkeypatch, 
     files = set(_members(cap["package_b64"]))
     assert files == {
         "README.md",
+        "configs/base.toml",
+        "configs/nested/tuning.TOML",
         "dataset/train.jsonl",
         "datasets/eval.jsonl",
         "environment.py",
+        "runtime.TOML",
     }
 
 
@@ -906,6 +920,7 @@ def test_push_sibling_config_does_not_override_explicit_name(monkeypatch, tmp_pa
     names = set(_members(cap["package_b64"]))
     assert cap["name"] == "new-name"
     assert "environment.py" in names
+    assert "rl.toml" in names
 
 
 def test_push_needs_no_local_github_credentials(monkeypatch, tmp_path):

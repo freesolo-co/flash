@@ -26,6 +26,8 @@ from typing import Any
 
 from packaging.version import Version
 
+from flash.opd_limits import OPD_NO_SIGNAL_ATTEMPTS
+
 try:
     from flash_opd_multiturn import build_flash_multi_turn_agent_loop
     from flash_opd_structured import StructuredOutputReplay, canonical_structured_spec
@@ -166,7 +168,7 @@ def _run_with_no_signal_replacements(
     record_resample,
     record_abandoned,
     *,
-    max_attempts: int = 3,
+    max_attempts: int = OPD_NO_SIGNAL_ATTEMPTS,
 ):
     """retry an all-no-signal rollout with a fresh bounded dispatch."""
     if max_attempts <= 0:

@@ -22,10 +22,12 @@ from flash.engine.worker.adapter import (
     _download_adapter,
     _init_adapter_model,
     _resolve_adapter_ref,
+    lora_target_parameters,
     make_lora,
     prepare_fresh_lora_base,
     require_vllm_for_rollout_func,
     stamp_adapter_provenance,
+    validate_lora_target_parameters,
 )
 from flash.engine.worker.backend_common import collect_ray_failure_logs
 from flash.engine.worker.decoding import (
@@ -543,6 +545,7 @@ __all__ = [
     "liger_on",
     "load_mega_cache",
     "load_tokenizer",
+    "lora_target_parameters",
     "loraplus_optimizer_cls",
     "main",
     "make_checkpoint_upload_callback",
@@ -572,6 +575,7 @@ __all__ = [
     "thinking_text",
     "upload_debug_jsonl",
     "upload_resume_checkpoint",
+    "validate_lora_target_parameters",
     "wait_for_gpu",
     "wandb_finish",
     "wandb_report_to",

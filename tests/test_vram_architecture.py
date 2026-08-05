@@ -19,7 +19,9 @@ _EXPECTED_LORA_TARGET_COUNTS = {
     "Qwen/Qwen3.5-2B": 284,
     "Qwen/Qwen3.5-4B": 346,
     "Qwen/Qwen3.5-9B": 358,
-    "Qwen/Qwen3.6-35B-A3B": 460,
+    # 460 ordinary linears + both fused routed-expert tensors (40 layers x 256 experts each),
+    # which peft wraps as 10,240 rank-r slices per tensor.
+    "Qwen/Qwen3.6-35B-A3B": 460 + 2 * 10_240,
     "Qwen/Qwen3.6-27B": 606,
 }
 
@@ -182,11 +184,13 @@ def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overroutin
             {"max_context_tokens": 4096, "group_size": 8, "lora_rank": 64},
             80,
         ),
+        # the two moe ceilings sit above the pre-expert numbers (103 and 180) on purpose: the routed
+        # experts are real trainable parameters, so an estimate that excluded them under-reserved.
         "moe_sft": (
             "Qwen/Qwen3.6-35B-A3B",
             "sft",
             {"max_context_tokens": 4096, "batch_size": 4, "lora_rank": 64},
-            103,
+            154,
         ),
         "moe_grpo": (
             "Qwen/Qwen3.6-35B-A3B",
@@ -197,7 +201,7 @@ def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overroutin
                 "group_size": 8,
                 "lora_rank": 16,
             },
-            180,
+            190,
         ),
     }
 
@@ -218,8 +222,11 @@ def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overroutin
     assert model_required_vram_gb("Qwen/Qwen3.5-2B", "grpo") <= 32
     assert model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"group_size": 8}) <= 48
     assert sized["gdn_vl_9b_grpo"] <= 80
-    assert sized["moe_sft"] <= 141
-    assert sized["moe_grpo"] <= 180
+    # training the routed experts adds ~3.7B trainable parameters at rank 64, so the 35B no longer
+    # fits one card for these shapes; it routes to two. sizing it back under a single-card tier would
+    # mean under-reserving a run that really does need the memory.
+    assert sized["moe_sft"] <= 2 * 141
+    assert sized["moe_grpo"] <= 2 * 180
 
     assert sized["gdn_vl_small_grpo"] < cases["gdn_vl_small_grpo"][3]
     assert sized["gdn_vl_4b_grpo"] < cases["gdn_vl_4b_grpo"][3]

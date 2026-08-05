@@ -84,7 +84,14 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
-    env = build_worker_env(opd_spec, 0)
+    env = build_worker_env(
+        opd_spec,
+        0,
+        runtime_secrets={
+            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+        },
+    )
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
     assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
     # GRPO still ships the sleep-safe non-expandable conf.
@@ -116,42 +123,77 @@ def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
 
-def test_build_worker_env_forwards_managed_teacher_key_for_opd_only(monkeypatch):
-    """The opd GLM teacher key is a platform-owned credential injected from the control-plane env
-    (like GITHUB_TOKEN) — but ONLY for opd runs, since only opd uses it. sft/grpo workers never
-    receive it."""
+def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monkeypatch):
+    """opd receives bounded broker transport while provider credentials remain control-plane-only."""
     from flash.providers.runpod.train import build_worker_env
     from flash.spec import JobSpec, TrainSpec
 
-    monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
+    monkeypatch.setenv("PARASAIL_API_KEY", "platform-managed-parasail")
     opd_spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
-    assert build_worker_env(opd_spec, 0).get("FIREWORKS_API_KEY") == "platform-managed-teacher"
-    # grpo/sft don't use a teacher, so the key is not forwarded to those workers.
-    assert "FIREWORKS_API_KEY" not in build_worker_env(_spec(), 0)
+    env = build_worker_env(
+        opd_spec,
+        0,
+        runtime_secrets={
+            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+        },
+    )
+    assert env["FLASH_CONTROL_PANEL_URL"] == "https://broker.example"
+    assert env["FLASH_TEACHER_CAPABILITY"] == "capability-test-value"
+    assert "PARASAIL_API_KEY" not in env
+    grpo = build_worker_env(_spec(), 0)
+    assert "FLASH_CONTROL_PANEL_URL" not in grpo
+    assert "FLASH_TEACHER_CAPABILITY" not in grpo
 
 
-def test_build_worker_env_managed_teacher_key_is_authoritative_no_byo(monkeypatch):
-    """Bring-your-own is not supported: even if a user routes a FIREWORKS_API_KEY runtime_secret
-    (by declaring it in [environment].secrets), the control-plane value wins — it is applied last."""
+def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
+
+    opd_spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+
+    with pytest.raises(RuntimeError, match="control-panel teacher transport is missing"):
+        build_worker_env(
+            opd_spec,
+            0,
+            runtime_secrets={
+                "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+                "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+            },
+        )
+
+
+def test_build_worker_env_rejects_managed_teacher_byo_names():
     from flash.providers.runpod.train import build_worker_env
     from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
 
-    monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
     opd_spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
-        environment=EnvironmentSpec(id="org/env", secrets=("FIREWORKS_API_KEY",)),
+        environment=EnvironmentSpec(id="org/env", secrets=("PARASAIL_API_KEY",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
-    env = build_worker_env(opd_spec, 0, runtime_secrets={"FIREWORKS_API_KEY": "byo-user-key"})
-    assert env["FIREWORKS_API_KEY"] == "platform-managed-teacher"
-    assert "GITHUB_TOKEN" not in build_worker_env(_spec(), 0)
+    with pytest.raises(ValueError, match="managed teacher credential names"):
+        build_worker_env(
+            opd_spec,
+            0,
+            runtime_secrets={
+                "PARASAIL_API_KEY": "byo-parasail-key",
+                "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+                "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+            },
+        )
 
 
 def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(monkeypatch):
@@ -764,19 +806,16 @@ def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
     assert steady_state_commits_per_hour <= 5.0
 
 
-def test_worker_image_override_carries_deploy_constraints(monkeypatch):
-    # the override image's own requirements (registry auth, cuda floor, disk floor) ride with it
+def test_worker_image_override_carries_its_registry_credential(monkeypatch):
+    # a private override image needs its provider-side pull credential; that cannot be derived
+    # from the image ref, so it rides alongside it.
     from flash.providers import _worker
 
     monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/private-worker:cu13")
     monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-123")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_CUDA", "13.0")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_DISK_GB", "150")
     o = _worker.worker_image_override()
     assert o.image == "ghcr.io/example/private-worker:cu13"
     assert o.registry_auth_id == "auth-123"
-    assert o.min_cuda == "13.0"
-    assert o.min_disk_gb == 150
     assert _worker.worker_image_for_gpu("H200") == o.image
 
 
@@ -787,30 +826,28 @@ def test_worker_image_override_absent_is_none(monkeypatch):
     assert _worker.worker_image_override() is None
 
 
-def test_min_cuda_for_takes_image_floor_when_higher(monkeypatch):
+def test_min_cuda_for_uses_the_gpu_class_floor(monkeypatch):
+    # the CUDA floor is a property of the GPU class, not of an operator-supplied image tag
     from flash.providers.runpod.train.endpoints import min_cuda_for
 
     monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:cu13")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_CUDA", "13.0")
-    # H200 class floor is 12.x; the cu13 image raises it
-    assert min_cuda_for("H200") == "13.0"
-    # class floor wins when the image floor is lower
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_CUDA", "11.8")
-    assert min_cuda_for("B200") != "11.8"
+    assert min_cuda_for("B200") == "13.0"  # blackwell needs cu13 drivers
+    assert min_cuda_for("H200") == "12.8"
 
 
-def test_apply_disk_honors_image_floor(monkeypatch):
+def test_apply_disk_raises_to_the_requested_floor(monkeypatch):
     from types import SimpleNamespace
 
     from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
 
     monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:big")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_DISK_GB", "150")
     monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-xyz")
     tpl = SimpleNamespace(containerDiskInGb=64, containerRegistryAuthId=None)
     cfg = SimpleNamespace(template=tpl)
     apply_disk_gb(cfg, 80)
-    assert tpl.containerDiskInGb == 150  # image floor wins over the 80 GB request
+    assert tpl.containerDiskInGb == 80  # raise-only: the request wins over the smaller default
+    apply_disk_gb(cfg, 32)
+    assert tpl.containerDiskInGb == 80  # never lowers an already-larger disk
     apply_image_override_constraints(cfg)
     assert tpl.containerRegistryAuthId == "auth-xyz"
 

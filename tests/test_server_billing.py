@@ -575,7 +575,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     )
 
     assert res.status_code == 400, res.text
-    assert "single-turn" in res.text
+    assert "image-bearing opd is not supported" in res.text
     assert "insufficient" not in res.text
 
 

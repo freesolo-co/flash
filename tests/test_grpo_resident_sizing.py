@@ -15,9 +15,13 @@ from flash.engine.vram import estimate_vram_gb, grpo_fits_resident, grpo_rollout
 
 def test_fp8_kv_unlocks_longer_resident_context():
     # fp8 KV halves the resident KV bytes, so the resident-fit gate (which sizes the KV) must admit a
-    # longer context than the bf16 sizing would. The 35B-A3B on a 180 GB B200 at group 8 fits ctx 2048
-    # either way, but ctx 4096 fits ONLY with fp8 KV factored (else it's wrongly routed to the broken
-    # sleep path). Without this awareness the gate over-reserves bf16 KV and rejects a run fp8 KV fits.
+    # longer context than the bf16 sizing would. At group 8 the 35B-A3B fits ctx 2048 either way, but
+    # ctx 4096 fits ONLY with fp8 KV factored (else it's wrongly routed to the broken sleep path).
+    # Without this awareness the gate over-reserves bf16 KV and rejects a run fp8 KV fits.
+    #
+    # the budget is load-bearing and deliberately NOT a round multiple of a card: training the routed
+    # experts pushed this run past one card, and only ~190-195 GB still separates bf16 from fp8 here.
+    # a full two-card 358 GB budget admits every case above, which would make this test unfailable.
     mid = "Qwen/Qwen3.6-35B-A3B"
 
     def f(ctx, fp8):
@@ -27,7 +31,7 @@ def test_fp8_kv_unlocks_longer_resident_context():
             max_tokens=384,
             lora_rank=16,
             group_size=8,
-            card_vram_gb=179.06,
+            card_vram_gb=190.0,
             fp8_kv=fp8,
         )
 
@@ -42,6 +46,9 @@ def test_sleep_unsupported_model_is_sized_resident_not_slept():
     # "does it fit RESIDENT" -- there is no sleeping fallback to fall back to. group 8 / ctx 4096 fits
     # with fp8 KV; doubling the context does not, and the parse-time gate below turns that into a
     # rejection rather than a run that hangs on its first wake.
+    #
+    # same load-bearing budget as the fp8 test above: a full two-card 358 GB budget fits ctx 8192 too,
+    # which would erase the ceiling this test exists to prove.
     mid = "Qwen/Qwen3.6-35B-A3B"
 
     def fits(ctx):
@@ -51,7 +58,7 @@ def test_sleep_unsupported_model_is_sized_resident_not_slept():
             max_tokens=384,
             lora_rank=16,
             group_size=8,
-            card_vram_gb=179.06,
+            card_vram_gb=190.0,
             fp8_kv=True,
         )
 
@@ -60,8 +67,12 @@ def test_sleep_unsupported_model_is_sized_resident_not_slept():
 
 
 def test_sleep_unsupported_model_rejected_at_parse_time_for_long_context():
-    # Submit-time: a sleep-broken model is sized on its RESIDENT peak, so a context too long to fit
-    # resident pushes the requirement PAST the biggest GPU (180 GB B200) -> rejected before launch.
+    # Submit-time: a sleep-broken model is sized on its RESIDENT peak, so a longer context pushes the
+    # requirement past the allocation it would otherwise get -> rejected before launch.
+    #
+    # the 195 GB bound is between the two sized values (190 and 200) on purpose. training the routed
+    # experts moved both past one 180 GB B200, and a full two-card 360 GB bound would sit above BOTH,
+    # so the test would pass no matter how badly the long-context case were sized.
     from flash.engine.vram import model_required_vram_gb
 
     mid = "Qwen/Qwen3.6-35B-A3B"
@@ -77,8 +88,8 @@ def test_sleep_unsupported_model_rejected_at_parse_time_for_long_context():
         "max_completion_tokens": 384,
         "lora_rank": 16,
     }
-    assert model_required_vram_gb(mid, "grpo", train=fits) <= 180  # admitted on the B200
-    assert model_required_vram_gb(mid, "grpo", train=over) > 180  # past every GPU -> rejected
+    assert model_required_vram_gb(mid, "grpo", train=fits) <= 195  # admitted
+    assert model_required_vram_gb(mid, "grpo", train=over) > 195  # sized past it -> rejected
 
 
 def test_resident_peak_is_at_least_sleep_peak():
@@ -114,8 +125,8 @@ def test_moe_resident_fit_sizes_activations_on_active_params():
     # this never under-counts the two resident weight copies.
     kw = {"seq_len": 2048, "max_tokens": 384, "group_size": 8, "lora_rank": 32}
     moe = "Qwen/Qwen3.6-35B-A3B"
-    # active-sized estimate fits a 180 GB B200 resident; the same gate would NOT have, sizing as 35B.
-    assert grpo_fits_resident(moe, card_vram_gb=180, **kw) is True
+    # active-sized estimate fits resident on two B200s; the same gate would NOT have, sizing as 35B.
+    assert grpo_fits_resident(moe, card_vram_gb=2 * 180, **kw) is True
     # a too-small card still keeps sleep mode on (the active sizing only shrinks activations/KV, not
     # the full 140 GB of resident weights, so a 80 GB card cannot hold the two bf16 copies).
     assert grpo_fits_resident(moe, card_vram_gb=80, **kw) is False
@@ -203,13 +214,13 @@ def test_moe_grpo_fits_resident_sizes_compute_on_active_params():
     assert info.active_params_b  # it's an MoE...
     assert info.active_params_b < info.params_b  # ...with active < total
     kw = {"seq_len": 1024, "max_tokens": 64, "group_size": 8, "lora_rank": 32}
-    # active-aware (the fix) admits the run resident on the 180 GB B200; the 141 GB H200 still can't
-    # hold the two ~70 GB weight copies, so sleep stays on there.
-    assert grpo_fits_resident(moe, card_vram_gb=180, **kw) is True
+    # active-aware (the fix) admits the run resident on two 180 GB B200s; one card no longer holds it
+    # now that the routed experts are trained, and the 141 GB H200 never could.
+    assert grpo_fits_resident(moe, card_vram_gb=2 * 180, **kw) is True
     assert grpo_fits_resident(moe, card_vram_gb=141, **kw) is False
-    # Had the gate kept sizing compute on the 35B total, the 1.15-margined resident estimate would
-    # exceed 180 and the B200 case above would be False. Prove the active-aware estimate is materially
-    # leaner than the (buggy) total-based one — that gap is what flips the B200 verdict.
+    # the weight terms now decide the card count, so prove the active-aware/total-based gap directly
+    # rather than through the fit verdict: 180 still lies between the two margined estimates, so this
+    # stays a real discriminator. sizing compute on the 35B total would push it over that line.
     active_aware = estimate_vram_gb(
         info.params_b,
         "grpo",
@@ -252,13 +263,22 @@ def test_unset_max_length_still_resolves_the_real_rollout_length():
 # "expandable_segments:True" (vllm/device_allocator/cumem.py:132, pytorch#147851). The launcher's
 # per-algorithm choice is now the only route to that conf, so it carries the whole invariant.
 # ---------------------------------------------------------------------------
+def _worker_runtime_for(algorithm: str) -> dict[str, str] | None:
+    if algorithm != "opd":
+        return None
+    return {
+        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+        "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+    }
+
+
 def _worker_env_for(algorithm: str, phase: str) -> dict:
     from flash.providers._worker import build_worker_env
     from flash.spec import JobSpec
 
     spec = JobSpec.from_dict({"model": "m", "seed": 0, "algorithm": algorithm})
     assert spec.phase == phase, "phase is derived from algorithm; the mapping moved"
-    return build_worker_env(spec, 0)
+    return build_worker_env(spec, 0, runtime_secrets=_worker_runtime_for(algorithm))
 
 
 @pytest.mark.parametrize(("algorithm", "phase"), [("grpo", "rl"), ("opd", "opd")])
@@ -303,7 +323,11 @@ def test_a_stale_backend_key_cannot_change_the_allocator(stale_backend):
                 "worker_env": {f"FLASH_{phase.upper()}_BACKEND": stale_backend},
             }
         )
-        env = build_worker_env(spec, 0)
+        env = build_worker_env(
+            spec,
+            0,
+            runtime_secrets=_worker_runtime_for(algorithm),
+        )
         for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
             assert ("expandable_segments" in env[key]) is expect_expandable, (
                 f"{algorithm} allocator moved under a stale {stale_backend!r} key"

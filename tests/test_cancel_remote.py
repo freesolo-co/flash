@@ -185,6 +185,60 @@ def test_terminate_endpoint_never_raises_when_sdk_missing(monkeypatch):
     assert out[0]["success"] is False
 
 
+@pytest.mark.parametrize("failed_revocation_call", [1, 2])
+def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
+    tmp_path, monkeypatch, failed_revocation_call
+):
+    import flash.runner as orch
+    from flash.runner import lifecycle
+    from flash.server import db as server_db
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "gpu": {"type": "RTX 5090"},
+            "run_id": f"flash-revoke-failure-{failed_revocation_call}",
+        }
+    )
+    status = provisioned_status(
+        orch,
+        spec,
+        state="running",
+        remote=_remote("endpoint-1", "job-1", 1),
+    )
+    orch._save_status(status)
+    revocation_calls = 0
+    teardown_calls = []
+
+    def revoke(_run_id):
+        nonlocal revocation_calls
+        revocation_calls += 1
+        if revocation_calls == failed_revocation_call:
+            raise RuntimeError(f"revocation failure {failed_revocation_call}")
+        return 1
+
+    monkeypatch.setattr(server_db, "revoke_teacher_capabilities_for_run", revoke)
+
+    def teardown(handle, run_id):
+        teardown_calls.append((handle.provider, run_id, orch.get_status(run_id).state))
+        return True
+
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+
+    with pytest.raises(RuntimeError, match=f"revocation failure {failed_revocation_call}"):
+        orch.cancel_run(spec.run_id)
+
+    persisted = orch.get_status(spec.run_id)
+    assert persisted.state == "cancelled"
+    assert persisted.remote is None
+    assert teardown_calls == [("runpod", spec.run_id, "cancelled")]
+    assert revocation_calls == 2
+
+
 def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
     import flash.runner as orch
 

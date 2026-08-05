@@ -235,6 +235,92 @@ def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
     assert sdk_env.batch_sizes == [1, 1, 1]
 
 
+def test_single_turn_scores_breakdown_many_batches_named_metrics_in_order(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _CountingSingleTurnEnv(_FakeSingleTurnEnv):
+        def __init__(self):
+            self.batch_sizes = []
+
+        def score_responses(self, example, response_texts):
+            self.batch_sizes.append(len(response_texts))
+            return super().score_responses(example, response_texts)
+
+    sdk_env = _CountingSingleTurnEnv()
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    ex_a = {"id": "a", "input": "2+2?", "output": "4"}
+    ex_b = {"id": "b", "input": "3+3?", "output": "6"}
+
+    breakdowns = env.scores_breakdown_many(
+        [
+            (ex_a, {"response_text": "4"}),
+            (ex_b, {"response_text": "nope"}),
+            (ex_a, {"response_text": "also 4"}),
+        ]
+    )
+
+    assert breakdowns == [
+        {"match": 1.0, "total": 1.0},
+        {"match": 0.0, "total": 0.0},
+        {"match": 1.0, "total": 1.0},
+    ]
+    assert sorted(sdk_env.batch_sizes) == [1, 2]
+
+
+def test_single_turn_scores_breakdown_many_is_serial_when_not_thread_safe(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _UnsafeSingleTurnEnv(_FakeSingleTurnEnv):
+        reward_thread_safe = False
+
+        def __init__(self):
+            self.batch_sizes = []
+
+        def score_responses(self, example, response_texts):
+            self.batch_sizes.append(len(response_texts))
+            return super().score_responses(example, response_texts)
+
+    sdk_env = _UnsafeSingleTurnEnv()
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+
+    assert env.scores_breakdown_many(
+        [
+            (example, {"response_text": "4"}),
+            (example, {"response_text": "nope"}),
+        ]
+    ) == [
+        {"match": 1.0, "total": 1.0},
+        {"match": 0.0, "total": 0.0},
+    ]
+    assert sdk_env.batch_sizes == [1, 1]
+
+
+def test_single_turn_scores_breakdown_many_rejects_wrong_length(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _ShortSingleTurnEnv(_FakeSingleTurnEnv):
+        def score_responses(self, example, response_texts):
+            return super().score_responses(example, response_texts[:-1])
+
+    env = FreesoloEnvironment(_ShortSingleTurnEnv(), "owner/env", source=None, contract_text="")
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+
+    with pytest.raises(RuntimeError, match="score_responses returned the wrong length"):
+        env.scores_breakdown_many(
+            [
+                (example, {"response_text": "4"}),
+                (example, {"response_text": "also 4"}),
+            ]
+        )
+
+
 def test_single_turn_scoring_gets_completion_thinking_and_raw(monkeypatch):
     """Thinking-mode GRPO passes an answer-only string to existing scorers while exposing
     structured thinking/raw fields for scorers that need them."""
@@ -279,6 +365,14 @@ def test_single_turn_scoring_gets_completion_thinking_and_raw(monkeypatch):
     assert breakdown["raw_reasoning"] == 1.0
     assert breakdown["answer"] == 1.0
     assert breakdown["total"] == 3.0
+    assert env.scores_breakdown_many(
+        [
+            (
+                {"id": "q", "input": "q", "output": "4"},
+                {"response_text": " 5", **state},
+            )
+        ]
+    ) == [breakdown]
 
 
 def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
