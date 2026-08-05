@@ -227,7 +227,10 @@ def _force_fla_triton_gdn_on_sm100() -> None:
     wins on every fla version, so this env set reproduces upstream's current gate on our pin and
     stays a correct no-op across a future pin bump.
 
-    * ``setdefault``: an explicitly pre-set FLA_TILELANG (e.g. testing a fixed tilelang) wins.
+    * Unconditional on sm100: this is a correctness floor, not a preference. A pre-set
+      FLA_TILELANG used to win here, which meant an operator could re-enable a backend that
+      silently miscomputes gradients — the worst failure mode there is, since training completes
+      and only the weights are wrong. Flash owns this value on sm100.
     * sm100 only: sm90 NEEDS tilelang (fla #640, the fast-path installer owns it); sm89/sm120
       train healthily today under the pin's default and upstream's next-pin gate flips them to
       Triton anyway — no evidence to justify changing them from here.
@@ -240,14 +243,6 @@ def _force_fla_triton_gdn_on_sm100() -> None:
         if not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)):
             return
     except Exception:
-        return
-    prior = os.environ.get("FLA_TILELANG")
-    if prior is not None:
-        print(
-            f"[blackwell] FLA_TILELANG={prior!r} pre-set; respecting it "
-            "(default here is 0 on sm100: tilelang chunk_bwd_dqkwg miscomputes grads)",
-            flush=True,
-        )
         return
     os.environ["FLA_TILELANG"] = "0"
     print(

@@ -6,7 +6,7 @@ doesn't exercise: the tri-state env flag, the isatty fallback, the identity/logi
 types, provider redaction over lists, timestamp/age humanizers, the cost panel, object panel, and
 the small confirmation cards. Color is dropped via ``NO_COLOR`` wherever we assert on contiguous
 text (the same discipline the sibling theme tests use); the two tests that must see SGR codes force
-color on with an explicit ``TERM``/``COLORTERM``/``FLASH_THEME`` so they stay deterministic.
+color on with an explicit ``TERM``/``COLORTERM``/``COLORFGBG`` so they stay deterministic.
 """
 
 from __future__ import annotations
@@ -114,7 +114,6 @@ def test_login_ok_and_failed(styled_plain) -> None:
 
 
 def test_theme_colorfgbg_non_integer_defaults_dark(monkeypatch) -> None:
-    monkeypatch.delenv("FLASH_THEME", raising=False)
     monkeypatch.setenv("COLORFGBG", "foo;bar")  # last field not an int -> ValueError guard
     assert render._theme() == "dark"
 
@@ -124,7 +123,7 @@ def test_sgr_uses_256_color_fallback_without_truecolor(monkeypatch) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")  # not "dumb" -> color stays on
     monkeypatch.delenv("COLORTERM", raising=False)  # not truecolor -> 256 fallback
-    monkeypatch.setenv("FLASH_THEME", "dark")
+    monkeypatch.setenv("COLORFGBG", "15;0")  # light text on dark background -> dark theme
     out = render.badge("done")  # green/dark 256 fallback is 84
     assert "38;5;84" in out
     assert "38;2;" not in out  # no truecolor triple
