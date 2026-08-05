@@ -1,6 +1,7 @@
 """Client-side credential storage: Flash API key + control-plane URL.
 
-Stored in ``~/.flash/config.json`` (0600). ``FREESOLO_API_KEY`` / ``FLASH_API_URL`` override.
+Stored in ``config.json`` (0600) under the Flash data dir, ``~/.flash`` unless
+``FLASH_DATA_DIR`` says otherwise. ``FREESOLO_API_KEY`` / ``FLASH_API_URL`` override.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from .._channel import CHANNEL, CLI_NAME
 from .._fileio import read_json_or_empty, secure_json_write
+from .._paths import data_dir
 
 PROD_API_URL = "https://flash.freesolo.co"
 DEV_API_URL = "https://flash-dev.freesolo.co"
@@ -22,7 +24,10 @@ def default_api_url(channel: str = CHANNEL) -> str:
 
 DEFAULT_API_URL = default_api_url()
 
-CONFIG_DIR = Path.home() / ".flash"
+# Resolved at import so the CLI reports one stable path for the life of a command: these appear
+# in user-facing messages ("the login saved in ..."), and a value that changed between the read
+# and the message would name a file the user was not told about.
+CONFIG_DIR = data_dir()
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 
