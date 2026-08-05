@@ -64,6 +64,50 @@ def test_charge_usd_for_spec_prorates_sft_cancel_by_tokens(monkeypatch):
     assert half < naive
 
 
+def test_cancelled_profile_is_billed_all_or_nothing():
+    """A profile that never started is free; one that started owes its whole bounded wall.
+
+    A profile has no optimizer steps, so its quote is a wall cap rather than a per-step price and
+    cannot be prorated. Both directions are defects: charging the cap for a profile cancelled while
+    still queued bills a gpu that never ran, and since the id is derived from the workload rather
+    than the account that lands on whichever submitter won the claim; charging $0 for one that ran
+    gives the rented wall away.
+    """
+    from dataclasses import replace
+
+    from flash.workload_profile import SFT_PROFILE_KIND
+
+    profile = replace(
+        _spec(), run_id="profile-sft-abc", workload_profile_kind=SFT_PROFILE_KIND, algorithm="sft"
+    )
+    quote = runner.charge_usd_for_spec(profile)
+    assert quote > 0
+    # never started -> nothing rented -> nothing owed.
+    assert runner.charge_usd_for_spec(profile, steps=0) == 0.0
+    # started at all -> the whole bounded wall, not a fraction of it.
+    assert runner.charge_usd_for_spec(profile, steps=1) == quote
+
+
+def test_profile_steps_run_reads_started_not_optimizer_steps():
+    """The profile cancel signal is "did the worker ever speak", not a step count.
+
+    ``actual_steps_run`` looks for rl_step/sft_step/opd_step heartbeats, which a profile never
+    emits -- so reusing it here would read 0 for a profile that ran to completion and hand back
+    its rented wall for free. The last assertion is the one that makes the split load-bearing.
+    """
+
+    def st(hb):
+        return runner.RunStatus(run_id="r", state="cancelled", spec={}, last_heartbeat=hb)
+
+    assert runner.profile_steps_run(st(None)) == 0
+    assert runner.profile_steps_run(st({})) == 0
+    assert runner.profile_steps_run(st({"stage": "profile_start"})) == 1
+    assert runner.profile_steps_run(st({"stage": "setup"})) == 1
+    assert runner.profile_steps_run(st({"stage": "done"})) == 1
+    # the reason profile_steps_run exists rather than reusing actual_steps_run.
+    assert runner.actual_steps_run(st({"stage": "profile_start"})) == 0
+
+
 def test_charge_usd_for_spec_falls_back_when_unpriceable():
     # a spec that can't be priced returns the fallback rather than raising (a charge is never blocked)
     assert runner.charge_usd_for_spec(object(), fallback=1.5) == 1.5
