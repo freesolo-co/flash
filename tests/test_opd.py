@@ -1444,8 +1444,8 @@ class _TinyLM:
 
 
 def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch):
-    teacher_model = "glm-5.2"
     """Image-bearing OPD must fail before teacher construction or paid GPU work."""
+    teacher_model = "glm-5.2"
     fake_torch = types.ModuleType("torch")
     fake_torch.manual_seed = lambda _seed: None
     fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
