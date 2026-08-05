@@ -1620,6 +1620,8 @@ def build_opd_overrides(config: dict) -> list[str]:
         # that mattered (VERL-123). size the pool to the container instead. this also keeps the
         # storage-unit reservation above satisfiable, since it stays well under the cpu floor.
         f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(config['n_gpus_per_node'])}",
+        # num_gpus is absent from verl's generated ray_init node, so hydra requires add-key syntax.
+        f"+ray_kwargs.ray_init.num_gpus={config['n_gpus_per_node']}",
         "critic.enable=false",
         "reward.reward_model.enable=false",
         # disabling the reward MODEL does not disable reward SCORING. with no custom function the
