@@ -11,7 +11,7 @@ import os
 from flash.catalog import (
     DEFAULT_MODEL,
     MODELS,
-    SERVING_FP8_MODEL_REPOS,
+    SERVING_MODEL_REPOS,
     get_model,
     opd_mamba_batched_token_floor,
 )
@@ -110,16 +110,14 @@ def test_serving_capacity_matches_validated_matrix():
             "gpu_memory_utilization": 0.98,
         },
         "Qwen/Qwen3.6-35B-A3B": {
-            "gpu": "A100-80GB",
-            "serve_model_id": "Qwen/Qwen3.6-35B-A3B-FP8",
+            "gpu": "H200",
+            "serve_model_id": "Qwen/Qwen3.6-35B-A3B",
             "max_loras": 6,
             "max_lora_rank": 64,
-            # 4096 (down from 8192): the 6x64 LoRA ceiling is weight-bound not context-bound, so the
-            # smaller context buys ~2x serving concurrency without costing slots (canary 2026-07-04).
-            "max_model_len": 4096,
+            "max_model_len": 32768,
             "max_num_seqs": 8,
             "max_num_batched_tokens": 4096,
-            "gpu_memory_utilization": 0.98,
+            "gpu_memory_utilization": 0.90,
         },
     }
     for model_id, values in expected.items():
@@ -149,14 +147,14 @@ def test_public_rows_prune_unset_serving_capacity_fields():
     }
 
 
-def test_serving_fp8_repos_match_current_serving_matrix() -> None:
-    # dense models serve freesolo-owned fp8 checkpoints; the qwen3.6 moe serves official qwen fp8.
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-0.8B"] == "Freesolo-Co/Qwen3.5-0.8B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-2B"] == "Freesolo-Co/Qwen3.5-2B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-4B"] == "Freesolo-Co/Qwen3.5-4B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-9B"] == "Freesolo-Co/Qwen3.5-9B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-27B"] == "Freesolo-Co/Qwen3.6-27B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"] == "Qwen/Qwen3.6-35B-A3B-FP8"
+def test_serving_repos_match_current_serving_matrix() -> None:
+    # dense models serve freesolo-owned fp8 checkpoints; the qwen3.6 moe serves base bf16 on h200.
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-0.8B"] == "Freesolo-Co/Qwen3.5-0.8B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-2B"] == "Freesolo-Co/Qwen3.5-2B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-4B"] == "Freesolo-Co/Qwen3.5-4B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"] == "Freesolo-Co/Qwen3.5-9B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.6-27B"] == "Freesolo-Co/Qwen3.6-27B-FP8"
+    assert SERVING_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"] == "Qwen/Qwen3.6-35B-A3B"
 
 
 def test_qwen36_27b_geometry_is_dense_hybrid():
