@@ -166,9 +166,16 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
         from flash.cost.analytical import estimate_cost
         from flash.cost.spec import estimate_for_spec, runconfig_from_spec
 
-        if steps is None or getattr(spec, "workload_profile_kind", ""):
-            # a profile job has no optimizer steps to prorate; its charge is the bounded wall it
-            # rented, which estimate_for_spec already returns.
+        if getattr(spec, "workload_profile_kind", ""):
+            # a profile job has no optimizer steps to prorate, so its charge is all-or-nothing: the
+            # bounded wall it rented, or zero if it never started. the caller passes steps=0 for the
+            # latter (see profile_steps_run), and honouring it matters because the id is derived
+            # from the workload rather than the account -- a profile cancelled before launch would
+            # otherwise bill the full wall cap to whichever submitter happened to win the claim.
+            if steps is not None and int(steps) <= 0:
+                return 0.0
+            return float(estimate_for_spec(spec).total_usd)
+        if steps is None:
             return float(estimate_for_spec(spec).total_usd)
         n = max(0, int(steps))
         if n == 0:
@@ -221,6 +228,24 @@ def actual_steps_run(status: RunStatus) -> int:
     if hb.get("stage") in _TRAINING_STAGES:
         return 1
     return 0
+
+
+def profile_steps_run(status: RunStatus) -> int:
+    """Whether a cancelled profile job rented anything: 1 if it started, 0 if it never did.
+
+    A profile has no optimizer steps, so ``actual_steps_run`` reads 0 for every one of them -- it
+    looks for training-stage heartbeats a profile never emits. Billing a cancel on that number
+    would hand back the rented wall of a profile that ran to completion. Billing the quote
+    unconditionally has the opposite failure: a profile cancelled while still queued would charge
+    the whole wall cap for work no gpu did, and because the id is derived from the workload rather
+    than the account, that charge lands on whichever submitter won the claim.
+
+    The distinguishing signal is simply whether the worker ever spoke. Any heartbeat means a
+    machine was rented and the bounded wall is owed; none means nothing ran and nothing is owed.
+    The charge is all-or-nothing rather than prorated because a profile is quoted as a wall cap,
+    not a per-step price -- see ``charge_usd_for_spec``."""
+    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
+    return 1 if hb.get("stage") else 0
 
 
 def _require_valid_deadline(value: object) -> float:
