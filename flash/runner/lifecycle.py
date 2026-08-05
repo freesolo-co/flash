@@ -876,6 +876,9 @@ def _submit_seed_supervised(
                 # gate has already confirmed a sharding backend on a provider that rents n cards, so
                 # combinations of smaller classes become fair game when they price below one big card.
                 max_gpu_count=gpu_count_of(attempt_spec),
+                # a profile job tokenizes on cpu and exits before weights load, so it allocates the
+                # cheapest rentable card rather than the training shape it is measuring.
+                workload_profile=bool(attempt_spec.workload_profile_kind),
             )
         except Exception as exc:
             from flash.providers.base import UnsupportedGpuError
@@ -971,6 +974,7 @@ def _submit_seed_supervised(
                 # provisioning starts and before any billable work can occur.
                 from flash.cost.spec import estimate_for_spec
                 from flash.providers.base import Allocation as QuoteAllocation
+                from flash.workload_profile import WorkloadProfileMismatch
 
                 quote_allocation = QuoteAllocation(
                     provider=chosen.provider,
@@ -986,6 +990,12 @@ def _submit_seed_supervised(
                     ).total_usd
                     _recheck_selected_quote_affordability(latest, selected_quote, log)
                 except _SelectedQuoteUnaffordable:
+                    raise
+                except WorkloadProfileMismatch:
+                    # the quote is backed by a workload profile whose identity is derived from this
+                    # spec, so a mismatch here is a defect in the run's own inputs, not a market or
+                    # metadata blip. retrying re-derives the same identity and fails the same way,
+                    # spending the run's remaining deadline in backoff sleeps to get there.
                     raise
                 except Exception as exc:
                     # revision-aware quote inputs can depend on remote metadata. a transient refresh

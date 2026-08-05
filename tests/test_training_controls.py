@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import sys
 import types
 from types import SimpleNamespace
@@ -545,6 +546,40 @@ def test_seed_training_rngs_initializes_all_supported_generators(monkeypatch):
         ("cuda", full_seed),
     ]
     assert rng.backend_seed(full_seed) == 7
+
+
+def test_seed_host_rngs_reaches_the_dataset_generators_without_importing_torch(monkeypatch):
+    """The workload-profile run seeds these and nothing else.
+
+    Environment code is user code and may consume Python's or NumPy's global generator while
+    building its dataset, so a profile that skipped them could select a different sample than
+    training and fail the parity check. torch is the opposite case: seeding it would import the
+    model stack into a job that is allocated and billed as cpu-only.
+    """
+    from flash.engine.worker import rng
+
+    calls: list[tuple[str, int]] = []
+    fake_numpy = SimpleNamespace(
+        random=SimpleNamespace(seed=lambda value: calls.append(("numpy", value)))
+    )
+    monkeypatch.setitem(sys.modules, "numpy", fake_numpy)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(rng.random, "seed", lambda value: calls.append(("python", value)))
+
+    # any import of torch from here on is the defect, whether or not it is installed.
+    real_import = builtins.__import__
+
+    def _guarded(name, *args, **kwargs):
+        if name == "torch" or name.startswith("torch."):
+            raise AssertionError("seed_host_rngs imported torch")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _guarded)
+
+    full_seed = 2**32 + 7
+    rng.seed_host_rngs(full_seed)
+
+    assert calls == [("python", full_seed), ("numpy", 7)]
 
 
 def test_worker_seed_prefers_jobspec_when_present():

@@ -393,6 +393,108 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
     return gpu, need
 
 
+def _offline_profile_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
+    """Offline structural quote for a cpu-only profile job: the cheapest rentable single card.
+
+    Mirrors ``_offline_gpu_shape``'s offline-only rule, but not its ranking: the profile job's wall
+    is a fixed cap, so no card finishes it sooner and rate alone decides.
+    """
+    from flash.providers.allocator import profile_required_vram_gb
+    from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
+
+    need = profile_required_vram_gb()
+    provider = config.provider if config.provider != "auto" else "auto"
+    names = (
+        (canonical_gpu(config.gpu_type),)
+        if config.gpu_type
+        else tuple(info.name for info in GPU_INFO.values() if info.enum_member and info.validated)
+    )
+    ranked = []
+    for gpu in names:
+        info = GPU_INFO[gpu]
+        if provider != "auto" and provider not in providers_for(gpu):
+            continue
+        if provider == "lambda":
+            from flash.providers.lambdalabs.pricing import static_hourly_rate
+
+            hourly = static_hourly_rate(gpu)
+        else:
+            hourly = info.hourly_usd
+        ranked.append((hourly, info.vram_gb, gpu))
+    if not ranked:
+        raise ValueError("no GPU class can host the workload profile job")
+    hourly, _vram, gpu = min(ranked)
+    return gpu, need, 1, provider, hourly
+
+
+def _quote_shape(
+    config: RunConfig, allocation, market_wall_s: float, *, profile: bool = False
+) -> tuple[str, int, int, str, float]:
+    """The (gpu, need, count, provider, per-card rate) a quote bills against.
+
+    ``allocation`` is the exact live candidate the lifecycle selected; without one the shape is the
+    offline structural pick, which must never touch a live market (see ``_offline_gpu_shape``).
+    """
+    if allocation is None:
+        return (
+            _offline_profile_shape(config)
+            if profile
+            else _offline_gpu_shape(config, max_wall_seconds=market_wall_s)
+        )
+    need = int(
+        getattr(allocation, "min_vram_gb", 0)
+        or required_vram_gb(
+            config.model_id,
+            config.method,
+            train=config.train_knobs(),
+            thinking=config.thinking,
+            model_revision=config.model_revision,
+        )
+    )
+    return (
+        allocation.gpu,
+        need,
+        int(getattr(allocation, "gpu_count", 1) or 1),
+        allocation.provider,
+        float(allocation.hourly_usd),
+    )
+
+
+def estimate_profile_cost(config: RunConfig, *, allocation=None) -> CostEstimate:
+    """Price a bounded workload-profile job from its wall cap, not from the workload it measures.
+
+    A profile job exists to produce the exact workload evidence a training quote needs, so it cannot
+    be priced through the training estimator without a circular dependency. It runs no optimizer
+    steps and loads no model weights: the charge is the rented shape held for at most its wall cap,
+    which is a ceiling the real run comes in under.
+    """
+    wall_s = max(60.0, float(config.max_wall_seconds or 0.0))
+    gpu, need, billed_gpu_count, quote_provider, hourly = _quote_shape(
+        config, allocation, wall_s, profile=True
+    )
+    return CostEstimate(
+        model_id=config.model_id,
+        method=config.method,
+        steps=config.steps,
+        gpu=gpu,
+        provider=quote_provider,
+        gpu_vram_gb=gpu_vram_gb(gpu),
+        required_vram_gb=need,
+        gpu_hourly_usd=hourly,
+        setup_seconds=0.0,
+        seconds_per_step=wall_s,
+        train_seconds=wall_s,
+        wall_clock_seconds=wall_s,
+        wall_capped=True,
+        gpu_count=billed_gpu_count,
+        total_usd=wall_s / 3600.0 * hourly * billed_gpu_count,
+        notes=(
+            f"workload profile job: billed at most its {_fmt_duration(wall_s)} wall cap "
+            "(no optimizer steps)",
+        ),
+    )
+
+
 def _notes(
     config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: float
 ) -> tuple[str, ...]:
@@ -421,7 +523,18 @@ def _notes(
             + ") + policy+reference update"
         )
     elif n.train_tokens is not None:
-        notes.append(f"SFT priced on {n.train_tokens:,} actual train tokens")
+        profile_shape = (
+            f" across {n.sft_packed_blocks:,} packed block(s)"
+            if n.sft_packed_blocks is not None
+            else ""
+        )
+        if n.supervised_train_tokens is not None and n.sft_packing_mode:
+            notes.append(
+                f"SFT priced on {n.train_tokens:,} exact compute tokens"
+                f" ({n.supervised_train_tokens:,} supervised, {n.sft_packing_mode}{profile_shape})"
+            )
+        else:
+            notes.append(f"SFT priced on {n.train_tokens:,} actual train tokens")
     required_save_s = required_save_overhead_seconds(n)
     if required_save_s:
         notes.append(

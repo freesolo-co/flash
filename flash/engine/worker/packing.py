@@ -107,10 +107,8 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None, revision: str = "") 
         return False
 
 
-def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bool:
-    """True when flash-linear-attention and causal_conv1d are both present, functional, and the
-    GDN forward actually threads cu_seq_lens_q + seq_idx (varies by transformers version).
-    """
+def gdn_packing_contract_available(model_id: str | None = None, revision: str = "") -> bool:
+    """True when the installed gdn stack exposes the boundary-reset contract without opening cuda."""
     try:
         import importlib
 
@@ -121,13 +119,19 @@ def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bo
 
         if not (is_flash_linear_attention_available() and is_causal_conv1d_available()):
             return False
-        importlib.import_module(
-            "causal_conv1d"
-        )  # fail a built-but-broken ABI here, not at model load
-        if not _gdn_forward_threads_reset_kwargs(model_id, revision=revision):
-            return False
-        # causal_conv1d compiled without the current GPU arch imports fine but raises at first forward;
-        # smoke it now so we fall back to unpacked rather than crashing mid-train.
+        importlib.import_module("causal_conv1d")
+        return _gdn_forward_threads_reset_kwargs(model_id, revision=revision)
+    except Exception:
+        return False
+
+
+def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bool:
+    """True when the gdn reset contract is installed and functional on the current device."""
+    if not gdn_packing_contract_available(model_id, revision=revision):
+        return False
+    try:
+        # causal_conv1d compiled without the current gpu arch imports fine but raises at first forward;
+        # smoke it now so training fails before optimizer work rather than at a packed boundary.
         import torch
 
         if torch.cuda.is_available():

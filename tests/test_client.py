@@ -71,6 +71,19 @@ def stub():
             if self.path == "/v1/runs/json-chat/chat":
                 self._send(200, {"choices": [{"message": {"content": "json reply"}}]})
                 return
+            if self.path == "/v1/runs" and seen["body"].get("spec", {}).get("model") == "pending":
+                self._send(
+                    409,
+                    {
+                        "detail": {
+                            "code": "workload_profile_pending",
+                            "profile_run_id": "profile-sft-abc",
+                            "state": "queued",
+                            "owned": False,
+                        }
+                    },
+                )
+                return
             if (
                 self.path in {"/v1/runs/r1/chat", "/v1/runs/run-a/chat"}
                 and seen["body"].get("stream") is True
@@ -231,6 +244,36 @@ def test_api_error_carries_server_detail(stub):
         client.get_run("missing")
     assert excinfo.value.status == 404
     assert "unknown run_id: missing" in str(excinfo.value)
+
+
+def test_api_error_preserves_a_structured_detail_over_the_wire(stub):
+    """The pending payload has to arrive as a dict, not as the repr of one.
+
+    Every caller-visible behaviour on a profile miss -- naming the run, quoting its separate
+    charge, deciding whether to tell the user to poll it -- is a branch on a key of this dict. If
+    the transport flattened it to a string the code lookup would return "" and the miss would
+    surface as a bare 409 traceback, which is the same failure whether the server is right or not.
+    """
+    url, _ = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ApiError) as excinfo:
+        client.create_run({"model": "pending", "project": _PROJECT_ID})
+
+    exc = excinfo.value
+    assert exc.status == 409
+    assert exc.detail == {
+        "code": "workload_profile_pending",
+        "profile_run_id": "profile-sft-abc",
+        "state": "queued",
+        "owned": False,
+    }
+    # `code` reads through to the dict, and False survives as False rather than as the string
+    # "False" -- which is truthy, and would flip the ownership branch to the wrong wording.
+    assert exc.code == "workload_profile_pending"
+    assert exc.detail["owned"] is False
+    # the message still stringifies for callers that only print it.
+    assert "workload_profile_pending" in str(exc)
 
 
 def test_api_error_mentions_env_override(stub):
