@@ -699,6 +699,25 @@ def test_opd_parquet_repeated_prompt_references_survive_batching(tmp_path):
     assert restored == rows
 
 
+def test_opd_parquet_leaves_no_truncated_file_when_a_later_batch_fails(tmp_path):
+    """closing a partly written parquet still emits a valid footer.
+
+    without the atomic rename the failed write would leave a READABLE short file, and since the
+    horizon parquet is the training schedule that is a silently truncated run rather than an error.
+    """
+    rows = [_opd_row(index, multimodal=False) for index in range(_OPD_PARQUET_WRITE_BATCH_ROWS + 5)]
+    # a type the pinned schema cannot accept, landing in the second batch
+    rows[-1]["extra_info"] = {"index": "not-an-int"}
+    path = tmp_path / "doomed.parquet"
+
+    pa = pytest.importorskip("pyarrow")
+    with pytest.raises(pa.ArrowInvalid):
+        _write_opd_parquet(rows, str(path))
+
+    assert not path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_opd_parquet_pins_the_image_type_when_the_first_batch_has_no_images(tmp_path):
     """a multimodal job may still round-robin a run of image-free prompts into the first batch.
 
