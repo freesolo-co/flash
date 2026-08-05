@@ -188,8 +188,8 @@ DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 # the checkpoint each base model's serving engine loads. dense models serve freesolo-owned fp8
 # checkpoints; the 35b-a3b moe serves the base bf16 checkpoint because its full-expert lora path is
-# incompatible with fp8 on the validated h200 tier. informational for the catalog mirror; deploy
-# gating reads only max_lora_rank.
+# incompatible with fp8 on the validated h200 tier. informational for the catalog mirror; adapter
+# deployment gates read max_lora_rank, and serving preflight reads max_model_len.
 SERVING_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
     "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
