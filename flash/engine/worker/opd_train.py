@@ -84,17 +84,21 @@ from flash.engine.worker.sft_train import (
     _VerlCheckpointWatcher,
     _warmstart_adapter_path,
 )
-from flash.engine.worker.teacher import _MAX_LOGPROB_ROUNDING_ERROR, TeacherError
+from flash.engine.worker.teacher import (
+    _MAX_LOGPROB_ROUNDING_ERROR,
+    TeacherError,
+    TeacherScore,
+)
 from flash.engine.worker.tokenizer_align import (
     TeacherToken,
     groupwise_alignment,
     groupwise_coverage,
 )
+from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resume_state_metadata
 
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
-_TEXT_TEACHER_BATCH_SIZE = 8
 _TEXT_TEACHER_FLUSH_WAIT_S = 0.1
 _TEXT_TEACHER_SHUTDOWN_WAIT_S = 5.0
 _TEXT_TEACHER_REQUEST_BACKLOG = 64
@@ -129,24 +133,19 @@ class _TeacherBridgeHTTPServer(BoundedThreadingHTTPServer):
     request_queue_size = _TEXT_TEACHER_REQUEST_BACKLOG
 
 
-class _UnbilledTeacherTokens(list[TeacherToken]):
-    input_tokens = 0
-    output_tokens = 0
-
-
 @dataclass
 class _TextTeacherWaiter:
     item: tuple[str, str]
     enqueued_at: float
     done: threading.Event = field(default_factory=threading.Event)
-    result: list[TeacherToken] | None = None
+    result: TeacherScore | None = None
     error: Exception | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def complete(
         self,
         *,
-        result: list[TeacherToken] | None = None,
+        result: TeacherScore | None = None,
         error: Exception | None = None,
     ) -> None:
         with self._lock:
@@ -156,7 +155,7 @@ class _TextTeacherWaiter:
             self.error = error
             self.done.set()
 
-    def wait(self) -> list[TeacherToken]:
+    def wait(self) -> TeacherScore:
         self.done.wait()
         if self.error is not None:
             raise self.error
@@ -174,7 +173,7 @@ def _teacher_batch_error(error: Exception) -> Exception:
 def _validate_text_teacher_batch(
     scored,
     items: list[tuple[str, str]],
-) -> list[list[TeacherToken]]:
+) -> list[TeacherScore]:
     expected = len(items)
     if not isinstance(scored, list) or len(scored) != expected:
         actual = len(scored) if isinstance(scored, list) else type(scored).__name__
@@ -182,17 +181,17 @@ def _validate_text_teacher_batch(
             f"teacher text batch returned {actual} result(s) for {expected} unique input(s)",
             permanent=True,
         )
-    for result_index, (tokens, (_prompt_text, completion_text)) in enumerate(
+    for result_index, (score, (_prompt_text, completion_text)) in enumerate(
         zip(scored, items, strict=True)
     ):
-        if not isinstance(tokens, list):
+        if not isinstance(score, TeacherScore):
             raise TeacherError(
-                f"teacher text batch result {result_index} is not a token list",
+                f"teacher text batch result {result_index} is not a TeacherScore",
                 permanent=True,
             )
         previous_start = -1
         previous_end = -1
-        for token_index, token in enumerate(tokens):
+        for token_index, token in enumerate(score.tokens):
             if not isinstance(token, TeacherToken):
                 raise TeacherError(
                     f"teacher text batch result {result_index} contains an invalid token",
@@ -230,9 +229,7 @@ def _validate_text_teacher_batch(
                 )
             previous_start = token.start
             previous_end = token.end
-        input_tokens = int(getattr(tokens, "input_tokens", 0) or 0)
-        output_tokens = int(getattr(tokens, "output_tokens", 0) or 0)
-        if input_tokens <= 0 or output_tokens != 1:
+        if score.input_tokens <= 0 or score.output_tokens != 1:
             raise TeacherError(
                 f"teacher text batch result {result_index} is missing authoritative token usage",
                 permanent=True,
@@ -245,7 +242,7 @@ class _TextTeacherBatcher:
         self,
         teacher,
         *,
-        max_batch_size: int = _TEXT_TEACHER_BATCH_SIZE,
+        max_batch_size: int = OPD_TEACHER_SCORING_CONCURRENCY,
         flush_wait_s: float = _TEXT_TEACHER_FLUSH_WAIT_S,
     ) -> None:
         if max_batch_size <= 0:
@@ -275,7 +272,7 @@ class _TextTeacherBatcher:
             thread = self._thread
         thread.start()
 
-    def score(self, prompt_text: str, completion_text: str) -> list[TeacherToken]:
+    def score(self, prompt_text: str, completion_text: str) -> TeacherScore:
         with self._condition:
             if self._closed:
                 raise TeacherError("text teacher batcher shut down", permanent=True)
@@ -325,7 +322,7 @@ class _TextTeacherBatcher:
         for waiter, index in zip(batch, scatter_indexes, strict=True):
             result = scored[index]
             if index in billed_indexes:
-                result = _UnbilledTeacherTokens(result)
+                result = result.without_billing()
             else:
                 billed_indexes.add(index)
             waiter.complete(result=result)
@@ -786,9 +783,9 @@ class _TeacherAlignmentBridge:
         teacher_prompt = _teacher_prompt_text(prompt.teacher_messages, self.thinking_prefill)
         try:
             if self._text_teacher_batcher is None:
-                teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+                teacher_score = self.teacher.score(teacher_prompt, completion_text)
             else:
-                teacher_tokens = self._text_teacher_batcher.score(teacher_prompt, completion_text)
+                teacher_score = self._text_teacher_batcher.score(teacher_prompt, completion_text)
         except TeacherError as error:
             if error.permanent:
                 raise
@@ -797,8 +794,8 @@ class _TeacherAlignmentBridge:
             if recovered_failure is not None:
                 recovered_failure.append(failure)
             return self._empty(prompt_length, len(response_ids))
-        teacher_input_tokens = int(getattr(teacher_tokens, "input_tokens", 0) or 0)
-        teacher_output_tokens = int(getattr(teacher_tokens, "output_tokens", 0) or 0)
+        teacher_input_tokens = teacher_score.input_tokens
+        teacher_output_tokens = teacher_score.output_tokens
         if not (
             (teacher_input_tokens > 0 and teacher_output_tokens == 1)
             or (teacher_input_tokens == 0 and teacher_output_tokens == 0)
@@ -810,7 +807,7 @@ class _TeacherAlignmentBridge:
         _student_ids, student_tokens = student_tokens_with_offsets(
             self.tokenizer, kept_ids, completion_text
         )
-        groups = groupwise_alignment(student_tokens, teacher_tokens)
+        groups = groupwise_alignment(student_tokens, teacher_score.tokens)
         groups = [(indices, logsum) for indices, logsum in groups if indices]
         aligned_group_count = len(groups)
         groups = _drop_fully_forced_groups(groups, kept_forced)
@@ -1135,17 +1132,19 @@ class _TeacherAlignmentBridge:
                     for position in scorable
                 ]
                 teacher_batches = []
-                for start in range(0, len(items), _TEXT_TEACHER_BATCH_SIZE):
+                for start in range(0, len(items), OPD_TEACHER_SCORING_CONCURRENCY):
                     teacher_batches.extend(
-                        self.teacher.score_many(items[start : start + _TEXT_TEACHER_BATCH_SIZE])
+                        self.teacher.score_many(
+                            items[start : start + OPD_TEACHER_SCORING_CONCURRENCY]
+                        )
                     )
                 if len(teacher_batches) != len(scorable):
                     raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
                 with self._stats_lock:
                     self.teacher_ok += len(teacher_batches)
-                for position, teacher_tokens in zip(scorable, teacher_batches, strict=True):
-                    teacher_input_tokens = int(getattr(teacher_tokens, "input_tokens", 0) or 0)
-                    teacher_output_tokens = int(getattr(teacher_tokens, "output_tokens", 0) or 0)
+                for position, teacher_score in zip(scorable, teacher_batches, strict=True):
+                    teacher_input_tokens = teacher_score.input_tokens
+                    teacher_output_tokens = teacher_score.output_tokens
                     if teacher_input_tokens <= 0 or teacher_output_tokens != 1:
                         raise RuntimeError(
                             "teacher score is missing authoritative Parasail token usage"
@@ -1155,7 +1154,7 @@ class _TeacherAlignmentBridge:
                     _student_ids, student_tokens = student_tokens_with_offsets(
                         self.tokenizer, response_ids, turn["completion_text"]
                     )
-                    groups = groupwise_alignment(student_tokens, teacher_tokens)
+                    groups = groupwise_alignment(student_tokens, teacher_score.tokens)
                     groups = [(indices, logsum) for indices, logsum in groups if indices]
                     coverage = groupwise_coverage(groups, student_tokens)
                     granularity = _align_granularity(groups, student_tokens)
@@ -1345,7 +1344,7 @@ class _TeacherAlignmentBridge:
 
         self._text_teacher_batcher = _TextTeacherBatcher(
             self.teacher,
-            max_batch_size=_TEXT_TEACHER_BATCH_SIZE,
+            max_batch_size=OPD_TEACHER_SCORING_CONCURRENCY,
             flush_wait_s=_TEXT_TEACHER_FLUSH_WAIT_S,
         )
         self._text_teacher_batcher.start()
@@ -1836,13 +1835,6 @@ def _canonical_skip_reasons(skip_counts: dict) -> dict:
     return dict(sorted(canonical.items()))
 
 
-def _teacher_token_metadata(accounting: dict) -> dict[str, int]:
-    return {
-        "teacher_input_tokens": int(accounting["teacher_input_tokens"]),
-        "teacher_output_tokens": int(accounting["teacher_output_tokens"]),
-    }
-
-
 def _failure_accounting_metadata(accounting: dict) -> dict:
     return {
         "teacher_transient_failures": int(accounting["teacher_transient"]),
@@ -2114,7 +2106,6 @@ def run_opd_train(spec=None) -> None:
         image_teacher_prompt_messages,
         normalize_prompt_images,
         record_has_images,
-        validate_image_opd_teacher,
         validate_multimodal_training,
     )
 
@@ -2182,25 +2173,27 @@ def run_opd_train(spec=None) -> None:
             _scanned[0] += 1
     multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
     if multimodal:
-        validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)
-        validate_image_opd_teacher(knobs.teacher_model)
+        validate_multimodal_training(model_id, "opd")
     random.Random(_w.SEED).shuffle(train)
 
     started_at = time.time()
-    # validate broker transport before the gpu probe and model prefetch so a malformed attempt fails
+    # validate the control-panel broker transport before the gpu probe and model prefetch so a malformed
+    # attempt fails
     # before any additional paid setup. raw managed-teacher provider credentials never enter the worker.
-    from flash.spec import TEACHER_BROKER_URL_ENV, TEACHER_CAPABILITY_ENV
+    from flash.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV
 
-    broker_url = os.environ.get(TEACHER_BROKER_URL_ENV, "").strip()
+    control_panel_url = os.environ.get(CONTROL_PANEL_URL_ENV, "").strip()
     capability = os.environ.get(TEACHER_CAPABILITY_ENV, "").strip()
-    if not broker_url or not capability:
-        raise RuntimeError("managed teacher broker transport is missing from the OPD parent worker")
+    if not control_panel_url or not capability:
+        raise RuntimeError(
+            "managed teacher control-panel transport is missing from the OPD parent worker"
+        )
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    teacher = TeacherClient(capability, broker_url, knobs.teacher_model)
+    teacher = TeacherClient(capability, control_panel_url, knobs.teacher_model)
     processor = None
     if multimodal:
         from transformers import AutoProcessor
@@ -2777,7 +2770,8 @@ def run_opd_train(spec=None) -> None:
                 "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
                 "forced_tokens": int(final_accounting["forced_tokens"]),
                 "dropped_forced_groups": int(final_accounting["dropped_forced_groups"]),
-                **_teacher_token_metadata(final_accounting),
+                "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
+                "teacher_output_tokens": int(final_accounting["teacher_output_tokens"]),
                 "aligned_sequences": int(final_accounting["aligned_sequences"]),
                 "empty_alignments": int(final_accounting["empty_alignments"]),
                 "teacher_ok": int(final_accounting["teacher_ok"]),
@@ -2807,7 +2801,9 @@ def run_opd_train(spec=None) -> None:
                 # in _opd_teacher_batch_size): a step of 1 rollout can never fill a batch of 8, and
                 # reporting the global cap there would describe a shape the run cannot reach.
                 "opd_teacher_batch_size": (
-                    min(_TEXT_TEACHER_BATCH_SIZE, max(1, prompts_per_step * knobs.group_size))
+                    min(
+                        OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size)
+                    )
                     if not multimodal and not multi_turn
                     else None
                 ),

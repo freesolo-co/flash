@@ -79,7 +79,7 @@ def _offline(monkeypatch):
         "LAMBDA_API_KEY",
         "VAST_API_KEY",
         "PARASAIL_API_KEY",
-        "FLASH_TEACHER_BROKER_URL",
+        "FLASH_CONTROL_PANEL_URL",
         "FLASH_TEACHER_CAPABILITY",
     } | set(DEFAULT_RUNTIME_SECRET_KEYS):
         monkeypatch.delenv(_key, raising=False)

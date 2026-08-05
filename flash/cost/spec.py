@@ -142,8 +142,8 @@ def runconfig_from_spec(spec) -> RunConfig:
     # Both grpo and opd sample on-policy student completions, so both carry the rollout
     # dimensions (completion length + group size) into the cost model.
     has_rollout = samples_on_policy(spec.algorithm)
-    # price the actual opd teacher the run will use. [train].teacher_model is already the resolved
-    # parasail model id (parse canonicalizes it), so a higher/lower-priced teacher moves the itemized
+    # price the actual opd teacher the run will use. [train].teacher_model is the canonical friendly
+    # alias, so a higher/lower-priced teacher moves the itemized
     # teacher-api estimate; "" means the default glm 5.2, and "" for sft/grpo (no teacher).
     teacher_model = ""
     opd_multi_turn = False

@@ -88,7 +88,7 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
         opd_spec,
         0,
         runtime_secrets={
-            "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
         },
     )
@@ -139,16 +139,38 @@ def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monke
         opd_spec,
         0,
         runtime_secrets={
-            "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
         },
     )
-    assert env["FLASH_TEACHER_BROKER_URL"] == "https://broker.example"
+    assert env["FLASH_CONTROL_PANEL_URL"] == "https://broker.example"
     assert env["FLASH_TEACHER_CAPABILITY"] == "capability-test-value"
     assert "PARASAIL_API_KEY" not in env
     grpo = build_worker_env(_spec(), 0)
-    assert "FLASH_TEACHER_BROKER_URL" not in grpo
+    assert "FLASH_CONTROL_PANEL_URL" not in grpo
     assert "FLASH_TEACHER_CAPABILITY" not in grpo
+
+
+def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
+
+    opd_spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+
+    with pytest.raises(RuntimeError, match="control-panel teacher transport is missing"):
+        build_worker_env(
+            opd_spec,
+            0,
+            runtime_secrets={
+                "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+                "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+            },
+        )
 
 
 def test_build_worker_env_rejects_managed_teacher_byo_names():
@@ -168,7 +190,7 @@ def test_build_worker_env_rejects_managed_teacher_byo_names():
             0,
             runtime_secrets={
                 "PARASAIL_API_KEY": "byo-parasail-key",
-                "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+                "FLASH_CONTROL_PANEL_URL": "https://broker.example",
                 "FLASH_TEACHER_CAPABILITY": "capability-test-value",
             },
         )

@@ -17,9 +17,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from flash.engine.recipe import RECIPE, resolve_teacher
-from flash.opd_limits import configured_opd_turn_limit, opd_teacher_request_multiplier
+from flash.opd_limits import (
+    OPD_TEACHER_SCORING_CONCURRENCY,
+    configured_opd_turn_limit,
+    opd_teacher_request_multiplier,
+)
 from flash.server import db
-from flash.spec import TEACHER_BROKER_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
+from flash.spec import CONTROL_PANEL_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
 
 PARASAIL_PROVIDER = "parasail"
 PARASAIL_ORIGIN = "https://api.parasail.io"
@@ -30,7 +34,6 @@ PARASAIL_API_KEY_ENV = "PARASAIL_API_KEY"
 MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
 MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024
 MAX_PROVIDER_ERROR_BODY_BYTES = 64 * 1024
-MAX_IN_FLIGHT_REQUESTS = 8
 MAX_UPSTREAM_ATTEMPTS = 1
 MAX_REQUEST_TOKENS = 131_072
 MAX_TOTAL_SCORE_ITEMS = 1_000_000
@@ -81,7 +84,7 @@ class ProviderResponse:
     output_tokens: int
 
 
-def validate_teacher_broker_url(value: str) -> str:
+def validate_control_panel_url(value: str) -> str:
     url = str(value or "").strip().rstrip("/")
     parsed = urllib.parse.urlsplit(url)
     if (
@@ -93,7 +96,7 @@ def validate_teacher_broker_url(value: str) -> str:
         or parsed.fragment
     ):
         raise RuntimeError(
-            f"{TEACHER_BROKER_URL_ENV} must be a worker-reachable https URL without credentials, "
+            f"{CONTROL_PANEL_URL_ENV} must be a worker-reachable https URL without credentials, "
             "query parameters, or a fragment"
         )
     return url
@@ -107,7 +110,7 @@ def require_teacher_broker_configuration(
 ) -> str:
     if spec.algorithm != "opd":
         raise RuntimeError("teacher broker configuration is only valid for opd runs")
-    broker_url = validate_teacher_broker_url(os.environ.get(TEACHER_BROKER_URL_ENV, ""))
+    control_panel_url = validate_control_panel_url(os.environ.get(CONTROL_PANEL_URL_ENV, ""))
     if not os.environ.get(PARASAIL_API_KEY_ENV, "").strip():
         raise RuntimeError(
             f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers"
@@ -125,7 +128,7 @@ def require_teacher_broker_configuration(
             raise RuntimeError(
                 "managed opd teacher capabilities are limited to a 24-hour run deadline"
             )
-    return broker_url
+    return control_panel_url
 
 
 def capability_limits_for_spec(spec: JobSpec) -> dict[str, int]:
@@ -178,7 +181,7 @@ def capability_limits_for_spec(spec: JobSpec) -> dict[str, int]:
         "max_score_items": score_items,
         "max_request_bytes": MAX_REQUEST_BODY_BYTES,
         "max_response_bytes": MAX_RESPONSE_BODY_BYTES,
-        "max_concurrency": MAX_IN_FLIGHT_REQUESTS,
+        "max_concurrency": OPD_TEACHER_SCORING_CONCURRENCY,
         "max_upstream_attempts": MAX_UPSTREAM_ATTEMPTS,
         "max_request_tokens": request_tokens,
         "max_total_tokens": total_tokens,
@@ -193,7 +196,7 @@ def issue_teacher_capability(
     now: float | None = None,
 ) -> tuple[str, str]:
     issued_at = time.time() if now is None else float(now)
-    broker_url = require_teacher_broker_configuration(
+    control_panel_url = require_teacher_broker_configuration(
         spec,
         deadline_at=deadline_at,
         now=issued_at,
@@ -211,18 +214,7 @@ def issue_teacher_capability(
         limits=capability_limits_for_spec(spec),
         now=issued_at,
     )
-    return broker_url, token
-
-
-def teacher_runtime_secrets(broker_url: str, capability: str) -> dict[str, str]:
-    return {
-        TEACHER_BROKER_URL_ENV: broker_url,
-        TEACHER_CAPABILITY_ENV: capability,
-    }
-
-
-def revoke_run_teacher_capabilities(run_id: str) -> int:
-    return db.revoke_teacher_capabilities_for_run(run_id)
+    return control_panel_url, token
 
 
 @contextlib.contextmanager
@@ -235,13 +227,16 @@ def teacher_attempt_transport(
     if spec.algorithm != "opd":
         yield {}
         return
-    broker_url, capability = issue_teacher_capability(
+    control_panel_url, capability = issue_teacher_capability(
         spec,
         attempt=attempt,
         deadline_at=deadline_at,
     )
     try:
-        yield teacher_runtime_secrets(broker_url, capability)
+        yield {
+            CONTROL_PANEL_URL_ENV: control_panel_url,
+            TEACHER_CAPABILITY_ENV: capability,
+        }
     finally:
         db.revoke_teacher_capability(capability)
 
