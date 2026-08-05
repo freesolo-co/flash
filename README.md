@@ -128,6 +128,10 @@ Consequences worth knowing before you submit:
   so if someone else already measured your exact config you wait for their profile and are not
   charged for a second one. Their run is not readable by your key, so the CLI tells you to
   wait rather than pointing you at a run id that would answer 404.
+- **A failed profile is retried, not final.** If a profile fails or is cancelled, the next
+  submission of that config starts a replacement rather than reporting the workload as
+  permanently unquotable. Because the id is shared, exactly one of the waiting submitters
+  launches the replacement and the rest wait on it.
 
 Run management lives under `flash runs` (`status`, `log`, `cancel`, `checkpoint`) and
 serving under `flash models` (`deploy`, `chat`, `deployments`, `undeploy`, `export`).

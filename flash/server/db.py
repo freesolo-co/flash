@@ -381,6 +381,38 @@ def claim_profile_run(run_id: str, key_id: int) -> bool:
         return cursor.rowcount == 1
 
 
+def reclaim_spent_profile_run(run_id: str, key_id: int, *, spent_at: float) -> bool:
+    """Take over a profile id whose previous run is spent, or report that someone else got there.
+
+    A profile that failed or was cancelled leaves its row behind, and the id is derived from the
+    workload rather than the account, so without a takeover the config becomes permanently
+    unquotable for every user with nothing in the system able to clear it.
+
+    The takeover is a compare-and-swap, not a plain update: an update matching only ``run_id``
+    succeeds for every caller, so two submitters watching the same failed profile would both be
+    told to launch and the workload would be profiled (and billed) twice. Deleting and re-claiming
+    has the mirror problem, since the loser's delete would remove the row the winner just took.
+
+    ``spent_at`` is the ``created_at`` of the spent run the caller actually observed, read from the
+    status store rather than from this table. That distinction is the whole mechanism: this table
+    holds no record of which attempt is spent, so a token re-read from here would be the *winner's*
+    fresh stamp and the next caller's swap would match it just as happily. Anchoring on the spent
+    run means the first takeover moves the row past it and every later attempt misses.
+
+    That comparison rests on one ordering, which the caller must preserve: a claim is always taken
+    before the run it authorizes is created, both here and on the relaunch below. So the claim
+    backing a spent run precedes it, and a claim taken to replace it follows it. Creating a profile
+    run without claiming it first would break the takeover for that id in both directions.
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE runs SET key_id = ?, created_at = ? "
+            "WHERE run_id = ? AND kind = 'profile' AND created_at <= ?",
+            (key_id, time.time(), run_id, spent_at),
+        )
+        return cursor.rowcount == 1
+
+
 def delete_run(run_id: str) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))

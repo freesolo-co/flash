@@ -248,7 +248,18 @@ def create_run(
                 # another key may already own this exact profile -- in which case it is already
                 # running and this submitter neither launches it again nor pays for it a second
                 # time. losing the claim is ordinary reuse, not an error; it just means waiting.
-                if db.claim_profile_run(profile_run_id, key["id"]):
+                spent_at = getattr(exc, "spent_at", None)
+                if spent_at is None:
+                    claimed = db.claim_profile_run(profile_run_id, key["id"])
+                else:
+                    # the id is already claimed by a run that is spent, so a fresh claim cannot be
+                    # inserted. take the existing one over against the spent run's own timestamp,
+                    # so of several submitters watching the same dead profile exactly one relaunches
+                    # it and the rest are told to wait on the one that is now running.
+                    claimed = db.reclaim_spent_profile_run(
+                        profile_run_id, key["id"], spent_at=spent_at
+                    )
+                if claimed:
                     profile_submit_kwargs = {
                         "background": True,
                         "owner_key_id": key["id"],
@@ -271,10 +282,16 @@ def create_run(
                     except Exception:
                         # the claim only means "this key launches it". if the launch does not
                         # happen the row must go, or the deterministic id stays claimed by a run
-                        # that never ran and every later submitter waits on it forever.
+                        # that never ran and every later submitter waits on it forever. this is
+                        # right for a takeover too: the row it replaced was already spent, so
+                        # dropping it returns the id to the plain claim-by-insert path.
                         db.delete_run(profile_run_id)
                         raise
-                state = "queued"
+                if claimed or spent_at is not None:
+                    # launched here, or lost the takeover to a submitter who is launching it. either
+                    # way the id now belongs to a live attempt, and reporting the spent state the
+                    # loser happened to read would name a run that no longer exists under this id.
+                    state = "queued"
             raise HTTPException(
                 status_code=409,
                 detail={
