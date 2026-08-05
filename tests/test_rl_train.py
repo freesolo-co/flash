@@ -1213,6 +1213,129 @@ def test_concurrent_scorers_are_serialized_for_the_env():
         server.shutdown()
 
 
+def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order():
+    import concurrent.futures
+
+    calls = []
+    live = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def score_batch(requests):
+        nonlocal live, peak
+        with lock:
+            live += 1
+            peak = max(peak, live)
+            calls.append(list(requests))
+        time.sleep(0.02)
+        with lock:
+            live -= 1
+        return [float(index) + len(solution) for index, solution in requests]
+
+    server, url = rl_train.start_reward_server(
+        lambda index, solution: pytest.fail("the scalar scorer should not run"),
+        example_count=8,
+        score_batch=score_batch,
+    )
+    try:
+        ns: dict = {}
+        exec(compile(rl_train.render_reward_module("TEST_URL"), "<reward>", "exec"), ns)
+        ns["_URL"] = url
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(
+                pool.map(
+                    lambda i: ns["compute_score"](
+                        "env", f"a{i}", "unused", extra_info={"index": i}
+                    ),
+                    range(8),
+                )
+            )
+
+        assert results == [float(i) + 2 for i in range(8)]
+        assert sum(len(call) for call in calls) == 8
+        assert max(len(call) for call in calls) > 1, f"no batch formed: {calls}"
+        assert peak == 1, f"the env saw {peak} concurrent top-level batch calls"
+    finally:
+        server.shutdown()
+
+
+def test_score_batcher_wrong_length_fails_every_waiter_without_partial_scatter():
+    batch_sizes = []
+
+    def short_batch(requests):
+        batch_sizes.append(len(requests))
+        return [1.0] * max(0, len(requests) - 1)
+
+    batcher = rl_train._ScoreBatcher(
+        short_batch,
+        max_batch_size=8,
+        flush_wait_s=0.1,
+        label="test",
+        thread_name="test-score-batcher",
+    )
+    outcomes = []
+    lock = threading.Lock()
+
+    def score(request):
+        try:
+            batcher.score(request)
+        except Exception as exc:
+            outcome = str(exc)
+        else:
+            outcome = "scored"
+        with lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=score, args=(i,), daemon=True) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    batcher.close(1.0)
+
+    assert not [thread for thread in threads if thread.is_alive()]
+    assert max(batch_sizes) > 1, f"no shared batch formed: {batch_sizes}"
+    assert len(outcomes) == 4
+    assert all("zip() argument" in outcome for outcome in outcomes)
+
+
+def test_score_batcher_close_releases_an_inflight_waiter_after_the_join_bound():
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_batch(requests):
+        entered.set()
+        release.wait(timeout=30)
+        return [1.0 for _ in requests]
+
+    batcher = rl_train._ScoreBatcher(
+        blocked_batch,
+        max_batch_size=8,
+        flush_wait_s=0.01,
+        label="test",
+        thread_name="test-blocked-score-batcher",
+    )
+    outcomes = []
+
+    def score():
+        try:
+            batcher.score("request")
+        except Exception as exc:
+            outcomes.append(str(exc))
+
+    waiter = threading.Thread(target=score, daemon=True)
+    waiter.start()
+    assert entered.wait(timeout=10), "the scorer never entered the env call"
+    batcher.close(0.01)
+    waiter.join(timeout=2)
+    release.set()
+    if batcher._thread is not None:
+        batcher._thread.join(timeout=2)
+
+    assert not waiter.is_alive(), "shutdown left an in-flight waiter blocked"
+    assert outcomes == ["test score batcher shut down"]
+
+
 def test_reward_server_accept_queue_holds_a_whole_rollout_batch(monkeypatch):
     # verl opens one connection per episode and starts a whole step at once, so the accept queue
     # sees prompts_per_step * group_size connects in a burst. socketserver's default backlog of 5
@@ -1612,6 +1735,74 @@ def test_an_unusable_total_records_no_named_components():
     )
     assert score == 0.0
     assert breakdowns == [None]
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_score_single_turn_batch_preserves_breakdowns_penalties_and_nonfinite_masking():
+    class _BatchEnv:
+        def __init__(self):
+            self.calls = 0
+
+        def scores_breakdown_many(self, items):
+            self.calls += 1
+            return [
+                {"quality": 0.5, "total": 1.0},
+                {"quality": 0.25, "total": float("nan")},
+            ]
+
+    env = _BatchEnv()
+    results = rl_train.score_single_turn_batch(
+        env,
+        [("good", {"gt": "good"}), ("bad", {"gt": "bad"})],
+        tok=object(),
+        thinking=True,
+        prompt_opened_thinking=True,
+        think_penalty=0.1,
+    )
+
+    assert env.calls == 1
+    assert results[0][0] == pytest.approx(0.7)
+    assert results[0][1] == [{"quality": 0.5, "total": 1.0}]
+    assert results[1][0] == 0.0
+    assert results[1][1][0]["quality"] == 0.25
+    assert math.isnan(results[1][1][0]["total"])
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_score_single_turn_batch_falls_back_per_item_without_failing_neighbors():
+    class _BatchThenScalarEnv:
+        def __init__(self):
+            self.batch_calls = 0
+            self.scalar_calls = []
+
+        def scores_breakdown_many(self, items):
+            self.batch_calls += 1
+            raise RuntimeError("batch judge unavailable")
+
+        def scores_breakdown(self, graded, ex, state):
+            self.scalar_calls.append(graded)
+            if graded == "bad":
+                raise ValueError("one malformed completion")
+            return {"success": 1.0, "total": 1.0}
+
+    env = _BatchThenScalarEnv()
+    results = rl_train.score_single_turn_batch(
+        env,
+        [("good-a", {}), ("bad", {}), ("good-b", {})],
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+    )
+
+    assert env.batch_calls == 1
+    assert env.scalar_calls == ["good-a", "bad", "good-b"]
+    assert [score for score, _ in results] == [1.0, 0.0, 1.0]
+    assert [breakdowns for _, breakdowns in results] == [
+        [{"success": 1.0, "total": 1.0}],
+        [None],
+        [{"success": 1.0, "total": 1.0}],
+    ]
 
 
 # ------------------------------- reward rpc bridge -------------------------------
@@ -4535,6 +4726,25 @@ def test_train_notes_report_idle_fraction_from_the_runs_own_step_wall(monkeypatc
     assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
 
 
+def test_train_notes_do_not_publish_the_serial_idle_projection_when_batching(monkeypatch):
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    completions = inp["prompts_per_step"] * inp["group_size"]
+    notes = rl_train._build_verl_train_notes(
+        inp,
+        steps_run=10,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        reward_profile=_profile(8.0 / completions),
+        step_intervals=[10.0] * 10,
+        reward_bridge_batching=True,
+    )
+
+    assert notes["reward_bridge_batching"] is True
+    assert notes["reward_seconds_per_completion"] == 8.0 / completions
+    assert notes["reward_gpu_idle_fraction"] is None
+
+
 def test_idle_fraction_is_none_when_grading_exceeds_the_measured_step(monkeypatch):
     """Grading that fills the whole step leaves no gpu-bound remainder to divide.
 
@@ -4668,6 +4878,7 @@ def test_the_run_body_passes_the_measured_profile_into_train_meta():
     assert "_log_reward_profile(" in src, "the hook is never called"
     assert "reward_profile = " in src, "the hook's reading is discarded"
     assert "reward_profile=reward_profile" in src, "the reading never reaches train_meta"
+    assert 'reward_bridge_batching=not inp["multi_turn"]' in src
 
 
 def test_the_reward_profiler_is_skipped_on_multi_turn():
@@ -4716,63 +4927,32 @@ def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
     return score, buffer
 
 
-def test_score_grades_before_it_records():
-    """Grading calls user code and can block on i/o for seconds while verl scores many rollouts.
-
-    `record` takes the buffer's lock, so calling it around the grading rather than after it would
-    serialize every grading in the run behind the slowest one -- the whole reward wall.
-    """
+def test_score_batch_grades_before_it_records():
+    """User grading must finish before the observability lock is taken per result."""
     src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    body = src[src.index("def _score(index: int") :]
+    body = src[src.index("def _score_batch(requests:") :]
     body = body[: body.index("def _score_for_profile")]
 
     assert body.count("observability.record(") == 1
-    assert body.index("score = score_single_turn(") < body.index("observability.record(")
+    assert body.index("scored = score_single_turn_batch(") < body.index("observability.record(")
 
 
-def test_the_recorded_prompt_is_the_one_the_completion_was_graded_against():
-    """A sample pairs a prompt with a completion, so the two must come from the SAME index.
+def test_the_recorded_prompt_is_the_one_the_batched_completion_was_graded_against():
+    """Each scattered sample must use the same request index for its example and prompt."""
+    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    body = src[src.index("def _score_batch(requests:") :]
+    body = body[: body.index("def _score_for_profile")]
 
-    `_score` receives an index and a completion; the prompt is looked up, and looking it up under
-    anything but that index publishes a rollout whose `prompt_tail` belongs to a different example.
-    Nothing downstream can detect it -- the pair is well-formed, just not a pair -- and every
-    reader of `flash runs log` is then reading the model answering a question it was never asked.
-    `_score_buffer` below reimplements these two calls, so it cannot catch this; read the call.
-
-    Asserted with ast: the lookup is one subscript expression, and a substring needle would fail on
-    a reformat rather than on the re-indexing that is the actual invariant.
-    """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
-    score = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_score"
+    assert (
+        "(solution_str, rollout_examples[int(index)]) for index, solution_str in requests" in body
     )
-    index_arg, completion_arg = (a.arg for a in score.args.args[:2])
-    calls = [
-        node
-        for node in ast.walk(score)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "record"
-    ]
-    assert len(calls) == 1
-    prompt, completion = calls[0].args[:2]
-    # the completion is passed straight through, unindexed: it IS the graded text.
-    assert isinstance(completion, ast.Name)
-    assert completion.id == completion_arg
-    # the prompt is subscripted by _score's own index argument, not by a separate cursor.
-    assert isinstance(prompt, ast.Subscript)
-    assert ast.unparse(prompt.slice) in (index_arg, f"int({index_arg})")
-    # and it is the same list the grading example comes from -- one dataset order for both.
-    graded = next(
-        node
-        for node in ast.walk(score)
-        if isinstance(node, ast.Subscript)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "rollout_examples"
+    assert (
+        "for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):"
+        in body
     )
-    assert ast.unparse(graded.slice) == ast.unparse(prompt.slice)
+    assert (
+        "observability.record(message_prompts[int(index)], solution_str, score, breakdowns)" in body
+    )
 
 
 @pytest.mark.usefixtures("_identity_graded")
