@@ -4535,6 +4535,25 @@ def test_train_notes_report_idle_fraction_from_the_runs_own_step_wall(monkeypatc
     assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
 
 
+def test_train_notes_do_not_publish_the_serial_idle_projection_when_batching(monkeypatch):
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    completions = inp["prompts_per_step"] * inp["group_size"]
+    notes = rl_train._build_verl_train_notes(
+        inp,
+        steps_run=10,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        reward_profile=_profile(8.0 / completions),
+        step_intervals=[10.0] * 10,
+        reward_bridge_batching=True,
+    )
+
+    assert notes["reward_bridge_batching"] is True
+    assert notes["reward_seconds_per_completion"] == 8.0 / completions
+    assert notes["reward_gpu_idle_fraction"] is None
+
+
 def test_idle_fraction_is_none_when_grading_exceeds_the_measured_step(monkeypatch):
     """Grading that fills the whole step leaves no gpu-bound remainder to divide.
 
@@ -4668,6 +4687,7 @@ def test_the_run_body_passes_the_measured_profile_into_train_meta():
     assert "_log_reward_profile(" in src, "the hook is never called"
     assert "reward_profile = " in src, "the hook's reading is discarded"
     assert "reward_profile=reward_profile" in src, "the reading never reaches train_meta"
+    assert 'reward_bridge_batching=not inp["multi_turn"]' in src
 
 
 def test_the_reward_profiler_is_skipped_on_multi_turn():
@@ -4716,63 +4736,32 @@ def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
     return score, buffer
 
 
-def test_score_grades_before_it_records():
-    """Grading calls user code and can block on i/o for seconds while verl scores many rollouts.
-
-    `record` takes the buffer's lock, so calling it around the grading rather than after it would
-    serialize every grading in the run behind the slowest one -- the whole reward wall.
-    """
+def test_score_batch_grades_before_it_records():
+    """User grading must finish before the observability lock is taken per result."""
     src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    body = src[src.index("def _score(index: int") :]
+    body = src[src.index("def _score_batch(requests:") :]
     body = body[: body.index("def _score_for_profile")]
 
     assert body.count("observability.record(") == 1
-    assert body.index("score = score_single_turn(") < body.index("observability.record(")
+    assert body.index("scored = score_single_turn_batch(") < body.index("observability.record(")
 
 
-def test_the_recorded_prompt_is_the_one_the_completion_was_graded_against():
-    """A sample pairs a prompt with a completion, so the two must come from the SAME index.
+def test_the_recorded_prompt_is_the_one_the_batched_completion_was_graded_against():
+    """Each scattered sample must use the same request index for its example and prompt."""
+    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    body = src[src.index("def _score_batch(requests:") :]
+    body = body[: body.index("def _score_for_profile")]
 
-    `_score` receives an index and a completion; the prompt is looked up, and looking it up under
-    anything but that index publishes a rollout whose `prompt_tail` belongs to a different example.
-    Nothing downstream can detect it -- the pair is well-formed, just not a pair -- and every
-    reader of `flash runs log` is then reading the model answering a question it was never asked.
-    `_score_buffer` below reimplements these two calls, so it cannot catch this; read the call.
-
-    Asserted with ast: the lookup is one subscript expression, and a substring needle would fail on
-    a reformat rather than on the re-indexing that is the actual invariant.
-    """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
-    score = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_score"
+    assert (
+        "(solution_str, rollout_examples[int(index)]) for index, solution_str in requests" in body
     )
-    index_arg, completion_arg = (a.arg for a in score.args.args[:2])
-    calls = [
-        node
-        for node in ast.walk(score)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "record"
-    ]
-    assert len(calls) == 1
-    prompt, completion = calls[0].args[:2]
-    # the completion is passed straight through, unindexed: it IS the graded text.
-    assert isinstance(completion, ast.Name)
-    assert completion.id == completion_arg
-    # the prompt is subscripted by _score's own index argument, not by a separate cursor.
-    assert isinstance(prompt, ast.Subscript)
-    assert ast.unparse(prompt.slice) in (index_arg, f"int({index_arg})")
-    # and it is the same list the grading example comes from -- one dataset order for both.
-    graded = next(
-        node
-        for node in ast.walk(score)
-        if isinstance(node, ast.Subscript)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "rollout_examples"
+    assert (
+        "for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):"
+        in body
     )
-    assert ast.unparse(graded.slice) == ast.unparse(prompt.slice)
+    assert (
+        "observability.record(message_prompts[int(index)], solution_str, score, breakdowns)" in body
+    )
 
 
 @pytest.mark.usefixtures("_identity_graded")
