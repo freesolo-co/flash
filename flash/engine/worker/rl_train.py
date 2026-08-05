@@ -1502,6 +1502,49 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
     )
 
 
+def _single_turn_scoring_state(
+    solution_str: str, *, thinking: bool, prompt_opened_thinking: bool
+) -> tuple[str, dict | None]:
+    graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
+    state = (
+        {
+            "raw": solution_str,
+            "completion": graded,
+            "thinking": _w.thinking_text(
+                solution_str, prompt_opened_thinking=prompt_opened_thinking
+            ),
+        }
+        if thinking
+        else None
+    )
+    return graded, state
+
+
+def _finalize_single_turn_reward(
+    reward: float,
+    solution_str: str,
+    *,
+    tok,
+    thinking: bool,
+    prompt_opened_thinking: bool,
+    think_penalty: float,
+    raise_on_error: bool = False,
+) -> float:
+    if think_penalty > 0 and thinking:
+        reward -= think_penalty * _w.think_token_count(
+            solution_str, tok, prompt_opened_thinking=prompt_opened_thinking
+        )
+    reward = float(reward)
+    # verl computes the grpo baseline with plain mean/std, so one non-finite row poisons every
+    # advantage in its group. match the scalar and batched paths by masking it before the bridge.
+    if not math.isfinite(reward):
+        if raise_on_error:
+            raise ValueError(f"env scoring returned a non-finite reward: {reward}")
+        print(f"[rl-verl] env scored {reward}; unscorable, scoring 0.0", flush=True)
+        return 0.0
+    return reward
+
+
 def score_single_turn(
     env,
     solution_str: str,
@@ -1542,17 +1585,10 @@ def score_single_turn(
         # whole contract is to turn an env scoring fault into 0.0.
         has_breakdown = hasattr(env, "scores_breakdown")
         collect_breakdown = collect_breakdown and has_breakdown
-        graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
-        state = (
-            {
-                "raw": solution_str,
-                "completion": graded,
-                "thinking": _w.thinking_text(
-                    solution_str, prompt_opened_thinking=prompt_opened_thinking
-                ),
-            }
-            if thinking
-            else None
+        graded, state = _single_turn_scoring_state(
+            solution_str,
+            thinking=thinking,
+            prompt_opened_thinking=prompt_opened_thinking,
         )
         if has_breakdown:
             breakdown = env.scores_breakdown(graded, ex, state)
@@ -1572,33 +1608,20 @@ def score_single_turn(
             f"[rl-verl] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0", flush=True
         )
         return 0.0
-    if think_penalty > 0 and thinking:
-        r -= think_penalty * _w.think_token_count(
-            solution_str, tok, prompt_opened_thinking=prompt_opened_thinking
-        )
-    r = float(r)
-    # an unscorable completion scores 0.0, the same as a failed grading. it CANNOT be forwarded:
-    # verl's grpo baseline is a plain torch.mean/torch.std over the group (core_algos.py:320-326),
-    # with no nan-aware variant anywhere on its path -- one nan row therefore makes the mean, the
-    # std, and every one of the group's `group_size` advantages nan, not just its own. the retired
-    # trl path could forward it because it masked nan rows out of the baseline and zeroed their
-    # advantage (grpo_trainer.py:2171, :2222); nothing downstream of here does that now.
-    # 0.0 rather than a mask because that is what this backend already does with an unscorable
-    # multi-turn episode (see FlashMultiTurnBridge.score) and with a grading that raised, above.
-    # last, so it covers the penalty arithmetic as well as the env's return. the penalty cannot
-    # itself introduce a non-finite value -- the schema bounds its coefficient to [0.0, 1.0] -- but
-    # a mask this cheap has no reason to sit anywhere a future term could slip past it.
-    if not math.isfinite(r):
-        if raise_on_error:
-            raise ValueError(f"env scoring returned a non-finite reward: {r}")
-        print(f"[rl-verl] env scored {r}; unscorable, scoring 0.0", flush=True)
-        return 0.0
-    return r
+    return _finalize_single_turn_reward(
+        r,
+        solution_str,
+        tok=tok,
+        thinking=thinking,
+        prompt_opened_thinking=prompt_opened_thinking,
+        think_penalty=think_penalty,
+        raise_on_error=raise_on_error,
+    )
 
 
 def score_single_turn_batch(
     env,
-    requests: list[tuple[str, object]],
+    requests: list[tuple[str, dict]],
     *,
     tok,
     thinking: bool,
@@ -1611,17 +1634,10 @@ def score_single_turn_batch(
 
     prepared = []
     for solution_str, ex in requests:
-        graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
-        state = (
-            {
-                "raw": solution_str,
-                "completion": graded,
-                "thinking": _w.thinking_text(
-                    solution_str, prompt_opened_thinking=prompt_opened_thinking
-                ),
-            }
-            if thinking
-            else None
+        graded, state = _single_turn_scoring_state(
+            solution_str,
+            thinking=thinking,
+            prompt_opened_thinking=prompt_opened_thinking,
         )
         batch_state = {"response_text": graded}
         if state is not None:
@@ -1672,15 +1688,19 @@ def score_single_turn_batch(
 
     results = []
     for (solution_str, _, _), (score, breakdowns) in zip(prepared, raw_results, strict=True):
-        if think_penalty > 0 and thinking:
-            score -= think_penalty * _w.think_token_count(
-                solution_str, tok, prompt_opened_thinking=prompt_opened_thinking
+        results.append(
+            (
+                _finalize_single_turn_reward(
+                    score,
+                    solution_str,
+                    tok=tok,
+                    thinking=thinking,
+                    prompt_opened_thinking=prompt_opened_thinking,
+                    think_penalty=think_penalty,
+                ),
+                breakdowns,
             )
-        score = float(score)
-        if not math.isfinite(score):
-            print(f"[rl-verl] env scored {score}; unscorable, scoring 0.0", flush=True)
-            score = 0.0
-        results.append((score, breakdowns))
+        )
     return results
 
 
@@ -3154,15 +3174,11 @@ def run_rl_train():
             results.append(score)
         return results
 
-    def _score(index: int, solution_str: str) -> float:
-        return _score_batch([(index, solution_str)])[0]
-
     def _score_for_profile(index: int, solution_str: str) -> float:
-        """the same grading path as _score, minus training's own bookkeeping.
+        """the scalar grading path without training observability bookkeeping.
 
-        deliberately NOT _score: that buffers the rollout, so profiling would seed the
-        per-step completion dump with gradings that never came from a rollout. it also propagates
-        scoring errors instead of scoring them 0.0, so a grader failing on every call reports as a
+        profiling must not use _score_batch: that would seed the per-step completion dump with
+        gradings that never came from a rollout. errors propagate so a broken grader reports as a
         failure rather than as a fast latency.
         """
         return score_single_turn(
@@ -3204,7 +3220,7 @@ def run_rl_train():
         else None
     )
     server, reward_url = start_reward_server(
-        _score,
+        _score_for_profile,
         example_count=len(rollout_examples),
         multi_turn_bridge=multi_turn_bridge,
         rollout_batch=int(inp["prompts_per_step"]) * int(inp["group_size"]),
