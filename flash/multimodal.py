@@ -692,20 +692,13 @@ def resolve_image_pad_token_id(processor, tok) -> int:
     raise ValueError("could not resolve a valid image-pad token id from the processor or tokenizer")
 
 
-def validate_multimodal_training(
-    model_id: str, algorithm: str, *, multi_turn: bool = False
-) -> None:
+def validate_multimodal_training(model_id: str, algorithm: str) -> None:
     from flash.catalog import supports_image_training
 
     if not supports_image_training(model_id):
         raise ValueError(f"{model_id} does not support image-bearing training records")
-    if algorithm == "opd" and multi_turn:
-        raise ValueError("opd supports image-bearing records only for single-turn environments")
-
-
-def validate_image_opd_teacher(_teacher_model: str | None) -> None:
-    """Reject image-bearing OPD because the managed Parasail scoring contract is text-only."""
-    raise ValueError("image-bearing opd is not supported by managed Parasail teachers")
+    if algorithm == "opd":
+        raise ValueError("image-bearing opd is not supported")
 
 
 def assistant_completion_text(completion: object) -> str:
@@ -800,11 +793,5 @@ def preflight_validate_image_opd(spec) -> None:
         records = records[:max_examples]
     for record in records:
         if record_has_images(record, _record_messages(record)):
-            multi_turn = bool(
-                getattr(environment, "multi_turn", False) or params.get("multi_turn", False)
-            )
-            validate_multimodal_training(
-                str(getattr(spec, "model", "")), "opd", multi_turn=multi_turn
-            )
-            validate_image_opd_teacher(getattr(train, "teacher_model", "") if train else "")
+            validate_multimodal_training(str(getattr(spec, "model", "")), "opd")
             return

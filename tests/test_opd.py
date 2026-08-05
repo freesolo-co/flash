@@ -579,7 +579,7 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
     from flash.engine.worker.opd_train import run_opd_train
 
     source = inspect.getsource(run_opd_train)
-    validation = 'validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)'
+    validation = 'validate_multimodal_training(model_id, "opd")'
 
     assert source.index(validation) < source.index("_probe_gpu_in_subprocess(")
 
@@ -911,7 +911,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     import flash.engine.worker.teacher as tmod
 
     monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
-    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "unit-test-teacher-capability")
 
     # The all-over-budget guard (RuntimeError) must fire; _student_model's AssertionError would
@@ -1443,14 +1443,9 @@ class _TinyLM:
         return self
 
 
-@pytest.mark.parametrize("teacher_model", ["", "glm-5.2", "kimi-k3", "qwen3.5-397b-a17b"])
-def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch, teacher_model):
-    """An image dataset paired with a text-only teacher must fail before any paid GPU work.
-
-    Runs against the verl worker, which owns the whole OPD path. The rejection is the load-bearing
-    part: a text-only teacher cannot score image prompts, so reaching the GPU probe would rent a
-    card for a run that can only fail.
-    """
+def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch):
+    teacher_model = "glm-5.2"
+    """Image-bearing OPD must fail before teacher construction or paid GPU work."""
     fake_torch = types.ModuleType("torch")
     fake_torch.manual_seed = lambda _seed: None
     fake_torch.cuda = SimpleNamespace(is_available=lambda: False)

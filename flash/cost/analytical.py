@@ -7,7 +7,9 @@ policy/reference update.
 
 from __future__ import annotations
 
-from flash.opd_limits import opd_teacher_request_multiplier
+import math
+
+from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
 
 from .facts import (
@@ -228,12 +230,16 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
             peak * update_mfu
         )
         teacher_lat = teacher_seconds_per_completion()
-        # run_opd's primary path scores a step's completions concurrently over parasail with a fan-out
-        # cap of the step's own completion count (prompts_per_step * group_size, opd.py phase 2), so
-        # every completion in a step is scored in one parallel wave - the teacher wall is a single
-        # latency, not the full serial sum (that describes only the cpu-test fallback that can't
-        # batch-generate). the teacher endpoint's rate limit is the real ceiling on this fan-out.
-        teacher_s = teacher_lat
+        request_multiplier = opd_teacher_request_multiplier(
+            multi_turn=n.opd_multi_turn,
+            max_turns=n.opd_max_turns,
+        )
+        score_items = completions * request_multiplier
+        # conservative retry-and-turn wave policy: every potentially scored request consumes one slot,
+        # including bounded no-signal replacement attempts and every bounded multi-turn assistant turn.
+        # the worker and broker enforce the same shared concurrency ceiling.
+        teacher_waves = math.ceil(score_items / OPD_TEACHER_SCORING_CONCURRENCY)
+        teacher_s = teacher_waves * teacher_lat
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
         return gen_s + update_s, overhead + teacher_s
@@ -409,7 +415,8 @@ def _notes(
         teacher_name = resolve_teacher(n.teacher_model).display_name
         notes.append(
             f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {n.completion_len} tok + {teacher_name} teacher scoring ({tsec:.2f}s/completion) + policy "
+            f"@ {n.completion_len} tok + {teacher_name} teacher scoring "
+            f"({tsec:.2f}s/request, {OPD_TEACHER_SCORING_CONCURRENCY} concurrent) + policy "
             "update (no local reference forward)"
         )
     elif n.is_grpo:

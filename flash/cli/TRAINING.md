@@ -815,8 +815,10 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   lets you pick the teacher that best fits your task without changing anything else.
 
   **How to check, given the key is managed.** Flash has no command that generates teacher
-  rollouts; the platform's Parasail key is used only inside the paid OPD worker, to score the
-  student's own tokens — so there is nothing to run locally with your Flash credentials alone.
+  rollouts. The control-plane broker owns `PARASAIL_API_KEY`; GPU workers receive only
+  `FLASH_CONTROL_PANEL_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`, never the provider key.
+  The broker scores the student's own
+  tokens, so there is nothing to run locally with your Flash credentials alone.
   Two workable routes:
 
   - _Best, if you can:_ get your own access to the same model (the allow-list is Parasail-hosted,
@@ -849,7 +851,7 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
   the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
   `glm-5.2` (default), `kimi-k3`, or `qwen3.5-397b-a17b`. Every option is
-  a Parasail-hosted model reached with the platform's own key, so there is nothing to export or
+  a Parasail-hosted model reached through the control-plane broker, so there is nothing to export or
   declare. An opd run submits like any other, and a `PARASAIL_API_KEY` in your shell is ignored.
   Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
   teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
