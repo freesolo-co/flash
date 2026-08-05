@@ -71,21 +71,20 @@ def test_sft_unset_max_context_tokens_allowed():
     preflight_train_context_within_serving(_spec(model="Qwen/Qwen3.5-4B", algorithm="sft"))
 
 
-def test_35b_serves_4096_so_8192_sft_context_rejected():
-    # The 35B now serves at 4096 (weight-bound 6x64 ceiling), so an 8192 SFT context is rejected.
-    spec = _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="sft", max_context_tokens=8192)
-    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=4096"):
-        preflight_train_context_within_serving(spec)
-
-
-def test_35b_4096_context_allowed():
+def test_35b_32768_context_allowed():
     preflight_train_context_within_serving(
-        _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="sft", max_context_tokens=4096)
+        _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="sft", max_context_tokens=32768)
     )
 
 
+def test_35b_context_above_serving_cap_rejected():
+    spec = _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="sft", max_context_tokens=32769)
+    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
+        preflight_train_context_within_serving(spec)
+
+
 def test_grpo_unset_rollout_within_35b_cap_allowed():
-    # Unset GRPO rollout defaults (max_prompt 2048 + completion) stay under 4096, even for thinking.
+    # unset grpo rollout defaults (max_prompt 2048 + completion) stay under 32768, even for thinking.
     preflight_train_context_within_serving(
         _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="grpo", thinking=True)
     )
@@ -102,11 +101,11 @@ def test_opd_rollout_context_above_serving_cap_rejected():
     spec = _spec(
         model="Qwen/Qwen3.6-35B-A3B",
         algorithm="opd",
-        max_completion_tokens=3500,
+        max_completion_tokens=32000,
     )
     with pytest.raises(
         ValueError,
-        match=r"OPD rollout prompt\+completion\)=4524 exceeds .*max_model_len=4096",
+        match=r"OPD rollout prompt\+completion\)=33024 exceeds .*max_model_len=32768",
     ):
         preflight_train_context_within_serving(spec)
 
