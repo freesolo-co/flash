@@ -804,9 +804,7 @@ def _iter_env_sidecar_files(
                     if (
                         config.suffix.lower() != ".toml"
                         or config in yielded
-                        or _ignore_env_push_path(
-                            config, env_root=env_root, entrypoint=entrypoint
-                        )
+                        or _ignore_env_push_path(config, env_root=env_root, entrypoint=entrypoint)
                     ):
                         continue
                     yielded.add(config)
