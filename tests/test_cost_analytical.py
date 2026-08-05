@@ -207,29 +207,33 @@ def test_9b_bf16_grpo_needs_an_80gb_class():
     assert e.gpu_vram_gb >= 80
 
 
-def test_35b_moe_long_context_grpo_sized_past_the_b200():
+def test_35b_moe_long_context_grpo_sized_past_the_resident_wall():
     # The 35B MoE is RESIDENT-ONLY for GRPO (sleep_unsupported: vLLM sleep HANGS its wake), so it's
-    # sized on the RESIDENT peak (two ~70 GB weight copies + KV pool, fp8 KV). Default/moderate context
-    # fits the single 180 GB B200, but anything past the resident wall (~4-5k tok at group 8) is sized
-    # PAST 180 GB -> REJECTED at parse time, rather than admitted-then-HUNG in the broken sleep path
+    # sized on the RESIDENT peak (two ~70 GB weight copies + KV pool, fp8 KV). What this pins is the
+    # resident WALL: context past ~4-5k tok at group 8 costs materially more, so it is sized past the
+    # allocation a moderate-context run gets rather than admitted-then-HUNG in the broken sleep path
     # (the old sleep estimate wrongly admitted up to ~16k, then the worker stalled).
+    #
+    # 205 GB is between the moderate-context sizes (200-201) and the long-context ones (211+); it is
+    # deliberately not a card size, because training the routed experts moved every one of these past
+    # a single 180 GB B200 and a 180 bound would no longer separate short context from long.
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     moe = "Qwen/Qwen3.6-35B-A3B"
-    # default + moderate context fit the single B200 (<= 180 GB).
-    assert alloc_required_vram_gb(moe, "grpo", train={}, thinking=False) <= 180
+    # default + moderate context stay under the wall.
+    assert alloc_required_vram_gb(moe, "grpo", train={}, thinking=False) <= 205
     assert (
         alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 4096}, thinking=False)
-        <= 180
+        <= 205
     )
-    # past the resident wall -> sized ABOVE the 180 GB B200 -> rejected (NOT routed to broken sleep).
+    # past the resident wall -> sized above it -> rejected (NOT routed to broken sleep).
     assert (
         alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 8192}, thinking=False)
-        > 180
+        > 205
     )
     assert (
         alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 32768}, thinking=False)
-        > 180
+        > 205
     )
     # The GRPO escalation is GRPO-only: default SFT stays at its 180 GB floor (fits the B200). (Long-
     # context SFT has its OWN large-vocab fp32-logits growth, independent of this grpo escalation.)

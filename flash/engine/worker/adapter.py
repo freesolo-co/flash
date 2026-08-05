@@ -27,11 +27,35 @@ from flash.engine.worker.perf import optimal_attn_impl
 
 _ADAPTER_DOWNLOAD_RETRIES = 4
 _ADAPTER_DOWNLOAD_BACKOFF_S = 5.0
+_QWEN35_EXPERT_TARGET_PARAMETERS = (
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+)
+
+
+def lora_target_parameters(model_id: str | None) -> list[str] | None:
+    """return direct parameter targets required by the model's fused expert layout."""
+    if model_id == "Qwen/Qwen3.6-35B-A3B":
+        return list(_QWEN35_EXPERT_TARGET_PARAMETERS)
+    return None
+
+
+def validate_lora_target_parameters(config: dict, model_id: str) -> None:
+    """fail closed when a warm-start adapter omits required fused expert parameters."""
+    required = set(lora_target_parameters(model_id) or ())
+    if not required:
+        return
+    actual = set(config.get("target_parameters") or ())
+    missing = sorted(required - actual)
+    if missing:
+        raise ValueError(
+            f"warm-start adapter for {model_id} omits required expert targets {missing}; "
+            "retrain the source adapter with the current Flash version"
+        )
 
 
 def make_lora(model_id: str | None = None):
-    """Build LoRA config targeting all linear layers (VL models included: the vision tower /
-    projector / MTP linears are adapted too; on examples without images they simply get no gradient)."""
+    """build the model's complete serve-compatible lora target set."""
     from peft import LoraConfig
 
     targets = "all-linear"
@@ -46,7 +70,9 @@ def make_lora(model_id: str | None = None):
         "task_type": "CAUSAL_LM",
         "revision": model_revision or None,
     }
-    # PiSSA removed: it mutates the base, so its adapter corrupts serve + warm-start on the unmodified base.
+    if target_parameters := lora_target_parameters(model_id):
+        kwargs["target_parameters"] = target_parameters
+    # pissa removed: it mutates the base, so its adapter corrupts serve + warm-start on the unmodified base.
     kwargs["init_lora_weights"] = True
     print(
         "[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)"
@@ -160,6 +186,8 @@ def _init_adapter_model(model_id: str):
             "refusing to silently start from the base model. Verify the source run and access, "
             "or omit init_from_adapter to train a fresh LoRA."
         )
+    with open(os.path.join(adir, "adapter_config.json"), encoding="utf-8") as config_file:
+        validate_lora_target_parameters(json.load(config_file), model_id)
     print("[init-adapter] continuing the prepared source LoRA")
     _attn = optimal_attn_impl()
     attn_kw = {"attn_implementation": _attn} if _attn else {}

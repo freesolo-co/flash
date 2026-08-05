@@ -166,6 +166,11 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         f"model.lora_rank={_hydra_val(cfg['lora_rank'])}",
         f"model.lora_alpha={_hydra_val(cfg['lora_alpha'])}",
         f"model.target_modules={_hydra_val(cfg['target_modules'])}",
+        *(
+            [f"++model.target_parameters={_hydra_val(cfg['target_parameters'])}"]
+            if cfg.get("target_parameters")
+            else []
+        ),
         f"model.lora_adapter_path={_hydra_val(cfg.get('lora_adapter_path'))}",
         "model.use_remove_padding=true",
         # 32k contexts: the fused linear-CE forward never materializes the [tokens, vocab] logits
@@ -762,6 +767,7 @@ def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: i
             f"SFT warm-start adapter rank {rank} does not match the prepared train.lora_rank "
             f"{expected_rank}; rank changes are not supported"
         )
+    _w.validate_lora_target_parameters(config, model_id)
     base = str(config.get("base_model_name_or_path") or "").strip()
     if base and base != model_id:
         raise ValueError("SFT warm-start adapter base model does not match the target model")
@@ -1270,6 +1276,7 @@ def run_sft_train(spec=None) -> None:
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "target_modules": target_modules,
+        "target_parameters": _w.lora_target_parameters(model_id),
         "lora_adapter_path": warmstart_adapter,
         "ulysses_sp_size": gpu_count,
         "lr": learning_rate,

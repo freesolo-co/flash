@@ -445,6 +445,22 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "algorithm.rollout_correction.rollout_is_threshold=2.0" in o
 
 
+def test_build_verl_overrides_carries_fused_expert_target_parameters():
+    o = rl_train.build_verl_overrides(
+        _overrides_cfg(
+            target_parameters=[
+                "mlp.experts.gate_up_proj",
+                "mlp.experts.down_proj",
+            ]
+        )
+    )
+
+    assert (
+        "++actor_rollout_ref.model.target_parameters="
+        "[mlp.experts.gate_up_proj,mlp.experts.down_proj]"
+    ) in o
+
+
 def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
     # this guards only against flash emitting a misleading no-op; it does not prove verl reads the key.
     o = rl_train.build_verl_overrides(_overrides_cfg())
@@ -3432,7 +3448,15 @@ class _CapabilityProcessor:
         return {"input_ids": [[1] * self.expanded_len]}
 
 
-def _capability_resolve(monkeypatch, env, train=None, overrides=None, processor=None):
+def _capability_resolve(
+    monkeypatch,
+    env,
+    train=None,
+    overrides=None,
+    processor=None,
+    model="Qwen/Qwen3.5-0.8B",
+    gpu_count=1,
+):
     """run the resolver against one env, with everything else on the supported path."""
     import transformers
 
@@ -3456,9 +3480,10 @@ def _capability_resolve(monkeypatch, env, train=None, overrides=None, processor=
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": model,
             "algorithm": "grpo",
             "train": {"batch_size": 4, "epochs": 1, **(train or {})},
+            "gpu": {"count": gpu_count},
         }
     )
     monkeypatch.setattr(_PkgW, "JOB_SPEC", spec, raising=False)
@@ -3616,6 +3641,26 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
     )
     assert inp["warmstart_adapter"]
     assert inp["kl_coef"] == pytest.approx(0.1)
+
+
+def test_35b_grpo_warm_start_requires_fused_expert_targets(monkeypatch, tmp_path):
+    import flash.engine.worker.adapter as adapter_mod
+
+    adapter_dir = tmp_path / "warmstart"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps({"r": 32, "lora_alpha": 64}), encoding="utf-8"
+    )
+    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
+
+    with pytest.raises(ValueError, match="omits required expert targets"):
+        _capability_resolve(
+            monkeypatch,
+            _capability_env(),
+            train={"init_from_adapter": "org/pre-expert-adapter"},
+            model="Qwen/Qwen3.6-35B-A3B",
+            gpu_count=2,
+        )
 
 
 def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch, capsys):
