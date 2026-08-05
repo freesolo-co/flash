@@ -13,7 +13,7 @@ from flash.spec import JobSpec
         ("Qwen/Qwen3.5-4B", 32768),
         ("Qwen/Qwen3.5-9B", 32768),
         ("Qwen/Qwen3.6-27B", 32768),
-        ("Qwen/Qwen3.6-35B-A3B", 4096),
+        ("Qwen/Qwen3.6-35B-A3B", 32768),
     ],
 )
 def test_serving_context_cap(model: str, expected_cap: int) -> None:
