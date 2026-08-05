@@ -258,6 +258,33 @@ class TestServerBind:
             self._parsed(monkeypatch, [], {"FLASH_SERVER_PORT": value})
         assert "FLASH_SERVER_PORT" in str(excinfo.value)
 
+    @pytest.mark.parametrize("value", ["not-a-port", "0", "65536", "-1"])
+    def test_port_flag_wins_even_when_the_env_var_is_unusable(self, monkeypatch, value):
+        """Precedence must hold for MALFORMED values, not just valid ones.
+
+        Resolving the environment while building the argparse defaults evaluates it before
+        parsing, so a broken variable outranked the very flag meant to override it -- the
+        operator's escape hatch failed exactly when they needed it.
+        """
+        assert self._parsed(monkeypatch, ["--port", "9999"], {"FLASH_SERVER_PORT": value}) == {
+            "host": "127.0.0.1",
+            "port": 9999,
+        }
+
+    def test_help_works_with_an_unusable_port_env_var(self, monkeypatch):
+        """`--help` must survive a broken environment: it is how you learn the flag exists.
+
+        Erroring here sends someone looking for the override to a message about the thing they
+        are trying to override.
+        """
+        main = self._main()
+        monkeypatch.setenv("FLASH_SERVER_PORT", "not-a-port")
+        monkeypatch.setattr(main, "run_server", lambda host, port: None)
+        monkeypatch.setattr(main, "configure_logging", lambda **_: None)
+        with pytest.raises(SystemExit) as excinfo:
+            main.main(["--help"])
+        assert excinfo.value.code == 0
+
     def test_blank_host_falls_back_to_the_default(self, monkeypatch):
         assert self._parsed(monkeypatch, [], {"FLASH_SERVER_HOST": "  "})["host"] == "127.0.0.1"
 
