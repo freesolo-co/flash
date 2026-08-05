@@ -57,6 +57,7 @@ from flash.engine.worker.opd_train import (
     _render_opd_sitecustomize,
     _restore_verl_resume,
     _stage_retry_contract,
+    _teacher_token_metadata,
     _TeacherAlignmentBridge,
     _TextTeacherBatcher,
     _trim_response_and_forced,
@@ -763,6 +764,7 @@ def _resume_accounting(step=2):
         "prompt_pool_fingerprint": "a" * 64,
         "generated_tokens": 41,
         "teacher_input_tokens": 37,
+        "teacher_output_tokens": 6,
         "truncated_rollouts": 3,
         "forced_tokens": 9,
         "dropped_forced_groups": 4,
@@ -785,6 +787,23 @@ def _resume_accounting(step=2):
         "aligned_sequences": 5,
         "empty_alignments": 2,
         "coverage_sum": 3.5,
+    }
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "output_tokens"),
+    [(5, 1), (15, 3), (42, 7)],
+    ids=("normal", "deduplicated", "resumed"),
+)
+def test_teacher_token_metadata_preserves_input_and_output_accounting(input_tokens, output_tokens):
+    assert _teacher_token_metadata(
+        {
+            "teacher_input_tokens": input_tokens,
+            "teacher_output_tokens": output_tokens,
+        }
+    ) == {
+        "teacher_input_tokens": input_tokens,
+        "teacher_output_tokens": output_tokens,
     }
 
 
@@ -877,6 +896,7 @@ def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     source = inspect.getsource(run_opd_train)
     write_train_meta_source = source[source.index("_w.write_train_meta(") :]
 
+    assert "**_teacher_token_metadata(final_accounting)" in write_train_meta_source
     assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
     assert '"teacher_transient":' not in write_train_meta_source
     assert '"teacher_error":' not in write_train_meta_source
@@ -890,33 +910,48 @@ def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     assert "granularity_n" not in write_train_meta_source
 
 
+class _ScoredTokens(list):
+    def __init__(self, tokens, *, input_tokens=5, output_tokens=1):
+        super().__init__(tokens)
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
 class _BridgeTeacher:
     def score(self, prompt_text, completion_text):
         assert prompt_text == "User: question\nAssistant: "
         assert completion_text == "AB"
-        return [
-            TeacherToken(text="A", logprob=-0.4, start=0, end=1),
-            TeacherToken(text="B", logprob=-0.7, start=1, end=2),
-        ]
+        return _ScoredTokens(
+            [
+                TeacherToken(text="A", logprob=-0.4, start=0, end=1),
+                TeacherToken(text="B", logprob=-0.7, start=1, end=2),
+            ]
+        )
 
 
 class _MergedBridgeTeacher:
     def score(self, prompt_text, completion_text):
         assert prompt_text == "User: question\nAssistant: "
         assert completion_text == "AB"
-        return [TeacherToken(text="AB", logprob=-1.1, start=0, end=2)]
+        return _ScoredTokens([TeacherToken(text="AB", logprob=-1.1, start=0, end=2)])
 
 
 class _ScoreManyTeacherAdapter:
     def __init__(self, teacher):
         self.teacher = teacher
 
+    @staticmethod
+    def _with_usage(tokens):
+        if hasattr(tokens, "input_tokens") and hasattr(tokens, "output_tokens"):
+            return tokens
+        return _ScoredTokens(tokens)
+
     def score(self, prompt_text, completion_text):
-        return self.teacher.score(prompt_text, completion_text)
+        return self._with_usage(self.teacher.score(prompt_text, completion_text))
 
     def score_many(self, items):
         return [
-            self.teacher.score(prompt_text, completion_text)
+            self._with_usage(self.teacher.score(prompt_text, completion_text))
             for prompt_text, completion_text in items
         ]
 
@@ -999,20 +1034,25 @@ class _BatchingTeacher:
         if self.failure == "malformed_result":
             return [[object()] for _item in items]
         if self.failure == "invalid_offsets":
-            return [[TeacherToken(text="AB", logprob=-1.0, start=0, end=3)] for _item in items]
-        return [
-            [
-                TeacherToken(
-                    text=completion_text,
-                    logprob=(
-                        self.token_logprob
-                        if self.token_logprob is not None
-                        else self.logprobs[prompt_text]
-                    ),
-                    start=0,
-                    end=len(completion_text),
-                )
+            return [
+                _ScoredTokens([TeacherToken(text="AB", logprob=-1.0, start=0, end=3)])
+                for _item in items
             ]
+        return [
+            _ScoredTokens(
+                [
+                    TeacherToken(
+                        text=completion_text,
+                        logprob=(
+                            self.token_logprob
+                            if self.token_logprob is not None
+                            else self.logprobs[prompt_text]
+                        ),
+                        start=0,
+                        end=len(completion_text),
+                    )
+                ]
+            )
             for prompt_text, completion_text in items
         ]
 
@@ -1237,6 +1277,8 @@ def test_text_teacher_batcher_deduplicates_exact_pairs_and_scatters_to_all_waite
     assert [_teacher_logsum(result) for _status, result in outcomes] == [-1.0] * 8
     assert bridge.score_requests == 8
     assert bridge.teacher_ok == 8
+    assert bridge.teacher_input_tokens == 5
+    assert bridge.teacher_output_tokens == 1
 
 
 def test_text_teacher_batcher_keeps_nonidentical_inputs_separate_and_ordered(monkeypatch):
@@ -1393,7 +1435,8 @@ def test_text_teacher_batch_mixed_dedup_preserves_logical_accounting(monkeypatch
         assert _teacher_logsum(result) == teacher.logprobs[f"User: {prompt_text}\nAssistant: "]
     assert bridge.score_requests == 8
     assert bridge.teacher_ok == 8
-    assert bridge.teacher_input_tokens == 40
+    assert bridge.teacher_input_tokens == 15
+    assert bridge.teacher_output_tokens == 3
     assert bridge.aligned_sequences == 8
 
 
@@ -1409,14 +1452,16 @@ def test_text_teacher_batcher_close_allows_inflight_scatter_within_bound():
             self.entered.set()
             assert self.release.wait(timeout=2.0)
             return [
-                [
-                    TeacherToken(
-                        text=completion_text,
-                        logprob=-float(int(prompt_text.removeprefix("prompt-")) + 1),
-                        start=0,
-                        end=len(completion_text),
-                    )
-                ]
+                _ScoredTokens(
+                    [
+                        TeacherToken(
+                            text=completion_text,
+                            logprob=-float(int(prompt_text.removeprefix("prompt-")) + 1),
+                            start=0,
+                            end=len(completion_text),
+                        )
+                    ]
+                )
                 for prompt_text, completion_text in items
             ]
 
@@ -2212,82 +2257,27 @@ def test_stop_trimming_slices_response_ids_and_forced_mask_identically():
     assert kept_forced == [True, False]
 
 
-class _ScoredImageTokens(list):
-    input_tokens = 17
-
-
-class _ImageBridgeTeacher:
-    def __init__(self):
-        self.items = None
-
-    def score_many_multimodal(self, items):
-        self.items = items
-        return [
-            _ScoredImageTokens(
-                [
-                    TeacherToken(text="A", logprob=-0.4, start=0, end=1),
-                    TeacherToken(text="B", logprob=-0.7, start=1, end=2),
-                ]
-            )
-        ]
-
-
-def test_multimodal_bridge_rebuilds_teacher_images_in_frozen_order_and_accounts_echo(tmp_path):
-    image_module = pytest.importorskip("PIL.Image")
-    from flash.multimodal import image_descriptors_to_data_uris, normalize_image_source
-
-    dataset_dir = tmp_path / "dataset"
-    dataset_dir.mkdir()
-    red = dataset_dir / "red.png"
-    blue = dataset_dir / "blue.png"
-    image_module.new("RGB", (2, 2), "red").save(red)
-    image_module.new("RGB", (2, 2), "blue").save(blue)
-    descriptors = (
-        normalize_image_source("dataset/red.png", tmp_path),
-        normalize_image_source("dataset/blue.png", tmp_path),
-    )
-    teacher = _ImageBridgeTeacher()
+def test_multimodal_bridge_rejects_managed_teacher_scoring():
     bridge = _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
-                student_messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": " then "},
-                            {"type": "image"},
-                        ],
-                    }
-                ],
-                teacher_messages=[{"role": "user", "content": "<|media_pad|> then <|media_pad|>"}],
+                student_messages=[{"role": "user", "content": [{"type": "image"}]}],
+                teacher_messages=[{"role": "user", "content": "<|media_pad|>"}],
                 prompt_ids=(10, 11),
-                image_descriptors=descriptors,
-                package_root=str(tmp_path),
+                image_descriptors=("frozen-descriptor",),
+                package_root=None,
             )
         ],
         tokenizer=_BridgeTokenizer(),
-        teacher=teacher,
+        teacher=object(),
         thinking_prefill="",
         eos_token_ids=frozenset({99}),
         stop_sequences=(),
         mutation_callback=lambda: None,
     )
 
-    bridge.start()
-    try:
-        encoded = bridge.score(0, 2, [10, 11, 65, 66, 99], image_count=2)
-        with pytest.raises(ValueError, match="exactly match"):
-            bridge.score(0, 3, [10, 11, 77, 65, 99], image_count=2)
-    finally:
-        bridge.close()
-
-    expected_uris = image_descriptors_to_data_uris(descriptors, tmp_path)
-    assert teacher.items == [
-        ("User: <|media_pad|> then <|media_pad|>\nAssistant: ", "AB", expected_uris)
-    ]
-    assert encoded["teacher_ids"] == [-1, 0, 1, -1, -1]
-    assert bridge.teacher_input_tokens == 17
+    with pytest.raises(ValueError, match="not supported by managed Parasail teachers"):
+        bridge.score(0, 2, [10, 11, 65, 99], image_count=1)
 
 
 def test_bridge_rejects_parent_child_image_count_mismatch_before_scoring():
@@ -2376,6 +2366,7 @@ def test_retry_sidecar_persists_real_accumulated_accounting(tmp_path):
     assert state["coverage_curve"] == [0.5, 0.7]
     assert state["generated_tokens"] == 41
     assert state["teacher_input_tokens"] == 37
+    assert state["teacher_output_tokens"] == 6
     assert state["teacher_ok"] == 6
     assert state["teacher_transient"] == 1
     assert state["forced_tokens"] == 9
@@ -2415,6 +2406,7 @@ def test_resume_restores_bridge_counters_and_extends_full_curves():
     assert restored["coverage_curve"] == [0.5, 0.7, 1.0]
     assert restored["generated_tokens"] == 44
     assert restored["teacher_input_tokens"] == 42
+    assert restored["teacher_output_tokens"] == 7
     assert restored["teacher_ok"] == 7
     assert restored["forced_tokens"] == 9
     assert restored["dropped_forced_groups"] == 4
@@ -3616,6 +3608,59 @@ def test_deterministic_empty_alignment_exhaustion_remains_permanent():
     assert bridge.teacher_transient == 0
     assert bridge.teacher_error == 0
     assert bridge.empty_alignments == 3
+
+
+def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
+    class OrderedTeacher:
+        def __init__(self):
+            self.batch_sizes = []
+            self.next_index = 0
+
+        def score_many(self, items):
+            self.batch_sizes.append(len(items))
+            results = []
+            for _item in items:
+                self.next_index += 1
+                results.append(
+                    _ScoredTokens(
+                        [
+                            TeacherToken(
+                                text="AB",
+                                logprob=-float(self.next_index),
+                                start=0,
+                                end=2,
+                            )
+                        ]
+                    )
+                )
+            return results
+
+    teacher = OrderedTeacher()
+    bridge = _text_bridge(teacher)
+    monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
+    bridge._sessions["session-1"] = {
+        "turns": [
+            {
+                "prompt_ids": [10, 11],
+                "response_ids": [65, 66],
+                "completion_text": "AB",
+                "context_messages": [{"role": "user", "content": "question"}],
+                "truncated": False,
+                "skip_reason": "",
+            }
+            for _index in range(15)
+        ],
+        "score_cache": None,
+        "score_lock": threading.Lock(),
+        "lease_deadline": time.monotonic() + 60,
+    }
+
+    result = bridge.score_multiturn("session-1")
+
+    assert teacher.batch_sizes == [8, 7]
+    assert [_teacher_logsum(turn) for turn in result["turns"]] == [
+        -float(index) for index in range(1, 16)
+    ]
 
 
 def test_multiturn_transient_bridge_failure_latches_terminal_cause():
@@ -5048,8 +5093,10 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
     assert _resolve_image_token_id(SimpleNamespace(), fallback) == 42
 
 
-def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tmp_path):
-    monkeypatch.setenv("FIREWORKS_API_KEY", "teacher-secret")
+def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypatch, tmp_path):
+    monkeypatch.setenv("PARASAIL_API_KEY", "parasail-secret")
+    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "capability-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     child = _build_opd_child_env(
@@ -5080,7 +5127,9 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
     assert child["FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH"] == str(tmp_path / "cycle-commit-failure")
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
-    assert "FIREWORKS_API_KEY" not in child
+    assert "PARASAIL_API_KEY" not in child
+    assert "FLASH_TEACHER_BROKER_URL" not in child
+    assert "FLASH_TEACHER_CAPABILITY" not in child
     assert "HF_TOKEN" not in child
     assert "FLASH_OPD_STRUCTURED_OUTPUTS" not in child
     assert "FLASH_OPD_MODEL_VOCAB_SIZE" not in child
@@ -5131,7 +5180,7 @@ def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path)
         "env_reply",
         "rollout_done",
     ]
-    assert "FIREWORKS_API_KEY" not in child
+    assert "PARASAIL_API_KEY" not in child
 
 
 def test_structured_validator_rejects_vllm_mistral_tokenizer_models(monkeypatch):
@@ -5347,7 +5396,9 @@ def test_text_teacher_batcher_scores_one_batch_at_a_time():
             with self.lock:
                 self.in_flight -= 1
             return [
-                [TeacherToken(text=completion, logprob=-1.0, start=0, end=len(completion))]
+                _ScoredTokens(
+                    [TeacherToken(text=completion, logprob=-1.0, start=0, end=len(completion))]
+                )
                 for _prompt, completion in items
             ]
 
@@ -5458,10 +5509,18 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             payload["worker_env"] = worker_env
         return JobSpec.from_dict(payload)
 
+    teacher_runtime = {
+        "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+        "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+    }
     for worker_env in (None, {"FLASH_OPD_BACKEND": "trl"}, {"FLASH_OPD_BACKEND": "bogus"}):
         spec = _spec(worker_env)
         assert spec.phase == "opd"
-        alloc = build_worker_env(spec, spec.seed)["PYTORCH_CUDA_ALLOC_CONF"]
+        alloc = build_worker_env(
+            spec,
+            spec.seed,
+            runtime_secrets=teacher_runtime,
+        )["PYTORCH_CUDA_ALLOC_CONF"]
         assert "expandable_segments" not in alloc, (worker_env, alloc)
 
     # sft is verl-only too, but it builds no rollout engine at all, so expandable segments stay.
@@ -5675,7 +5734,7 @@ def test_stalled_thread_probe_reports_a_thread_that_is_gone_instead_of_raising()
     assert plugin._describe_stalled_thread(None) == "stack unavailable"
 
 
-def test_opd_missing_managed_teacher_key_fails_before_the_gpu_probe(monkeypatch):
+def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypatch):
     """A missing managed teacher key must fail before any paid GPU work starts.
 
     Ported from the TRL OPD suite (`test_opd_missing_teacher_key_raises_platform_managed_error`),
@@ -5733,9 +5792,10 @@ def test_opd_missing_managed_teacher_key_fails_before_the_gpu_probe(monkeypatch)
     )
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
     monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
-    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    monkeypatch.delenv("FLASH_TEACHER_BROKER_URL", raising=False)
+    monkeypatch.delenv("FLASH_TEACHER_CAPABILITY", raising=False)
 
-    with pytest.raises(RuntimeError, match="managed teacher api key is missing"):
+    with pytest.raises(RuntimeError, match="managed teacher broker transport is missing"):
         opd_mod.run_opd_train()
 
 

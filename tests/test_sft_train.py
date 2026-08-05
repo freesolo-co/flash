@@ -677,7 +677,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
     monkeypatch.setenv("HF_HOME", "/cache/hf")
     monkeypatch.setenv("FLASH_VERL_PYTHON", "/verl/python")
     monkeypatch.setenv("WANDB_API_KEY", "wandb-secret")
-    monkeypatch.setenv("FIREWORKS_API_KEY", "teacher-secret")
+    monkeypatch.setenv("PARASAIL_API_KEY", "teacher-secret")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "control-secret")
     monkeypatch.setenv("RUNPOD_API_KEY", "provider-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
@@ -689,7 +689,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
     assert without_wandb["FLASH_VERL_PYTHON"] == "/verl/python"
     assert "WANDB_API_KEY" not in without_wandb
     for secret in (
-        "FIREWORKS_API_KEY",
+        "PARASAIL_API_KEY",
         "FREESOLO_INTERNAL_KEY",
         "RUNPOD_API_KEY",
         "HF_TOKEN",

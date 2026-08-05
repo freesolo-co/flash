@@ -86,7 +86,7 @@ def test_authored_train_keys_follow_composed_config() -> None:
     )
     assert spec.train.temperature == 0.0
     assert spec.train.stop_sequences == ()
-    assert spec.train.teacher_model.startswith("accounts/fireworks/models/")
+    assert spec.train.teacher_model == "glm-5.2"
 
 
 def test_set_requires_key_value():
