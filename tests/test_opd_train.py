@@ -4626,6 +4626,7 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["actor_rollout_ref.model.fused_kernel_options.impl_backend"] == "torch"
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == "4"
     assert overrides["actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size"] == "4"
+    assert overrides["+ray_kwargs.ray_init.num_gpus"] == "4"
     # the engine is sized to the job's own sequence length, never a hardcoded context.
     assert overrides["actor_rollout_ref.rollout.max_model_len"] == "1536"
     assert overrides["distillation.n_gpus_per_node"] == "0"
