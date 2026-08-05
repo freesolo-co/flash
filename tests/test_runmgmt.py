@@ -329,17 +329,17 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.spec import JobSpec, TrainSpec
+        from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+        from tests._helpers.profile import satisfy_sft_profile
 
-        status = runner.submit_job(
-            JobSpec(
-                run_id="hb",
-                model="Qwen/Qwen3.5-4B",
-                algorithm="sft",
-                train=TrainSpec(max_examples=8),
-            ),
-            dry_run=True,
+        spec = JobSpec(
+            run_id="hb",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            environment=EnvironmentSpec(id="team/example"),
+            train=TrainSpec(max_examples=8),
         )
+        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
         status.state = "running"
         runner._save_status(status)
 
@@ -387,17 +387,17 @@ def test_record_heartbeat_persists_finalize_liveness_ping_with_step(monkeypatch)
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.spec import JobSpec, TrainSpec
+        from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+        from tests._helpers.profile import satisfy_sft_profile
 
-        status = runner.submit_job(
-            JobSpec(
-                run_id="hbf",
-                model="Qwen/Qwen3.5-4B",
-                algorithm="sft",
-                train=TrainSpec(max_examples=8),
-            ),
-            dry_run=True,
+        spec = JobSpec(
+            run_id="hbf",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            environment=EnvironmentSpec(id="team/example"),
+            train=TrainSpec(max_examples=8),
         )
+        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
         status.state = "running"
         runner._save_status(status)
 
@@ -659,14 +659,20 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     from flash.providers.base import Allocation, Candidate, PollResult
     from flash.runner import lifecycle
     from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="attempt-sequence",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(max_examples=1),
-        gpu=GpuSpec(type="", max_retries=1),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="attempt-sequence",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=1),
+        )
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -731,14 +737,20 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     from flash.providers.base import Allocation, Candidate, PollResult
     from flash.runner import lifecycle
     from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="pre-handle-attempt",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(max_examples=1),
-        gpu=GpuSpec(type="", max_retries=1),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="pre-handle-attempt",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=1),
+        )
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -797,14 +809,20 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     from flash.providers.base import Allocation, Candidate, PollResult
     from flash.runner import lifecycle
     from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="wall-budget",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(max_examples=1),
-        gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="wall-budget",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
+        )
     )
     runner._save_status(
         provisioned_status(runner, spec, state="running", created_at=100.0),
@@ -880,14 +898,20 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
     from flash.providers.base import Allocation, Candidate
     from flash.runner import lifecycle
     from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="retry-deadline-minimum",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(max_examples=1),
-        gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="retry-deadline-minimum",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
+        )
     )
     runner._save_status(
         provisioned_status(runner, spec, state="running", created_at=100.0),
@@ -2479,14 +2503,20 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
     from flash.providers.base import Allocation, Candidate
     from flash.runner import lifecycle
     from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id=f"terminal-handle-race-{cleanup_confirmed}",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(max_examples=1),
-        gpu=GpuSpec(type="", max_retries=2),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id=f"terminal-handle-race-{cleanup_confirmed}",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=2),
+        )
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -2568,14 +2598,20 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     from flash.providers.base import Allocation, Candidate
     from flash.runner import lifecycle
     from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="terminal-handle-race-two-remotes",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(max_examples=1),
-        gpu=GpuSpec(type="", max_retries=0),
+    # the attached profile pins a model revision, which makes the post-allocation quote refresh
+    # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="terminal-handle-race-two-remotes",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=0),
+        )
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),

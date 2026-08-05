@@ -966,6 +966,22 @@ def cost_panel(est) -> str:
     return _safe(out)
 
 
+def exact_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
+    """Profile-backed cost estimate (sft), whose inputs are measured rather than modelled.
+
+    Deliberately not cost_panel(): that panel's gpu/per-step/wall rows come from a local
+    CostEstimate, and this quote is frozen server-side, so those fields are not available here.
+    Rendering them would mean inventing the numbers the exact path exists to stop guessing.
+    """
+    panel = _kv([(k, _paint(v, _ACCENT2) if k == "run" else v) for k, v in rows])
+    total = (
+        f"  {_paint('TOTAL'.ljust(8), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} "
+        f"{_paint(f'${total_usd:.2f}', _TEAL, '1')}"
+    )
+    head = header("train", "exact cost estimate (measured workload)")
+    return _safe(f"{head}\n{panel}\n{_rule()}\n{total}")
+
+
 def project_created(project_id: str, name: str) -> str:
     """Styled project creation confirmation with the copyable id."""
     return _safe(
