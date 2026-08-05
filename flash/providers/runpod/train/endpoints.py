@@ -656,27 +656,10 @@ def _patch_runpod_backoff() -> None:
 
 
 def min_cuda_for(friendly_gpu: str) -> str:
-    """Minimum host CUDA driver version for this GPU class (Blackwell requires >=13.0).
-
-    An overriding worker image can raise the floor further: a cu13-built image crashes at CUDA
-    init on 12.x-driver hosts regardless of the GPU class, so the effective floor is the max of
-    the class floor and the image's own requirement.
-    """
-    from flash.providers._worker import worker_image_override
+    """Minimum host CUDA driver version for this GPU class (Blackwell requires >=13.0)."""
     from flash.providers.base import min_cuda_modern
 
-    floor = min_cuda_modern(friendly_gpu)
-    override = worker_image_override()
-    if override and override.min_cuda:
-        parse = lambda v: tuple(int(x) for x in v.split("."))  # noqa: E731
-        try:
-            if parse(override.min_cuda) > parse(floor):
-                return override.min_cuda
-        except ValueError:
-            raise ValueError(
-                f"FLASH_WORKER_IMAGE_MIN_CUDA must look like '13.0', got {override.min_cuda!r}"
-            ) from None
-    return floor
+    return min_cuda_modern(friendly_gpu)
 
 
 def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
