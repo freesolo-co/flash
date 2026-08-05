@@ -208,3 +208,36 @@ def test_score_single_turn_batch_falls_back_per_item_without_failing_neighbors()
         [None],
         [{"success": 1.0, "total": 1.0}],
     ]
+
+
+def test_score_single_turn_batch_isolates_a_preprocessing_failure(monkeypatch):
+    def graded_text(text, prompt_opened_thinking=False):
+        if text == "bad":
+            raise ValueError("malformed reasoning tags")
+        return text
+
+    monkeypatch.setattr(W, "graded_text", graded_text)
+    monkeypatch.setattr(W, "thinking_text", lambda text, prompt_opened_thinking=False: "")
+
+    class _Env:
+        def scores_breakdown_many(self, items):
+            pytest.fail("failed preprocessing must fall back before batch scoring")
+
+        def scores_breakdown(self, graded, ex, state):
+            return {"success": 1.0, "total": 1.0}
+
+    results = rl_train.score_single_turn_batch(
+        _Env(),
+        [("good-a", {}), ("bad", {}), ("good-b", {})],
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+    )
+
+    assert [score for score, _ in results] == [1.0, 0.0, 1.0]
+    assert [breakdowns for _, breakdowns in results] == [
+        [{"success": 1.0, "total": 1.0}],
+        [None],
+        [{"success": 1.0, "total": 1.0}],
+    ]
