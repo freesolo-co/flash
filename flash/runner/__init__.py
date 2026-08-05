@@ -22,6 +22,7 @@ try:
 except ImportError:  # pragma: no cover - linux production fails closed below
     fcntl = None
 
+from flash._paths import data_dir
 from flash.catalog import ModelInfo, resolve_model
 from flash.opd_retry_contract import (
     OPD_RETRY_CONTRACT_STATUS_KEY,
@@ -31,7 +32,7 @@ from flash.opd_retry_contract import (
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
 from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, GpuSpec, JobSpec, gpu_count_of
 
-_STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
+_STATE_DIR = str(data_dir())
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
 RESULTS_DIR = os.path.join(_STATE_DIR, "results")
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
