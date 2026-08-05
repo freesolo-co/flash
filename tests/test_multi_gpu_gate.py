@@ -20,6 +20,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._helpers.profile import satisfy_sft_profile
+
 # the keys each phase used to be selected by. all dead: no worker reads any of them now.
 _STALE_BACKEND_ENV = {
     "sft": "FLASH_SFT_BACKEND",
@@ -143,9 +145,9 @@ def test_submit_accepts_multi_gpu_on_every_provider(
 
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-        status = runner.submit_job(
-            _submittable(algorithm, count=4, provider=provider), dry_run=True
-        )
+        spec = _submittable(algorithm, count=4, provider=provider)
+        satisfy_sft_profile(runner, monkeypatch, spec)
+        status = runner.submit_job(spec, dry_run=True)
         assert status is not None
 
 
@@ -772,6 +774,10 @@ def _submittable(
         "gpu": {"type": gpu, "count": count, "provider": provider},
         "train": train,
     }
+    if algorithm == "sft":
+        # sft is workload-profiled before it is quoted, and the profile is keyed on an immutable
+        # environment revision. Pair this with satisfy_sft_profile at the submit site.
+        body["environment"] = {"id": "github:owner/repo@main:env/environment.py"}
     if backend:
         body["worker_env"] = {_STALE_BACKEND_ENV[algorithm]: backend}
     return JobSpec.from_dict(body)
@@ -789,7 +795,9 @@ def test_submit_records_the_resolved_backend(monkeypatch, algorithm, backend):
     expected = "verl"
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-        status = runner.submit_job(_submittable(algorithm, backend), dry_run=True)
+        spec = _submittable(algorithm, backend)
+        satisfy_sft_profile(runner, monkeypatch, spec)
+        status = runner.submit_job(spec, dry_run=True)
         assert (status.effective_preparation or {}).get("backend") == expected
 
 
@@ -893,13 +901,17 @@ def test_schema_preflight_applies_the_open_model_geometry_cap():
 
 
 def test_runner_preflight_applies_the_same_open_model_geometry_cap(monkeypatch):
-    """Preparation must pass the capped count to both provisional sizing and model resolution."""
+    """Preparation must pass the capped count to both provisional sizing and model resolution.
+
+    The cap is algorithm-independent, so this runs on grpo: sft would additionally drag in the
+    workload-profile gate (pinned env sha, profile record), none of which is what is under test.
+    """
     import flash.catalog as catalog
     import flash.runner as runner
     from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     seen: list[tuple[str, int]] = []
-    monkeypatch.setattr(runner, "_resolve_model_revision", lambda spec: spec)
+    monkeypatch.setattr(runner, "_resolve_model_revision", lambda spec, **_kwargs: spec)
     monkeypatch.setattr(
         "flash.providers.base.provisional_gpu",
         lambda _model, *args, gpu_count=1, **kwargs: seen.append(("preview", gpu_count)) or "H100",
@@ -920,7 +932,7 @@ def test_runner_preflight_applies_the_same_open_model_geometry_cap(monkeypatch):
         JobSpec(
             model="acme/open-12-head-model",
             model_policy="allow",
-            algorithm="sft",
+            algorithm="grpo",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(count=8),
         )

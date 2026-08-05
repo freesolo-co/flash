@@ -25,6 +25,7 @@ import types
 import pytest
 
 from flash.spec import GpuSpec, JobSpec, TrainSpec
+from tests._helpers.profile import satisfy_sft_profile
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
@@ -780,6 +781,9 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
                 "run_id": "flash-wc-1",
             }
         )
+        # sft submission is profile-gated; the cache attachment under test is not, so seed the
+        # profile rather than exercising the hub round-trips a real submit performs.
+        satisfy_sft_profile(runner, monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
     gpu = status.effective_preparation["worker_spec"]["gpu"]
     assert gpu["network_volume"] == "flash-weights"

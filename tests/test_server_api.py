@@ -1044,6 +1044,128 @@ def test_create_run_rejects_authored_warmstart_rank_before_prepare_or_persist(ap
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
+def test_sft_profile_miss_starts_a_separate_profile_run(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server import db
+
+    profile_run_id = "profile-sft-" + "a" * 64
+    submitted = []
+
+    def prepare(spec, **_kwargs):
+        profile_spec = replace(
+            spec,
+            run_id=profile_run_id,
+            workload_profile_kind="sft",
+            workload_profile_input_digest="a" * 64,
+        )
+        pending = runner.PreparedJob(
+            public_spec=profile_spec,
+            worker_spec=profile_spec,
+            estimated_cost_usd=0.25,
+        )
+        raise runner.WorkloadProfilePending(
+            profile_run_id,
+            "required",
+            prepared_job=pending,
+        )
+
+    monkeypatch.setattr(app_mod, "prepare_job", prepare)
+    monkeypatch.setattr(
+        app_mod,
+        "submit_job",
+        lambda spec, **kwargs: submitted.append((spec, kwargs)),
+    )
+
+    spec = {
+        **SPEC,
+        "algorithm": "sft",
+        "train": {"epochs": 1, "max_examples": 8},
+    }
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec},
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "code": "workload_profile_pending",
+        "profile_run_id": profile_run_id,
+        "state": "queued",
+        # this key launched it, so it may poll it and is the one being charged for it.
+        "owned": True,
+    }
+    # the real row, not a stubbed recorder: the profile is persisted as its own run under its own
+    # kind, which is what keeps its charge separate from the training run it unblocks.
+    assert db.run_owner(profile_run_id) is not None
+    assert [r["kind"] for r in db.all_runs() if r["run_id"] == profile_run_id] == ["profile"]
+    assert len(submitted) == 1
+    assert submitted[0][0].run_id == profile_run_id
+    assert submitted[0][1]["prepared_job"].estimated_cost_usd == 0.25
+
+
+def test_a_second_owner_needing_the_same_profile_is_not_blocked_by_the_first(api, monkeypatch):
+    """The profile run id is deterministic in the workload, so two owners collide on it by design.
+
+    ``runs.run_id`` is a primary key, so a plain insert raises for the second owner. That must not
+    surface as a leaked sqlite error on a submission that is otherwise fine: the profile they need
+    already exists and is already running, which is exactly the reuse the deterministic id is for.
+    What they must NOT get is ownership of the first owner's run -- run reads are owner-scoped and
+    404 for everyone else, so the response has to be the same pending 409 that tells them to wait
+    and retry, and the profile must not be launched or charged a second time.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server import db
+
+    profile_run_id = "profile-sft-" + "b" * 64
+    submitted = []
+
+    def prepare(spec, **_kwargs):
+        profile_spec = replace(
+            spec,
+            run_id=profile_run_id,
+            workload_profile_kind="sft",
+            workload_profile_input_digest="b" * 64,
+        )
+        raise runner.WorkloadProfilePending(
+            profile_run_id,
+            "required",
+            prepared_job=runner.PreparedJob(
+                public_spec=profile_spec,
+                worker_spec=profile_spec,
+                estimated_cost_usd=0.25,
+            ),
+        )
+
+    monkeypatch.setattr(app_mod, "prepare_job", prepare)
+    monkeypatch.setattr(
+        app_mod, "submit_job", lambda spec, **kwargs: submitted.append((spec, kwargs))
+    )
+
+    spec = {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 8}}
+    first = api.post("/v1/runs", headers=_bearer(_login()), json={"spec": spec})
+    assert first.status_code == 409
+    first_owner = db.run_owner(profile_run_id)
+    assert first_owner is not None
+
+    second_token = _login()
+    second = api.post("/v1/runs", headers=_bearer(second_token), json={"spec": spec})
+
+    assert second.status_code == 409, second.text
+    detail = second.json()["detail"]
+    assert detail["code"] == "workload_profile_pending"
+    assert detail["profile_run_id"] == profile_run_id
+    # and it is told the run is not its own, because polling that id would answer 404 for this key.
+    assert detail["owned"] is False
+    # ownership does not transfer, and the existing profile run is not launched a second time.
+    assert db.run_owner(profile_run_id) == first_owner
+    assert len(submitted) == 1
+    # the second submitter is not billed for a profile it did not start.
+    assert [r["run_id"] for r in db.all_runs()] == [profile_run_id]
+
+
 def test_warmstart_dry_run_persists_source_adapter_alpha(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod

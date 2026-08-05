@@ -284,12 +284,36 @@ def lookup_key(api_key: str) -> dict | None:
         return dict(row)
 
 
-def record_run(run_id: str, key_id: int) -> None:
+def record_run(run_id: str, key_id: int, *, kind: str = "train") -> None:
+    if kind not in {"train", "profile"}:
+        raise ValueError("run kind must be 'train' or 'profile'")
     with _connect() as conn:
         conn.execute(
             "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, ?, ?)",
-            (run_id, key_id, "train", time.time()),
+            (run_id, key_id, kind, time.time()),
         )
+
+
+def claim_profile_run(run_id: str, key_id: int) -> bool:
+    """Take ownership of a profile run, or report that someone already has it.
+
+    Profile run ids are deterministic in the workload, so two owners submitting the same config
+    arrive at the same id by design: that is the reuse the deterministic id exists for. Only the
+    first one records it. The insert has to decide that atomically rather than the caller reading
+    run_owner first, because two concurrent submissions would both read "absent" and the loser
+    would raise on a primary-key that is not actually a defect.
+
+    Returns True when this key now owns the row and is therefore the one that must launch the run.
+    Ownership never transfers on a conflict: run reads are owner-scoped, so the second submitter
+    waits for a run it cannot read, which is what the pending response tells it to do.
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, 'profile', ?) "
+            "ON CONFLICT(run_id) DO NOTHING",
+            (run_id, key_id, time.time()),
+        )
+        return cursor.rowcount == 1
 
 
 def delete_run(run_id: str) -> None:

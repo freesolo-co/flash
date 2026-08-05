@@ -9,6 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from flash import multimodal as mm
+from tests._helpers.profile import attach_sft_profile
+
+# one text row and one image row: the shape a ceiling-based quote cannot describe.
+_MIXED_RECORDS = [
+    {"input": "text", "output": "answer"},
+    {"input": "image", "output": "red", "image": "dataset/red.png"},
+]
 
 
 def _png_bytes(color=(255, 0, 0), size=(2, 2)) -> bytes:
@@ -404,7 +411,7 @@ def test_a_row_whose_completion_truncated_away_is_dropped_not_trained_on():
     verl pre-tokenizes to `input_ids`/`loss_mask` instead, so the check moved to `_has_real_target`
     -- same invariant, different representation, and nothing covered it after the move.
     """
-    from flash.engine.worker.sft_train import _has_real_target
+    from flash.engine.sft_workload import _has_real_target
 
     eos = 2
     special = {eos}
@@ -479,7 +486,7 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     pytest.importorskip("datasets")
     from datasets import Dataset
 
-    from flash.engine.worker import sft_train
+    from flash.engine import sft_workload
 
     completions = [
         [{"role": "assistant", "content": "red"}],
@@ -501,7 +508,7 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     # str/list `content` column makes Arrow infer a struct type and drops one shape at write time.
     assert (
         "completion_messages = text_only_prompt_messages(completion_messages)"
-        in inspect.getsource(sft_train)
+        in inspect.getsource(sft_workload)
     )
 
 
@@ -769,27 +776,22 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
         runner.get_status(spec.run_id)
 
 
-def test_cost_specs_price_the_full_context_budget_for_image_and_mixed_rows():
+def test_grpo_prices_the_full_context_budget_for_image_and_mixed_rows():
+    """An image prompt occupies its context budget, so grpo prices the budget, not the text length.
+
+    sft used to be asserted here against the same ceiling. It no longer prices from the ceiling at
+    all: the workload profile measures the tokens the rows actually produce, which for a mixed
+    dataset is the whole point of measuring. The companion test below holds the multimodal half of
+    that -- an image sft run cannot be quoted from an assumed context.
+    """
     from flash.cost.spec import runconfig_from_spec
     from flash.spec import JobSpec
 
-    mixed_records = [
-        {"input": "text", "output": "answer"},
-        {"input": "image", "output": "red", "image": "dataset/red.png"},
-    ]
-    sft_spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-4B",
-            "algorithm": "sft",
-            "environment": {"id": "local", "params": {"records": mixed_records}},
-            "train": {"epochs": 1, "max_examples": 2, "max_context_tokens": 1536},
-        }
-    )
     grpo_spec = JobSpec.from_dict(
         {
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
-            "environment": {"id": "local", "params": {"records": mixed_records}},
+            "environment": {"id": "local", "params": {"records": _MIXED_RECORDS}},
             "train": {
                 "epochs": 1,
                 "max_examples": 2,
@@ -799,8 +801,35 @@ def test_cost_specs_price_the_full_context_budget_for_image_and_mixed_rows():
         }
     )
 
-    assert runconfig_from_spec(sft_spec).seq_len == 1536
     assert runconfig_from_spec(grpo_spec).seq_len == 2048
+
+
+def test_image_sft_cannot_be_priced_from_an_assumed_context():
+    """The failure mode this replaces: quoting a mixed dataset off max_context_tokens.
+
+    Image rows and text rows produce wildly different token counts, so a ceiling-based quote for a
+    mixed dataset is a guess wearing an exact number. Pricing now requires the profile that
+    tokenized these exact rows, and without one the quote fails rather than defaulting.
+    """
+    from flash.cost.spec import runconfig_from_spec
+    from flash.spec import JobSpec
+    from flash.workload_profile import WorkloadProfileMismatch
+
+    sft_spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "environment": {"id": "local", "params": {"records": _MIXED_RECORDS}},
+            "train": {"epochs": 1, "max_examples": 2, "max_context_tokens": 1536},
+        }
+    )
+
+    with pytest.raises(WorkloadProfileMismatch):
+        runconfig_from_spec(sft_spec)
+
+    # with the measurement attached, the priced length is the profile's, never the config ceiling.
+    priced = runconfig_from_spec(attach_sft_profile(sft_spec))
+    assert priced.seq_len == attach_sft_profile(sft_spec).workload_profile["max_length"]
 
 
 def test_catalog_image_capability_does_not_change_public_rows():

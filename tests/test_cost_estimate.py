@@ -212,12 +212,17 @@ def test_estimate_exact_gpu_enforces_provider_support_and_vram():
 def test_runconfig_from_spec_preserves_gpu_constraints():
     from flash.cost.spec import runconfig_from_spec
     from flash.spec import GpuSpec, JobSpec, TrainSpec
+    from tests._helpers.profile import attach_sft_profile
 
-    spec = JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
-        algorithm="sft",
-        train=TrainSpec(epochs=1, max_examples=8),
-        gpu=GpuSpec(provider="runpod", type="H100", disk_gb=200),
+    # the subject is hardware passthrough, not sft pricing; the profile is attached because
+    # prepare_job is the only producer of an sft spec and cannot emit one without a matching profile.
+    spec = attach_sft_profile(
+        JobSpec(
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="sft",
+            train=TrainSpec(epochs=1, max_examples=8),
+            gpu=GpuSpec(provider="runpod", type="H100", disk_gb=200),
+        )
     )
 
     config = runconfig_from_spec(spec)

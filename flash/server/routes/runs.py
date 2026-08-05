@@ -193,8 +193,12 @@ def create_run(
             status_code=400,
             detail="org id is required to bill a completed training run",
         )
+    # a workload profile is a separate job that really runs, so it bills on its own completion
+    # whenever the key is billable -- including under `--dry-run`. dry-run previews the TRAINING
+    # run; it does not make work that actually executed free.
+    profile_billing_context = {"org_id": affordability_org_id} if billable_key else None
     if bill_on_completion:
-        billing_context = {"org_id": affordability_org_id}
+        billing_context = profile_billing_context
     platform_context = {
         field: value
         for field, value in {
@@ -234,6 +238,54 @@ def create_run(
                     f"train.init_from_adapter source {source_ref!r} could not be prepared; "
                     "verify that the source adapter is complete, compatible, and unchanged"
                 ),
+            ) from exc
+        except _runner.WorkloadProfilePending as exc:
+            pending = exc.prepared_job
+            state = exc.state
+            if isinstance(pending, _runner.PreparedJob):
+                profile_run_id = pending.public_spec.run_id
+                # claim before spending anything on it. the id is deterministic in the workload, so
+                # another key may already own this exact profile -- in which case it is already
+                # running and this submitter neither launches it again nor pays for it a second
+                # time. losing the claim is ordinary reuse, not an error; it just means waiting.
+                if db.claim_profile_run(profile_run_id, key["id"]):
+                    profile_submit_kwargs = {
+                        "background": True,
+                        "owner_key_id": key["id"],
+                        "prepared_job": pending,
+                    }
+                    if runtime_secrets:
+                        profile_submit_kwargs["runtime_secrets"] = runtime_secrets
+                    if profile_billing_context:
+                        profile_submit_kwargs["billing_context"] = profile_billing_context
+                    if platform_context:
+                        profile_submit_kwargs["platform_context"] = platform_context
+                    try:
+                        if billable_key:
+                            _precheck_budget_or_block(
+                                run_id=profile_run_id,
+                                estimate_usd=pending.estimated_cost_usd,
+                                org_id=affordability_org_id,
+                            )
+                        _app.submit_job(pending.public_spec, **profile_submit_kwargs)
+                    except Exception:
+                        # the claim only means "this key launches it". if the launch does not
+                        # happen the row must go, or the deterministic id stays claimed by a run
+                        # that never ran and every later submitter waits on it forever.
+                        db.delete_run(profile_run_id)
+                        raise
+                state = "queued"
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workload_profile_pending",
+                    "profile_run_id": exc.profile_run_id,
+                    "state": state,
+                    # whether THIS key can read that run. the id is deterministic, so a submitter
+                    # can be waiting on a profile another key launched -- telling them to poll a
+                    # run id that answers 404 for them would read as the server inventing an id.
+                    "owned": db.run_owner(exc.profile_run_id) == key["id"],
+                },
             ) from exc
         run_id = prepared.public_spec.run_id
         # validate the spec BEFORE charging affordability against it. submit_job runs these same

@@ -393,6 +393,59 @@ def test_record_run_rejects_unknown_key_id(isolated_db) -> None:
     assert isolated_db.all_runs() == []
 
 
+def test_claim_profile_run_gives_the_row_to_exactly_one_of_two_racing_keys(isolated_db) -> None:
+    """Profile ids are deterministic in the workload, so two keys reach the same id concurrently.
+
+    Exactly one may be told to launch it. Reading ownership first and inserting after would let
+    both read "absent" inside the same window and both claim, which is why the decision has to be
+    the insert itself.
+    """
+    owners = []
+    barrier = threading.Barrier(2)
+
+    def claim(index: int) -> bool:
+        row = isolated_db.ensure_external_key(f"fslo_racer_{index}")
+        assert row is not None
+        owners.append(row["id"])
+        barrier.wait()
+        return isolated_db.claim_profile_run("profile-sft-race", row["id"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        won = list(executor.map(claim, range(2)))
+
+    assert sorted(won) == [False, True], "exactly one claimant may launch the profile"
+    # the row belongs to whichever key won, and to only that key: the loser waits on a run it
+    # cannot read rather than inheriting one it never launched.
+    assert isolated_db.run_owner("profile-sft-race") in owners
+    assert [r["run_id"] for r in isolated_db.all_runs()] == ["profile-sft-race"]
+
+
+def test_claim_profile_run_records_the_profile_kind_and_keeps_the_first_owner(isolated_db) -> None:
+    owner_a = isolated_db.ensure_external_key("fslo_claim_a")
+    owner_b = isolated_db.ensure_external_key("fslo_claim_b")
+    assert owner_a is not None
+    assert owner_b is not None
+
+    assert isolated_db.claim_profile_run("profile-sft-shared", owner_a["id"]) is True
+    assert isolated_db.claim_profile_run("profile-sft-shared", owner_b["id"]) is False
+    assert isolated_db.run_owner("profile-sft-shared") == owner_a["id"]
+    # kind is what keeps the profile charge separate from the training run it unblocks, so a claim
+    # that recorded it as a train run would merge the two charges under one kind.
+    assert [r["kind"] for r in isolated_db.all_runs()] == ["profile"]
+
+
+def test_claim_profile_run_still_rejects_an_unknown_key(isolated_db) -> None:
+    """DO NOTHING must absorb the duplicate id only, not every integrity failure.
+
+    A conflict clause that also swallowed the foreign-key violation would report False for an
+    orphan claim -- indistinguishable from "someone else owns it" -- and the caller would answer
+    "wait for the profile" for a run that no key owns and nobody will ever launch.
+    """
+    with pytest.raises(sqlite3.IntegrityError):
+        isolated_db.claim_profile_run("profile-sft-orphan", 999)
+    assert isolated_db.all_runs() == []
+
+
 def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -> None:
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

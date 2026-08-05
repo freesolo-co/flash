@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import types
 
 import pytest
@@ -12,7 +13,9 @@ from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.cost.types import RunConfig
 from flash.engine.recipe import RECIPE
-from flash.schema import ConfigError, spec_from_dict
+from flash.schema import spec_from_dict
+from flash.workload_profile import WorkloadProfileMismatch
+from tests._helpers.profile import attach_sft_profile
 
 GRPO_RAW = {
     "model": "Qwen/Qwen3.5-9B",
@@ -217,142 +220,87 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
     assert _runconfig_from_spec(_spec()).teacher_model == ""
 
 
-def test_sft_steps_derived_from_examples():
+def test_sft_cost_requires_the_measured_workload_rather_than_deriving_one():
+    """sft has no analytical step count left: without a profile the quote refuses to exist.
+
+    The old path derived steps from ``max_examples`` and priced a 128-token-per-row prior. Both are
+    gone, so the failure has to be an explicit mismatch, not a plausible number.
+    """
     spec = spec_from_dict(
         {
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "sft",
             "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
-            "train": {
-                "max_examples": 320,
-                "batch_size": 16,
-                "epochs": 2,
-            },
+            "train": {"max_examples": 320, "batch_size": 16, "epochs": 2},
             "gpu": {},
         }
     )
-    # batch_size 16 is a multiple of the per-device micro-batch (4) so realized == requested:
-    # epochs(2) x ceil(320 / 16) = 40.
-    assert _spec_steps(spec) == 40
+
+    assert spec.train.max_examples == 320
+    for call in (_spec_steps, _runconfig_from_spec):
+        with pytest.raises(WorkloadProfileMismatch):
+            call(spec)
+
+
+def test_sft_cost_reads_the_horizon_and_tokens_the_profile_measured():
+    """Every exact field reaches ``RunConfig`` from the profile rather than from the config.
+
+    Scope: this is the wiring, not the measurement. ``tests/test_sft_workload.py`` owns whether the
+    measured numbers are right, and the helper's profile mirrors the config's own shape, so equality
+    with a config-derived number here would prove nothing on its own. What it does pin is that the
+    estimator reads ``authoritative_steps``/token/packing fields that only a profile carries -- and
+    ``seq_len``, which the config leaves unset entirely.
+    """
+    spec = attach_sft_profile(
+        spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "sft",
+                "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
+                "train": {"max_examples": 320, "batch_size": 16, "epochs": 2},
+                "gpu": {},
+            }
+        )
+    )
+    profile = spec.workload_profile
+
     cfg = _runconfig_from_spec(spec)
+
     assert cfg.method == "sft"
-    assert cfg.group_size is None  # SFT carries no completions-per-prompt
+    assert cfg.steps == _spec_steps(spec) == profile["authoritative_steps"]
+    assert cfg.batch_size == profile["examples_per_update"]
+    assert cfg.seq_len == profile["max_length"]
+    assert cfg.train_tokens == profile["authoritative_compute_tokens"]
+    assert cfg.supervised_train_tokens == profile["authoritative_supervised_tokens"]
+    assert cfg.sft_packing_mode == profile["packing_mode"]
+    assert cfg.sft_packed_blocks == profile["packed_blocks"]
+    assert cfg.group_size is None  # sft carries no completions-per-prompt
     assert cfg.completion_len is None
 
 
-def _sft_spec(**train):
-    raw = {
-        "model": "Qwen/Qwen3.5-4B",
-        "algorithm": "sft",
-        "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
-        "train": {**train},
-        "gpu": {},
-    }
-    return spec_from_dict(raw)
+def test_sft_cost_rejects_a_profile_keyed_to_a_different_workload():
+    """Editing a workload-shaping field after the profile was measured must not reprice silently."""
+    spec = attach_sft_profile(
+        spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "sft",
+                "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
+                "train": {"max_examples": 320, "batch_size": 16, "epochs": 2},
+                "gpu": {},
+            }
+        )
+    )
+    retuned = dataclasses.replace(spec, train=dataclasses.replace(spec.train, epochs=3))
 
-
-def _worker_sft_steps(*, examples, requested_batch, epochs, max_steps=0):
-    """Independent re-derivation of the worker's per-seed SFT optimizer-step count (engine.worker:
-    fixed per-device micro-batch 4 + ceil grad-accum -> realized global batch), to pin _spec_steps
-    against what actually runs."""
-    from flash.engine.vram import _sft_per_device_bs
-
-    per_device = max(1, min(_sft_per_device_bs(), requested_batch))
-    grad_accum = max(1, -(-requested_batch // per_device))
-    realized = per_device * grad_accum
-    n = max(1, -(-examples // realized) * epochs)
-    return max_steps if max_steps > 0 else n
-
-
-def test_sft_steps_default_epochs_mirror_the_worker():
-    # No [train].epochs -> the worker uses RECIPE.sft.num_epochs (2), NOT 1. The estimate must too.
-    spec = _sft_spec(max_examples=320, batch_size=16)  # epochs omitted
-    assert spec.train.epochs is None
-    assert RECIPE.sft.num_epochs == 2
-    assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
-
-
-def test_sft_steps_use_worker_realized_grad_accum_batch():
-    # batch_size 6 is NOT a multiple of the micro-batch (4): the worker realizes per_device(4) x
-    # grad_accum(ceil(6/4)=2) = 8, so steps = epochs(2) x ceil(320/8) = 80 -- NOT the raw-batch
-    # ceil(320/6)*2 = 108. Pin the estimator to the worker's independent step derivation here on the
-    # UNPACKED path (context > 16k): the chunked-nll gdn-packing special-case that deliberately prices
-    # the requested batch conservatively only applies at packable (<=16k) context and is covered by
-    # test_sft_steps_price_gdn_packing_conservatively.
-    spec = _sft_spec(max_examples=320, batch_size=6, epochs=2, max_context_tokens=16_385)
-    assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=6, epochs=2) == 80
-
-
-def test_sft_steps_unpinned_requires_max_examples():
-    # --cost no longer imports/counts the environment. SFT must pin max_examples explicitly.
-    with pytest.raises(ConfigError, match=r"max_examples.*positive"):
-        _sft_spec(batch_size=16, epochs=2)
-
-
-def test_sft_steps_max_examples_zero_requires_positive_cap_for_cost():
-    # max_examples = 0 still means "no cap" to the worker, but --cost needs a positive row count.
-    with pytest.raises(ConfigError, match=r"max_examples.*positive"):
-        _sft_spec(max_examples=0, batch_size=16, epochs=2)
-
-
-def test_sft_steps_pinned_examples_are_used_as_the_cost_row_count(capsys):
-    # An explicit [train].max_examples prices exactly that, with no environment fallback.
-    spec = _sft_spec(max_examples=320, batch_size=16, epochs=2)
-    assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
-    assert "could not count" not in capsys.readouterr().err
-
-
-def test_sft_runconfig_does_not_count_env_train_tokens():
-    spec = _sft_spec(max_examples=320, batch_size=16, epochs=2)
-    cfg = _runconfig_from_spec(spec)
-    assert cfg.steps == 40
-    assert cfg.train_tokens is None
+    with pytest.raises(WorkloadProfileMismatch, match="input digest"):
+        _runconfig_from_spec(retuned)
 
 
 def test_runconfig_preserves_positional_seq_len_compatibility():
     cfg = RunConfig("Qwen/Qwen3.5-4B", "sft", 10, 2048)
     assert cfg.seq_len == 2048
     assert cfg.train_tokens is None
-
-
-def test_sft_positive_max_steps_is_authoritative():
-    below_derived = _sft_spec(max_examples=10_000, batch_size=16, epochs=2, max_steps=5)
-    above_derived = _sft_spec(max_examples=16, batch_size=16, epochs=1, max_steps=9)
-    assert _spec_steps(below_derived) == 5
-    assert _spec_steps(above_derived) == 9
-
-
-def test_sft_steps_price_gdn_packing_conservatively():
-    # qwen chunked nll permits a per-device batch of four, but the worker's gdn packing path forces
-    # per-device=1. price the requested batch so a non-multiple-of-four request cannot underquote.
-    import math
-
-    from flash.catalog import vocab_size_for
-    from flash.engine.vram import sft_chunked_nll_enabled, sft_per_device, sft_realized_batch
-
-    raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
-        "algorithm": "sft",
-        "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
-        "train": {
-            "max_examples": 320,
-            "batch_size": 6,
-            "epochs": 2,
-            "max_context_tokens": 1024,
-        },
-        "gpu": {},
-    }
-    spec = spec_from_dict(raw)
-    v = vocab_size_for("Qwen/Qwen3.5-0.8B")
-    chunked = sft_chunked_nll_enabled(spec.model)
-    assert chunked is True
-    assert sft_per_device(6, seq_len=1024, vocab=v, fused=chunked) == 4
-    assert sft_realized_batch(6, seq_len=1024, vocab=v, fused=chunked) == 8
-    assert _spec_steps(spec) == math.ceil(320 / 6) * 2 == 108
-
-    raw["train"]["max_context_tokens"] = 16_385
-    unpacked_spec = spec_from_dict(raw)
-    assert _spec_steps(unpacked_spec) == math.ceil(320 / 8) * 2 == 80
 
 
 def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
@@ -386,6 +334,353 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     assert "TOTAL" in out
     assert "$" in out
     assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
+
+
+SFT_TOML = (
+    'model = "Qwen/Qwen3.5-4B"\n'
+    'project = "11111111-1111-4111-8111-111111111111"\n'
+    'algorithm = "sft"\n'
+    "[environment]\n"
+    'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+    "[train]\n"
+    "epochs = 1\n"
+    "batch_size = 8\n"
+    "[gpu]\n"
+)
+
+PROFILE_RUN_ID = "profile-sft-" + "a" * 64
+
+EXACT_PROFILE = {
+    "authoritative_steps": 7,
+    "selected_examples": 10,
+    "retained_examples": 8,
+    "dropped_examples": 2,
+    "authoritative_compute_tokens": 4096,
+    "authoritative_supervised_tokens": 2048,
+    "packing_mode": "packed",
+    "architecture_mode": "pure-attention",
+    "content_digest": "b" * 64,
+}
+
+
+def _sft_args(tmp_path, body: str = SFT_TOML, **overrides):
+    cfg = tmp_path / "sft.toml"
+    cfg.write_text(body)
+    return types.SimpleNamespace(
+        config=str(cfg),
+        overrides=[],
+        extra_configs=[],
+        cost=True,
+        dry_run=False,
+        background=False,
+        **overrides,
+    )
+
+
+class _QuotingClient:
+    """Server that already holds a matching profile and answers the dry-run with an exact quote."""
+
+    def __init__(self, response: dict | None = None):
+        self.calls: list[dict] = []
+        self.response = (
+            {"estimated_cost_usd": 1.25, "workload_profile": dict(EXACT_PROFILE)}
+            if response is None
+            else response
+        )
+
+    def create_run(self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None):
+        self.calls.append(
+            {
+                "spec": spec,
+                "runtime_secrets": runtime_secrets,
+                "dry_run": dry_run,
+                "client_train_schema": client_train_schema,
+            }
+        )
+        return dict(self.response)
+
+
+class _PendingClient:
+    """Server with no matching profile: it starts one and rejects the quote with 409."""
+
+    def __init__(
+        self, *, state: str = "queued", profile_quote: object = 0.25, owned: bool | None = True
+    ):
+        from flash.client import ApiError
+
+        detail = {
+            "code": "workload_profile_pending",
+            "profile_run_id": PROFILE_RUN_ID,
+            "state": state,
+        }
+        if owned is not None:
+            detail["owned"] = owned
+        self.error = ApiError(409, "workload profile pending", detail=detail)
+        self.profile_quote = profile_quote
+        self.get_run_calls: list[str] = []
+
+    def create_run(self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None):
+        raise self.error
+
+    def get_run(self, run_id):
+        self.get_run_calls.append(run_id)
+        return {"run_id": run_id, "state": "queued", "estimated_cost_usd": self.profile_quote}
+
+
+def _use_client(monkeypatch, client):
+    from flash.cli import commands
+
+    monkeypatch.setattr(commands, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    return client
+
+
+def test_sft_cost_asks_the_server_for_the_exact_quote_without_creating_a_training_run(
+    tmp_path, monkeypatch, capsys
+):
+    """sft ``--cost`` is a dry-run submit, because only the server can hold the profile.
+
+    The public payload must stay public: the internal profile carrier is what the server attaches
+    after measuring, so a client that could send one could also fabricate the workload its own
+    quote is derived from.
+    """
+    client = _use_client(monkeypatch, _QuotingClient())
+
+    rc = cmd_train(_sft_args(tmp_path))
+
+    assert rc == 0
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    assert call["dry_run"] is True
+    assert not any(key.startswith("workload_profile") for key in call["spec"])
+
+
+def test_sft_cost_reports_the_measured_workload_and_no_invented_hardware(
+    tmp_path, monkeypatch, capsys
+):
+    """The panel prints what was measured. It must not fabricate the timing fields it no longer has.
+
+    The analytical breakdown named a GPU, an hourly rate, and a per-step time. An exact quote is
+    computed server-side, so reprinting that layout here would mean inventing every number in it.
+    """
+    _use_client(monkeypatch, _QuotingClient())
+
+    rc = cmd_train(_sft_args(tmp_path))
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "$1.25" in captured.out
+    assert "7 steps" in captured.out
+    assert "8 trained of 10 selected" in captured.out
+    assert "(2 dropped)" in captured.out
+    assert "4,096 compute, 2,048 supervised" in captured.out
+    assert "packed (pure-attention)" in captured.out
+    assert "bbbbbbbbbbbb" in captured.out
+    for invented in ("/hr", "setup", "per-step", "train_seconds"):
+        assert invented not in captured.out
+    assert "nothing was charged for training" in captured.err
+
+
+def test_sft_cost_omits_aggregates_the_profile_did_not_report(tmp_path, monkeypatch, capsys):
+    """A partial profile drops rows rather than defaulting them to zero."""
+    _use_client(
+        monkeypatch,
+        _QuotingClient({"estimated_cost_usd": 0.5, "workload_profile": {"authoritative_steps": 3}}),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "3 steps" in out
+    assert "$0.50" in out
+    for absent in ("examples", "tokens", "workload", "profile"):
+        assert f"{absent}  " not in out
+
+
+@pytest.mark.parametrize("quote", [None, True, "1.25"])
+def test_sft_cost_refuses_to_print_a_total_the_server_did_not_quote(
+    tmp_path, monkeypatch, quote, capsys
+):
+    """No estimate means no panel. ``True`` matters on its own: bool is an int subclass, so an
+    unchecked numeric test would render a JSON ``true`` as ``$1.00``."""
+    from flash.client import ClientError
+
+    response = {"workload_profile": dict(EXACT_PROFILE)}
+    if quote is not None:
+        response["estimated_cost_usd"] = quote
+    _use_client(monkeypatch, _QuotingClient(response))
+
+    with pytest.raises(ClientError, match="no cost estimate"):
+        cmd_train(_sft_args(tmp_path))
+    assert "$" not in capsys.readouterr().out
+
+
+def test_sft_cost_on_a_profile_miss_explains_the_separate_charge_and_fails(
+    tmp_path, monkeypatch, capsys
+):
+    """A miss must not read as "your training started". It started a different, billed job.
+
+    The user asked what training would cost and instead incurred a charge. Naming the profile run,
+    its own quote, and what was NOT charged is the difference between that and a surprise.
+    """
+    from flash.client import ClientError
+
+    client = _use_client(monkeypatch, _PendingClient())
+
+    with pytest.raises(ClientError, match=f"workload profile {PROFILE_RUN_ID} is queued"):
+        cmd_train(_sft_args(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "$0.25" in err
+    assert "billed on its own" in err
+    assert "no training run was created" in err
+    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert client.get_run_calls == [PROFILE_RUN_ID]
+
+
+@pytest.mark.parametrize("quote", [True, "0.25", None])
+def test_sft_cost_pending_omits_the_charge_it_cannot_read(tmp_path, monkeypatch, quote, capsys):
+    """An unreadable profile quote drops the amount rather than inventing one."""
+    from flash.client import ClientError
+
+    _use_client(monkeypatch, _PendingClient(profile_quote=quote))
+
+    with pytest.raises(ClientError):
+        cmd_train(_sft_args(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "billed on its own;" in err
+    assert "$" not in err
+
+
+def test_sft_cost_pending_on_someone_elses_profile_promises_no_charge_and_no_poll(
+    tmp_path, monkeypatch, capsys
+):
+    """A profile another key launched is not readable here, so neither instruction may be repeated.
+
+    The id is deterministic in the workload, so this is ordinary reuse. Telling the user to poll it
+    would send them to a 404, and telling them they were billed for it would be false: they were
+    not charged, and nothing was started on their behalf.
+    """
+    from flash.client import ClientError
+
+    client = _use_client(monkeypatch, _PendingClient(owned=False))
+
+    with pytest.raises(ClientError, match=f"workload profile {PROFILE_RUN_ID} is queued"):
+        cmd_train(_sft_args(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "already being measured" in err
+    assert "nothing was started or charged here" in err
+    assert "runs status" not in err
+    assert "$" not in err
+    # no charge was quoted, so the unreadable run is never fetched to price one.
+    assert client.get_run_calls == []
+
+
+def test_sft_cost_pending_without_an_ownership_flag_keeps_the_owner_wording(
+    tmp_path, monkeypatch, capsys
+):
+    """An older server omits ``owned``. Absent must mean "yours", not "someone else's".
+
+    Reading a missing key as not-owned would tell every user of such a server that they were not
+    charged for a profile run they in fact own and are paying for.
+    """
+    from flash.client import ClientError
+
+    client = _use_client(monkeypatch, _PendingClient(owned=None))
+
+    with pytest.raises(ClientError):
+        cmd_train(_sft_args(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "billed on its own" in err
+    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert client.get_run_calls == [PROFILE_RUN_ID]
+
+
+def test_sft_dry_run_shares_the_profile_pending_path(tmp_path, monkeypatch, capsys):
+    """`train --dry-run` hits the same miss and must explain it identically, not print a traceback."""
+    from flash.client import ClientError
+
+    args = _sft_args(tmp_path)
+    args.cost, args.dry_run = False, True
+    _use_client(monkeypatch, _PendingClient())
+
+    with pytest.raises(ClientError, match="workload profile"):
+        cmd_train(args)
+    assert "no training run was created" in capsys.readouterr().err
+
+
+def test_sft_cost_leaves_unrelated_api_errors_alone(tmp_path, monkeypatch):
+    """Only the profile-pending code is translated; every other rejection surfaces as itself."""
+    from flash.client import ApiError
+
+    class _Rejecting:
+        def create_run(self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None):
+            raise ApiError(402, "insufficient balance")
+
+    _use_client(monkeypatch, _Rejecting())
+
+    with pytest.raises(ApiError, match="insufficient balance"):
+        cmd_train(_sft_args(tmp_path))
+
+
+def test_sft_cost_forwards_declared_secrets_without_printing_them(tmp_path, monkeypatch, capsys):
+    """A declared secret reaches the server out of band and appears in neither the spec nor output."""
+    monkeypatch.setenv("MY_ENV_TOKEN", "s3cret-value")
+    client = _use_client(monkeypatch, _QuotingClient())
+    body = SFT_TOML.replace(
+        'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n',
+        'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\nsecrets = ["MY_ENV_TOKEN"]\n',
+    )
+
+    assert cmd_train(_sft_args(tmp_path, body)) == 0
+
+    call = client.calls[0]
+    assert call["runtime_secrets"]["MY_ENV_TOKEN"] == "s3cret-value"
+    assert "s3cret-value" not in repr(call["spec"])
+    captured = capsys.readouterr()
+    assert "s3cret-value" not in captured.out + captured.err
+
+
+def test_sft_cost_warns_when_an_env_key_shadows_the_saved_login(tmp_path, monkeypatch, capsys):
+    """The generic ``--cost`` hook stays quiet because it cannot know the algorithm yet. sft does
+    reach an organization and can start a billed profile there, so it warns for itself."""
+    from flash.cli import commands
+
+    monkeypatch.setattr(commands, "shadowed_login_warning", lambda: "shadowed!")
+    _use_client(monkeypatch, _QuotingClient())
+
+    assert cmd_train(_sft_args(tmp_path)) == 0
+    assert "shadowed!" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
+    """grpo/opd keep the local analytical quote until PR2 profiles their rollouts.
+
+    Asserted by making the client constructor itself fatal: a passing quote then proves no
+    authenticated request was possible, not merely that none was observed.
+    """
+    from flash.cli import commands
+
+    def _forbidden(*_a, **_kw):
+        raise AssertionError(f"{algorithm} --cost must not contact the control plane")
+
+    monkeypatch.setattr(commands, "client_from_config", _forbidden)
+    monkeypatch.setattr(commands, "shadowed_login_warning", lambda: "shadowed!")
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    # group_size 2 is grpo's floor (advantages are group-relative) and is valid for opd too.
+    body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
+        "batch_size = 8\n", "batch_size = 8\nmax_examples = 40\ngroup_size = 2\n"
+    )
+
+    assert cmd_train(_sft_args(tmp_path, body)) == 0
+    captured = capsys.readouterr()
+    assert "TOTAL" in captured.out
+    assert "shadowed!" not in captured.err
 
 
 def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):

@@ -165,7 +165,9 @@ JOB_SPEC = load_job_spec_from_env()
 SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
 PHASE = os.environ.get(
     "PHASE",
-    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
+    JOB_SPEC.phase
+    if JOB_SPEC
+    else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd", "profile") else "sft"),
 )
 OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
 
@@ -295,10 +297,13 @@ def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
 
 def main():
     try:
+        from flash.engine.worker.sft_profile import run_sft_profile
+
         modes = {
             "sft": run_sft,
             "rl": run_rl,
             "opd": run_opd,
+            "profile": run_sft_profile,
         }
         handler = modes.get(RUN_MODE)
         if handler is None:
@@ -369,6 +374,13 @@ def main():
                     "DONE present but metrics.json unreadable after retries "
                     f"(transient HF; {error_kind})"
                 )
+        if RUN_MODE == "profile":
+            heartbeat("boot")
+            handler()
+            wandb_finish(exit_code=0)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         # BEFORE any model import / fla dispatch: on sm100 the baked tilelang GDN backend
         # computes wrong gradients — opt out so fla uses its (correct-there) Triton path.
         _force_fla_triton_gdn_on_sm100()

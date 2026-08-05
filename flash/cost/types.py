@@ -49,6 +49,9 @@ class RunConfig:
     # Spec gpu.count: cards the job occupies. total cost scales linearly with it (n cards for the
     # billed training wall); 1 = the historical single-gpu quote.
     gpu_count: int = 1
+    supervised_train_tokens: int | None = None
+    sft_packing_mode: str = ""
+    sft_packed_blocks: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -91,6 +94,15 @@ class RunConfig:
                 raise ValueError(f"{_name} must be >= 1, got {_val}")
         if self.train_tokens is not None and self.train_tokens < 1:
             raise ValueError(f"train_tokens must be >= 1, got {self.train_tokens}")
+        if self.supervised_train_tokens is not None:
+            if self.supervised_train_tokens < 1:
+                raise ValueError("supervised_train_tokens must be >= 1")
+            if self.train_tokens is None or self.supervised_train_tokens > self.train_tokens:
+                raise ValueError("supervised_train_tokens cannot exceed train_tokens")
+        if self.sft_packing_mode not in {"", "packed", "exact-unpacked"}:
+            raise ValueError("unsupported sft_packing_mode")
+        if self.sft_packed_blocks is not None and self.sft_packed_blocks < 1:
+            raise ValueError("sft_packed_blocks must be >= 1")
         save_at_steps = parse_positive_int_tuple(self.save_at_steps, name="save_at_steps")
         if save_at_steps and save_at_steps[-1] > self.steps:
             raise ValueError("save_at_steps cannot exceed steps")
