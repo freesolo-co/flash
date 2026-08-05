@@ -487,6 +487,28 @@ def test_cmd_env_pull_whole_env(monkeypatch, tmp_path):
     assert (dest / "datasets" / "train.jsonl").is_file()
 
 
+def test_cmd_env_pull_whole_env_preserves_toml_configs(monkeypatch, tmp_path):
+    sft_config = b"[training]\nalgorithm = 'sft'\n"
+    opd_config = b"[teacher]\nthinking = true\n"
+    _patch_client(
+        monkeypatch,
+        _package_tarball(
+            {
+                "environment.py": b"# env\n",
+                "configs/sft.toml": sft_config,
+                "configs/nested/opd.toml": opd_config,
+            }
+        ),
+    )
+    dest = tmp_path / "stuff"
+
+    rc = cmd_env_pull(_margs(output=str(dest)))
+
+    assert rc == 0
+    assert (dest / "configs" / "sft.toml").read_bytes() == sft_config
+    assert (dest / "configs" / "nested" / "opd.toml").read_bytes() == opd_config
+
+
 def test_cmd_env_pull_whole_env_refuses_nonempty_dest_without_force(monkeypatch, tmp_path):
     _patch_client(
         monkeypatch,

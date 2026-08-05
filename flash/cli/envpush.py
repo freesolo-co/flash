@@ -762,9 +762,9 @@ def _iter_env_sidecar_files(
     if not include_full_tree:
         import ast
 
-        # a single-file push carries only the entrypoint, its dataset sidecars, and its own
-        # docs. ship user-authored docs so the synthesized stub readme does not stand in for
-        # real training guidance the user shipped next to the module.
+        # a single-file push uses bounded sidecar selections. root *.toml and recursive
+        # configs/**/*.toml are handled explicitly below rather than widening to neighbouring trees.
+        # ship user-authored docs so the synthesized stub readme does not replace real guidance.
         for doc_name in ("README.md", "TRAINING.md"):
             doc = env_root / doc_name
             if doc.is_file() and not _ignore_env_push_path(
@@ -772,6 +772,43 @@ def _iter_env_sidecar_files(
             ):
                 yielded.add(doc)
                 yield doc, doc.relative_to(env_root)
+        # root config files and the conventional configs tree are runtime inputs, not a request to
+        # widen an exact-file push to unrelated neighbouring trees. apply the shared ignore policy
+        # and yielded set so the limit and copy passes select the identical safe members.
+        for config in sorted(env_root.iterdir()):
+            if (
+                config.is_file()
+                and config.suffix.lower() == ".toml"
+                and config not in yielded
+                and not _ignore_env_push_path(config, env_root=env_root, entrypoint=entrypoint)
+            ):
+                yielded.add(config)
+                yield config, config.relative_to(env_root)
+        configs = env_root / "configs"
+        if configs.is_dir() and not _ignore_env_push_path(
+            configs, env_root=env_root, entrypoint=entrypoint
+        ):
+            for root, dirs, files in os.walk(
+                configs, topdown=True, followlinks=False, onerror=_raise_walk_error
+            ):
+                root_path = Path(root)
+                dirs[:] = sorted(
+                    name
+                    for name in dirs
+                    if not _ignore_env_push_path(
+                        root_path / name, env_root=env_root, entrypoint=entrypoint
+                    )
+                )
+                for name in sorted(files):
+                    config = root_path / name
+                    if (
+                        config.suffix.lower() != ".toml"
+                        or config in yielded
+                        or _ignore_env_push_path(config, env_root=env_root, entrypoint=entrypoint)
+                    ):
+                        continue
+                    yielded.add(config)
+                    yield config, config.relative_to(env_root)
         # the entrypoint's OWN imports ship, exactly as its evaluation sidecar's do. seeding the
         # closure only from evaluations.py published an environment whose entrypoint imported
         # siblings without them: `env push` exits 0 and prints an id, so nothing surfaces until a
