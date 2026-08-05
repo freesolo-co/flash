@@ -1632,18 +1632,6 @@ def score_single_turn_batch(
     if not requests:
         return []
 
-    prepared = []
-    for solution_str, ex in requests:
-        graded, state = _single_turn_scoring_state(
-            solution_str,
-            thinking=thinking,
-            prompt_opened_thinking=prompt_opened_thinking,
-        )
-        batch_state = {"response_text": graded}
-        if state is not None:
-            batch_state.update(state)
-        prepared.append((solution_str, ex, batch_state))
-
     def score_serially():
         results = []
         for solution_str, ex in requests:
@@ -1662,6 +1650,18 @@ def score_single_turn_batch(
         return results
 
     try:
+        prepared = []
+        for solution_str, ex in requests:
+            graded, state = _single_turn_scoring_state(
+                solution_str,
+                thinking=thinking,
+                prompt_opened_thinking=prompt_opened_thinking,
+            )
+            batch_state = {"response_text": graded}
+            if state is not None:
+                batch_state.update(state)
+            prepared.append((solution_str, ex, batch_state))
+
         scores_breakdown_many = getattr(env, "scores_breakdown_many", None)
         reward_many = getattr(env, "reward_many", None)
         items = [(ex, state) for _, ex, state in prepared]
