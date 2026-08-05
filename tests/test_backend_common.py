@@ -875,9 +875,7 @@ def test_run_verl_training_retries_nested_cuda_device_unavailable_after_tail_evi
     command = [
         "bash",
         "-c",
-        "printf '%s\\n' \"$TEST_SIGNATURE\"; "
-        "for i in $(seq 1 70); do echo filler-$i; done; "
-        "exit 1",
+        "printf '%s\\n' \"$TEST_SIGNATURE\"; for i in $(seq 1 70); do echo filler-$i; done; exit 1",
     ]
     env = {**os.environ, "TEST_SIGNATURE": signature}
 
@@ -930,7 +928,7 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     command = [
         "bash",
         "-c",
-        "printf '%s\\n' \"$FIRST\" \"$SECOND\"; "
+        'printf \'%s\\n\' "$FIRST" "$SECOND"; '
         "for i in $(seq 1 70); do echo filler-$i; done; "
         "exit 1",
     ]

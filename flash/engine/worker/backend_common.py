@@ -1425,9 +1425,7 @@ def _process_group_members(pgid: int) -> list[int] | None:
     return members
 
 
-def kill_process_group(
-    proc: subprocess.Popen, *, process_group_id: int | None = None
-) -> None:
+def kill_process_group(proc: subprocess.Popen, *, process_group_id: int | None = None) -> None:
     """signal the child's whole process group, escalating to SIGKILL if anything survives.
 
     signalling the group rather than the pid is what reaches vllm's EngineCore grandchild; a survivor
