@@ -186,17 +186,17 @@ class ModelInfo:
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
-# the pre-quantized fp8 checkpoint each base model's serving engine loads (mirrors serving's
-# ``src.prequant_config``). every dense model serves a freesolo-owned fp8 checkpoint; the qwen3.6
-# 35b-a3b moe serves the official qwen fp8 variant. informational for the catalog mirror; deploy
-# gating reads only max_lora_rank.
-SERVING_FP8_MODEL_REPOS: dict[str, str] = {
+# the checkpoint each base model's serving engine loads. dense models serve freesolo-owned fp8
+# checkpoints; the 35b-a3b moe serves the base bf16 checkpoint because its full-expert lora path is
+# incompatible with fp8 on the validated h200 tier. informational for the catalog mirror; adapter
+# deployment gates read max_lora_rank, and serving preflight reads max_model_len.
+SERVING_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
     "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
     "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
-    "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B-FP8",
     "Qwen/Qwen3.6-27B": "Freesolo-Co/Qwen3.6-27B-FP8",
+    "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
 }
 
 MODELS: dict[str, ModelInfo] = {
@@ -238,7 +238,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
             gpu="L4",
-            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-0.8B"],
+            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-0.8B"],
             max_loras=16,
             max_lora_rank=128,
             max_model_len=32768,
@@ -282,7 +282,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
             gpu="L4",
-            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-2B"],
+            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-2B"],
             max_loras=16,
             max_lora_rank=128,
             max_model_len=32768,
@@ -325,7 +325,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 5090",
         serving=ServingCapacity(
             gpu="L4",
-            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-4B"],
+            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-4B"],
             max_loras=16,
             max_lora_rank=64,
             max_model_len=32768,
@@ -376,7 +376,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="A100 PCIe",
         serving=ServingCapacity(
             gpu="H100",
-            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-9B"],
+            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"],
             max_loras=16,
             max_lora_rank=64,
             max_model_len=32768,
@@ -430,7 +430,7 @@ MODELS: dict[str, ModelInfo] = {
         min_disk_gb=160,
         serving=ServingCapacity(
             gpu="H100",
-            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-27B"],
+            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.6-27B"],
             max_loras=16,
             max_lora_rank=64,
             max_model_len=32768,
@@ -497,23 +497,16 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="H200",
         serving=ServingCapacity(
-            gpu="A100-80GB",
-            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"],
-            # rank-64 at only 6 hot slots: the fused-MoE LoRA buffer scales with
-            # max_loras x rank x num_experts, so the A100-80GB ceiling is ~max_loras x rank = 384
-            # (6 x 64 fits at 99.3% util; 16 x 64 OOMs on every single/multi GPU). Serving-validated.
-            # The 6 x 64 ceiling is WEIGHT-bound, not context-bound: the FP8 checkpoint's MoE experts
-            # load as bf16 under the LoRA path (~76 GiB on the 80 GiB card), so weights + the 6 x 64
-            # buffer leave only ~0.44 GiB for KV. Canary-measured 2026-07-04: at 8192 ctx that KV pool
-            # gives 2.2x concurrency; dropping to 4096 does NOT free any LoRA-slot room (7 x 64 and
-            # 8 x 64 both OOM at 4096 exactly as at 8192) but ~doubles concurrency to ~4.4x. So context
-            # is 4096 (concurrency win, matches the training-context cap) while slots stay 6 x 64.
+            gpu="H200",
+            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"],
+            # bf16 on h200 is the validated full-expert lora path. six hot rank-64 adapters plus 32k
+            # fit with cuda graphs and a 679,701-token kv cache; eight hot adapters overflow the card.
             max_loras=6,
             max_lora_rank=64,
-            max_model_len=4096,
+            max_model_len=32768,
             max_num_seqs=8,
             max_num_batched_tokens=4096,
-            gpu_memory_utilization=0.98,
+            gpu_memory_utilization=0.90,
         ),
         thinking="hybrid",
         min_disk_gb=200,
