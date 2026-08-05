@@ -563,6 +563,9 @@ def test_opd_accepts_short_hybrid_mamba_context_with_conditional_worker_floor(
                 "max_context_tokens": max_context_tokens,
                 "max_completion_tokens": 128,
             },
+            # 35B opd trains the routed experts, so it no longer fits one card even at this short
+            # context; the run needs two. the context floor under test is unchanged.
+            "gpu": {"count": 2},
         },
         run_id="x",
     )
@@ -993,8 +996,8 @@ def test_model_required_vram_uses_opd_group_default_not_grpo_default():
     assert grpo_default_group > default_group
 
 
-def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
-    """35B OPD with colocated student vLLM routes above the old H200-sized OPD estimate."""
+def test_opd_35b_vllm_rollout_routes_past_any_single_card():
+    """35B OPD with colocated student vLLM sizes past every single card once the experts train."""
     from flash.engine.vram import model_required_vram_gb
 
     need = model_required_vram_gb(
@@ -1008,7 +1011,9 @@ def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
             "lora_rank": 16,
         },
     )
-    assert 141 < need <= 180
+    # the routed-expert adapter pushed this past the 180 GB B200, so the run needs two cards. the
+    # upper bound keeps the estimate honest: it must not silently inflate past what two cards hold.
+    assert 180 < need <= 2 * 180
 
 
 def test_opd_35b_full_context_group1_is_rejected_because_it_only_fits_under_fp8():
