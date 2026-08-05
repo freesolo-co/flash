@@ -33,8 +33,6 @@ class RunConfig:
     # prices the teacher-api estimate; an empty value resolves to the default glm 5.2 teacher (an
     # omitted [train].teacher_model).
     teacher_model: str = ""
-    opd_multi_turn: bool = False
-    opd_max_turns: int | None = None
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
@@ -51,6 +49,8 @@ class RunConfig:
     # Spec gpu.count: cards the job occupies. total cost scales linearly with it (n cards for the
     # billed training wall); 1 = the historical single-gpu quote.
     gpu_count: int = 1
+    opd_multi_turn: bool = False
+    opd_max_turns: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))

@@ -299,7 +299,7 @@ def test_nonpositive_run_knobs_rejected(knob, bad):
 
 @pytest.mark.parametrize(
     ("multi_turn", "max_turns", "multiplier"),
-    [(False, None, 3), (True, 24, 72), (True, 64, 192)],
+    [(False, None, 3), (True, 24, 72), (True, 64, 192), (True, None, 192)],
 )
 def test_opd_teacher_cost_uses_authoritative_request_multiplier(multi_turn, max_turns, multiplier):
     from flash.cost.facts import teacher_token_cost_usd

@@ -12,15 +12,18 @@ OPD_NO_SIGNAL_ATTEMPTS = 3
 
 def configured_opd_turn_limit(environment: Any) -> tuple[bool, int | None]:
     params = getattr(environment, "params", None)
-    if not isinstance(params, dict):
-        return False, None
+    params = params if isinstance(params, dict) else {}
     raw_turns = params.get("max_turns")
-    multi_turn = params.get("multi_turn") is True or raw_turns is not None
-    if not multi_turn:
+    if params.get("multi_turn") is True or raw_turns is not None:
+        if isinstance(raw_turns, bool) or not isinstance(raw_turns, int):
+            return True, None
+        return True, max(OPD_MIN_EPISODE_TURNS, min(OPD_MAX_EPISODE_TURNS, raw_turns))
+    if params.get("multi_turn") is False:
         return False, None
-    if isinstance(raw_turns, bool) or not isinstance(raw_turns, int):
+    environment_id = getattr(environment, "id", "")
+    if isinstance(environment_id, str) and environment_id.strip():
         return True, None
-    return True, max(OPD_MIN_EPISODE_TURNS, min(OPD_MAX_EPISODE_TURNS, raw_turns))
+    return False, None
 
 
 def opd_teacher_request_multiplier(*, multi_turn: bool, max_turns: int | None) -> int:

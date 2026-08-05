@@ -1263,3 +1263,27 @@ def test_multiturn_capability_quota_covers_turns_and_no_signal_attempts(max_turn
     assert limits["max_score_items"] == expected_requests
     assert limits["max_requests"] <= teacher_broker.MAX_TOTAL_REQUESTS
     assert limits["max_score_items"] <= teacher_broker.MAX_TOTAL_SCORE_ITEMS
+
+
+def test_unknown_external_environment_uses_identical_ceiling_for_quota_and_cost():
+    from flash.cost.spec import runconfig_from_spec
+    from flash.opd_limits import opd_teacher_request_multiplier
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=EnvironmentSpec(id="owner/external"),
+        train=TrainSpec(max_examples=8, max_steps=1, batch_size=8, group_size=1),
+        run_id="run-external-unknown-turns",
+    )
+
+    limits = teacher_broker.capability_limits_for_spec(spec)
+    config = runconfig_from_spec(spec)
+    cost_multiplier = opd_teacher_request_multiplier(
+        multi_turn=config.opd_multi_turn,
+        max_turns=config.opd_max_turns,
+    )
+
+    assert cost_multiplier == 192
+    assert limits["max_requests"] == 8 * cost_multiplier
+    assert limits["max_score_items"] == 8 * cost_multiplier
