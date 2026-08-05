@@ -29,7 +29,7 @@ class RunConfig:
     thinking: bool = False
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
-    # opd only: the parasail teacher model id (already resolved from [train].teacher_model at parse).
+    # opd only: the canonical friendly teacher alias from [train].teacher_model.
     # prices the teacher-api estimate; an empty value resolves to the default glm 5.2 teacher (an
     # omitted [train].teacher_model).
     teacher_model: str = ""

@@ -606,7 +606,7 @@ def test_environment_subfields_reject_wrong_types() -> None:
     "key",
     [
         "PARASAIL_API_KEY",
-        "FLASH_TEACHER_BROKER_URL",
+        "FLASH_CONTROL_PANEL_URL",
         "FLASH_TEACHER_CAPABILITY",
     ],
 )

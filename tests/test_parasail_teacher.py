@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import math
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
 from flash.engine.recipe import TEACHER_MODELS, resolve_teacher
-from flash.engine.worker.teacher import TeacherClient, TeacherError
+from flash.engine.worker.teacher import TeacherClient, TeacherError, TeacherScore
 from flash.engine.worker.teacher_encoding import (
     EncodedTeacherToken,
     _byte_piece_offsets,
@@ -87,6 +88,9 @@ def test_training_guide_lists_only_the_managed_teacher_aliases():
     assert "glm-5.2 (default) | kimi-k3 |" in guide
     assert "qwen3.5-397b-a17b (key stays managed)" in guide
     assert "kimi-k2.6" not in guide
+    assert "The control-plane broker owns `PARASAIL_API_KEY`" in guide
+    assert "`FLASH_CONTROL_PANEL_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`" in guide
+    assert "platform's Parasail key is used only inside the paid OPD worker" not in guide
 
 
 def test_catalog_contains_exactly_three_parasail_aliases():
@@ -153,17 +157,25 @@ def test_token_keyed_response_scores_boundary_crossing_token_and_bills_one_outpu
             "seed": 0,
         },
     }
-    assert [(token.text, token.start, token.end, token.logprob) for token in scored] == [
+    assert isinstance(scored, TeacherScore)
+    assert isinstance(scored.tokens, tuple)
+    assert [(token.text, token.start, token.end, token.logprob) for token in scored.tokens] == [
         (": hi", 0, 2, -0.5),
         ("!", 2, 3, -0.2),
     ]
     assert scored.input_tokens == 3
     assert scored.output_tokens == 1
+    with pytest.raises(FrozenInstanceError):
+        scored.input_tokens = 0
+    unbilled = scored.without_billing()
+    assert unbilled.tokens is scored.tokens
+    assert (unbilled.input_tokens, unbilled.output_tokens) == (0, 0)
+    assert (scored.input_tokens, scored.output_tokens) == (3, 1)
 
 
 def test_positional_glm_response_normalizes_only_after_id_parity():
     scored = _client(_positional_response()).score("P: ", "hi!")
-    assert [token.logprob for token in scored] == [-0.5, -0.2]
+    assert [token.logprob for token in scored.tokens] == [-0.5, -0.2]
 
 
 @pytest.mark.parametrize(

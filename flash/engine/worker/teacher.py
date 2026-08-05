@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from flash.engine.worker.teacher_encoding import (
@@ -22,14 +23,11 @@ from flash.engine.worker.teacher_encoding import (
     load_teacher_tokenizer,
 )
 from flash.engine.worker.tokenizer_align import TeacherToken
+from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY
 
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
 _BROKER_PROVIDER_TIMEOUT_CEILING_S = 90.0
 _DEFAULT_TEACHER_TIMEOUT_S = 105.0
-_MAX_SCORE_CONCURRENCY = 8
-_PREDISPATCH_RETRYABLE_BROKER_CODES = frozenset(
-    {"broker_busy", "provider_unavailable", "request_in_progress"}
-)
 
 
 class TeacherError(RuntimeError):
@@ -160,19 +158,16 @@ class _ThreadLocalHttpsTransport:
         return _ReusableHttpsResponse(self, connection, response)
 
 
-class _ScoredTeacherTokens(list[TeacherToken]):
-    """Teacher tokens carrying authoritative provider usage for one unique request."""
+@dataclass(frozen=True)
+class TeacherScore:
+    """Immutable scored tokens and authoritative provider usage for one request."""
 
-    def __init__(
-        self,
-        tokens: list[TeacherToken],
-        *,
-        input_tokens: int,
-        output_tokens: int,
-    ) -> None:
-        super().__init__(tokens)
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
+    tokens: tuple[TeacherToken, ...]
+    input_tokens: int
+    output_tokens: int
+
+    def without_billing(self) -> TeacherScore:
+        return replace(self, input_tokens=0, output_tokens=0)
 
 
 def _permanent(message: str) -> TeacherError:
@@ -309,7 +304,7 @@ def _normalize_response(
     encoded: list[EncodedTeacherToken],
     full: str,
     prompt_length: int,
-) -> _ScoredTeacherTokens:
+) -> TeacherScore:
     choices = response.get("choices")
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
         raise _permanent("teacher response must contain exactly one choice")
@@ -333,8 +328,8 @@ def _normalize_response(
         full=full,
         prompt_length=prompt_length,
     )
-    return _ScoredTeacherTokens(
-        tokens,
+    return TeacherScore(
+        tokens=tuple(tokens),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
     )
@@ -344,7 +339,7 @@ class TeacherClient:
     def __init__(
         self,
         capability: str,
-        broker_url: str,
+        control_panel_url: str,
         model: str,
         *,
         timeout: float = _DEFAULT_TEACHER_TIMEOUT_S,
@@ -353,10 +348,10 @@ class TeacherClient:
     ) -> None:
         if not capability:
             raise _permanent("no managed teacher capability available on the worker")
-        if not broker_url:
-            raise _permanent("no managed teacher broker URL available on the worker")
+        if not control_panel_url:
+            raise _permanent("no Flash control-panel URL available on the worker")
         self.capability = capability
-        self.base_url = broker_url.rstrip("/")
+        self.base_url = control_panel_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
@@ -395,7 +390,10 @@ class TeacherClient:
                         raw_classification = broker_error.get("classification")
                         if isinstance(raw_code, str) and raw_code:
                             code = raw_code
-                        if raw_classification in {"permanent", "transient"}:
+                        if isinstance(raw_classification, str) and raw_classification in {
+                            "permanent",
+                            "transient",
+                        }:
                             classification = raw_classification
                 except (
                     UnicodeDecodeError,
@@ -404,9 +402,7 @@ class TeacherClient:
                     http.client.IncompleteRead,
                 ):
                     pass
-                retryable = (
-                    classification == "transient" and code in _PREDISPATCH_RETRYABLE_BROKER_CODES
-                )
+                retryable = classification == "transient"
                 broker_failure = TeacherError(
                     f"teacher broker HTTP {error.code} for {request_id} on {path}: {code} "
                     f"({'transient' if retryable else 'permanent'})",
@@ -440,7 +436,7 @@ class TeacherClient:
                 time.sleep(delay)
         raise last_error or TeacherError(f"teacher broker call to {path} failed")
 
-    def _score_one(self, prompt_text: str, completion_text: str) -> _ScoredTeacherTokens:
+    def _score_one(self, prompt_text: str, completion_text: str) -> TeacherScore:
         full = prompt_text + completion_text
         encoded = self.tokenizer.encode(full)
         response = self._post(
@@ -465,14 +461,16 @@ class TeacherClient:
             prompt_length=len(prompt_text),
         )
 
-    def score_many(self, items: list[tuple[str, str]]) -> list[list[TeacherToken]]:
+    def score_many(self, items: list[tuple[str, str]]) -> list[TeacherScore]:
         """Score each unique prompt and completion through one idempotent broker request."""
         if not items:
             return []
         if len(items) == 1:
             return [self._score_one(*items[0])]
-        with ThreadPoolExecutor(max_workers=min(_MAX_SCORE_CONCURRENCY, len(items))) as executor:
+        with ThreadPoolExecutor(
+            max_workers=min(OPD_TEACHER_SCORING_CONCURRENCY, len(items))
+        ) as executor:
             return list(executor.map(lambda item: self._score_one(*item), items))
 
-    def score(self, prompt_text: str, completion_text: str) -> list[TeacherToken]:
+    def score(self, prompt_text: str, completion_text: str) -> TeacherScore:
         return self._score_one(prompt_text, completion_text)

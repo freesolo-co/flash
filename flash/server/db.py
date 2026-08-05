@@ -801,17 +801,3 @@ def recover_teacher_request_ledger(*, now: float | None = None) -> dict[str, int
     except Exception:
         conn.rollback()
         raise
-
-
-def teacher_capability_usage(token: str) -> dict:
-    capability = teacher_capability_binding(token)
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT state, COUNT(*) AS count FROM teacher_score_requests "
-            "WHERE capability_id = ? GROUP BY state",
-            (capability["id"],),
-        ).fetchall()
-    return {
-        "capability": capability,
-        "outcomes": {row["state"]: row["count"] for row in rows},
-    }
