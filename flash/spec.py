@@ -192,8 +192,20 @@ def parse_max_steps(value: Any) -> int | None:
     return value if value > 0 else None
 
 
+TEACHER_BROKER_URL_ENV = "FLASH_TEACHER_BROKER_URL"
+TEACHER_CAPABILITY_ENV = "FLASH_TEACHER_CAPABILITY"
+MANAGED_TEACHER_CREDENTIAL_ENV_KEYS = frozenset({"PARASAIL_API_KEY"})
 RESERVED_WORKER_ENV_KEYS = frozenset(
-    {"RUN_ID", "HF_REPO", "FLASH_ARM", "SEED", OPD_RESUME_REVISION_ENV}
+    {
+        "RUN_ID",
+        "HF_REPO",
+        "FLASH_ARM",
+        "SEED",
+        OPD_RESUME_REVISION_ENV,
+        TEACHER_BROKER_URL_ENV,
+        TEACHER_CAPABILITY_ENV,
+        *MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
+    }
 )
 
 
@@ -308,9 +320,8 @@ class TrainSpec:
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
-    # OPD only: the managed teacher to distil from, stored as its resolved Fireworks model id (parse
-    # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
-    # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
+    # opd only: the managed teacher's canonical friendly alias. provider and repository ids are not
+    # accepted as user input. an empty value selects the recipe default, glm-5.2.
     teacher_model: str = field(default="", metadata={"introduced_in": "0.2.56"})
     stop_sequences: tuple[str, ...] = field(default=(), metadata={"introduced_in": "0.2.0"})
     # canonical json of vllm structured-output kwargs ("" = unconstrained). normalized once

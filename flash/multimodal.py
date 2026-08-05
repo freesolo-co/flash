@@ -585,7 +585,7 @@ def _base64_image_data_uri(data: bytes) -> tuple[str, int]:
 def image_descriptors_to_data_uris(
     descriptors: list[str] | tuple[str, ...], package_root: str | Path | None
 ) -> list[str]:
-    """Convert normalized descriptors to Fireworks data URIs under existing aggregate limits."""
+    """Convert normalized descriptors to image data URIs under existing aggregate limits."""
     if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
         raise ValueError(
             f"example contains {len(descriptors)} images, exceeding the "
@@ -703,16 +703,9 @@ def validate_multimodal_training(
         raise ValueError("opd supports image-bearing records only for single-turn environments")
 
 
-def validate_image_opd_teacher(teacher_model: str | None) -> None:
-    """Require the managed Kimi vision teacher for image-bearing OPD."""
-    from flash.engine.recipe import resolve_teacher, teacher_supports_images
-
-    teacher = resolve_teacher(teacher_model or "")
-    if not teacher_supports_images(teacher_model or ""):
-        raise ValueError(
-            "image-bearing opd requires [train] teacher_model = 'kimi-k2.6'; "
-            f"the selected teacher {teacher.alias!r} does not support images"
-        )
+def validate_image_opd_teacher(_teacher_model: str | None) -> None:
+    """Reject image-bearing OPD because the managed Parasail scoring contract is text-only."""
+    raise ValueError("image-bearing opd is not supported by managed Parasail teachers")
 
 
 def assistant_completion_text(completion: object) -> str:
