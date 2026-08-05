@@ -1553,6 +1553,14 @@ def build_opd_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",
         f"actor_rollout_ref.model.target_modules={_hydra_val(config['target_modules'])}",
+        *(
+            [
+                "++actor_rollout_ref.model.target_parameters="
+                + _hydra_val(config["target_parameters"])
+            ]
+            if config.get("target_parameters")
+            else []
+        ),
         f"actor_rollout_ref.model.lora_adapter_path={_hydra_val(config.get('lora_adapter_path'))}",
         "actor_rollout_ref.actor.strategy=fsdp",
         "actor_rollout_ref.actor.use_kl_loss=false",
@@ -2498,6 +2506,7 @@ def run_opd_train(spec=None) -> None:
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
             "target_modules": target_modules,
+            "target_parameters": _w.lora_target_parameters(model_id),
             "lora_adapter_path": warmstart_adapter,
             "learning_rate": knobs.learning_rate,
             "local_dir": local_dir,

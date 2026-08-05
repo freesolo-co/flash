@@ -358,6 +358,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
+        *(
+            ["++actor_rollout_ref.model.target_parameters=" + _hydra_val(cfg["target_parameters"])]
+            if cfg.get("target_parameters")
+            else []
+        ),
         # memory: match the retired trl path's gradient checkpointing.
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         # 32k contexts: fused linear-CE computes logprobs/entropy from hidden states + lm_head in
@@ -566,6 +571,7 @@ def _build_verl_training_cfg(
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
         "target_modules": "all-linear",
+        "target_parameters": _w.lora_target_parameters(model_id),
         "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],
         "group_size": inp["group_size"],
@@ -2758,6 +2764,7 @@ def _resolve_grpo_inputs():
             )
         with open(os.path.join(warmstart_adapter, "adapter_config.json")) as f:
             _src_cfg = json.load(f)
+        _w.validate_lora_target_parameters(_src_cfg, model_id)
         # a patterned adapter trains some modules at higher rank than the base `r`; verl allocates
         # one uniform rank, so it must cover the MAXIMUM prepared rank or the load truncates.
         _ranks = [int(_src_cfg.get("r", lora_rank))]
