@@ -128,6 +128,68 @@ class TestEntrypointBehaviour:
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "container_wins"
 
+    def test_keep_naming_an_unset_variable_leaves_the_vault_value_alone(self, tmp_path):
+        """A KEEP entry the container never set must NOT wipe the injected secret.
+
+        The loop re-applies each KEEP name as a `K=V` argument to `env`. An unset name expands
+        to nothing, so a bare `K=` would overwrite the vault's value with an empty string --
+        turning a typo in INFISICAL_KEEP into a silently missing credential, which surfaces as
+        an authentication failure far from its cause.
+        """
+        result = self._run(
+            tmp_path,
+            {
+                "INFISICAL_CLIENT_ID": "cid",
+                "INFISICAL_CLIENT_SECRET": "csec",
+                "INFISICAL_PROJECT_ID": "proj",
+                "INFISICAL_PATH": "/flash",
+                "INFISICAL_KEEP": "FROM_VAULT",
+            },
+            ["sh", "-c", 'printf "%s" "${FROM_VAULT:-EMPTY}"'],
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "vault_value"
+
+    def test_keep_honours_an_explicitly_empty_container_value(self, tmp_path):
+        """Set-but-empty is a deliberate choice and still beats the vault.
+
+        This is the flip side of the test above: the fix must distinguish "unset" from "set to
+        an empty string" rather than treating every falsy value as absent.
+        """
+        result = self._run(
+            tmp_path,
+            {
+                "INFISICAL_CLIENT_ID": "cid",
+                "INFISICAL_CLIENT_SECRET": "csec",
+                "INFISICAL_PROJECT_ID": "proj",
+                "INFISICAL_PATH": "/flash",
+                "INFISICAL_KEEP": "FROM_VAULT",
+                "FROM_VAULT": "",
+            },
+            ["sh", "-c", 'printf "%s" "${FROM_VAULT?unset}"'],
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ""
+
+    def test_keep_rejects_a_name_that_is_not_an_identifier(self, tmp_path):
+        """KEEP names reach `eval`, so a non-identifier is refused rather than executed."""
+        marker = tmp_path / "executed"
+        result = self._run(
+            tmp_path,
+            {
+                "INFISICAL_CLIENT_ID": "cid",
+                "INFISICAL_CLIENT_SECRET": "csec",
+                "INFISICAL_PROJECT_ID": "proj",
+                "INFISICAL_PATH": "/flash",
+                "INFISICAL_KEEP": f"$(touch {marker})",
+            },
+            ["sh", "-c", "echo reached"],
+        )
+        assert result.returncode == 2
+        assert not marker.exists(), "a KEEP entry was executed as a command"
+        assert "not a variable name" in result.stderr
+        assert "reached" not in result.stdout
+
     def test_keep_preserves_values_containing_spaces(self, tmp_path):
         """KEEP values are re-applied as quoted `K=V` args, so metacharacters survive intact.
 

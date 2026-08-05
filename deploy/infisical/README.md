@@ -56,6 +56,11 @@ You can also skip the overlay build and mount the script into the base image, pr
 
 `INFISICAL_TOKEN` is minted by the wrapper at startup. Do not set it yourself.
 
+A name listed in `INFISICAL_KEEP` that the container has **not** set is skipped, so the vault's
+value survives — a typo there costs you an override, not a credential. Setting a name to an empty
+string is treated as a deliberate choice and still wins over the vault. Entries must be shell
+identifiers; anything else aborts startup rather than being evaluated.
+
 ## Failure behaviour
 
 The wrapper runs under `set -eu`: a failed login or a missing `INFISICAL_PROJECT_ID` /

@@ -49,8 +49,24 @@ export INFISICAL_TOKEN
 # NAMES, so splitting *it* is intentional.
 # shellcheck disable=SC2086
 for k in ${INFISICAL_KEEP:-}; do
-  set -- "$k=$(eval "printf '%s' \"\${$k:-}\"")" "$@"
+  # These names are expanded inside `eval` below, so refuse anything that is not a shell
+  # identifier instead of executing it.
+  case $k in
+    [!A-Za-z_]* | *[!A-Za-z0-9_]*)
+      echo "flash infisical entrypoint: INFISICAL_KEEP entry is not a variable name: $k" >&2
+      exit 2
+      ;;
+  esac
+  # Only re-apply names the container actually SET. An unset name expands to nothing, and
+  # handing `env` a bare `K=` would overwrite the injected secret with an empty string --
+  # so a typo'd or absent KEEP entry would silently WIPE a credential rather than leave the
+  # vault's value alone. `${K+set}` distinguishes unset from set-but-empty, so an explicitly
+  # empty container value still wins (that is a deliberate choice by whoever wrote it).
+  eval "keep_is_set=\${$k+set}"
+  [ "${keep_is_set:-}" = set ] || continue
+  set -- "$k=$(eval "printf '%s' \"\${$k}\"")" "$@"
 done
+unset keep_is_set
 
 exec infisical run \
   --projectId "$INFISICAL_PROJECT_ID" \
