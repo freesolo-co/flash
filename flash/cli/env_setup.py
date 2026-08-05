@@ -215,7 +215,7 @@ All three algorithms train off this file:
   `output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
   `output` for a single gold assistant turn.
 - OPD (configs/opd.toml) rolls out each episode and distils EVERY assistant turn against
-  the managed Fireworks teacher (GLM 5.2 by default; pick another with [train] teacher_model),
+  the managed Parasail teacher (GLM 5.2 by default; pick another with [train] teacher_model),
   conditioned on the transcript so far — the multi-turn on-policy-distillation objective. The
   teacher key is platform-managed (nothing to set).
 """
@@ -645,8 +645,8 @@ def cmd_env_setup(args) -> int:
         # per prompt; multi-turn rolls out each episode and distils every assistant turn against the
         # transcript so far. The scaffold differs only by a one-line note pointing at the mode.
         opd_multiturn_note = (
-            "# NOTE: opd rolls out each episode and distils EVERY assistant turn (conditioned on the\n"
-            "# transcript so far) against the managed Fireworks teacher — the multi-turn distillation path.\n\n"
+            "# note: opd rolls out each episode and distils every assistant turn (conditioned on the\n"
+            "# transcript so far) against the managed parasail teacher - the multi-turn distillation path.\n\n"
             if multi_turn
             else ""
         )
@@ -654,20 +654,20 @@ def cmd_env_setup(args) -> int:
             f"{opd_multiturn_note}"
             'model = "Qwen/Qwen3.5-4B"\n'
             f"{project_line}"
-            'algorithm = "opd"   # on-policy distillation from a managed Fireworks teacher (default GLM 5.2)\n'
+            'algorithm = "opd"   # on-policy distillation from a managed parasail teacher (default glm 5.2)\n'
             f"{thinking_line}"
             "\n"
             "# Environment: upload this project folder with\n"
             f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
-            "# The teacher and its Fireworks key are platform-managed — nothing to set up or export.\n"
+            "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
             "[environment]\n"
             'id = ""\n\n'
             "[train]\n"
             "epochs = 1\n"
             f"{max_examples_line}"
             "lora_rank = 32\n"
-            '# teacher_model = "glm-5.2"   # teacher to distil from: glm-5.2 (default) |\n'
-            "#                             # kimi-k2.6 (key stays managed)\n"
+            '# teacher_model = "glm-5.2"   # teacher: glm-5.2 (default) | kimi-k3 |\n'
+            "#                             # qwen3.5-397b-a17b (key stays managed)\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )

@@ -188,9 +188,6 @@ def test_opd_positive_max_steps_is_authoritative():
 
 
 def test_opd_runconfig_carries_selected_teacher_and_prices_it():
-    """runconfig_from_spec resolves [train].teacher_model to the Fireworks model id so the estimate
-    prices the CHOSEN teacher; a cheaper teacher lowers teacher_api_usd vs the default GLM 5.2, and
-    sft/grpo carry no teacher."""
     from flash.cost.analytical import estimate_cost
 
     def _opd(teacher=None):
@@ -202,16 +199,13 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
             raw["train"]["teacher_model"] = teacher
         return spec_from_dict(raw)
 
-    # Omitted teacher_model -> default GLM 5.2 provider id.
-    assert _runconfig_from_spec(_opd()).teacher_model == "accounts/fireworks/models/glm-5p2"
-    # A selected alias resolves to its Fireworks model id.
-    kimi_cfg = _runconfig_from_spec(_opd("kimi-k2.6"))
-    assert kimi_cfg.teacher_model == "accounts/fireworks/models/kimi-k2p6"
+    assert _runconfig_from_spec(_opd()).teacher_model == "glm-5.2"
+    qwen_cfg = _runconfig_from_spec(_opd("qwen3.5-397b-a17b"))
+    assert qwen_cfg.teacher_model == "qwen3.5-397b-a17b"
 
-    # kimi-k2.6 input price ($0.95/M) < glm-5.2 ($1.40/M), so its teacher-API estimate is smaller.
     default_teacher_usd = estimate_cost(_runconfig_from_spec(_opd())).teacher_api_usd
-    kimi_teacher_usd = estimate_cost(kimi_cfg).teacher_api_usd
-    assert 0 < kimi_teacher_usd < default_teacher_usd
+    qwen_teacher_usd = estimate_cost(qwen_cfg).teacher_api_usd
+    assert 0 < qwen_teacher_usd < default_teacher_usd
 
     # sft/grpo carry no teacher.
     assert _runconfig_from_spec(_spec()).teacher_model == ""

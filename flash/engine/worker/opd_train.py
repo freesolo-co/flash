@@ -129,6 +129,11 @@ class _TeacherBridgeHTTPServer(BoundedThreadingHTTPServer):
     request_queue_size = _TEXT_TEACHER_REQUEST_BACKLOG
 
 
+class _UnbilledTeacherTokens(list[TeacherToken]):
+    input_tokens = 0
+    output_tokens = 0
+
+
 @dataclass
 class _TextTeacherWaiter:
     item: tuple[str, str]
@@ -225,6 +230,13 @@ def _validate_text_teacher_batch(
                 )
             previous_start = token.start
             previous_end = token.end
+        input_tokens = int(getattr(tokens, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(tokens, "output_tokens", 0) or 0)
+        if input_tokens <= 0 or output_tokens != 1:
+            raise TeacherError(
+                f"teacher text batch result {result_index} is missing authoritative token usage",
+                permanent=True,
+            )
     return scored
 
 
@@ -309,8 +321,14 @@ class _TextTeacherBatcher:
             self.teacher.score_many(unique_items),
             unique_items,
         )
+        billed_indexes: set[int] = set()
         for waiter, index in zip(batch, scatter_indexes, strict=True):
-            waiter.complete(result=scored[index])
+            result = scored[index]
+            if index in billed_indexes:
+                result = _UnbilledTeacherTokens(result)
+            else:
+                billed_indexes.add(index)
+            waiter.complete(result=result)
 
     def _run(self) -> None:
         try:
@@ -549,6 +567,7 @@ class _TeacherAlignmentBridge:
         self._stats_lock = threading.Lock()
         self.generated_tokens = int(state.get("generated_tokens", 0))
         self.teacher_input_tokens = int(state.get("teacher_input_tokens", 0))
+        self.teacher_output_tokens = int(state.get("teacher_output_tokens", 0))
         self.aligned_sequences = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
         self.empty_alignments = int(
             state.get(
@@ -676,6 +695,7 @@ class _TeacherAlignmentBridge:
             return {
                 "generated_tokens": self.generated_tokens,
                 "teacher_input_tokens": self.teacher_input_tokens,
+                "teacher_output_tokens": self.teacher_output_tokens,
                 "truncated_rollouts": self.truncated_rollouts,
                 "forced_tokens": self.forced_tokens,
                 "dropped_forced_groups": self.dropped_forced_groups,
@@ -727,6 +747,8 @@ class _TeacherAlignmentBridge:
                 f"verl rollout reported {int(image_count)} image(s) for dataset index {index}; "
                 f"the frozen prompt has {expected_image_count}"
             )
+        if expected_image_count:
+            raise ValueError("image-bearing opd is not supported by managed Parasail teachers")
         prompt_ids = list(prompt.prompt_ids)
         prompt_length = int(prompt_length)
         sequence_ids = [int(token_id) for token_id in sequence_ids]
@@ -762,25 +784,11 @@ class _TeacherAlignmentBridge:
         if not completion_text.strip() or "�" in completion_text:
             return self._empty(prompt_length, len(response_ids))
         teacher_prompt = _teacher_prompt_text(prompt.teacher_messages, self.thinking_prefill)
-        teacher_images = None
-        if prompt.image_descriptors:
-            from flash.multimodal import image_descriptors_to_data_uris
-
-            teacher_images = image_descriptors_to_data_uris(
-                prompt.image_descriptors, prompt.package_root
-            )
         try:
-            if teacher_images is not None:
-                teacher_batches = self.teacher.score_many_multimodal(
-                    [(teacher_prompt, completion_text, teacher_images)]
-                )
+            if self._text_teacher_batcher is None:
+                teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
             else:
-                if self._text_teacher_batcher is None:
-                    teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
-                else:
-                    teacher_tokens = self._text_teacher_batcher.score(
-                        teacher_prompt, completion_text
-                    )
+                teacher_tokens = self._text_teacher_batcher.score(teacher_prompt, completion_text)
         except TeacherError as error:
             if error.permanent:
                 raise
@@ -789,19 +797,19 @@ class _TeacherAlignmentBridge:
             if recovered_failure is not None:
                 recovered_failure.append(failure)
             return self._empty(prompt_length, len(response_ids))
-        if teacher_images is not None:
-            teacher_tokens = teacher_batches[0]
-            teacher_input_tokens = int(getattr(teacher_tokens, "input_tokens", 0) or 0)
-        else:
-            teacher_input_tokens = 0
+        teacher_input_tokens = int(getattr(teacher_tokens, "input_tokens", 0) or 0)
+        teacher_output_tokens = int(getattr(teacher_tokens, "output_tokens", 0) or 0)
+        if not (
+            (teacher_input_tokens > 0 and teacher_output_tokens == 1)
+            or (teacher_input_tokens == 0 and teacher_output_tokens == 0)
+        ):
+            raise RuntimeError("teacher score has invalid authoritative Parasail token usage")
         with self._stats_lock:
             self.teacher_ok += 1
             self._pending_teacher_success = True
-        student_ids, student_tokens = student_tokens_with_offsets(
+        _student_ids, student_tokens = student_tokens_with_offsets(
             self.tokenizer, kept_ids, completion_text
         )
-        if not prompt.image_descriptors:
-            teacher_input_tokens = prompt_length + len(student_ids)
         groups = groupwise_alignment(student_tokens, teacher_tokens)
         groups = [(indices, logsum) for indices, logsum in groups if indices]
         aligned_group_count = len(groups)
@@ -810,6 +818,7 @@ class _TeacherAlignmentBridge:
         granularity = _align_granularity(groups, student_tokens)
         with self._stats_lock:
             self.teacher_input_tokens += teacher_input_tokens
+            self.teacher_output_tokens += teacher_output_tokens
             self.dropped_forced_groups += aligned_group_count - len(groups)
             self.coverage_sum += coverage
             if groups:
@@ -1125,15 +1134,25 @@ class _TeacherAlignmentBridge:
                     )
                     for position in scorable
                 ]
-                teacher_batches = self.teacher.score_many(items)
+                teacher_batches = []
+                for start in range(0, len(items), _TEXT_TEACHER_BATCH_SIZE):
+                    teacher_batches.extend(
+                        self.teacher.score_many(items[start : start + _TEXT_TEACHER_BATCH_SIZE])
+                    )
                 if len(teacher_batches) != len(scorable):
                     raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
                 with self._stats_lock:
                     self.teacher_ok += len(teacher_batches)
                 for position, teacher_tokens in zip(scorable, teacher_batches, strict=True):
+                    teacher_input_tokens = int(getattr(teacher_tokens, "input_tokens", 0) or 0)
+                    teacher_output_tokens = int(getattr(teacher_tokens, "output_tokens", 0) or 0)
+                    if teacher_input_tokens <= 0 or teacher_output_tokens != 1:
+                        raise RuntimeError(
+                            "teacher score is missing authoritative Parasail token usage"
+                        )
                     turn = turns[position]
                     response_ids = turn["response_ids"]
-                    student_ids, student_tokens = student_tokens_with_offsets(
+                    _student_ids, student_tokens = student_tokens_with_offsets(
                         self.tokenizer, response_ids, turn["completion_text"]
                     )
                     groups = groupwise_alignment(student_tokens, teacher_tokens)
@@ -1141,7 +1160,8 @@ class _TeacherAlignmentBridge:
                     coverage = groupwise_coverage(groups, student_tokens)
                     granularity = _align_granularity(groups, student_tokens)
                     with self._stats_lock:
-                        self.teacher_input_tokens += len(turn["prompt_ids"]) + len(student_ids)
+                        self.teacher_input_tokens += teacher_input_tokens
+                        self.teacher_output_tokens += teacher_output_tokens
                         self.coverage_sum += coverage
                         if groups:
                             self.aligned_sequences += 1
@@ -1816,6 +1836,13 @@ def _canonical_skip_reasons(skip_counts: dict) -> dict:
     return dict(sorted(canonical.items()))
 
 
+def _teacher_token_metadata(accounting: dict) -> dict[str, int]:
+    return {
+        "teacher_input_tokens": int(accounting["teacher_input_tokens"]),
+        "teacher_output_tokens": int(accounting["teacher_output_tokens"]),
+    }
+
+
 def _failure_accounting_metadata(accounting: dict) -> dict:
     return {
         "teacher_transient_failures": int(accounting["teacher_transient"]),
@@ -2160,17 +2187,20 @@ def run_opd_train(spec=None) -> None:
     random.Random(_w.SEED).shuffle(train)
 
     started_at = time.time()
-    # validate the teacher credential BEFORE the gpu probe + model prefetch: a missing key fails
-    # in milliseconds instead of after minutes of paid setup.
-    api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("the managed teacher api key is missing from the OPD parent worker")
+    # validate broker transport before the gpu probe and model prefetch so a malformed attempt fails
+    # before any additional paid setup. raw managed-teacher provider credentials never enter the worker.
+    from flash.spec import TEACHER_BROKER_URL_ENV, TEACHER_CAPABILITY_ENV
+
+    broker_url = os.environ.get(TEACHER_BROKER_URL_ENV, "").strip()
+    capability = os.environ.get(TEACHER_CAPABILITY_ENV, "").strip()
+    if not broker_url or not capability:
+        raise RuntimeError("managed teacher broker transport is missing from the OPD parent worker")
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
+    teacher = TeacherClient(capability, broker_url, knobs.teacher_model)
     processor = None
     if multimodal:
         from transformers import AutoProcessor
@@ -2747,7 +2777,7 @@ def run_opd_train(spec=None) -> None:
                 "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
                 "forced_tokens": int(final_accounting["forced_tokens"]),
                 "dropped_forced_groups": int(final_accounting["dropped_forced_groups"]),
-                "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
+                **_teacher_token_metadata(final_accounting),
                 "aligned_sequences": int(final_accounting["aligned_sequences"]),
                 "empty_alignments": int(final_accounting["empty_alignments"]),
                 "teacher_ok": int(final_accounting["teacher_ok"]),
