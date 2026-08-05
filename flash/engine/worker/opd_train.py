@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import http.client
@@ -1822,7 +1823,7 @@ def _opd_multimodal_parquet_features():
 # costs peak host ram proportional to horizon * prompts_per_step * prompt_bytes. that is the parent
 # worker's ram, not the gpu's, and the allocator sizes vram only -- a host-ram kill surfaces as a
 # generic child exit with oom:false. writing in fixed batches holds the peak flat instead
-# (measured: 24k rows of ~8k-token prompts, 6233 MB in one table vs 360 MB batched).
+# (measured: 24k rows of ~8k-token prompts, 6143 MB in one table vs 189 MB batched).
 _OPD_PARQUET_WRITE_BATCH_ROWS = 2000
 
 
@@ -1841,16 +1842,26 @@ def _write_opd_parquet(rows: list[dict], path: str) -> None:
         if features is not None
         else pa.Table.from_pylist(rows[:_OPD_PARQUET_WRITE_BATCH_ROWS]).schema
     )
-    writer = pq.ParquetWriter(path, schema)
+    # write to a sibling temp file and rename only once every batch landed. closing a partially
+    # written ParquetWriter still emits a valid footer, so failing in place would leave a READABLE
+    # short file at `path` -- a truncated horizon that trains silently instead of raising.
+    partial = f"{path}.partial"
     try:
-        for start in range(0, len(rows), _OPD_PARQUET_WRITE_BATCH_ROWS):
-            writer.write_table(
-                pa.Table.from_pylist(
-                    rows[start : start + _OPD_PARQUET_WRITE_BATCH_ROWS], schema=schema
+        writer = pq.ParquetWriter(partial, schema)
+        try:
+            for start in range(0, len(rows), _OPD_PARQUET_WRITE_BATCH_ROWS):
+                writer.write_table(
+                    pa.Table.from_pylist(
+                        rows[start : start + _OPD_PARQUET_WRITE_BATCH_ROWS], schema=schema
+                    )
                 )
-            )
-    finally:
-        writer.close()
+        finally:
+            writer.close()
+        os.replace(partial, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(partial)
+        raise
 
 
 # the verl bridge stores the empty-alignment skip under its own internal key,
