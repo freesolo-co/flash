@@ -585,7 +585,7 @@ def _base64_image_data_uri(data: bytes) -> tuple[str, int]:
 def image_descriptors_to_data_uris(
     descriptors: list[str] | tuple[str, ...], package_root: str | Path | None
 ) -> list[str]:
-    """Convert normalized descriptors to Fireworks data URIs under existing aggregate limits."""
+    """Convert normalized descriptors to image data URIs under existing aggregate limits."""
     if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
         raise ValueError(
             f"example contains {len(descriptors)} images, exceeding the "
@@ -692,27 +692,13 @@ def resolve_image_pad_token_id(processor, tok) -> int:
     raise ValueError("could not resolve a valid image-pad token id from the processor or tokenizer")
 
 
-def validate_multimodal_training(
-    model_id: str, algorithm: str, *, multi_turn: bool = False
-) -> None:
+def validate_multimodal_training(model_id: str, algorithm: str) -> None:
     from flash.catalog import supports_image_training
 
     if not supports_image_training(model_id):
         raise ValueError(f"{model_id} does not support image-bearing training records")
-    if algorithm == "opd" and multi_turn:
-        raise ValueError("opd supports image-bearing records only for single-turn environments")
-
-
-def validate_image_opd_teacher(teacher_model: str | None) -> None:
-    """Require the managed Kimi vision teacher for image-bearing OPD."""
-    from flash.engine.recipe import resolve_teacher, teacher_supports_images
-
-    teacher = resolve_teacher(teacher_model or "")
-    if not teacher_supports_images(teacher_model or ""):
-        raise ValueError(
-            "image-bearing opd requires [train] teacher_model = 'kimi-k2.6'; "
-            f"the selected teacher {teacher.alias!r} does not support images"
-        )
+    if algorithm == "opd":
+        raise ValueError("image-bearing opd is not supported")
 
 
 def assistant_completion_text(completion: object) -> str:
@@ -807,11 +793,5 @@ def preflight_validate_image_opd(spec) -> None:
         records = records[:max_examples]
     for record in records:
         if record_has_images(record, _record_messages(record)):
-            multi_turn = bool(
-                getattr(environment, "multi_turn", False) or params.get("multi_turn", False)
-            )
-            validate_multimodal_training(
-                str(getattr(spec, "model", "")), "opd", multi_turn=multi_turn
-            )
-            validate_image_opd_teacher(getattr(train, "teacher_model", "") if train else "")
+            validate_multimodal_training(str(getattr(spec, "model", "")), "opd")
             return

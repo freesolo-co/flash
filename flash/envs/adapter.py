@@ -23,6 +23,11 @@ from flash.envs.loader import (
     load_freesolo_environment,
     managed_slug_to_github_ref,
 )
+from flash.opd_limits import (
+    OPD_DEFAULT_EPISODE_TURNS,
+    OPD_MAX_EPISODE_TURNS,
+    OPD_MIN_EPISODE_TURNS,
+)
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
@@ -113,9 +118,9 @@ class FreesoloEnvironment(BaseEnvironment):
         """Batch-level turn ceiling: dataset-wide max of per-example budgets, clamped to [8, 64]."""
         if self._max_turns_cache is not None:
             return self._max_turns_cache
-        cap = 8
+        cap = OPD_MIN_EPISODE_TURNS
         if self.multi_turn:
-            cap = 24
+            cap = OPD_DEFAULT_EPISODE_TURNS
             best: int | None = None
             for ex in self.dataset():
                 try:
@@ -125,7 +130,7 @@ class FreesoloEnvironment(BaseEnvironment):
                 if best is None or turns > best:
                     best = turns
             if best is not None:
-                cap = max(8, min(64, best))
+                cap = max(OPD_MIN_EPISODE_TURNS, min(OPD_MAX_EPISODE_TURNS, best))
         self._max_turns_cache = cap
         return cap
 

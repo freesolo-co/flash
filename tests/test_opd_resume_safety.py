@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -22,6 +23,26 @@ from tests._helpers.runner import provisioned_status
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
+@pytest.fixture(autouse=True)
+def _stub_teacher_broker_transport(monkeypatch):
+    import flash.server.teacher_broker as teacher_broker
+
+    monkeypatch.setattr(
+        teacher_broker,
+        "require_teacher_broker_configuration",
+        lambda _spec, **_kwargs: "https://broker.example",
+    )
+
+    @contextlib.contextmanager
+    def teacher_transport(_spec, **_kwargs):
+        yield {
+            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+        }
+
+    monkeypatch.setattr(teacher_broker, "teacher_attempt_transport", teacher_transport)
+
+
 def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
     state = {
         "contract_version": OPD_RESUME_STATE_VERSION,
@@ -34,6 +55,7 @@ def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
         "coverage_curve": [1.0] * step,
         "generated_tokens": step,
         "teacher_input_tokens": step,
+        "teacher_output_tokens": step,
         "truncated_rollouts": 0,
         "granularity_sum": 0.0,
         "granularity_n": 0,
@@ -723,11 +745,16 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
         # that actually billed it.
         "allocated_provider": "runpod",
     }
+    broker_transport = {
+        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+        "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+    }
     assert provider.runtime_secrets == [
-        {"WANDB_API_KEY": "real-secret"},
+        {"WANDB_API_KEY": "real-secret", **broker_transport},
         {
             "WANDB_API_KEY": "real-secret",
             OPD_RESUME_REVISION_ENV: "private-pinned-sha",
+            **broker_transport,
         },
     ]
     assert OPD_RESUME_REVISION_ENV not in provider.worker_envs[0]

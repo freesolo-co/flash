@@ -263,13 +263,22 @@ def test_unset_max_length_still_resolves_the_real_rollout_length():
 # "expandable_segments:True" (vllm/device_allocator/cumem.py:132, pytorch#147851). The launcher's
 # per-algorithm choice is now the only route to that conf, so it carries the whole invariant.
 # ---------------------------------------------------------------------------
+def _worker_runtime_for(algorithm: str) -> dict[str, str] | None:
+    if algorithm != "opd":
+        return None
+    return {
+        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+        "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+    }
+
+
 def _worker_env_for(algorithm: str, phase: str) -> dict:
     from flash.providers._worker import build_worker_env
     from flash.spec import JobSpec
 
     spec = JobSpec.from_dict({"model": "m", "seed": 0, "algorithm": algorithm})
     assert spec.phase == phase, "phase is derived from algorithm; the mapping moved"
-    return build_worker_env(spec, 0)
+    return build_worker_env(spec, 0, runtime_secrets=_worker_runtime_for(algorithm))
 
 
 @pytest.mark.parametrize(("algorithm", "phase"), [("grpo", "rl"), ("opd", "opd")])
@@ -314,7 +323,11 @@ def test_a_stale_backend_key_cannot_change_the_allocator(stale_backend):
                 "worker_env": {f"FLASH_{phase.upper()}_BACKEND": stale_backend},
             }
         )
-        env = build_worker_env(spec, 0)
+        env = build_worker_env(
+            spec,
+            0,
+            runtime_secrets=_worker_runtime_for(algorithm),
+        )
         for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
             assert ("expandable_segments" in env[key]) is expect_expandable, (
                 f"{algorithm} allocator moved under a stale {stale_backend!r} key"

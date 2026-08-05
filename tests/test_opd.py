@@ -7,10 +7,6 @@ CI, which has the training stack).
 
 from __future__ import annotations
 
-import base64
-import io
-import json
-import os
 import sys
 import types
 from types import SimpleNamespace
@@ -450,10 +446,7 @@ def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
     assert opd_rollout_seq_len(4096, 8192, False) == 4096  # explicit max_length pins the sequence
 
 
-def test_opd_selects_managed_teacher_and_rejects_unknown():
-    """[train].teacher_model selects the managed teacher from a fixed allow-list: a supported alias
-    (or the raw Fireworks id, or a spaced/mixed-case form) parses and is stored as its canonical
-    Fireworks model id; an unsupported teacher is rejected at PARSE time (before a paid GPU)."""
+def test_opd_selects_only_managed_parasail_aliases():
     from flash.schema import ConfigError, spec_from_dict
 
     def _spec(teacher):
@@ -467,36 +460,23 @@ def test_opd_selects_managed_teacher_and_rejects_unknown():
             run_id="x",
         )
 
-    # supported aliases parse and are stored as the canonical fireworks model id.
-    assert _spec("kimi-k2.6").train.teacher_model == "accounts/fireworks/models/kimi-k2p6"
-    # A spaced / mixed-case form normalizes to the same model id.
-    assert _spec("GLM 5.2").train.teacher_model == "accounts/fireworks/models/glm-5p2"
-    # The raw Fireworks model id is also accepted (identity), including with stray surrounding
-    # whitespace (stripped like the alias branch).
-    assert (
-        _spec("accounts/fireworks/models/glm-5p2").train.teacher_model
-        == "accounts/fireworks/models/glm-5p2"
-    )
-    assert (
-        _spec("  accounts/fireworks/models/glm-5p2  ").train.teacher_model
-        == "accounts/fireworks/models/glm-5p2"
-    )
-    # Omitting/blank leaves it unset ("" => the worker uses the default GLM 5.2 teacher).
+    assert _spec("kimi-k3").train.teacher_model == "kimi-k3"
+    assert _spec("GLM 5.2").train.teacher_model == "glm-5.2"
+    assert _spec("qwen3.5-397b-a17b").train.teacher_model == "qwen3.5-397b-a17b"
     assert _spec("").train.teacher_model == ""
 
-    # an unsupported teacher is rejected at parse time with a teacher-specific configerror.
-    with pytest.raises(ConfigError, match="teacher_model"):
-        _spec("gpt-5.5")
-    with pytest.raises(ConfigError, match="teacher_model"):
-        _spec("deepseek-v4-pro")
-    with pytest.raises(ConfigError, match="teacher_model"):
-        _spec("accounts/fireworks/models/deepseek-v4-pro")
-    # qwen-3.7-max (on-demand only) and minimax-m3 (serverless chat, but its /completions echo
-    # endpoint opd needs does not respond) are not allow-listed teachers, so both are rejected.
-    with pytest.raises(ConfigError, match="teacher_model"):
-        _spec("qwen-3.7-max")
-    with pytest.raises(ConfigError, match="teacher_model"):
-        _spec("minimax-m3")
+    rejected = (
+        "kimi-k2.6",
+        "deepseek-v4-pro",
+        "moonshotai/Kimi-K3",
+        "nvidia/GLM-5.2-NVFP4",
+        "Qwen/Qwen3.5-397B-A17B-FP8",
+        "parasail-glm-52",
+        "accounts/fireworks/models/glm-5p2",
+    )
+    for teacher in rejected:
+        with pytest.raises(ConfigError, match="teacher_model"):
+            _spec(teacher)
 
 
 def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
@@ -602,7 +582,7 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
     from flash.engine.worker.opd_train import run_opd_train
 
     source = inspect.getsource(run_opd_train)
-    validation = 'validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)'
+    validation = 'validate_multimodal_training(model_id, "opd")'
 
     assert source.index(validation) < source.index("_probe_gpu_in_subprocess(")
 
@@ -904,8 +884,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         opd_mod,
         "_resolve_opd_knobs",
         lambda: opd_mod.OpdKnobs(
-            teacher_model="accounts/fireworks/models/glm-5p2",
-            teacher_base_url="http://teacher.invalid",
+            teacher_model="glm-5.2",
             epochs=1,
             learning_rate=1e-4,
             temperature=0.0,
@@ -935,7 +914,8 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     import flash.engine.worker.teacher as tmod
 
     monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
-    monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "unit-test-teacher-capability")
 
     # The all-over-budget guard (RuntimeError) must fire; _student_model's AssertionError would
     # escape pytest.raises(RuntimeError) and fail the test (its "before the fix" behavior).
@@ -1276,900 +1256,22 @@ def test_opd_vram_scales_to_loss_microbatch_not_full_batch():
     assert sft_bs16 > sft_bs1
 
 
-def test_opd_teacher_rate_matches_fireworks_glm5p2_input_price():
-    """glm-5p2 (and the omitted-teacher default) price at Fireworks' $1.40/M input, not the old $0.90
-    — opd echo-scoring bills input tokens from the submit-time quote."""
-    from flash.cost.facts import teacher_price_per_1m
-
-    assert teacher_price_per_1m("accounts/fireworks/models/glm-5p2")[0] == 1.40
-    assert teacher_price_per_1m("")[0] == 1.40  # omitted teacher -> representative default rate
-
-
-def test_opd_teacher_price_table_covers_every_allowlisted_teacher():
-    """Every allow-listed teacher is priced by its exact row (pricing routes through resolve_teacher
-    over recipe.TEACHER_MODELS, so there is no unpriced teacher), Kimi carries its own input price
-    (not silently GLM-priced), and an unknown teacher falls back to the default rate."""
+def test_opd_teacher_price_table_covers_exact_parasail_catalog():
     from flash.cost.facts import teacher_price_per_1m
     from flash.engine.recipe import TEACHER_MODELS
 
-    # One exact price per allow-listed teacher, looked up by its provider model id.
-    for info in TEACHER_MODELS.values():
-        assert teacher_price_per_1m(info.model_id) == info.usd_per_1m
-
-    # kimi carries its own input price (distinct from glm's $1.40/m).
-    assert teacher_price_per_1m("accounts/fireworks/models/kimi-k2p6")[0] == 0.95
-    # removed teachers are unknown ids and price defensively at the default glm rate.
-    assert teacher_price_per_1m("accounts/fireworks/models/deepseek-v4-pro")[0] == 1.40
-    assert teacher_price_per_1m("accounts/fireworks/models/qwen3p7-max")[0] == 1.40
-    assert teacher_price_per_1m("accounts/fireworks/models/minimax-m3")[0] == 1.40
-
-    # An unknown teacher id falls back defensively to the default (GLM) rate.
-    assert teacher_price_per_1m("accounts/fireworks/models/does-not-exist")[0] == 1.40
+    assert teacher_price_per_1m("") == (1.40, 4.40)
+    for alias, info in TEACHER_MODELS.items():
+        assert teacher_price_per_1m(alias) == info.usd_per_1m
+    assert teacher_price_per_1m("kimi-k3") == (3.00, 15.00)
+    assert teacher_price_per_1m("qwen3.5-397b-a17b") == (0.50, 3.60)
+    with pytest.raises(ValueError, match="not a supported teacher"):
+        teacher_price_per_1m("deepseek-v4-pro")
 
 
 # --------------------------------------------------------------------------------------------------
 # teacher client (mocked HTTP)
 # --------------------------------------------------------------------------------------------------
-class _FakeResp:
-    def __init__(self, payload):
-        self._data = json.dumps(payload).encode()
-
-    def read(self):
-        return self._data
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-
-def _mock_urlopen(monkeypatch, payload, capture=None):
-    import flash.engine.worker.teacher as tm
-
-    def fake_urlopen(_transport, req, timeout=None):
-        if capture is not None:
-            capture["url"] = req.full_url
-            capture["body"] = json.loads(req.data.decode())
-        return _FakeResp(payload)
-
-    monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", fake_urlopen)
-
-
-def test_teacher_score_returns_completion_region_with_rebased_offsets_and_logprobs(monkeypatch):
-    # prompt "P: " (len 3) + completion "hi" ; teacher tokens: "P", ":", " ", "hi".
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["P", ":", " ", "hi"],
-                    "token_logprobs": [0.0, -1.0, -2.0, -0.5],
-                    "text_offset": [0, 1, 2, 3],
-                }
-            }
-        ]
-    }
-    capture = {}
-    _mock_urlopen(monkeypatch, payload, capture)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    toks = client.score("P: ", "hi")
-    # only the completion token survives; offset rebased to the completion (start 0).
-    assert len(toks) == 1
-    assert toks[0].text == "hi"
-    assert toks[0].start == 0
-    assert toks[0].logprob == -0.5  # the realized-token logprob gkd consumes
-    # scoring must not pay for generation, and asks for the minimal logprobs that return token_logprobs.
-    assert capture["body"]["max_tokens"] == 0
-    assert capture["body"]["echo"] is True
-    assert capture["body"]["logprobs"] == 1
-
-
-def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatch):
-    payload = {
-        "choices": [
-            {
-                "index": 1,
-                "logprobs": {
-                    "tokens": ["Q", "2", "B"],
-                    "token_logprobs": [0.0, -1.0, -0.2],
-                    "text_offset": [0, 1, 2],
-                },
-            },
-            {
-                "index": 0,
-                "logprobs": {
-                    "tokens": ["Q", "1", "A"],
-                    "token_logprobs": [0.0, -1.0, -0.1],
-                    "text_offset": [0, 1, 2],
-                },
-            },
-        ]
-    }
-    capture = {}
-    _mock_urlopen(monkeypatch, payload, capture)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-
-    out = client.score_many([("Q1", "A"), ("Q2", "B")])
-
-    assert capture["body"] == {
-        "model": "glm",
-        "prompt": ["Q1A", "Q2B"],
-        "max_tokens": 0,
-        "echo": True,
-        "logprobs": 1,
-        "temperature": 0,
-    }
-    assert [[t.text for t in toks] for toks in out] == [["A"], ["B"]]
-    assert [out[0][0].logprob, out[1][0].logprob] == [-0.1, -0.2]
-
-
-def test_teacher_score_many_multimodal_sends_nested_images_and_extracts_completion_suffix(
-    monkeypatch,
-):
-    payload = {
-        "choices": [
-            {
-                "index": 1,
-                "logprobs": {
-                    "tokens": ["User", ": ", "<expanded-image>", "\nAssistant:", " blue"],
-                    "token_logprobs": [None, -0.1, -0.2, -0.3, -0.7],
-                    "text_offset": [0, 4, 6, 106, 118],
-                },
-            },
-            {
-                "index": 0,
-                "logprobs": {
-                    "tokens": ["User", ": ", "<expanded-image>", "\nAssistant:", " red"],
-                    "token_logprobs": [None, -0.1, -0.2, -0.3, -0.4],
-                    "text_offset": [0, 4, 4, 104, 116],
-                },
-            },
-        ]
-    }
-    capture = {}
-    _mock_urlopen(monkeypatch, payload, capture)
-    client = TeacherClient("k", "https://api.example/v1", "kimi")
-    prompt = "User: <|media_pad|>\nAssistant: "
-
-    scored = client.score_many_multimodal(
-        [
-            (prompt, "red", ["data:image/png;base64,red"]),
-            (prompt, "blue", ["data:image/png;base64,blue"]),
-        ]
-    )
-
-    assert capture["body"] == {
-        "model": "kimi",
-        "prompt": [prompt + "red", prompt + "blue"],
-        "images": [
-            ["data:image/png;base64,red"],
-            ["data:image/png;base64,blue"],
-        ],
-        "max_tokens": 0,
-        "echo": True,
-        "logprobs": 1,
-        "temperature": 0,
-    }
-    assert [[token.text for token in tokens] for tokens in scored] == [[" red"], [" blue"]]
-    assert [(scored[0][0].start, scored[0][0].end), (scored[1][0].start, scored[1][0].end)] == [
-        (0, 3),
-        (0, 4),
-    ]
-    assert [scored[0][0].logprob, scored[1][0].logprob] == [-0.4, -0.7]
-    assert [scored[0].input_tokens, scored[1].input_tokens] == [5, 5]
-
-
-def test_teacher_score_multimodal_single_request_uses_flat_image_list(monkeypatch):
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["prompt", " answer"],
-                    "token_logprobs": [None, -0.2],
-                    "text_offset": [0, 100],
-                }
-            }
-        ]
-    }
-    capture = {}
-    _mock_urlopen(monkeypatch, payload, capture)
-    client = TeacherClient("k", "https://api.example/v1", "kimi")
-
-    client.score_many_multimodal(
-        [("prompt<|media_pad|>", "answer", ["data:image/png;base64,image"])]
-    )
-
-    assert capture["body"]["prompt"] == "prompt<|media_pad|>answer"
-    assert capture["body"]["images"] == ["data:image/png;base64,image"]
-
-
-def test_teacher_multimodal_echo_drops_trailing_zero_width_token(monkeypatch):
-    # a trailing zero-width token after the completion must not be scored as a completion token;
-    # only tokens overlapping the completion region [0, len(completion)) count.
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["prompt", " red", ""],
-                    "token_logprobs": [None, -0.4, -0.9],
-                    "text_offset": [0, 100, 104],
-                }
-            }
-        ]
-    }
-    capture = {}
-    _mock_urlopen(monkeypatch, payload, capture)
-    client = TeacherClient("k", "https://api.example/v1", "kimi")
-
-    scored = client.score_many_multimodal(
-        [("prompt<|media_pad|>", "red", ["data:image/png;base64,image"])]
-    )
-
-    assert [token.text for token in scored[0]] == [" red"]
-    assert (scored[0][0].start, scored[0][0].end) == (0, 3)
-    assert scored[0][0].logprob == -0.4
-
-
-@pytest.mark.parametrize(
-    ("tokens", "logprobs", "offsets", "completion", "message"),
-    [
-        (["p", " x"], [None], [0, 100], "x", "length"),
-        (["p", " x"], [None, None], [0, 100], "x", "null"),
-        (["p", " x"], [None, float("nan")], [0, 100], "x", "non-finite"),
-        (["p", " x"], [None, 0.2], [0, 100], "x", "positive"),
-        (["p", " y"], [None, -0.2], [0, 100], "x", "exact completion suffix"),
-    ],
-)
-def test_teacher_multimodal_echo_validator_rejects_bad_completion_contract(
-    monkeypatch, tokens, logprobs, offsets, completion, message
-):
-    from flash.engine.worker.teacher import TeacherError
-
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": tokens,
-                    "token_logprobs": logprobs,
-                    "text_offset": offsets,
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, payload)
-    client = TeacherClient("k", "https://api.example/v1", "kimi")
-
-    with pytest.raises(TeacherError, match=message) as exc_info:
-        client.score_many_multimodal(
-            [("prompt<|media_pad|>", completion, ["data:image/png;base64,image"])]
-        )
-    assert exc_info.value.permanent is True
-
-
-def test_teacher_transport_reuses_connection_and_reconnects_after_eof(monkeypatch):
-    import http.client
-
-    import flash.engine.worker.teacher as tm
-
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["P", "hi"],
-                    "token_logprobs": [0.0, -0.5],
-                    "text_offset": [0, 1],
-                }
-            }
-        ]
-    }
-    instances = []
-    delays = []
-
-    class _Socket:
-        def settimeout(self, timeout):
-            self.timeout = timeout
-
-    class _Response:
-        status = 200
-        reason = "OK"
-        will_close = False
-
-        def __init__(self):
-            self.headers = {}
-
-        def read(self):
-            return json.dumps(payload).encode()
-
-        def close(self):
-            pass
-
-    class _Connection:
-        def __init__(self, host, port, timeout):
-            self.host = host
-            self.port = port
-            self.timeout = timeout
-            self.sock = _Socket()
-            self.request_count = 0
-            instances.append(self)
-
-        def request(self, method, selector, body=None, headers=None):
-            self.request_count += 1
-            if len(instances) == 1 and self.request_count == 3:
-                raise http.client.RemoteDisconnected("stale keep-alive socket")
-
-        def getresponse(self):
-            return _Response()
-
-        def close(self):
-            self.sock = None
-
-    monkeypatch.setattr(tm.http.client, "HTTPSConnection", _Connection)
-    monkeypatch.setattr(tm.time, "sleep", delays.append)
-    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
-
-    client.score("P", "hi")
-    client.score("P", "hi")
-    client.score("P", "hi")
-    client.score("P", "hi")
-
-    assert len(instances) == 2
-    assert instances[0].request_count == 3
-    assert instances[1].request_count == 2
-    assert delays == [2.0]
-
-
-def test_teacher_score_keeps_boundary_crossing_token_clamped_to_completion(monkeypatch):
-    # Prompt ends in whitespace ("P: ", plen=3); the teacher emits a leading-space merge token
-    # " hi" that starts at char 2 (inside the prompt) and ends at 5 (inside the completion). Rather
-    # than DROP it — which for a one-token completion would leave zero teacher tokens and skip the
-    # sample — score() KEEPS it with its completion span clamped to [0, end-plen) so the first
-    # completion token still carries a teacher logprob. Only tokens ENTIRELY in the prompt (end<=plen)
-    # are dropped.
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["P", ":", " hi", "!"],
-                    "token_logprobs": [0.0, -1.0, -0.5, -0.2],
-                    "text_offset": [0, 1, 2, 5],
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, payload)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    toks = client.score("P: ", "hi!")
-    # "P" and ":" lie entirely in the prompt (end <= plen=3) -> dropped. The boundary-crossing " hi"
-    # is kept, clamped to completion span [0, 2); "!" keeps [2, 3). "hi!" is fully covered.
-    assert [t.text for t in toks] == [" hi", "!"]
-    assert (toks[0].start, toks[0].end) == (0, 2)  # max(0, 2-3)=0 ; 5-3=2
-    assert (toks[1].start, toks[1].end) == (2, 3)  # 5-3=2 ; 6-3=3
-    assert toks[0].logprob == -0.5  # the merged token's realized logprob is preserved
-
-
-def test_teacher_score_raises_on_malformed_response(monkeypatch):
-    from flash.engine.worker.teacher import TeacherError
-
-    _mock_urlopen(monkeypatch, {"choices": [{"logprobs": {}}]})
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError) as ei:
-        client.score("", "hi")
-    assert ei.value.permanent is True  # malformed response -> abort the run, not skip-and-burn
-
-
-def test_teacher_score_treats_mismatched_array_lengths_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): a 200 response whose tokens / token_logprobs / text_offset
-    arrays disagree in length would IndexError inside the per-token loop and escape as a generic
-    (non-TeacherError) exception, so a teacher that consistently returns malformed arrays could burn
-    every OPD step before the run fails with "no trained step". A length mismatch is a broken contract
-    -> PERMANENT (abort now)."""
-    from flash.engine.worker.teacher import TeacherError
-
-    def _payload(tokens, logprobs, offsets):
-        return {
-            "choices": [
-                {"logprobs": {"tokens": tokens, "token_logprobs": logprobs, "text_offset": offsets}}
-            ]
-        }
-
-    # Both directions of length disagreement are a broken contract and must abort PERMANENTLY:
-    #  - logprobs SHORTER than tokens -> the per-token loop IndexErrors.
-    #  - logprobs/offsets LONGER than tokens -> n=len(tokens) silently ignores the tail AND the last
-    #    token (i==n-1) takes end=len(full), reinterpreting a mid-string token as spanning the whole
-    #    completion and training on the wrong logprob (codex[bot]). `!=` (not `< n`) catches both.
-    cases = [
-        (["a", "b", "c"], [0.0, -1.0], [0, 1, 2]),  # 2 logprobs < 3 tokens
-        (["a", "b"], [0.0, -1.0, -2.0], [0, 1]),  # 3 logprobs > 2 tokens (tail ignored)
-        (["a", "b"], [0.0, -1.0], [0, 1, 2]),  # 3 offsets > 2 tokens
-    ]
-    for tokens, logprobs, offsets in cases:
-        _mock_urlopen(monkeypatch, _payload(tokens, logprobs, offsets))
-        client = TeacherClient("k", "https://api.example/v1", "glm")
-        with pytest.raises(TeacherError) as ei:
-            client.score("", "".join(tokens))
-        assert ei.value.permanent is True, f"{(tokens, logprobs, offsets)} must be PERMANENT"
-        assert "length" in str(ei.value).lower()
-
-
-def test_teacher_score_rejects_null_logprob_on_completion_token_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): a null (None) realized logprob is legitimate ONLY for
-    unscored PROMPT context. A None on a token that overlaps the COMPLETION (the ones score() keeps)
-    means the teacher did not score it; coercing it to 0.0 (log-prob 1.0 == full confidence) would
-    train the gkd loss on fabricated teacher confidence, so it must abort like the other contract
-    violations. A prompt-context null (dropped anyway) must NOT trip it."""
-    from flash.engine.worker.teacher import TeacherError
-
-    # prompt "P" (plen=1) + completion "hi". Token "hi" spans [1,3) (end>plen -> KEPT) with a null
-    # logprob -> reject as permanent.
-    bad = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["P", "hi"],
-                    "token_logprobs": [0.0, None],  # completion token "hi" unscored -> abort
-                    "text_offset": [0, 1],
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, bad)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is True
-    assert "null" in str(ei.value).lower()
-
-    # A PROMPT-context null (token entirely in the prompt, end<=plen) is fine: it's dropped, not kept.
-    ok = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["P", "hi"],
-                    "token_logprobs": [None, -0.5],  # prompt token "P" null (dropped); "hi" scored
-                    "text_offset": [0, 1],
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, ok)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    toks = client.score("P", "hi")
-    assert toks
-    assert toks[0].logprob == -0.5
-
-
-def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
-    import urllib.error
-
-    import flash.engine.worker.teacher as tm
-    from flash.engine.worker.teacher import TeacherError
-
-    def raise_http(code):
-        def fake_urlopen(_transport, req, timeout=None):
-            raise urllib.error.HTTPError(req.full_url, code, f"HTTP {code}", {}, None)
-
-        monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", fake_urlopen)
-
-    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=1)
-    # 401 (bad key) is permanent -> raised immediately so the worker aborts, not burns every step.
-    raise_http(401)
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is True
-    # 503 is transient -> retries exhaust to a non-permanent error (a skipped sample, run continues).
-    raise_http(503)
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is False
-
-
-def test_teacher_http_error_diagnostic_omits_opaque_response_body(monkeypatch):
-    import io
-    import traceback
-    import urllib.error
-
-    import flash.engine.worker.teacher as tm
-    from flash.engine.worker.teacher import TeacherError
-
-    private = b"opaque-private-teacher-sentinel-91ad"
-
-    def raise_http(_transport, req, timeout=None):
-        raise urllib.error.HTTPError(
-            req.full_url,
-            403,
-            private.decode(),
-            {},
-            io.BytesIO(private),
-        )
-
-    monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", raise_http)
-    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=1)
-
-    with pytest.raises(TeacherError) as exc_info:
-        client.score("P", "hi")
-
-    detail = str(exc_info.value)
-    formatted = "".join(traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb))
-    assert exc_info.value.permanent is True
-    assert "teacher HTTP 403" in detail
-    assert "/completions" in detail
-    assert "permanent" in detail
-    assert private.decode() not in detail
-    assert private.decode() not in formatted
-
-
-def test_teacher_score_rejects_non_list_logprob_fields_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py:130): the length check assumes tokens/token_logprobs/
-    text_offset are sequences. A malformed 200 with token_logprobs=null (or a scalar text_offset) makes
-    len()/indexing raise TypeError OUTSIDE TeacherError, so a consistently malformed teacher could burn
-    every OPD step. Non-list fields must raise a PERMANENT TeacherError up front."""
-    from flash.engine.worker.teacher import TeacherError
-
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["a", "b"],
-                    "token_logprobs": None,  # malformed: null instead of a list
-                    "text_offset": [0, 1],
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, payload)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError) as ei:
-        client.score("", "ab")
-    assert ei.value.permanent is True
-    assert "not all lists" in str(ei.value)
-
-
-def test_teacher_malformed_200_body_is_transient_teacher_error(monkeypatch):
-    """Regression (codex[bot], teacher.py:65): an HTTP 200 with a non-JSON body must surface as a
-    TRANSIENT TeacherError, not a raw json.JSONDecodeError. A raw decode error escapes _post's except
-    clauses, so a run hammered by malformed 200s could fail as permanent no-signal instead of retrying
-    as teacher infra."""
-    import flash.engine.worker.teacher as tm
-    from flash.engine.worker.teacher import TeacherError
-
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return b"<html>502 Bad Gateway</html>"  # HTTP 200 status, non-JSON body
-
-    monkeypatch.setattr(
-        tm._ThreadLocalHttpsTransport,
-        "urlopen",
-        lambda _transport, req, timeout=None: _Resp(),
-    )
-    monkeypatch.setattr(tm.time, "sleep", lambda *a, **k: None)  # skip real backoff sleeps
-    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is False  # transient -> retried as infra, not permanent no-signal
-    assert "unparseable" in str(ei.value).lower()
-
-
-def test_teacher_incomplete_read_body_is_transient_teacher_error(monkeypatch):
-    """Regression (codex[bot], teacher.py:65): an HTTP 200 whose body is truncated mid-read() raises
-    http.client.IncompleteRead — an HTTPException, NOT an OSError — so without an explicit clause it
-    escapes _post's retry loop, failing a truncated-200 run as permanent no-signal instead of retrying
-    as infra."""
-    import http.client
-
-    import flash.engine.worker.teacher as tm
-    from flash.engine.worker.teacher import TeacherError
-
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            raise http.client.IncompleteRead(b"half", 100)  # body truncated mid-read
-
-    monkeypatch.setattr(
-        tm._ThreadLocalHttpsTransport,
-        "urlopen",
-        lambda _transport, req, timeout=None: _Resp(),
-    )
-    monkeypatch.setattr(tm.time, "sleep", lambda *a, **k: None)  # skip real backoff sleeps
-    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is False  # transient -> retried as infra, not permanent no-signal
-    assert "truncated" in str(ei.value).lower()
-
-
-def test_teacher_score_rejects_non_numeric_or_unordered_offsets_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): a malformed 200 can put a value in text_offset that passes
-    the list/length guards yet corrupts the alignment: non-numeric (null/string) or out-of-order (as
-    before), and also non-finite (int(NaN) RAISES outside TeacherError -> unclassified skip), fractional
-    (int() silently truncates to a wrong char index), or out-of-[0, len(full)] (a span outside the
-    completion region). All must be rejected up front as PERMANENT so the worker aborts, not skip-burns.
-    full = 'P' + 'hi' = 'Phi', len 3."""
-    from flash.engine.worker.teacher import TeacherError
-
-    def _payload(offsets):
-        return {
-            "choices": [
-                {
-                    "logprobs": {
-                        "tokens": ["P", "hi"],
-                        "token_logprobs": [0.0, -0.5],
-                        "text_offset": offsets,
-                    }
-                }
-            ]
-        }
-
-    for bad, needle in (
-        ([0, None], "non-numeric"),
-        ([0, "x"], "non-numeric"),
-        ([2, 1], "non-decreasing"),  # both in-range so the order check (not range) is what fires
-        ([0, 1.5], "not an integer"),  # fractional -> int() truncates to a wrong index
-        ([0, float("nan")], "not finite"),  # NaN -> int(NaN) raises outside TeacherError
-        ([0, 9], "outside"),  # 9 > len('Phi')=3 -> span past the string
-        ([-1, 0], "outside"),  # negative start -> span before the completion
-    ):
-        _mock_urlopen(monkeypatch, _payload(bad))
-        client = TeacherClient("k", "https://api.example/v1", "glm")
-        with pytest.raises(TeacherError) as ei:
-            client.score("P", "hi")
-        assert ei.value.permanent is True, f"{bad!r} must be PERMANENT"
-        assert needle in str(ei.value).lower(), f"{bad!r}: expected {needle!r} in {ei.value}"
-
-
-def test_teacher_score_rejects_non_numeric_or_nonfinite_logprobs_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): token_logprobs[i] is coerced with float(...) below (None ->
-    0.0 for a null realized logprob). A malformed 200 can still carry a non-numeric value (float() raises
-    ValueError OUTSIDE TeacherError and can burn every OPD step) or a non-finite NaN/inf (feeds a
-    poisoned gradient straight into the gkd loss). Both must be
-    rejected up front as PERMANENT; a null logprob stays allowed (handled as 0.0)."""
-    from flash.engine.worker.teacher import TeacherError
-
-    def _payload(logprobs):
-        return {
-            "choices": [
-                {
-                    "logprobs": {
-                        "tokens": ["P", "hi"],
-                        "token_logprobs": logprobs,
-                        "text_offset": [0, 1],
-                    }
-                }
-            ]
-        }
-
-    for bad, needle in (
-        ([0.0, "x"], "non-numeric"),
-        ([0.0, float("nan")], "non-finite"),
-        ([0.0, float("inf")], "non-finite"),
-    ):
-        _mock_urlopen(monkeypatch, _payload(bad))
-        client = TeacherClient("k", "https://api.example/v1", "glm")
-        with pytest.raises(TeacherError) as ei:
-            client.score("P", "hi")
-        assert ei.value.permanent is True, f"{bad!r} must be PERMANENT"
-        assert needle in str(ei.value).lower(), f"{bad!r}: expected {needle!r} in {ei.value}"
-
-    # A NULL realized logprob (first token) is legitimate and must NOT raise -> it becomes 0.0.
-    _mock_urlopen(monkeypatch, _payload([None, -0.5]))
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    toks = client.score("P", "hi")
-    assert toks  # completion token survives; null prompt logprob dropped
-    assert toks[0].logprob == -0.5
-
-
-def test_teacher_score_rejects_positive_logprob_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): a log-probability cannot exceed 0. A malformed 200 with a
-    POSITIVE token_logprob is a probability > 1; summed into teacher_logsum it poisons the reverse-KL
-    coefficient with impossible teacher mass, so OPD would train on a bogus signal instead of aborting.
-    Reject as PERMANENT like the other teacher-contract violations. A ~0 logprob (near-deterministic
-    token) stays allowed via the small float-rounding tolerance."""
-    from flash.engine.worker.teacher import TeacherError
-
-    def _payload(logprobs):
-        return {
-            "choices": [
-                {
-                    "logprobs": {
-                        "tokens": ["P", "hi"],
-                        "token_logprobs": logprobs,
-                        "text_offset": [0, 1],
-                    }
-                }
-            ]
-        }
-
-    # A clearly-positive completion logprob (prob e^2.5 >> 1) is rejected as PERMANENT.
-    _mock_urlopen(monkeypatch, _payload([0.0, 2.5]))
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is True
-    assert "positive" in str(ei.value).lower()
-
-    # A ~0 logprob within float-rounding tolerance (near-deterministic token) is NOT rejected.
-    _mock_urlopen(monkeypatch, _payload([None, 1e-9]))
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    toks = client.score("P", "hi")
-    assert toks  # completion token survives
-    assert abs(toks[0].logprob - 1e-9) < 1e-12
-
-
-def test_teacher_score_rejects_truncated_echo_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): a malformed 200 with equal-length arrays can still OMIT a
-    suffix of `full`. The final token's end falls back to len(full), so a truncated echo stretches the
-    last returned token across text the teacher never scored (and, if that token sits in the prompt,
-    drags it across the boundary into the completion) — a fabricated span. The echoed tokens must tile
-    the whole input, so a last token whose own text ends short of len(full) is rejected as PERMANENT.
-    prompt 'P' (plen 1) + 'hello' = 'Phello' (len 6); an echo of only ['P','h'] ends at char 2."""
-    from flash.engine.worker.teacher import TeacherError
-
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["P", "h"],  # covers only "Ph"; omits "ello"
-                    "token_logprobs": [0.0, -0.5],
-                    "text_offset": [0, 1],
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, payload)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hello")
-    assert ei.value.permanent is True
-    assert "does not tile" in str(ei.value).lower()
-
-
-def test_teacher_score_rejects_same_length_wrong_text_token_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): the tiling guard must compare the token TEXT to the echoed
-    substring, not just its LENGTH. A malformed 200 echoing a same-length-but-different token over the
-    right offsets (here 'XY' where full[1:3]=='hi') passes a length-only check yet trains the gkd loss
-    on the wrong token's logprob. full 'P'+'hi'='Phi' (len 3); token 1 'XY' (len 2, == the span length)
-    must still be rejected as PERMANENT because its text isn't the echoed substring."""
-    from flash.engine.worker.teacher import TeacherError
-
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["P", "XY"],  # len(XY)==len(hi)==2, tiles by length but wrong text
-                    "token_logprobs": [0.0, -0.5],
-                    "text_offset": [0, 1],
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, payload)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is True
-    assert "does not tile" in str(ei.value).lower()
-
-
-def test_teacher_score_rejects_interior_tiling_gap_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): the coverage guard must validate EVERY token boundary, not
-    only the final one. An INTERIOR gap/overlap — offsets[i+1] != offsets[i] + len(tokens[i]) — makes the
-    emit loop use offsets[i+1] as token i's end, assigning token i's logprob to text the teacher never
-    scored (a fabricated completion span when the gap straddles plen). full 'P'+'hiyo' = 'Phiyo' (len 5);
-    a mid-sequence offset jump (token 1 'h' ends at char 2 but the next offset is 3) must be PERMANENT."""
-    from flash.engine.worker.teacher import TeacherError
-
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["P", "h", "yo"],
-                    "token_logprobs": [0.0, -0.3, -0.5],
-                    "text_offset": [
-                        0,
-                        1,
-                        3,
-                    ],  # token 1 'h' ends at 2 but next offset is 3 -> gap at 2
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, payload)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hiyo")
-    assert ei.value.permanent is True
-    assert "does not tile" in str(ei.value).lower()
-
-
-def test_teacher_score_rejects_echo_not_starting_at_offset_0_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): the tiling guard proves coverage of full[offsets[0]:] only —
-    it never requires offsets[0] == 0. A malformed 200 that DROPS a prompt prefix and echoes a cleanly-
-    tiling SUFFIX passes every offset/tiling check, but its completion logprobs were computed over a
-    TRUNCATED prompt, so the gkd signal is scored against context the student never saw. full 'AB'+'cd' =
-    'ABcd' (len 4); an echo of ['B','cd'] at offsets [1,2] tiles full[1:4] cleanly yet omits 'A' — the
-    first offset is 1, not 0, and must be rejected as PERMANENT."""
-    from flash.engine.worker.teacher import TeacherError
-
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": [
-                        "B",
-                        "cd",
-                    ],  # tiles full[1:4]=='Bcd' cleanly, but drops the 'A' prefix
-                    "token_logprobs": [0.0, -0.5],
-                    "text_offset": [1, 2],  # starts at 1, not 0
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, payload)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError) as ei:
-        client.score("AB", "cd")
-    assert ei.value.permanent is True
-    assert "offset 0" in str(ei.value).lower()
-
-
-def test_teacher_score_rejects_echo_with_no_completion_tokens_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py): an echo that yields NO completion-region token for a
-    non-empty completion (here the degenerate empty-arrays 200) scored nothing to distil; score() must
-    reject it as PERMANENT instead of returning an empty list that then burns every OPD step on no
-    signal before the generic no-trained-step failure."""
-    from flash.engine.worker.teacher import TeacherError
-
-    payload = {"choices": [{"logprobs": {"tokens": [], "token_logprobs": [], "text_offset": []}}]}
-    _mock_urlopen(monkeypatch, payload)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert ei.value.permanent is True
-    assert "no completion-region tokens" in str(ei.value).lower()
-
-
-def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkeypatch):
-    """Regression (codex[bot], teacher.py:62): a retryable 5xx whose error body is truncated makes
-    e.read() raise IncompleteRead BEFORE last_err is set — without a guard it escapes _post as a generic
-    exception before classification, so repeated retryable errors end as permanent no-signal. The
-    preview read must be guarded and the error still classified by e.code."""
-    import http.client
-    import urllib.error
-
-    import flash.engine.worker.teacher as tm
-    from flash.engine.worker.teacher import TeacherError
-
-    class _BadBodyHTTPError(urllib.error.HTTPError):
-        def read(self, *a, **k):
-            raise http.client.IncompleteRead(b"", 10)
-
-    err = _BadBodyHTTPError("http://x", 503, "Service Unavailable", {}, None)
-    err.fp = object()  # force the `if e.fp` branch so the guarded read() is attempted
-
-    def raise_503(_transport, req, timeout=None):
-        raise err
-
-    monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", raise_503)
-    monkeypatch.setattr(tm.time, "sleep", lambda *a, **k: None)  # skip real backoff
-    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
-    with pytest.raises(TeacherError) as ei:
-        client.score("P", "hi")
-    assert (
-        ei.value.permanent is False
-    )  # 503 retryable -> transient TeacherError, not a raw exception
-    assert "503" in str(ei.value)
-
-
 def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
     """Regression (codex[bot], opd.py:64): kl_penalty_coef scales the gkd objective, so an explicit 0
     (allowed by the shared schema for GRPO) makes every OPD backward a zero gradient while opt_steps
@@ -2205,12 +1307,7 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
     assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
 
 
-def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
-    """_resolve_opd_knobs defensively re-resolves [train].teacher_model at the worker's (tolerant)
-    deserialization boundary: parse already canonicalized it to a Fireworks model id, but the worker
-    still validates — accepting an alias or the model id — so the TeacherClient sends a supported model.
-    An unset value keeps the default GLM 5.2 teacher; the shared base_url is unchanged; an unsupported
-    teacher fails loudly on the worker."""
+def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
     from flash.engine.worker import opd as opd_mod
 
     class _Train:  # any [train] field not set returns None (falls back to the recipe default)
@@ -2230,17 +1327,14 @@ def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
         )
         return opd_mod._resolve_opd_knobs()
 
-    # a friendly alias resolves to the provider model id.
-    assert _knobs("kimi-k2.6").teacher_model == "accounts/fireworks/models/kimi-k2p6"
-    # unset / blank / none -> the default glm 5.2 teacher (historical behavior preserved).
-    assert _knobs("").teacher_model == "accounts/fireworks/models/glm-5p2"
-    assert _knobs(None).teacher_model == "accounts/fireworks/models/glm-5p2"
-    # base_url is shared across every allow-listed teacher (one fireworks endpoint + one managed key).
-    assert _knobs("kimi-k2.6").teacher_base_url == opd_mod.RECIPE.opd.teacher_base_url
-    # unsupported teachers fail loudly on the worker (defensive guard, mirrors the kl_coef check).
+    assert _knobs("kimi-k3").teacher_model == "parasail-kimi-k3-fast"
+    assert _knobs("qwen3.5-397b-a17b").teacher_model == "parasail-qwen35-397b-a17b"
+    assert _knobs("").teacher_model == "parasail-glm-52"
+    assert _knobs(None).teacher_model == "parasail-glm-52"
     for teacher in (
-        "gpt-5.5",
+        "kimi-k2.6",
         "deepseek-v4-pro",
+        "Qwen/Qwen3.5-397B-A17B-FP8",
         "accounts/fireworks/models/deepseek-v4-pro",
     ):
         with pytest.raises(RuntimeError, match="teacher_model"):
@@ -2257,41 +1351,7 @@ def test_groupwise_alignment_emits_no_empty_student_group():
     assert [s_idx for s_idx, _ in groups] == [[0, 1]]
 
 
-@pytest.mark.live
-@pytest.mark.skipif(
-    os.environ.get("FLASH_LIVE") != "1" or not os.environ.get("FIREWORKS_API_KEY"),
-    reason="set FLASH_LIVE=1 and FIREWORKS_API_KEY to run the live Fireworks teacher test",
-)
-def test_live_kimi_multimodal_teacher_conditions_red_completion_on_image():
-    image_module = pytest.importorskip("PIL.Image")
-
-    def data_uri(color):
-        image = image_module.new("RGB", (48, 48), color)
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
-
-    prompt = (
-        "User: <|media_pad|>\nWhat color is this image? Reply with one lowercase word.\nAssistant: "
-    )
-    client = TeacherClient(
-        os.environ["FIREWORKS_API_KEY"],
-        "https://api.fireworks.ai/inference/v1",
-        "accounts/fireworks/models/kimi-k2p6",
-    )
-    red_tokens, blue_tokens = client.score_many_multimodal(
-        [
-            (prompt, "red", [data_uri((220, 20, 20))]),
-            (prompt, "red", [data_uri((20, 20, 220))]),
-        ]
-    )
-    delta = sum(token.logprob for token in red_tokens) - sum(token.logprob for token in blue_tokens)
-
-    assert delta > 0.05
-
-
-def test_teacher_client_requires_key():
+def test_teacher_client_requires_capability():
     from flash.engine.worker.teacher import TeacherError
 
     with pytest.raises(TeacherError):
@@ -2321,9 +1381,8 @@ def test_opd_spec_json_round_trip():
     restored = JobSpec.from_json(spec.to_json())
     assert restored == spec
     assert restored.phase == "opd"
-    # The teacher key is platform-managed (control-plane-injected into the worker env, like
-    # HF_TOKEN) — NOT a user secret, so it is never added to environment.secrets.
-    assert "FIREWORKS_API_KEY" not in restored.environment.secrets
+    # the provider credential is control-plane-only and is never added to environment.secrets.
+    assert "PARASAIL_API_KEY" not in restored.environment.secrets
 
 
 def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
@@ -2344,8 +1403,8 @@ def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
     est = estimate_for_spec(spec)
     assert est.method == "opd"
     assert est.teacher_api_usd > 0.0  # external teacher token spend is itemized (diagnostic)
-    # Teacher tokens are billed by Fireworks to the platform-managed teacher key, tracked separately
-    # from the GPU charge: total_usd is GPU (platform-billed) time only, never total + teacher.
+    # teacher tokens are billed by parasail to the platform-managed teacher key, tracked separately
+    # from the gpu charge: total_usd is gpu (platform-billed) time only, never total + teacher.
     assert est.total_usd == pytest.approx(est.billable_hours * est.gpu_hourly_usd)
     assert "opd step" in " ".join(est.notes)
 
@@ -2389,21 +1448,9 @@ class _TinyLM:
         return self
 
 
-@pytest.mark.parametrize(
-    "teacher_model",
-    [
-        "",
-        "glm-5.2",
-        "accounts/fireworks/models/glm-5p2",
-    ],
-)
-def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(monkeypatch, teacher_model):
-    """An image dataset paired with a text-only teacher must fail before any paid GPU work.
-
-    Runs against the verl worker, which owns the whole OPD path. The rejection is the load-bearing
-    part: a text-only teacher cannot score image prompts, so reaching the GPU probe would rent a
-    card for a run that can only fail.
-    """
+def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch):
+    """Image-bearing OPD must fail before teacher construction or paid GPU work."""
+    teacher_model = "glm-5.2"
     fake_torch = types.ModuleType("torch")
     fake_torch.manual_seed = lambda _seed: None
     fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
@@ -2462,5 +1509,5 @@ def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(monkeypa
     # ValueError, not RuntimeError: TRL re-wrapped this as `RuntimeError(f"opd: {exc}")`, verl lets it
     # propagate. The type carries no behavioral difference -- `_worker_failure_flags` branches only on
     # RetriableInfraError/GitHubRateLimitError and CUDA OOM, so both are fatal and non-retriable.
-    with pytest.raises(ValueError, match=r"requires .*kimi-k2\.6"):
+    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
         opd_mod.run_opd_train()

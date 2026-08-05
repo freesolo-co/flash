@@ -1025,7 +1025,7 @@ wheels = [
 
 [[package]]
 name = "freesolo-flash"
-version = "1.0.82"
+version = "1.0.84"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1043,6 +1043,8 @@ dev = [
     { name = "regex" },
     { name = "ruff" },
     { name = "runpod-flash" },
+    { name = "tiktoken" },
+    { name = "tokenizers" },
     { name = "transformers" },
     { name = "uvicorn" },
 ]
@@ -1053,6 +1055,8 @@ gpu = [
     { name = "freesolo" },
     { name = "huggingface-hub" },
     { name = "peft" },
+    { name = "tiktoken" },
+    { name = "tokenizers" },
     { name = "torch" },
     { name = "transformers" },
     { name = "uv" },
@@ -1080,6 +1084,8 @@ dev = [
     { name = "pillow" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "tiktoken" },
+    { name = "tokenizers" },
 ]
 
 [package.metadata]
@@ -1112,6 +1118,10 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "runpod-flash", marker = "extra == 'dev'" },
     { name = "runpod-flash", marker = "extra == 'server'" },
+    { name = "tiktoken", marker = "extra == 'dev'", specifier = ">=0.12" },
+    { name = "tiktoken", marker = "extra == 'gpu'", specifier = ">=0.12" },
+    { name = "tokenizers", marker = "extra == 'dev'", specifier = ">=0.22" },
+    { name = "tokenizers", marker = "extra == 'gpu'", specifier = ">=0.22" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.10.0" },
     { name = "transformers", marker = "extra == 'dev'", specifier = ">=5.6,<5.11" },
     { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.11" },
@@ -1131,6 +1141,8 @@ dev = [
     { name = "pillow", specifier = ">=11" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.6" },
+    { name = "tiktoken", specifier = ">=0.12" },
+    { name = "tokenizers", specifier = ">=0.22" },
 ]
 
 [[package]]

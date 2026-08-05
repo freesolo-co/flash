@@ -29,8 +29,8 @@ class RunConfig:
     thinking: bool = False
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
-    # OPD only: the Fireworks teacher model id (already resolved from [train].teacher_model at parse).
-    # Prices the teacher-API estimate; an empty value resolves to the default GLM 5.2 teacher (an
+    # opd only: the canonical friendly teacher alias from [train].teacher_model.
+    # prices the teacher-api estimate; an empty value resolves to the default glm 5.2 teacher (an
     # omitted [train].teacher_model).
     teacher_model: str = ""
 
@@ -49,6 +49,8 @@ class RunConfig:
     # Spec gpu.count: cards the job occupies. total cost scales linearly with it (n cards for the
     # billed training wall); 1 = the historical single-gpu quote.
     gpu_count: int = 1
+    opd_multi_turn: bool = False
+    opd_max_turns: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -91,6 +93,12 @@ class RunConfig:
                 raise ValueError(f"{_name} must be >= 1, got {_val}")
         if self.train_tokens is not None and self.train_tokens < 1:
             raise ValueError(f"train_tokens must be >= 1, got {self.train_tokens}")
+        if not isinstance(self.opd_multi_turn, bool):
+            raise TypeError("opd_multi_turn must be a boolean")
+        if self.opd_max_turns is not None and (
+            isinstance(self.opd_max_turns, bool) or not isinstance(self.opd_max_turns, int)
+        ):
+            raise TypeError("opd_max_turns must be an integer")
         save_at_steps = parse_positive_int_tuple(self.save_at_steps, name="save_at_steps")
         if save_at_steps and save_at_steps[-1] > self.steps:
             raise ValueError("save_at_steps cannot exceed steps")
@@ -186,7 +194,7 @@ class CostEstimate:
     total_usd: float
     # cards the job occupies; total_usd already reflects n-card billing. 1 = single-gpu quote.
     gpu_count: int = 1
-    # opd only: external fireworks teacher token spend (0.0 for sft/grpo). billed by fireworks
+    # opd only: external parasail teacher token spend (0.0 for sft/grpo). billed by parasail
     # to the platform-managed teacher key (users don't supply one), tracked separately from the
     # platform-billed gpu charge, so it is not part of total_usd and is shown as its own itemized
     # diagnostic line only.
@@ -219,7 +227,7 @@ class CostEstimate:
         ]
         if self.teacher_api_usd > 0:
             lines.append(
-                f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks teacher token spend on the "
+                f"Teacher API: ${self.teacher_api_usd:.2f} (Parasail teacher token spend on the "
                 "platform-managed teacher key — tracked separately, NOT included in TOTAL)"
             )
         lines.append(f"TOTAL      : ${self.total_usd:.2f}")
