@@ -14,6 +14,7 @@ the module is import-safe and unit-testable on a CPU box.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 
@@ -39,7 +40,7 @@ class StudentToken:
 
 
 def groupwise_alignment(
-    student_toks: list[StudentToken], teacher_toks: list[TeacherToken]
+    student_toks: Sequence[StudentToken], teacher_toks: Sequence[TeacherToken]
 ) -> list[tuple[list[int], float]]:
     """Align student & teacher tokens into matching decoded-text spans, for groupwise reverse-KL.
 
