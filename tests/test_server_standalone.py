@@ -629,20 +629,19 @@ def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
     assert "RunPod endpoint concurrency is not capped by Flash" in doc
 
 
-def test_the_private_fp8_serving_repos_are_not_on_the_training_path() -> None:
-    """The catalog names a per-model FP8 repo under the managed namespace, and most are PRIVATE.
+def test_the_serving_repos_are_not_on_the_training_path() -> None:
+    """The catalog names a serving checkpoint per model, and most FP8 checkpoints are private.
 
-    A self-hoster's HF_TOKEN cannot read them, so if anything on the training path resolved
-    `serve_model_id` the run would die on a 401 against a repo they can neither see nor fix --
-    and the catalog would be advertising a model Flash cannot actually train. The field is
-    serving metadata; this pins that it stays that way.
+    A self-hoster's HF_TOKEN cannot read the private checkpoints, so if anything on the training
+    path resolved `serve_model_id` the run would die on a 401 against a repo they can neither see
+    nor fix. The field is serving metadata; this pins that it stays that way.
 
     Asserted against the CODE, not just the doc: a doc-only check keeps passing the moment a
     future caller starts reading the field, which is exactly when the claim stops being true.
     """
     import pathlib
 
-    from flash.catalog import MODELS, SERVING_FP8_MODEL_REPOS
+    from flash.catalog import MODELS, SERVING_MODEL_REPOS
 
     root = pathlib.Path(__file__).resolve().parent.parent / "flash"
     # every module that runs while a job trains -- allocation, launch, the worker itself.
@@ -651,13 +650,13 @@ def test_the_private_fp8_serving_repos_are_not_on_the_training_path() -> None:
     readers = [
         str(p.relative_to(root.parent))
         for p in trainers
-        if "serve_model_id" in p.read_text() or "SERVING_FP8_MODEL_REPOS" in p.read_text()
+        if "serve_model_id" in p.read_text() or "SERVING_MODEL_REPOS" in p.read_text()
     ]
-    assert readers == [], f"training path now reads the private FP8 serving repos: {readers}"
+    assert readers == [], f"training path now reads the serving checkpoints: {readers}"
 
     # and the field is genuinely populated, so the check above is not vacuous.
     assert any(m.serving and m.serving.serve_model_id for m in MODELS.values())
-    assert SERVING_FP8_MODEL_REPOS
+    assert SERVING_MODEL_REPOS
 
     doc = (root.parent / "SELF_HOSTING.md").read_text()
     assert "informational\nonly" in doc or "informational only" in doc
