@@ -682,11 +682,18 @@ def cmd_train(args) -> int:
         else:
             print(json.dumps(status, indent=2))
         return 0
-    status = client.create_run(
-        payload,
-        runtime_secrets=runtime_secrets,
-        client_train_schema=client_train_schema,
-    )
+    try:
+        status = client.create_run(
+            payload,
+            runtime_secrets=runtime_secrets,
+            client_train_schema=client_train_schema,
+        )
+    except ApiError as exc:
+        # a real submit misses the profile cache the same way a preview does, and the miss starts a
+        # separately billed profile run. without this the user sees a bare 409 for a charge they
+        # were never told about (see _raise_if_workload_profile_pending).
+        _raise_if_workload_profile_pending(client, exc)
+        raise
     run_id = status["run_id"]
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
