@@ -403,6 +403,11 @@ def reclaim_spent_profile_run(run_id: str, key_id: int, *, spent_at: float) -> b
     before the run it authorizes is created, both here and on the relaunch below. So the claim
     backing a spent run precedes it, and a claim taken to replace it follows it. Creating a profile
     run without claiming it first would break the takeover for that id in both directions.
+
+    An unclaimed id is claimed outright rather than reported lost. A previous takeover whose launch
+    failed released its row, leaving the status store still showing the spent run: without the
+    insert every later submitter would keep arriving here, keep matching nothing, and the workload
+    would be wedged by the very path that exists to unwedge it.
     """
     with _connect() as conn:
         cursor = conn.execute(
@@ -410,7 +415,16 @@ def reclaim_spent_profile_run(run_id: str, key_id: int, *, spent_at: float) -> b
             "WHERE run_id = ? AND kind = 'profile' AND created_at <= ?",
             (key_id, time.time(), run_id, spent_at),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount == 1:
+            return True
+        # inline rather than delegating to claim_profile_run: that would open a nested transaction
+        # on this same pooled connection and commit the update above out from under this block.
+        inserted = conn.execute(
+            "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, 'profile', ?) "
+            "ON CONFLICT(run_id) DO NOTHING",
+            (run_id, key_id, time.time()),
+        )
+        return inserted.rowcount == 1
 
 
 def delete_run(run_id: str) -> None:
