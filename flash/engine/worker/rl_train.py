@@ -111,6 +111,9 @@ DATA_SOURCE = "flash_env"
 _MULTI_TURN_SCORE_BATCH_SIZE = 64
 _MULTI_TURN_SCORE_FLUSH_WAIT_S = 0.1
 _MULTI_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
+_SINGLE_TURN_SCORE_BATCH_SIZE = 64
+_SINGLE_TURN_SCORE_FLUSH_WAIT_S = 0.1
+_SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
 
 # the bridge's listen() backlog. verl opens one connection per episode and starts a whole step's
 # episodes at once, so the accept queue sees the entire rollout batch -- prompts_per_step *
@@ -679,6 +682,7 @@ def _build_verl_train_notes(
     wandb_id: str | None = None,
     reward_profile=None,
     step_intervals: list[float] | None = None,
+    reward_bridge_batching: bool = False,
 ) -> dict:
     return {
         "backend": "verl",
@@ -732,20 +736,23 @@ def _build_verl_train_notes(
         # wandb.run, verl from the child marker (see backend_common.render_wandb_link_shim).
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
-        # what this env's grader actually cost, and what share of a step the gpu spent waiting on
-        # it. measured, not modelled: the cost model prices every grader at one global average
-        # (1.0 s/completion) spanning regex graders to llm judges, and those two sit at opposite
-        # ends of the utilization range. None when the profile was skipped or untrustworthy --
-        # recording a number with nothing behind it is worse than recording no number.
+        # scalar grader latency remains useful after batching, but multiplying it by every completion
+        # no longer measures the reward wall. publish no idle fraction until the batch-aware estimator
+        # has a measured batch denominator rather than presenting the old serial projection as fact.
+        "reward_bridge_batching": bool(reward_bridge_batching),
         "reward_seconds_per_completion": (
             reward_profile.seconds_per_completion
             if reward_profile is not None and reward_profile.trustworthy
             else None
         ),
-        "reward_gpu_idle_fraction": _measured_idle_fraction(
-            reward_profile,
-            completions_per_step=inp["prompts_per_step"] * inp["group_size"],
-            step_intervals=step_intervals or [],
+        "reward_gpu_idle_fraction": (
+            None
+            if reward_bridge_batching
+            else _measured_idle_fraction(
+                reward_profile,
+                completions_per_step=inp["prompts_per_step"] * inp["group_size"],
+                step_intervals=step_intervals or [],
+            )
         ),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
@@ -1480,9 +1487,9 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         # NO client deadline. verl fans this call out hard: RewardLoopManager builds
         # reward.num_workers (8) ray workers unconditionally on the grpo path
         # (ray_trainer.py:901-910), and each one asyncio.gathers every row in its chunk
-        # (reward_loop.py:138-143). start_reward_server serializes them behind one lock, so a
-        # per-request timeout would bound QUEUE WAIT, not the env call -- the Nth caller in line
-        # fails for the crime of arriving Nth, and a slow-but-healthy judge fails the whole run.
+        # (reward_loop.py:138-143). start_reward_server coalesces those requests behind one scoring
+        # thread, so a per-request timeout would still bound QUEUE WAIT as well as the env call -- a
+        # caller can fail for arriving behind a slow-but-healthy judge batch.
         # a wedged env is caught by the training stall watchdog instead (STALL_AFTER_S=1500s in
         # providers/_poll.py), which measures training progress rather than one request.
         "        with urllib.request.urlopen(req) as r:\n"
@@ -1589,6 +1596,94 @@ def score_single_turn(
     return r
 
 
+def score_single_turn_batch(
+    env,
+    requests: list[tuple[str, object]],
+    *,
+    tok,
+    thinking: bool,
+    prompt_opened_thinking: bool,
+    think_penalty: float,
+) -> list[tuple[float, list[dict[str, float] | None]]]:
+    """score a batch of single-turn completions while preserving scalar failure semantics."""
+    if not requests:
+        return []
+
+    prepared = []
+    for solution_str, ex in requests:
+        graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
+        state = (
+            {
+                "raw": solution_str,
+                "completion": graded,
+                "thinking": _w.thinking_text(
+                    solution_str, prompt_opened_thinking=prompt_opened_thinking
+                ),
+            }
+            if thinking
+            else None
+        )
+        batch_state = {"response_text": graded}
+        if state is not None:
+            batch_state.update(state)
+        prepared.append((solution_str, ex, batch_state))
+
+    def score_serially():
+        results = []
+        for solution_str, ex in requests:
+            breakdowns: list[dict[str, float] | None] = []
+            score = score_single_turn(
+                env,
+                solution_str,
+                ex,
+                tok=tok,
+                thinking=thinking,
+                prompt_opened_thinking=prompt_opened_thinking,
+                think_penalty=think_penalty,
+                breakdowns=breakdowns,
+            )
+            results.append((score, breakdowns))
+        return results
+
+    try:
+        scores_breakdown_many = getattr(env, "scores_breakdown_many", None)
+        reward_many = getattr(env, "reward_many", None)
+        items = [(ex, state) for _, ex, state in prepared]
+        if callable(scores_breakdown_many):
+            breakdown_values = list(scores_breakdown_many(items))
+            if len(breakdown_values) != len(prepared):
+                raise RuntimeError("env scores_breakdown_many returned the wrong length")
+            raw_results = [
+                (float(breakdown.get("total", 0.0)), [breakdown]) for breakdown in breakdown_values
+            ]
+        elif callable(reward_many):
+            reward_values = list(reward_many(items))
+            if len(reward_values) != len(prepared):
+                raise RuntimeError("env reward_many returned the wrong length")
+            raw_results = [(float(reward), []) for reward in reward_values]
+        else:
+            return score_serially()
+    except Exception as exc:
+        print(
+            f"[rl-verl] env batch scoring raised ({type(exc).__name__}: {exc}); retrying serially",
+            flush=True,
+        )
+        return score_serially()
+
+    results = []
+    for (solution_str, _, _), (score, breakdowns) in zip(prepared, raw_results, strict=True):
+        if think_penalty > 0 and thinking:
+            score -= think_penalty * _w.think_token_count(
+                solution_str, tok, prompt_opened_thinking=prompt_opened_thinking
+            )
+        score = float(score)
+        if not math.isfinite(score):
+            print(f"[rl-verl] env scored {score}; unscorable, scoring 0.0", flush=True)
+            score = 0.0
+        results.append((score, breakdowns))
+    return results
+
+
 # the total startup delay this hook is allowed to add, covering reference extraction AND timing.
 # both call user code, so one shared ceiling is the only number that means anything to a caller.
 _PROFILE_BUDGET_S = 30.0
@@ -1602,10 +1697,10 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
     env's latency is what separates a compute-bound run from a latency-bound one, and that is a
     placement input, not just an observability line.
 
-    Single-turn grading is serial, so it is pure gpu-idle wall time -- at the default 64x8 shape a
-    1s grader idles the gpu for ~80% of every step. The cost model has to guess that number from
-    one global average spanning regex graders to llm judges; this prints what it actually is for
-    THIS env, so a mispriced run is visible in the log instead of only in the bill.
+    The reading is one completion's scalar grading latency. Training can batch compatible envs, so
+    multiplying it by the rollout count is only a conservative pre-batching reference rather than
+    the runtime reward wall. The independent cost-estimation path must account for batching before
+    using it as a placement input.
 
     Profiles against each example's own reference completion rather than blank text: an empty
     string does not exercise a grader, so a blank-text profile measures the early-return.
@@ -1685,11 +1780,10 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
         )
         print(f"[rl-verl] {profile.describe()}", flush=True)
         if profile.trustworthy and completions_per_step > 0:
-            per_step_s = profile.seconds_per_completion * completions_per_step
             print(
-                f"[rl-verl] serial reward grading costs ~{per_step_s:.0f}s per step "
-                f"({completions_per_step} completions x {profile.seconds_per_completion:.3f}s), "
-                "all of it gpu-idle.",
+                f"[rl-verl] scalar reward profile sampled "
+                f"{profile.seconds_per_completion:.3f}s per completion; runtime batching may "
+                f"overlap up to {completions_per_step} completions per step",
                 flush=True,
             )
         return profile
@@ -1701,12 +1795,13 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
 # --------------------------------------------------------------------------------------------
 # reward rpc bridge: verl subprocess -> flash live env.
 # --------------------------------------------------------------------------------------------
-class _EpisodeScoreWaiter:
-    """one episode waiting on a batched scoring call."""
+class _ScoreWaiter:
+    """one request waiting on a batched scoring call."""
 
-    def __init__(self, request, enqueued_at: float) -> None:
+    def __init__(self, request, enqueued_at: float, *, label: str) -> None:
         self.request = request
         self.enqueued_at = enqueued_at
+        self.label = label
         self.done = threading.Event()
         self.result = None
         self.error: Exception | None = None
@@ -1727,50 +1822,51 @@ class _EpisodeScoreWaiter:
         if self.error is not None:
             raise self.error
         if self.result is None:
-            raise RuntimeError("multi-turn episode score waiter completed without a result")
+            raise RuntimeError(f"{self.label} score waiter completed without a result")
         return self.result
 
 
-class _EpisodeScoreBatcher:
-    """coalesce concurrently-finished episodes into one env scoring call.
+class _ScoreBatcher:
+    """coalesce concurrent requests into one ordered env scoring call.
 
-    same shape as the opd text-teacher batcher: a single daemon thread takes whatever is pending
-    once the oldest waiter's grace period expires, scores it in one call, and scatters the results
-    back in request order. one thread means the env still sees exactly one scoring call at a time,
-    which is the contract the rest of this bridge holds it to -- the concurrency it gains is the
-    env's OWN, inside the batched call.
+    a single daemon thread takes whatever is pending once the oldest waiter's grace period expires,
+    scores it in one call, and scatters the results back in request order. one thread means the env
+    still sees exactly one top-level scoring call at a time; concurrency lives inside the env's own
+    batched scorer.
     """
 
-    def __init__(self, score_batch, *, max_batch_size: int, flush_wait_s: float) -> None:
+    def __init__(
+        self,
+        score_batch,
+        *,
+        max_batch_size: int,
+        flush_wait_s: float,
+        label: str,
+        thread_name: str,
+    ) -> None:
         if max_batch_size <= 0:
-            raise ValueError("multi-turn score batch size must be positive")
+            raise ValueError(f"{label} score batch size must be positive")
         if flush_wait_s <= 0:
-            raise ValueError("multi-turn score flush wait must be positive")
+            raise ValueError(f"{label} score flush wait must be positive")
         self._score_batch = score_batch
         self.max_batch_size = int(max_batch_size)
         self.flush_wait_s = float(flush_wait_s)
+        self.label = label
+        self.thread_name = thread_name
         self._condition = threading.Condition()
-        self._pending: list[_EpisodeScoreWaiter] = []
-        self._in_flight: list[_EpisodeScoreWaiter] = []
+        self._pending: list[_ScoreWaiter] = []
+        self._in_flight: list[_ScoreWaiter] = []
         self._closed = False
         self._thread: threading.Thread | None = None
 
     def _ensure_running(self) -> None:
-        """start the consumer thread if it is not already running; idempotent and safe to race.
-
-        deliberately lazy rather than an explicit ``start()`` a caller must remember: with nothing
-        consuming ``_pending`` a scoring episode blocks on its event FOREVER, and a construct-but-
-        never-start bug is invisible until a multi-turn run wedges on real gpu. binding the start
-        to the first ``score`` makes that state unreachable.
-        """
+        """start the consumer thread lazily; idempotent and safe to race."""
         with self._condition:
             if self._closed:
-                raise RuntimeError("multi-turn score batcher shut down")
+                raise RuntimeError(f"{self.label} score batcher shut down")
             if self._thread is not None:
                 return
-            self._thread = threading.Thread(
-                target=self._run, name="flash-grpo-episode-scorer", daemon=True
-            )
+            self._thread = threading.Thread(target=self._run, name=self.thread_name, daemon=True)
             thread = self._thread
         thread.start()
 
@@ -1778,13 +1874,13 @@ class _EpisodeScoreBatcher:
         self._ensure_running()
         with self._condition:
             if self._closed:
-                raise RuntimeError("multi-turn score batcher shut down")
-            waiter = _EpisodeScoreWaiter(request, enqueued_at=time.monotonic())
+                raise RuntimeError(f"{self.label} score batcher shut down")
+            waiter = _ScoreWaiter(request, enqueued_at=time.monotonic(), label=self.label)
             self._pending.append(waiter)
             self._condition.notify_all()
         return waiter.wait()
 
-    def _take_batch(self) -> list[_EpisodeScoreWaiter] | None:
+    def _take_batch(self) -> list[_ScoreWaiter] | None:
         with self._condition:
             while not self._pending:
                 if self._closed:
@@ -1809,20 +1905,12 @@ class _EpisodeScoreBatcher:
                     return
                 try:
                     results = self._score_batch([waiter.request for waiter in batch])
-                    # materialize the pairing BEFORE completing anyone: zip(strict=True) checks the
-                    # lengths only when it reaches the end, so scattering as it iterates would
-                    # resolve a prefix of the waiters and only THEN raise on the mismatch. building
-                    # the list first moves that raise ahead of every completion, so the except
-                    # below always sees an all-or-nothing batch rather than a half-scattered one.
+                    # validate the full vector before completing any waiter. a strict zip checked while
+                    # scattering would resolve a prefix before discovering a length mismatch.
                     scattered = list(zip(batch, results, strict=True))
                     for waiter, result in scattered:
                         waiter.complete(result=result)
                 except Exception as error:
-                    # EVERY waiter in the batch fails, not just the one that provoked it. each waiter
-                    # blocks on its OWN event, so the notify_all below cannot wake them -- a waiter
-                    # left uncompleted here hangs until the 1500s stall watchdog kills the run, with
-                    # no error anywhere. complete() ignores a second call, so waiters already
-                    # resolved by a partial scatter keep their result.
                     for waiter in batch:
                         waiter.complete(error=error)
                 finally:
@@ -1830,7 +1918,7 @@ class _EpisodeScoreBatcher:
                         self._in_flight = []
                         self._condition.notify_all()
         finally:
-            error = RuntimeError("multi-turn score batcher stopped")
+            error = RuntimeError(f"{self.label} score batcher stopped")
             with self._condition:
                 stranded = [*self._pending, *self._in_flight]
                 self._pending.clear()
@@ -1840,18 +1928,23 @@ class _EpisodeScoreBatcher:
             for waiter in stranded:
                 waiter.complete(error=error)
 
-    def close(self, timeout_s: float = _MULTI_TURN_SCORE_SHUTDOWN_WAIT_S) -> None:
+    def close(self, timeout_s: float) -> None:
         with self._condition:
             self._closed = True
             pending = list(self._pending)
             self._pending.clear()
             self._condition.notify_all()
             thread = self._thread
-        error = RuntimeError("multi-turn score batcher shut down")
+        error = RuntimeError(f"{self.label} score batcher shut down")
         for waiter in pending:
             waiter.complete(error=error)
         if thread is not None:
             thread.join(timeout=timeout_s)
+            if thread.is_alive():
+                with self._condition:
+                    in_flight = list(self._in_flight)
+                for waiter in in_flight:
+                    waiter.complete(error=error)
 
 
 class MultiTurnBridge:
@@ -1889,7 +1982,7 @@ class MultiTurnBridge:
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
-        # every env touch below happens under this lock, matching the single-turn path's contract.
+        # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
         self._sessions: dict[str, dict] = {}
         # episode scoring still happens under that lock, but ONE call now covers many episodes.
@@ -1900,10 +1993,12 @@ class MultiTurnBridge:
         # total time the lock is held rather than dropping it: `reward_thread_safe` licenses racing
         # the scorer against ITSELF, which is not the same as racing it against `env_reply`, and no
         # env contract permits the latter.
-        self._scorer = _EpisodeScoreBatcher(
+        self._scorer = _ScoreBatcher(
             self._score_batch,
             max_batch_size=int(score_batch_size),
             flush_wait_s=float(score_flush_wait_s),
+            label="multi-turn episode",
+            thread_name="flash-grpo-episode-scorer",
         )
 
     def routes(self) -> dict:
@@ -1917,7 +2012,7 @@ class MultiTurnBridge:
     def shutdown(self) -> None:
         """stop the scoring thread. distinct from the ``/multiturn/close`` route, which ends one
         episode. any episode still waiting is failed rather than left blocked on its event."""
-        self._scorer.close()
+        self._scorer.close(_MULTI_TURN_SCORE_SHUTDOWN_WAIT_S)
 
     def _session(self, payload: dict) -> dict:
         session_id = str(payload["session_id"])
@@ -2105,29 +2200,45 @@ def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[
 
 
 def start_reward_server(
-    score_by_index, *, example_count: int, multi_turn_bridge=None, rollout_batch: int = 0
+    score_by_index,
+    *,
+    example_count: int,
+    multi_turn_bridge=None,
+    rollout_batch: int = 0,
+    score_batch=None,
 ):
-    """start a localhost http reward server. score_by_index(index, solution_str) -> float.
+    """start a localhost http reward server with scalar or batched single-turn scoring.
 
     returns (server, base_url). the server runs in a daemon thread; call server.shutdown() when
     done. single-turn scoring lives at ``<base_url>/score``; when ``multi_turn_bridge`` is given,
     its four episode routes are served alongside it from the same thread pool. ``rollout_batch`` is
     how many episodes verl starts at once (prompts_per_step * group_size) and sizes the accept queue.
     """
-    # serialize scoring so the flash env sees sequential calls: a flash env is a plain python object
-    # with no concurrency contract, and the retired trl path only ever called it from one thread.
-    # verl does NOT: RewardLoopManager spawns reward.num_workers (8) ray workers unconditionally
-    # (ray_trainer.py:901-910) and each asyncio.gathers its whole chunk (reward_loop.py:138-143), so
-    # without this lock a batch arrives as dozens of simultaneous calls. the queue this creates is
-    # why the generated client carries no deadline -- see render_reward_module.
+    # the scalar compatibility path serializes top-level env calls. training supplies score_batch,
+    # which keeps that same one-call-at-a-time boundary while coalescing concurrent verl requests into
+    # the env's own batched scorer.
     score_lock = threading.Lock()
+    score_batcher = (
+        _ScoreBatcher(
+            score_batch,
+            max_batch_size=_SINGLE_TURN_SCORE_BATCH_SIZE,
+            flush_wait_s=_SINGLE_TURN_SCORE_FLUSH_WAIT_S,
+            label="single-turn reward",
+            thread_name="flash-grpo-reward-scorer",
+        )
+        if callable(score_batch)
+        else None
+    )
 
     def _score_route(payload: dict) -> dict:
         index = int(payload["index"])
         if index < 0 or index >= example_count:
             raise IndexError(f"reward example index {index} is outside [0, {example_count})")
+        solution_str = payload.get("solution_str", "")
+        if score_batcher is not None:
+            return {"score": float(score_batcher.score((index, solution_str)))}
         with score_lock:
-            return {"score": float(score_by_index(index, payload.get("solution_str", "")))}
+            return {"score": float(score_by_index(index, solution_str))}
 
     routes = {"/score": _score_route}
     if multi_turn_bridge is not None:
@@ -2161,6 +2272,11 @@ def start_reward_server(
 
     class _RewardBridgeHTTPServer(BoundedThreadingHTTPServer):
         request_queue_size = max(_REWARD_BRIDGE_MIN_REQUEST_BACKLOG, int(rollout_batch))
+
+        def shutdown(self):
+            if score_batcher is not None:
+                score_batcher.close(_SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S)
+            super().shutdown()
 
     server = _RewardBridgeHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -3021,24 +3137,25 @@ def run_rl_train():
     # filled from the child's marker line; stays empty when wandb is off (see render_wandb_link_shim).
     wandb_link: dict[str, str | None] = {}
 
-    def _score(index: int, solution_str: str) -> float:
-        ex = rollout_examples[int(index)]
-        # graded BEFORE the buffer is touched: grading calls user code and can block on i/o for
-        # seconds while verl scores many rollouts at once, and RewardObservabilityBuffer.record
-        # takes a lock every grading in the run would then serialize behind.
-        breakdowns: list[dict[str, float] | None] = []
-        score = score_single_turn(
+    def _score_batch(requests: list[tuple[int, str]]) -> list[float]:
+        # grade the whole batch before touching the observability lock. the env's scorer may block on
+        # judge i/o, while record is intentionally a short per-result critical section.
+        scored = score_single_turn_batch(
             env,
-            solution_str,
-            ex,
+            [(solution_str, rollout_examples[int(index)]) for index, solution_str in requests],
             tok=tok,
             thinking=bool(_w.THINKING),
             prompt_opened_thinking=inp["prompt_opened_thinking"],
             think_penalty=inp["think_penalty"],
-            breakdowns=breakdowns,
         )
-        observability.record(message_prompts[int(index)], solution_str, score, breakdowns)
-        return score
+        results = []
+        for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):
+            observability.record(message_prompts[int(index)], solution_str, score, breakdowns)
+            results.append(score)
+        return results
+
+    def _score(index: int, solution_str: str) -> float:
+        return _score_batch([(index, solution_str)])[0]
 
     def _score_for_profile(index: int, solution_str: str) -> float:
         """the same grading path as _score, minus training's own bookkeeping.
@@ -3091,6 +3208,7 @@ def run_rl_train():
         example_count=len(rollout_examples),
         multi_turn_bridge=multi_turn_bridge,
         rollout_batch=int(inp["prompts_per_step"]) * int(inp["group_size"]),
+        score_batch=None if inp["multi_turn"] else _score_batch,
     )
     # bound before the try so the finally can always ask whether it was started.
     resume_uploader: _VerlResumeUploader | None = None
@@ -3476,5 +3594,6 @@ def run_rl_train():
             wandb_id=wandb_link.get("wandb_id"),
             reward_profile=reward_profile,
             step_intervals=_step_intervals(step_line_times),
+            reward_bridge_batching=not inp["multi_turn"],
         ),
     )
