@@ -592,14 +592,14 @@ def _train_body(input_data: dict) -> dict:
 
 
 def isolate_flash_state(scope: str | None = None) -> None:
-    """Point the Flash SDK's resource registry at a per-process directory under ~/.flash/flash-state/."""
+    """Point the Flash SDK's resource registry at a per-process dir under <data dir>/flash-state/."""
     try:
-        from pathlib import Path
-
         import runpod_flash.core.resources.resource_manager as rm
 
+        from flash._paths import data_dir
+
         scope = scope or f"pid{os.getpid()}"
-        state_dir = Path.home() / ".flash" / "flash-state" / scope
+        state_dir = data_dir() / "flash-state" / scope
         state_dir.mkdir(parents=True, exist_ok=True)
         previous_state_file = getattr(rm, "RESOURCE_STATE_FILE", None)
         rm.FLASH_STATE_DIR = state_dir
