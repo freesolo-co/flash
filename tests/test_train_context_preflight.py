@@ -84,7 +84,7 @@ def test_35b_context_above_serving_cap_rejected():
 
 
 def test_grpo_unset_rollout_within_35b_cap_allowed():
-    # Unset GRPO rollout defaults (max_prompt 2048 + completion) stay under 4096, even for thinking.
+    # unset grpo rollout defaults (max_prompt 2048 + completion) stay under 32768, even for thinking.
     preflight_train_context_within_serving(
         _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="grpo", thinking=True)
     )
