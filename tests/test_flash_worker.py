@@ -797,19 +797,16 @@ def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
     assert steady_state_commits_per_hour <= 5.0
 
 
-def test_worker_image_override_carries_deploy_constraints(monkeypatch):
-    # the override image's own requirements (registry auth, cuda floor, disk floor) ride with it
+def test_worker_image_override_carries_its_registry_credential(monkeypatch):
+    # a private override image needs its provider-side pull credential; that cannot be derived
+    # from the image ref, so it rides alongside it.
     from flash.providers import _worker
 
     monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/private-worker:cu13")
     monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-123")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_CUDA", "13.0")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_DISK_GB", "150")
     o = _worker.worker_image_override()
     assert o.image == "ghcr.io/example/private-worker:cu13"
     assert o.registry_auth_id == "auth-123"
-    assert o.min_cuda == "13.0"
-    assert o.min_disk_gb == 150
     assert _worker.worker_image_for_gpu("H200") == o.image
 
 
@@ -820,30 +817,28 @@ def test_worker_image_override_absent_is_none(monkeypatch):
     assert _worker.worker_image_override() is None
 
 
-def test_min_cuda_for_takes_image_floor_when_higher(monkeypatch):
+def test_min_cuda_for_uses_the_gpu_class_floor(monkeypatch):
+    # the CUDA floor is a property of the GPU class, not of an operator-supplied image tag
     from flash.providers.runpod.train.endpoints import min_cuda_for
 
     monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:cu13")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_CUDA", "13.0")
-    # H200 class floor is 12.x; the cu13 image raises it
-    assert min_cuda_for("H200") == "13.0"
-    # class floor wins when the image floor is lower
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_CUDA", "11.8")
-    assert min_cuda_for("B200") != "11.8"
+    assert min_cuda_for("B200") == "13.0"  # blackwell needs cu13 drivers
+    assert min_cuda_for("H200") == "12.8"
 
 
-def test_apply_disk_honors_image_floor(monkeypatch):
+def test_apply_disk_raises_to_the_requested_floor(monkeypatch):
     from types import SimpleNamespace
 
     from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
 
     monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:big")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_MIN_DISK_GB", "150")
     monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-xyz")
     tpl = SimpleNamespace(containerDiskInGb=64, containerRegistryAuthId=None)
     cfg = SimpleNamespace(template=tpl)
     apply_disk_gb(cfg, 80)
-    assert tpl.containerDiskInGb == 150  # image floor wins over the 80 GB request
+    assert tpl.containerDiskInGb == 80  # raise-only: the request wins over the smaller default
+    apply_disk_gb(cfg, 32)
+    assert tpl.containerDiskInGb == 80  # never lowers an already-larger disk
     apply_image_override_constraints(cfg)
     assert tpl.containerRegistryAuthId == "auth-xyz"
 

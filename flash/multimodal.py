@@ -4,13 +4,8 @@ from __future__ import annotations
 
 import base64
 import binascii
-import http.client
 import io
-import ipaddress
 import json
-import os
-import socket
-import ssl
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,8 +20,6 @@ MAX_TOTAL_DECODED_BYTES = 128 * 1024 * 1024
 MAX_DATA_URI_HEADER_BYTES = 1024
 MAX_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
-REMOTE_IMAGE_ENV = "FLASH_MULTIMODAL_ALLOW_REMOTE_IMAGES"
-_REMOTE_TIMEOUT_SECONDS = 10.0
 _IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image"})
 IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
 
@@ -77,50 +70,6 @@ def _parse_descriptor(raw: str) -> tuple[str, str]:
     if not isinstance(kind, str) or not isinstance(payload, str):
         raise ValueError("invalid internal image descriptor")
     return kind, payload
-
-
-def _remote_enabled() -> bool:
-    return os.environ.get(REMOTE_IMAGE_ENV, "").strip().lower() in {"1", "true", "yes"}
-
-
-def _validate_remote_url(url: str) -> tuple[urllib.parse.SplitResult, str, int, tuple[str, ...]]:
-    parsed = urllib.parse.urlsplit(url)
-    scheme = parsed.scheme.lower()
-    if scheme not in {"http", "https"}:
-        raise ValueError("remote image URL must use http or https")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("remote image URLs must not include credentials")
-    hostname = parsed.hostname
-    if not hostname:
-        raise ValueError("remote image URL must include a hostname")
-    try:
-        hostname = hostname.encode("idna").decode("ascii")
-        port = parsed.port or (443 if scheme == "https" else 80)
-        resolved = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise ValueError(f"failed to resolve remote image host: {hostname}") from exc
-    addresses = []
-    for family, _socktype, _proto, _canonname, sockaddr in resolved:
-        if family not in {socket.AF_INET, socket.AF_INET6}:
-            raise ValueError(
-                f"remote image host resolved to an unsupported address family: {hostname}"
-            )
-        address = str(sockaddr[0]).split("%", 1)[0]
-        try:
-            globally_routable = ipaddress.ip_address(address).is_global
-        except ValueError as exc:
-            raise ValueError(
-                f"remote image host resolved to an invalid address: {hostname}"
-            ) from exc
-        if not globally_routable:
-            raise ValueError(
-                f"remote image host must resolve only to globally routable addresses: {hostname}"
-            )
-        if address not in addresses:
-            addresses.append(address)
-    if not addresses:
-        raise ValueError(f"remote image host did not resolve to an IP address: {hostname}")
-    return parsed, hostname, port, tuple(addresses)
 
 
 def _data_uri_bytes(uri: str) -> bytes:
@@ -234,13 +183,13 @@ def normalize_image_source(source: object, package_root: str | Path | None) -> s
         _inspect_image_bytes(data)
         return _descriptor("data_uri", value)
     if scheme in {"http", "https"}:
-        if not _remote_enabled():
-            raise ValueError(
-                f"remote image URLs are disabled; set {REMOTE_IMAGE_ENV}=1 only for a trusted dataset"
-            )
-        data = _read_remote(value)
-        _inspect_image_bytes(data)
-        return _descriptor("bytes", base64.b64encode(data).decode("ascii"))
+        # flash never fetches a user-supplied URL server-side. download the image ahead of time
+        # and reference it as a relative path in the environment package, or embed it as a data
+        # URI, so the training input is fixed at submit time rather than at training time.
+        raise ValueError(
+            "remote image URLs are not supported; include the image in the environment package "
+            "as a relative path, or embed it as a data URI"
+        )
     if scheme == "file":
         raise ValueError("file:// image URLs are not supported")
     if scheme:
@@ -482,66 +431,6 @@ def descriptor_source_size(descriptor: str, package_root: str | Path | None) -> 
             _package_image_path(value, Path(package_root) if package_root else None).stat().st_size
         )
     raise ValueError("invalid internal image descriptor kind")
-
-
-def _remote_host_header(hostname: str, port: int, scheme: str) -> str:
-    host = f"[{hostname}]" if ":" in hostname else hostname
-    default_port = 443 if scheme == "https" else 80
-    return host if port == default_port else f"{host}:{port}"
-
-
-def _fetch_remote_address(
-    parsed: urllib.parse.SplitResult, hostname: str, port: int, address: str
-) -> bytes:
-    connection = http.client.HTTPConnection(address, port, timeout=_REMOTE_TIMEOUT_SECONDS)
-    try:
-        if parsed.scheme.lower() == "https":
-            raw_socket = socket.create_connection((address, port), timeout=_REMOTE_TIMEOUT_SECONDS)
-            try:
-                connection.sock = ssl.create_default_context().wrap_socket(
-                    raw_socket, server_hostname=hostname
-                )
-            except Exception:
-                raw_socket.close()
-                raise
-        target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
-        connection.request(
-            "GET",
-            target,
-            headers={
-                "Host": _remote_host_header(hostname, port, parsed.scheme.lower()),
-                "User-Agent": "freesolo-flash-image-loader",
-            },
-        )
-        response = connection.getresponse()
-        try:
-            if 300 <= response.status < 400:
-                raise ValueError("remote image redirects are not allowed")
-            if response.status < 200 or response.status >= 300:
-                raise ValueError(f"remote image request failed with HTTP {response.status}")
-            declared = response.headers.get("Content-Length")
-            if declared:
-                _check_source_size(int(declared))
-            data = response.read(MAX_IMAGE_SOURCE_BYTES + 1)
-        finally:
-            response.close()
-    finally:
-        connection.close()
-    _check_source_size(len(data))
-    return data
-
-
-def _read_remote(url: str) -> bytes:
-    parsed, hostname, port, addresses = _validate_remote_url(url)
-    last_error = None
-    for address in addresses:
-        try:
-            return _fetch_remote_address(parsed, hostname, port, address)
-        except ValueError:
-            raise
-        except Exception as exc:
-            last_error = exc
-    raise ValueError(f"failed to fetch remote image: {url}") from last_error
 
 
 def _read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:

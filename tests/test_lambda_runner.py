@@ -767,9 +767,6 @@ def test_resolve_ssh_key_names(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs.jobs import resolve_ssh_key_names
 
-    monkeypatch.setenv("LAMBDA_SSH_KEY_NAME", "pinned-key")
-    assert resolve_ssh_key_names() == ["pinned-key"]
-    monkeypatch.delenv("LAMBDA_SSH_KEY_NAME", raising=False)
     monkeypatch.setattr(lambda_api, "list_ssh_keys", lambda: [{"name": "jk"}, {"name": "other"}])
     assert resolve_ssh_key_names() == ["jk"]  # first registered key
     monkeypatch.setattr(lambda_api, "list_ssh_keys", list)
