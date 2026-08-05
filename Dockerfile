@@ -29,5 +29,7 @@ EXPOSE 8080
 # reminder).
 
 # Secrets come from the container environment (-e, --env-file, or your orchestrator's secret
-# store). Wrap this image's entrypoint yourself if you inject secrets from a manager.
+# store), so this image needs no secret-manager tooling baked in. Pulling secrets from a manager
+# at container start is an opt-in overlay that wraps this image's entrypoint and inherits the CMD
+# below -- see deploy/infisical/ for a working example.
 CMD ["python", "-m", "flash.server", "--host", "0.0.0.0", "--port", "8080"]
