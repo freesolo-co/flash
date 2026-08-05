@@ -480,7 +480,7 @@ def test_reclaim_spent_profile_run_gives_the_relaunch_to_exactly_one_of_two_raci
     assert [r["run_id"] for r in isolated_db.all_runs()] == ["profile-sft-spent"]
 
 
-def test_reclaim_spent_profile_run_ignores_a_live_claim_and_a_missing_id(isolated_db) -> None:
+def test_reclaim_spent_profile_run_loses_to_a_newer_claim(isolated_db) -> None:
     """Only a claim no newer than the spent run may be taken over.
 
     Once someone relaunches, the row carries a stamp past the spent one, so a submitter still
@@ -490,10 +490,6 @@ def test_reclaim_spent_profile_run_ignores_a_live_claim_and_a_missing_id(isolate
     taker = isolated_db.ensure_external_key("fslo_late_taker")
     assert owner is not None
     assert taker is not None
-    assert (
-        isolated_db.reclaim_spent_profile_run("profile-sft-absent", taker["id"], spent_at=1.0)
-        is False
-    )
 
     # the spent run this caller watched, and then the relaunch claim someone else already won.
     spent_at = time.time()
@@ -504,6 +500,26 @@ def test_reclaim_spent_profile_run_ignores_a_live_claim_and_a_missing_id(isolate
         is False
     )
     assert isolated_db.run_owner("profile-sft-live") == owner["id"]
+
+
+def test_reclaim_spent_profile_run_claims_an_id_whose_row_was_released(isolated_db) -> None:
+    """A takeover whose launch failed releases the row; the next one must claim, not report lost.
+
+    The status store still shows the spent run, so every later submitter arrives on the takeover
+    path. If an absent row were reported as "someone else has it", nobody would ever launch and the
+    wedge would be recreated by the path that exists to clear it.
+    """
+    taker = isolated_db.ensure_external_key("fslo_released_taker")
+    assert taker is not None
+
+    assert (
+        isolated_db.reclaim_spent_profile_run(
+            "profile-sft-released", taker["id"], spent_at=time.time()
+        )
+        is True
+    )
+    assert isolated_db.run_owner("profile-sft-released") == taker["id"]
+    assert [r["kind"] for r in isolated_db.all_runs()] == ["profile"]
 
 
 def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -> None:

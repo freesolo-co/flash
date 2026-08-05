@@ -607,6 +607,27 @@ def test_sft_dry_run_shares_the_profile_pending_path(tmp_path, monkeypatch, caps
     assert "no training run was created" in capsys.readouterr().err
 
 
+def test_sft_real_submit_shares_the_profile_pending_path(tmp_path, monkeypatch, capsys):
+    """A real submit misses the cache like a preview does, and starts the same billed profile run.
+
+    This is the path that actually spends money, so it is the one where a bare 409 is worst: the
+    user is charged for a profile run whose id, purpose and cost the error never mentions.
+    """
+    from flash.client import ClientError
+
+    args = _sft_args(tmp_path)
+    args.cost, args.dry_run = False, False
+    client = _use_client(monkeypatch, _PendingClient())
+
+    with pytest.raises(ClientError, match=f"workload profile {PROFILE_RUN_ID} is queued"):
+        cmd_train(args)
+
+    err = capsys.readouterr().err
+    assert "billed on its own" in err
+    assert "no training run was created" in err
+    assert f"flash runs status {PROFILE_RUN_ID}" in err
+
+
 def test_sft_cost_leaves_unrelated_api_errors_alone(tmp_path, monkeypatch):
     """Only the profile-pending code is translated; every other rejection surfaces as itself."""
     from flash.client import ApiError
