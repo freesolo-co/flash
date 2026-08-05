@@ -198,131 +198,23 @@ def test_relative_paths_are_confined_to_packaged_dataset_directory(tmp_path):
         mm.normalize_image_source(outside.resolve().as_uri(), root)
 
 
-def _addrinfo(*addresses):
-    return [
-        (
-            mm.socket.AF_INET6 if ":" in address else mm.socket.AF_INET,
-            mm.socket.SOCK_STREAM,
-            6,
-            "",
-            (address, 80, 0, 0) if ":" in address else (address, 80),
-        )
-        for address in addresses
-    ]
-
-
-def _install_http_response(monkeypatch, *, status=200, data=b"", headers=None):
-    class _Response:
-        def __init__(self):
-            self.status = status
-            self.headers = dict(headers or {})
-
-        def read(self, size):
-            assert size == mm.MAX_IMAGE_SOURCE_BYTES + 1
-            return data
-
-        def close(self):
-            return None
-
-    class _Connection:
-        def __init__(self, address, port, timeout):
-            assert address == "93.184.216.34"
-            assert port == 80
-            assert timeout == mm._REMOTE_TIMEOUT_SECONDS
-
-        def request(self, method, target, headers):
-            assert method == "GET"
-            assert target == "/red.png"
-            assert headers["Host"] == "images.example"
-
-        def getresponse(self):
-            return _Response()
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr(mm.http.client, "HTTPConnection", _Connection)
-
-
-def test_remote_images_are_opt_in_and_bounded(monkeypatch, tmp_path):
-    root, _image = _package(tmp_path)
-    url = "http://images.example/red.png"
-    with pytest.raises(ValueError, match="disabled"):
-        mm.normalize_image_source(url, root)
-
-    monkeypatch.setenv(mm.REMOTE_IMAGE_ENV, "1")
-    monkeypatch.setattr(
-        mm.socket, "getaddrinfo", lambda *args, **kwargs: _addrinfo("93.184.216.34")
-    )
-    _install_http_response(
-        monkeypatch,
-        headers={"Content-Length": str(mm.MAX_IMAGE_SOURCE_BYTES + 1)},
-    )
-    with pytest.raises(ValueError, match="source exceeds"):
-        mm.normalize_image_source(url, root)
-
-    data = _png_bytes()
-    _install_http_response(
-        monkeypatch,
-        data=data,
-        headers={"Content-Length": str(len(data))},
-    )
-    descriptor = mm.normalize_image_source(url, root)
-    assert json.loads(descriptor)["kind"] == "bytes"
-    image, _encoded, _decoded = mm.decode_image_descriptor(descriptor, root)
-    assert image.size == (2, 2)
-
-
-def test_remote_images_are_fetched_once_and_materialized_as_bytes(monkeypatch):
-    data = _png_bytes()
-    url = "https://images.example/red.png"
-    calls = []
-
-    monkeypatch.setenv(mm.REMOTE_IMAGE_ENV, "1")
-    monkeypatch.setattr(mm, "_read_remote", lambda value: calls.append(value) or data)
-
-    descriptor = mm.normalize_image_source(url, None)
-    parsed = json.loads(descriptor)
-
-    assert parsed["kind"] == "bytes"
-    assert base64.b64decode(parsed["value"], validate=True) == data
-    image, _encoded, _decoded = mm.decode_image_descriptor(descriptor, None)
-    assert image.size == (2, 2)
-    assert calls == [url]
-
-
 @pytest.mark.parametrize(
-    "addresses",
-    [
-        ("169.254.169.254",),
-        ("127.0.0.1",),
-        ("10.0.0.7",),
-        ("::1",),
-        ("fe80::1",),
-        ("93.184.216.34", "10.0.0.7"),
-    ],
+    "url",
+    ["http://images.example/red.png", "https://images.example/red.png"],
 )
-def test_remote_images_reject_any_non_global_dns_answer(monkeypatch, addresses):
-    monkeypatch.setenv(mm.REMOTE_IMAGE_ENV, "1")
-    monkeypatch.setattr(mm.socket, "getaddrinfo", lambda *args, **kwargs: _addrinfo(*addresses))
+def test_remote_image_urls_are_always_rejected(monkeypatch, url):
+    """Flash never fetches a user-supplied URL server-side, and nothing can re-enable it.
 
-    with pytest.raises(ValueError, match="globally routable"):
-        mm.normalize_image_source("http://images.example/red.png", None)
+    The rejection is unconditional by construction: there is no env flag, no argument, and no
+    module attribute left to flip, so a dataset carrying a remote URL fails at normalization
+    rather than turning the trainer into an SSRF vector.
+    """
+    with pytest.raises(ValueError, match="remote image URLs are not supported"):
+        mm.normalize_image_source(url, None)
 
-
-def test_remote_images_do_not_follow_redirects_to_private_hosts(monkeypatch):
-    monkeypatch.setenv(mm.REMOTE_IMAGE_ENV, "1")
-    monkeypatch.setattr(
-        mm.socket, "getaddrinfo", lambda *args, **kwargs: _addrinfo("93.184.216.34")
-    )
-    _install_http_response(
-        monkeypatch,
-        status=302,
-        headers={"Location": "http://169.254.169.254/latest/meta-data/"},
-    )
-
-    with pytest.raises(ValueError, match="redirects are not allowed"):
-        mm.normalize_image_source("http://images.example/red.png", None)
+    # the fetch machinery itself is gone, not merely gated
+    for removed in ("_read_remote", "_remote_enabled", "_validate_remote_url", "REMOTE_IMAGE_ENV"):
+        assert not hasattr(mm, removed)
 
 
 def test_malformed_blocks_fail_clearly(tmp_path):
@@ -572,13 +464,11 @@ def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
     assert messages[1]["content"][1]["image"] is pil
 
 
-def test_multimodal_algorithm_validation_rejects_unsupported_modes():
+def test_multimodal_algorithm_validation_rejects_all_image_opd_after_model_validation():
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft")
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", multi_turn=False)
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", multi_turn=True)
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", multi_turn=False)
-    with pytest.raises(ValueError, match="single-turn"):
-        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", multi_turn=True)
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo")
+    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
+        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd")
     with pytest.raises(ValueError, match="does not support"):
         mm.validate_multimodal_training("meta-llama/Llama-3.2-1B", "opd")
 
@@ -599,7 +489,7 @@ def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
     assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in entry
 
 
-def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_path):
+def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path):
     root, _image = _package(tmp_path)
     env_file = root / "environment.py"
     env_file.write_text("def load_environment(**kwargs):\n    return None\n")
@@ -611,55 +501,19 @@ def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_pa
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="kimi-k2.6"),
+        train=SimpleNamespace(teacher_model="kimi-k3"),
     )
-    mm.preflight_validate_image_opd(supported)
+    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
+        mm.preflight_validate_image_opd(supported)
 
     unsupported = SimpleNamespace(
         model="meta-llama/Llama-3.2-1B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="kimi-k2.6"),
+        train=SimpleNamespace(teacher_model="kimi-k3"),
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
         mm.preflight_validate_image_opd(unsupported)
-
-
-@pytest.mark.parametrize("teacher_model", ["", "glm-5.2", "accounts/fireworks/models/glm-5p2"])
-def test_image_opd_preflight_requires_kimi_vision_teacher(tmp_path, teacher_model):
-    root, _image = _package(tmp_path)
-    env_file = root / "environment.py"
-    env_file.write_text("def load_environment(**kwargs):\n    return None\n")
-    (root / "dataset" / "train.jsonl").write_text(
-        json.dumps({"input": "color?", "output": "red", "image": "dataset/red.png"}) + "\n"
-    )
-    spec = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}),
-        train=SimpleNamespace(teacher_model=teacher_model),
-    )
-
-    with pytest.raises(ValueError, match=r"requires .*kimi-k2\.6"):
-        mm.preflight_validate_image_opd(spec)
-
-
-def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
-    root, _image = _package(tmp_path)
-    env_file = root / "environment.py"
-    env_file.write_text("def load_environment(**kwargs):\n    return None\n")
-    (root / "dataset" / "train.jsonl").write_text(
-        json.dumps({"input": "color?", "output": "red", "image": "dataset/red.png"}) + "\n"
-    )
-    multi_turn = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}, multi_turn=True),
-        train=SimpleNamespace(teacher_model="kimi-k2.6"),
-    )
-
-    with pytest.raises(ValueError, match="single-turn"):
-        mm.preflight_validate_image_opd(multi_turn)
 
 
 @pytest.mark.parametrize("record_source", ["inline", "packaged"])
@@ -694,53 +548,8 @@ def test_image_opd_preflight_limits_scan_to_max_examples(tmp_path, record_source
 
 
 @pytest.mark.parametrize("background", [False, True])
-def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
+def test_image_opd_submit_preflight_rejects_supported_single_turn_records(
     monkeypatch, tmp_path, background
-):
-    from flash import runner
-    from flash.spec import JobSpec
-
-    class _ReachedSubmitBoundary(RuntimeError):
-        pass
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-
-    def reached_submit_boundary(*args, **kwargs):
-        raise _ReachedSubmitBoundary
-
-    monkeypatch.setattr(runner, "_mark_warmstart_source", reached_submit_boundary)
-
-    spec = JobSpec.from_dict(
-        {
-            "run_id": f"image-opd-{'background' if background else 'sync'}",
-            "model": "Qwen/Qwen3.5-4B",
-            "algorithm": "opd",
-            "environment": {
-                "id": "local",
-                "params": {
-                    "records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]
-                },
-            },
-            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
-        }
-    )
-
-    with pytest.raises(_ReachedSubmitBoundary):
-        runner.submit_job(spec, background=background)
-    with pytest.raises(FileNotFoundError):
-        runner.get_status(spec.run_id)
-
-
-@pytest.mark.parametrize(
-    ("algorithm", "model", "extra_params", "message"),
-    [
-        ("opd", "meta-llama/Llama-3.2-1B", {}, "does not support image-bearing"),
-        ("opd", "Qwen/Qwen3.5-4B", {"multi_turn": True}, "single-turn"),
-    ],
-)
-def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
-    monkeypatch, tmp_path, algorithm, model, extra_params, message
 ):
     from flash import runner
     from flash.spec import JobSpec
@@ -755,17 +564,54 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
     monkeypatch.setattr(runner, "_run_job", fail)
     monkeypatch.setattr(runner, "_run_job_background", fail)
     monkeypatch.setattr(runner.threading, "Thread", fail)
-    params = {
-        "records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}],
-        **extra_params,
-    }
+
+    spec = JobSpec.from_dict(
+        {
+            "run_id": f"image-opd-{'background' if background else 'sync'}",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "opd",
+            "environment": {
+                "id": "local",
+                "params": {
+                    "records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]
+                },
+            },
+            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k3"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
+        runner.submit_job(spec, background=background)
+    with pytest.raises(FileNotFoundError):
+        runner.get_status(spec.run_id)
+
+
+def test_image_opd_submit_preflight_preserves_unsupported_model_precedence(monkeypatch, tmp_path):
+    from flash import runner
+    from flash.spec import JobSpec
+
+    algorithm = "opd"
+    model = "meta-llama/Llama-3.2-1B"
+    message = "does not support image-bearing"
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+
+    def fail(*args, **kwargs):
+        raise AssertionError("rejected submit must not mutate warm-start state or reach providers")
+
+    monkeypatch.setattr(runner, "_mark_warmstart_source", fail)
+    monkeypatch.setattr(runner, "_run_job", fail)
+    monkeypatch.setattr(runner, "_run_job_background", fail)
+    monkeypatch.setattr(runner.threading, "Thread", fail)
+    params = {"records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]}
     spec = JobSpec.from_dict(
         {
             "run_id": f"image-{algorithm}-reject-{model.rsplit('/', 1)[-1]}",
             "model": model,
             "algorithm": algorithm,
             "environment": {"id": "local", "params": params},
-            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
+            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k3"},
         }
     )
     prepared = runner.PreparedJob(public_spec=spec, worker_spec=spec, estimated_cost_usd=0.0)

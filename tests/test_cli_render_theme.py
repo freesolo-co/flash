@@ -466,18 +466,17 @@ def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
     monkeypatch.setenv("TERM", "xterm-256color")  # color stays on under TERM=dumb CI
     monkeypatch.delenv("NO_COLOR", raising=False)
 
-    monkeypatch.setenv("FLASH_THEME", "dark")
+    monkeypatch.setenv("COLORFGBG", "15;0")  # light text on dark background -> dark theme
     dark = render.badge("done")
     assert "87;255;143" in dark  # bright brand green (#57ff8f) reads on a dark terminal
 
-    monkeypatch.setenv("FLASH_THEME", "light")
+    monkeypatch.setenv("COLORFGBG", "0;15")  # dark text on light background -> light theme
     light = render.badge("done")
     assert "0;105;92" in light  # deep teal (#00695c) — the website's light-surface green
     assert dark != light
 
 
 def test_theme_follows_terminal_background(monkeypatch) -> None:
-    monkeypatch.delenv("FLASH_THEME", raising=False)
     monkeypatch.setenv("COLORFGBG", "0;15")  # dark text on light background
     assert render._theme() == "light"
     monkeypatch.setenv("COLORFGBG", "15;0")  # light text on dark background

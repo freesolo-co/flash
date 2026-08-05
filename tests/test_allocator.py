@@ -1073,7 +1073,7 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
     from flash.catalog import ALGORITHMS, MODELS
     from flash.cost import RunConfig, estimate_cost
     from flash.providers import allocator
-    from flash.providers.base import get_gpu_info, provisional_gpu
+    from flash.providers.base import GPU_INFO, combined_vram_gb, get_gpu_info, provisional_gpu
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     expected = {
@@ -1090,25 +1090,50 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
                 continue
             train = {}
             need = allocator.required_vram_gb(model_id, algo, train=train, thinking=False)
+            # most cells fit one card. the 35B MoE trains 256 routed experts per fused tensor, so its
+            # GRPO/OPD peaks exceed every single card and the route is only defined across two.
+            cards = 2 if need > max(g.vram_gb for g in GPU_INFO.values() if g.validated) else 1
 
-            preview_gpu = provisional_gpu(model_id, algo, train=train, thinking=False)
+            preview_gpu = provisional_gpu(
+                model_id, algo, train=train, thinking=False, gpu_count=cards
+            )
             preview_info = get_gpu_info(preview_gpu)
             assert preview_info.validated
             assert preview_info.enum_member
-            assert preview_info.vram_gb >= need, (model_id, algo, preview_gpu, need)
+            # sharding is not free: combined_vram_gb applies the per-card overhead, so two cards hold
+            # less than twice one card. sizing with a naive sum would overstate what the shape holds.
+            assert combined_vram_gb(preview_info.vram_gb, cards) >= need, (
+                model_id,
+                algo,
+                preview_gpu,
+                need,
+            )
 
-            alloc = allocator.allocate(model_id, algo, train=train, thinking=False)
+            alloc = allocator.allocate(
+                model_id, algo, train=train, thinking=False, max_gpu_count=cards
+            )
             alloc_info = get_gpu_info(alloc.gpu)
             assert alloc.provider == "runpod"
             assert alloc.min_vram_gb == need
             assert alloc_info.validated
             assert alloc_info.enum_member
-            assert alloc_info.vram_gb >= need, (model_id, algo, alloc.gpu, need)
-            assert all(c.vram_gb >= need for c in alloc.candidates)
+            assert combined_vram_gb(alloc_info.vram_gb, cards) >= need, (
+                model_id,
+                algo,
+                alloc.gpu,
+                need,
+            )
+            assert all(combined_vram_gb(c.vram_gb, cards) >= need for c in alloc.candidates)
 
-            estimate = estimate_cost(RunConfig(model_id, algo, 1, provider="runpod"))
-            assert estimate.required_vram_gb == need
-            assert estimate.gpu_vram_gb >= need, (model_id, algo, estimate.gpu, need)
+            estimate = estimate_cost(
+                RunConfig(model_id, algo, 1, provider="runpod", gpu_count=cards)
+            )
+            assert estimate.gpu_vram_gb * estimate.gpu_count >= estimate.required_vram_gb, (
+                model_id,
+                algo,
+                estimate.gpu,
+                estimate.required_vram_gb,
+            )
             checked.add((model_id, algo))
 
     assert checked == expected
@@ -1151,7 +1176,18 @@ def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
                 }
                 key = (model_id, algo, configured_gpu)
                 if get_gpu_info(configured_gpu).vram_gb < need:
-                    with pytest.raises(ConfigError, match="requires at least"):
+                    # two distinct rejections, both correct: a pin that is merely too small names the
+                    # shortfall, while a run that outgrows EVERY validated class (35B GRPO/OPD, once
+                    # the routed experts train) fails earlier with no fitting class at all.
+                    biggest = max(g.vram_gb for g in GPU_INFO.values() if g.validated)
+                    # opd words its over-capacity error differently from the generic allocator one,
+                    # so match the shared "no ... validated GPU" shape rather than either wording.
+                    reason = (
+                        "requires at least"
+                        if need <= biggest
+                        else r"(no validated GPU class has|more than any single validated GPU)"
+                    )
+                    with pytest.raises(ConfigError, match=reason):
                         spec_from_dict(raw, run_id="matrix")
                     rejected.add(key)
                     continue

@@ -152,6 +152,11 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         f"model.lora_rank={_hydra_val(cfg['lora_rank'])}",
         f"model.lora_alpha={_hydra_val(cfg['lora_alpha'])}",
         f"model.target_modules={_hydra_val(cfg['target_modules'])}",
+        *(
+            [f"++model.target_parameters={_hydra_val(cfg['target_parameters'])}"]
+            if cfg.get("target_parameters")
+            else []
+        ),
         f"model.lora_adapter_path={_hydra_val(cfg.get('lora_adapter_path'))}",
         "model.use_remove_padding=true",
         # 32k contexts: the fused linear-CE forward never materializes the [tokens, vocab] logits
@@ -676,6 +681,7 @@ def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: i
             f"SFT warm-start adapter rank {rank} does not match the prepared train.lora_rank "
             f"{expected_rank}; rank changes are not supported"
         )
+    _w.validate_lora_target_parameters(config, model_id)
     base = str(config.get("base_model_name_or_path") or "").strip()
     if base and base != model_id:
         raise ValueError("SFT warm-start adapter base model does not match the target model")
@@ -877,7 +883,7 @@ class _NvidiaSmiPeakSampler:
 def run_sft_train(spec=None) -> None:
     """run flash sft through verl's out-of-process fsdp trainer."""
     from flash.catalog import MODELS, resolve_vocab_size
-    from flash.engine.vram import sft_grad_accum
+    from flash.engine.vram import sft_chunked_nll_enabled, sft_grad_accum
 
     spec = spec or _w.JOB_SPEC
     env = _w.require_active_env()
@@ -1005,11 +1011,12 @@ def run_sft_train(spec=None) -> None:
     warmstart_adapter = _warmstart_adapter_path(model_id, model_revision, lora_rank)
 
     vocab_size = resolve_vocab_size(model_id, model_revision)
+    fused_ce = sft_chunked_nll_enabled(model_id)
     per_device_batch, _ = sft_grad_accum(
         effective_batch,
-        seq_len=max_length,
+        seq_len=realized_max_length,
         vocab=vocab_size,
-        fused=False,
+        fused=fused_ce,
     )
     train_batch_size = profile.examples_per_update
     micro_batch = max(1, min(per_device_batch, train_batch_size))
@@ -1027,14 +1034,14 @@ def run_sft_train(spec=None) -> None:
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
     gradient_checkpointing = _w.grad_checkpointing_on(
         model_id,
-        max_length,
+        realized_max_length,
         allow_disable=True,
         card_vram_gb=card_vram_gb,
         capability=capability,
         active_params_b=active_params_b,
         hidden=hidden,
         num_layers=layers,
-        fused_ce=False,
+        fused_ce=fused_ce,
         per_device_bs=micro_batch,
         lora_rank=lora_rank,
         revision=model_revision,
@@ -1066,12 +1073,13 @@ def run_sft_train(spec=None) -> None:
         "train_batch_size": train_batch_size,
         "max_length": max_length,
         "micro_batch": micro_batch,
-        "max_token_len_per_gpu": max_length * micro_batch,
+        "max_token_len_per_gpu": realized_max_length * micro_batch,
         "custom_dataset_path": custom_dataset_path,
         "model_path": model_path,
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "target_modules": target_modules,
+        "target_parameters": _w.lora_target_parameters(model_id),
         "lora_adapter_path": warmstart_adapter,
         "ulysses_sp_size": gpu_count,
         "lr": learning_rate,
@@ -1328,7 +1336,7 @@ def run_sft_train(spec=None) -> None:
             "gradient_checkpointing_reentrant": reentrant_gradient_checkpointing,
             "configured_max_length": max_length,
             "realized_max_length": realized_max_length,
-            "runtime_max_length": max_length,
+            "runtime_max_length": realized_max_length,
             "per_device_train_batch_size": micro_batch,
             "gradient_accumulation_steps": math.ceil(train_batch_size / micro_batch),
             "packing": "verl_remove_padding",

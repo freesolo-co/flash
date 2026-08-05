@@ -767,7 +767,7 @@ def _submittable(
 
     train: dict = {"max_examples": 4}
     if algorithm == "opd":
-        train["teacher_model"] = "kimi-k2.6"
+        train["teacher_model"] = "kimi-k3"
     body: dict = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": algorithm,

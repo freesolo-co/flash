@@ -815,11 +815,13 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   lets you pick the teacher that best fits your task without changing anything else.
 
   **How to check, given the key is managed.** Flash has no command that generates teacher
-  rollouts — the platform's Fireworks key is used only inside the paid OPD worker, to score the
-  student's own tokens — so there is nothing to run locally with your Flash credentials alone.
+  rollouts. The control-plane broker owns `PARASAIL_API_KEY`; GPU workers receive only
+  `FLASH_CONTROL_PANEL_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`, never the provider key.
+  The broker scores the student's own
+  tokens, so there is nothing to run locally with your Flash credentials alone.
   Two workable routes:
 
-  - _Best, if you can:_ get your own access to the same model (the allow-list is Fireworks-hosted,
+  - _Best, if you can:_ get your own access to the same model (the allow-list is Parasail-hosted,
     and these are widely available elsewhere too), point your environment's scorer at it, and grade
     a held-out split exactly as you would a student. Read the score _and_ a sample of trajectories —
     a teacher that is right for the wrong reasons transfers the wrong reasons.
@@ -848,15 +850,15 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
 
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
   the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
-  `glm-5.2` (default) or `kimi-k2.6`. Every option is
-  a Fireworks-hosted model reached with the platform's own key, so there is nothing to export or
-  declare — an opd run submits like any other, and a `FIREWORKS_API_KEY` in your shell is ignored.
+  `glm-5.2` (default), `kimi-k3`, or `qwen3.5-397b-a17b`. Every option is
+  a Parasail-hosted model reached through the control-plane broker, so there is nothing to export or
+  declare. An opd run submits like any other, and a `PARASAIL_API_KEY` in your shell is ignored.
   Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
   teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
   at serving time; teacher token cost varies by model and is shown in the pre-flight estimate.
 - **The student (Qwen) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai _spider_ / Tinker
-  method): it aligns the two tokenizations by shared decoded-text spans and applies per-span reverse
+  method): it aligns the two tokenizations by shared source-text spans and applies per-span reverse
   KL using only realized-token logprobs — no vocabulary projection, so it covers every token exactly
   and works for any student tokenizer. When the tokenizers happen to agree it reduces to plain
   per-token reverse KL (Thinking Machines, _On-Policy Distillation_). Nothing to configure.
@@ -883,8 +885,8 @@ epochs = 1
 max_examples = 2
 lora_rank = 32
 # teacher_model = "glm-5.2"                             # managed teacher to distil from; one of
-#                                                       # glm-5.2 (default) | kimi-k2.6
-#                                                       # (key stays managed)
+#                                                       # glm-5.2 (default) | kimi-k3 |
+#                                                       # qwen3.5-397b-a17b (key stays managed)
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 ```
 

@@ -1137,9 +1137,9 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert 'algorithm = "opd"' in opd_text
     assert "epochs = 1" in opd_text
     assert "max_examples = 2" in opd_text
-    # The teacher key is platform-managed: the scaffold neither declares it as a secret nor tells
-    # the user to export it, so the generated config must not mention FIREWORKS_API_KEY at all.
-    assert "FIREWORKS_API_KEY" not in opd_text
+    # the teacher key is platform-managed: the scaffold neither declares it as a secret nor tells
+    # the user to export it, so the generated config must not mention the provider credential.
+    assert "PARASAIL_API_KEY" not in opd_text
     assert "secrets" not in opd_text
     assert "platform-managed" in opd_text
     # single-turn opd runs fine, so it carries NO multi-turn "fails fast" warning
@@ -1230,7 +1230,7 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     opd_text = (tmp_path / "configs/opd.toml").read_text()
     assert 'algorithm = "opd"' in opd_text
     # ...and the multi-turn opd.toml notes it distils every assistant turn, with NO fail-fast warning
-    assert "distils EVERY assistant turn" in opd_text
+    assert "distils every assistant turn" in opd_text
     assert "SINGLE-TURN only" not in opd_text
     assert "fail fast" not in opd_text
     assert "configs/opd.toml" in capsys.readouterr().out
