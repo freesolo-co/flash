@@ -279,24 +279,18 @@ def reward_seconds_per_completion(override: float | None = None) -> float:
     return AVG_REWARD_SECONDS_PER_COMPLETION
 
 
-# Fireworks echo-scoring round-trip per completion (wall time, concurrency-bound like reward grading).
+# parasail supplied-token scoring round-trip per completion.
 AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
 
 
 def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
     """(input, output) $/1M tokens for a teacher model.
 
-    Routes through resolve_teacher, the single OPD-teacher resolver, whose recipe.TEACHER_MODELS is
-    the one source of teacher prices. ``teacher_model`` is the Fireworks model id chosen via ``[train]
-    teacher_model``, or "" for the default GLM 5.2 teacher. Teacher pricing is static, offline, and
-    credential-free. OPD echo-scores completions (max_tokens=0), so only the input column is billed,
-    but both are returned. An unsupported value falls back defensively to the default rate."""
+    Routes through the closed managed-teacher catalog. Parasail bills every supplied-token score as
+    all prompt tokens plus the one generated output token required by its completions endpoint."""
     from flash.engine.recipe import resolve_teacher
 
-    try:
-        return resolve_teacher(teacher_model).usd_per_1m
-    except ValueError:
-        return resolve_teacher("").usd_per_1m
+    return resolve_teacher(teacher_model).usd_per_1m
 
 
 def teacher_token_cost_usd(

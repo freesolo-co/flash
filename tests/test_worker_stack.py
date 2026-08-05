@@ -702,6 +702,35 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         assert "pissa" not in str(captured.get("init_lora_weights")).lower()
         assert captured.get("use_rslora") is False
         assert captured.get("revision") == "a" * 40
+        assert "target_parameters" not in captured
+
+    captured.clear()
+    worker.make_lora("Qwen/Qwen3.6-35B-A3B")
+    assert captured["r"] == 32
+    assert captured["target_modules"] == "all-linear"
+    assert captured["target_parameters"] == [
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+    ]
+
+
+def test_35b_warmstart_requires_fused_expert_targets(monkeypatch):
+    worker = _import_worker(monkeypatch)
+    model_id = "Qwen/Qwen3.6-35B-A3B"
+
+    with pytest.raises(ValueError, match="omits required expert targets"):
+        worker.validate_lora_target_parameters({"target_modules": "all-linear"}, model_id)
+
+    worker.validate_lora_target_parameters(
+        {
+            "target_parameters": [
+                "mlp.experts.gate_up_proj",
+                "mlp.experts.down_proj",
+            ]
+        },
+        model_id,
+    )
+    worker.validate_lora_target_parameters({}, "Qwen/Qwen3.5-9B")
 
 
 def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
@@ -795,7 +824,7 @@ def test_prepare_fresh_lora_base_rejects_revision_authority_conflict(monkeypatch
         )
 
 
-def test_warmstart_base_loader_forwards_model_revision(monkeypatch):
+def test_warmstart_base_loader_forwards_model_revision(monkeypatch, tmp_path):
     import flash.engine.worker.adapter as adapter_mod
 
     loads = []
@@ -839,7 +868,8 @@ def test_warmstart_base_loader_forwards_model_revision(monkeypatch):
             )
         ),
     )
-    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda prefix: "/tmp/adapter")
+    (tmp_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda prefix: str(tmp_path))
     monkeypatch.setattr(adapter_mod, "adapter_is_vl_warmstart", lambda *args, **kwargs: False)
     monkeypatch.setattr(adapter_mod, "optimal_attn_impl", lambda: None)
     monkeypatch.setattr(adapter_mod, "_assert_warmstart_adapter_applied", lambda *args: None)
@@ -1854,8 +1884,13 @@ def test_sm100_fla_tilelang_opted_out(monkeypatch):
     assert os.environ.get("FLA_TILELANG") == "0"
 
 
-def test_sm100_fla_tilelang_explicit_preset_wins(monkeypatch):
-    """An explicitly pre-set FLA_TILELANG (e.g. testing a fixed tilelang) is respected."""
+def test_sm100_fla_tilelang_overrides_an_explicit_preset(monkeypatch):
+    """A pre-set FLA_TILELANG=1 is overridden on sm100: this is a correctness floor.
+
+    tilelang's chunk_bwd_dqkwg miscomputes GDN gradients on sm100, and the failure is silent —
+    training completes and only the weights are wrong. Honouring an operator's opt-in here would
+    let a run produce quietly garbage weights, so flash owns this value on this arch.
+    """
     import os
 
     perf = _patch_arch(monkeypatch, (10, 0))
@@ -1863,7 +1898,7 @@ def test_sm100_fla_tilelang_explicit_preset_wins(monkeypatch):
 
     perf._force_fla_triton_gdn_on_sm100()
 
-    assert os.environ.get("FLA_TILELANG") == "1"
+    assert os.environ.get("FLA_TILELANG") == "0"
 
 
 @pytest.mark.parametrize("cc", [(9, 0), (12, 0), (8, 9)])

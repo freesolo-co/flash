@@ -708,7 +708,11 @@ def test_provider_worker_env_carries_control_plane_resume_revision():
     env = build_worker_env(
         spec,
         987,
-        runtime_secrets={OPD_RESUME_REVISION_ENV: "a" * 40},
+        runtime_secrets={
+            OPD_RESUME_REVISION_ENV: "a" * 40,
+            "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+        },
     )
     assert env[OPD_RESUME_REVISION_ENV] == "a" * 40
 

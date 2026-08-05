@@ -122,6 +122,23 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
     assert "data.messages_key" not in overrides
 
 
+def test_overrides_carry_fused_expert_target_parameters():
+    overrides = _as_map(
+        build_sft_overrides(
+            _cfg(
+                target_parameters=[
+                    "mlp.experts.gate_up_proj",
+                    "mlp.experts.down_proj",
+                ]
+            )
+        )
+    )
+
+    assert overrides["++model.target_parameters"] == (
+        "[mlp.experts.gate_up_proj,mlp.experts.down_proj]"
+    )
+
+
 def test_verl_sft_optimizer_is_dtensor_safe():
     """the fsdp2 engine hands DTensor params to the optimizer.
 
@@ -779,7 +796,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
     monkeypatch.setenv("HF_HOME", "/cache/hf")
     monkeypatch.setenv("FLASH_VERL_PYTHON", "/verl/python")
     monkeypatch.setenv("WANDB_API_KEY", "wandb-secret")
-    monkeypatch.setenv("FIREWORKS_API_KEY", "teacher-secret")
+    monkeypatch.setenv("PARASAIL_API_KEY", "teacher-secret")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "control-secret")
     monkeypatch.setenv("RUNPOD_API_KEY", "provider-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
@@ -791,7 +808,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
     assert without_wandb["FLASH_VERL_PYTHON"] == "/verl/python"
     assert "WANDB_API_KEY" not in without_wandb
     for secret in (
-        "FIREWORKS_API_KEY",
+        "PARASAIL_API_KEY",
         "FREESOLO_INTERNAL_KEY",
         "RUNPOD_API_KEY",
         "HF_TOKEN",
@@ -908,6 +925,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     the caller supplies its own ``run_verl_training`` fake, which is the only remaining seam.
     """
     import flash.catalog as catalog
+    import flash.engine.vram as vram
     import flash.engine.worker as worker
     from flash.engine.worker import sft_train
 
@@ -1022,6 +1040,21 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     Watcher = watcher_cls or _DefaultWatcher
 
     captured = {"heartbeats": [], "published": [], "uploads": []}
+    real_sft_grad_accum = vram.sft_grad_accum
+
+    def capture_sft_grad_accum(batch_size, **kwargs):
+        captured["sft_grad_accum"] = {"batch_size": batch_size, **kwargs}
+        return real_sft_grad_accum(batch_size, **kwargs)
+
+    def capture_grad_checkpointing(model_id, max_length, **kwargs):
+        captured["grad_checkpointing"] = {
+            "model_id": model_id,
+            "max_length": max_length,
+            **kwargs,
+        }
+        return True
+
+    monkeypatch.setattr(vram, "sft_grad_accum", capture_sft_grad_accum)
     # run_sft_train imports AutoProcessor at data-loading time and transformers is not installed in
     # the cpu test env. this used to pass only because some EARLIER test module left a transformers
     # stub in sys.modules, so running this file alone failed -- stub it here so the test stands on
@@ -1053,7 +1086,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
     monkeypatch.setattr(worker, "prefetch_model", lambda *args, **kwargs: 1.25)
     monkeypatch.setattr(worker, "load_tokenizer", lambda *args, **kwargs: Tokenizer())
     monkeypatch.setattr(worker, "make_lora", lambda model_id: LoraConfig())
-    monkeypatch.setattr(worker, "grad_checkpointing_on", lambda *args, **kwargs: True)
+    monkeypatch.setattr(worker, "grad_checkpointing_on", capture_grad_checkpointing)
     monkeypatch.setattr(worker, "grpo_use_reentrant", lambda model_id: False)
     monkeypatch.setattr(worker, "backend_seed", lambda seed: seed)
     monkeypatch.setattr(worker, "wandb_run_name", lambda: "flash-sft-test")
@@ -1144,7 +1177,19 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     assert captured["meta"]["train_tokens"] > 0
     assert captured["meta"]["notes"]["loss_curve"] == [1.0]
     assert captured["meta"]["notes"]["loraplus_applied"] is True
-    assert captured["meta"]["notes"]["realized_max_length"] > 0
+    notes = captured["meta"]["notes"]
+    realized_max_length = notes["realized_max_length"]
+    assert 0 < realized_max_length < notes["configured_max_length"]
+    assert notes["runtime_max_length"] == realized_max_length
+    assert captured["sft_grad_accum"]["seq_len"] == realized_max_length
+    assert captured["sft_grad_accum"]["fused"] is True
+    assert captured["grad_checkpointing"]["max_length"] == realized_max_length
+    assert captured["grad_checkpointing"]["fused_ce"] is True
+    assert "data.max_length=1024" in captured["command"]
+    assert (
+        f"data.max_token_len_per_gpu={realized_max_length * notes['per_device_train_batch_size']}"
+        in captured["command"]
+    )
 
 
 def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monkeypatch):

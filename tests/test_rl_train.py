@@ -11,7 +11,9 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
+import subprocess
 import sys
 import textwrap
 import threading
@@ -46,6 +48,117 @@ def test_run_rl_always_delegates_to_verl(monkeypatch, stale):
         monkeypatch.setenv("FLASH_RL_BACKEND", stale)
     rl.run_rl()
     assert called == [True]
+
+
+class _FakeGrpoProcess:
+    def __init__(self, lines, *, wait_code, stale_return_code):
+        self.stdout = iter(lines)
+        self.pid = 424242
+        self.returncode = stale_return_code
+        self._wait_code = wait_code
+        self.wait_calls = 0
+
+    def wait(self):
+        self.wait_calls += 1
+        return self._wait_code
+
+
+def test_grpo_subprocess_stream_classifies_the_recorded_nonzero_exit(monkeypatch):
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    terminated = []
+    monkeypatch.setattr(
+        rl_train,
+        "kill_process_group",
+        lambda proc, *, process_group_id: terminated.append((proc, process_group_id)),
+    )
+    signature = "cudaErrorDevicesUnavailable\n"
+    lines = [signature, *(f"filler-{i}\n" for i in range(150))]
+    proc = _FakeGrpoProcess(lines, wait_code=17, stale_return_code=0)
+    stream = rl_train._GrpoSubprocessStream(proc)
+
+    assert list(stream) == lines
+    with pytest.raises(RetriableInfraError) as exc_info:
+        stream.wait_and_classify()
+
+    assert "cudaErrorDevicesUnavailable" in str(exc_info.value)
+    assert proc.wait_calls == 1
+    assert terminated == [(proc, proc.pid)]
+
+
+def test_grpo_subprocess_stream_does_not_classify_a_zero_exit():
+    lines = ["cudaErrorDevicesUnavailable\n"]
+    proc = _FakeGrpoProcess(lines, wait_code=0, stale_return_code=17)
+    stream = rl_train._GrpoSubprocessStream(proc)
+
+    assert list(stream) == lines
+    assert stream.wait_and_classify() == 0
+    assert proc.wait_calls == 1
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="requires linux process groups")
+def test_grpo_classified_exit_drains_group_after_leader_is_reaped(tmp_path, monkeypatch):
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    if not backend_common.adopt_orphaned_descendants():
+        pytest.skip("child subreaper unavailable")
+    monkeypatch.setattr(backend_common, "_TEARDOWN_GRACE_S", 0.5)
+    marker = tmp_path / "grpo-classified-grandchild.pid"
+    grandchild = (
+        "import signal,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    leader = (
+        "import pathlib,subprocess,sys\n"
+        f"g = subprocess.Popen([sys.executable, '-c', {grandchild!r}], "
+        "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)\n"
+        "assert g.stdout.readline().strip() == 'ready'\n"
+        "g.stdout.close()\n"
+        f"pathlib.Path({str(marker)!r}).write_text(str(g.pid))\n"
+        "print('cudaErrorDevicesUnavailable', flush=True)\n"
+        "raise SystemExit(1)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", leader],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    grandchild_pid = None
+    try:
+        stream = rl_train._GrpoSubprocessStream(proc)
+        assert "cudaErrorDevicesUnavailable\n" in list(stream)
+        with pytest.raises(RetriableInfraError, match="cudaErrorDevicesUnavailable"):
+            stream.wait_and_classify()
+
+        assert proc.poll() == 1, "test did not exercise classification after leader reaping"
+        assert marker.exists(), "leader exited before recording its surviving grandchild"
+        grandchild_pid = int(marker.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and os.path.exists(f"/proc/{grandchild_pid}"):
+            time.sleep(0.05)
+        assert not os.path.exists(f"/proc/{grandchild_pid}"), (
+            f"classified grpo exit left grandchild {grandchild_pid} alive or unreaped"
+        )
+    finally:
+        if grandchild_pid is not None:  # pragma: no cover - only on an unexpected failure
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(grandchild_pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(grandchild_pid, 0)
+        if proc.poll() is None:  # pragma: no cover - only on an unexpected failure
+            backend_common.kill_process_group(proc)
+
+
+def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
+    source = inspect.getsource(rl_train.run_rl_train)
+
+    assert "child_stream = _GrpoSubprocessStream(proc)" in source
+    assert "for line in child_stream" in source
+    assert "rc = child_stream.wait_and_classify()" in source
 
 
 # ------------------------------- data conversion -------------------------------
@@ -332,6 +445,22 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "algorithm.rollout_correction.rollout_is_threshold=2.0" in o
 
 
+def test_build_verl_overrides_carries_fused_expert_target_parameters():
+    o = rl_train.build_verl_overrides(
+        _overrides_cfg(
+            target_parameters=[
+                "mlp.experts.gate_up_proj",
+                "mlp.experts.down_proj",
+            ]
+        )
+    )
+
+    assert (
+        "++actor_rollout_ref.model.target_parameters="
+        "[mlp.experts.gate_up_proj,mlp.experts.down_proj]"
+    ) in o
+
+
 def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
     # this guards only against flash emitting a misleading no-op; it does not prove verl reads the key.
     o = rl_train.build_verl_overrides(_overrides_cfg())
@@ -366,6 +495,7 @@ def test_run_rl_train_sizes_the_run_from_the_spec_gpu_count(count, expected):
 
 def test_build_verl_overrides_single_gpu_is_the_unchanged_default():
     o = rl_train.build_verl_overrides(_overrides_cfg(n_gpus=1))
+    assert "+ray_kwargs.ray_init.num_gpus=1" in o
     assert "trainer.n_gpus_per_node=1" in o
     assert "trainer.nnodes=1" in o
     assert "actor_rollout_ref.rollout.tensor_model_parallel_size=1" in o
@@ -378,6 +508,7 @@ def test_build_verl_overrides_shards_every_card_along_the_sequence(n_gpus):
     # global batch of prompts_per_step * group_size. sharding the BATCH instead would change the
     # gradient, which is why sp/tp track the card count rather than leaving dp to absorb it.
     o = rl_train.build_verl_overrides(_overrides_cfg(n_gpus=n_gpus))
+    assert f"+ray_kwargs.ray_init.num_gpus={n_gpus}" in o
     assert f"trainer.n_gpus_per_node={n_gpus}" in o
     assert f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={n_gpus}" in o
     assert f"actor_rollout_ref.rollout.tensor_model_parallel_size={n_gpus}" in o
@@ -3317,7 +3448,15 @@ class _CapabilityProcessor:
         return {"input_ids": [[1] * self.expanded_len]}
 
 
-def _capability_resolve(monkeypatch, env, train=None, overrides=None, processor=None):
+def _capability_resolve(
+    monkeypatch,
+    env,
+    train=None,
+    overrides=None,
+    processor=None,
+    model="Qwen/Qwen3.5-0.8B",
+    gpu_count=1,
+):
     """run the resolver against one env, with everything else on the supported path."""
     import transformers
 
@@ -3341,9 +3480,10 @@ def _capability_resolve(monkeypatch, env, train=None, overrides=None, processor=
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": model,
             "algorithm": "grpo",
             "train": {"batch_size": 4, "epochs": 1, **(train or {})},
+            "gpu": {"count": gpu_count},
         }
     )
     monkeypatch.setattr(_PkgW, "JOB_SPEC", spec, raising=False)
@@ -3501,6 +3641,26 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
     )
     assert inp["warmstart_adapter"]
     assert inp["kl_coef"] == pytest.approx(0.1)
+
+
+def test_35b_grpo_warm_start_requires_fused_expert_targets(monkeypatch, tmp_path):
+    import flash.engine.worker.adapter as adapter_mod
+
+    adapter_dir = tmp_path / "warmstart"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps({"r": 32, "lora_alpha": 64}), encoding="utf-8"
+    )
+    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
+
+    with pytest.raises(ValueError, match="omits required expert targets"):
+        _capability_resolve(
+            monkeypatch,
+            _capability_env(),
+            train={"init_from_adapter": "org/pre-expert-adapter"},
+            model="Qwen/Qwen3.6-35B-A3B",
+            gpu_count=2,
+        )
 
 
 def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch, capsys):
@@ -4535,6 +4695,25 @@ def test_train_notes_report_idle_fraction_from_the_runs_own_step_wall(monkeypatc
     assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
 
 
+def test_train_notes_do_not_publish_the_serial_idle_projection_when_batching(monkeypatch):
+    inp = _resolved_inputs_for_notes(monkeypatch)
+    completions = inp["prompts_per_step"] * inp["group_size"]
+    notes = rl_train._build_verl_train_notes(
+        inp,
+        steps_run=10,
+        retained_prompts=len(inp["prompts"]),
+        reward_history=[],
+        loss_curve=[],
+        reward_profile=_profile(8.0 / completions),
+        step_intervals=[10.0] * 10,
+        reward_bridge_batching=True,
+    )
+
+    assert notes["reward_bridge_batching"] is True
+    assert notes["reward_seconds_per_completion"] == 8.0 / completions
+    assert notes["reward_gpu_idle_fraction"] is None
+
+
 def test_idle_fraction_is_none_when_grading_exceeds_the_measured_step(monkeypatch):
     """Grading that fills the whole step leaves no gpu-bound remainder to divide.
 
@@ -4668,6 +4847,7 @@ def test_the_run_body_passes_the_measured_profile_into_train_meta():
     assert "_log_reward_profile(" in src, "the hook is never called"
     assert "reward_profile = " in src, "the hook's reading is discarded"
     assert "reward_profile=reward_profile" in src, "the reading never reaches train_meta"
+    assert 'reward_bridge_batching=not inp["multi_turn"]' in src
 
 
 def test_the_reward_profiler_is_skipped_on_multi_turn():
@@ -4716,63 +4896,32 @@ def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
     return score, buffer
 
 
-def test_score_grades_before_it_records():
-    """Grading calls user code and can block on i/o for seconds while verl scores many rollouts.
-
-    `record` takes the buffer's lock, so calling it around the grading rather than after it would
-    serialize every grading in the run behind the slowest one -- the whole reward wall.
-    """
+def test_score_batch_grades_before_it_records():
+    """User grading must finish before the observability lock is taken per result."""
     src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    body = src[src.index("def _score(index: int") :]
+    body = src[src.index("def _score_batch(requests:") :]
     body = body[: body.index("def _score_for_profile")]
 
     assert body.count("observability.record(") == 1
-    assert body.index("score = score_single_turn(") < body.index("observability.record(")
+    assert body.index("scored = score_single_turn_batch(") < body.index("observability.record(")
 
 
-def test_the_recorded_prompt_is_the_one_the_completion_was_graded_against():
-    """A sample pairs a prompt with a completion, so the two must come from the SAME index.
+def test_the_recorded_prompt_is_the_one_the_batched_completion_was_graded_against():
+    """Each scattered sample must use the same request index for its example and prompt."""
+    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    body = src[src.index("def _score_batch(requests:") :]
+    body = body[: body.index("def _score_for_profile")]
 
-    `_score` receives an index and a completion; the prompt is looked up, and looking it up under
-    anything but that index publishes a rollout whose `prompt_tail` belongs to a different example.
-    Nothing downstream can detect it -- the pair is well-formed, just not a pair -- and every
-    reader of `flash runs log` is then reading the model answering a question it was never asked.
-    `_score_buffer` below reimplements these two calls, so it cannot catch this; read the call.
-
-    Asserted with ast: the lookup is one subscript expression, and a substring needle would fail on
-    a reformat rather than on the re-indexing that is the actual invariant.
-    """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
-    score = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_score"
+    assert (
+        "(solution_str, rollout_examples[int(index)]) for index, solution_str in requests" in body
     )
-    index_arg, completion_arg = (a.arg for a in score.args.args[:2])
-    calls = [
-        node
-        for node in ast.walk(score)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "record"
-    ]
-    assert len(calls) == 1
-    prompt, completion = calls[0].args[:2]
-    # the completion is passed straight through, unindexed: it IS the graded text.
-    assert isinstance(completion, ast.Name)
-    assert completion.id == completion_arg
-    # the prompt is subscripted by _score's own index argument, not by a separate cursor.
-    assert isinstance(prompt, ast.Subscript)
-    assert ast.unparse(prompt.slice) in (index_arg, f"int({index_arg})")
-    # and it is the same list the grading example comes from -- one dataset order for both.
-    graded = next(
-        node
-        for node in ast.walk(score)
-        if isinstance(node, ast.Subscript)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "rollout_examples"
+    assert (
+        "for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):"
+        in body
     )
-    assert ast.unparse(graded.slice) == ast.unparse(prompt.slice)
+    assert (
+        "observability.record(message_prompts[int(index)], solution_str, score, breakdowns)" in body
+    )
 
 
 @pytest.mark.usefixtures("_identity_graded")

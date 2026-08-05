@@ -103,6 +103,8 @@ def test_runconfig_preserves_old_positional_constructor():
     assert config.train_tokens == 16_000
     assert config.save_at_steps == (2, 5)
     assert config.gpu_type == ""
+    assert config.opd_multi_turn is False
+    assert config.opd_max_turns is None
 
 
 def test_provisional_estimate_preserves_auto_provider():
@@ -230,6 +232,32 @@ def test_runconfig_from_spec_preserves_gpu_constraints():
     assert config.gpu_type == "H100"
     # the run's disk floor threads through so an exact-auto quote allocates the same disk as launch
     assert config.disk_gb == 200.0
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({"id": "owner/single", "params": {"multi_turn": False}}, (False, None)),
+        ({"id": "owner/multi", "params": {"multi_turn": True, "max_turns": 24}}, (True, 24)),
+        ({"id": "owner/unknown"}, (True, None)),
+    ],
+)
+def test_runconfig_from_spec_preserves_conservative_opd_turn_budget(environment, expected):
+    from flash.cost.spec import runconfig_from_spec
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "opd",
+            "environment": environment,
+            "train": {"max_examples": 8, "max_steps": 1},
+        }
+    )
+
+    config = runconfig_from_spec(spec)
+
+    assert (config.opd_multi_turn, config.opd_max_turns) == expected
 
 
 def test_quote_preparation_never_calls_live_allocate(monkeypatch):

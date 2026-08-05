@@ -63,20 +63,15 @@ _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
 
 def resolve_ssh_key_names(*, deadline_at: float | None = None) -> list[str]:
     """Return the SSH key to attach at launch (required by Lambda even though we never SSH in)."""
-    import os
-
-    pinned = os.environ.get("LAMBDA_SSH_KEY_NAME")
-    if pinned:
-        return [pinned]
     keys = lambda_api.list_ssh_keys(
         **deadline_kwargs(lambda_api.list_ssh_keys, deadline_at),
     )
     names = [k.get("name") for k in keys if k.get("name")]
     if not names:
         raise lambda_api.LambdaApiError(
-            "Lambda launch requires an SSH key on the account, but none are registered and "
-            "LAMBDA_SSH_KEY_NAME is unset; add one in the Lambda console (the box is bootstrapped "
-            "via user_data, so the key is unused — any key works)."
+            "Lambda launch requires an SSH key on the account, but none are registered; add one "
+            "in the Lambda console (the box is bootstrapped via user_data, so the key is unused "
+            "— any key works)."
         )
     return [names[0]]
 

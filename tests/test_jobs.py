@@ -3135,11 +3135,29 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
+        import contextlib
+
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
+        import flash.server.teacher_broker as teacher_broker
         from flash.providers.base import Allocation, Candidate
         from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.setattr(
+            teacher_broker,
+            "require_teacher_broker_configuration",
+            lambda _spec, **_kwargs: "https://broker.example",
+        )
+
+        @contextlib.contextmanager
+        def teacher_transport(_spec, **_kwargs):
+            yield {
+                "FLASH_CONTROL_PANEL_URL": "https://broker.example",
+                "FLASH_TEACHER_CAPABILITY": "capability-test-value",
+            }
+
+        monkeypatch.setattr(teacher_broker, "teacher_attempt_transport", teacher_transport)
 
         candidates = (
             Candidate("runpod", "A100 SXM 40GB", 1.00, 40),

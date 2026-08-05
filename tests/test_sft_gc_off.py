@@ -44,8 +44,10 @@ def test_gc_off_gate_is_lora_rank_aware():
     p32 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 32})
     p512 = sft_gc_off_peak_gb(35.0, seq_len=2368, **{**_MOE, "lora_rank": 512})
     assert p512 > p32  # the peak grows with rank
-    # end-to-end through grad_checkpointing_on: at a 125 GB card the default rank disables GC (returns
+    # end-to-end through grad_checkpointing_on: at a 180 GB card the default rank disables GC (returns
     # False) but rank 512 keeps it on (returns True) -> the configured rank changes the decision.
+    # the card moved up from 125 GB with the routed experts: below ~170 GB the GC-off peak no longer
+    # fits at ANY rank, so both ranks would keep GC on and the rank contrast would vanish.
     kw = {
         "model_id": "Qwen/Qwen3.6-35B-A3B",
         "max_length": 2368,
@@ -57,8 +59,8 @@ def test_gc_off_gate_is_lora_rank_aware():
         "per_device_bs": 4,
         "capability": (9, 0),
     }
-    assert grad_checkpointing_on(card_vram_gb=125.0, lora_rank=32, **kw) is False  # GC off (fits)
-    assert grad_checkpointing_on(card_vram_gb=125.0, lora_rank=512, **kw) is True  # GC kept on
+    assert grad_checkpointing_on(card_vram_gb=180.0, lora_rank=32, **kw) is False  # GC off (fits)
+    assert grad_checkpointing_on(card_vram_gb=180.0, lora_rank=512, **kw) is True  # GC kept on
 
 
 def test_gc_off_peak_scales_linearly_with_seq():
@@ -97,8 +99,29 @@ def test_can_disable_conservative_on_unknown_card_or_dims():
     assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=141.0, **bad) is False
 
 
-def test_gate_turns_gc_off_for_35b_on_h200():
+def test_gate_turns_gc_off_for_35b_on_b200():
+    # training the routed experts grew the adapter/optimizer term, so the GC-off peak no longer fits
+    # the 141 GB H200 -- the speed win now starts at the 180 GB B200. the 141 GB case is covered by
+    # test_gate_keeps_gc_on_for_35b_on_h200 below.
     off = grad_checkpointing_on(
+        "Qwen/Qwen3.6-35B-A3B",
+        2368,
+        allow_disable=True,
+        card_vram_gb=180.0,
+        capability=(9, 0),
+        active_params_b=3.0,
+        hidden=2048,
+        num_layers=40,
+        fused_ce=True,
+        per_device_bs=4,
+    )
+    assert off is False  # GC OFF (the speed win)
+
+
+def test_gate_keeps_gc_on_for_35b_on_h200():
+    # the 141 GB H200 can no longer hold the GC-off peak once the experts are trained, so the gate
+    # must keep gradient checkpointing ON there rather than disabling it into an OOM.
+    on = grad_checkpointing_on(
         "Qwen/Qwen3.6-35B-A3B",
         2368,
         allow_disable=True,
@@ -110,7 +133,7 @@ def test_gate_turns_gc_off_for_35b_on_h200():
         fused_ce=True,
         per_device_bs=4,
     )
-    assert off is False  # GC OFF (the speed win)
+    assert on is True
 
 
 def test_gate_keeps_gc_on_h100_80gb():

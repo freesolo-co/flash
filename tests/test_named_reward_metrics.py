@@ -78,7 +78,9 @@ def test_reward_metrics_reach_the_step_heartbeat() -> None:
     breakdowns travel through the reward-observability buffer into the rl_step liveness fields."""
     source = inspect.getsource(run_rl_train)
 
-    assert "breakdowns=breakdowns" in source
-    assert "observability.record(" in source
+    assert (
+        "observability.record(message_prompts[int(index)], solution_str, score, breakdowns)"
+        in source
+    )
     assert "observability.heartbeat_fields()" in source
     assert "**_reward_observability()" in source

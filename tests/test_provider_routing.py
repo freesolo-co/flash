@@ -241,11 +241,15 @@ def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, mo
     assert provider_calls == []
 
 
-def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypatch):
+@pytest.mark.parametrize("first_revocation_fails", [False, True])
+def test_cancel_waits_for_durable_provider_handle_then_tears_down(
+    orch, monkeypatch, first_revocation_fails
+):
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
+    from flash.server import db as server_db
 
     spec = _spec(run_id="flash-provider-handshake-cancel", max_retries=0)
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
@@ -262,6 +266,14 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
     resource_live = {"value": False}
     cancelled_handles = []
     destroyed_handles = []
+    revocation_calls = 0
+
+    def revoke_capabilities(_run_id):
+        nonlocal revocation_calls
+        revocation_calls += 1
+        if first_revocation_fails and revocation_calls == 1:
+            raise RuntimeError("teacher revocation store unavailable")
+        return 1
 
     def fake_runpod_submit(run_spec, seed, *, on_handle, **kwargs):
         resource_live["value"] = True
@@ -285,6 +297,7 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
         return True
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    monkeypatch.setattr(server_db, "revoke_teacher_capabilities_for_run", revoke_capabilities)
     monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
 
@@ -297,11 +310,16 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
             submit_errors.append(exc)
 
     cancel_results = []
+    cancel_errors = []
 
     def cancel():
         cancellation_started.set()
-        cancel_results.append(orch.cancel_run(spec.run_id))
-        cancellation_finished.set()
+        try:
+            cancel_results.append(orch.cancel_run(spec.run_id))
+        except Exception as exc:
+            cancel_errors.append(exc)
+        finally:
+            cancellation_finished.set()
 
     submit_thread = threading.Thread(target=submit)
     submit_thread.start()
@@ -313,7 +331,9 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
     cancel_thread.join(timeout=0.1)
     assert cancel_thread.is_alive()
     assert not cancellation_finished.is_set()
-    assert orch.get_status(spec.run_id).remote is None
+    waiting_status = orch.get_status(spec.run_id)
+    assert waiting_status.state == "running"
+    assert waiting_status.remote is None
     assert resource_live["value"]
 
     allow_handle.set()
@@ -324,7 +344,14 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
 
     assert not cancel_thread.is_alive()
     assert submit_thread.is_alive()
-    assert cancel_results[0].state == "cancelled"
+    if first_revocation_fails:
+        assert cancel_results == []
+        assert len(cancel_errors) == 1
+        assert "teacher revocation store unavailable" in str(cancel_errors[0])
+    else:
+        assert cancel_errors == []
+        assert cancel_results[0].state == "cancelled"
+    assert revocation_calls == 2
     status = orch.get_status(spec.run_id)
     assert status.state == "cancelled"
     assert status.remote is None

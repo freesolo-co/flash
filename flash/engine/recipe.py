@@ -4,98 +4,104 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Keep in sync with catalog.DEFAULT_MODEL.
+# keep in sync with catalog.default_model.
 HF_MODEL_ID = "Qwen/Qwen3.5-4B"
-
-# The single Fireworks OpenAI-compatible endpoint every managed OPD teacher is reached over. ONE
-# base_url + ONE platform-managed FIREWORKS_API_KEY authorize every teacher below (all are Fireworks
-# serverless models), so selecting a teacher swaps only the ``model`` string the TeacherClient sends —
-# no new secret, no per-teacher base_url.
-TEACHER_BASE_URL = "https://api.fireworks.ai/inference/v1"
 
 
 @dataclass(frozen=True)
 class TeacherModel:
-    """A managed OPD teacher: a Fireworks-hosted model the student distils toward, selected by its
-    short ``alias`` via ``[train] teacher_model``. The catalog below is the ONE source of truth — the
-    schema validates against it, the worker resolves ``alias -> model_id`` from it, and the cost model
-    derives its teacher price table from it."""
+    """One managed serverless OPD teacher and its pinned local tokenizer contract."""
 
-    alias: str  # short, user-facing name typed in [train] teacher_model (the TEACHER_MODELS key)
-    model_id: str  # Fireworks OpenAI-compatible model id (the ``model`` field TeacherClient sends)
+    alias: str
+    model_id: str
     display_name: str
-    # Fireworks serverless list price, $/1M tokens as (input, output). OPD echo-scores completions
-    # (max_tokens=0) so only the INPUT column is billed / feeds the estimate, but both are kept so a
-    # mispriced row is obvious. note: the non-glm entry is a best-effort estimate for this next-gen
-    # serverless model — confirm against the live fireworks.ai pricing before relying on the
-    # `flash train` cost quote.
     usd_per_1m: tuple[float, float]
-    supports_images: bool = False
+    tokenizer_repo: str
+    tokenizer_revision: str
+    tokenizer_kind: str
+    tokenizer_files: tuple[tuple[str, str], ...]
 
 
-# The alias used when [train] omits teacher_model — the historical fixed teacher, unchanged.
 DEFAULT_TEACHER_ALIAS = "glm-5.2"
 
-# Curated OPD teacher allow-list, keyed by friendly alias (the value users put in [train]
-# teacher_model). A CLOSED allow-list, not "any Fireworks model": a teacher MUST support echo-scoring
-# (echo=true, logprobs=1, max_tokens=0 tiling the input char-for-char — see
-# engine.worker.teacher._validate_echo) to drive the groupwise reverse-KL loss, and every entry needs
-# a price row for the estimate. Adding a teacher = adding ONE row here.
 TEACHER_MODELS: dict[str, TeacherModel] = {
-    # glm-5.2 is the default and the verified echo-scoring baseline (see DEFAULT_TEACHER_ALIAS).
+    "kimi-k3": TeacherModel(
+        alias="kimi-k3",
+        model_id="parasail-kimi-k3-fast",
+        display_name="Kimi K3",
+        usd_per_1m=(3.00, 15.00),
+        tokenizer_repo="moonshotai/Kimi-K3",
+        tokenizer_revision="9f62e4e9fffbd0a83ddd60e1c209d828994b3569",
+        tokenizer_kind="kimi_tiktoken",
+        tokenizer_files=(
+            (
+                "tokenizer_config.json",
+                "5d0803c94db9cd78763499e0956c95fd5a225c14a727e5a6cf5db3f96f010a6e",
+            ),
+            (
+                "tiktoken.model",
+                "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
+            ),
+        ),
+    ),
     "glm-5.2": TeacherModel(
         alias="glm-5.2",
-        model_id="accounts/fireworks/models/glm-5p2",
+        model_id="parasail-glm-52",
         display_name="GLM 5.2",
         usd_per_1m=(1.40, 4.40),
+        tokenizer_repo="nvidia/GLM-5.2-NVFP4",
+        tokenizer_revision="aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa",
+        tokenizer_kind="tokenizer_json",
+        tokenizer_files=(
+            (
+                "tokenizer.json",
+                "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+            ),
+        ),
     ),
-    "kimi-k2.6": TeacherModel(
-        alias="kimi-k2.6",
-        model_id="accounts/fireworks/models/kimi-k2p6",
-        display_name="Kimi K2.6",
-        usd_per_1m=(0.95, 4.00),
-        supports_images=True,
+    "qwen3.5-397b-a17b": TeacherModel(
+        alias="qwen3.5-397b-a17b",
+        model_id="parasail-qwen35-397b-a17b",
+        display_name="Qwen3.5 397B A17B",
+        usd_per_1m=(0.50, 3.60),
+        tokenizer_repo="Qwen/Qwen3.5-397B-A17B-FP8",
+        tokenizer_revision="ea5b4f81096f3901c91dea97f81324302495781d",
+        tokenizer_kind="tokenizer_json",
+        tokenizer_files=(
+            (
+                "tokenizer.json",
+                "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+            ),
+        ),
     ),
 }
 
 
 def normalize_teacher_alias(value: str) -> str:
-    """Canonicalize a user-typed teacher name to a catalog key: lowercased, trimmed, and any run of
-    whitespace/underscores collapsed to a single hyphen. So ``"GLM 5.2"`` / ``"glm_5.2"`` both map to
-    the ``"glm-5.2"`` key. A ``.`` in a version is preserved (``kimi-k2.6``)."""
+    """Normalize a user-facing teacher alias without accepting upstream model identifiers."""
     return "-".join(str(value).strip().lower().replace("_", " ").replace("-", " ").split())
 
 
-def teacher_supports_images(value: str) -> bool:
-    """Return whether the resolved managed teacher accepts image-conditioned echo scoring."""
-    return resolve_teacher(value).supports_images
-
-
-def resolve_teacher(value: str) -> TeacherModel:
-    """Resolve a ``[train] teacher_model`` value to its catalog entry.
-
-    Empty/None -> the default teacher (GLM 5.2), so an omitted knob keeps the historical behavior.
-    Accepts a friendly alias (``"glm-5.2"``, ``"kimi-k2.6"``, or a spaced ``"GLM 5.2"``) OR the exact
-    Fireworks ``model_id`` (so a pasted ``accounts/fireworks/models/...`` still works). Raises
-    ``ValueError`` listing the allowed aliases for an unsupported teacher. This is the SINGLE resolver
-    the schema (parse-time), the worker, and the cost model all call, so validation can't drift."""
+def resolve_teacher(value: str | None) -> TeacherModel:
+    """Resolve only a friendly managed alias, defaulting an omitted value to GLM 5.2."""
     if value is None or not str(value).strip():
         return TEACHER_MODELS[DEFAULT_TEACHER_ALIAS]
-    raw = str(value).strip()
-    key = normalize_teacher_alias(raw)
+    key = normalize_teacher_alias(str(value))
     if key in TEACHER_MODELS:
         return TEACHER_MODELS[key]
-    # Compare against the stripped value so a pasted model id with stray surrounding whitespace
-    # resolves just like the alias branch (which normalize_teacher_alias already strips). Case is
-    # preserved — Fireworks model ids are case-sensitive identifiers.
-    for info in TEACHER_MODELS.values():
-        if raw == info.model_id:
-            return info
     allowed = ", ".join(TEACHER_MODELS)
     raise ValueError(
         f"teacher_model {value!r} is not a supported teacher; choose one of: {allowed} "
         f"(default {DEFAULT_TEACHER_ALIAS})"
     )
+
+
+def teacher_for_model_id(model_id: str) -> TeacherModel:
+    """Resolve an internal provider model id after public alias validation has already succeeded."""
+    for teacher in TEACHER_MODELS.values():
+        if model_id == teacher.model_id:
+            return teacher
+    raise ValueError(f"unknown managed teacher model id {model_id!r}")
 
 
 @dataclass(frozen=True)
@@ -108,7 +114,6 @@ class LoRAConfig:
 @dataclass(frozen=True)
 class SFTConfig:
     max_seq_len: int = 1024
-    # <think> traces need extra headroom; VRAM scales with length.
     max_seq_len_thinking: int = 2048
     learning_rate: float = 1e-4
     warmup_frac: float = 0.03
@@ -121,7 +126,6 @@ class RLConfig:
     learning_rate: float = 1e-5
     max_prompt_len: int = 2048
     max_completion_len: int = 320
-    # 320 is too short for <think> blocks; overridable via [train].max_completion_tokens.
     max_completion_len_thinking: int = 1536
     prompts_per_step: int = 64
     group_size: int = 8
@@ -132,29 +136,18 @@ class RLConfig:
 
 @dataclass(frozen=True)
 class OPDConfig:
-    """On-policy distillation: student samples, a remote teacher scores its tokens, and a groupwise
-    reverse-KL loss (the collinear-ai spider / Tinker cross-tokenizer method) trains the student."""
+    """On-policy distillation using one managed serverless teacher."""
 
-    # The DEFAULT teacher (GLM 5.2), used when [train] omits teacher_model. The teacher is now
-    # selectable from the managed TEACHER_MODELS allow-list via [train].teacher_model; its Fireworks
-    # key + base_url stay platform-managed (one key authorizes every allow-listed model).
-    teacher_model: str = TEACHER_MODELS[DEFAULT_TEACHER_ALIAS].model_id
-    teacher_base_url: str = TEACHER_BASE_URL
+    teacher_model: str = DEFAULT_TEACHER_ALIAS
     learning_rate: float = 1e-5
     max_prompt_len: int = 1024
     max_completion_len: int = 512
-    # 512 is short for <think> traces; overridable via [train].max_completion_tokens.
     max_completion_len_thinking: int = 1536
     prompts_per_step: int = 8
-    # Student samples per prompt. 1 is enough for a direct KD loss (no group-relative baseline
-    # as in GRPO); raise for more teacher-scored coverage per prompt at higher cost.
     group_size: int = 1
     num_epochs: int = 1
     sampling_temperature: float = 1.0
     sampling_top_p: float = 1.0
-    # Reverse-KL coefficient for the groupwise reverse-KL loss; scales the per-span
-    # (student_logsum - teacher_logsum) advantage. 1.0 is plain reverse KL (Thinking Machines,
-    # *On-Policy Distillation*). Overridable via [train].kl_penalty_coef.
     kl_coef: float = 1.0
 
 

@@ -13,7 +13,6 @@ from typing import NoReturn
 from flash import __version__
 from flash._channel import CLI_NAME
 from flash._logging import configure_logging
-from flash._update_check import emit_update_notice, maybe_start_update_check
 from flash.catalog import ALGORITHMS
 from flash.cli import render
 
@@ -768,7 +767,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
-    update_check = maybe_start_update_check()
     _warn_if_login_shadowed(args)
     try:
         return args.func(args)
@@ -800,5 +798,3 @@ def main(argv: list[str] | None = None) -> int:
         print(render.error(str(exc) or exc.__class__.__name__), file=sys.stderr)
         print(render.arrow(f"run `{cmd}` for the full traceback"), file=sys.stderr)
         return 1
-    finally:
-        emit_update_notice(update_check)

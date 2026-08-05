@@ -23,6 +23,11 @@ from flash.envs.loader import (
     load_freesolo_environment,
     managed_slug_to_github_ref,
 )
+from flash.opd_limits import (
+    OPD_DEFAULT_EPISODE_TURNS,
+    OPD_MAX_EPISODE_TURNS,
+    OPD_MIN_EPISODE_TURNS,
+)
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
@@ -113,9 +118,9 @@ class FreesoloEnvironment(BaseEnvironment):
         """Batch-level turn ceiling: dataset-wide max of per-example budgets, clamped to [8, 64]."""
         if self._max_turns_cache is not None:
             return self._max_turns_cache
-        cap = 8
+        cap = OPD_MIN_EPISODE_TURNS
         if self.multi_turn:
-            cap = 24
+            cap = OPD_DEFAULT_EPISODE_TURNS
             best: int | None = None
             for ex in self.dataset():
                 try:
@@ -125,7 +130,7 @@ class FreesoloEnvironment(BaseEnvironment):
                 if best is None or turns > best:
                     best = turns
             if best is not None:
-                cap = max(8, min(64, best))
+                cap = max(OPD_MIN_EPISODE_TURNS, min(OPD_MAX_EPISODE_TURNS, best))
         self._max_turns_cache = cap
         return cap
 
@@ -246,6 +251,28 @@ class FreesoloEnvironment(BaseEnvironment):
         self, completion: str, example: dict, state: dict | None = None
     ) -> dict[str, float]:
         return self._reward_to_breakdown(self._score_one(completion, example, state))
+
+    def scores_breakdown_many(self, items: list[tuple[dict, dict]]) -> list[dict[str, float]]:
+        """Named reward components for many single-turn rollouts, in input order."""
+        if self.multi_turn:
+            raise RuntimeError(
+                "scores_breakdown_many is only available for single-turn environments"
+            )
+        if not self.reward_thread_safe:
+            return [
+                self.scores_breakdown(str(state.get("response_text") or ""), example, state)
+                for example, state in items
+            ]
+        results = self._grouped_results(
+            items,
+            task_of=lambda example, state: self._task_example(example),
+            payload_of=lambda state: _completion_for_scoring(
+                str(state.get("response_text") or ""), state
+            ),
+            scorer=self._env.score_responses,
+            method="score_responses",
+        )
+        return [self._reward_to_breakdown(result) for result in results]
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(getattr(self._score_one(completion, example, state), "score", 0.0))

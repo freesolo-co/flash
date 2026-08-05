@@ -17,12 +17,9 @@ OPD_OPTIMIZER_START_PHASE = "opd"
 OPD_RETRY_ARTIFACT_PREFIX = "_opd_retry"
 OPD_OPTIMIZER_START_FILENAME = "optimizer-start.v1.json"
 OPD_RESUME_REVISION_ENV = "FLASH_OPD_RESUME_REVISION"
-# bumped to 3 when the verl worker began accumulating align_group_sum/align_group_n. a version-2
-# state carries neither, so resuming one would restart the accumulator at zero and publish a
-# post-resume-only mean_align_granularity as though it described the whole run. the version check
-# below already rejects mismatches fail-closed, so the bump refuses those states outright instead of
-# threading a completeness flag through the accounting.
-OPD_RESUME_STATE_VERSION = 3
+# version 4 adds authoritative managed-teacher output-token accounting. older checkpoints cannot
+# reconstruct that billed usage, so the version gate rejects them rather than silently undercounting.
+OPD_RESUME_STATE_VERSION = 4
 MAX_BOUNDED_NONNEGATIVE_INTEGER = (1 << 63) - 1
 
 # a full-state opd resume checkpoint (the custom loop's counterpart to the hf trainer's checkpoint-n)
@@ -42,6 +39,7 @@ _PAYLOAD_KEYS = frozenset({"attempt", "contract", "phase", "run_id", "seed", "ve
 _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "generated_tokens": "nonneg_int",
     "teacher_input_tokens": "nonneg_int",
+    "teacher_output_tokens": "nonneg_int",
     "truncated_rollouts": "nonneg_int",
     "granularity_n": "nonneg_int",
     "samples_seen": "nonneg_int",
