@@ -75,6 +75,34 @@ The process environment is the only contract, so a Kubernetes Secret, systemd
 secret manager at container start instead, wrap the image's entrypoint; `deploy/infisical/`
 is a working example you can copy for another provider.
 
+### The state directory
+
+Everything the plane persists locally - the SQLite database of keys and run ownership, run
+records, results, and the CLI's saved login - lives under one root, `~/.flash` by default
+(`/root/.flash` in the container). Set `FLASH_DATA_DIR` to move it somewhere a rootless
+container, a mounted PVC, or a `ProtectHome` systemd unit can actually write:
+
+```bash
+FLASH_DATA_DIR=/var/lib/flash
+```
+
+Everything moves together, so back up or mount that one directory. In Docker, setting
+`FLASH_DATA_DIR` also means mounting your own volume at the new path - the image's `VOLUME`
+declaration names the default location, and state written anywhere else lands on the
+container's writable layer and is lost when the container is replaced.
+
+Run exactly **one** instance per state directory. State is local files plus SQLite; there is
+no horizontal scaling. On networked storage, where a lock can be held far longer than on a
+local disk, raise `FLASH_SQLITE_BUSY_TIMEOUT_SECONDS` (default 30).
+
+### Logs
+
+`flash-server` logs at INFO. Provider resolution, capability revocation, reaper startup, and
+degraded-configuration warnings are reported there and nowhere else, so that is the first
+place to look when the plane misbehaves. `FLASH_LOG_LEVEL` turns it up (`DEBUG`) or down
+(`WARNING`), and `FLASH_LOG_FORMAT=json` emits one JSON object per line for a structured log
+sink.
+
 ## Environments
 
 An environment is the Python package defining your task - dataset, rollout, reward. Point
