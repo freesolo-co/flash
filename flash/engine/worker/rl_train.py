@@ -357,10 +357,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
         *(
-            [
-                "++actor_rollout_ref.model.target_parameters="
-                + json.dumps(cfg["target_parameters"], separators=(",", ":"))
-            ]
+            ["++actor_rollout_ref.model.target_parameters=" + _hydra_val(cfg["target_parameters"])]
             if cfg.get("target_parameters")
             else []
         ),

@@ -344,7 +344,7 @@ def test_build_verl_overrides_carries_fused_expert_target_parameters():
 
     assert (
         "++actor_rollout_ref.model.target_parameters="
-        '["mlp.experts.gate_up_proj","mlp.experts.down_proj"]'
+        "[mlp.experts.gate_up_proj,mlp.experts.down_proj]"
     ) in o
 
 

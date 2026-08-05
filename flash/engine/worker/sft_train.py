@@ -1200,9 +1200,6 @@ def run_sft_train(spec=None) -> None:
     target_modules = lora_config.target_modules
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
-    target_parameters = getattr(lora_config, "target_parameters", None)
-    if isinstance(target_parameters, set | frozenset):
-        target_parameters = sorted(target_parameters)
     warmstart_adapter = _warmstart_adapter_path(model_id, model_revision, lora_rank)
 
     vocab_size = resolve_vocab_size(model_id, model_revision)
@@ -1279,7 +1276,7 @@ def run_sft_train(spec=None) -> None:
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "target_modules": target_modules,
-        "target_parameters": target_parameters,
+        "target_parameters": _w.lora_target_parameters(model_id),
         "lora_adapter_path": warmstart_adapter,
         "ulysses_sp_size": gpu_count,
         "lr": learning_rate,

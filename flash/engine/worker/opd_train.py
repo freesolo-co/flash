@@ -2357,9 +2357,6 @@ def run_opd_train(spec=None) -> None:
     target_modules = lora_config.target_modules
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
-    target_parameters = getattr(lora_config, "target_parameters", None)
-    if isinstance(target_parameters, set | frozenset):
-        target_parameters = sorted(target_parameters)
     warmstart_adapter = _warmstart_adapter_path(model_id, model_revision, lora_rank)
     # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv and
     # installs the training stack, minutes long with nothing to report and no liveness thread running.
@@ -2486,7 +2483,7 @@ def run_opd_train(spec=None) -> None:
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
             "target_modules": target_modules,
-            "target_parameters": target_parameters,
+            "target_parameters": _w.lora_target_parameters(model_id),
             "lora_adapter_path": warmstart_adapter,
             "learning_rate": knobs.learning_rate,
             "local_dir": local_dir,
