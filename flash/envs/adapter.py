@@ -247,6 +247,28 @@ class FreesoloEnvironment(BaseEnvironment):
     ) -> dict[str, float]:
         return self._reward_to_breakdown(self._score_one(completion, example, state))
 
+    def scores_breakdown_many(self, items: list[tuple[dict, dict]]) -> list[dict[str, float]]:
+        """Named reward components for many single-turn rollouts, in input order."""
+        if self.multi_turn:
+            raise RuntimeError(
+                "scores_breakdown_many is only available for single-turn environments"
+            )
+        if not self.reward_thread_safe:
+            return [
+                self.scores_breakdown(str(state.get("response_text") or ""), example, state)
+                for example, state in items
+            ]
+        results = self._grouped_results(
+            items,
+            task_of=lambda example, state: self._task_example(example),
+            payload_of=lambda state: _completion_for_scoring(
+                str(state.get("response_text") or ""), state
+            ),
+            scorer=self._env.score_responses,
+            method="score_responses",
+        )
+        return [self._reward_to_breakdown(result) for result in results]
+
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(getattr(self._score_one(completion, example, state), "score", 0.0))
 
