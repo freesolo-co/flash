@@ -543,10 +543,17 @@ class WorkloadProfilePending(RuntimeError):
         state: str,
         *,
         prepared_job: object | None = None,
+        spent_at: float | None = None,
     ) -> None:
         self.profile_run_id = profile_run_id
         self.state = state
         self.prepared_job = prepared_job
+        # set when the previous profile under this id is spent (failed/cancelled/dry_run) and its
+        # claim has to be taken over before a replacement can run. the value is that run's own
+        # created_at, which is what makes the takeover decidable: a claim stamp re-read at takeover
+        # time would already be the winner's, so every later caller would think it won too.
+        # None means no spent run was observed and the claim is taken by insert instead.
+        self.spent_at = spent_at
         super().__init__(
             f"workload profile {profile_run_id} is {state}; retry training preparation after it succeeds"
         )
@@ -1290,8 +1297,16 @@ def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
             workload_profile=profile.to_dict(),
         )
     if status.state in {"failed", "cancelled", "dry_run"}:
-        raise WorkloadProfileUnavailable(
-            f"sft workload profile {profile_run_id} ended in state {status.state}"
+        # a spent profile is not a verdict on the workload. the id is derived from the workload
+        # alone, so a preempted pod or a cancel would otherwise make this exact config unquotable
+        # for everyone, forever, with nothing in the system that could ever clear it. offer a fresh
+        # profile job the same way a missing one is offered; the claim decides who actually runs it.
+        prepared = _prepared_sft_profile_job(spec, input_digest=input_digest)
+        raise WorkloadProfilePending(
+            profile_run_id,
+            status.state,
+            prepared_job=prepared,
+            spent_at=status.created_at,
         )
     raise WorkloadProfilePending(profile_run_id, status.state)
 
@@ -1528,8 +1543,18 @@ def submit_job(
     }
     if worker_spec.workload_profile_kind:
         with _status_guard(status.run_id):
-            if os.path.exists(runs_file_path(status.run_id, ".json")):
-                return _runstatus_from_json(_load_status_json(status.run_id))
+            existing = (
+                _runstatus_from_json(_load_status_json(status.run_id))
+                if os.path.exists(runs_file_path(status.run_id, ".json"))
+                else None
+            )
+            # a live profile under this id is joined, never restarted: the id is deterministic in
+            # the workload, so a concurrent submitter of the same config lands here and must wait
+            # on the running one rather than launch a second billed copy of identical work.
+            if existing is not None and existing.state not in _UNDEPLOYABLE_STATES:
+                return existing
+            # a spent one is replaced. the caller only reaches this after winning the takeover on
+            # that exact spent record, so overwriting it is the relaunch, not a lost update.
             _save_status_unlocked(status, **save_kwargs)
     else:
         _save_status(status, **save_kwargs)

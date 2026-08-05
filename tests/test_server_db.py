@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -444,6 +445,65 @@ def test_claim_profile_run_still_rejects_an_unknown_key(isolated_db) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         isolated_db.claim_profile_run("profile-sft-orphan", 999)
     assert isolated_db.all_runs() == []
+
+
+def test_reclaim_spent_profile_run_gives_the_relaunch_to_exactly_one_of_two_racing_keys(
+    isolated_db,
+) -> None:
+    """A spent profile is relaunched by one key, not by every key that noticed it died.
+
+    The takeover cannot be a plain update on the id: that matches for every caller, so both
+    submitters would launch and the identical workload would be profiled and billed twice. It
+    compares against the spent run's own timestamp instead, which the winner's claim moves past.
+    """
+    owner = isolated_db.ensure_external_key("fslo_spent_owner")
+    assert owner is not None
+    # claim first, then create the run: the real order, and the one the takeover comparison needs.
+    isolated_db.claim_profile_run("profile-sft-spent", owner["id"])
+    spent_at = time.time()
+    barrier = threading.Barrier(2)
+
+    def reclaim(index: int) -> bool:
+        row = isolated_db.ensure_external_key(f"fslo_reclaimer_{index}")
+        assert row is not None
+        barrier.wait()
+        return isolated_db.reclaim_spent_profile_run(
+            "profile-sft-spent", row["id"], spent_at=spent_at
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        won = list(executor.map(reclaim, range(2)))
+
+    assert sorted(won) == [False, True], "exactly one claimant may relaunch the spent profile"
+    assert isolated_db.run_owner("profile-sft-spent") != owner["id"]
+    # still one row under the deterministic id: a takeover replaces the claim, it does not add one.
+    assert [r["run_id"] for r in isolated_db.all_runs()] == ["profile-sft-spent"]
+
+
+def test_reclaim_spent_profile_run_ignores_a_live_claim_and_a_missing_id(isolated_db) -> None:
+    """Only a claim no newer than the spent run may be taken over.
+
+    Once someone relaunches, the row carries a stamp past the spent one, so a submitter still
+    holding the old observation must lose rather than restart a profile that is already running.
+    """
+    owner = isolated_db.ensure_external_key("fslo_live_owner")
+    taker = isolated_db.ensure_external_key("fslo_late_taker")
+    assert owner is not None
+    assert taker is not None
+    assert (
+        isolated_db.reclaim_spent_profile_run("profile-sft-absent", taker["id"], spent_at=1.0)
+        is False
+    )
+
+    # the spent run this caller watched, and then the relaunch claim someone else already won.
+    spent_at = time.time()
+    isolated_db.claim_profile_run("profile-sft-live", owner["id"])
+
+    assert (
+        isolated_db.reclaim_spent_profile_run("profile-sft-live", taker["id"], spent_at=spent_at)
+        is False
+    )
+    assert isolated_db.run_owner("profile-sft-live") == owner["id"]
 
 
 def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -> None:

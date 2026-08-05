@@ -156,11 +156,57 @@ def test_successful_profile_is_attached_to_training_spec(tmp_path, monkeypatch) 
     assert attached.to_dict().get("workload_profile") is None
 
 
-def test_failed_profile_blocks_training_preparation(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("spent_state", ["failed", "cancelled", "dry_run"])
+def test_spent_profile_blocks_training_and_offers_a_replacement(
+    tmp_path, monkeypatch, spent_state: str
+) -> None:
+    """A spent profile must not wedge its workload: it blocks the quote but offers a relaunch.
+
+    The profile id is derived from the workload, not from the account, so a preempted pod would
+    otherwise make this exact config unquotable for every user forever with nothing in the system
+    able to clear it. The replacement carries the spent run's own timestamp, which is what lets the
+    server hand the relaunch to exactly one of several submitters waiting on the same dead profile.
+    """
     runner = fresh_runner(tmp_path, monkeypatch)
     spec = _spec()
     digest = _input_digest(spec)
     profile_run_id = sft_profile_run_id(digest)
+    spent = runner.RunStatus(
+        run_id=profile_run_id,
+        state=spent_state,
+        spec=spec.to_dict(),
+        workload_profile_kind="sft",
+        workload_profile_input_digest=digest,
+        error="profile worker failed",
+    )
+    runner._save_status(spent)
+    monkeypatch.setattr(runner, "_profile_producer_version", lambda: "1.2.3")
+
+    with pytest.raises(runner.WorkloadProfilePending) as excinfo:
+        runner._require_sft_workload_profile(spec)
+
+    assert excinfo.value.state == spent_state
+    assert excinfo.value.spent_at == spent.created_at
+    assert isinstance(excinfo.value.prepared_job, runner.PreparedJob)
+    assert excinfo.value.prepared_job.public_spec.run_id == profile_run_id
+
+
+def test_relaunching_a_spent_profile_replaces_it_but_a_live_one_is_joined(
+    tmp_path, monkeypatch
+) -> None:
+    """Submitting the deterministic profile id overwrites a spent record and joins a live one.
+
+    Both halves matter. Without the overwrite the takeover winner would return the dead record and
+    never launch, so the wedge would survive the relaunch path. Without the join a concurrent
+    submitter of the same config would restart a profile that is already running and bill the
+    identical work twice.
+    """
+    runner = fresh_runner(tmp_path, monkeypatch)
+    spec = _spec()
+    digest = _input_digest(spec)
+    monkeypatch.setattr(runner, "_profile_producer_version", lambda: "1.2.3")
+    prepared = runner._prepared_sft_profile_job(spec, input_digest=digest)
+    profile_run_id = prepared.public_spec.run_id
     runner._save_status(
         runner.RunStatus(
             run_id=profile_run_id,
@@ -168,13 +214,34 @@ def test_failed_profile_blocks_training_preparation(tmp_path, monkeypatch) -> No
             spec=spec.to_dict(),
             workload_profile_kind="sft",
             workload_profile_input_digest=digest,
-            error="profile worker failed",
+            error="pod preempted",
         )
     )
-    monkeypatch.setattr(runner, "_profile_producer_version", lambda: "1.2.3")
 
-    with pytest.raises(runner.WorkloadProfileUnavailable, match="ended in state failed"):
-        runner._require_sft_workload_profile(spec)
+    relaunched = runner.submit_job(
+        prepared.public_spec, dry_run=True, prepared_job=prepared, owner_key_id=1
+    )
+
+    # the spent record is gone rather than returned: a fresh run replaced it under the same id.
+    assert relaunched.state == "dry_run"
+    assert relaunched.error is None
+
+    # a live profile under the same id is returned untouched instead. written directly because
+    # _update refuses to move a run back out of a terminal state, which is the point of this half.
+    runner._save_status(
+        runner.RunStatus(
+            run_id=profile_run_id,
+            state="running",
+            spec=spec.to_dict(),
+            workload_profile_kind="sft",
+            workload_profile_input_digest=digest,
+        )
+    )
+    joined = runner.submit_job(
+        prepared.public_spec, dry_run=True, prepared_job=prepared, owner_key_id=1
+    )
+
+    assert joined.state == "running"
 
 
 def _profile_spec(spec: JobSpec, digest: str) -> JobSpec:
