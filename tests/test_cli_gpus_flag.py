@@ -305,8 +305,13 @@ def test_a_pinned_class_below_the_whole_run_floor_is_only_rejected_on_one_card(t
         '[gpu]\ntype = "H200"\nprovider = "runpod"\n'
     )
 
-    # one card genuinely cannot hold it, so the gate must still fire and name the shortfall.
-    with pytest.raises(ConfigError, match="but this run requires at least"):
+    # one card genuinely cannot hold it, so the gate must still fire. the 35B GRPO floor now exceeds
+    # every validated class (the routed experts train), so the refusal names that rather than the
+    # per-pin shortfall; either way --gpus 1 must not be admitted.
+    with pytest.raises(
+        ConfigError,
+        match=r"(but this run requires at least|no validated GPU class has)",
+    ):
         _spec(tmp_path, "--gpus", "1", config=big)
 
     # two cards clear the floor, so the gate must stand aside and let the allocator decide.

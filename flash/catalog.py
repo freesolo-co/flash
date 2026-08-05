@@ -466,16 +466,18 @@ MODELS: dict[str, ModelInfo] = {
         # vllm 0.19.1 derives the 1,097,728-byte gdn state page as 1072 fp8 attention
         # tokens after the 16-token backend alignment.
         mamba_block_size=1072,
-        # peft targets shared-expert linears on every layer. fused routed-expert tensors are not
-        # nn.linear modules and are not adapter targets in the loaded model.
+        # peft targets ordinary linears plus both fused routed-expert tensors on every layer.
+        # each routed tensor has 256 expert slices, all using the adapter's uniform serving rank.
         lora_target_shapes=(
             (512, 2048, 40),
+            (512, 2048, 10_240),
             (1152, 1152, 27),
             (1152, 3456, 27),
             (1152, 4304, 27),
             (2048, 1, 40),
             (2048, 32, 60),
             (2048, 512, 100),
+            (2048, 1024, 10_240),
             (2048, 4096, 30),
             (2048, 8192, 40),
             (4096, 2048, 40),
