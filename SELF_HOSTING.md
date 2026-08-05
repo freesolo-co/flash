@@ -70,6 +70,11 @@ max_examples = 1000
 file, load it: `set -a && . ./.env && set +a && flash-server`, or
 `docker run --env-file .env ...`. Copy `.env.example` to start from a documented template.
 
+The process environment is the only contract, so a Kubernetes Secret, systemd
+`EnvironmentFile`, or any orchestrator's secret store works as-is. To pull secrets from a
+secret manager at container start instead, wrap the image's entrypoint; `deploy/infisical/`
+is a working example you can copy for another provider.
+
 ## Environments
 
 An environment is the Python package defining your task - dataset, rollout, reward. Point
