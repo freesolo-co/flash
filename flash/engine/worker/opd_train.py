@@ -1534,6 +1534,14 @@ def build_opd_overrides(config: dict) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",
         f"actor_rollout_ref.model.target_modules={_hydra_val(config['target_modules'])}",
+        *(
+            [
+                "++actor_rollout_ref.model.target_parameters="
+                + _hydra_val(config["target_parameters"])
+            ]
+            if config.get("target_parameters")
+            else []
+        ),
         f"actor_rollout_ref.model.lora_adapter_path={_hydra_val(config.get('lora_adapter_path'))}",
         "actor_rollout_ref.actor.strategy=fsdp",
         "actor_rollout_ref.actor.use_kl_loss=false",
@@ -2349,6 +2357,9 @@ def run_opd_train(spec=None) -> None:
     target_modules = lora_config.target_modules
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
+    target_parameters = getattr(lora_config, "target_parameters", None)
+    if isinstance(target_parameters, set | frozenset):
+        target_parameters = sorted(target_parameters)
     warmstart_adapter = _warmstart_adapter_path(model_id, model_revision, lora_rank)
     # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv and
     # installs the training stack, minutes long with nothing to report and no liveness thread running.
@@ -2475,6 +2486,7 @@ def run_opd_train(spec=None) -> None:
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
             "target_modules": target_modules,
+            "target_parameters": target_parameters,
             "lora_adapter_path": warmstart_adapter,
             "learning_rate": knobs.learning_rate,
             "local_dir": local_dir,

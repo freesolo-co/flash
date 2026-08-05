@@ -4612,6 +4612,24 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert multi_turn_overrides["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"] == "1536"
 
 
+def test_overrides_carry_fused_expert_target_parameters():
+    overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_overrides(
+            _config(
+                target_parameters=[
+                    "mlp.experts.gate_up_proj",
+                    "mlp.experts.down_proj",
+                ]
+            )
+        )
+    )
+
+    assert overrides["++actor_rollout_ref.model.target_parameters"] == (
+        "[mlp.experts.gate_up_proj,mlp.experts.down_proj]"
+    )
+
+
 def test_overrides_size_agent_loop_workers_to_the_opd_rollout_batch():
     # opd runs async rollout through verl's AgentLoopManager, which chunks
     # train_batch_size * group_size across agent.num_workers and asserts the split is exact.

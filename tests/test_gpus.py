@@ -331,6 +331,47 @@ def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
     assert need >= bf16_floor
 
 
+def test_35b_expert_lora_shapes_and_multicard_sizing():
+    from flash.catalog import MODELS
+    from flash.engine.vram import model_required_vram_gb
+    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+
+    model_id = "Qwen/Qwen3.6-35B-A3B"
+    info = MODELS[model_id]
+    assert (512, 2048, 10_240) in info.lora_target_shapes
+    assert (2048, 1024, 10_240) in info.lora_target_shapes
+
+    target_dims = sum(
+        (input_dim + output_dim) * count for input_dim, output_dim, count in info.lora_target_shapes
+    )
+    expert_dims = (512 + 2048) * 10_240 + (2048 + 1024) * 10_240
+    assert target_dims == 59_573_640
+    assert 64 * expert_dims == 3_690_987_520
+    assert 32 * target_dims == 1_906_356_480
+    assert 64 * target_dims == 3_812_712_960
+
+    expected_need = {
+        32: {"sft": 117, "grpo": 200, "opd": 204},
+        64: {"sft": 151, "grpo": 222, "opd": 238},
+    }
+    for rank, by_algorithm in expected_need.items():
+        for algorithm, need in by_algorithm.items():
+            train = {"lora_rank": rank}
+            assert model_required_vram_gb(model_id, algorithm, train=train) == need
+            if algorithm != "sft":
+                with pytest.raises(UnsupportedGpuError):
+                    provisional_gpu(
+                        model_id,
+                        algorithm=algorithm,
+                        train=train,
+                        gpu_count=1,
+                    )
+
+    assert provisional_gpu(model_id, "grpo", train={"lora_rank": 32}, gpu_count=2) == "H200"
+    assert provisional_gpu(model_id, "opd", train={"lora_rank": 32}, gpu_count=2) == "H200"
+    assert provisional_gpu(model_id, "opd", train={"lora_rank": 64}, gpu_count=2) == "B200"
+
+
 def test_pinned_revision_retains_calibrated_vram_floors(monkeypatch):
     from flash.catalog import MODELS
     from flash.engine import vram
