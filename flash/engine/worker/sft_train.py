@@ -978,7 +978,7 @@ class _NvidiaSmiPeakSampler:
 def run_sft_train(spec=None) -> None:
     """run flash sft through verl's out-of-process fsdp trainer."""
     from flash.catalog import MODELS, resolve_vocab_size
-    from flash.engine.vram import sft_grad_accum
+    from flash.engine.vram import sft_chunked_nll_enabled, sft_grad_accum
 
     spec = spec or _w.JOB_SPEC
     env = _w.require_active_env()
@@ -1197,11 +1197,12 @@ def run_sft_train(spec=None) -> None:
     warmstart_adapter = _warmstart_adapter_path(model_id, model_revision, lora_rank)
 
     vocab_size = resolve_vocab_size(model_id, model_revision)
+    fused_ce = sft_chunked_nll_enabled(model_id)
     per_device_batch, _ = sft_grad_accum(
         effective_batch,
-        seq_len=max_length,
+        seq_len=realized_max_length,
         vocab=vocab_size,
-        fused=False,
+        fused=fused_ce,
     )
     train_batch_size = min(effective_batch, len(rows))
     micro_batch = max(1, min(per_device_batch, train_batch_size))
@@ -1224,14 +1225,14 @@ def run_sft_train(spec=None) -> None:
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
     gradient_checkpointing = _w.grad_checkpointing_on(
         model_id,
-        max_length,
+        realized_max_length,
         allow_disable=True,
         card_vram_gb=card_vram_gb,
         capability=capability,
         active_params_b=active_params_b,
         hidden=hidden,
         num_layers=layers,
-        fused_ce=False,
+        fused_ce=fused_ce,
         per_device_bs=micro_batch,
         lora_rank=lora_rank,
         revision=model_revision,
@@ -1263,7 +1264,7 @@ def run_sft_train(spec=None) -> None:
         "train_batch_size": train_batch_size,
         "max_length": max_length,
         "micro_batch": micro_batch,
-        "max_token_len_per_gpu": max_length * micro_batch,
+        "max_token_len_per_gpu": realized_max_length * micro_batch,
         "custom_dataset_path": custom_dataset_path,
         "model_path": model_path,
         "lora_rank": lora_rank,
@@ -1520,7 +1521,7 @@ def run_sft_train(spec=None) -> None:
             "gradient_checkpointing_reentrant": reentrant_gradient_checkpointing,
             "configured_max_length": max_length,
             "realized_max_length": realized_max_length,
-            "runtime_max_length": max_length,
+            "runtime_max_length": realized_max_length,
             "per_device_train_batch_size": micro_batch,
             "gradient_accumulation_steps": math.ceil(train_batch_size / micro_batch),
             "packing": "verl_remove_padding",
