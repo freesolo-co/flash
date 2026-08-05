@@ -57,7 +57,6 @@ from flash.engine.worker.opd_train import (
     _render_opd_sitecustomize,
     _restore_verl_resume,
     _stage_retry_contract,
-    _teacher_token_metadata,
     _TeacherAlignmentBridge,
     _TextTeacherBatcher,
     _trim_response_and_forced,
@@ -66,6 +65,7 @@ from flash.engine.worker.opd_train import (
     build_opd_overrides,
     encode_shifted_group_metadata,
 )
+from flash.engine.worker.teacher import TeacherScore
 from flash.engine.worker.tokenizer_align import TeacherToken
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION
 from flash.opd_validation import validate_opd_structured_outputs
@@ -790,23 +790,6 @@ def _resume_accounting(step=2):
     }
 
 
-@pytest.mark.parametrize(
-    ("input_tokens", "output_tokens"),
-    [(5, 1), (15, 3), (42, 7)],
-    ids=("normal", "deduplicated", "resumed"),
-)
-def test_teacher_token_metadata_preserves_input_and_output_accounting(input_tokens, output_tokens):
-    assert _teacher_token_metadata(
-        {
-            "teacher_input_tokens": input_tokens,
-            "teacher_output_tokens": output_tokens,
-        }
-    ) == {
-        "teacher_input_tokens": input_tokens,
-        "teacher_output_tokens": output_tokens,
-    }
-
-
 def test_failure_accounting_metadata_uses_canonical_train_meta_contract():
     accounting = {
         "teacher_transient": 3,
@@ -896,7 +879,6 @@ def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     source = inspect.getsource(run_opd_train)
     write_train_meta_source = source[source.index("_w.write_train_meta(") :]
 
-    assert "**_teacher_token_metadata(final_accounting)" in write_train_meta_source
     assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
     assert '"teacher_transient":' not in write_train_meta_source
     assert '"teacher_error":' not in write_train_meta_source
@@ -910,18 +892,19 @@ def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     assert "granularity_n" not in write_train_meta_source
 
 
-class _ScoredTokens(list):
-    def __init__(self, tokens, *, input_tokens=5, output_tokens=1):
-        super().__init__(tokens)
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
+def _teacher_score(tokens, *, input_tokens=5, output_tokens=1):
+    return TeacherScore(
+        tokens=tuple(tokens),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
 
 
 class _BridgeTeacher:
     def score(self, prompt_text, completion_text):
         assert prompt_text == "User: question\nAssistant: "
         assert completion_text == "AB"
-        return _ScoredTokens(
+        return _teacher_score(
             [
                 TeacherToken(text="A", logprob=-0.4, start=0, end=1),
                 TeacherToken(text="B", logprob=-0.7, start=1, end=2),
@@ -933,7 +916,7 @@ class _MergedBridgeTeacher:
     def score(self, prompt_text, completion_text):
         assert prompt_text == "User: question\nAssistant: "
         assert completion_text == "AB"
-        return _ScoredTokens([TeacherToken(text="AB", logprob=-1.1, start=0, end=2)])
+        return _teacher_score([TeacherToken(text="AB", logprob=-1.1, start=0, end=2)])
 
 
 class _ScoreManyTeacherAdapter:
@@ -941,10 +924,10 @@ class _ScoreManyTeacherAdapter:
         self.teacher = teacher
 
     @staticmethod
-    def _with_usage(tokens):
-        if hasattr(tokens, "input_tokens") and hasattr(tokens, "output_tokens"):
-            return tokens
-        return _ScoredTokens(tokens)
+    def _with_usage(score):
+        if isinstance(score, TeacherScore):
+            return score
+        return _teacher_score(score)
 
     def score(self, prompt_text, completion_text):
         return self._with_usage(self.teacher.score(prompt_text, completion_text))
@@ -1035,11 +1018,11 @@ class _BatchingTeacher:
             return [[object()] for _item in items]
         if self.failure == "invalid_offsets":
             return [
-                _ScoredTokens([TeacherToken(text="AB", logprob=-1.0, start=0, end=3)])
+                _teacher_score([TeacherToken(text="AB", logprob=-1.0, start=0, end=3)])
                 for _item in items
             ]
         return [
-            _ScoredTokens(
+            _teacher_score(
                 [
                     TeacherToken(
                         text=completion_text,
@@ -1281,6 +1264,33 @@ def test_text_teacher_batcher_deduplicates_exact_pairs_and_scatters_to_all_waite
     assert bridge.teacher_output_tokens == 1
 
 
+def test_text_teacher_batcher_marks_dedup_copy_as_explicit_unbilled_score():
+    teacher = _BatchingTeacher(["same question"])
+    batcher = _TextTeacherBatcher(teacher, max_batch_size=8, flush_wait_s=1.0)
+    start = threading.Barrier(2)
+    batcher.start()
+
+    def score():
+        start.wait(timeout=2.0)
+        return batcher.score("User: same question\nAssistant: ", "AB")
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = [
+                future.result(timeout=5.0) for future in [executor.submit(score) for _ in range(2)]
+            ]
+    finally:
+        batcher.close()
+
+    assert all(isinstance(result, TeacherScore) for result in results)
+    assert all(isinstance(result.tokens, tuple) for result in results)
+    assert results[0].tokens is results[1].tokens
+    assert sorted((result.input_tokens, result.output_tokens) for result in results) == [
+        (0, 0),
+        (5, 1),
+    ]
+
+
 def test_text_teacher_batcher_keeps_nonidentical_inputs_separate_and_ordered(monkeypatch):
     from flash.engine.worker import opd_train as opd_train_mod
 
@@ -1452,7 +1462,7 @@ def test_text_teacher_batcher_close_allows_inflight_scatter_within_bound():
             self.entered.set()
             assert self.release.wait(timeout=2.0)
             return [
-                _ScoredTokens(
+                _teacher_score(
                     [
                         TeacherToken(
                             text=completion_text,
@@ -1497,7 +1507,11 @@ def test_text_teacher_batcher_close_allows_inflight_scatter_within_bound():
     assert teacher.items is not None
     assert len(teacher.items) == 8
     for index, result in enumerate(results):
-        assert result == [TeacherToken(text="AB", logprob=-float(index + 1), start=0, end=2)]
+        # the batcher hands back the full TeacherScore so authoritative provider usage stays
+        # attached to the scored tokens; scatter must preserve per-caller token identity.
+        assert result.tokens == (
+            TeacherToken(text="AB", logprob=-float(index + 1), start=0, end=2),
+        )
 
 
 def test_text_teacher_batcher_shutdown_cannot_strand_pending_bridge_waiter(monkeypatch):
@@ -3622,7 +3636,7 @@ def test_multiturn_teacher_scores_are_chunked_and_ordered(monkeypatch):
             for _item in items:
                 self.next_index += 1
                 results.append(
-                    _ScoredTokens(
+                    _teacher_score(
                         [
                             TeacherToken(
                                 text="AB",
@@ -5095,7 +5109,7 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
 
 def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypatch, tmp_path):
     monkeypatch.setenv("PARASAIL_API_KEY", "parasail-secret")
-    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "capability-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
@@ -5128,7 +5142,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "PARASAIL_API_KEY" not in child
-    assert "FLASH_TEACHER_BROKER_URL" not in child
+    assert "FLASH_CONTROL_PANEL_URL" not in child
     assert "FLASH_TEACHER_CAPABILITY" not in child
     assert "HF_TOKEN" not in child
     assert "FLASH_OPD_STRUCTURED_OUTPUTS" not in child
@@ -5364,7 +5378,9 @@ def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     # global cap there would describe a shape the run is structurally unable to reach.
     assert (
         '"opd_teacher_batch_size": (\n'
-        "                    min(_TEXT_TEACHER_BATCH_SIZE, max(1, prompts_per_step * knobs.group_size))\n"
+        "                    min(\n"
+        "                        OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size)\n"
+        "                    )\n"
         "                    if not multimodal and not multi_turn\n"
         "                    else None\n"
         "                ),"
@@ -5396,7 +5412,7 @@ def test_text_teacher_batcher_scores_one_batch_at_a_time():
             with self.lock:
                 self.in_flight -= 1
             return [
-                _ScoredTokens(
+                _teacher_score(
                     [TeacherToken(text=completion, logprob=-1.0, start=0, end=len(completion))]
                 )
                 for _prompt, completion in items
@@ -5510,7 +5526,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
         return JobSpec.from_dict(payload)
 
     teacher_runtime = {
-        "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
         "FLASH_TEACHER_CAPABILITY": "capability-test-value",
     }
     for worker_env in (None, {"FLASH_OPD_BACKEND": "trl"}, {"FLASH_OPD_BACKEND": "bogus"}):
@@ -5792,10 +5808,10 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
     )
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
     monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
-    monkeypatch.delenv("FLASH_TEACHER_BROKER_URL", raising=False)
+    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
     monkeypatch.delenv("FLASH_TEACHER_CAPABILITY", raising=False)
 
-    with pytest.raises(RuntimeError, match="managed teacher broker transport is missing"):
+    with pytest.raises(RuntimeError, match="managed teacher control-panel transport is missing"):
         opd_mod.run_opd_train()
 
 

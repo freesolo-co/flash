@@ -3153,7 +3153,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
         @contextlib.contextmanager
         def teacher_transport(_spec, **_kwargs):
             yield {
-                "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+                "FLASH_CONTROL_PANEL_URL": "https://broker.example",
                 "FLASH_TEACHER_CAPABILITY": "capability-test-value",
             }
 

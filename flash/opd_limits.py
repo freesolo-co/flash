@@ -8,6 +8,7 @@ OPD_DEFAULT_EPISODE_TURNS = 24
 OPD_MIN_EPISODE_TURNS = 8
 OPD_MAX_EPISODE_TURNS = 64
 OPD_NO_SIGNAL_ATTEMPTS = 3
+OPD_TEACHER_SCORING_CONCURRENCY = 8
 
 
 def configured_opd_turn_limit(environment: Any) -> tuple[bool, int | None]:

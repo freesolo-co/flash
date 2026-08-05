@@ -15,9 +15,9 @@ from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.spec import (
+    CONTROL_PANEL_URL_ENV,
     MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
     RESERVED_WORKER_ENV_KEYS,
-    TEACHER_BROKER_URL_ENV,
     TEACHER_CAPABILITY_ENV,
     JobSpec,
     require_matching_seed,
@@ -313,17 +313,18 @@ def build_worker_env(
         env[OPD_RESUME_REVISION_ENV] = str(resume_revision)
 
     # managed teacher provider credentials stay control-plane-only even if a caller declares or
-    # supplies the same names as runtime secrets. opd receives only its attempt-scoped broker transport.
+    # supplies the same names as runtime secrets. opd receives only the control-panel origin and its
+    # attempt-scoped teacher capability.
     for key in MANAGED_TEACHER_CREDENTIAL_ENV_KEYS:
         env.pop(key, None)
-    env.pop(TEACHER_BROKER_URL_ENV, None)
+    env.pop(CONTROL_PANEL_URL_ENV, None)
     env.pop(TEACHER_CAPABILITY_ENV, None)
     if str(getattr(spec, "algorithm", "")).lower() == "opd":
-        broker_url = str((runtime_secrets or {}).get(TEACHER_BROKER_URL_ENV) or "").strip()
+        control_panel_url = str((runtime_secrets or {}).get(CONTROL_PANEL_URL_ENV) or "").strip()
         capability = str((runtime_secrets or {}).get(TEACHER_CAPABILITY_ENV) or "").strip()
-        if not broker_url or not capability:
-            raise RuntimeError("managed opd teacher broker transport is missing")
-        env[TEACHER_BROKER_URL_ENV] = broker_url
+        if not control_panel_url or not capability:
+            raise RuntimeError("managed opd control-panel teacher transport is missing")
+        env[CONTROL_PANEL_URL_ENV] = control_panel_url
         env[TEACHER_CAPABILITY_ENV] = capability
     return env
 

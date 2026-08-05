@@ -156,7 +156,7 @@ def test_capability_is_bound_to_attempt_and_new_attempt_revokes_old(broker_db):
 
 
 def test_exact_24_hour_capability_deadline_is_accepted(broker_db, monkeypatch):
-    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     issued_at = 1_000.0
     deadline_at = issued_at + teacher_broker.MAX_CAPABILITY_LIFETIME_S
@@ -181,7 +181,7 @@ def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
     import flash.providers.allocator as allocator
     from flash.runner import lifecycle
 
-    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     monkeypatch.setattr(
         lifecycle,
@@ -206,7 +206,7 @@ def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
 
 
 def test_deadline_contract_over_24_hours_is_rejected(monkeypatch):
-    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -331,7 +331,7 @@ def test_total_token_quota_is_reserved_before_dispatch_and_never_overshoots(brok
         expected_run_id="run-1",
         expected_attempt=2,
     )
-    assert db.teacher_capability_usage(token)["capability"]["token_count"] == 128
+    assert db.teacher_capability_binding(token)["token_count"] == 128
     with pytest.raises(db.TeacherLedgerError, match="token_quota_exhausted"):
         db.reserve_teacher_request(
             token=token,
@@ -346,7 +346,7 @@ def test_total_token_quota_is_reserved_before_dispatch_and_never_overshoots(brok
     db.retry_teacher_request_before_dispatch(
         first["capability"]["id"], "request-tokens-000001", error_class="local_busy"
     )
-    assert db.teacher_capability_usage(token)["capability"]["token_count"] == 64
+    assert db.teacher_capability_binding(token)["token_count"] == 64
     db.mark_teacher_request_started(second["capability"]["id"], "request-tokens-000002")
     db.complete_teacher_request(
         second["capability"]["id"],
@@ -355,7 +355,7 @@ def test_total_token_quota_is_reserved_before_dispatch_and_never_overshoots(brok
         input_tokens=10,
         response_body=b"{}",
     )
-    assert db.teacher_capability_usage(token)["capability"]["token_count"] == 10
+    assert db.teacher_capability_binding(token)["token_count"] == 10
     db.reserve_teacher_request(
         token=token,
         request_id="request-tokens-000003",
@@ -365,7 +365,7 @@ def test_total_token_quota_is_reserved_before_dispatch_and_never_overshoots(brok
         expected_run_id="run-1",
         expected_attempt=2,
     )
-    assert db.teacher_capability_usage(token)["capability"]["token_count"] == 74
+    assert db.teacher_capability_binding(token)["token_count"] == 74
 
 
 def test_stale_started_request_becomes_outcome_unknown_and_never_redispatches(broker_db):
@@ -393,7 +393,7 @@ def test_stale_started_request_becomes_outcome_unknown_and_never_redispatches(br
     recovered = db.recover_teacher_request_ledger()
 
     assert recovered == {"retryable": 1, "outcome_unknown": 1}
-    assert db.teacher_capability_usage(token)["capability"]["token_count"] == 128
+    assert db.teacher_capability_binding(token)["token_count"] == 128
     with pytest.raises(db.TeacherLedgerError, match="outcome_unknown"):
         db.reserve_teacher_request(
             token=token,
@@ -626,7 +626,7 @@ def test_worker_reuses_one_logical_request_id_across_transport_retries(monkeypat
     assert len(set(request_ids)) == 1
 
 
-def test_worker_retries_predispatch_http_error_with_same_request_id(monkeypatch):
+def test_worker_retries_body_ingress_timeout_with_same_request_id(monkeypatch):
     import urllib.error
 
     from flash.engine.worker import teacher as worker_teacher
@@ -649,12 +649,12 @@ def test_worker_retries_predispatch_http_error_with_same_request_id(monkeypatch)
             body = json.dumps(
                 {
                     "error": {
-                        "code": "provider_unavailable",
+                        "code": "body_ingress_timeout",
                         "classification": "transient",
                     }
                 }
             ).encode()
-            raise urllib.error.HTTPError(request.full_url, 503, "unavailable", {}, io.BytesIO(body))
+            raise urllib.error.HTTPError(request.full_url, 408, "timeout", {}, io.BytesIO(body))
         return Response()
 
     monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
@@ -713,7 +713,8 @@ def test_worker_retries_request_in_progress_with_same_request_id(monkeypatch):
     assert sleeps == [2.0, 4.0]
 
 
-def test_worker_does_not_retry_postdispatch_http_error(monkeypatch):
+@pytest.mark.parametrize("classification", ["permanent", None, "unknown", {"bad": "shape"}])
+def test_worker_fails_closed_on_nontransient_broker_classification(monkeypatch, classification):
     import urllib.error
 
     from flash.engine.worker import teacher as worker_teacher
@@ -722,14 +723,10 @@ def test_worker_does_not_retry_postdispatch_http_error(monkeypatch):
 
     def urlopen(_transport, request, timeout=None):
         request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
-        body = json.dumps(
-            {
-                "error": {
-                    "code": "provider_rejected",
-                    "classification": "transient",
-                }
-            }
-        ).encode()
+        error_payload = {"code": "provider_rejected"}
+        if classification is not None:
+            error_payload["classification"] = classification
+        body = json.dumps({"error": error_payload}).encode()
         raise urllib.error.HTTPError(request.full_url, 502, "rejected", {}, io.BytesIO(body))
 
     monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
@@ -1034,12 +1031,46 @@ def test_only_predispatch_failure_can_retry_same_logical_request(broker_db, monk
     )["choices"]
 
 
-@pytest.mark.parametrize("missing", ["FLASH_TEACHER_BROKER_URL", "PARASAIL_API_KEY"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://flash.example.com",
+        "https://user:pass@flash.example.com",
+        "https://flash.example.com?query=1",
+        "https://flash.example.com#fragment",
+        "https:///missing-host",
+    ],
+)
+def test_control_panel_url_requires_a_canonical_worker_reachable_https_origin(url):
+    with pytest.raises(RuntimeError, match="FLASH_CONTROL_PANEL_URL"):
+        teacher_broker.validate_control_panel_url(url)
+
+    assert teacher_broker.validate_control_panel_url("https://flash.example.com/") == (
+        "https://flash.example.com"
+    )
+
+
+def test_legacy_teacher_broker_url_does_not_configure_the_control_panel(monkeypatch):
+    monkeypatch.delenv("FLASH_CONTROL_PANEL_URL", raising=False)
+    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(max_examples=8, max_steps=1),
+        run_id="run-legacy-control-panel-url",
+    )
+
+    with pytest.raises(RuntimeError, match="FLASH_CONTROL_PANEL_URL"):
+        teacher_broker.require_teacher_broker_configuration(spec)
+
+
+@pytest.mark.parametrize("missing", ["FLASH_CONTROL_PANEL_URL", "PARASAIL_API_KEY"])
 def test_missing_broker_configuration_fails_before_allocation(monkeypatch, missing):
     import flash.providers.allocator as allocator
     from flash.runner import lifecycle
 
-    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     monkeypatch.delenv(missing, raising=False)
     monkeypatch.setattr(
@@ -1064,7 +1095,7 @@ def test_missing_broker_configuration_fails_before_allocation(monkeypatch, missi
 
 
 def test_failed_submission_scope_revokes_attempt_capability(broker_db, monkeypatch):
-    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -1089,7 +1120,7 @@ def test_failed_submission_scope_revokes_attempt_capability(broker_db, monkeypat
 
 
 def test_old_attempt_context_exit_does_not_revoke_new_attempt_token(broker_db, monkeypatch):
-    monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -1175,7 +1206,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     )
     runtime = {
         "PARASAIL_API_KEY": "parasail-worker-canary",
-        "FLASH_TEACHER_BROKER_URL": "https://broker.example",
+        "FLASH_CONTROL_PANEL_URL": "https://broker.example",
         "FLASH_TEACHER_CAPABILITY": "capability-worker-canary",
     }
     monkeypatch.setenv("PARASAIL_API_KEY", "parasail-control-plane-canary")
@@ -1240,6 +1271,7 @@ def test_capability_policy_is_run_bounded_and_rejects_excessive_shapes(monkeypat
     assert limits["max_score_items"] == 24
     assert limits["max_requests"] == 24
     assert limits["max_upstream_attempts"] == 1
+    assert limits["max_concurrency"] == teacher_broker.OPD_TEACHER_SCORING_CONCURRENCY
 
     monkeypatch.setattr(teacher_broker, "MAX_TOTAL_SCORE_ITEMS", 4)
     with pytest.raises(ValueError, match="score-item limit"):
