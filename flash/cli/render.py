@@ -195,10 +195,7 @@ def _truecolor() -> bool:
 
 
 def _theme() -> str:
-    """Active theme: ``light`` or ``dark``. ``FLASH_THEME`` overrides; else inferred from ``COLORFGBG``."""
-    forced = os.environ.get("FLASH_THEME", "").strip().lower()
-    if forced in {"light", "dark"}:
-        return forced
+    """Active theme: ``light`` or ``dark``, inferred from ``COLORFGBG`` (the terminal's own signal)."""
     fgbg = os.environ.get("COLORFGBG", "")
     if fgbg:
         try:

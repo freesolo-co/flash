@@ -1854,8 +1854,13 @@ def test_sm100_fla_tilelang_opted_out(monkeypatch):
     assert os.environ.get("FLA_TILELANG") == "0"
 
 
-def test_sm100_fla_tilelang_explicit_preset_wins(monkeypatch):
-    """An explicitly pre-set FLA_TILELANG (e.g. testing a fixed tilelang) is respected."""
+def test_sm100_fla_tilelang_overrides_an_explicit_preset(monkeypatch):
+    """A pre-set FLA_TILELANG=1 is overridden on sm100: this is a correctness floor.
+
+    tilelang's chunk_bwd_dqkwg miscomputes GDN gradients on sm100, and the failure is silent —
+    training completes and only the weights are wrong. Honouring an operator's opt-in here would
+    let a run produce quietly garbage weights, so flash owns this value on this arch.
+    """
     import os
 
     perf = _patch_arch(monkeypatch, (10, 0))
@@ -1863,7 +1868,7 @@ def test_sm100_fla_tilelang_explicit_preset_wins(monkeypatch):
 
     perf._force_fla_triton_gdn_on_sm100()
 
-    assert os.environ.get("FLA_TILELANG") == "1"
+    assert os.environ.get("FLA_TILELANG") == "0"
 
 
 @pytest.mark.parametrize("cc", [(9, 0), (12, 0), (8, 9)])

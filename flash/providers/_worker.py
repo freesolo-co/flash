@@ -93,33 +93,25 @@ class WorkerImageOverride:
 
     image: str
     registry_auth_id: str = ""
-    min_cuda: str = ""
-    min_disk_gb: int = 0
 
 
 def worker_image_override() -> WorkerImageOverride | None:
-    """Parse the FLASH_WORKER_IMAGE override with its optional deploy constraints.
+    """Parse the FLASH_WORKER_IMAGE override and its registry credential.
 
-    FLASH_WORKER_IMAGE holds the image ref. The image's own deploy requirements ride in
-    FLASH_WORKER_IMAGE_REGISTRY_AUTH (provider registry-credential id for private images),
-    FLASH_WORKER_IMAGE_MIN_CUDA (host driver floor the image's CUDA build needs), and
-    FLASH_WORKER_IMAGE_MIN_DISK_GB (container disk floor for image extraction).
+    FLASH_WORKER_IMAGE holds the image ref; FLASH_WORKER_IMAGE_REGISTRY_AUTH holds the
+    provider-side registry-credential id a private image needs to pull. The credential cannot be
+    derived from the image ref, so it stays configurable.
+
+    The image's CUDA and disk floors are NOT configurable: the GPU class floor (min_cuda_modern)
+    already encodes the real constraint, and a run that needs more container disk sets
+    ``[gpu] disk_gb`` in its own spec, where the requirement is recorded with the run.
     """
     image = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
     if not image:
         return None
-    disk_raw = os.environ.get("FLASH_WORKER_IMAGE_MIN_DISK_GB", "").strip()
-    try:
-        min_disk_gb = int(disk_raw) if disk_raw else 0
-    except ValueError as exc:
-        raise ValueError(
-            f"FLASH_WORKER_IMAGE_MIN_DISK_GB must be an integer, got {disk_raw!r}"
-        ) from exc
     return WorkerImageOverride(
         image=image,
         registry_auth_id=os.environ.get("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "").strip(),
-        min_cuda=os.environ.get("FLASH_WORKER_IMAGE_MIN_CUDA", "").strip(),
-        min_disk_gb=min_disk_gb,
     )
 
 
@@ -278,12 +270,10 @@ def build_worker_env(
     env["HF_REPO"] = spec.train.hf_repo
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
-    for k in (
-        "FLASH_CHALK_SPEC",
-    ):  # install-source override only; the kernels themselves are warmed by kernel_warmup
-        # Forward when SET, even if empty: an explicit "" is a meaningful override.
-        if os.environ.get(k) is not None:
-            env[k] = os.environ[k]
+    # FLASH_CHALK_SPEC is a per-run [worker_env] key, read from the worker_env dict below and in
+    # chalk_spec_for. It is deliberately NOT forwarded from the control plane's own environment:
+    # a plane-wide value would silently change the kernels every run installs, with no record of
+    # it in the run's own spec.
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         ku = str(k).upper()
         if ku in _REMOVED_OPTIMIZATION_ENV:

@@ -15,10 +15,7 @@ WORKDIR /app
 COPY . .
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git curl \
-    && curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
-    && apt-get update && apt-get install -y --no-install-recommends infisical \
-    && rm -rf /var/lib/apt/lists/* \
-    && chmod +x /app/infisical-entrypoint.sh
+    && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir ".[server]"
 
 VOLUME /root/.flash
@@ -31,7 +28,6 @@ EXPOSE 8080
 # bake-kernel-cache.yml so the -smXX tags don't ship stale deps (the worker-image build posts a
 # reminder).
 
-# secret injection wrapper: no-op passthrough unless INFISICAL_CLIENT_ID is set, else
-# `infisical login` (universal-auth) then `infisical run --path /flash` before the server.
-ENTRYPOINT ["/app/infisical-entrypoint.sh"]
+# Secrets come from the container environment (-e, --env-file, or your orchestrator's secret
+# store). Wrap this image's entrypoint yourself if you inject secrets from a manager.
 CMD ["python", "-m", "flash.server", "--host", "0.0.0.0", "--port", "8080"]
