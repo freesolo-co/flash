@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import types
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -1190,6 +1191,42 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
         f"data.max_token_len_per_gpu={realized_max_length * notes['per_device_train_batch_size']}"
         in captured["command"]
     )
+
+
+def test_a_workload_that_moved_under_the_frozen_quote_stops_before_training(monkeypatch):
+    """The worker re-derives the workload and refuses to train on one the quote never priced.
+
+    The environment is pinned by SHA, so this is not the ordinary case: it is the one where the
+    pinned inputs still produce different rows (a non-deterministic dataset build, a tokenizer
+    resolving differently). Training anyway would bill a run against a quote measured on other
+    data, so the profile is evidence to check rather than metadata to carry.
+
+    The drift has to come from the workload, not from the artifact. A profile carries its own
+    content digest, so an edited one is rejected as corrupt before this guard is reached; only a
+    re-derivation that legitimately disagrees can exercise it.
+    """
+    from flash.engine import sft_workload
+    from flash.engine.worker import sft_train
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    honest = sft_workload.prepare_sft_workload
+
+    def drifted(*args, **kwargs):
+        prepared = honest(*args, **kwargs)
+        moved = replace(
+            prepared.profile, realized_max_length=prepared.profile.realized_max_length - 1
+        )
+        return replace(prepared, profile=moved)
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", drifted)
+
+    def unreachable_training(command, *, env, on_step, on_line, heartbeat):
+        raise AssertionError("training must not start on a workload the quote did not price")
+
+    monkeypatch.setattr(sft_train, "run_verl_training", unreachable_training)
+
+    with pytest.raises(ValueError, match="workload changed after the quote was frozen"):
+        sft_train.run_sft_train(spec)
 
 
 def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monkeypatch):
