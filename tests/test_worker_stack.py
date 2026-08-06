@@ -628,21 +628,13 @@ def test_flash_attn_probes_false_in_ci(monkeypatch):
     assert w._flash_attn_available() is False  # flash_attn wheel absent in CI
 
 
-def test_liger_on_requires_default_and_gpu(monkeypatch):
-    """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
-    liger_kernel (both absent in CI), so it's off here too."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
-    assert w.liger_on(False) is False
-    assert w.liger_on(True) is False  # no CUDA / liger_kernel in CI
-
-
 def test_liger_default_model_size_gate(monkeypatch):
-    """Liger default is OFF for small models (1B-class, measured net loss PR #174) and ON only
-    for models ≥ ~3B where fused-CE's memory win pays off."""
+    """The model-size gate is OFF for small models (1B-class) and ON at ≥ ~3B.
+
+    Named for liger because that is where the threshold was measured (PR #174, fused-CE's memory win
+    only paying off above ~3B), but liger itself is gone from the verl paths: this predicate now
+    feeds ``_memory_mode`` -> ``grad_checkpointing_on``, so the threshold is load-bearing for
+    gradient checkpointing rather than for a fused-CE choice."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
