@@ -149,10 +149,19 @@ STEP_FLOOR_CARD_OFFSET_SECONDS = {
 # B200 and H200 share ONE offset (the slower of the two) so no member of a declared
 # throughput-equivalence class can ever be quoted faster than another. Flash models B200 at H200's
 # effective training throughput -- 550 of its 2250 peak TFLOPS -- because Flash's kernels are
-# portable rather than sm100-tuned, and at B200's higher $/hr it must never quote cheaper. The
-# campaign cannot overturn that: matched pairs give H200/B200 = 2.53x at 32 completions but 0.92x
-# at 256 (the ordering REVERSES), on n=2 replicates whose own spread is 1.29x. Tying them costs
-# nothing on honest validation (42/56 either way). Fitted independently they would invert it.
+# portable rather than sm100-tuned, and at B200's higher $/hr it must never quote cheaper.
+#
+# The tie is a POLICY, not a measurement, and a dedicated A/B has now measured against it. 12 arms,
+# 3 replicates per cell, all validity gates passing: H200/B200 = 2.202x at 32 completions and 2.402x
+# at 256, against an earned 2.07x noise floor. B200 is faster at BOTH shapes and the ordering does
+# NOT reverse -- the campaign's earlier 0.92x reversal at 256 was n=2 noise. Evidence:
+# /home/azureuser/benchmark/b200-vs-h200-20260806/.
+#
+# The tie is kept anyway, deliberately. Untying it is not a constant edit: it changes what
+# test_b200_not_cheaper_or_faster_than_h200_for_grpo asserts, i.e. the never-cheaper contract
+# itself, which is a different decision from fitting a floor. Cost of keeping it: B200 quotes long
+# (1/4 in band). Cost of relaxing it wrongly: a pricier card advertised as cheaper. Tying is the
+# conservative direction and costs nothing on honest validation (42/56 either way).
 
 
 def step_floor_seconds(gpu: str, completions: int) -> float:
@@ -406,6 +415,13 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # opd samples on-policy and syncs weights to the rollout engine exactly as grpo does, so it
         # pays the same unmodelled per-step floor. it has no frozen-reference forward, but
         # old_log_prob and the weight sync are rollout properties, not grpo-specific ones.
+        #
+        # UNVALIDATED EXTRAPOLATION: all 56 arms the floor was fitted and validated on are GRPO.
+        # The reasoning above is mechanical (same rollout engine, same weight sync, same
+        # checkpointing) but no OPD arm has confirmed the CONSTANTS transfer. The floor is a much
+        # larger share of an opd step than a grpo one (~94% of the gpu-bound half at 4B vs ~88%),
+        # so an error here is proportionally worse for opd. Treat opd quotes as carrying the floor's
+        # uncertainty un-measured until a matched opd campaign exists.
         floor_s = step_floor_seconds(gpu, completions)
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
@@ -427,8 +443,17 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     # every completion is scored, one at a time (see the serial-scoring note above).
     reward_s = completions * latency
     # old_log_prob + weight sync + checkpointing: real gpu work with no flops term of its own.
-    # gpu-bound, not fixed -- it is compute on this card, so a faster card shortens it and
-    # sharding divides it, unlike reward grading which is a wait on off-gpu python.
+    # gpu-bound, not fixed -- it is compute on this card, so a faster card shortens it, unlike
+    # reward grading which is a wait on off-gpu python.
+    #
+    # MULTI-CARD CAVEAT: being in the gpu-bound half means the whole floor is divided by
+    # multi_card_speedup(), and only ~80% of it should be. Within the floor, old_log_prob (79.9%)
+    # is a real forward pass that fsdp shards, but update_weights (13.4%) is a weight COPY into the
+    # vllm engine that every rank pays, and save_checkpoint (6.7%) is disk i/o. Sharding those two
+    # under-quotes a wide run: +5% at 2 cards, ~+10% at 8. Every arm the floor was fitted on is
+    # SINGLE-CARD, so splitting the floor into shardable and non-shardable parts would be a fit
+    # against no data. Tracked as a follow-up needing matched multi-card arms; the error is bounded
+    # and in the same direction the multi_card_speedup extrapolation already errs.
     floor_s = step_floor_seconds(gpu, completions)
     # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
     # changes. a grpo step dominated by it is latency-bound, not compute-bound.
