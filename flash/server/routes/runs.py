@@ -242,6 +242,10 @@ def create_run(
         except _runner.WorkloadProfilePending as exc:
             pending = exc.prepared_job
             state = exc.state
+            # whether THIS request launched and billed the profile, as opposed to joining one that
+            # was already running. only a winning claim launches, so anything else must not be told
+            # it was charged. defaults false: a path that never reaches the claim launched nothing.
+            launched = False
             if isinstance(pending, _runner.PreparedJob):
                 profile_run_id = pending.public_spec.run_id
                 # claim before spending anything on it. the id is deterministic in the workload, so
@@ -287,6 +291,10 @@ def create_run(
                         # dropping it returns the id to the plain claim-by-insert path.
                         db.delete_run(profile_run_id)
                         raise
+                    # set only after submit_job returns: a launch that raised deleted the row and
+                    # charged nothing, so reporting it as launched would name a charge that was
+                    # rolled back.
+                    launched = True
                 if claimed or spent_at is not None:
                     # launched here, or lost the takeover to a submitter who is launching it. either
                     # way the id now belongs to a live attempt, and reporting the spent state the
@@ -302,6 +310,10 @@ def create_run(
                     # can be waiting on a profile another key launched -- telling them to poll a
                     # run id that answers 404 for them would read as the server inventing an id.
                     "owned": db.run_owner(exc.profile_run_id) == key["id"],
+                    # whether this request started and billed the profile. an owner polling a
+                    # profile it launched earlier joins rather than launches, and must not be told
+                    # it was charged again.
+                    "launched": launched,
                 },
             ) from exc
         run_id = prepared.public_spec.run_id
