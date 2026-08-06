@@ -15,6 +15,7 @@ Two properties make that safe to bill separately from training, and both are ass
 from __future__ import annotations
 
 import builtins
+import random
 import sys
 from dataclasses import replace
 
@@ -223,6 +224,42 @@ def test_a_profile_that_cannot_be_measured_never_reaches_terminal_success(
     with pytest.raises(RuntimeError, match="environment dataset unreadable"):
         sft_profile.run_sft_profile()
     assert finalized == [], "a failed measurement must not publish DONE or metrics"
+
+
+def test_profile_seeds_after_loading_the_environment_like_training_does(
+    monkeypatch, profile_worker
+) -> None:
+    """The seed must land on the same side of env load in both workers, not merely be applied.
+
+    `run_sft_train` loads the environment and only then calls `seed_training_rngs`. If the profile
+    seeded first, anything drawing on the global generators during env load -- the loader's retry
+    jitter, a user module consuming random/numpy at import -- would advance the profile's RNG after
+    its seed while training's seed reset it afterwards. The two workers would then build different
+    rows and the drift guard would reject a profile the user already paid for.
+
+    Asserting on the ORDER rather than on two equal digests is deliberate: with both sides seeded
+    the digests match whichever way round it is, so a test comparing them cannot fail.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_profile
+
+    order: list[str] = []
+
+    def _env_that_draws():
+        order.append("env")
+        random.random()
+        return _Environment()
+
+    monkeypatch.setattr(worker, "require_active_env", _env_that_draws, raising=False)
+    monkeypatch.setattr(
+        sft_profile,
+        "seed_host_rngs",
+        lambda seed: order.append("seed"),
+    )
+
+    sft_profile.run_sft_profile()
+
+    assert order == ["env", "seed"]
 
 
 def test_profile_measurement_is_reproducible_across_two_runs(profile_worker) -> None:

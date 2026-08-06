@@ -26,15 +26,21 @@ def run_sft_profile() -> None:
     if expected != spec.workload_profile_input_digest:
         raise ValueError("sft workload profile input digest does not match the worker spec")
 
+    started_at = time.time()
+    _w.heartbeat("profile_start")
+    # load the environment BEFORE seeding, exactly as the training worker does. both sides reseed
+    # python and numpy, so what has to match is not that they seed but WHERE: anything that draws on
+    # the global generators during env load (the loader's retry jitter, a user module consuming
+    # random/numpy at import) lands on the opposite side of the seed otherwise, the two workers build
+    # different rows, and the drift guard rejects a profile the user already paid for.
+    env = _w.require_active_env()
     # host generators only: environment code may consume them while building its dataset, so the
     # profile must reach the same rows training will. seeding torch would import it, and a job that
     # is quoted as cpu-only has no business pulling in the model stack.
     seed_host_rngs(spec.seed)
-    started_at = time.time()
-    _w.heartbeat("profile_start")
     prepared = prepare_sft_workload(
         spec,
-        _w.require_active_env(),
+        env,
         tokenizer_loader=lambda model_id, revision: _w.load_tokenizer(
             model_id,
             revision=revision,
