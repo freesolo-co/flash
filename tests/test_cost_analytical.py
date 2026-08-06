@@ -3,6 +3,8 @@ steps, GRPO > SFT, bigger model costs more, the wall cap bounds runs) + arithmet
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from flash.cost import RunConfig, estimate_cost
@@ -330,22 +332,28 @@ def test_opd_teacher_cost_uses_authoritative_request_multiplier(multi_turn, max_
 
 
 @pytest.mark.parametrize(
-    ("completions", "multi_turn", "max_turns", "expected_waves"),
+    ("completions", "multi_turn", "max_turns", "expected_scored_requests"),
     [
-        (8, False, None, 3),
-        (9, False, None, 4),
-        (16, False, None, 6),
-        (1, True, None, 24),
+        # single-turn: every completion costs OPD_NO_SIGNAL_ATTEMPTS (3) potentially-scored
+        # requests, because a bounded no-signal replacement consumes a slot whether or not it is
+        # needed. so 8 completions -> 24 requests, 9 -> 27, 16 -> 48.
+        (8, False, None, 24),
+        (9, False, None, 27),
+        (16, False, None, 48),
+        # multi-turn with no explicit cap bounds at OPD_MAX_EPISODE_TURNS (64) assistant turns,
+        # each of which is separately scored and separately retried: 1 * 64 * 3 = 192.
+        (1, True, None, 192),
     ],
 )
 def test_opd_teacher_latency_uses_conservative_retry_and_turn_wave_policy(
     completions,
     multi_turn,
     max_turns,
-    expected_waves,
+    expected_scored_requests,
 ):
     from flash.cost.analytical import step_seconds_split
     from flash.cost.facts import teacher_seconds_per_completion
+    from flash.opd_limits import OPD_TEACHER_SCORING_CONCURRENCY
 
     config = RunConfig(
         MID,
@@ -359,6 +367,14 @@ def test_opd_teacher_latency_uses_conservative_retry_and_turn_wave_policy(
 
     _gpu_seconds, fixed_seconds = step_seconds_split(config, "RTX 5090")
 
+    # the policy under test is HOW MANY REQUESTS ARE COUNTED -- retries and per-turn scoring are
+    # charged for even when they do not fire. that count is the hand-written fact in the table
+    # above. how many waves it takes is then just arithmetic over the concurrency ceiling, so the
+    # ceiling is read from the constant rather than baked into the expectations: hardcoding wave
+    # counts made this test fail purely because the measured ceiling moved 8 -> 32, which is not a
+    # policy change. recomputing the REQUEST COUNT with the same helper the code uses would instead
+    # make the test unable to fail.
+    expected_waves = math.ceil(expected_scored_requests / OPD_TEACHER_SCORING_CONCURRENCY)
     assert fixed_seconds == pytest.approx(expected_waves * teacher_seconds_per_completion())
 
 

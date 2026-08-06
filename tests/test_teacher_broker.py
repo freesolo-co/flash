@@ -560,7 +560,7 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
 
     def reject(*_args):
         dispatches.append(1)
-        return 500, private_canary.encode()
+        return 400, private_canary.encode()
 
     monkeypatch.setattr(teacher_broker, "_provider_post", reject)
 
@@ -594,6 +594,32 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
     assert private_canary not in dump
     assert "control-plane-only-canary" not in dump
     assert token not in dump
+
+
+@pytest.mark.parametrize("status", [429, 500, 503, 400, 404])
+def test_every_provider_reject_is_terminal_for_the_logical_request(broker_db, monkeypatch, status):
+    """a 429 is terminal here, and the ledger is why -- not a classification judgement.
+
+    MAX_UPSTREAM_ATTEMPTS is 1, so mark_teacher_request_started refuses a second upstream call, and
+    reserve_teacher_request re-admits only rows in state 'retryable'. a completed 'provider_rejected'
+    row cannot be reopened, so calling a 429 retryable would buy the worker a round trip that comes
+    back permanent and drops the score anyway. this pins that contract: recovering shed load is
+    broker lifecycle work (attempt budget above 1 plus re-admission of a 'started' row).
+    """
+    _service_ready(monkeypatch)
+    token = _issue()
+    monkeypatch.setattr(teacher_broker, "_provider_post", lambda *_args: (status, b"upstream"))
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as error:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id="request-shed-00000001",
+            raw_body=_body(),
+        )
+
+    assert error.value.code == "provider_rejected"
+    assert error.value.retryable is False
+    assert error.value.payload()["error"]["classification"] == "permanent"
 
 
 def test_worker_default_timeout_exceeds_broker_provider_ceiling():
