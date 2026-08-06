@@ -443,6 +443,27 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     # truncated importance sampling: token-level, cap 2.0 (matches flash's tis recipe).
     assert "algorithm.rollout_correction.rollout_is=token" in o
     assert "algorithm.rollout_correction.rollout_is_threshold=2.0" in o
+    # ...and the rollout logprobs that make those two do anything. verl only applies the correction
+    # when "rollout_log_probs" is on the batch, and only a sampler asked for logprobs writes it.
+    # without this the two overrides above are inert. see build_verl_overrides.
+    assert "actor_rollout_ref.rollout.calculate_log_probs=True" in o
+
+
+def test_tis_overrides_are_not_inert_without_rollout_logprobs():
+    """the tis knobs and their enabling flag must never be separated.
+
+    this is the regression that shipped: `rollout_is=token` and the 2.0 threshold composed fine,
+    cost nothing, and applied no correction, because verl gates on the logprobs key being present
+    rather than on the tis config being set. asserting the pair together is what makes a future
+    edit that drops calculate_log_probs fail here instead of silently in training.
+    """
+    o = rl_train.build_verl_overrides(_overrides_cfg())
+    tis_configured = any(item.startswith("algorithm.rollout_correction.rollout_is=") for item in o)
+    logprobs_enabled = "actor_rollout_ref.rollout.calculate_log_probs=True" in o
+    assert tis_configured is logprobs_enabled, (
+        "rollout correction is configured but rollout logprobs are not enabled (or vice versa); "
+        "verl needs both or the correction silently does nothing"
+    )
 
 
 def test_build_verl_overrides_carries_fused_expert_target_parameters():
@@ -3817,8 +3838,17 @@ def test_the_run_body_puts_the_shim_dir_on_the_child_path_for_multi_turn():
     # plain multi-turn job copied three modules the child could never import. source-level because
     # the assignment sits inside run_rl_train, past the subprocess launch.
     src = inspect.getsource(rl_train.run_rl_train)
-    assert 'if shim_source or inp["multi_turn"]:' in src, (
-        "PYTHONPATH is not extended for a multi-turn job with no other shim"
+    # matched on the guard's TERMS rather than its exact text: the condition legitimately grows a
+    # disjunct whenever another feature writes into shim_dir (the gdn boundary shim did), and an
+    # exact-string assertion fails on that without anything being wrong. what must stay true is that
+    # a multi-turn job reaches the PYTHONPATH assignment on its own.
+    lines = src.splitlines()
+    assign = next(i for i, line in enumerate(lines) if 'env_for_verl["PYTHONPATH"]' in line)
+    guard = next(
+        line for line in reversed(lines[:assign]) if line.strip().startswith("if shim_source")
+    )
+    assert 'inp["multi_turn"]' in guard, (
+        f"PYTHONPATH is not extended for a multi-turn job with no other shim; guard was: {guard!r}"
     )
     assert 'if inp["multi_turn"]:\n        copy_multi_turn_child_modules(shim_dir)' in src
 

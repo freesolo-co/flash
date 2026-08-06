@@ -1,4 +1,4 @@
-"""Worker heartbeat: stream stage/progress to the HF artifact repo + TRL callbacks.
+"""Worker heartbeat: stream stage/progress to the HF artifact repo.
 
 Monkeypatch contract: all patchable knobs live on the worker package (_w); locks/frozensets live
 here. Tests that monkeypatch worker.<name> then call worker.heartbeat(...) take effect.
