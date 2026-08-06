@@ -1095,6 +1095,7 @@ def test_sft_profile_miss_starts_a_separate_profile_run(api, monkeypatch):
         "state": "queued",
         # this key launched it, so it may poll it and is the one being charged for it.
         "owned": True,
+        "launched": True,
     }
     # the real row, not a stubbed recorder: the profile is persisted as its own run under its own
     # kind, which is what keeps its charge separate from the training run it unblocks.
@@ -1159,10 +1160,69 @@ def test_a_second_owner_needing_the_same_profile_is_not_blocked_by_the_first(api
     assert detail["profile_run_id"] == profile_run_id
     # and it is told the run is not its own, because polling that id would answer 404 for this key.
     assert detail["owned"] is False
+    # it lost the claim, so it launched nothing and is not the one paying for the profile.
+    assert detail["launched"] is False
     # ownership does not transfer, and the existing profile run is not launched a second time.
     assert db.run_owner(profile_run_id) == first_owner
     assert len(submitted) == 1
     # the second submitter is not billed for a profile it did not start.
+    assert [r["run_id"] for r in db.all_runs()] == [profile_run_id]
+
+
+def test_an_owner_retrying_its_own_pending_profile_is_not_billed_again(api, monkeypatch):
+    """Re-running the same command while your own profile is in flight joins it, it does not relaunch.
+
+    This is the ordinary retry: the first submit answers 409 and tells the user to wait, so they
+    wait and run it again. Only the winning claim launches, so the retry starts nothing and is
+    charged nothing -- but it still owns the run, so ``owned`` alone cannot distinguish it from the
+    submit that did the launching. Without a separate launch signal the client has no choice but to
+    repeat the start-and-bill wording, naming one profile charge per retry against an account that
+    was charged exactly once.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.server import db
+
+    profile_run_id = "profile-sft-" + "c" * 64
+    submitted = []
+
+    def prepare(spec, **_kwargs):
+        profile_spec = replace(
+            spec,
+            run_id=profile_run_id,
+            workload_profile_kind="sft",
+            workload_profile_input_digest="c" * 64,
+        )
+        raise runner.WorkloadProfilePending(
+            profile_run_id,
+            "required",
+            prepared_job=runner.PreparedJob(
+                public_spec=profile_spec,
+                worker_spec=profile_spec,
+                estimated_cost_usd=0.25,
+            ),
+        )
+
+    monkeypatch.setattr(app_mod, "prepare_job", prepare)
+    monkeypatch.setattr(
+        app_mod, "submit_job", lambda spec, **kwargs: submitted.append((spec, kwargs))
+    )
+
+    spec = {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 8}}
+    token = _login()
+    first = api.post("/v1/runs", headers=_bearer(token), json={"spec": spec})
+    assert first.status_code == 409
+    assert first.json()["detail"]["launched"] is True
+
+    retry = api.post("/v1/runs", headers=_bearer(token), json={"spec": spec})
+
+    assert retry.status_code == 409, retry.text
+    detail = retry.json()["detail"]
+    # same key, so the run is still readable and pollable by this submitter...
+    assert detail["owned"] is True
+    # ...but the retry lost the claim, so it launched nothing and added no second charge.
+    assert detail["launched"] is False
+    assert len(submitted) == 1
     assert [r["run_id"] for r in db.all_runs()] == [profile_run_id]
 
 
