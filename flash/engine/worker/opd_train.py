@@ -2476,17 +2476,22 @@ def run_opd_train(spec=None) -> None:
             flush=True,
         )
 
-    # vllm 0.19.1 graph capture is only validated on a100/h100/blackwell; elsewhere it dies in
-    # aot_compile or triton slot-mapping, so the rollout runs eagerly. grpo has resolved this since
-    # the trl driver; opd never did, and opd is the MORE exposed of the two because it always runs
-    # `rollout.mode=async`, whose server hardcodes cudagraph_mode=FULL_AND_PIECEWISE
-    # (vllm_async_server.py:240). on an rtx 4090 (sm89, the catalog's recommended card for the small
-    # models) that captured 102 graphs and pushed the box to 41.51GB/42.84GB of HOST ram, and the
-    # weight sync at the end of the first opd step was killed. the graphs live in vllm's EngineCore
-    # CHILD process, so ray's own accounting saw only 12.45GB of it and the run read as a mystery
-    # oom. see resolve_rollout_enforce_eager for why this one knob is enough and cannot fight
-    # verl's: vllm resolves enforce_eager LAST (config/vllm.py:1024), after the async server has set
-    # cudagraph_mode, and forces both compilation mode and cudagraph_mode to NONE.
+    # sm86's vllm 0.19.1 graph capture degenerates, so only that arch runs the rollout eagerly. grpo
+    # has resolved this since the trl driver; opd never did, and opd is the MORE exposed of the two
+    # because it always runs `rollout.mode=async`, whose server hardcodes
+    # cudagraph_mode=FULL_AND_PIECEWISE (vllm_async_server.py:240).
+    #
+    # an opd run on an rtx 4090 (sm89) captured 102 graphs and was OOM-killed with the node at
+    # 41.51GB/42.84GB of HOST ram, and this gate once excluded sm89 on that basis. the ~29 GB blamed
+    # on the graphs was a RESIDUAL of ray's accounting, not a measurement -- ray cannot see vllm's
+    # EngineCore CHILD process, where the graphs live, so everything unaccounted was attributed to
+    # them. measured across the whole process tree, capture costs ~450 MB on sm89 against ~9.9 GB of
+    # baseline engine footprint that eager pays too. that box was already at 97%; graphs were the
+    # last straw, not the load. see resolve_rollout_enforce_eager for the per-arch evidence.
+    #
+    # one knob is enough and cannot fight verl's: vllm resolves enforce_eager LAST
+    # (config/vllm.py:1024), after the async server has set cudagraph_mode, and forces both
+    # compilation mode and cudagraph_mode to NONE.
     # one capability probe feeds both rollout decisions, as it does on the grpo path.
     verl_cc = resolve_verl_device_capability(python_bin)
     enforce_eager = resolve_rollout_enforce_eager(verl_cc)

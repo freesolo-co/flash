@@ -617,14 +617,39 @@ def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
     verl is strictly MORE aggressive than the default that crashed: ``rollout.enforce_eager``
     defaults False (``workers/config/rollout.py:195``) and its async server hardcodes
     ``cudagraph_mode=FULL_AND_PIECEWISE`` (``vllm_async_server.py:237-241``) where trl asked only for
-    ``FULL_DECODE_ONLY``. So an unvalidated card now captures MORE graphs than the configuration
-    already known to fail on it. RTX 4090 (sm89) is the catalog's ``recommended_gpu`` for the small
-    models, so this is the default GRPO route, not an exotic one.
+    ``FULL_DECODE_ONLY``. So an unvalidated card captures MORE graphs than the configuration already
+    known to fail on it.
 
     One knob is enough and cannot fight verl's: vllm 0.19.1 resolves ``enforce_eager`` LAST, forcing
     ``compilation_config.mode=NONE`` and ``cudagraph_mode=NONE`` regardless of what was requested
     (``config/vllm.py:847-853`` and ``:1024-1029``). Overriding ``cudagraph_mode`` instead would
     leave torch.compile on, which is the other half of what sm86 dies in.
+
+    **sm89 (Ada, RTX 4090 / L40S) captures graphs.** It was excluded as "unvalidated" -- inherited
+    from the trl driver's allowlist rather than measured -- and it is the catalog's
+    ``recommended_gpu`` for Qwen3.5-0.8B and 2B, so the default small-model GRPO and OPD route was
+    forfeiting both cuda graphs and torch.compile. Both axes of the exclusion were then measured on
+    real hardware:
+
+    - *output*: judged against sm90-with-graphs, the configuration flash already ships, in both raw
+      and chat-templated prompt formats. sm89's graph arm introduced no non-termination, no
+      repetition loop, and lost no decidable answer its own eager arm got right -- strictly cleaner
+      than the shipping reference, which drops one arithmetic token. bit-identity is NOT the bar:
+      vllm makes no determinism promise across execution modes, and sm80/sm90 would fail it too.
+    - *host memory*: this is what the exclusion actually rested on. an OPD run captured 102 graphs
+      and was OOM-killed with the node at 41.51/42.84 GB, and ~29 GB was attributed to those graphs.
+      that number was a RESIDUAL (node total minus ray's accounting), not a measurement, and ray
+      cannot see vllm's ``EngineCore`` child where the graphs live. measured across the whole process
+      tree, capture costs **453 MB** on sm89 0.8B and **426 MB** on 2B -- *less* than sm90's 551 MB.
+      the box was already at 97% on ~9.9 GB of baseline engine footprint that eager pays too; graphs
+      were the last straw on an undersized host, not the load.
+
+    **sm86 (Ampere, A10/A10G) stays eager.** Not inherited -- reproduced. Under graphs the A10G
+    turned "List three colors." into that sentence repeated to the token cap, never emitting EOS,
+    where its own eager arm answered in 19 tokens; a second run reproduced the same collapse on a
+    different prompt ("Count from 1 to 10." verbatim, repetition 0.96) while sm90 and sm86's own
+    eager arm both produced a normal escalating continuation on the identical prompt. That is
+    degeneration, not the wording drift graph capture is entitled to.
 
     B200 (sm100) is deliberately NOT eager -- the trl path returned early there and kept vllm's own
     default, and the b200 rollout work depends on graphs.
@@ -635,13 +660,16 @@ def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
     if cc is None:
         return False
     major, minor = cc
-    if (major, minor) in {(8, 0), (9, 0)} or major in (10, 12):
-        return False
-    print(
-        f"[verl] sm{major}{minor}: enforce_eager=True for the rollout (vllm 0.19.1 graph capture is "
-        "unvalidated on this arch: aot_compile / triton slot-mapping failures)"
-    )
-    return True
+    # sm86 is the only measured graph-capture failure. everything else -- sm80/sm89/sm90 and
+    # blackwell -- captures. an arch nobody has measured keeps verl's default rather than being
+    # forced eager on the strength of one other Ampere minor version's defect.
+    if (major, minor) == (8, 6):
+        print(
+            "[verl] sm86: enforce_eager=True for the rollout (vllm 0.19.1 graph capture degenerates "
+            "on this arch: completions repeat to the token cap without emitting EOS)"
+        )
+        return True
+    return False
 
 
 def rollout_sleep_unsupported(model_id: str) -> bool:
