@@ -627,6 +627,7 @@ def _submit_seed_supervised(
         _TerminalHandleRace,
         _update,
         _verified_opd_retry_state,
+        _worker_deadline_at,
         flash_code_prefix,
         get_status,
     )
@@ -1042,7 +1043,11 @@ def _submit_seed_supervised(
                                 "attempt": attempt,
                                 "on_last_gpu": on_last_gpu,
                                 "code_prefix": code_prefix,
-                                "_deadline_at": _load_run_deadline_at(spec.run_id),
+                                # bounded, not the raw run deadline: while a profile is unarmed the
+                                # persisted one still carries the queue allowance, and the bootstrap
+                                # enforces whatever absolute deadline it is handed regardless of
+                                # max_wall_seconds. see _worker_deadline_at.
+                                "_deadline_at": _worker_deadline_at(spec.run_id, run_spec),
                             }
                             if attempt_runtime_secrets:
                                 submit_kwargs["runtime_secrets"] = attempt_runtime_secrets

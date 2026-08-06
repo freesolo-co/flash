@@ -336,6 +336,26 @@ def _remaining_run_wall_seconds(run_id: str, *, now: float | None = None) -> flo
     return max(0.0, _load_run_deadline_at(run_id) - float(current))
 
 
+def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None) -> float:
+    """Return the absolute deadline the worker may enforce for this launch.
+
+    The persisted run deadline is submission-to-terminal and, for an unarmed profile, still holds
+    the queue allowance on top of the work budget. The bootstrap enforces whatever absolute
+    deadline it is handed (see ``_worker_execution_deadline``) independently of max_wall_seconds,
+    so passing the run-global one lets a profile that got capacity immediately work through the
+    queue window on a job priced for its wall alone. Bound it to the work budget from launch, so
+    the deadline the worker enforces matches the wall ``_spec_with_remaining_wall`` grants.
+
+    Once armed, the persisted deadline is already work-budget-from-arm, and it is the authority:
+    taking the min keeps a relaunched or slow-to-speak worker from extending past it.
+    """
+    stored = _load_run_deadline_at(run_id)
+    if not spec.workload_profile_kind:
+        return stored
+    current = time.time() if now is None else now
+    return min(stored, float(current) + float(_WORKLOAD_PROFILE_WALL_SECONDS))
+
+
 def _spec_with_remaining_wall(
     spec: JobSpec,
     *,
