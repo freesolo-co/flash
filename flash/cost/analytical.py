@@ -121,12 +121,50 @@ def setup_seconds(config: RunConfig) -> float:
     return s
 
 
-def _opd_step_shape(n: RunConfig) -> tuple[int, int]:
+def _opd_step_shape(n: RunConfig) -> tuple[int, float]:
     """(completions per step, prompt+completion tokens per step) for one OPD step, from a NORMALIZED
-    config. completions = batch x group; each is billed over the FULL n.seq_len (prompt+completion,
-    not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
+    config. completions = batch x group; each is billed over the FULL prompt+completion length
+    (not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
     completions = n.batch_size * n.group_size
-    return completions, completions * n.seq_len
+    return completions, completions * _sequence_tokens(n)
+
+
+def _sequence_tokens(n: RunConfig) -> float:
+    """Prompt+completion tokens ONE rollout costs, measured when a profile exists.
+
+    ``n.seq_len`` is ``max_context_tokens``: a capacity ceiling the engine is configured with, not
+    the work a step performs. Billing it assumes every rollout fills the context, which measurement
+    contradicts -- realized generation ran 0.323x of a 2048-token cap on the reference sample.
+
+    Both halves must be measured together. Substituting a measured completion length while leaving
+    the prompt at the context ceiling would price a short completion onto a full-context prompt,
+    which is not a shape any rollout has.
+    """
+    if n.measured_completion_tokens is None or n.measured_prompt_tokens is None:
+        return float(n.seq_len)
+    measured = n.measured_prompt_tokens + n.measured_completion_tokens
+    # the ceiling still binds: a measured mean above it would mean the profile and the run
+    # disagree about the engine's context, and the engine wins.
+    return min(float(n.seq_len), measured)
+
+
+def _completion_tokens(n: RunConfig) -> float:
+    """Tokens ONE rollout generates, measured when a profile exists, else the declared cap."""
+    if n.measured_completion_tokens is None:
+        return float(n.completion_len)
+    return min(float(n.completion_len), n.measured_completion_tokens)
+
+
+def _describe_rollout_tokens(n: RunConfig) -> str:
+    """How the rollout length reaching the quote should be shown to the user.
+
+    A measured quote and a cap-based quote can differ several-fold, so the note has to say which
+    one it is. Reporting a measured mean as though it were the configured cap would make the
+    cheaper number look like a pricing change rather than a measurement.
+    """
+    if n.measured_completion_tokens is None:
+        return f"{n.completion_len} tok"
+    return f"{_completion_tokens(n):.0f} tok measured (cap {n.completion_len})"
 
 
 def required_save_overhead_seconds(config: RunConfig) -> float:
@@ -250,7 +288,10 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
 
     # GRPO step = rollout (G completions/prompt) + serial reward grading + policy/ref update.
     completions = n.batch_size * n.group_size
-    gen_tokens = completions * n.completion_len
+    # measured realized generation when a rollout profile exists, else max_completion_tokens. this
+    # count feeds BOTH terms below, so quoting the cap multiplies its error through the two largest
+    # parts of a grpo step.
+    gen_tokens = completions * _completion_tokens(n)
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * update_mfu)
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
@@ -517,7 +558,7 @@ def _notes(
         teacher_name = resolve_teacher(n.teacher_model).display_name
         notes.append(
             f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {n.completion_len} tok + {teacher_name} teacher scoring "
+            f"@ {_describe_rollout_tokens(n)} + {teacher_name} teacher scoring "
             f"({tsec:.2f}s/request, {OPD_TEACHER_SCORING_CONCURRENCY} concurrent) + policy "
             "update (no local reference forward)"
         )
@@ -526,7 +567,7 @@ def _notes(
         rsec = reward_seconds_per_completion(n.reward_seconds_per_completion)
         notes.append(
             f"GRPO step = vLLM rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {n.completion_len} tok + reward ({rsec:.2f}s/completion"
+            f"@ {_describe_rollout_tokens(n)} + reward ({rsec:.2f}s/completion"
             + (f", env {n.environment}" if n.environment else "")
             + ") + policy+reference update"
         )

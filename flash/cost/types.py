@@ -54,6 +54,14 @@ class RunConfig:
     sft_packed_blocks: int | None = None
     opd_multi_turn: bool = False
     opd_max_turns: int | None = None
+    # grpo/opd: MEASURED mean tokens one rollout actually generates and consumes, from a sampled
+    # rollout profile. deliberately SEPARATE fields rather than an overwrite of completion_len and
+    # seq_len, because those two size the gpu (see train_knobs) and sizing must cover the worst
+    # case while pricing must reflect the expected one. quoting the cap overbills generation ~3.1x;
+    # SIZING to a measured mean would provision vram for the mean and OOM on the tail. same split
+    # sft already uses with train_tokens, for the same reason.
+    measured_completion_tokens: float | None = None
+    measured_prompt_tokens: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
