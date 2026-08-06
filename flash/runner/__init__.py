@@ -1863,17 +1863,31 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         # first word from a profile's worker starts its work budget. the arm and the deadline it
         # implies are written together under this guard so a reader never sees one without the
         # other -- _checked_stored_run_deadline rejects that pair as tampering and halts the run.
+        #
+        # only a heartbeat from THIS run may arm it. a profile's run id is derived from the
+        # workload, so a relaunch reuses the id and its artifact prefix, and the first heartbeat
+        # read back can be the previous lifecycle's leftover (observed: a 2.8-hour-old one arming a
+        # 5-second-old run). the same provenance requirement _heartbeat_matches_attempt enforces
+        # provider-side, applied to the boundary available here.
         arm_kwargs: dict[str, float] = {}
         raw = _load_status_json(run_id)
         armed_spec = _internal_spec_from_status(status)
         if armed_spec.workload_profile_kind and _profile_wall_armed_at(raw) is None:
-            armed_at = time.time()
-            arm_kwargs = {
-                "_profile_wall_armed_at": armed_at,
-                "_run_deadline_at": _require_valid_deadline(
-                    armed_at + _require_valid_deadline(armed_spec.gpu.max_wall_seconds)
-                ),
-            }
+            hb_ts = hb.get("ts") if isinstance(hb, dict) else None
+            fresh = (
+                not isinstance(hb_ts, bool)
+                and isinstance(hb_ts, (int, float))
+                and math.isfinite(float(hb_ts))
+                and float(hb_ts) >= _require_valid_deadline(status.created_at)
+            )
+            if fresh:
+                armed_at = time.time()
+                arm_kwargs = {
+                    "_profile_wall_armed_at": armed_at,
+                    "_run_deadline_at": _require_valid_deadline(
+                        armed_at + _require_valid_deadline(armed_spec.gpu.max_wall_seconds)
+                    ),
+                }
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
