@@ -87,7 +87,6 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
         "fla",
         "tilelang",
         "tvm_ffi",
-        "chalk",
         "kernel_warmup_sha256",
     ):
         assert cache_inputs[key], f"cache input {key} not populated"
@@ -108,14 +107,6 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
     assert sha in cache_inputs["fla"]
     # the cache toolchain must NOT leak into the base pip list (else a cache-toolchain bump would fire a re-layer)
     assert not any("liger-kernel" in s or "tilelang" in s for s in base_partial["pip_base"])
-
-
-def test_bake_kernel_cache_uses_chalk_default_source_of_truth():
-    from flash.providers._worker import LATEST_CHALK_MAIN_SHA
-
-    bake_src = (ROOT / "docker" / "bake_kernel_cache.py").read_text()
-    assert "DEFAULT_CHALK_SPEC" in bake_src
-    assert LATEST_CHALK_MAIN_SHA not in bake_src
 
 
 def test_dockerfile_only_change_is_a_free_relayer():

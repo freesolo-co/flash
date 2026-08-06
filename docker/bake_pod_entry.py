@@ -28,7 +28,7 @@ def main() -> int:
     arch = os.environ.get("BAKE_ARCH", "")
     api = HfApi(token=token)
 
-    # Upload a STARTED marker FIRST -- before the code download / chalk install / warmup -- so a CI-side
+    # Upload a STARTED marker FIRST -- before the code download / warmup -- so a CI-side
     # timeout can tell whether this entrypoint even ran. Present on a timeout = the warmup started (so it
     # hung or was slow); absent = the pod ran the wrong entrypoint, OR this upload itself failed while
     # the warmup is still running. Retry a few times so a transient HF blip doesn't drop the marker and
@@ -63,13 +63,6 @@ def main() -> int:
         local_dir="/runcode",
         token=token,
     )
-    # match production: install freesolo-chalk so its default gap-filler kernels (rope, lora-delta,
-    # embedding) get warmed too. best-effort — the warmup skips chalk cleanly if this fails, so a
-    # chalk install hiccup just drops back to the validated 4/5 (no-chalk) bake.
-    chalk_spec = os.environ.get("BAKE_CHALK_SPEC", "")
-    if chalk_spec:
-        print(f"[bake] installing chalk: {chalk_spec}", flush=True)
-        subprocess.call([sys.executable, "-m", "pip", "install", "--no-cache-dir", chalk_spec])
 
     env = {**os.environ, "PYTHONPATH": "/runcode/code"}
     cmd = [sys.executable, "-m", "flash.engine.worker.kernel_warmup", "--out", "/out"]
