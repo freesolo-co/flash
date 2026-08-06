@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import http.client
@@ -1819,11 +1820,50 @@ def _opd_multimodal_parquet_features():
     )
 
 
-def _write_opd_parquet(rows: list[dict], path: str) -> None:
-    from datasets import Dataset
+# arrow expands every shared python reference into its own copy, and the opd row list is one
+# reference per prompt repeated across the whole horizon, so converting the rows in a single table
+# costs peak host ram proportional to horizon * prompts_per_step * prompt_bytes. that is the parent
+# worker's ram, not the gpu's, and the allocator sizes vram only -- a host-ram kill surfaces as a
+# generic child exit with oom:false. writing in fixed batches holds the peak flat instead
+# (measured: 24k rows of ~8k-token prompts, 6143 MB in one table vs 189 MB batched).
+_OPD_PARQUET_WRITE_BATCH_ROWS = 2000
 
+
+def _write_opd_parquet(rows: list[dict], path: str) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if not rows:
+        raise ValueError("refusing to write an empty OPD parquet")
     features = _opd_multimodal_parquet_features() if any("images" in row for row in rows) else None
-    Dataset.from_list(rows, features=features).to_parquet(path)
+    # pin one schema for every batch. multimodal takes it from the declared features exactly as the
+    # single-table write did; text infers it from the first batch so a later batch cannot silently
+    # infer a different type and be rejected mid-file.
+    schema = (
+        features.arrow_schema
+        if features is not None
+        else pa.Table.from_pylist(rows[:_OPD_PARQUET_WRITE_BATCH_ROWS]).schema
+    )
+    # write to a sibling temp file and rename only once every batch landed. closing a partially
+    # written ParquetWriter still emits a valid footer, so failing in place would leave a READABLE
+    # short file at `path` -- a truncated horizon that trains silently instead of raising.
+    partial = f"{path}.partial"
+    try:
+        writer = pq.ParquetWriter(partial, schema)
+        try:
+            for start in range(0, len(rows), _OPD_PARQUET_WRITE_BATCH_ROWS):
+                writer.write_table(
+                    pa.Table.from_pylist(
+                        rows[start : start + _OPD_PARQUET_WRITE_BATCH_ROWS], schema=schema
+                    )
+                )
+        finally:
+            writer.close()
+        os.replace(partial, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(partial)
+        raise
 
 
 # the verl bridge stores the empty-alignment skip under its own internal key,

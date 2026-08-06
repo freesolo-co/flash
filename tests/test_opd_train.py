@@ -45,6 +45,7 @@ from flash.engine.worker.opd_structured import (
     canonical_structured_spec,
 )
 from flash.engine.worker.opd_train import (
+    _OPD_PARQUET_WRITE_BATCH_ROWS,
     _BridgePrompt,
     _build_opd_child_env,
     _failure_accounting_metadata,
@@ -644,6 +645,104 @@ def test_multimodal_opd_parquet_round_trip_preserves_image_dicts(tmp_path, image
     assert restored[0]["images"] == rows[0]["images"]
     assert restored[1]["images"] == rows[1]["images"]
     assert restored.features["images"].feature["image"].dtype == "string"
+
+
+def _opd_row(index: int, *, multimodal: bool) -> dict:
+    row = {
+        "prompt": [{"role": "user", "content": f"prompt {index}"}],
+        "data_source": "flash_opd",
+        "reward_model": {"style": "rule", "ground_truth": ""},
+        "extra_info": {"index": index},
+    }
+    if multimodal:
+        row["images"] = [{"image": f"file:///tmp/{index}.png"}]
+    return row
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_opd_parquet_spanning_write_batches_preserves_every_row_in_order(tmp_path, multimodal):
+    """the horizon row list is written in batches, so a batch boundary must not drop or reorder.
+
+    verl runs the dataloader with data.shuffle=false, so parquet row order IS the training order.
+    """
+    datasets = pytest.importorskip("datasets")
+    # deliberately not a multiple of the batch size, so the final batch is a short one
+    count = _OPD_PARQUET_WRITE_BATCH_ROWS * 2 + 3
+    rows = [_opd_row(index, multimodal=multimodal) for index in range(count)]
+    path = tmp_path / "horizon.parquet"
+
+    _write_opd_parquet(rows, str(path))
+
+    restored = datasets.load_dataset("parquet", data_files=str(path))["train"].to_list()
+    assert restored == rows
+    assert [row["extra_info"]["index"] for row in restored] == list(range(count))
+
+
+def test_opd_parquet_repeated_prompt_references_survive_batching(tmp_path):
+    """each row holds a shared reference to one pooled prompt; batching must copy, not alias."""
+    datasets = pytest.importorskip("datasets")
+    prompt = [{"role": "user", "content": "shared"}]
+    rows = [
+        {
+            "prompt": prompt,
+            "data_source": "flash_opd",
+            "reward_model": {"style": "rule", "ground_truth": ""},
+            "extra_info": {"index": ordinal % 3},
+        }
+        for ordinal in range(_OPD_PARQUET_WRITE_BATCH_ROWS + 5)
+    ]
+    path = tmp_path / "repeated.parquet"
+
+    _write_opd_parquet(rows, str(path))
+
+    restored = datasets.load_dataset("parquet", data_files=str(path))["train"].to_list()
+    assert restored == rows
+
+
+def test_opd_parquet_leaves_no_truncated_file_when_a_later_batch_fails(tmp_path):
+    """closing a partly written parquet still emits a valid footer.
+
+    without the atomic rename the failed write would leave a READABLE short file, and since the
+    horizon parquet is the training schedule that is a silently truncated run rather than an error.
+    """
+    rows = [_opd_row(index, multimodal=False) for index in range(_OPD_PARQUET_WRITE_BATCH_ROWS + 5)]
+    # a type the pinned schema cannot accept, landing in the second batch
+    rows[-1]["extra_info"] = {"index": "not-an-int"}
+    path = tmp_path / "doomed.parquet"
+
+    pa = pytest.importorskip("pyarrow")
+    with pytest.raises(pa.ArrowInvalid):
+        _write_opd_parquet(rows, str(path))
+
+    assert not path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_opd_parquet_pins_the_image_type_when_the_first_batch_has_no_images(tmp_path):
+    """a multimodal job may still round-robin a run of image-free prompts into the first batch.
+
+    inferring the schema from that batch would type ``images`` as a list of nulls and reject the
+    first row that actually carries one, so the declared multimodal features must pin it.
+    """
+    datasets = pytest.importorskip("datasets")
+    rows = [_opd_row(index, multimodal=True) for index in range(_OPD_PARQUET_WRITE_BATCH_ROWS + 2)]
+    for row in rows[:_OPD_PARQUET_WRITE_BATCH_ROWS]:
+        row["images"] = []
+    path = tmp_path / "late-image.parquet"
+
+    _write_opd_parquet(rows, str(path))
+
+    restored = datasets.load_dataset("parquet", data_files=str(path))["train"].to_list()
+    assert restored == rows
+    assert restored[_OPD_PARQUET_WRITE_BATCH_ROWS]["images"] == [
+        {"image": f"file:///tmp/{_OPD_PARQUET_WRITE_BATCH_ROWS}.png"}
+    ]
+
+
+def test_opd_parquet_rejects_an_empty_row_list(tmp_path):
+    """a zero-row write would leave verl pointing at a file with no training data."""
+    with pytest.raises(ValueError, match="empty OPD parquet"):
+        _write_opd_parquet([], str(tmp_path / "empty.parquet"))
 
 
 @pytest.mark.parametrize("image_first", [False, True])
