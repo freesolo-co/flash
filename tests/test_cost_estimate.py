@@ -508,6 +508,33 @@ def test_b200_not_cheaper_or_faster_than_h200_for_grpo():
     assert b200.total_usd > h200.total_usd
 
 
+def test_b200_never_beats_h200_at_any_card_count_for_grpo_or_opd():
+    """The never-faster contract must survive sharding, on both rollout algorithms.
+
+    The single-card test above passes on equal per-step seconds. Sharding divides only the
+    gpu-bound half, so a card whose floor offset differed would diverge as the count rises even
+    while the 1-card numbers matched -- the tie has to hold per-count, not just at count=1. opd is
+    covered too because it carries the same floor with a much larger share of its step (~94% of the
+    gpu-bound half vs ~88% for grpo), so it is the more sensitive of the two, not a duplicate.
+    """
+    from flash.cost.analytical import multi_card_speedup, step_seconds_split
+
+    for method in ("grpo", "opd"):
+        h_bound, h_fixed = step_seconds_split(
+            RunConfig("Qwen/Qwen3.5-4B", method, 100, gpu_type="H200"), "H200"
+        )
+        b_bound, b_fixed = step_seconds_split(
+            RunConfig("Qwen/Qwen3.5-4B", method, 100, gpu_type="B200"), "B200"
+        )
+        for count in (1, 2, 4, 8):
+            h_sps = h_bound / multi_card_speedup(count, "H200") + h_fixed
+            b_sps = b_bound / multi_card_speedup(count, "B200") + b_fixed
+            assert b_sps >= h_sps - 1e-9, (
+                f"{method} at {count} cards quotes B200 faster than H200 "
+                f"({b_sps:.3f}s vs {h_sps:.3f}s): the equivalence-class tie broke under sharding"
+            )
+
+
 # ---------------------------------------------------------------------------
 # multi-gpu: total scales linearly with gpu_count
 # ---------------------------------------------------------------------------
