@@ -1,10 +1,11 @@
-"""Run held-out environment evaluation suites against a deployed model."""
+"""Run a published environment's held-out evaluation suites against a deployed model."""
 
 from __future__ import annotations
 
 import argparse
 import math
 import queue
+import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,10 +13,10 @@ from pathlib import Path
 
 from flash._channel import CLI_NAME
 from flash.envs.evaluations import (
-    _DEFAULT_EVALUATIONS_PATH,
     EvalCase,
     EvalResult,
     EvalSuiteReport,
+    _evaluation_path,
     load_evaluation_suites,
     normalize_eval_result,
     validate_evaluation_cases,
@@ -23,7 +24,7 @@ from flash.envs.evaluations import (
 
 from . import render
 from .env_test import _env_params, _evaluation_example
-from .envpush import _err, _resolve_local_env_entrypoint
+from .envpush import _err
 
 _MAX_CONCURRENCY = 32
 
@@ -442,13 +443,56 @@ def _case_payload(case: EvalCase | None, result: EvalResult) -> dict:
     }
 
 
-def _require_accessible_project(project_id: str) -> str:
+def _spec_project(spec: object) -> str:
+    """The project a run's public spec files under, or empty when it names none."""
+    if not isinstance(spec, dict):
+        return ""
+    project = spec.get("project")
+    return project.strip() if isinstance(project, str) else ""
+
+
+def _spec_environment_id(spec: object) -> str:
+    """The hub environment a run trains against, as the dashboard stores it.
+
+    A managed slug (`namespace/name`) is what the environment pages are keyed by, so a `github:`
+    ref pointing at the managed hub is canonicalized to the slug it denotes -- the same
+    normalization the submit route applies before it records the run's environment
+    (`flash/server/routes/runs.py`). Anything else is a reference this side cannot resolve to a
+    hub page, so it is returned verbatim rather than guessed at."""
+    if not isinstance(spec, dict):
+        return ""
+    environment = spec.get("environment")
+    if not isinstance(environment, dict):
+        return ""
+    env_id = environment.get("id")
+    if not isinstance(env_id, str) or not env_id.strip():
+        return ""
+    env_id = env_id.strip()
+    from flash.envs.loader import canonical_managed_environment_slug
+
+    try:
+        return canonical_managed_environment_slug(env_id) or env_id
+    except ValueError:
+        # a malformed managed ref is still the identity the run carries; recording it verbatim
+        # keeps the report honest about what it graded rather than dropping the provenance.
+        return env_id
+
+
+def _require_accessible_project(project_id: object) -> str:
     """The canonical id of a project this caller can actually upload to.
 
-    Raises ClientError when the credentials are missing or the project is not reachable from
-    this organization, so the refusal happens before a single generation is bought."""
+    Shape and reachability are one question here because they have one answer at every call
+    site: a project that cannot be resolved is not a project to record against, whether it is
+    malformed, deleted, or owned by another organization. Raises ClientError in every one of
+    those cases, so the refusal happens before a single generation is bought."""
     from flash.client import ApiError, ClientError, get_project
     from flash.client.config import load_credentials
+    from flash.spec import require_project_id
+
+    try:
+        project_id = require_project_id(project_id)
+    except (TypeError, ValueError) as exc:
+        raise ClientError(str(exc)) from exc
 
     _, api_key = load_credentials()
     if not api_key:
@@ -479,9 +523,9 @@ def _upload_report(
 ) -> int:
     """Record one suite's results against a project, reporting failures without hiding them.
 
-    `environment_reference` is the resolved entrypoint, not its directory: a package may hold
-    several environment modules, and evaluating `/env/easy.py` then `/env/hard.py` recorded the
-    same provenance for two runs graded by different environments.
+    `environment_reference` is the hub environment the graded run trains against, so the dashboard
+    can open it. It is always a published slug, never a path: an evaluation with no published
+    environment to name is refused before it runs.
 
     Upload failure is reported but does not change the eval's own exit status: the suite
     already ran and its verdict is printed above. Returning FAIL here would relabel a
@@ -557,38 +601,18 @@ def _print_report(report: EvalSuiteReport) -> None:
 
 
 def cmd_env_eval(args) -> int:
-    """Score local held-out suites against one deployed model target."""
+    """Score one deployed model target against its own published environment's held-out suites."""
     from flash.client import ApiError, ClientError, client_from_config
-    from flash.envs.loader import load_freesolo_environment
+    from flash.envs.loader import (
+        _DEFAULT_ENVIRONMENT_PATH,
+        is_managed_environment_slug,
+        load_freesolo_environment,
+    )
+    from flash.envs.pull import pull_environment_package_from_archive
     from flash.schema import parse_adapter_revision, parse_checkpoint_ref
 
-    # checked before the suites run so a bad project id fails in a second rather than after a
-    # long paid evaluation whose results would then have nowhere to go. the id is validated
-    # here, not just checked for emptiness: upload_eval_run requires a canonical UUID, so a
-    # malformed one would otherwise buy every model request and be rejected at the end -- and
-    # because upload failure deliberately does not change the verdict, it would still print
-    # `overall: PASS` with nothing recorded.
-    from flash.spec import require_project_id
-
-    project_id = ""
-    if args.upload:
-        try:
-            project_id = require_project_id(args.project)
-        except (TypeError, ValueError) as exc:
-            return _err(f"--upload requires a valid --project PROJECT_ID: {exc}")
-        # a well-formed UUID is not an accessible project. checking only the shape let a deleted id,
-        # or one belonging to another organization, buy the whole evaluation and be rejected at
-        # upload -- printing `overall: PASS` with nothing recorded, since upload failure
-        # deliberately does not change the verdict. `env setup` already resolves the project this
-        # way before scaffolding anything.
-        try:
-            project_id = _require_accessible_project(project_id)
-        except (ApiError, ClientError) as exc:
-            if getattr(args, "debug", False):
-                raise
-            return _err(f"--upload requires a valid --project PROJECT_ID: {exc}")
     if args.project and not args.upload:
-        return _err("--project only applies with --upload")
+        return _err("--project cannot be combined with --no-upload")
 
     revision = parse_adapter_revision(args.target)
     parsed = parse_checkpoint_ref(args.target) if revision is None else None
@@ -598,36 +622,24 @@ def cmd_env_eval(args) -> int:
             "(expected a bare <run_id>, <run_id>/step-N, or full immutable adapter revision)"
         )
 
+    # an explicitly named project is fully settled before anything else happens, including before a
+    # client exists: it is already known, so neither its shape nor its accessibility needs the run
+    # lookup below, and a typo or an unreachable project costs one second rather than a control
+    # plane round trip and then a whole paid suite.
+    project_id = ""
+    if args.project:
+        try:
+            project_id = _require_accessible_project(args.project)
+        except ClientError as exc:
+            if getattr(args, "debug", False):
+                raise
+            return _err(f"--project must be a valid PROJECT_ID: {exc}")
+
     try:
         params = _env_params(args)
     except ValueError as exc:
         _err(f"env eval failed: {exc}")
         return _err("overall: FAIL")
-
-    try:
-        _, _, entrypoint, _ = _resolve_local_env_entrypoint(Path(args.path))
-        entrypoint = entrypoint.resolve()
-        # the same kwargs `env test` builds from --split/--param, so a held-out suite grades the
-        # environment the run is actually configured with. loading parameterless rejected an env
-        # whose load_environment() requires a setting, and silently built a differently-configured
-        # scorer for one that merely defaults (codex[bot]).
-        environment = load_freesolo_environment(str(entrypoint), **params)
-        suites = load_evaluation_suites(entrypoint, environment=environment)
-    except (Exception, SystemExit) as exc:
-        # a load failure is a bug in the sidecar or the package layout, not a measurement.
-        # --debug asked for the traceback, so let the root handler print it.
-        if getattr(args, "debug", False):
-            raise
-        reason = str(exc) or exc.__class__.__name__
-        _err(f"env eval failed: {reason.replace('cannot publish', 'cannot evaluate')}")
-        return _err("overall: FAIL")
-
-    if args.suite:
-        available = ", ".join(sorted(suite.name for suite in suites))
-        suites = [suite for suite in suites if suite.name == args.suite]
-        if not suites:
-            _err(f"env eval failed: unknown suite {args.suite!r}; available suites: {available}")
-            return _err("overall: FAIL")
 
     client = client_from_config()
     evaluation_target = args.target
@@ -714,7 +726,7 @@ def cmd_env_eval(args) -> int:
             # `/v1/runs/{id}/checkpoints` carries no revision, and the chat route never echoes the
             # revision that answered. So refuse before buying a single generation rather than spend
             # a whole suite on a result nobody can identify. Both ways out are in the message, and
-            # evaluating without `--upload` still prints the verdict.
+            # evaluating with `--no-upload` still prints the verdict.
             #
             # Only when a step was asked for. A bare alias means "whatever serves this run now",
             # which is what it records, and a busy one deliberately stays unpinned so the run still
@@ -722,144 +734,259 @@ def cmd_env_eval(args) -> int:
             _err(
                 f"env eval failed: cannot upload results for {args.target}: the immutable "
                 "revision that will answer it is not knowable here. re-run with the full "
-                f"revision from `{CLI_NAME} models deployments`, or drop --upload"
+                f"revision from `{CLI_NAME} models deployments`, or pass --no-upload"
             )
             return _err("overall: FAIL")
 
-    # graders must see what training graded, so the run's own `thinking` decides whether the
-    # reasoning is stripped first (see `_scored_response`). read once here rather than per case:
-    # it is the same answer for every case, and a suite of 200 would otherwise buy 200 lookups.
-    thinking = False
+    # one lookup answers everything this command needs to know ABOUT THE TARGET RUN: which published
+    # environment it trains against, whether its responses carry reasoning, and which project owns
+    # its results. all three are properties of that run, so none is a default or a fallback -- an
+    # evaluation grades the weights against the environment that trained them, and files under the
+    # project that owns them.
+    #
+    # read once here rather than per case: it is the same answer for every case, and a suite of 200
+    # would otherwise buy 200 lookups.
+    spec = None
     target_run_id = (revision or parsed or (None,))[0]
     if target_run_id:
-        spec = None
         try:
             spec = client.get_run(target_run_id).get("spec")
         except ClientError as exc:
             # one handler, not two: `ApiError` subclasses `ClientError`, so an `except ApiError`
-            # arm would catch 5xx and 429 before the retryable arm ever saw them, and a plane
-            # merely overloaded while chat stays usable would grade the whole suite raw -- the
-            # exact failure the retryable branch exists to stop (cursor[bot]).
+            # arm would catch 5xx and 429 before the retryable arm ever saw them (cursor[bot]).
             #
-            # a 4xx is the plane answering, just not about this run: an old build with no such
-            # route, or a run this key cannot see. retrying returns the same answer, and every
-            # eval before this lookup existed graded the raw response, so keep that and say so.
+            # both arms end the command, because the spec is no longer an enrichment: it names the
+            # environment whose suites this evaluation runs. without it there is nothing to grade
+            # against, so neither arm can warn and continue. they stay separate only to say whether
+            # retrying is worth anything -- a 4xx is a settled answer about this run, a 5xx or a
+            # timeout is the plane failing to answer at all.
+            if getattr(args, "debug", False):
+                raise
             answered_definitively = (
                 isinstance(exc, ApiError) and exc.status < 500 and exc.status != 429
             )
             if answered_definitively:
-                _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
+                _err(
+                    f"env eval failed: could not read the target run {target_run_id}: {exc}. "
+                    "its published environment is what supplies the suites to score."
+                )
             else:
-                # the plane did not answer, or answered with a fault that will pass: unreachable,
-                # timed out, overloaded. the chat requests that follow may still succeed, and then
-                # `thinking` would stay false while every `<think>...</think>answer` was handed to
-                # the scorer raw, uploading a whole paid suite of false failures (codex[bot]).
-                # retryable, so stop before buying any generation rather than grade in a
-                # normalization state we guessed at.
-                if getattr(args, "debug", False):
-                    raise
                 _err(
                     f"env eval failed: could not reach the control plane for {target_run_id}: "
-                    f"{exc}. retry once it is reachable: grading without its thinking mode would "
-                    "score every reasoning response against raw output."
+                    f"{exc}. retry once it is reachable."
                 )
-                return _err("overall: FAIL")
+            return _err("overall: FAIL")
         except Exception as exc:
             # anything else is not a transport fault, so it is not retryable either. broad, so an
             # unexpected client shape cannot crash a command the user asked for.
-            _err(f"warning: could not read thinking mode for {target_run_id}: {exc}")
-        thinking = bool(spec.get("thinking")) if isinstance(spec, dict) else False
+            if getattr(args, "debug", False):
+                raise
+            _err(f"env eval failed: could not read the target run {target_run_id}: {exc}")
+            return _err("overall: FAIL")
 
-    reports: list[EvalSuiteReport] = []
-    for suite in suites:
-        # each suite uploads as its own run, so each needs its own start. sharing one timestamp
-        # across suites backdates every later run to before the earlier suites' work and
-        # inflates its dashboard duration by time it did not spend.
-        started_at = datetime.now(UTC).isoformat()
+    # graders must see what training graded, so the run's own `thinking` decides whether the
+    # reasoning is stripped first (see `_scored_response`).
+    thinking = bool(spec.get("thinking")) if isinstance(spec, dict) else False
+
+    if args.upload and not project_id:
+        # the run's own project, and not a default: an evaluation of these weights files where the
+        # weights themselves live. nothing here falls back to a first, sole, or example project --
+        # when the run names none and the user did not either, recording would have to invent a home
+        # for a permanent result, so it refuses before any paid generation and names both ways out.
         try:
-            cases = validate_evaluation_cases(
-                suite, source=entrypoint.parent / _DEFAULT_EVALUATIONS_PATH
+            project_id = _require_accessible_project(_spec_project(spec))
+        except ClientError as exc:
+            if getattr(args, "debug", False):
+                raise
+            _err(
+                f"env eval failed: cannot record results for {args.target}: its project is unknown "
+                f"({exc}). pass `--project PROJECT_ID`, or pass --no-upload to score without "
+                "recording"
             )
+            return _err("overall: FAIL")
+
+    # the published environment the graded weights were trained on: both the suites that score them
+    # and the identity the report is filed under. a local directory cannot serve either role -- it
+    # names no environment anyone else can open, so two developers evaluating one run recorded two
+    # different provenances for the same measurement, and neither could be resolved back to a page.
+    # there is no fallback: an evaluation with nothing published to name is refused rather than
+    # recorded against a path.
+    environment_reference = _spec_environment_id(spec)
+    if not environment_reference:
+        _err(
+            f"env eval failed: run {args.target} trains on no published environment. "
+            f"publish one with `{CLI_NAME} env push` and train a run against it"
+        )
+        return _err("overall: FAIL")
+    # nonempty is not enough. a run may legitimately train on a generic `github:` ref, which
+    # `_spec_environment_id` returns verbatim because it denotes no hub page -- and recording one
+    # would file this report under exactly the unlinkable provenance the command exists to stop
+    # (codex[bot]). the hub is also what makes the package fetchable below, so this is one gate for
+    # both: a slug, or no evaluation.
+    if not is_managed_environment_slug(environment_reference):
+        _err(
+            f"env eval failed: run {args.target} trains on {environment_reference}, which is not a "
+            f"published environment. publish it with `{CLI_NAME} env push` and train a run against "
+            "the resulting namespace/name slug"
+        )
+        return _err("overall: FAIL")
+
+    with tempfile.TemporaryDirectory(prefix="flash-env-eval-") as workdir:
+        try:
+            # ONE download, through the control plane, and everything is graded from what it wrote.
+            #
+            # through the plane because that is the only credential an ordinary user has: the direct
+            # hub path in `load_freesolo_environment` authenticates with an operator-style
+            # GITHUB_TOKEN, so evaluating a published environment would have demanded a credential
+            # that `env pull` never asks for, and failed without it (codex[bot]).
+            #
+            # once because a managed slug points at environment-hub@main, which moves, and symbolic
+            # refs are deliberately not cached (`_resolve_ref_sha`). resolving per-call let the
+            # environment object come from one revision and its grading code from the next
+            # (codex[bot]). one archive cannot disagree with itself.
+            #
+            # and from the extracted path because slug resolution is not uniform: the sidecar lookup
+            # prefers a local directory when one named `namespace/name` sits in the cwd, so a
+            # matching checkout silently graded the published environment with a working copy's
+            # evaluations.py (cursor[bot]). an absolute path into this temp dir has no such branch.
+            package = client.download_env_package(environment_reference)
+            entrypoint = (
+                pull_environment_package_from_archive(package, Path(workdir) / "package")
+                / _DEFAULT_ENVIRONMENT_PATH
+            )
+        except (ApiError, ClientError) as exc:
+            if getattr(args, "debug", False):
+                raise
+            _err(
+                f"env eval failed: could not download the published environment "
+                f"{environment_reference}: {exc}"
+            )
+            return _err("overall: FAIL")
+        except Exception as exc:
+            if getattr(args, "debug", False):
+                raise
+            _err(
+                f"env eval failed: could not unpack the published environment "
+                f"{environment_reference}: {exc}"
+            )
+            return _err("overall: FAIL")
+
+        try:
+            # the same kwargs `env test` builds from --split/--param, so a held-out suite grades the
+            # environment the run is actually configured with. loading parameterless rejected an env
+            # whose load_environment() requires a setting, and silently built a differently-
+            # configured scorer for one that merely defaults (codex[bot]).
+            environment = load_freesolo_environment(str(entrypoint), **params)
+            suites = load_evaluation_suites(entrypoint, environment=environment)
+            # where those suites came from, for the case-validation errors below -- the file
+            # `load_evaluation_suites` actually read, not a second guess at it.
+            sidecar = _evaluation_path(entrypoint)
         except (Exception, SystemExit) as exc:
+            # a load failure is a bug in the published environment or its sidecar, not a
+            # measurement. --debug asked for the traceback, so let the root handler print it.
             if getattr(args, "debug", False):
                 raise
             reason = str(exc) or exc.__class__.__name__
-            _err(f"suite {suite.name} failed to load cases: {reason}")
-            report = EvalSuiteReport(
-                name=suite.name,
-                results=(_generation_error("load", f"case loading failed: {reason}"),),
-            )
-            _print_report(report)
-            reports.append(report)
-            if args.upload:
-                _upload_report(
-                    report,
-                    [],
-                    project_id=project_id,
-                    environment_reference=str(entrypoint),
-                    target=evaluation_target,
-                    started_at=started_at,
-                    status="failed",
-                    error=f"case loading failed: {reason}",
+            _err(f"env eval failed: {reason.replace('cannot publish', 'cannot evaluate')}")
+            return _err("overall: FAIL")
+
+        if args.suite:
+            available = ", ".join(sorted(suite.name for suite in suites))
+            suites = [suite for suite in suites if suite.name == args.suite]
+            if not suites:
+                _err(
+                    f"env eval failed: unknown suite {args.suite!r}; available suites: {available}"
                 )
-            continue
-        if not cases:
-            # a suite that graded nothing measured nothing. reporting 0/0 as a pass would
-            # turn an empty or over-filtered suite into a green check nobody looks at again.
-            _err(f"suite {suite.name} has no cases to run")
-            report = EvalSuiteReport(
-                name=suite.name,
-                results=(_generation_error("load", "suite produced no cases"),),
+                return _err("overall: FAIL")
+
+        reports: list[EvalSuiteReport] = []
+        for suite in suites:
+            # each suite uploads as its own run, so each needs its own start. sharing one timestamp
+            # across suites backdates every later run to before the earlier suites' work and
+            # inflates its dashboard duration by time it did not spend.
+            started_at = datetime.now(UTC).isoformat()
+            try:
+                cases = validate_evaluation_cases(suite, source=sidecar)
+            except (Exception, SystemExit) as exc:
+                if getattr(args, "debug", False):
+                    raise
+                reason = str(exc) or exc.__class__.__name__
+                _err(f"suite {suite.name} failed to load cases: {reason}")
+                report = EvalSuiteReport(
+                    name=suite.name,
+                    results=(_generation_error("load", f"case loading failed: {reason}"),),
+                )
+                _print_report(report)
+                reports.append(report)
+                if args.upload:
+                    _upload_report(
+                        report,
+                        [],
+                        project_id=project_id,
+                        environment_reference=environment_reference,
+                        target=evaluation_target,
+                        started_at=started_at,
+                        status="failed",
+                        error=f"case loading failed: {reason}",
+                    )
+                continue
+            if not cases:
+                # a suite that graded nothing measured nothing. reporting 0/0 as a pass would
+                # turn an empty or over-filtered suite into a green check nobody looks at again.
+                _err(f"suite {suite.name} has no cases to run")
+                report = EvalSuiteReport(
+                    name=suite.name,
+                    results=(_generation_error("load", "suite produced no cases"),),
+                )
+                _print_report(report)
+                reports.append(report)
+                if args.upload:
+                    _upload_report(
+                        report,
+                        cases,
+                        project_id=project_id,
+                        environment_reference=environment_reference,
+                        target=evaluation_target,
+                        started_at=started_at,
+                        status="failed",
+                        error="suite produced no cases",
+                    )
+                continue
+            if args.max_cases is not None:
+                cases = cases[: args.max_cases]
+            results = _run_cases(
+                client, evaluation_target, suite, cases, args, environment, thinking=thinking
             )
+            for result in results:
+                _print_case(result)
+            report = EvalSuiteReport(name=suite.name, results=results)
             _print_report(report)
             reports.append(report)
+            # every report uploads, including the ones that never graded a case. skipping them
+            # left the dashboard showing the earlier suites as a completed run with the failing
+            # suite simply absent -- a green-looking evaluation whose CLI exit code was 1
+            # (codex[bot]). `_case_payload` tolerates a missing case, so a load failure records
+            # its error rather than nothing.
             if args.upload:
+                # the errored-case downgrade lives in `_upload_report`, so it covers this call and the
+                # two load-failure ones above rather than only the path that happens to run cases.
                 _upload_report(
                     report,
                     cases,
                     project_id=project_id,
-                    environment_reference=str(entrypoint),
+                    environment_reference=environment_reference,
                     target=evaluation_target,
                     started_at=started_at,
-                    status="failed",
-                    error="suite produced no cases",
                 )
-            continue
-        if args.max_cases is not None:
-            cases = cases[: args.max_cases]
-        results = _run_cases(
-            client, evaluation_target, suite, cases, args, environment, thinking=thinking
-        )
-        for result in results:
-            _print_case(result)
-        report = EvalSuiteReport(name=suite.name, results=results)
-        _print_report(report)
-        reports.append(report)
-        # every report uploads, including the ones that never graded a case. skipping them
-        # left the dashboard showing the earlier suites as a completed run with the failing
-        # suite simply absent -- a green-looking evaluation whose CLI exit code was 1
-        # (codex[bot]). `_case_payload` tolerates a missing case, so a load failure records
-        # its error rather than nothing.
-        if args.upload:
-            # the errored-case downgrade lives in `_upload_report`, so it covers this call and the
-            # two load-failure ones above rather than only the path that happens to run cases.
-            _upload_report(
-                report,
-                cases,
-                project_id=project_id,
-                environment_reference=str(entrypoint),
-                target=evaluation_target,
-                started_at=started_at,
-            )
 
-    failed = any(
-        report.passed != report.total or any(result.error for result in report.results)
-        for report in reports
-    )
-    if failed:
-        return _err("overall: FAIL")
-    print(render.ok("overall: PASS") if render.styled() else "overall: PASS")
-    return 0
+        failed = any(
+            report.passed != report.total or any(result.error for result in report.results)
+            for report in reports
+        )
+        if failed:
+            return _err("overall: FAIL")
+        print(render.ok("overall: PASS") if render.styled() else "overall: PASS")
+        return 0
 
 
 __all__ = ["_MAX_CONCURRENCY", "bounded_concurrency", "cmd_env_eval", "positive_int"]

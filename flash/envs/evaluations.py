@@ -598,6 +598,7 @@ __all__ = [
     "EvalResult",
     "EvalSuite",
     "EvalSuiteReport",
+    "_evaluation_path",
     "has_evaluations",
     "load_evaluation_suites",
     "normalize_eval_result",
