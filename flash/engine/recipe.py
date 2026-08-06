@@ -59,6 +59,21 @@ TEACHER_MODELS: dict[str, TeacherModel] = {
             ),
         ),
     ),
+    "deepseek-v4-pro": TeacherModel(
+        alias="deepseek-v4-pro",
+        model_id="parasail-deepseek-v4-pro",
+        display_name="DeepSeek V4 Pro",
+        usd_per_1m=(1.74, 3.48),
+        tokenizer_repo="deepseek-ai/DeepSeek-V4-Pro",
+        tokenizer_revision="b5968e9190ef611bbf34a7229255be88a0e937c1",
+        tokenizer_kind="tokenizer_json",
+        tokenizer_files=(
+            (
+                "tokenizer.json",
+                "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+            ),
+        ),
+    ),
     "qwen3.5-397b-a17b": TeacherModel(
         alias="qwen3.5-397b-a17b",
         model_id="parasail-qwen35-397b-a17b",
