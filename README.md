@@ -91,6 +91,48 @@ flash models deploy RUN_ID             # serve the trained adapter
 flash models chat RUN_ID -m "hello"    # talk to it
 ```
 
+### Workload profiles (SFT)
+
+The first `flash train` or `flash train --cost` on a new SFT config does not print a quote.
+It reports that no workload profile exists yet and starts one:
+
+```
+no exact workload profile exists for this config yet, so there is no training quote to
+print. the server started a separate profile run that loads your environment and tokenizes
+the exact dataset this training would consume.
+that profile run is real work and is billed on its own (estimated $0.03); no training run
+was created, no training gpu was allocated, and nothing was charged for training.
+follow it with `flash runs status profile-sft-...`, then re-run this command once it
+reports done.
+```
+
+A profile run loads your environment at its pinned SHA, renders and tokenizes every example
+this config would train on, and records aggregates: retained and dropped examples, tokens per
+epoch, supervised tokens, realized max length, packed blocks, and the update horizon. The SFT
+quote is then computed from those measured tokens rather than from an assumed average example
+length, and the same profile is what the training worker trains from.
+
+Consequences worth knowing before you submit:
+
+- **Profiles are separate runs and separate charges.** A profile appears in `flash runs list`
+  under its own id and is billed for its own (CPU-only, short) work. It is never rolled into
+  the training charge, and a failed profile cannot become training spend.
+- **Quoting fails closed.** If no trustworthy matching profile exists, no training run is
+  created, no GPU is allocated, and no quote is persisted. There is no fallback estimate.
+- **The cache key is the workload, not the run.** Profile ids are derived from environment id,
+  resolved SHA and params; model, revision and tokenizer revision; `seed`; `thinking`; worker
+  env; and the `[train]` fields `epochs`, `batch_size`, `max_context_tokens`, `max_steps` and
+  `max_examples`. Change any of them and it is a different workload needing its own profile.
+  Everything else about a run, including which GPU it lands on, is outside the key.
+- **Profiles are shared across users.** The id is a hash of that workload, not of your account,
+  so if someone else already measured your exact config you wait for their profile and are not
+  charged for a second one. Their run is not readable by your key, so the CLI tells you to
+  wait rather than pointing you at a run id that would answer 404.
+- **A failed profile is retried, not final.** If a profile fails or is cancelled, the next
+  submission of that config starts a replacement rather than reporting the workload as
+  permanently unquotable. Because the id is shared, exactly one of the waiting submitters
+  launches the replacement and the rest wait on it.
+
 Run management lives under `flash runs` (`status`, `log`, `cancel`, `checkpoint`) and
 serving under `flash models` (`deploy`, `chat`, `deployments`, `undeploy`, `export`).
 `flash models` on its own lists supported base models and `flash gpus` lists GPU classes

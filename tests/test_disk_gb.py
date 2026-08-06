@@ -6,6 +6,8 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 
+from tests._helpers.profile import satisfy_sft_profile
+
 
 @dataclass
 class _FakeTemplate:
@@ -89,6 +91,9 @@ def test_submit_raises_disk_to_model_min(monkeypatch):
                 "gpu": {"type": "RTX 5090", "disk_gb": 60},
             }
         )
+        # sft submission is profile-gated, and this synthetic catalog model has no hub revision to
+        # resolve. Disk sizing is what is under test, so seed the profile instead.
+        satisfy_sft_profile(runner, monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         # disk_gb is platform-managed: stripped from the public status.spec, read the sizing the
         # worker executes from the effective-preparation worker spec.
