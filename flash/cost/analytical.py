@@ -41,6 +41,140 @@ MFU_TRAIN = 0.35  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
 MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 
+# --- rollout step floor ------------------------------------------------------------------------
+# Per-step work that the FLOPs terms above do not model at all. verl's own timing_s/* keys
+# decompose a real grpo step to 100.0% (a2_revtext, Qwen3.5-0.8B, RTX 4090, 8 steps):
+#
+#   update_actor    62.1%  -> update_s
+#   old_log_prob    17.9%  -> NOTHING
+#   gen             15.5%  -> gen_s
+#   update_weights   3.0%  -> NOTHING
+#   save_checkpoint  1.5%  -> NOTHING
+#   reward           0.0%  -> reward_s
+#
+# ~22% of every step had no term: grpo recomputes log-probs under the current policy before each
+# update, and syncs trained weights into the vllm rollout engine to keep the next rollout
+# on-policy. But those three phases are the SMALLER half of what this constant absorbs. On that
+# same arm the residual (real step - modelled gpu seconds) is 44.74s, of which:
+#
+#   11.62s  the three phases above, which genuinely have no term
+#   33.12s  update_actor + gen running 40.19s against a modelled 7.06s -- 5.7x
+#
+# So the floor is mostly the FLOPs model under-predicting the phases it ALREADY models. At 0.8B-4B
+# a step is dominated by fixed per-step overhead (kernel launches, optimizer and dataloader work,
+# engine round-trips) that no peak-FLOPs term captures, which is why a constant fits and every
+# scaled form fails. Matched measurements confirm the cards do not rank by FLOPs at this size: at
+# 0.8B/gens=32 the RTX 5090 is the fastest card measured (44.6s) against H100 72.7s and H200
+# 152.7s.
+#
+# This was invisible for as long as it was because the fictitious reward wall stood in for it:
+# 32 completions x the old 1.0 s/completion default = 32.00s of a 32.88s prediction, against a
+# MEASURED reward phase of 0.000s. Two large errors in opposite directions, so the total looked
+# calibrated while both halves were wrong. Removing the fiction WITHOUT adding this term scores
+# 49.8x geometric bias -- far worse than leaving both alone.
+#
+# FITTED as (real_step - everything else modelled) over a 45-arm campaign, with the measured reward
+# already applied, then scored on arms the fit never saw. It has an intercept AND a slope because
+# both halves are real: a fixed per-step overhead, plus work that grows with the rollout batch.
+#
+#   gens=32   n=35   median floor  77.2s
+#   gens=64   n= 2                146.6s
+#   gens=96   n= 2                138.4s
+#   gens=256  n= 6                230.5s
+#
+# Choosing the form by holding out ONE WHOLE COMPLETION CLASS at a time -- the only test of whether
+# it extrapolates to a shape it was not fitted on (in band, and worst-case error):
+#
+#   held-out class      flat constant        linear (shipped)
+#   gens=16   n= 2      2/2   1.16x          2/2   1.40x
+#   gens=32   n=43      1/43  4.57x          26/43 2.37x
+#   gens=64   n= 3      1/3   1.91x          2/3   1.44x
+#   gens=96   n= 2      1/2   2.26x          0/2   2.15x
+#   gens=256  n= 6      0/6   4.23x          6/6   1.42x
+#
+# A flat constant scores 1/43 on gens=32 once it cannot fit that class, and 0/6 on gens=256. It
+# only looked competitive because 35 of the 45 fit arms ARE gens=32 -- the same contamination that
+# made a per-card table look good (that table also quoted B200 71s/step FASTER than H200, which is
+# backwards, since B200 training is H100/H200-class on portable kernels at a higher $/hr).
+#
+# Rejected alternatives, all scored the same way: pure per-completion with no intercept (32/56,
+# worst 3.24x) loses the fixed overhead; completions x params (35/56) adds a parameter without
+# beating plain completions; scaling by the card's throughput predicts RTX 5090 pays 169.8s where
+# it measurably pays 44.2s, because update_weights is a weight COPY into the vllm engine
+# (bandwidth, pcie) and save_checkpoint is disk i/o -- neither tracks tflops.
+#
+# This is an empirical aggregate and will drift as hardware, verl, or the engine change. The
+# principled fix is a per-step overhead term in the throughput model itself, since that is what the
+# bulk of this correction is really standing in for.
+STEP_FLOOR_BASE_SECONDS = 62.7
+STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
+
+# --- per-card offset ---------------------------------------------------------------------------
+# The intercept above is the pooled one; a card also has a measurable offset from it. On a matched
+# shape (0.8B, ascii-tree, 32 completions) 76% of the variance is BETWEEN cards and card means span
+# 3.48x, so the card signal is real and worth carrying.
+#
+# It is only an offset on the INTERCEPT: the slope stays shared. Per-card slopes were measured and
+# collapse (0/6 on gens=256), because 6 of 8 cards have fewer than 3 distinct completion counts, so
+# a two-parameter per-card fit is exactly determined with zero residual degrees of freedom -- it
+# reproduces its own training arms and predicts nothing.
+#
+# Each offset is SHRUNK toward zero by sample size, n/(n+2), and a card with fewer than
+# STEP_FLOOR_MIN_ARMS_FOR_OFFSET arms gets none at all. Validated by holding out every replicate of
+# a config together, so no sibling run of the held-out arm stays in training to leak its noise:
+#
+#   form                      in band   geo     worst
+#   pooled, no offsets        37/56     1.055   2.18x
+#   offsets, min 2 arms       41/56     1.045   2.11x
+#   offsets, min 3 arms       42/56     1.019   2.11x   <- shipped
+#   offsets, min 4 arms       41/56     1.003   2.18x
+#   offsets, min 10 arms      39/56     0.994   2.18x
+#
+# That leak is not hypothetical: under leave-one-ARM-out (siblings retained) the same offsets score
+# 48/56, so roughly two thirds of the apparent gain was replicate noise. Rerunning one identical
+# config on one card moves the step time up to 2.37x, which is the real noise floor here.
+#
+# A card with no entry falls back to exactly the pooled form, which is the correct behaviour for
+# every unmeasured and future card: leave-one-CARD-out scores 35/56 for offsets and pooled alike,
+# because a held-out card HAS no offset. These buy accuracy on cards already measured, nothing more.
+STEP_FLOOR_MIN_ARMS_FOR_OFFSET = 3
+STEP_FLOOR_CARD_OFFSET_SECONDS = {
+    "A100 PCIe": -12.6,  # n=6, completion counts 32/256
+    "B200": 42.5,  # n=4, 32/256 -- tied to H200, see below
+    "H100": -10.4,  # n=24, 16/32/256
+    "H200": 42.5,  # n=4, 32/256
+    "RTX 4090": 14.8,  # n=10, 16/32/64/96
+    "RTX 5090": -30.0,  # n=4, 32/96
+}
+# B200 and H200 share ONE offset (the slower of the two) so no member of a declared
+# throughput-equivalence class can ever be quoted faster than another. Flash models B200 at H200's
+# effective training throughput -- 550 of its 2250 peak TFLOPS -- because Flash's kernels are
+# portable rather than sm100-tuned, and at B200's higher $/hr it must never quote cheaper.
+#
+# The tie is a POLICY, not a measurement, and a dedicated A/B has now measured against it. 12 arms,
+# 3 replicates per cell, all validity gates passing: H200/B200 = 2.202x at 32 completions and 2.402x
+# at 256, against an earned 2.07x noise floor. B200 is faster at BOTH shapes and the ordering does
+# NOT reverse -- the campaign's earlier 0.92x reversal at 256 was n=2 noise. Evidence:
+# /home/azureuser/benchmark/b200-vs-h200-20260806/.
+#
+# The tie is kept anyway, deliberately. Untying it is not a constant edit: it changes what
+# test_b200_not_cheaper_or_faster_than_h200_for_grpo asserts, i.e. the never-cheaper contract
+# itself, which is a different decision from fitting a floor. Cost of keeping it: B200 quotes long
+# (1/4 in band). Cost of relaxing it wrongly: a pricier card advertised as cheaper. Tying is the
+# conservative direction and costs nothing on honest validation (42/56 either way).
+
+
+def step_floor_seconds(gpu: str, completions: int) -> float:
+    """Per-step seconds the FLOPs terms do not account for.
+
+    An unmeasured ``gpu`` gets the pooled floor, never a guess: the per-card offsets below are
+    measured corrections for cards the campaign covered, not a model of hardware.
+    """
+    offset = STEP_FLOOR_CARD_OFFSET_SECONDS.get(gpu, 0.0)
+    floor = STEP_FLOOR_BASE_SECONDS + STEP_FLOOR_SECONDS_PER_COMPLETION * max(0, completions)
+    return max(0.0, floor + offset)
+
+
 # --- MoE (mixture-of-experts) per-step correction ----------------------------------------------
 # For an MoE model (active params << total, e.g. Qwen3.6-35B-A3B: ~3B active / 35B total) the wall
 # time per step is NOT the tiny active-param FLOPs the dense model predicts. Routing, all-expert
@@ -121,12 +255,50 @@ def setup_seconds(config: RunConfig) -> float:
     return s
 
 
-def _opd_step_shape(n: RunConfig) -> tuple[int, int]:
+def _opd_step_shape(n: RunConfig) -> tuple[int, float]:
     """(completions per step, prompt+completion tokens per step) for one OPD step, from a NORMALIZED
-    config. completions = batch x group; each is billed over the FULL n.seq_len (prompt+completion,
-    not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
+    config. completions = batch x group; each is billed over the FULL prompt+completion length
+    (not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
     completions = n.batch_size * n.group_size
-    return completions, completions * n.seq_len
+    return completions, completions * _sequence_tokens(n)
+
+
+def _sequence_tokens(n: RunConfig) -> float:
+    """Prompt+completion tokens ONE rollout costs, measured when a profile exists.
+
+    ``n.seq_len`` is ``max_context_tokens``: a capacity ceiling the engine is configured with, not
+    the work a step performs. Billing it assumes every rollout fills the context, which measurement
+    contradicts -- realized generation ran 0.323x of a 2048-token cap on the reference sample.
+
+    Both halves must be measured together. Substituting a measured completion length while leaving
+    the prompt at the context ceiling would price a short completion onto a full-context prompt,
+    which is not a shape any rollout has.
+    """
+    if n.measured_completion_tokens is None or n.measured_prompt_tokens is None:
+        return float(n.seq_len)
+    measured = n.measured_prompt_tokens + n.measured_completion_tokens
+    # the ceiling still binds: a measured mean above it would mean the profile and the run
+    # disagree about the engine's context, and the engine wins.
+    return min(float(n.seq_len), measured)
+
+
+def _completion_tokens(n: RunConfig) -> float:
+    """Tokens ONE rollout generates, measured when a profile exists, else the declared cap."""
+    if n.measured_completion_tokens is None:
+        return float(n.completion_len)
+    return min(float(n.completion_len), n.measured_completion_tokens)
+
+
+def _describe_rollout_tokens(n: RunConfig) -> str:
+    """How the rollout length reaching the quote should be shown to the user.
+
+    A measured quote and a cap-based quote can differ several-fold, so the note has to say which
+    one it is. Reporting a measured mean as though it were the configured cap would make the
+    cheaper number look like a pricing change rather than a measurement.
+    """
+    if n.measured_completion_tokens is None:
+        return f"{n.completion_len} tok"
+    return f"{_completion_tokens(n):.0f} tok measured (cap {n.completion_len})"
 
 
 def required_save_overhead_seconds(config: RunConfig) -> float:
@@ -240,9 +412,20 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # the worker and broker enforce the same shared concurrency ceiling.
         teacher_waves = math.ceil(score_items / OPD_TEACHER_SCORING_CONCURRENCY)
         teacher_s = teacher_waves * teacher_lat
+        # opd samples on-policy and syncs weights to the rollout engine exactly as grpo does, so it
+        # pays the same unmodelled per-step floor. it has no frozen-reference forward, but
+        # old_log_prob and the weight sync are rollout properties, not grpo-specific ones.
+        #
+        # UNVALIDATED EXTRAPOLATION: all 56 arms the floor was fitted and validated on are GRPO.
+        # The reasoning above is mechanical (same rollout engine, same weight sync, same
+        # checkpointing) but no OPD arm has confirmed the CONSTANTS transfer. The floor is a much
+        # larger share of an opd step than a grpo one (~94% of the gpu-bound half at 4B vs ~88%),
+        # so an error here is proportionally worse for opd. Treat opd quotes as carrying the floor's
+        # uncertainty un-measured until a matched opd campaign exists.
+        floor_s = step_floor_seconds(gpu, completions)
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
-        return gen_s + update_s, overhead + teacher_s
+        return gen_s + update_s + floor_s, overhead + teacher_s
 
     if not n.is_grpo:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
@@ -250,15 +433,31 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
 
     # GRPO step = rollout (G completions/prompt) + serial reward grading + policy/ref update.
     completions = n.batch_size * n.group_size
-    gen_tokens = completions * n.completion_len
+    # measured realized generation when a rollout profile exists, else max_completion_tokens. this
+    # count feeds BOTH terms below, so quoting the cap multiplies its error through the two largest
+    # parts of a grpo step.
+    gen_tokens = completions * _completion_tokens(n)
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * update_mfu)
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
     # every completion is scored, one at a time (see the serial-scoring note above).
     reward_s = completions * latency
+    # old_log_prob + weight sync + checkpointing: real gpu work with no flops term of its own.
+    # gpu-bound, not fixed -- it is compute on this card, so a faster card shortens it, unlike
+    # reward grading which is a wait on off-gpu python.
+    #
+    # MULTI-CARD CAVEAT: being in the gpu-bound half means the whole floor is divided by
+    # multi_card_speedup(), and only ~80% of it should be. Within the floor, old_log_prob (79.9%)
+    # is a real forward pass that fsdp shards, but update_weights (13.4%) is a weight COPY into the
+    # vllm engine that every rank pays, and save_checkpoint (6.7%) is disk i/o. Sharding those two
+    # under-quotes a wide run: +5% at 2 cards, ~+10% at 8. Every arm the floor was fitted on is
+    # SINGLE-CARD, so splitting the floor into shardable and non-shardable parts would be a fit
+    # against no data. Tracked as a follow-up needing matched multi-card arms; the error is bounded
+    # and in the same direction the multi_card_speedup extrapolation already errs.
+    floor_s = step_floor_seconds(gpu, completions)
     # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
     # changes. a grpo step dominated by it is latency-bound, not compute-bound.
-    return gen_s + update_s, overhead + reward_s
+    return gen_s + update_s + floor_s, overhead + reward_s
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
@@ -527,7 +726,7 @@ def _notes(
         teacher_name = resolve_teacher(n.teacher_model).display_name
         notes.append(
             f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {n.completion_len} tok + {teacher_name} teacher scoring "
+            f"@ {_describe_rollout_tokens(n)} + {teacher_name} teacher scoring "
             f"({tsec:.2f}s/request, {OPD_TEACHER_SCORING_CONCURRENCY} concurrent) + policy "
             "update (no local reference forward)"
         )
@@ -536,7 +735,7 @@ def _notes(
         rsec = reward_seconds_per_completion(n.reward_seconds_per_completion)
         notes.append(
             f"GRPO step = vLLM rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {n.completion_len} tok + reward ({rsec:.2f}s/completion"
+            f"@ {_describe_rollout_tokens(n)} + reward ({rsec:.2f}s/completion"
             + (f", env {n.environment}" if n.environment else "")
             + ") + policy+reference update"
         )
