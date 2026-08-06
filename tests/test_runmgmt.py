@@ -2781,6 +2781,102 @@ def test_profile_attempt_allowance_never_exceeds_the_work_budget(monkeypatch, tm
     assert attempt_spec.gpu.max_wall_seconds <= runner._WORKLOAD_PROFILE_WALL_SECONDS
 
 
+def test_profile_worker_deadline_excludes_the_unspent_queue_allowance(monkeypatch, tmp_path):
+    """The absolute deadline handed to the worker is bounded the same way its wall budget is.
+
+    Capping ``max_wall_seconds`` is not sufficient on its own. The bootstrap derives its own
+    execution deadline from the absolute ``deadline_at`` it is passed
+    (``_worker_execution_deadline``) and enforces it independently, so handing over the run-global
+    deadline lets a profile that got capacity immediately keep working through the queue window on
+    a job priced for its wall alone -- the same overrun the wall cap was added to prevent.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    # capacity arrived instantly: the queue allowance is entirely unspent, so the persisted
+    # run-global deadline is the one that still contains it.
+    launched_at = created_at + 1.0
+    stored = runner._load_run_deadline_at(spec.run_id)
+    assert stored == pytest.approx(
+        created_at
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+    worker_deadline = runner._worker_deadline_at(spec.run_id, spec, now=launched_at)
+    assert worker_deadline == pytest.approx(launched_at + runner._WORKLOAD_PROFILE_WALL_SECONDS)
+    # the whole point: strictly earlier than the run-global deadline, by the unspent allowance.
+    assert worker_deadline < stored
+    assert stored - worker_deadline == pytest.approx(
+        runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS - 1.0
+    )
+
+    # a training run is unaffected -- its deadline is submission-to-terminal by contract.
+    from flash.spec import GpuSpec, JobSpec
+
+    train_spec = JobSpec(
+        run_id="train-" + "b" * 20,
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        gpu=GpuSpec(type="RTX 5090", provider="runpod", max_wall_seconds=3600.0),
+    )
+    runner._save_status(
+        runner.RunStatus(
+            run_id=train_spec.run_id,
+            state="queued",
+            spec=train_spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": train_spec.to_internal_dict()},
+        )
+    )
+    assert runner._worker_deadline_at(
+        train_spec.run_id, train_spec, now=launched_at
+    ) == pytest.approx(runner._load_run_deadline_at(train_spec.run_id))
+
+
+def test_armed_profile_worker_deadline_never_extends_past_the_armed_budget(monkeypatch, tmp_path):
+    """Once armed, the persisted deadline is the authority and the bound may not extend it.
+
+    A worker that speaks and then relaunches or stalls must not win a fresh full work budget from
+    the moment of the later launch; the min() keeps the armed deadline binding.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    armed_at = created_at + 5.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        ),
+        _profile_wall_armed_at=armed_at,
+        _run_deadline_at=armed_at + runner._WORKLOAD_PROFILE_WALL_SECONDS,
+    )
+
+    stored = runner._load_run_deadline_at(spec.run_id)
+    assert stored == pytest.approx(armed_at + runner._WORKLOAD_PROFILE_WALL_SECONDS)
+    # a later launch must inherit the armed deadline, not restart the budget from now.
+    later = armed_at + 120.0
+    assert runner._worker_deadline_at(spec.run_id, spec, now=later) == pytest.approx(stored)
+
+
 def test_first_profile_heartbeat_arms_the_work_budget(monkeypatch, tmp_path):
     """The wall starts when the worker first speaks, and the tamper guard accepts that pair."""
     import flash.runner as runner
