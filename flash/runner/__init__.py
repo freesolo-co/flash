@@ -1536,6 +1536,49 @@ def _persist_effective_worker_spec(
     return _update(worker_spec.run_id, status.state, **fields)
 
 
+def _persist_profile_submission(status: RunStatus, save_kwargs: dict) -> RunStatus | None:
+    """Write a profile's submission record, returning a live run to join instead of restarting.
+
+    A profile's run id is derived from the workload rather than the account, so this id is reused
+    by design and the record it writes may not be the first under it.
+    """
+    with _status_guard(status.run_id):
+        raw_existing = (
+            _load_status_json(status.run_id)
+            if os.path.exists(runs_file_path(status.run_id, ".json"))
+            else None
+        )
+        existing = _runstatus_from_json(raw_existing) if raw_existing is not None else None
+        # a live profile under this id is joined, never restarted: a concurrent submitter of the
+        # same config lands here and must wait on the running one rather than launch a second
+        # billed copy of identical work.
+        if existing is not None and existing.state not in _UNDEPLOYABLE_STATES:
+            return existing
+        # a spent one is replaced. the caller only reaches this after winning the takeover on that
+        # exact spent record, so overwriting it is the relaunch, not a lost update.
+        if raw_existing is not None:
+            # the RECORD is replaced but the ARTIFACTS are not: the reused id means this lifecycle
+            # uploads to the HF prefix ({phase}/{run_id}) the spent one left behind, so two private
+            # keys have to carry across the overwrite rather than restart with it.
+            #
+            # attempt identity stays globally monotonic. error_<phase>_attempt<N>.txt is
+            # attempt-scoped, and _instance_poll treats a present one as THIS handle's crash
+            # ("error files are attempt-scoped, so a present file already belongs to this exact
+            # handle") -- sound only while an id never repeats. restarting at 0 hands the fresh run
+            # the spent one's attempt-0 error file, and it dies job_failed seconds after launch,
+            # deterministically, on hardware it never used.
+            save_kwargs["_next_attempt"] = _infer_next_attempt(raw_existing)
+            # the wall, by contrast, must NOT carry: an arm records that a worker spoke, and that
+            # worker was the previous lifecycle's. inheriting it dates this run's budget to a
+            # heartbeat predating its own submission -- and since _canonical_run_deadline rebuilds
+            # the deadline from that basis, the stored pair stops matching and every read fails the
+            # tamper check, wedging this workload's profile id for every submitter. None drops the
+            # stored key rather than carrying it forward.
+            save_kwargs["_profile_wall_armed_at"] = None
+        _save_status_unlocked(status, **save_kwargs)
+    return None
+
+
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -1622,20 +1665,9 @@ def submit_job(
         ),
     }
     if worker_spec.workload_profile_kind:
-        with _status_guard(status.run_id):
-            existing = (
-                _runstatus_from_json(_load_status_json(status.run_id))
-                if os.path.exists(runs_file_path(status.run_id, ".json"))
-                else None
-            )
-            # a live profile under this id is joined, never restarted: the id is deterministic in
-            # the workload, so a concurrent submitter of the same config lands here and must wait
-            # on the running one rather than launch a second billed copy of identical work.
-            if existing is not None and existing.state not in _UNDEPLOYABLE_STATES:
-                return existing
-            # a spent one is replaced. the caller only reaches this after winning the takeover on
-            # that exact spent record, so overwriting it is the relaunch, not a lost update.
-            _save_status_unlocked(status, **save_kwargs)
+        joined = _persist_profile_submission(status, save_kwargs)
+        if joined is not None:
+            return joined
     else:
         _save_status(status, **save_kwargs)
     _report_status(status)
@@ -2663,6 +2695,8 @@ def _save_status_unlocked(
         value = private_values[key]
         if value is _PRIVATE_VALUE_UNSET:
             value = existing.get(key, _PRIVATE_VALUE_UNSET)
+        # an explicit None drops the key (it skips the carry-forward above, then this write);
+        # _PRIVATE_VALUE_UNSET means "keep whatever is on disk".
         if value is not _PRIVATE_VALUE_UNSET and value is not None:
             data[key] = value
     fd, tmp = tempfile.mkstemp(dir=RUNS_DIR, prefix=f"{status.run_id}.", suffix=".tmp")
