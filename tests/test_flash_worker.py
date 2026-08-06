@@ -562,30 +562,39 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     that really runs. Two of the old assertions are intentionally NOT reproduced -- LoRA+ B-matrix
     ratio plumbing and the chunked_nll loss_type -- because they were properties of trl's
     SFTTrainer call, and verl owns its own loss and kernel path.
+
+    The optimizations now live in two modules rather than one. Dataset preprocessing moved to
+    flash.engine.sft_workload so the profile run and the training run share one implementation, and
+    the sizing/memory choices stayed with the trainer that makes them. Each assertion reads the
+    module that actually owns its behaviour: pointing them all at one module would let a symbol
+    disappear from the other and still pass.
     """
     import inspect
 
+    from flash.engine import sft_workload
     from flash.engine.worker import sft, sft_train
 
     # run_sft is now a pure delegation: no backend selector, no trainer of its own.
     assert "run_sft_train()" in inspect.getsource(sft.run_sft)
 
-    src = inspect.getsource(sft_train)
+    workload_src = inspect.getsource(sft_workload)
     # completion-only supervision survives, as verl's loss_mask rather than trl's completion_mask.
-    assert "_pretokenize_completion_only(" in src
-    assert "completion_mask_from_ids(" in src
-    assert '"loss_mask": tokenized["completion_mask"]' in src
+    assert "_pretokenize_completion_only(" in workload_src
+    assert "completion_mask_from_ids(" in workload_src
+    assert '"loss_mask": tokenized["completion_mask"]' in workload_src
+
+    train_src = inspect.getsource(sft_train)
     # revision-aware vocab resolution: the worker must size the realized batch through the SAME
     # resolver the cost quote priced with, else a revision-pinned run drifts from its quote.
-    assert "resolve_vocab_size(" in src
-    assert "vocab_size_for(model_id)" not in src
+    assert "resolve_vocab_size(" in train_src
+    assert "vocab_size_for(model_id)" not in train_src
     # per-device micro-batch / grad-accum sizing for the large-vocab logits cap.
-    assert "sft_grad_accum(" in src
+    assert "sft_grad_accum(" in train_src
     # gradient checkpointing, with the MoE/GDN reentrant rule shared with grpo.
-    assert "grad_checkpointing_on(" in src
-    assert "grpo_use_reentrant(" in src
+    assert "grad_checkpointing_on(" in train_src
+    assert "grpo_use_reentrant(" in train_src
     # LoRA+ survives (verl builds the optimizer itself, but flash still supplies the grouping).
-    assert "create_loraplus_optimizer" in src
+    assert "create_loraplus_optimizer" in train_src
 
 
 def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):

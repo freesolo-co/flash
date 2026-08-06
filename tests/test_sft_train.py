@@ -8,10 +8,12 @@ import os
 import re
 import sys
 import types
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
+from flash.engine.sft_workload import _serialize_multimodal_inputs
 from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.sft import _pretokenize_completion_only
 from flash.engine.worker.sft_train import (
@@ -22,9 +24,9 @@ from flash.engine.worker.sft_train import (
     _build_verl_child_env,
     _render_sft_dataset_module,
     _render_sft_sitecustomize,
-    _serialize_multimodal_inputs,
     _write_sft_parquet,
     build_sft_overrides,
+    render_exact_sft_dataloader_shim,
     render_loraplus_shim,
 )
 
@@ -498,6 +500,107 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
     assert scheduler_calls == [("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})]
 
 
+def _exec_dataloader_shim(monkeypatch):
+    """Execute the real rendered dataloader shim against fake torch classes, and return them.
+
+    The shim is a string concatenated into the shipped sitecustomize, so nothing else in the suite
+    would notice it breaking: an import it cannot satisfy, or a patch that silently stops applying,
+    surfaces on a rented gpu as rows arriving in a different order than the profile measured.
+    """
+    sampler_calls: list[dict] = []
+    loader_calls: list[dict] = []
+
+    class FakeDistributedSampler:
+        def __init__(self, dataset, **kwargs):
+            sampler_calls.append(kwargs)
+
+    class FakeStatefulDataLoader:
+        def __init__(self, dataset, **kwargs):
+            loader_calls.append(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch.utils.data.distributed",
+        _module("torch.utils.data.distributed", DistributedSampler=FakeDistributedSampler),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torchdata.stateful_dataloader",
+        _module("torchdata.stateful_dataloader", StatefulDataLoader=FakeStatefulDataLoader),
+    )
+
+    exec(compile(render_exact_sft_dataloader_shim(), "sitecustomize.py", "exec"), {})
+    return FakeDistributedSampler, FakeStatefulDataLoader, sampler_calls, loader_calls
+
+
+def test_dataloader_shim_forces_the_row_order_the_profile_measured(monkeypatch):
+    """Shuffle off and drop_last off, whatever verl asked for.
+
+    Both are overrides, not defaults: verl passes shuffle=True and drop_last=True itself, so a shim
+    that merely supplied them when absent would change nothing. Shuffling would reorder the rows
+    the profile tokenized in a fixed order, and dropping the last partial batch would train on
+    fewer examples than were measured and quoted -- neither of which fails loudly.
+    """
+    sampler, loader, sampler_calls, loader_calls = _exec_dataloader_shim(monkeypatch)
+
+    sampler(["row"], shuffle=True, num_replicas=1, rank=0)
+    loader(["row"], drop_last=True, batch_size=2)
+
+    assert sampler_calls == [{"shuffle": False, "num_replicas": 1, "rank": 0}]
+    assert loader_calls == [{"drop_last": False, "batch_size": 2}]
+
+
+def test_dataloader_shim_sets_both_flags_when_the_caller_omits_them(monkeypatch):
+    """A caller that passes neither must still get the exact-order behaviour.
+
+    verl currently passes both, but the shim's guarantee cannot depend on that: a verl release that
+    started relying on the library defaults (shuffle=True, drop_last=False for the sampler) would
+    silently reintroduce shuffling through a shim that only rewrote what it was given.
+    """
+    sampler, loader, sampler_calls, loader_calls = _exec_dataloader_shim(monkeypatch)
+
+    sampler(["row"])
+    loader(["row"])
+
+    assert sampler_calls == [{"shuffle": False}]
+    assert loader_calls == [{"drop_last": False}]
+
+
+def test_dataloader_shim_patches_the_classes_verl_imports(monkeypatch):
+    """The patch must land on the shared class objects, not on a copy the shim made.
+
+    A shim that rebound its own local name would execute cleanly and assert nothing -- verl
+    constructs the sampler through its own import of the same class, so the identity of the patched
+    attribute is the whole mechanism.
+    """
+    sampler, loader, _sampler_calls, _loader_calls = _exec_dataloader_shim(monkeypatch)
+
+    from torch.utils.data.distributed import DistributedSampler
+    from torchdata.stateful_dataloader import StatefulDataLoader
+
+    assert DistributedSampler is sampler
+    assert StatefulDataLoader is loader
+    assert DistributedSampler.__init__.__name__ == "_flash_exact_sampler_init"
+    assert StatefulDataLoader.__init__.__name__ == "_flash_exact_loader_init"
+
+
+def test_shipped_shim_carries_the_exact_dataloader_patch(monkeypatch):
+    """The rendered fragment is only worth testing if it reaches the file verl imports.
+
+    ``run_sft_train`` concatenates it onto the sitecustomize source; asserting that here keeps the
+    three tests above from passing against a fragment nothing writes out.
+    """
+    import pathlib
+
+    import flash.engine.worker.sft_train as sft_train_module
+
+    fragment = render_exact_sft_dataloader_shim()
+    source = "".join(pathlib.Path(sft_train_module.__file__).read_text().split())
+    assert "shim_source+=render_exact_sft_dataloader_shim()" in source
+    assert "shuffle" in fragment
+    assert "drop_last" in fragment
+
+
 def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointing():
     """GRAD-001: lora freezes the embeddings, so nothing entering the first checkpointed layer
     requires grad and reentrant checkpointing returns no gradient at all. the shim must call
@@ -822,13 +925,27 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
 
     the caller supplies its own ``run_verl_training`` fake, which is the only remaining seam.
     """
+    import flash.catalog as catalog
     import flash.engine.vram as vram
     import flash.engine.worker as worker
     from flash.engine.worker import sft_train
 
+    monkeypatch.setattr(catalog, "resolve_vocab_size", lambda *_args, **_kwargs: 151936)
+
     spec = SimpleNamespace(
         model="Qwen/Qwen3.5-0.8B",
-        model_revision="",
+        model_revision="a" * 40,
+        algorithm="sft",
+        seed=7,
+        thinking=False,
+        worker_env={},
+        workload_profile_input_digest="",
+        workload_profile={},
+        environment=SimpleNamespace(
+            id="owner/env",
+            resolved_sha="b" * 40,
+            params={},
+        ),
         gpu=SimpleNamespace(type="RTX 4090", exact_type="", count=2),
         train=SimpleNamespace(
             epochs=1,
@@ -877,6 +994,24 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
             if add_generation_prompt:
                 rendered += "<assistant>"
             return rendered
+
+    from flash import __version__
+    from flash.engine.sft_workload import prepare_sft_workload
+    from flash.workload_profile import sft_profile_input_digest
+
+    spec.workload_profile_input_digest = sft_profile_input_digest(
+        spec,
+        tokenizer_revision=spec.model_revision,
+        producer_version=__version__,
+    )
+    spec.workload_profile = prepare_sft_workload(
+        spec,
+        Env(),
+        tokenizer_loader=lambda _model, _revision: Tokenizer(),
+        producer_version=__version__,
+        allow_packing=False,
+        packing_support=lambda _model, _revision: ("unsupported", False),
+    ).profile.to_dict()
 
     class LoraConfig:
         r = 16
@@ -1056,6 +1191,42 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
         f"data.max_token_len_per_gpu={realized_max_length * notes['per_device_train_batch_size']}"
         in captured["command"]
     )
+
+
+def test_a_workload_that_moved_under_the_frozen_quote_stops_before_training(monkeypatch):
+    """The worker re-derives the workload and refuses to train on one the quote never priced.
+
+    The environment is pinned by SHA, so this is not the ordinary case: it is the one where the
+    pinned inputs still produce different rows (a non-deterministic dataset build, a tokenizer
+    resolving differently). Training anyway would bill a run against a quote measured on other
+    data, so the profile is evidence to check rather than metadata to carry.
+
+    The drift has to come from the workload, not from the artifact. A profile carries its own
+    content digest, so an edited one is rejected as corrupt before this guard is reached; only a
+    re-derivation that legitimately disagrees can exercise it.
+    """
+    from flash.engine import sft_workload
+    from flash.engine.worker import sft_train
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    honest = sft_workload.prepare_sft_workload
+
+    def drifted(*args, **kwargs):
+        prepared = honest(*args, **kwargs)
+        moved = replace(
+            prepared.profile, realized_max_length=prepared.profile.realized_max_length - 1
+        )
+        return replace(prepared, profile=moved)
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", drifted)
+
+    def unreachable_training(command, *, env, on_step, on_line, heartbeat):
+        raise AssertionError("training must not start on a workload the quote did not price")
+
+    monkeypatch.setattr(sft_train, "run_verl_training", unreachable_training)
+
+    with pytest.raises(ValueError, match="workload changed after the quote was frozen"):
+        sft_train.run_sft_train(spec)
 
 
 def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monkeypatch):

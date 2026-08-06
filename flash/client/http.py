@@ -29,9 +29,24 @@ class RequestTimeoutError(ClientError):
 
 
 class ApiError(ClientError):
-    def __init__(self, status: int, message: str):
+    """A non-2xx response from a Flash/freesolo endpoint.
+
+    ``detail`` keeps the server's FastAPI ``detail`` as parsed, so a caller can branch on a
+    structured payload (``{"code": ..., ...}``) instead of parsing it back out of a dict's repr.
+    The message is unchanged, so callers that match on ``str(exc)`` behave exactly as before.
+    """
+
+    def __init__(self, status: int, message: str, *, detail: object | None = None):
         super().__init__(message)
         self.status = status
+        self.detail = message if detail is None else detail
+
+    @property
+    def code(self) -> str:
+        """The server's machine-readable error code, or "" for an unstructured detail."""
+        if isinstance(self.detail, dict):
+            return str(self.detail.get("code") or "")
+        return ""
 
 
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
@@ -49,14 +64,23 @@ def freesolo_base_url(override: str | None = None) -> str:
     )
 
 
-def _detail_from_http_error(exc: urllib.error.HTTPError) -> str:
-    """Extract the server's error message from an HTTPError body (FastAPI ``detail``)."""
+def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
+    """Extract the server's ``detail`` from an HTTPError body, as parsed.
+
+    A structured detail stays a dict so the caller can read its ``code``; anything else is the
+    string it always was. ``str()`` it for a message, but branch on the object itself.
+    """
     body = exc.read()
     try:
         detail = json.loads(body).get("detail") or body.decode()
     except (ValueError, AttributeError):
         detail = body.decode(errors="replace") if body else str(exc)
-    return str(detail)
+    return detail if isinstance(detail, dict) else str(detail)
+
+
+def _api_error(exc: urllib.error.HTTPError) -> ApiError:
+    detail = _detail_from_http_error(exc)
+    return ApiError(exc.code, str(detail), detail=detail)
 
 
 def _read_capped_response(resp: object, max_bytes: int) -> bytes:
@@ -95,7 +119,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
                 "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
                 "(or FREESOLO_API_KEY)"
             ) from exc
-        raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+        raise _api_error(exc) from exc
     except urllib.error.URLError as exc:
         raise ClientError(
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "
@@ -129,7 +153,7 @@ def _freesolo_request(
                 "freesolo rejected this API key — run `flash login` with a valid key "
                 "(or set FREESOLO_API_KEY)"
             ) from exc
-        raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+        raise _api_error(exc) from exc
     # a socket timeout surfaces as a bare TimeoutError rather than a URLError, so without this
     # it escapes as an unexpected exception. callers catch ClientError to report a failure
     # without changing their own verdict; a traceback instead would lose that.
@@ -384,8 +408,13 @@ class ApiClient:
             return {"Authorization": f"Bearer {self.api_key}"}
         return {}
 
-    def _auth_error_detail(self, status: int, detail: str) -> str:
+    def _auth_error_detail(self, status: int, detail: object) -> object:
+        # only a plain-text detail is appended to. a structured detail is a machine-readable
+        # payload whose keys the caller branches on, so splicing prose into it would either
+        # corrupt a field or invent one.
         if status not in {401, 403} or self.key_source != "FREESOLO_API_KEY":
+            return detail
+        if isinstance(detail, dict):
             return detail
         return (
             f"{detail}; FREESOLO_API_KEY is set and overrides the key saved by "
@@ -399,7 +428,7 @@ class ApiClient:
             yield
         except urllib.error.HTTPError as exc:
             detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
-            raise ApiError(exc.code, detail) from exc
+            raise ApiError(exc.code, str(detail), detail=detail) from exc
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), TimeoutError):
                 raise RequestTimeoutError(
@@ -578,8 +607,11 @@ class ApiClient:
         if runtime_secrets:
             body["runtime_secrets"] = runtime_secrets
         if dry_run:
-            # Server-side preview: runs the same validation/preflights as a real submit and records a
-            # state=dry_run run, but allocates no GPU and charges nothing. Returns that status.
+            # server-side preview: runs the same validation/preflights as a real submit and records
+            # a state=dry_run run, but allocates no training gpu and charges nothing for training.
+            # returns that status. an sft preview additionally requires an exact workload profile;
+            # on a miss the server starts that separate, separately billed profile run and answers
+            # 409 workload_profile_pending, so a preview is free of training spend, not all spend.
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
