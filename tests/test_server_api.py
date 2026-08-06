@@ -1143,12 +1143,16 @@ def test_the_route_never_makes_submit_job_launch_the_profile_itself(api, monkeyp
             ),
         )
 
-    # only the PREPARE half is stubbed. submit_job stays real, so if the route stopped passing
-    # prepared_job this would re-enter prepare() and the count below would catch it. the route
-    # submits with background=True, so stubbing the thread body is what keeps this offline -- the
-    # whole of submit_job up to and including the profile branch still runs for real.
+    # BOTH bindings, and that is the whole point of the test. the route calls
+    # ``_app.prepare_job`` (app.py's import), but submit_job calls ``prepare_job`` as a BARE NAME,
+    # which resolves through flash.runner's own globals. patching only app_mod would leave the
+    # recursion calling the real prepare_job, so the counter below could never see the second call
+    # it exists to detect -- the assertion would read as passing while testing nothing.
     monkeypatch.setattr(app_mod, "prepare_job", prepare)
+    monkeypatch.setattr(runner, "prepare_job", prepare)
     launched = []
+    # submit_job stays real. the route submits with background=True, so stubbing the thread body is
+    # what keeps this offline -- the whole of submit_job, including the profile branch, runs for real.
     monkeypatch.setattr(runner, "_run_job_background", lambda *a, **k: launched.append(a))
 
     resp = api.post(
@@ -1157,11 +1161,17 @@ def test_the_route_never_makes_submit_job_launch_the_profile_itself(api, monkeyp
         json={"spec": {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 8}}},
     )
 
+    # the INVARIANT assertion comes first, deliberately. under mutation the route also returns a
+    # different status, and asserting that first would mask this one -- the test would fail for a
+    # reason unrelated to the invariant it names, which is how an assertion ends up inert.
+    # exactly one entry: a second means submit_job re-prepared, i.e. it took the recursive branch
+    # that skips the ownership claim and bills an unclaimed profile run.
+    assert len(prepare_calls) == 1, (
+        f"submit_job re-prepared: {prepare_calls}. the route must pass prepared_job so the "
+        "unclaimed self-launch branch stays unreachable"
+    )
     assert resp.status_code == 409
     assert resp.json()["detail"]["code"] == "workload_profile_pending"
-    # exactly once. a second entry means submit_job re-prepared, i.e. it took the recursive branch
-    # that skips the ownership claim.
-    assert len(prepare_calls) == 1
 
 
 def test_a_second_owner_needing_the_same_profile_is_not_blocked_by_the_first(api, monkeypatch):
