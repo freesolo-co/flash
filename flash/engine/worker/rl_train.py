@@ -64,6 +64,7 @@ from flash.engine.worker.backend_common import (
     raise_for_classified_verl_exit,
     ray_num_cpus,
     reap_stragglers,
+    render_gdn_varlen_shim,
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
@@ -75,6 +76,7 @@ from flash.engine.worker.backend_common import (
     stage_verl_resume,
     stamp_adapter_dir_provenance,
     trainer_dtype_overrides,
+    verl_child_gdn_reset_arch,
     verl_supports_rollout_field,
 )
 from flash.engine.worker.heartbeat import (
@@ -87,6 +89,7 @@ from flash.engine.worker.heartbeat import (
 from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.multiturn_glue import validate_glue_template
 from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
+from flash.engine.worker.packing import model_is_gdn_hybrid
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import (
@@ -305,10 +308,19 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.actor.loss_agg_mode={cfg['loss_agg_mode']}",
         "algorithm.use_kl_in_reward=False",
         # truncated importance sampling (token-level, cap 2.0): corrects the vllm-rollout vs
-        # fsdp-train policy mismatch. matches the retired trl path's tis recipe (token_truncate, c_max=2.0);
-        # verl otherwise defaults to sequence-level tis, so pin token to match flash.
+        # fsdp-train policy mismatch (token_truncate, c_max=2.0). verl otherwise defaults to
+        # sequence-level tis, so pin token.
         "algorithm.rollout_correction.rollout_is=token",
         "algorithm.rollout_correction.rollout_is_threshold=2.0",
+        # REQUIRED for the two overrides above to do anything. verl gates the correction on the
+        # rollout logprobs being ON THE BATCH (ray_trainer.py:1608 `"rollout_log_probs" in
+        # batch.batch`), and that key is written in exactly one place -- agent_loop.py:124, only
+        # when the sampler was asked for logprobs via `logprobs=config.calculate_log_probs`
+        # (agent_loop.py:501), which defaults False. without this the rollout_is overrides compose
+        # cleanly, cost nothing, and silently apply no correction at all. the same gate gets flash's
+        # multi-turn loop: it collects response_logprobs itself but reads them off the same sampler
+        # result, so they arrive None and it emits no vector.
+        "actor_rollout_ref.rollout.calculate_log_probs=True",
         f"data.train_files={cfg['train_files']}",
         f"data.val_files={cfg['val_files']}",
         f"data.train_batch_size={cfg['prompts_per_step']}",
@@ -368,7 +380,9 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # 32k contexts: fused linear-CE computes logprobs/entropy from hidden states + lm_head in
         # chunks (FusedLinearForPPO), never materializing the [tokens, vocab] logits tensor
         # (~130 GB at 32k on a 248k vocab). torch backend = numerically exact, no extra deps.
-        "actor_rollout_ref.model.use_remove_padding=True",
+        # packing the micro-batch into one row is only boundary-safe for a gdn hybrid when the child
+        # can honor seq_idx + cu_seqlens; see the gdn gate in run_rl_train.
+        f"actor_rollout_ref.model.use_remove_padding={cfg.get('use_remove_padding', True)}",
         "actor_rollout_ref.model.use_fused_kernels=True",
         "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
         *(
@@ -562,9 +576,11 @@ def _build_verl_training_cfg(
     project_name: str,
     experiment_name: str,
     n_gpus: int = 1,
+    use_remove_padding: bool = True,
 ) -> dict:
     engine_len = int(inp["engine_len"])
     return {
+        "use_remove_padding": use_remove_padding,
         "train_files": train_files,
         "val_files": val_files,
         "model_id": model_id,
@@ -693,6 +709,7 @@ def _build_verl_train_notes(
     reward_profile=None,
     step_intervals: list[float] | None = None,
     reward_bridge_batching: bool = False,
+    gdn_boundary_resets: bool | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -724,6 +741,13 @@ def _build_verl_train_notes(
         # engaged. this is resolved per-card (cc>=8.9, and never for gdn hybrids), so it is a property
         # of the run rather than of the config.
         "vllm_kv_cache_dtype": "fp8" if fp8_kv else None,
+        # same reasoning as vllm_kv_cache_dtype, and it matters more: whether the child could reset
+        # gdn state at packed example boundaries is resolved per-run by probing the child, announced
+        # only by a log line, and a successful run uploads no console. without this key a finished
+        # run gives no way to tell whether it packed with resets or fell back to the padded path --
+        # for a gate whose failure mode is silent contamination, that is the one thing worth
+        # recording. None for a non-gdn model, where the question does not arise.
+        "gdn_boundary_resets": gdn_boundary_resets,
         # an explicit vllm prefill-batch pin is only needed when the caller hardcodes 4096; this path sets no
         # such override, so the engine keeps its own default. None records "not pinned by flash"
         # rather than asserting a number flash never chose.
@@ -2974,7 +2998,7 @@ def _resolve_grpo_inputs():
     if hasattr(env, "prompt_opens_thinking"):
         env.prompt_opens_thinking = prompt_opened_thinking
 
-    # optimizer-update horizon, honoring [train].max_steps exactly like the retired trl path.
+    # optimizer-update horizon, honoring [train].max_steps exactly.
     epochs = int(_t.epochs) if (_t and _t.epochs is not None) else int(rl.num_epochs)
     derived_steps = on_policy_steps(
         epochs=epochs, prompt_count=len(prompts), prompts_per_step=prompts_per_step
@@ -3329,6 +3353,28 @@ def run_rl_train():
                 f"interpreter with '{VERL_REQUIREMENT}' installed, or set it EMPTY under "
                 '[worker_env] as FLASH_VERL_PYTHON = "" to provision one.'
             )
+        # gdn boundary resets need the CHILD to have fla + causal_conv1d: without them the kwargs
+        # are accepted and discarded, so packed examples bleed state into each other. appended here
+        # rather than with the shims above because the probe needs python_bin, which is resolved in
+        # this block; sitecustomize is imported by the child, which has not started yet.
+        gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
+        gdn_reset_arch = (
+            verl_child_gdn_reset_arch(python_bin, inp["model_id"], inp["model_revision"])
+            if gdn_hybrid
+            else None
+        )
+        gdn_boundary_resets = gdn_reset_arch is not None
+        use_remove_padding = not gdn_hybrid or gdn_boundary_resets
+        if gdn_reset_arch is not None:
+            with open(shim_py, "a") as f:
+                f.write(render_gdn_varlen_shim(gdn_reset_arch))
+        elif gdn_hybrid:
+            print(
+                "[grpo] gdn hybrid without child-side boundary resets: disabling remove-padding so "
+                "packed examples cannot contaminate each other (slower, correct)",
+                flush=True,
+            )
+
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see resolve_verl_loggers).
         loggers = resolve_verl_loggers(python_bin)
@@ -3341,16 +3387,15 @@ def run_rl_train():
         try:
             import torch as _torch_cc
 
-            from flash.engine.worker.packing import model_is_gdn_hybrid
-
             _cc_ok = bool(
                 _torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9)
             )
-            fp8_kv = _cc_ok and not model_is_gdn_hybrid(
-                inp["model_id"], revision=inp["model_revision"]
-            )
         except Exception:  # no cuda / probe failure -> conservative bf16 kv
-            fp8_kv = False
+            _cc_ok = False
+        # reuse the gdn answer resolved above rather than re-probing: model_is_gdn_hybrid returns
+        # False when its own probe raises, so a second call can disagree with the first and turn
+        # fp8 kv ON for the very hybrid the comment above says it crashes.
+        fp8_kv = _cc_ok and not gdn_hybrid
         # one capability probe, both rollout decisions below. asked of the verl interpreter, whose
         # torch/vllm stack is the one that has to run the rollout.
         verl_cc = resolve_verl_device_capability(python_bin)
@@ -3375,6 +3420,7 @@ def run_rl_train():
             enforce_eager=enforce_eager,
             attention_backend=attention_backend,
             mm_encoder_attn_backend=mm_encoder_attn_backend,
+            use_remove_padding=use_remove_padding,
             reward_path=reward_py,
             local_dir=local_dir,
             project_name=project_name,
@@ -3429,7 +3475,7 @@ def run_rl_train():
             env_for_verl.update(
                 multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
             )
-        if shim_source or inp["multi_turn"]:
+        if shim_source or inp["multi_turn"] or gdn_boundary_resets:
             # python imports sitecustomize automatically at startup, so the shim patches verl before
             # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
             # install itself, and ray workers inherit this env so every actor gets the same patch.
@@ -3692,5 +3738,6 @@ def run_rl_train():
             reward_profile=reward_profile,
             step_intervals=_step_intervals(step_line_times),
             reward_bridge_batching=not inp["multi_turn"],
+            gdn_boundary_resets=gdn_boundary_resets if gdn_hybrid else None,
         ),
     )

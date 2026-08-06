@@ -1,4 +1,4 @@
-"""Worker stack selection + TRL config compat + LoRA exclusion unit tests (CPU-only)."""
+"""Worker stack selection + worker config compat + LoRA exclusion unit tests (CPU-only)."""
 
 from __future__ import annotations
 
@@ -118,7 +118,7 @@ def test_model_revision_threads_through_config_probes(monkeypatch, revision):
 
     assert lora.is_vl_checkpoint("org/model", revision=revision)
     assert packing.model_is_gdn_hybrid("org/model", revision=revision)
-    assert not packing.model_is_pure_attention("org/model", revision=revision)
+    assert packing.gdn_model_type("org/model", revision=revision)
     assert sft._model_arch_dims("uncataloged/model", revision=revision) == (4096, 32)
     assert isinstance(liger._liger_default_for_model("org/model", revision=revision), bool)
 
@@ -628,21 +628,13 @@ def test_flash_attn_probes_false_in_ci(monkeypatch):
     assert w._flash_attn_available() is False  # flash_attn wheel absent in CI
 
 
-def test_liger_on_requires_default_and_gpu(monkeypatch):
-    """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
-    liger_kernel (both absent in CI), so it's off here too."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
-    assert w.liger_on(False) is False
-    assert w.liger_on(True) is False  # no CUDA / liger_kernel in CI
-
-
 def test_liger_default_model_size_gate(monkeypatch):
-    """Liger default is OFF for small models (1B-class, measured net loss PR #174) and ON only
-    for models ≥ ~3B where fused-CE's memory win pays off."""
+    """The model-size gate is OFF for small models (1B-class) and ON at ≥ ~3B.
+
+    Named for liger because that is where the threshold was measured (PR #174, fused-CE's memory win
+    only paying off above ~3B), but liger itself is gone from the verl paths: this predicate now
+    feeds ``_memory_mode`` -> ``grad_checkpointing_on``, so the threshold is load-bearing for
+    gradient checkpointing rather than for a fused-CE choice."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
@@ -1964,3 +1956,103 @@ def test_gpu_type_pin_still_rejects_underprovisioned_matching_card(monkeypatch):
 
     with pytest.raises(RetriableInfraError, match="does not match requested"):
         lifecycle.verify_gpu("H100", gpu_type="H100")
+
+
+def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
+    """No `except` may assign `gdn_hybrid`. A swallowed error must not answer the arch question.
+
+    THE regression for a real defect: opd computed `gdn_hybrid` in the SAME try block as its fp8-KV
+    `cuda.get_device_capability()` check, and that block's `except` set `gdn_hybrid = False`. The
+    capability call is evaluated FIRST, so any raise from it (no cuda, driver mismatch, a probe
+    failure with nothing to do with the checkpoint) skipped the classification entirely, reported a
+    genuine GDN hybrid as not-hybrid, skipped the boundary gate, and left `use_remove_padding` true
+    -- packing a GDN model with no boundary resets, exactly the contamination the gate prevents.
+
+    The hazard is specifically an `except` that SUPPLIES a value, because that is what converts an
+    unrelated failure into a confident wrong answer. A bare `try/finally` (grpo wraps its whole
+    training block in one) is fine: an exception propagates and the run dies rather than reaching the
+    packing decision with a fabricated `gdn_hybrid`. So this asserts on handler bodies, not on what
+    else shares the `try`.
+
+    `model_is_gdn_hybrid` already returns False on its own probe failure, so it needs no outer guard.
+    Asserted structurally, across all three algorithms, because the failure is invisible at runtime:
+    it fails toward "pack anyway", which logs nothing and moves no metric.
+    """
+    import ast
+    import inspect as _inspect
+
+    from flash.engine.worker import opd_train, rl_train, sft_train
+
+    for module in (sft_train, opd_train, rl_train):
+        tree = ast.parse(_inspect.getsource(module))
+        for handler in (n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)):
+            assigned = {
+                target.id
+                for node in ast.walk(handler)
+                if isinstance(node, ast.Assign)
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            }
+            assert "gdn_hybrid" not in assigned, (
+                f"{module.__name__}:{handler.lineno} an except handler assigns gdn_hybrid. a "
+                "failure anywhere in that try -- including probes unrelated to the checkpoint -- "
+                "would report a gdn hybrid as not-hybrid and pack it without boundary resets."
+            )
+
+
+def test_each_path_resolves_the_gdn_arch_question_exactly_once():
+    """`model_is_gdn_hybrid` may be called at most once per module. Two calls can disagree.
+
+    THE regression for a real defect: grpo asked the question twice -- once to decide packing, then
+    again inside the fp8-KV try to decide the kv dtype. The helper answers False when its OWN probe
+    raises (a hub blip, a revision fetch failure), so the second call could return False where the
+    first returned True. That turns fp8 kv ON for a GDN hybrid, which the code comment directly above
+    it says crashes vllm's wake path on the hybrid cache ('list' object has no attribute 'zero_').
+
+    Two calls with a swallowed exception between them are not one decision, they are two guesses that
+    happen to agree most of the time. Asserted structurally because the disagreeing case needs a
+    transient failure to reproduce and so will not show up in any deterministic test.
+    """
+    import ast
+    import inspect as _inspect
+
+    from flash.engine.worker import opd_train, rl_train, sft_train
+
+    for module in (sft_train, opd_train, rl_train):
+        tree = ast.parse(_inspect.getsource(module))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "model_is_gdn_hybrid"
+        ]
+        assert len(calls) <= 1, (
+            f"{module.__name__} calls model_is_gdn_hybrid {len(calls)} times (lines "
+            f"{[c.lineno for c in calls]}). it returns False on its own probe failure, so a second "
+            "call can contradict the first: resolve it once and reuse the value."
+        )
+
+
+def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
+    """All three verl paths must publish `gdn_boundary_resets` in their run metadata.
+
+    The gate is resolved per-run by probing the child, and it announces itself only with a log line.
+    A SUCCESSFUL run uploads no console, so without this key a finished GDN run gives no way to tell
+    whether it packed with boundary resets or fell back to the padded path. For a gate whose failure
+    mode is silent cross-example contamination, "which mode did this run actually train in" is the
+    one question the artifacts have to answer -- the same reasoning rl_train already applies to
+    `vllm_kv_cache_dtype`.
+
+    Asserted on the source rather than by invoking the builders, because opd's and grpo's metadata
+    dicts are constructed deep inside their run functions, behind a live bridge and a child process.
+    """
+    import inspect as _inspect
+
+    from flash.engine.worker import opd_train, rl_train, sft_train
+
+    for module in (sft_train, opd_train, rl_train):
+        assert '"gdn_boundary_resets"' in _inspect.getsource(module), (
+            f"{module.__name__} computes the gdn boundary-reset decision but never records it, so a "
+            "finished run cannot be checked for whether it trained packed-with-resets or padded."
+        )

@@ -55,12 +55,27 @@ FLASH_ATTN_SPEC = (
 # rather than inheriting the host's.
 VERL_VENV_PYTHON = "3.12"
 
+# gated-deltanet kernels for the verl interpreter, kept byte-identical to Dockerfile.worker's
+# verl-venv layer. fla resets the DeltaNet recurrence at packed example boundaries (cu_seqlens) and
+# causal_conv1d resets the short causal conv (seq_idx); WITHOUT them transformers falls back to
+# implementations that accept both arguments and silently discard them, so packed GDN training is
+# contaminated across example boundaries while appearing patched. fla is required; causal_conv1d is
+# best-effort (a failed build makes verl_child_gdn_reset_arch answer None, which turns
+# remove-padding off and trains padded rather than wrong).
+FLA_REQUIREMENT = (
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git"
+    "@f0e213dbd8b5fb90c3c7eca869ac1706d5377139"
+)
+CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
+
 # what a provisioned venv HOLDS, which is the only thing the stamp may identify. flash-attn belongs
 # in it because it is installed separately from verl and pinned separately: a workdir provisioned by
 # a release that installed verl but not flash-attn records the same VERL_REQUIREMENT, so a
 # verl-only stamp would let a retry reuse that venv, skip the install, and return an interpreter
-# missing exactly the package this path exists to guarantee.
-VERL_VENV_STAMP = f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}"
+# missing exactly the package this path exists to guarantee. fla is in the stamp for the same
+# reason: a venv from a release that predates it holds no fla, and reusing it would train gdn
+# models padded (or, worse, look patched) forever without ever reprovisioning.
+VERL_VENV_STAMP = f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}"
 
 
 # how many times the prebuilt-wheel install is attempted before the arm is handed back to the plane.
@@ -99,6 +114,24 @@ def _install_flash_attn(py: str) -> None:
                     f"(exit {e.returncode}): {FLASH_ATTN_SPEC}"
                 ) from e
             time.sleep(FLASH_ATTN_INSTALL_BACKOFF_S * (attempt + 1))
+
+
+def _install_causal_conv1d(py: str) -> None:
+    """Install the causal conv kernel that resets GDN conv state at packed example boundaries.
+
+    Best-effort, deliberately: unlike flash-attn this cannot fail the provisioning. Without it
+    ``verl_child_gdn_reset_arch`` answers None, the caller turns remove-padding off, and
+    the model trains on verl's padded path -- slower, but boundary-correct. Dying here instead would
+    turn a compiler hiccup into a dead paid run.
+
+    FORCE_BUILD is passed per-call rather than exported, so provisioning leaves no trace in the
+    environment verl inherits.
+    """
+    subprocess.run(
+        ["uv", "pip", "install", "--python", py, "--no-build-isolation", CAUSAL_CONV1D_REQUIREMENT],
+        check=False,
+        env={**os.environ, "CAUSAL_CONV1D_FORCE_BUILD": "TRUE"},
+    )
 
 
 def clamp_engine_len(engine_len: int, max_position_embeddings: int | None) -> int:
@@ -315,6 +348,102 @@ def verl_supports_rollout_field(python_bin: str, field: str) -> bool:
     return done.returncode == 0 and done.stdout.strip().endswith("1")
 
 
+# run in the VERL CHILD by verl_child_gdn_reset_arch. %(module)s is the checkpoint's
+# transformers modeling module, resolved by the parent. imports only transformers / causal_conv1d /
+# torch -- never flash, which is not installed in the verl venv (see the function's docstring).
+_GDN_BOUNDARY_PROBE = """
+import importlib
+import inspect
+
+from transformers.utils.import_utils import (
+    is_causal_conv1d_available,
+    is_flash_linear_attention_available,
+)
+
+ok = is_flash_linear_attention_available() and is_causal_conv1d_available()
+if ok:
+    import causal_conv1d  # noqa: F401  -- fail a built-but-broken ABI here, not at model load
+
+    mod = importlib.import_module("%(module)s")
+    gdn = next(
+        (c for n, c in vars(mod).items() if isinstance(c, type) and n.endswith("GatedDeltaNet")),
+        None,
+    )
+    src = inspect.getsource(gdn.forward) if gdn is not None else ""
+    ok = ("cu_seq_lens_q" in src) and ("seq_idx" in src)
+if ok:
+    import torch
+
+    # a causal_conv1d compiled without this arch imports fine and raises at the first forward, so
+    # smoke it now: the answer decides whether we pack, and being wrong means training contaminated.
+    if torch.cuda.is_available():
+        from causal_conv1d import causal_conv1d_fn
+
+        causal_conv1d_fn(
+            torch.zeros(1, 4, 8, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(4, 3, device="cuda", dtype=torch.bfloat16),
+        )
+        torch.cuda.synchronize()
+print("1" if ok else "0")
+"""
+
+
+def verl_child_gdn_reset_arch(python_bin: str, model_id: str, revision: str = "") -> str | None:
+    """the architecture to patch when the VERL CHILD can honor packed GDN boundary resets, else None.
+
+    the boundary shim derives ``cu_seq_lens_q`` and ``seq_idx`` and hands them to the GDN layer, but
+    delivering them is not the same as them being used. without flash-linear-attention,
+    ``chunk_gated_delta_rule`` binds to transformers' ``torch_chunk_gated_delta_rule``, which takes
+    ``**kwargs`` and never reads ``cu_seqlens``; without causal_conv1d, ``causal_conv1d_fn`` is None
+    and the conv falls back to a plain ``F.silu(self.conv1d(...))`` that takes no ``seq_idx``. both
+    fallbacks accept the arguments and silently discard them, so a run that looks patched trains on
+    contaminated boundaries anyway.
+
+    returns the ``model_type`` rather than a bool so the caller cannot hand the shim a DIFFERENT
+    architecture than the one just verified. the two must agree: ``qwen3_5_moe`` (the 35B) is a
+    separate transformers module from ``qwen3_5`` (the dense models), and patching the wrong one
+    leaves the forward unpatched while the gate still reports resets active -- packed, contaminated,
+    labelled fixed. a second independent resolve at the call site would make that agreement a
+    convention; returning it makes it structural.
+
+    asked of the CHILD interpreter because that is where the model lives: flash installs fla into the
+    parent worker, and the verl venv is built without ``--system-site-packages``, so the parent
+    answering "yes" says nothing about the interpreter that will run the forward pass.
+
+    the probe is deliberately self-contained -- it imports only transformers and causal_conv1d, never
+    ``flash``. flash is pip-installed into the WORKER interpreter at runtime and is not on the verl
+    venv's path, so a probe that imported ``flash.engine.worker.packing`` would raise
+    ModuleNotFoundError in every child, report "cannot reset", and silently pin every gdn run to the
+    padded fallback forever. that fails closed, so it trains correctly -- but the boundary fix would
+    never actually engage, and nothing would say so. ``verl_supports_rollout_field`` above sets the
+    convention: a child probe names only packages the child is guaranteed to have.
+
+    ``model_type`` is resolved by the PARENT (packing.gdn_model_type) and interpolated in, because it
+    comes from the checkpoint config -- which needs a hub/cache read the child should not repeat.
+
+    the checks mirror ``packing.gdn_packing_available``: fla present, causal_conv1d imports (catching
+    a built-but-broken ABI that find_spec would pass), the kernel actually runs on the live GPU
+    (catching a wheel compiled without this arch), and this transformers version's GDN forward really
+    threads both kwarg names.
+    """
+    from flash.engine.worker.packing import gdn_model_type
+
+    model_type = gdn_model_type(model_id, revision=revision)
+    probe = _GDN_BOUNDARY_PROBE % {
+        "module": f"transformers.models.{model_type}.modeling_{model_type}"
+    }
+    try:
+        done = subprocess.run(
+            [python_bin, "-c", probe], capture_output=True, text=True, timeout=600
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[verl] gdn boundary-reset probe failed ({e}); treating as unavailable")
+        return None
+    if done.returncode == 0 and done.stdout.strip().endswith("1"):
+        return model_type
+    return None
+
+
 def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     """return an interpreter that can import verl.
 
@@ -398,15 +527,26 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "xgrammar==0.1.25",
                 "tqdm",
                 "pyarrow",
+                # gated-deltanet kernels, in LOCKSTEP with Dockerfile.worker's verl-venv layer (same
+                # fla sha, same tilelang pins). the model trains in THIS interpreter, so fla being
+                # installed in the worker's own env says nothing: without it here, transformers binds
+                # chunk_gated_delta_rule to the pure-torch fallback that takes **kwargs and discards
+                # cu_seqlens, and packed gdn runs train across example boundaries while looking
+                # patched. apache-tvm-ffi is pinned to 0.1.11 because 0.1.12 double-registers TVM-FFI
+                # and aborts `import tilelang`.
+                FLA_REQUIREMENT,
+                "tilelang==0.1.11",
+                "apache-tvm-ffi==0.1.11",
             ],
             check=True,
         )
-        # a SEPARATE install, exactly as Dockerfile.worker:295 runs it: the wheel is prebuilt against
+        # a SEPARATE install, exactly as Dockerfile.worker runs it: the wheel is prebuilt against
         # torch 2.10, so it needs --no-build-isolation, and that flag must not apply to the resolve
-        # above. required, not best-effort -- all three backends hard-enable remove-padding and verl's
-        # cuda path imports flash_attn.bert_padding unguarded with no sdpa fallback, so a venv without
-        # it dies at the first training batch on a paid gpu rather than degrading.
+        # above. required, not best-effort -- remove-padding is the default on all three backends and
+        # verl's cuda path imports flash_attn.bert_padding unguarded with no sdpa fallback, so a venv
+        # without it dies at the first training batch on a paid gpu rather than degrading.
         _install_flash_attn(py)
+        _install_causal_conv1d(py)
         # written only after BOTH installs succeed, so a venv that died between them is unstamped
         # and the next attempt rebuilds it rather than reusing a half-provisioned interpreter.
         with open(stamp, "w") as f:
@@ -1531,6 +1671,130 @@ try:
 except Exception:
     pass
 """
+
+
+FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
+
+
+def render_gdn_varlen_shim(model_type: str) -> str:
+    """child-side sitecustomize fragment that resets GDN state at packed example boundaries.
+
+    verl trains with ``pad_mode: no_padding``, so a micro-batch reaches the model as ONE row of
+    ``(1, total_nnz)`` with ``attention_mask=None`` and per-example ``position_ids`` that restart at
+    0 (``workers/engine/fsdp/transformer_impl.py`` remove-padding branch). that is real packing, and
+    the softmax-attention layers handle it correctly on their own: transformers derives their varlen
+    boundaries from exactly those restarting position ids.
+
+    the GatedDeltaNet layers do not. they read their two reset structures out of ``**kwargs``:
+    ``seq_idx`` for the causal conv (``modeling_qwen3_5.py`` ``causal_conv1d_fn(..., seq_idx=...)``)
+    and ``cu_seq_lens_q`` for the DeltaNet recurrence (``chunk_gated_delta_rule(..., cu_seqlens=)``).
+    nothing upstream derives either from ``position_ids``, and verl passes only
+    ``{input_ids, attention_mask, position_ids}``, so both arrive ``None``. the conv window and the
+    recurrent state then carry from the end of one packed example into the start of the next: every
+    example after the first in a micro-batch trains on state that leaked from its neighbour. no
+    error, no warning, no metric moves. all six catalog models are GDN hybrids, so this is every run.
+
+    ``model_type`` names the architecture to patch, and MUST be the checkpoint's own -- the dense
+    catalog models are ``qwen3_5`` but the 35B MoE (and the 397B teacher) are ``qwen3_5_moe``, a
+    separate module whose ``Qwen3_5MoeGatedDeltaNet`` reads the same two kwargs from a
+    ``Qwen3_5MoeTextModel`` that the dense patch never touches. hardcoding ``qwen3_5`` would patch a
+    class the MoE never calls while the gate still reported resets active: packed, contaminated, and
+    labelled fixed. the class is then found by ``TextModel`` suffix rather than by name, for the same
+    reason the probe finds ``GatedDeltaNet`` that way. deliberately has NO default: the only sensible
+    one would be ``qwen3_5``, which is exactly the wrong answer for the MoE, and a caller that
+    forgot the argument would silently get it. pass ``verl_child_gdn_reset_arch``'s return value.
+
+    note that the model NAME does not predict the module: the 27B is Qwen3.6 by name but reports
+    ``model_type: qwen3_5``, while the 35B reports ``qwen3_5_moe``. only the config is authoritative.
+
+    patched at the TEXT MODEL forward rather than on the GDN layer, for three reasons: it already
+    spreads ``**kwargs`` into every decoder layer, so one patch covers all of them; it sees the
+    ``position_ids`` that actually arrived, so the derivation cannot desync from the real batch; and
+    it is where an upstream fix would go.
+
+    derivation is delegated to transformers' own ``prepare_fa_kwargs_from_position_ids`` so the
+    injected ``cu_seq_lens_q`` is byte-identical to the one the attention layers compute for
+    themselves off the same tensor -- a hand-rolled cumsum that disagreed by one would put the two
+    halves of the model on different segmentations.
+
+    the ``_is_packed_sequence`` guard keeps this inert on the padded path (``use_remove_padding
+    false``), where the batch is rectangular and the real ``attention_mask`` already drives
+    ``_update_linear_attn_mask``. an explicitly supplied kwarg always wins.
+
+    this shim raises on failure instead of passing. every other flash shim degrades quietly because
+    what it adds is optional; this one is a correctness floor, and a run that silently trains on
+    contaminated boundaries is worse than one that refuses to start.
+    """
+    return f'''
+# --- flash: reset gdn state at packed example boundaries (backend_common.render_gdn_varlen_shim) ---
+import importlib as _flash_gdn_importlib
+
+import torch as _flash_gdn_torch
+from transformers.modeling_flash_attention_utils import (
+    _is_packed_sequence as _flash_gdn_is_packed,
+    prepare_fa_kwargs_from_position_ids as _flash_gdn_prepare_fa_kwargs,
+)
+
+_flash_gdn_modeling = _flash_gdn_importlib.import_module(
+    "transformers.models.{model_type}.modeling_{model_type}"
+)
+# raises if absent, deliberately: this shim is only rendered once the gate says resets are honored,
+# so a missing TextModel means the gate and the model disagree -- refuse rather than train packed
+# with an unpatched forward.
+_flash_gdn_text_model = next(
+    c
+    for n, c in vars(_flash_gdn_modeling).items()
+    if isinstance(c, type) and n.endswith("TextModel")
+)
+
+
+def _flash_gdn_seq_idx(position_ids, cu_seq_lens):
+    """per-token example ordinal, int32 (1, total_nnz) -- what causal_conv1d_fn wants."""
+    lengths = cu_seq_lens.diff()
+    return (
+        _flash_gdn_torch.repeat_interleave(
+            _flash_gdn_torch.arange(
+                lengths.numel(), device=position_ids.device, dtype=_flash_gdn_torch.int32
+            ),
+            lengths.to(_flash_gdn_torch.int64),
+        )
+        .unsqueeze(0)
+        .contiguous()
+    )
+
+
+def _flash_patch_gdn_varlen():
+    original = _flash_gdn_text_model.forward
+
+    def forward(self, *args, **kwargs):
+        # only derive what the caller did not supply, and only for a genuinely packed batch.
+        if kwargs.get("cu_seq_lens_q") is None and kwargs.get("seq_idx") is None:
+            position_ids = kwargs.get("position_ids")
+            # the model reshapes position_ids to 4-way mrope internally; the text row is what the
+            # boundaries live on. a 3d (4, batch, seq) tensor indexes to it, 2d is already it.
+            text_position_ids = position_ids
+            if text_position_ids is not None and text_position_ids.ndim == 3:
+                text_position_ids = text_position_ids[0]
+            if text_position_ids is not None and text_position_ids.ndim == 2:
+                if _flash_gdn_is_packed(text_position_ids, text_position_ids.shape[0]):
+                    (cu_seq_lens_q, cu_seq_lens_k), (max_q, max_k) = (
+                        _flash_gdn_prepare_fa_kwargs(text_position_ids)
+                    )
+                    kwargs["cu_seq_lens_q"] = cu_seq_lens_q
+                    kwargs["cu_seq_lens_k"] = cu_seq_lens_k
+                    kwargs["max_length_q"] = max_q
+                    kwargs["max_length_k"] = max_k
+                    kwargs["seq_idx"] = _flash_gdn_seq_idx(text_position_ids, cu_seq_lens_q)
+        return original(self, *args, **kwargs)
+
+    _flash_gdn_text_model.forward = forward
+
+
+if not getattr(_flash_gdn_text_model.forward, "_flash_gdn_varlen_patched", False):
+    _flash_patch_gdn_varlen()
+    _flash_gdn_text_model.forward._flash_gdn_varlen_patched = True
+    print({FLASH_GDN_VARLEN_MARKER!r}, "{model_type}", flush=True)
+'''
 
 
 def parse_wandb_link(line: str) -> dict | None:
