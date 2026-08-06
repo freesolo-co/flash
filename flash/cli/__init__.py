@@ -89,7 +89,7 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("env setup", "scaffold a starter Freesolo environment"),
             ("env list", "list local environment sources"),
             ("env test", "validate a local environment offline"),
-            ("env eval", "score held-out suites against a deployed model"),
+            ("env eval", "score a deployed model against its published environment's suites"),
             ("env push", "upload a local environment"),
             ("env pull", "download a published environment or file"),
             ("env delete", "delete a published environment"),
@@ -396,19 +396,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     env_eval = env_sub.add_parser(
         "eval",
-        help="score held-out environment suites against a deployed model",
-        description="score held-out environment suites against a deployed model",
+        help="score a deployed model against its own environment's held-out suites",
+        description=(
+            "score a deployed model against the held-out suites of the published environment "
+            "its run trains on"
+        ),
     )
     env_eval.add_argument(
         "target",
         metavar="TARGET",
         help="a bare RUN_ID, RUN_ID/step-N, or full immutable adapter revision",
-    )
-    env_eval.add_argument(
-        "path",
-        nargs="?",
-        default=".",
-        help="local environment directory or environment.py path",
     )
     # the same two knobs `env test` exposes, and for the same reason: an env whose
     # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated
@@ -449,14 +446,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"parallel model requests (1-{_MAX_CONCURRENCY})",
     )
     env_eval.add_argument(
-        "--upload",
-        action="store_true",
-        help="record the results under a project so they show in the dashboard",
+        "--no-upload",
+        dest="upload",
+        action="store_false",
+        help="score locally without recording the results in the dashboard",
     )
     env_eval.add_argument(
         "--project",
         metavar="PROJECT_ID",
-        help="project id to record results under (required with --upload)",
+        help=(
+            "project id to record results under (default: the project the evaluated run belongs to)"
+        ),
     )
     env_eval.set_defaults(func=cmd_env_eval)
 

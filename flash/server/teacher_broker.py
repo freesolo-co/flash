@@ -116,7 +116,7 @@ def require_teacher_broker_configuration(
             f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers"
         )
     teacher = resolve_teacher(spec.train.teacher_model)
-    if teacher.alias not in {"kimi-k3", "glm-5.2", "qwen3.5-397b-a17b"}:
+    if teacher.alias not in {"kimi-k3", "glm-5.2", "qwen3.5-397b-a17b", "deepseek-v4-pro"}:
         raise RuntimeError("the selected managed teacher is not supported by the Parasail broker")
     capability_limits_for_spec(spec)
     if deadline_at is not None:

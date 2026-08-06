@@ -72,6 +72,12 @@ def _offline(monkeypatch):
     # "this overrides your saved login" warning to stderr -- so tests asserting on exact stderr fail
     # on a developer machine while passing in CI, which reads as a broken test rather than a leaked
     # credential. Every test that wants the var sets it itself after this fixture.
+    #
+    # FLASH_STANDALONE and FLASH_HF_NAMESPACE are not credentials but they switch global MODE, and a
+    # developer shell that followed SELF_HOSTING.md exports both. Left set, managed-mode tests take
+    # the standalone auth path, the disabled billing loop, a raising ``serving_base_url``, or a
+    # non-default artifact namespace -- and CI, whose env is clean, still passes. Every test that
+    # wants either one sets it itself (see tests/test_server_standalone.py).
     from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 
     for _key in {
@@ -81,6 +87,8 @@ def _offline(monkeypatch):
         "PARASAIL_API_KEY",
         "FLASH_CONTROL_PANEL_URL",
         "FLASH_TEACHER_CAPABILITY",
+        "FLASH_STANDALONE",
+        "FLASH_HF_NAMESPACE",
     } | set(DEFAULT_RUNTIME_SECRET_KEYS):
         monkeypatch.delenv(_key, raising=False)
 
