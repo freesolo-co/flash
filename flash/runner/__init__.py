@@ -463,6 +463,10 @@ class RunStatus:
     gpu_status: dict | None = None
     workload_profile_kind: str | None = None
     workload_profile_input_digest: str | None = None
+    # the flash version that keyed the digest. persisted because the spec's copy is stripped from
+    # the public representation, and a profile record read back has to be validated against the
+    # version that produced it rather than whatever the reading process happens to resolve.
+    workload_profile_producer_version: str | None = None
     workload_profile: dict | None = None
     effective_preparation: dict | None = None
 
@@ -1066,6 +1070,7 @@ def _preparation_digest(
     for key in (
         "workload_profile_kind",
         "workload_profile_input_digest",
+        "workload_profile_producer_version",
         "workload_profile",
     ):
         if not worker_payload.get(key):
@@ -1092,6 +1097,7 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "model_policy",
         "workload_profile_kind",
         "workload_profile_input_digest",
+        "workload_profile_producer_version",
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
@@ -1247,6 +1253,7 @@ def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJo
         ),
         workload_profile_kind=SFT_PROFILE_KIND,
         workload_profile_input_digest=input_digest,
+        workload_profile_producer_version=_profile_producer_version(),
         workload_profile={},
     )
     profile_spec = _assign_managed_hf_repo(profile_spec)
@@ -1286,6 +1293,7 @@ def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
             spec,
             workload_profile_kind="",
             workload_profile_input_digest=input_digest,
+            workload_profile_producer_version=producer_version,
             workload_profile=profile.to_dict(),
         )
 
@@ -1320,6 +1328,7 @@ def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
         return replace(
             spec,
             workload_profile_input_digest=input_digest,
+            workload_profile_producer_version=producer_version,
             workload_profile=profile.to_dict(),
         )
     if status.state in {"failed", "cancelled", "dry_run"}:
@@ -1834,7 +1843,7 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
         profile = require_matching_sft_profile(
             metrics.get("workload_profile"),
             input_digest=spec.workload_profile_input_digest,
-            producer_version=_profile_producer_version(),
+            producer_version=spec.workload_profile_producer_version,
             tokenizer_revision=spec.model_revision,
         )
         metrics = {**metrics, "workload_profile": profile.to_dict()}

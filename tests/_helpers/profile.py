@@ -134,6 +134,7 @@ def attach_sft_profile(spec: Any) -> Any:
     return _replace(
         pinned,
         workload_profile_input_digest=digest,
+        workload_profile_producer_version=__version__,
         workload_profile=profile.to_dict(),
     )
 
@@ -168,6 +169,7 @@ def record_sft_profile(runner, spec: Any) -> str:
             spec=spec.to_dict(),
             workload_profile_kind=SFT_PROFILE_KIND,
             workload_profile_input_digest=digest,
+            workload_profile_producer_version=producer_version,
             workload_profile=profile.to_dict(),
         )
     )
