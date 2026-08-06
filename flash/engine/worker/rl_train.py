@@ -528,7 +528,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # engine_kwargs.vllm struct (it is not a default field).
         o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
     if cfg.get("enforce_eager"):
-        # this card's vllm 0.19.1 graph capture is unvalidated (see resolve_rollout_enforce_eager).
+        # this card's vllm 0.19.1 graph capture degenerates (see resolve_rollout_enforce_eager).
         # rollout.enforce_eager is a real verl field, so this is a plain override, not a '+' append.
         o.append("actor_rollout_ref.rollout.enforce_eager=True")
     # blackwell attention pins (see resolve_blackwell_attention_backends for why each default is
@@ -3404,9 +3404,9 @@ def run_rl_train():
         attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(
             python_bin, verl_cc
         )
-        # vllm 0.19.1 graph capture is only validated on a100/h100/blackwell; elsewhere it dies in
-        # aot_compile or triton slot-mapping, so the rollout runs eagerly. see
-        # resolve_rollout_enforce_eager for why one knob is enough.
+        # sm86 is the one arch whose vllm 0.19.1 graph capture is a measured failure (completions
+        # repeat to the token cap without emitting EOS), so only it runs the rollout eagerly. see
+        # resolve_rollout_enforce_eager for the per-arch evidence and why one knob is enough.
         enforce_eager = resolve_rollout_enforce_eager(verl_cc)
         cfg = _build_verl_training_cfg(
             inp,
