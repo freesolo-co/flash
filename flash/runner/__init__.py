@@ -56,18 +56,30 @@ _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
+# when the plane first heard from a profile's worker. a profile's wall bounds the WORK it does, not
+# the wait for a machine to do it on, so its deadline runs from here rather than from submission --
+# see _canonical_run_deadline.
+_PROFILE_WALL_ARMED_AT_KEY = "profile_wall_armed_at"
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
         _CLEANUP_REMOTES_KEY,
         _OPD_RETRY_CONTRACT_KEY,
+        _PROFILE_WALL_ARMED_AT_KEY,
     }
 )
 _PRIVATE_VALUE_UNSET = object()
 MIN_PROVIDER_WALL_SECONDS = 60
 _WORKLOAD_PROFILE_WALL_SECONDS = 10 * 60
 _WORKLOAD_PROFILE_MAX_RETRIES = 1
+# a profile's wall bounds the WORK it does, not the wait for a machine to do it on. each provider
+# attempt gets its own IN_QUEUE grace (300s) and the infra retry floor allows several of them, so a
+# 600s deadline measured from submission cannot survive even two capacity cycles: the run dies "run
+# wall deadline exceeded" having profiled nothing, on hardware it never got. queue time gets this
+# separate explicit allowance and the wall itself starts at the first heartbeat, so the quote stays
+# wall x hourly (see estimate_profile_cost) rather than paying for the queue.
+_WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS = 30 * 60
 
 
 def artifacts_dir(spec: JobSpec) -> str:
@@ -258,6 +270,17 @@ def _require_valid_deadline(value: object) -> float:
     return deadline
 
 
+def _profile_wall_armed_at(raw: dict) -> float | None:
+    """Return when this profile's work budget started, or None if it has not started yet.
+
+    Absent means no worker has spoken for this profile yet, which is the normal state while it
+    queues. A stored value is validated like any other deadline input: a corrupt one fails closed
+    rather than silently reverting to the submission basis and shortening the budget."""
+    if _PROFILE_WALL_ARMED_AT_KEY not in raw:
+        return None
+    return _require_valid_deadline(raw[_PROFILE_WALL_ARMED_AT_KEY])
+
+
 def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
     status = _runstatus_from_json(raw)
     # max_wall_seconds is platform-managed and stripped from the public status.spec, so source the
@@ -265,6 +288,17 @@ def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
     spec = _internal_spec_from_status(status)
     created_at = _require_valid_deadline(status.created_at)
     max_wall_seconds = _require_valid_deadline(spec.gpu.max_wall_seconds)
+    if spec.workload_profile_kind:
+        # a profile's wall budget bounds its WORK. before a worker speaks, the run is still waiting
+        # on capacity, so it holds the queue allowance ON TOP of its untouched work budget; once one
+        # speaks, the work budget runs from that moment and the remaining queue allowance is
+        # dropped. the basis is recomputed from persisted state (never from the wall clock), so this
+        # stays a pure function of the record and _checked_stored_run_deadline still validates it.
+        armed_at = _profile_wall_armed_at(raw)
+        basis = (
+            created_at + _WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS if armed_at is None else armed_at
+        )
+        return status, _require_valid_deadline(basis + max_wall_seconds)
     return status, _require_valid_deadline(created_at + max_wall_seconds)
 
 
@@ -310,6 +344,14 @@ def _spec_with_remaining_wall(
 ) -> JobSpec:
     """Copy a spec with only the run-global wall allowance still available."""
     remaining = _remaining_run_wall_seconds(spec.run_id, now=now)
+    if spec.workload_profile_kind:
+        # an unarmed profile's remaining allowance still holds the queue budget, which exists to
+        # outlast capacity waits -- not to be spent working. handing it to the worker would let a
+        # profile that got capacity immediately run for the whole queue budget too, on a job billed
+        # for its wall alone (estimate_profile_cost prices wall x hourly). cap at the work budget;
+        # the queue allowance keeps protecting the WAIT because the run-global deadline still holds
+        # it, and once a heartbeat arms the run the two agree anyway.
+        remaining = min(remaining, float(_WORKLOAD_PROFILE_WALL_SECONDS))
     if remaining <= 0:
         raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
     if require_provider_minimum and remaining < MIN_PROVIDER_WALL_SECONDS:
@@ -1565,7 +1607,15 @@ def submit_job(
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
     )
     save_kwargs = {
-        "_run_deadline_at": status.created_at + float(public_spec.gpu.max_wall_seconds),
+        "_run_deadline_at": (
+            status.created_at
+            + float(public_spec.gpu.max_wall_seconds)
+            + (
+                _WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+                if worker_spec.workload_profile_kind
+                else 0.0
+            )
+        ),
         "_next_attempt": 0,
         "_opd_retry_contract_version": (
             OPD_RETRY_CONTRACT_VERSION if public_spec.algorithm == "opd" else _PRIVATE_VALUE_UNSET
@@ -1810,6 +1860,20 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             status = get_status(run_id)
         except FileNotFoundError:
             return
+        # first word from a profile's worker starts its work budget. the arm and the deadline it
+        # implies are written together under this guard so a reader never sees one without the
+        # other -- _checked_stored_run_deadline rejects that pair as tampering and halts the run.
+        arm_kwargs: dict[str, float] = {}
+        raw = _load_status_json(run_id)
+        armed_spec = _internal_spec_from_status(status)
+        if armed_spec.workload_profile_kind and _profile_wall_armed_at(raw) is None:
+            armed_at = time.time()
+            arm_kwargs = {
+                "_profile_wall_armed_at": armed_at,
+                "_run_deadline_at": _require_valid_deadline(
+                    armed_at + _require_valid_deadline(armed_spec.gpu.max_wall_seconds)
+                ),
+            }
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
@@ -1824,7 +1888,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
-        _save_status_unlocked(status)
+        _save_status_unlocked(status, **arm_kwargs)
     _report_status(status)
 
 
@@ -2519,6 +2583,7 @@ def _save_status(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
+    _profile_wall_armed_at: float | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     with _status_guard(status.run_id):
         if _opd_retry_contract_version is not _PRIVATE_VALUE_UNSET:
@@ -2531,9 +2596,13 @@ def _save_status(
                 # run-global wall budget from the internal worker spec so the auto-computed deadline
                 # reloads consistently (see _canonical_run_deadline).
                 spec = _internal_spec_from_status(status)
+                base = _require_valid_deadline(status.created_at)
+                if spec.workload_profile_kind:
+                    # a fresh profile has not been armed yet, so it holds the queue allowance on top
+                    # of its work budget -- same basis _canonical_run_deadline reconstructs on read.
+                    base += _WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
                 _run_deadline_at = _require_valid_deadline(
-                    _require_valid_deadline(status.created_at)
-                    + _require_valid_deadline(spec.gpu.max_wall_seconds)
+                    base + _require_valid_deadline(spec.gpu.max_wall_seconds)
                 )
             if _next_attempt is _PRIVATE_VALUE_UNSET:
                 _next_attempt = 0
@@ -2543,6 +2612,7 @@ def _save_status(
             _next_attempt=_next_attempt,
             _cleanup_remotes=_cleanup_remotes,
             _opd_retry_contract_version=_opd_retry_contract_version,
+            _profile_wall_armed_at=_profile_wall_armed_at,
         )
 
 
@@ -2553,6 +2623,7 @@ def _save_status_unlocked(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
+    _profile_wall_armed_at: float | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
     # write-then-rename so concurrent readers never see a half-written file.
@@ -2571,6 +2642,7 @@ def _save_status_unlocked(
         _NEXT_ATTEMPT_KEY: _next_attempt,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
+        _PROFILE_WALL_ARMED_AT_KEY: _profile_wall_armed_at,
     }
     data = _status_storage_dict(status)
     for key in _PRIVATE_STATUS_KEYS:

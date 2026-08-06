@@ -2691,3 +2691,161 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     with pytest.raises(runner._RunCancelled):
         lifecycle._run_training(spec, None, prior_cost=0.0)
     assert submitted == []  # never charged a GPU for an already-terminal run
+
+
+def _profile_spec(run_id: str = "profile-sft-" + "a" * 64):
+    """A profile job spec shaped like _prepared_sft_profile_job's output."""
+    import flash.runner as runner
+    from flash.spec import GpuSpec, JobSpec
+    from flash.workload_profile import SFT_PROFILE_KIND
+
+    return JobSpec(
+        run_id=run_id,
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        gpu=GpuSpec(
+            type="",
+            provider="",
+            max_wall_seconds=runner._WORKLOAD_PROFILE_WALL_SECONDS,
+            max_retries=runner._WORKLOAD_PROFILE_MAX_RETRIES,
+        ),
+        workload_profile_kind=SFT_PROFILE_KIND,
+        workload_profile_input_digest="a" * 64,
+        workload_profile_producer_version="1.0.0",
+        workload_profile={},
+    )
+
+
+def test_unarmed_profile_deadline_survives_a_capacity_cycle(monkeypatch, tmp_path):
+    """A queued profile keeps its whole work budget behind a separate queue allowance.
+
+    The regression: the wall ran from submission, so provider queue time ate the budget. Each
+    attempt gets its own 300s IN_QUEUE grace and the infra retry floor allows several, so a 600s
+    submission-based deadline died "run wall deadline exceeded" having profiled nothing.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    deadline = runner._load_run_deadline_at(spec.run_id)
+    assert deadline == pytest.approx(
+        created_at
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+    # the concrete failure: two 300s capacity cycles plus the grace that killed the real run.
+    still_queued_at = created_at + 2 * 301.0
+    assert runner._remaining_run_wall_seconds(spec.run_id, now=still_queued_at) > 0
+    # and the full work budget is still intact at that point, not merely nonzero.
+    assert runner._remaining_run_wall_seconds(spec.run_id, now=still_queued_at) >= (
+        runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+
+def test_profile_attempt_allowance_never_exceeds_the_work_budget(monkeypatch, tmp_path):
+    """The queue allowance protects the wait; it must never be handed over as work time.
+
+    Otherwise a profile that got capacity immediately would run for the queue budget too, on a job
+    billed for its wall alone (estimate_profile_cost prices wall x hourly).
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    # capacity arrived instantly, so the whole queue allowance is still unspent.
+    attempt_spec = runner._spec_with_remaining_wall(
+        spec, require_provider_minimum=True, now=created_at + 1.0
+    )
+    assert attempt_spec.gpu.max_wall_seconds <= runner._WORKLOAD_PROFILE_WALL_SECONDS
+    """The wall starts when the worker first speaks, and the tamper guard accepts that pair."""
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    armed_at = created_at + 900.0  # spent 15 minutes queueing
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(spec.run_id, {"stage": "sft_pretokenizing", "attempt": 0})
+
+    raw = runner._load_status_json(spec.run_id)
+    assert raw[runner._PROFILE_WALL_ARMED_AT_KEY] == pytest.approx(armed_at)
+    # the budget now runs from first contact, and _load_run_deadline_at (which re-derives the
+    # canonical value and rejects a mismatch) agrees -- so provisioning is not halted.
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(
+        armed_at + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+    # a later heartbeat must not re-arm: the budget bounds the work, so it cannot be refreshed by
+    # a worker that keeps talking.
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at + 120.0)
+    runner.record_heartbeat(spec.run_id, {"stage": "sft_pretokenizing", "attempt": 0, "step": 1})
+    assert runner._load_status_json(spec.run_id)[
+        runner._PROFILE_WALL_ARMED_AT_KEY
+    ] == pytest.approx(armed_at)
+
+
+def test_training_run_deadline_still_runs_from_submission(monkeypatch, tmp_path):
+    """The arming basis is profile-only; an ordinary training run is unchanged."""
+    import flash.runner as runner
+    from flash.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = JobSpec(
+        run_id="ordinary-training",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        gpu=GpuSpec(max_wall_seconds=900),
+    )
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            # max_wall_seconds is managed and stripped from the public spec, so the internal worker
+            # spec is what carries it (see _canonical_run_deadline).
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(created_at + 900.0)
+    monkeypatch.setattr(runner.time, "time", lambda: created_at + 100.0)
+    runner.record_heartbeat(spec.run_id, {"stage": "sft_step", "attempt": 0, "step": 1})
+    raw = runner._load_status_json(spec.run_id)
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in raw
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(created_at + 900.0)
