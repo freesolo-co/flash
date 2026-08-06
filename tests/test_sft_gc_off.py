@@ -192,7 +192,7 @@ def test_grpo_use_reentrant_true_for_moe():
 
 def test_grpo_use_reentrant_true_for_gdn_hybrid():
     # Dense Qwen3.5/3.6 GatedDeltaNet hybrids ALSO need reentrant GC under GRPO: FA2 varlen-unpad +
-    # the fused GDN chunk-scan + chalk's fused kernels save data-dependent tensors the non-reentrant
+    # the fused GDN chunk-scan + the fused Triton kernels save data-dependent tensors the non-reentrant
     # metadata-equality assert can't reconcile (forward packed [1636,..] vs recompute padded [1024,..]),
     # crashing at step 0 exactly like MoE. Live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090.
     from flash.engine.worker.perf.memory import grpo_use_reentrant

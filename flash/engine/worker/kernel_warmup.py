@@ -191,30 +191,6 @@ def warm_fla_gdn(torch) -> bool:
         return False
 
 
-def warm_chalk_kernels() -> bool:
-    """Compile PR11 default chalk self-test kernels when freesolo-chalk is installed."""
-    warmed = False
-    installers = (
-        ("rope", "chalk.ops.rope", "install_qwen35_rope", ()),
-        ("rmsnorm", "chalk.ops.rmsnorm", "install_qwen35_rmsnorm", ()),
-        ("swiglu", "chalk.ops.swiglu", "install_qwen35_swiglu", ()),
-        ("flce", "chalk.ops.flce", "install_qwen35_flce", (None,)),
-        ("lora", "chalk.ops.lora", "install_fused_lora_delta", ()),
-        ("trainable-attn-epilogue", "chalk.ops.qkv", "install_qwen35_qknorm_rope", (None,)),
-        ("embedding", "chalk.ops.embedding", "install_qwen35_fused_embedding", (None,)),
-        ("gdn", "chalk.ops.gdn", "install_qwen35_gdn", ()),
-    )
-    for label, module_name, attr, args in installers:
-        try:
-            mod = __import__(module_name, fromlist=[attr])
-            install = getattr(mod, attr)
-            warmed = bool(install(*args)) or warmed
-        except Exception as e:
-            _log(f"chalk {label} warm skipped: {e}")
-    _log(f"chalk PR11 default kernel installers ran (warmed={warmed})")
-    return warmed
-
-
 def warm_torch_compile(torch) -> bool:
     """Trigger a representative ``torch.compile`` so TorchInductor populates its cache."""
     try:
@@ -349,11 +325,10 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
         [
             warm_flash_attn(torch),
             warm_fla_gdn(torch),
-            warm_chalk_kernels(),
             warm_torch_compile(torch),
         ]
     )
-    _log(f"{warmed}/4 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
+    _log(f"{warmed}/3 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
     saved = save_mega_cache(torch, out_dir)
     meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
     _log(f"done in {time.time() - t0:.1f}s (saved={saved})")

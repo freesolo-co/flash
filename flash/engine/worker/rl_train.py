@@ -731,9 +731,6 @@ def _build_verl_train_notes(
         # torch-allocated subset of device_peak_gpu_gb; consumers must not assume that split here.)
         "peak_gpu_gb": device_peak_gpu_gb,
         "device_peak_gpu_gb": device_peak_gpu_gb,
-        # chalk installs against an in-process trainer.model; verl's model lives in the subprocess, so
-        # no kernel can engage on this path. None (not an empty list) matches the sft verl backend.
-        "chalk_kernels": None,
         # verl derives generated tokens from the response lengths it actually observed, not from a
         # padded upper bound. the flag is published so a consumer comparing against historical runs
         # (which counted the padded bound) does not read the two as equivalent.
