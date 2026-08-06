@@ -353,6 +353,47 @@ def test_build_worker_env_strips_the_deleted_chalk_spec_override(monkeypatch, ca
     assert env["MY_ENV_FLAG"] == "keep-me"
 
 
+def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
+    """[environment].secrets is a second door into the worker env, and it must honor the same
+    removal filter as [worker_env].
+
+    the two filters answer different questions and are deliberately disjoint:
+    RESERVED_WORKER_ENV_KEYS is control-plane ownership (a caller may not override SEED), while
+    _REMOVED_OPTIMIZATION_ENV is deadness (the key configures nothing now). the runtime-secret merge
+    only consulted the ownership set, so declaring a removed key under [environment].secrets
+    delivered it to the worker with no warning -- exactly the silence the worker_env filter exists
+    to prevent."""
+    from flash.providers._worker import _REMOVED_OPTIMIZATION_ENV
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    # every removed key, not a chalk special case. FLASH_TRITON_LORA stands in for the rest.
+    declared = ["FLASH_CHALK_SPEC", "FLASH_TRITON_LORA", "MY_TOKEN"]
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+        environment=EnvironmentSpec(id="owner/env", secrets=declared),
+    )
+    supplied = {
+        "FLASH_CHALK_SPEC": "freesolo-chalk==0.5.7",
+        "FLASH_TRITON_LORA": "1",
+        "MY_TOKEN": "keep-me",
+    }
+    env = build_worker_env(spec, 0, runtime_secrets=supplied)
+
+    # assert on the values this call supplied, not on key presence: some removed names (e.g.
+    # PYTORCH_ALLOC_CONF) are legitimately set by flash itself downstream, so "key absent from env"
+    # would be asserting something the fix never promised.
+    for key in set(supplied) & _REMOVED_OPTIMIZATION_ENV:
+        assert env.get(key) != supplied[key], (
+            f"{key} reached the worker through [environment].secrets"
+        )
+    # a live secret still gets through: this blocks dead keys, not runtime secrets generally.
+    assert env["MY_TOKEN"] == "keep-me"
+
+
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is

@@ -253,10 +253,15 @@ def build_worker_env(
     # runtime secrets and declared env secrets may never clobber a control-plane-owned key: the
     # canonical seed, run id, hf repo, and arm are set above, and a runtime seed override would break
     # the authoritative-seed invariant regardless of how environment.secrets was populated.
+    # removed keys are filtered here too. the two sets are disjoint and answer different questions --
+    # RESERVED_WORKER_ENV_KEYS is ownership (a caller may not override SEED), _REMOVED_OPTIMIZATION_ENV
+    # is deadness (the key configures nothing now) -- so checking only ownership left
+    # [environment].secrets as a second door that delivered a dead key with none of the warning that
+    # the [worker_env] path emits.
     allowed_runtime_secrets = {
         k
         for k in (set(DEFAULT_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
-        if k.upper() not in RESERVED_WORKER_ENV_KEYS
+        if k.upper() not in RESERVED_WORKER_ENV_KEYS and k.upper() not in _REMOVED_OPTIMIZATION_ENV
     }
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
