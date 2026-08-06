@@ -14,17 +14,17 @@ MEASURED_PROMPT = 25.4
 
 
 def _config(method, **overrides):
-    base = dict(
-        model_id="Qwen/Qwen3.5-9B",
-        method=method,
-        steps=100,
-        seq_len=2048,
-        completion_len=2048,
-        batch_size=8,
-        group_size=4,
-        gpu_type=GPU,
-        provider="runpod",
-    )
+    base = {
+        "model_id": "Qwen/Qwen3.5-9B",
+        "method": method,
+        "steps": 100,
+        "seq_len": 2048,
+        "completion_len": 2048,
+        "batch_size": 8,
+        "group_size": 4,
+        "gpu_type": GPU,
+        "provider": "runpod",
+    }
     base.update(overrides)
     return RunConfig(**base)
 
