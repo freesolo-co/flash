@@ -2998,7 +2998,7 @@ def _resolve_grpo_inputs():
     if hasattr(env, "prompt_opens_thinking"):
         env.prompt_opens_thinking = prompt_opened_thinking
 
-    # optimizer-update horizon, honoring [train].max_steps exactly like the retired trl path.
+    # optimizer-update horizon, honoring [train].max_steps exactly.
     epochs = int(_t.epochs) if (_t and _t.epochs is not None) else int(rl.num_epochs)
     derived_steps = on_policy_steps(
         epochs=epochs, prompt_count=len(prompts), prompts_per_step=prompts_per_step

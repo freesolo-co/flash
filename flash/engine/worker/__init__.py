@@ -86,9 +86,7 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
-    disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
-    patch_grpo_mask_aware_lm_head,
 )
 from flash.engine.worker.opd import run_opd
 from flash.engine.worker.perf import (
@@ -536,7 +534,6 @@ __all__ = [
     "backend_seed",
     "build_grpo_prompt_dataset",
     # gpu/backend setup
-    "disable_liger_grpo_torch_compile",
     "error_artifact_name",
     "flush_optional_uploads",
     "free_gpu",
@@ -565,7 +562,6 @@ __all__ = [
     "make_sft_heartbeat_callback",
     "model_revision_kwargs",
     "optimal_attn_impl",
-    "patch_grpo_mask_aware_lm_head",
     "prefetch_model",
     "prepare_fresh_lora_base",
     "prompt_opens_thinking",
