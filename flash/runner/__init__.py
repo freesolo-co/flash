@@ -364,6 +364,13 @@ def _spec_with_remaining_wall(
 ) -> JobSpec:
     """Copy a spec with only the run-global wall allowance still available."""
     remaining = _remaining_run_wall_seconds(spec.run_id, now=now)
+    # exhaustion is judged on the REAL remaining allowance, before any profile substitution below.
+    # a profile's grant replaces `remaining` outright, so deferring this check past that assignment
+    # would make it unreachable for profiles and let a run provision after its own deadline had
+    # passed -- and the first heartbeat would then arm a fresh work window from that moment,
+    # turning the bounded queue allowance into an unbounded one.
+    if remaining <= 0:
+        raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
     if spec.workload_profile_kind:
         # an unarmed profile's remaining allowance still holds the queue budget, which exists to
         # outlast capacity waits -- not to be spent working. handing it to the worker would let a
@@ -376,9 +383,10 @@ def _spec_with_remaining_wall(
         # 500s while the plane grants a full 600s the moment a heartbeat arms -- the shorter number
         # goes to the side actually doing the work, killing the profile mid-measurement on exactly
         # the slow-capacity days the queue allowance exists to survive.
+        #
+        # the run-global deadline still bounds the work: _worker_deadline_at hands the worker
+        # min(stored, now + work_budget), so this grant sets the wall, not a licence to outlive it.
         remaining = float(_WORKLOAD_PROFILE_WALL_SECONDS)
-    if remaining <= 0:
-        raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
     if require_provider_minimum and remaining < MIN_PROVIDER_WALL_SECONDS:
         raise RuntimeError(
             "run wall deadline has less than the 60-second minimum provider allowance remaining; "
