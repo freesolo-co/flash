@@ -2798,7 +2798,9 @@ def test_profile_attempt_allowance_never_exceeds_the_work_budget(monkeypatch, tm
 
     armed_at = created_at + 900.0  # spent 15 minutes queueing
     monkeypatch.setattr(runner.time, "time", lambda: armed_at)
-    runner.record_heartbeat(spec.run_id, {"stage": "sft_pretokenizing", "attempt": 0})
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "sft_pretokenizing", "attempt": 0, "ts": armed_at}
+    )
 
     raw = runner._load_status_json(spec.run_id)
     assert raw[runner._PROFILE_WALL_ARMED_AT_KEY] == pytest.approx(armed_at)
@@ -2811,10 +2813,52 @@ def test_profile_attempt_allowance_never_exceeds_the_work_budget(monkeypatch, tm
     # a later heartbeat must not re-arm: the budget bounds the work, so it cannot be refreshed by
     # a worker that keeps talking.
     monkeypatch.setattr(runner.time, "time", lambda: armed_at + 120.0)
-    runner.record_heartbeat(spec.run_id, {"stage": "sft_pretokenizing", "attempt": 0, "step": 1})
+    runner.record_heartbeat(
+        spec.run_id,
+        {"stage": "sft_pretokenizing", "attempt": 0, "step": 1, "ts": armed_at + 120.0},
+    )
     assert runner._load_status_json(spec.run_id)[
         runner._PROFILE_WALL_ARMED_AT_KEY
     ] == pytest.approx(armed_at)
+
+
+def test_a_previous_lifecycles_heartbeat_cannot_arm_the_profile_wall(monkeypatch, tmp_path):
+    """Only this run's own heartbeat starts its clock.
+
+    A profile's run id is derived from the workload, so a relaunch reuses the id and its artifact
+    prefix. Observed live: a 2.8-hour-old heartbeat from the previous lifecycle armed a 5-second-old
+    run, which would hand the fresh run a budget that had already mostly elapsed.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 10_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    monkeypatch.setattr(runner.time, "time", lambda: created_at + 5.0)
+    # the leftover artifact: written hours before this run was even created.
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "error_profile", "attempt": 0, "ts": created_at - 10_000.0}
+    )
+
+    raw = runner._load_status_json(spec.run_id)
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in raw
+    # still unarmed, so the queue allowance is intact and the work budget is untouched.
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(
+        created_at
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
 
 
 def test_training_run_deadline_still_runs_from_submission(monkeypatch, tmp_path):
