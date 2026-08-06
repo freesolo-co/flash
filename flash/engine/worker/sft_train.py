@@ -1339,7 +1339,10 @@ def run_sft_train(spec=None) -> None:
             "runtime_max_length": realized_max_length,
             "per_device_train_batch_size": micro_batch,
             "gradient_accumulation_steps": math.ceil(train_batch_size / micro_batch),
-            "packing": "verl_remove_padding",
+            # verl concatenates either way; the profile's mode records whether more than one
+            # example was allowed to share a concatenated batch, which is what a reader of these
+            # metrics needs in order to compare a run's step count against its row count.
+            "packing": profile.packing_mode,
             "loss_curve": loss_curve[:400],
             "peak_gpu_gb": device_peak_gpu_gb,
             "device_peak_gpu_gb": device_peak_gpu_gb,

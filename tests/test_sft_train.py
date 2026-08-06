@@ -162,6 +162,26 @@ def test_sft_engine_strategy_stays_fsdp2():
     assert _as_map(build_sft_overrides(_cfg()))["engine.strategy"] == "fsdp2"
 
 
+def test_verl_packs_every_batch_so_the_batch_size_is_the_isolation_boundary():
+    """verl concatenates a batch into one sequence, so `train_batch_size` decides what shares it.
+
+    The worker sends `model.use_remove_padding=true` and leaves `data.pad_mode` at verl's
+    `no_padding` default, which together make the fsdp engine hand the model a single
+    ``(1, total_nnz)`` row with ``attention_mask=None`` and per-example ``position_ids`` restarts.
+    Attention recovers its boundaries from those restarts; GatedDeltaNet layers do not, because
+    they read ``seq_idx`` and ``cu_seq_lens_q`` out of kwargs the fsdp engine never sends. So on a
+    gdn hybrid -- which every catalog model is -- the batch size is the only thing standing between
+    one example and the next example's carried state, and a profile that grouped examples for
+    costing convenience would silently corrupt training. Pin both halves of that coupling: neither
+    override may drift without this failing.
+    """
+    overrides = _as_map(build_sft_overrides(_cfg(train_batch_size=1)))
+
+    assert overrides["model.use_remove_padding"] == "true"
+    assert "data.pad_mode" not in overrides
+    assert overrides["data.train_batch_size"] == "1"
+
+
 def test_optimizer_eps_merges_into_override_config():
     overrides = _as_map(build_sft_overrides(_cfg(optimizer_kwargs={"amsgrad": True}, eps=1e-6)))
     assert overrides["optim.override_optimizer_config"] == "{amsgrad:true,eps:0.000001}"
