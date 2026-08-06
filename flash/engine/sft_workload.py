@@ -401,11 +401,12 @@ def prepare_sft_workload(
     # over from its predecessor -- silently, with no error and no metric. keeping one example per
     # batch leaves nothing to carry.
     #
-    # this decision is made WITHOUT a gpu, so it can only go on the architecture. the worker can
-    # do better: it probes the actual child interpreter and, when that child proves it honors both
-    # kwargs, it packs the gdn hybrid after all. that probe may only NARROW this choice (see
-    # sft_train's use_remove_padding) -- it never packs a run this priced as unpacked, because the
-    # quoted step count below is derived from `examples_per_update`.
+    # this decision is made WITHOUT a gpu, so it can only go on the architecture, and it is the one
+    # that binds: `examples_per_update` feeds the quoted step count below, and the worker replays it
+    # verbatim (sft_train reads `profile.examples_per_update` and `profile.authoritative_steps`), so
+    # the horizon the user was quoted is the horizon that runs. the worker's child probe decides
+    # something ELSE -- verl's tensor layout, `use_remove_padding` -- which is why that flag must not
+    # be gated on this mode: it selects a code path, not a batch size.
     examples_per_update = min(effective_batch, len(rows)) if packing_mode == "packed" else 1
     # packed_blocks is already the optimizer batches verl runs per epoch, so the horizon is one
     # update per block per epoch. do not divide by examples_per_update again.

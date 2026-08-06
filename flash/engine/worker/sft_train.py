@@ -1094,16 +1094,19 @@ def run_sft_train(spec=None) -> None:
         verl_child_gdn_reset_arch(python_bin, model_id, model_revision) if gdn_hybrid else None
     )
     gdn_boundary_resets = gdn_reset_arch is not None
-    # the PROFILE decides whether this run packs, and the child probe may only take that away.
-    # the profile was frozen before any worker existed and the step count the user was quoted was
-    # derived from it (examples_per_update is `effective_batch` when packed and 1 when not), so a
-    # worker that packs a run the profile priced as unpacked runs 1/batch of the quoted steps --
-    # and the parity gate above cannot catch it, because that gate compares two derivations of the
-    # PROFILE and never sees this decision. the probe stays because it can only fail closed: it
-    # withdraws packing the profile asked for when this specific child cannot honor the boundaries.
-    profile_packs = profile.packing_mode == "packed"
-    use_remove_padding = profile_packs and (not gdn_hybrid or gdn_boundary_resets)
-    if profile_packs and gdn_hybrid and not gdn_boundary_resets:
+    # remove-padding is verl's TENSOR LAYOUT switch, not this run's packing/step contract, so the
+    # profile must not gate it. verl defaults to `pad_mode: no_padding`, whose sft_loss reads
+    # `log_prob.values()` -- valid only on the nested tensor built by the remove-padding path. the
+    # padded path hands it a strided tensor and the first optimizer step dies with "values expected
+    # sparse tensor layout but got Strided". an earlier revision ANDed in `packing_mode == "packed"`
+    # here, reasoning that the probe may only narrow what the profile priced; that is true of the
+    # QUOTE but narrowing this flag also selects a verl code path the loss cannot consume, and every
+    # gdn-hybrid catalog model profiles as exact-unpacked, so it broke text sft on all of them.
+    # the step contract is already pinned to the profile independently: train_batch_size is
+    # profile.examples_per_update and total_training_steps is profile.authoritative_steps, neither of
+    # which reads this flag -- so a layout choice here cannot move the quoted horizon.
+    use_remove_padding = not gdn_hybrid or gdn_boundary_resets
+    if gdn_hybrid and not gdn_boundary_resets:
         print(
             "[sft] gdn hybrid without child-side boundary resets: disabling remove-padding so "
             "packed examples cannot contaminate each other (slower, correct)",
