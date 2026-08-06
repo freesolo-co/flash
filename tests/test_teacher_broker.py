@@ -560,9 +560,6 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
 
     def reject(*_args):
         dispatches.append(1)
-        # 400: this test is about never leaking the provider's error BODY. it needs a status whose
-        # classification is stable, and 5xx/429 are now transient (load shedding, worth retrying),
-        # so a malformed-request status is the one that stays permanent here.
         return 400, private_canary.encode()
 
     monkeypatch.setattr(teacher_broker, "_provider_post", reject)
@@ -599,25 +596,15 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
     assert token not in dump
 
 
-@pytest.mark.parametrize(
-    ("status", "classification", "retryable"),
-    [
-        (429, "transient", True),
-        (500, "transient", True),
-        (503, "transient", True),
-        (400, "permanent", False),
-        (404, "permanent", False),
-    ],
-)
-def test_load_shedding_statuses_are_transient_so_scores_are_retried_not_dropped(
-    broker_db, monkeypatch, status, classification, retryable
-):
-    """a rate-limited or briefly-unavailable provider must not cost a training example.
+@pytest.mark.parametrize("status", [429, 500, 503, 400, 404])
+def test_every_provider_reject_is_terminal_for_the_logical_request(broker_db, monkeypatch, status):
+    """a 429 is terminal here, and the ledger is why -- not a classification judgement.
 
-    the worker discards an item the broker calls permanent (teacher.py:411 raises instead of
-    retrying), so misclassifying a 429 silently drops teacher signal rather than merely costing
-    time. this matters at OPD_TEACHER_SCORING_CONCURRENCY=32: the measured provider ceiling is
-    exactly where 429s begin, so the classification is now reachable in normal operation.
+    MAX_UPSTREAM_ATTEMPTS is 1, so mark_teacher_request_started refuses a second upstream call, and
+    reserve_teacher_request re-admits only rows in state 'retryable'. a completed 'provider_rejected'
+    row cannot be reopened, so calling a 429 retryable would buy the worker a round trip that comes
+    back permanent and drops the score anyway. this pins that contract: recovering shed load is
+    broker lifecycle work (attempt budget above 1 plus re-admission of a 'started' row).
     """
     _service_ready(monkeypatch)
     token = _issue()
@@ -631,8 +618,8 @@ def test_load_shedding_statuses_are_transient_so_scores_are_retried_not_dropped(
         )
 
     assert error.value.code == "provider_rejected"
-    assert error.value.retryable is retryable
-    assert error.value.payload()["error"]["classification"] == classification
+    assert error.value.retryable is False
+    assert error.value.payload()["error"]["classification"] == "permanent"
 
 
 def test_worker_default_timeout_exceeds_broker_provider_ceiling():

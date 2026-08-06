@@ -648,24 +648,25 @@ def complete_teacher_request(
             request_id=request_id,
         ) from exc
     if status < 200 or status >= 300:
-        # a 429 (and a 5xx) is the provider shedding load, not rejecting the request on its merits:
-        # the identical body succeeds when retried. classifying those permanent makes the worker
-        # DISCARD a scoreable item at teacher.py:411, which silently drops training signal rather
-        # than costing time. everything else stays permanent -- a 400 body does not improve by being
-        # sent again.
-        transient = status == 429 or status >= 500
+        # every provider reject is terminal for this logical request, including a 429. that is a
+        # property of the ledger, not a classification choice here: MAX_UPSTREAM_ATTEMPTS is 1, so
+        # db.mark_teacher_request_started refuses a second upstream call with
+        # upstream_attempt_quota_exhausted, and db.reserve_teacher_request re-admits only rows in
+        # state 'retryable' -- a completed 'provider_rejected' row cannot be reopened whatever its
+        # error_class says. marking a 429 retryable here would only buy the worker a round trip that
+        # comes back permanent. recovering shed load needs an attempt budget above 1 and a
+        # re-admission path for a 'started' row, which is broker lifecycle work, not this change.
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,
                 request_id,
                 state="provider_rejected",
                 provider_status=status,
-                error_class="transient" if transient else "permanent",
+                error_class="permanent",
             )
         raise TeacherBrokerError(
             "provider_rejected",
             status_code=502,
-            retryable=transient,
             request_id=request_id,
         )
     try:
