@@ -37,19 +37,3 @@ def _liger_default_for_model(model_id: str, revision: str = "") -> bool:
     except Exception as e:
         print("liger model-size probe failed (default off):", e)
         return False
-
-
-def liger_on(default_on: bool) -> bool:
-    """Whether to enable Liger. Requires CUDA and liger_kernel importable — flash[gpu] doesn't ship it."""
-    if not default_on:
-        return False
-    try:
-        import importlib.util
-
-        import torch
-
-        return bool(
-            torch.cuda.is_available() and importlib.util.find_spec("liger_kernel") is not None
-        )
-    except Exception:
-        return False
