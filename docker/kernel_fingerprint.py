@@ -11,8 +11,8 @@ Two fingerprints, because "out of date" has two flavors with very different cost
   * fp_cache = hash of the inputs whose kernels live in the baked mega-cache
     (torch.compiler.save_cache_artifacts: Triton/Inductor/torch.compile). Changing one of these
     INVALIDATES the cache, so the per-arch image needs a real GPU re-warm. These are: the base
-    FROM image (torch+triton), the fla git pin, tilelang, apache-tvm-ffi, the default chalk
-    spec, and the warmup script itself (it decides which kernels get compiled).
+    FROM image (torch+triton), the fla git pin, tilelang, apache-tvm-ffi, and the warmup script
+    itself (it decides which kernels get compiled).
 
   * fp_base = hash of everything else baked into :cu128 that is NOT in the cache (FA2/FA3 wheels,
     causal-conv1d, the non-kernel pip stack, and the baked rp_handler = endpoints.py +
@@ -27,7 +27,7 @@ time, which is why every parse below FAILS LOUD rather than hashing a None.
 Known limitations (deliberately scoped -- each only ever costs a recoverable cold-JIT, never
 correctness, and the alternatives over-fire the paid GPU bake):
   * fp_cache hashes the Dockerfile dep PINS, not pip-resolved versions. A cache-affecting range
-    (the chalk spec) could resolve a newer build on a later worker-image rebuild with
+    could resolve a newer build on a later worker-image rebuild with
     no text change, leaving fp_cache unmoved. Pin those exactly for airtight coverage. (fp_base DOES
     hash the whole Dockerfile.worker, so arbitrary base edits -- apt/ENV/CMD/cache-dir -- still
     trigger a free re-layer; only a cache-affecting change that isn't a parsed pin slips through.)
@@ -72,44 +72,6 @@ def _search(pattern: str, text: str, what: str, *, flags: int = 0) -> str:
 
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _python_string_constant(text: str, name: str, what: str) -> str:
-    """Resolve a simple module-level string constant, including f-strings using prior constants."""
-    values: dict[str, str] = {}
-
-    def _eval(node: ast.AST) -> str | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
-        if isinstance(node, ast.JoinedStr):
-            parts: list[str] = []
-            for value in node.values:
-                if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                    parts.append(value.value)
-                elif (
-                    isinstance(value, ast.FormattedValue)
-                    and isinstance(value.value, ast.Name)
-                    and value.value.id in values
-                ):
-                    parts.append(values[value.value.id])
-                else:
-                    return None
-            return "".join(parts)
-        return None
-
-    tree = ast.parse(text)
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        value = _eval(node.value)
-        if value is None:
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                values[target.id] = value
-    if name not in values:
-        raise ValueError(f"kernel_fingerprint: could not parse {what}")
-    return values[name]
 
 
 def parse_baked_per_sm_arches(text: str, *, source: str = "_worker.py") -> list[str]:
@@ -201,13 +163,11 @@ def collect_inputs(
 
     Each value comes from where the IMAGE actually gets it:
       * pins / FROM / causal-conv1d from Dockerfile.worker (what the image is built from),
-      * default chalk spec textually from _worker.py (what the bake warms),
       * FA2/FA3 from worker-image.yml's build-args (overridable via fa2_spec/fa3_spec for the
         resolved-build-arg case), and file hashes for the warmup/handler sources.
     base_inputs_partial does NOT yet include fp_cache; compute_fingerprints folds it in.
     """
     dockerfile = (root / "Dockerfile.worker").read_text()
-    worker_pkg = (root / "flash" / "providers" / "_worker.py").read_text()
     worker_image_yml = (root / ".github" / "workflows" / "worker-image.yml").read_text()
 
     specs = _pip_stack_specs(dockerfile)
@@ -226,16 +186,11 @@ def collect_inputs(
         raise ValueError(
             "kernel_fingerprint: fla spec missing or not pinned to a 40-char commit sha"
         )
-    chalk = _python_string_constant(
-        worker_pkg, "DEFAULT_CHALK_SPEC", "_worker.py DEFAULT_CHALK_SPEC"
-    )
-
     cache_inputs = {
         "from_image": from_image,
         "fla": fla,
         "tilelang": _need("tilelang"),
         "tvm_ffi": _need("apache-tvm-ffi"),
-        "chalk": chalk,
         "kernel_warmup_sha256": _sha256_file(
             root / "flash" / "engine" / "worker" / "kernel_warmup.py"
         ),

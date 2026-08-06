@@ -3289,8 +3289,6 @@ def test_train_notes_carry_the_trl_observability_fields():
     # carry the same device figure rather than a torch-allocated subset that would read ~0 here.
     assert notes["peak_gpu_gb"] == 71.25
     assert notes["device_peak_gpu_gb"] == 71.25
-    # chalk installs against an in-process trainer.model, which verl does not have.
-    assert notes["chalk_kernels"] is None
     # trl counts generated tokens from a padded upper bound; verl uses observed response lengths.
     # without the flag the two backends' token counts read as comparable when they are not.
     assert notes["gen_tokens_is_upper_bound"] is False

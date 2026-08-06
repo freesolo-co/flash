@@ -98,8 +98,8 @@ def grpo_use_reentrant(model_id: str) -> bool:
       expert-buffer shapes differ (forward expert-dispatch tokens 28192 vs recompute 3524 ==
       group_size x). This is what #429 fixed.
     - GDN hybrids (Qwen3.5/3.6 dense): FlashAttention-2 varlen-unpad on the full-attention layers,
-      the fused GatedDeltaNet chunk-scan on the linear-attention layers, and chalk's fused Triton
-      kernels each save shape-/data-dependent tensors that the non-reentrant metadata-equality check
+      and the fused GatedDeltaNet chunk-scan on the linear-attention layers each save
+      shape-/data-dependent tensors that the non-reentrant metadata-equality check
       can't positionally reconcile (live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090: forward packed
       varlen ``[1636, ...]`` vs recompute padded ``[1024, ...]``). Same failure mode as MoE.
 

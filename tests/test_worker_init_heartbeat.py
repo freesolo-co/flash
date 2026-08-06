@@ -998,8 +998,8 @@ def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatc
 # --------------------------------------------------------------------------------------------
 # Wiring: each long blocking phase runs under the shared liveness_heartbeat helper (behaviour covered
 # above; these pin the call sites so coverage can't silently regress).
-# rl_initializing is intentionally absent, for the same reason SFT is absent from the chalk test
-# below: verl builds its trainer in a subprocess, so there is no in-process build window to wrap.
+# rl_initializing is intentionally absent: verl builds its trainer in a subprocess, so there is
+# no in-process build window to wrap.
 # The setup silence that wrap used to cover is now covered by rl_data_loading.
 @pytest.mark.parametrize(
     ("modname", "outer", "stage"),

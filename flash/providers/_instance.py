@@ -182,7 +182,6 @@ def build_payload(
     from flash.envs.registry import worker_pip_for_env
     from flash.providers._worker import (
         build_worker_env,
-        chalk_extra_pip,
         strip_runpod_volume_env,
     )
     from flash.runner import flash_code_prefix
@@ -212,9 +211,8 @@ def build_payload(
         "seed": spec.seed,
         "flash_arm": arm,
         "env": env,
-        # per-run env wheel + opt-in chalk spec; the bootstrap pip-installs extra_pip for every job.
-        "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
-        + chalk_extra_pip(spec),
+        # per-run env wheel; the bootstrap pip-installs extra_pip for every job.
+        "extra_pip": list(spec.environment.pip) or worker_pip_for_env(spec.environment.id),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "code_prefix": code_prefix or flash_code_prefix(),
         "deadline_at": absolute_deadline,
