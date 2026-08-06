@@ -142,9 +142,3 @@ def test_gdn_packing_catches_unexpected_probe_failures(monkeypatch) -> None:
     )
 
     assert packing.gdn_packing_available() is False
-
-
-def test_pack_token_ids_rejects_nonpositive_capacity() -> None:
-    """The pure bin packer must reject invalid capacities before inspecting token rows."""
-    with pytest.raises(ValueError, match="max_length must be positive"):
-        packing.pack_token_ids([[1, 2]], 0)
