@@ -230,7 +230,11 @@ def test_gpu_idle_fraction_matches_the_cost_models_split():
     assert reward_only == pytest.approx(completions * 1.0, rel=1e-6)
     mine = gpu_idle_fraction(1.0, completions, gpu_s)
     assert mine == pytest.approx(reward_only / (gpu_s + reward_only), rel=1e-6)
-    assert mine > 0.5  # a 1s grader really does idle the gpu for most of the step
+    # a 1s grader idles a real share of the step, but NOT most of it. this used to assert > 0.5,
+    # which held only because the step model was missing its floor: with old_log_prob, weight sync
+    # and checkpointing unpriced, gpu_s was small enough that a fictitious reward wall looked
+    # dominant. those phases are real gpu work, so the honest split leaves the grader a minority.
+    assert 0.2 < mine < 0.5
 
 
 def test_gpu_idle_fraction_edges():

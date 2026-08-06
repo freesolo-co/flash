@@ -177,6 +177,7 @@ def cancel_run(run_id: str) -> RunStatus:
         mark_checkpoint_deployed,
         mark_deployment_revocation_failed,
         mark_deployment_undeployed,
+        profile_steps_run,
         read_verified_adapter_revisions,
         verified_adapter_revision_generation,
     )
@@ -556,9 +557,23 @@ def cancel_run(run_id: str) -> RunStatus:
         billing_diagnostic: dict = {}
         if bill_cancel:
             if effective_spec is not None:
+                cancel_status = get_status(run_id)
+                # a profile has no optimizer steps, so actual_steps_run reads 0 for every one and
+                # would price a profile that ran to completion at $0. profile_steps_run answers the
+                # question that actually applies to one: did it start at all.
+                #
+                # the profile marker is read from the STATUS, not from effective_spec: to_dict()
+                # strips workload_profile_kind as a platform-managed field, so a spec rebuilt from
+                # persisted public status always reports "" and the branch below would never be
+                # taken. the status carries the kind explicitly for exactly this reason.
+                steps_billed = (
+                    profile_steps_run(cancel_status)
+                    if cancel_status.workload_profile_kind
+                    else actual_steps_run(cancel_status)
+                )
                 estimated_charge = charge_usd_for_spec(
                     effective_spec,
-                    steps=actual_steps_run(get_status(run_id)),
+                    steps=steps_billed,
                     fallback=float("nan"),
                 )
                 if math.isfinite(estimated_charge):

@@ -19,6 +19,10 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 from flash.engine.recipe import RECIPE
+from flash.engine.sft_workload import (
+    _materialize_verl_images,
+    _multimodal_messages_with_images,
+)
 from flash.engine.steps import (
     final_save_due,
     on_policy_steps,
@@ -79,8 +83,6 @@ from flash.engine.worker.sft_train import (
     _durable_required_save_steps,
     _export_checkpoint_adapter,
     _hydra_val,
-    _materialize_verl_images,
-    _multimodal_messages_with_images,
     _NvidiaSmiPeakSampler,
     _probe_gpu_in_subprocess,
     _verl_image_message_content,

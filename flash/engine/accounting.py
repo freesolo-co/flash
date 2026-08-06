@@ -68,6 +68,8 @@ class RunMetrics:
     train_throughput_toks_per_s: float = 0.0
     train_tokens: int = 0
     generated_tokens: int = 0  # RL: total sampled completion tokens
+    # aggregate-only evidence emitted by profile jobs; absent for training jobs.
+    workload_profile: dict | None = None
     # cost_usd is stamped by runner._persist_metrics, not the worker.
     notes: dict = field(default_factory=dict)
 

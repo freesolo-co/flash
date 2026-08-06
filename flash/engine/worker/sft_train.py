@@ -7,7 +7,6 @@ progress and checkpoints without holding a cuda context while torchrun owns the 
 
 from __future__ import annotations
 
-import io
 import json
 import math
 import os
@@ -19,15 +18,10 @@ import threading
 import time
 from functools import reduce
 from math import gcd
-from pathlib import Path
 
 from flash.engine.recipe import RECIPE
-from flash.engine.steps import (
-    final_save_due,
-    resolve_update_horizon,
-    sft_update_steps,
-    validate_save_steps,
-)
+from flash.engine.sft_workload import prepare_sft_workload, sft_tokens_for_updates
+from flash.engine.steps import final_save_due, validate_save_steps
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
     export_peft_adapter,
@@ -46,16 +40,9 @@ from flash.engine.worker.backend_common import (
     verl_step_number,
 )
 from flash.engine.worker.heartbeat import join_while_draining, liveness_heartbeat
-from flash.engine.worker.packing import completion_mask_from_ids, model_is_gdn_hybrid
+from flash.engine.worker.packing import model_is_gdn_hybrid
 from flash.engine.worker.rng import seed_training_rngs
-from flash.engine.worker.sft import (
-    _model_arch_dims,
-    _pretokenize_completion_only,
-    _reject_image_completion,
-    _select_indexed_sft_examples,
-    sft_completed_train_tokens,
-    sft_under_ran,
-)
+from flash.engine.worker.sft import _model_arch_dims, sft_under_ran
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
@@ -220,25 +207,6 @@ def build_sft_overrides(cfg: dict) -> list[str]:
     return overrides
 
 
-def _serialize_multimodal_inputs(values: dict) -> bytes:
-    if not values:
-        return b""
-    import numpy as np
-
-    arrays = {}
-    for key, value in values.items():
-        if value is None:
-            continue
-        if hasattr(value, "detach"):
-            value = value.detach().cpu().numpy()
-        arrays[key] = np.asarray(value)
-    if not arrays:
-        return b""
-    payload = io.BytesIO()
-    np.savez(payload, **arrays)
-    return payload.getvalue()
-
-
 def _sft_parquet_features():
     from datasets import Features, Sequence, Value
 
@@ -358,79 +326,26 @@ class FlashTokenizedSFTDataset:
 """
 
 
-def _multimodal_messages_with_images(messages: list[dict], images: list[object]) -> list[dict]:
-    image_iter = iter(images)
-    prepared = []
-    for message in messages:
-        copied = dict(message)
-        content = copied.get("content")
-        if isinstance(content, list):
-            blocks = []
-            for block in content:
-                block = dict(block)
-                if block.get("type") == "image":
-                    block["image"] = next(image_iter)
-                blocks.append(block)
-            copied["content"] = blocks
-        prepared.append(copied)
-    try:
-        next(image_iter)
-    except StopIteration:
-        return prepared
-    raise ValueError("unused decoded image while preparing multimodal sft tokens")
+def render_exact_sft_dataloader_shim() -> str:
+    """return the child shim that keeps profile and verl row order byte-for-byte aligned."""
+    return """
+from torch.utils.data.distributed import DistributedSampler as _FlashDistributedSampler
+from torchdata.stateful_dataloader import StatefulDataLoader as _FlashStatefulDataLoader
 
+_flash_sampler_init = _FlashDistributedSampler.__init__
+_flash_loader_init = _FlashStatefulDataLoader.__init__
 
-def _processor_tokenized_row(
-    processor,
-    prompt_messages: list[dict],
-    completion_messages: list[dict],
-    images: list[object],
-    *,
-    max_length: int,
-    thinking: bool,
-) -> tuple[list[int], list[int], bytes]:
-    prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
-    full_messages = [*prepared_prompt, *completion_messages]
-    common = {
-        "tokenize": True,
-        "return_dict": True,
-        "return_tensors": "pt",
-        "enable_thinking": thinking,
-    }
-    full = dict(
-        processor.apply_chat_template(
-            full_messages,
-            add_generation_prompt=False,
-            **common,
-        )
-    )
-    prompt = dict(
-        processor.apply_chat_template(
-            prepared_prompt,
-            add_generation_prompt=True,
-            **common,
-        )
-    )
+def _flash_exact_sampler_init(self, *args, **kwargs):
+    kwargs["shuffle"] = False
+    return _flash_sampler_init(self, *args, **kwargs)
 
-    def ids(value) -> list[int]:
-        if hasattr(value, "tolist"):
-            value = value.tolist()
-        if value and isinstance(value[0], list):
-            value = value[0]
-        return [int(item) for item in value]
+def _flash_exact_loader_init(self, *args, **kwargs):
+    kwargs["drop_last"] = False
+    return _flash_loader_init(self, *args, **kwargs)
 
-    input_ids = ids(full.pop("input_ids"))[:max_length]
-    prompt_ids = ids(prompt["input_ids"])[:max_length]
-    loss_mask = completion_mask_from_ids(prompt_ids, input_ids)
-    full.pop("attention_mask", None)
-    return input_ids, loss_mask, _serialize_multimodal_inputs(full)
-
-
-def _has_real_target(row: dict, special_ids: set[int]) -> bool:
-    return any(
-        mask and token_id not in special_ids
-        for token_id, mask in zip(row["input_ids"], row["loss_mask"], strict=True)
-    )
+_FlashDistributedSampler.__init__ = _flash_exact_sampler_init
+_FlashStatefulDataLoader.__init__ = _flash_exact_loader_init
+"""
 
 
 def render_loraplus_shim(ratio: float) -> str:
@@ -803,21 +718,6 @@ def _verl_image_message_content(content) -> str:
     return "".join(parts)
 
 
-def _materialize_verl_images(
-    descriptors: list[str], package_root, image_dir: str, row_index: int
-) -> list[str]:
-    from flash.multimodal import decode_image_descriptors
-
-    os.makedirs(image_dir, exist_ok=True)
-    images = decode_image_descriptors(descriptors, package_root)
-    rows: list[str] = []
-    for image_index, image in enumerate(images):
-        path = Path(image_dir, f"row-{row_index}-image-{image_index}.png").resolve()
-        image.save(path, format="PNG")
-        rows.append(path.as_uri())
-    return rows
-
-
 def _restore_verl_resume(local_dir: str) -> int:
     resume = _w.hf_resume_checkpoint()
     if not resume:
@@ -1013,23 +913,15 @@ def run_sft_train(spec=None) -> None:
 
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
-    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
     train_spec = spec.train if spec else None
 
     def train_opt(name, default):
         value = getattr(train_spec, name, None) if train_spec else None
         return value if value is not None else default
 
-    max_length = int(
-        train_opt(
-            "max_context_tokens",
-            RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len,
-        )
-    )
     epochs = int(train_opt("epochs", RECIPE.sft.num_epochs))
     learning_rate = float(train_opt("learning_rate", RECIPE.sft.learning_rate))
     effective_batch = int(train_opt("batch_size", RECIPE.sft.effective_batch))
-    max_examples = int(train_opt("max_examples", 0) or 0)
     max_steps = int(train_opt("max_steps", 0) or 0)
     save_at_steps = tuple(getattr(train_spec, "save_at_steps", ()) or ())
     save_every = int(train_opt("save_every", 50))
@@ -1046,126 +938,42 @@ def run_sft_train(spec=None) -> None:
     os.makedirs(local_dir, exist_ok=True)
 
     with liveness_heartbeat("sft_data_loading"):
-        from transformers import AutoProcessor
+        from flash import __version__
+        from flash.workload_profile import require_matching_sft_profile
 
-        from flash.multimodal import (
-            decode_image_descriptors,
-            normalize_prompt_images,
-            record_has_images,
-            text_only_prompt_messages,
-            validate_multimodal_training,
+        prepared_workload = prepare_sft_workload(
+            spec,
+            env,
+            tokenizer_loader=lambda candidate, revision: _w.load_tokenizer(
+                candidate,
+                revision=revision,
+            ),
+            producer_version=__version__,
+            image_dir=image_dir,
+            allow_packing=True,
         )
-
-        indexed_train = _select_indexed_sft_examples(env.dataset(), max_examples, _w.SEED)
-        selected = [example for _, example in indexed_train]
-        prompt_rows = [
-            (example, env.prompt_messages(example), env.sft_completion(example))
-            for example in selected
-        ]
-        package_root = getattr(env, "package_root", None)
-        multimodal = any(
-            record_has_images(example, prompt_messages)
-            for example, prompt_messages, _completion in prompt_rows
+        expected_profile = require_matching_sft_profile(
+            spec.workload_profile,
+            input_digest=spec.workload_profile_input_digest,
+            producer_version=__version__,
+            tokenizer_revision=model_revision,
         )
-        processor = None
-        if multimodal:
-            validate_multimodal_training(model_id, "sft")
-            processor = AutoProcessor.from_pretrained(
-                model_id,
-                trust_remote_code=True,
-                **_w.model_revision_kwargs(model_revision),
-            )
-            tokenizer = processor.tokenizer
-        else:
-            tokenizer = _w.load_tokenizer(model_id, revision=model_revision)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        if prepared_workload.profile != expected_profile:
+            raise ValueError("sft workload changed after the quote was frozen")
 
-        row_by_index: dict[int, dict] = {}
-        text_specs: list[dict] = []
-        sampled_texts: list[str] = []
-        multiturn_targets = 0
-        for row_index, (example, prompt_messages, completion_messages) in enumerate(prompt_rows):
-            _reject_image_completion(completion_messages)
-            if len(completion_messages) > 1:
-                multiturn_targets += 1
-            if record_has_images(example, prompt_messages):
-                assert processor is not None
-                normalized = normalize_prompt_images(example, prompt_messages, package_root)
-                completion_messages = text_only_prompt_messages(completion_messages)
-                decoded_images = decode_image_descriptors(normalized.descriptors, package_root)
-                input_ids, loss_mask, multimodal_inputs = _processor_tokenized_row(
-                    processor,
-                    normalized.messages,
-                    completion_messages,
-                    decoded_images,
-                    max_length=max_length,
-                    thinking=bool(_w.THINKING),
-                )
-                row_by_index[row_index] = {
-                    "input_ids": input_ids,
-                    "loss_mask": loss_mask,
-                    "images": _materialize_verl_images(
-                        normalized.descriptors,
-                        package_root,
-                        image_dir,
-                        row_index,
-                    ),
-                    "multimodal_inputs": multimodal_inputs,
-                }
-                sampled_texts.append(
-                    tokenizer.apply_chat_template(
-                        [*normalized.messages, *completion_messages],
-                        tokenize=False,
-                        add_generation_prompt=False,
-                        enable_thinking=_w.THINKING,
-                    )
-                )
-            else:
-                text = tokenizer.apply_chat_template(
-                    [*prompt_messages, *completion_messages],
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    enable_thinking=_w.THINKING,
-                )
-                prompt_text = tokenizer.apply_chat_template(
-                    prompt_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=_w.THINKING,
-                )
-                sampled_texts.append(text)
-                text_specs.append(
-                    {"text": text, "prompt_text": prompt_text, "row_index": row_index}
-                )
-
-        dropped = 0
-        if text_specs:
-            kept_specs, tokenized_rows, text_dropped = _pretokenize_completion_only(
-                text_specs, tokenizer, max_length
-            )
-            dropped += text_dropped
-            for spec_row, tokenized in zip(kept_specs, tokenized_rows, strict=True):
-                row_by_index[spec_row["row_index"]] = {
-                    "input_ids": tokenized["input_ids"],
-                    "loss_mask": tokenized["completion_mask"],
-                    "images": [],
-                    "multimodal_inputs": b"",
-                }
-
-        special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
-        rows = []
-        for row_index in sorted(row_by_index):
-            row = row_by_index[row_index]
-            if _has_real_target(row, special_ids):
-                rows.append(row)
-            else:
-                dropped += 1
-        if not rows:
-            raise ValueError(
-                "every SFT example has an empty completion after sft_max_len truncation "
-                "(nothing to train on); increase sft_max_len or shorten the prompts"
-            )
+        rows = prepared_workload.rows
+        multimodal = prepared_workload.multimodal
+        profile = prepared_workload.profile
+        # the context window comes from the profile, not a second reading of the train fields. the
+        # rows were truncated at the profile's max_length and the quote was priced at it, so a
+        # locally re-derived value could disagree with both while the parity check above still
+        # passed: that check compares two values the workload module produced, so it cannot see a
+        # third derivation living here.
+        max_length = profile.max_length
+        dropped = profile.dropped_examples
+        selected_count = profile.selected_examples
+        sampled_texts = prepared_workload.sampled_texts
+        multiturn_targets = prepared_workload.multiturn_targets
         if dropped:
             print(
                 f"[sft] dropped {dropped} rows with no real completion target "
@@ -1173,7 +981,7 @@ def run_sft_train(spec=None) -> None:
             )
         if multiturn_targets:
             print(
-                f"[sft] multi-turn SFT: {multiturn_targets}/{len(selected)} rows train on a full "
+                f"[sft] multi-turn SFT: {multiturn_targets}/{selected_count} rows train on a full "
                 "target transcript"
             )
         elif getattr(env, "multi_turn", False):
@@ -1187,9 +995,9 @@ def run_sft_train(spec=None) -> None:
                 "training on non-reasoning targets teaches the model to skip thinking"
             )
 
-        masked_tokens = sum(mask.count(0) for mask in (row["loss_mask"] for row in rows))
-        total_tokens_per_epoch = sum(len(row["input_ids"]) for row in rows)
-        realized_max_length = max(len(row["input_ids"]) for row in rows)
+        total_tokens_per_epoch = profile.real_tokens_per_epoch
+        realized_max_length = profile.realized_max_length
+        masked_tokens = total_tokens_per_epoch - profile.supervised_tokens_per_epoch
         print(
             f"[sft] completion-only loss: masking {masked_tokens}/{total_tokens_per_epoch} "
             f"({masked_tokens / total_tokens_per_epoch:.0%}) prompt tokens"
@@ -1199,6 +1007,7 @@ def run_sft_train(spec=None) -> None:
         _write_sft_parquet(rows, train_file)
         _write_sft_parquet([rows[0]], val_file)
 
+    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
     setup_seconds = time.time() - started_at
     _w.heartbeat(
         "sft_model_load",
@@ -1222,15 +1031,10 @@ def run_sft_train(spec=None) -> None:
         vocab=vocab_size,
         fused=fused_ce,
     )
-    train_batch_size = min(effective_batch, len(rows))
+    train_batch_size = profile.examples_per_update
     micro_batch = max(1, min(per_device_batch, train_batch_size))
     steps_per_epoch = max(1, math.ceil(len(rows) / train_batch_size))
-    derived_steps = sft_update_steps(
-        epochs=epochs,
-        example_count=len(rows),
-        examples_per_update=train_batch_size,
-    )
-    update_horizon = resolve_update_horizon(derived_steps, max_steps)
+    update_horizon = profile.authoritative_steps
     validate_save_steps(save_at_steps, update_horizon)
     loop_epochs = max(epochs, math.ceil(update_horizon / steps_per_epoch))
     save_freq = reduce(gcd, save_at_steps) if save_at_steps else save_every
@@ -1344,6 +1148,11 @@ def run_sft_train(spec=None) -> None:
         total_steps=update_horizon,
         reentrant_gradient_checkpointing=reentrant_gradient_checkpointing,
     )
+    # both shims, not either: this one patches DistributedSampler/StatefulDataLoader so the child's
+    # row order matches the profile's byte for byte, and the gdn one patches the model's text
+    # forward to reset linear-attention state at packed example boundaries. different objects,
+    # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
+    shim_source += render_exact_sft_dataloader_shim()
     if gdn_reset_arch is not None:
         shim_source += render_gdn_varlen_shim(gdn_reset_arch)
     if "wandb" in loggers:
@@ -1389,11 +1198,15 @@ def run_sft_train(spec=None) -> None:
     # zero (a fully-masked micro-batch), so require a short run of them before failing.
     zero_grad_steps: list[int] = []
     loss_curve: list[float] = []
-    train_tokens = sft_completed_train_tokens(
-        total_tokens_per_epoch,
-        epochs,
-        derived_steps,
-        resume_step,
+    train_tokens = (
+        sft_tokens_for_updates(
+            rows,
+            examples_per_update=train_batch_size,
+            updates=resume_step,
+            field="input_ids",
+        )
+        if resume_step > 0
+        else 0
     )
     loraplus_applied = resume_step >= update_horizon
     wandb_link: dict[str, str | None] = {}
@@ -1510,11 +1323,11 @@ def run_sft_train(spec=None) -> None:
         raise RuntimeError(
             f"sft completed {final_step}/{update_horizon} requested optimizer updates"
         )
-    train_tokens = sft_completed_train_tokens(
-        total_tokens_per_epoch,
-        epochs,
-        derived_steps,
-        final_step,
+    train_tokens = sft_tokens_for_updates(
+        rows,
+        examples_per_update=train_batch_size,
+        updates=final_step,
+        field="input_ids",
     )
 
     with liveness_heartbeat(

@@ -52,6 +52,25 @@ def required_vram_gb(
     )
 
 
+def profile_required_vram_gb() -> int:
+    """VRAM a workload-profile job needs: none beyond the smallest rentable card.
+
+    A profile job renders and tokenizes the exact dataset on cpu and exits before model weights or
+    cuda are touched, so sizing it like the training run it measures would rent (and bill) a card the
+    work never uses.
+    """
+    return 1
+
+
+def _profile_cost_ranker():
+    """``candidate -> dollars for the profile job``, which is rate alone.
+
+    The profile's wall is a fixed cap rather than a function of the hardware, so no card finishes it
+    sooner and the cheapest rentable shape always wins.
+    """
+    return lambda candidate: candidate.total_hourly_usd
+
+
 def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
     """``candidate -> dollars for one optimizer step``, or None when the run cannot be priced.
 
@@ -143,6 +162,7 @@ def allocate(
     gpu_type: str = "",
     model_revision: str = "",
     max_gpu_count: int = 1,
+    workload_profile: bool = False,
 ) -> Allocation:
     """Pick the cheapest fitting combination of (provider, GPU class, count) able to run the job.
 
@@ -150,14 +170,21 @@ def allocate(
     allocation. A caller whose algorithm can shard across cards passes a higher cap, and fitting
     multi-card combinations (same class x count) then compete on TOTAL hourly cost — e.g.
     2 x A100 beats 1 x H200 whenever 2 * $A100 < $H200 and the sharded fit clears the need.
+
+    ``workload_profile=True`` allocates the cpu-only profile job instead of the run it measures: it
+    needs no training VRAM and gains nothing from a faster card, so it ranks on rate alone.
     """
-    need = required_vram_gb(
-        model_id,
-        algorithm,
-        train=train,
-        thinking=thinking,
-        model_revision=model_revision,
-    )
+    if workload_profile:
+        need = profile_required_vram_gb()
+        max_gpu_count = 1
+    else:
+        need = required_vram_gb(
+            model_id,
+            algorithm,
+            train=train,
+            thinking=thinking,
+            model_revision=model_revision,
+        )
     provider = (provider or "").strip().lower()
     if provider and provider not in PROVIDER_NAMES:
         raise UnsupportedGpuError(
@@ -292,7 +319,11 @@ def allocate(
     # to pay for itself. ties prefer fewer cards (less inter-card overhead), then combined VRAM, then
     # class name. sorting is stable, so provider and provider-local order apply only when all key
     # fields match. a run the cost model cannot price falls back to total $/hr.
-    cost_per_step = _step_cost_ranker(model_id, algorithm, train, thinking, model_revision)
+    cost_per_step = (
+        _profile_cost_ranker()
+        if workload_profile
+        else _step_cost_ranker(model_id, algorithm, train, thinking, model_revision)
+    )
     primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
     ranked = sorted(
         candidates,
