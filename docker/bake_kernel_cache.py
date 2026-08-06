@@ -100,17 +100,6 @@ def main() -> int:
     entry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bake_pod_entry.py")
     allowed_cuda = [v.strip() for v in args.allowed_cuda.split(",") if v.strip()] or None
 
-    # The chalk install spec the production worker uses, so the bake warms the same kernels. Keep the
-    # default import fail-loud: a stale hidden fallback would silently bake against the wrong chalk SHA.
-    chalk_spec = os.environ.get("FLASH_CHALK_SPEC", "").strip()
-    if not chalk_spec:
-        try:
-            from flash.providers._worker import DEFAULT_CHALK_SPEC
-
-            chalk_spec = DEFAULT_CHALK_SPEC
-        except Exception as exc:
-            raise RuntimeError("could not import DEFAULT_CHALK_SPEC for kernel-cache bake") from exc
-
     _upload_flash_code(api, repo, token)
 
     # create -> poll -> download inside try/finally so the GPU pod + temp dataset are ALWAYS released,
@@ -134,7 +123,6 @@ def main() -> int:
                 "BAKE_HF_REPO": repo,
                 "BAKE_ARCH": args.arch,
                 "HF_TOKEN": token,
-                "BAKE_CHALK_SPEC": chalk_spec,
             },
         )
         pod_id = pod["id"]

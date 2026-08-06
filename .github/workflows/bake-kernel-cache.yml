@@ -188,8 +188,7 @@ jobs:
       # RUNPOD_API_KEY (the warmup GPU pod) + HF_TOKEN (the temp dataset that ferries code/cache) are
       # native repo Actions secrets, synced from Infisical (prod:/flash-ci) by the github-ci-flash
       # Secret Sync. No Infisical CLI/login at job time -- Infisical stays the source of truth and
-      # rotations propagate via the sync. FLASH_CHALK_SPEC isn't synced, so bake_kernel_cache.py uses
-      # the repo-default DEFAULT_CHALK_SPEC (the value the fingerprint hashed) automatically. BASE_IMAGE
+      # rotations propagate via the sync. BASE_IMAGE
       # is digest-pinned so the warm runs inside the EXACT base the per-arch tag will sit on.
       - name: Warm kernels on a RunPod ${{ matrix.sm }} GPU -> build/kernel_cache
         if: steps.gate.outputs.run == 'true'

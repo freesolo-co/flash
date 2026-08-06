@@ -1572,7 +1572,6 @@ def run_sft_train(spec=None) -> None:
             "device_peak_gpu_gb": device_peak_gpu_gb,
             "loraplus_optim": _VERL_OPTIMIZER_NAME,
             "loraplus_applied": loraplus_applied,
-            "chalk_kernels": None,
             "verl_backend": "fsdp2",
             "ulysses_sequence_parallel_size": gpu_count,
             "wandb_project": project_name if "wandb" in loggers else None,

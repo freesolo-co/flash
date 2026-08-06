@@ -1872,7 +1872,6 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
     payloads = []
     handles = []
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(train, "chalk_extra_pip", lambda _spec: [])
     monkeypatch.setattr(
         jobs,
         "deploy_train_endpoint",

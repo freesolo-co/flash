@@ -260,47 +260,6 @@ def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
         assert "_force_console" not in src
 
 
-def _clear_chalk_flags(monkeypatch):
-    monkeypatch.delenv("FLASH_CHALK_SPEC", raising=False)
-
-
-def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
-    """chalk is always selected (fixed gap-fillers), so a set FLASH_CHALK_SPEC IS appended to
-    extra_pip (chalk installs + auto-applies)."""
-    from flash.providers.runpod.train import chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")
-    assert chalk_extra_pip() == ["freesolo-chalk"]
-
-
-def test_chalk_extra_pip_defaults_to_latest_main_without_spec(monkeypatch):
-    """With FLASH_CHALK_SPEC unset, flash auto-installs the pinned PUBLIC PyPI chalk version by
-    default. A public version pin (not a git+https SHA against the INTERNAL chalk repo) lets
-    tokenless bake/worker pods install it, while still pinning the exact kernel surface."""
-    from flash.providers._worker import DEFAULT_CHALK_VERSION
-    from flash.providers.runpod.train import (
-        DEFAULT_CHALK_SPEC,
-        chalk_extra_pip,
-    )
-
-    _clear_chalk_flags(monkeypatch)
-    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
-    # public PyPI pin so tokenless bake/worker pods can pip-install (chalk repo is internal)
-    assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk==")
-    assert f"freesolo-chalk=={DEFAULT_CHALK_VERSION}" == DEFAULT_CHALK_SPEC
-
-
-def test_chalk_extra_pip_adds_spec_when_set(monkeypatch):
-    """FLASH_CHALK_SPEC -> the chalk spec is appended to extra_pip, which the worker installs for
-    EVERY job (the durable baked-image path that bypasses resolve_worker_deps)."""
-    from flash.providers.runpod.train import chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_CHALK_SPEC", "git+https://github.com/freesolo-co/chalk@main")
-    assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
-
-
 def _spec_worker_env(worker_env: dict):
     """A grpo JobSpec carrying a per-run [worker_env] block (the TOML override map)."""
     from flash.spec import JobSpec, TrainSpec
@@ -312,19 +271,6 @@ def _spec_worker_env(worker_env: dict):
         seed=0,
         worker_env=dict(worker_env),
     )
-
-
-def test_chalk_extra_pip_per_run_worker_env_spec_override(monkeypatch):
-    """A per-run [worker_env] FLASH_CHALK_SPEC overrides the PyPI default install SOURCE for THAT
-    run — resolved against the effective worker env (worker_env merged over os.environ)."""
-    from flash.providers.runpod.train import DEFAULT_CHALK_SPEC, chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)  # nothing in os.environ
-    spec = _spec_worker_env({"FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main"})
-    # bare env: the version-pinned PyPI default installs
-    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
-    # the per-run [worker_env] spec overrides the source for that run
-    assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
 
 
 def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
@@ -551,7 +497,7 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
                 "hf_repo": "owner/runs",
                 "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
                 "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+                "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
                 "code_prefix": "../code/flash",
                 **_run_deadline_fields(),
             }
@@ -595,7 +541,7 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
                     "hf_repo": "owner/runs",
                     "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
                     "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                    "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+                    "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
                     "code_prefix": "../code/flash",
                     **_run_deadline_fields(),
                 }
@@ -613,7 +559,7 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     The previous version of this test read run_sft's source. That body was trl's and is deleted:
     run_sft now delegates to run_sft_train. Rather than drop the coverage, assert against the module
-    that really runs. Three of the old assertions are intentionally NOT reproduced -- chalk kernel
+    that really runs. Three of the old assertions are intentionally NOT reproduced -- kernel
     installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
     properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
     """
