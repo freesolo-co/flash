@@ -73,57 +73,53 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # calibrated while both halves were wrong. Removing the fiction WITHOUT adding this term scores
 # 49.8x geometric bias -- far worse than leaving both alone.
 #
-# MEASURED per card as median(real_step - gpu_bound) over a 45-arm campaign, then scored on 11
-# held-out arms (ratio realized/predicted, band 0.70-1.43):
+# FITTED as (real_step - everything else modelled) over a 45-arm campaign, with the measured reward
+# already applied, then scored on arms the fit never saw. It has an intercept AND a slope because
+# both halves are real: a fixed per-step overhead, plus work that grows with the rollout batch.
 #
-#   flash as-is                     geo 3.262x   0/11 in band
-#   measured reward only            geo 49.771x  0/11
-#   floor only                      geo 0.842x   9/11
-#   measured reward + floor         geo 1.050x   8/11   (44/56 on the full set vs 31/56 floor-only)
+#   gens=32   n=35   median floor  77.2s
+#   gens=64   n= 2                146.6s
+#   gens=96   n= 2                138.4s
+#   gens=256  n= 6                230.5s
 #
-# ONE CONSTANT, not per card and not scaled, because every richer form was measured and lost:
+# Choosing the form by holding out ONE WHOLE COMPLETION CLASS at a time -- the only test of whether
+# it extrapolates to a shape it was not fitted on (in band, and worst-case error):
 #
-#   form                                    held-out (11 arms)   note
-#   flat, one constant                      8/11                 shipped
-#   flat, per card (6 constants)            8/11                 ties, and INVERTS b200 vs h200
-#   flat per card * (completions / 32)      5/11
-#   linear in completions, per card         5/11
-#   a * completions * params_B + c          6/11                 R^2 0.64
-#   k * modelled_gpu_seconds                2/11
+#   held-out class      flat constant        linear (shipped)
+#   gens=16   n= 2      2/2   1.16x          2/2   1.40x
+#   gens=32   n=43      1/43  4.57x          26/43 2.37x
+#   gens=64   n= 3      1/3   1.91x          2/3   1.44x
+#   gens=96   n= 2      1/2   2.26x          0/2   2.15x
+#   gens=256  n= 6      0/6   4.23x          6/6   1.42x
 #
-# The per-card table looks far better in aggregate (44/56 vs 36/56) but 45 of those 56 arms are
-# the ones its constants were fitted on. On arms it has never seen it only ties. It is fitting
-# each card's model and completion-count mix, not the hardware: H200's 152.5s comes from 4 arms,
-# and B200's 81.2s would quote B200 71s per step FASTER than H200 for an identical run, which is
-# backwards -- B200 training is H100/H200-class on portable kernels at a higher $/hr.
+# A flat constant scores 1/43 on gens=32 once it cannot fit that class, and 0/6 on gens=256. It
+# only looked competitive because 35 of the 45 fit arms ARE gens=32 -- the same contamination that
+# made a per-card table look good (that table also quoted B200 71s/step FASTER than H200, which is
+# backwards, since B200 training is H100/H200-class on portable kernels at a higher $/hr).
 #
-# The floor is not proportional to anything the model already computes: it is ~98x the modelled
-# gpu-bound seconds, so any proportional form amplifies a tiny noisy denominator (2/11).
-#
-# Scaling with the card's throughput is the instructive miss. ~82% of the floor is gpu work, so it
-# "should" be faster on a faster card -- but that form predicts RTX 5090 pays 169.8s where it
-# measurably pays 44.2s. update_weights is a weight COPY into the vllm engine (bandwidth, pcie)
-# and save_checkpoint is disk i/o; neither tracks tflops.
-#
-# It does grow with completions (g32 77s, g64 147s, g256 231s) and model size (0.8B 71s, 2B 80s,
-# 4B 110s), so a term in completions x parameters is the obvious candidate -- but the fit arms
-# cluster at 32 and 256 completions while the held-out arms run 16-64, so a slope fitted on a
-# 32-vs-256 contrast is not evidence about the gap it would extrapolate into, and it scored 6/11.
+# Rejected alternatives, all scored the same way: pure per-completion with no intercept (32/56,
+# worst 3.24x) loses the fixed overhead; completions x params (35/56) adds a parameter without
+# beating plain completions; scaling by the card's throughput predicts RTX 5090 pays 169.8s where
+# it measurably pays 44.2s, because update_weights is a weight COPY into the vllm engine
+# (bandwidth, pcie) and save_checkpoint is disk i/o -- neither tracks tflops. Matched measurements
+# agree the cards do not rank by FLOPs at this size: at 0.8B/gens=32 the RTX 5090 is the fastest
+# card measured (44.6s) against H100 72.7s and H200 152.7s.
 #
 # This is an empirical aggregate and will drift as hardware, verl, or the engine change. The
-# principled fix is a per-step overhead term in the throughput model itself, since that is what
-# the bulk of this constant is really standing in for.
-STEP_FLOOR_SECONDS = 78.8
+# principled fix is a per-step overhead term in the throughput model itself, since that is what the
+# bulk of this correction is really standing in for.
+STEP_FLOOR_BASE_SECONDS = 57.7
+STEP_FLOOR_SECONDS_PER_COMPLETION = 0.830
 
 
-def step_floor_seconds(gpu: str) -> float:
+def step_floor_seconds(gpu: str, completions: int) -> float:
     """Per-step seconds the FLOPs terms do not account for.
 
-    Takes ``gpu`` because the phases are real GPU work and a future FLOPs-based model will need
-    it, but returns one constant today: a per-card table was measured and does not beat this one
-    out of sample (see above).
+    Takes ``gpu`` because the phases are real GPU work and a future FLOPs-based model will need it,
+    but does not use it: a per-card table was measured, does not beat this out of sample, and
+    inverts the required B200/H200 ranking (see above).
     """
-    return STEP_FLOOR_SECONDS
+    return STEP_FLOOR_BASE_SECONDS + STEP_FLOOR_SECONDS_PER_COMPLETION * max(0, completions)
 
 
 # --- MoE (mixture-of-experts) per-step correction ----------------------------------------------
@@ -366,7 +362,7 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # opd samples on-policy and syncs weights to the rollout engine exactly as grpo does, so it
         # pays the same unmodelled per-step floor. it has no frozen-reference forward, but
         # old_log_prob and the weight sync are rollout properties, not grpo-specific ones.
-        floor_s = step_floor_seconds(gpu)
+        floor_s = step_floor_seconds(gpu, completions)
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
         return gen_s + update_s + floor_s, overhead + teacher_s
@@ -389,7 +385,7 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     # old_log_prob + weight sync + checkpointing: real gpu work with no flops term of its own.
     # gpu-bound, not fixed -- it is compute on this card, so a faster card shortens it and
     # sharding divides it, unlike reward grading which is a wait on off-gpu python.
-    floor_s = step_floor_seconds(gpu)
+    floor_s = step_floor_seconds(gpu, completions)
     # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
     # changes. a grpo step dominated by it is latency-bound, not compute-bound.
     return gen_s + update_s + floor_s, overhead + reward_s
