@@ -370,7 +370,8 @@ MODELS: dict[str, ModelInfo] = {
         algos=ALGORITHMS,
         min_vram_gb=48,
         min_disk_gb=120,
-        # NOT QLoRA: peft bnb merge during GRPO rollout diverges trainer precision -> TRL ratio collapses to 0.
+        # NOT QLoRA: a peft bnb merge during GRPO rollout diverges the rollout's precision from the
+        # trainer's, and the importance ratio those two log-probs form collapses to 0.
         grpo_min_vram_gb=80,
         quant="bf16",
         recommended_gpu="A100 PCIe",

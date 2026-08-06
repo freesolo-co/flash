@@ -379,18 +379,19 @@ def prepare_sft_workload(
     supervised_tokens = sum(sum(int(item) for item in row["loss_mask"]) for row in rows)
     padded_compute_tokens = real_tokens
     realized_max_length = max(len(row["input_ids"]) for row in rows)
-    # one example per update is the ONLY isolation lever this layer has, and it is needed because
-    # verl packs unconditionally: it defaults to `pad_mode: no_padding` and the worker sets
-    # `model.use_remove_padding=true`, so a micro-batch reaches the model as one (1, total_nnz)
-    # row with `attention_mask=None`. softmax layers recover their boundaries from the per-example
-    # `position_ids` restarts, but GatedDeltaNet layers read theirs out of kwargs the fsdp engine
-    # never sends (`seq_idx` for the causal conv, `cu_seq_lens_q` for the recurrence), so on a gdn
-    # hybrid every example after the first trains on state carried over from its predecessor --
-    # silently, with no error and no metric. keeping one example per batch leaves nothing to carry.
-    # the cheaper levers do not work here: `use_remove_padding=false` pairs a dense
-    # [B, max_response_length] slice with the nested tensor `sft_loss` expects, and supplying the
-    # two kwargs is inert unless fla and causal_conv1d are installed in the verl child venv,
-    # because the torch fallbacks accept and discard both.
+    # one example per update is this layer's isolation lever for an architecture it cannot pack.
+    # a micro-batch reaches the model as one (1, total_nnz) row with `attention_mask=None`: softmax
+    # layers recover their boundaries from the per-example `position_ids` restarts, but
+    # GatedDeltaNet layers read theirs out of `seq_idx` (causal conv) and `cu_seq_lens_q`
+    # (recurrence), so on a gdn hybrid every example after the first would train on state carried
+    # over from its predecessor -- silently, with no error and no metric. keeping one example per
+    # batch leaves nothing to carry.
+    #
+    # this decision is made WITHOUT a gpu, so it can only go on the architecture. the worker can
+    # do better: it probes the actual child interpreter and, when that child proves it honors both
+    # kwargs, it packs the gdn hybrid after all. that probe may only NARROW this choice (see
+    # sft_train's use_remove_padding) -- it never packs a run this priced as unpacked, because the
+    # quoted step count below is derived from `examples_per_update`.
     examples_per_update = min(effective_batch, len(rows)) if packing_mode == "packed" else 1
     # packed_blocks is already the optimizer batches verl runs per epoch, so the horizon is one
     # update per block per epoch. do not divide by examples_per_update again.

@@ -1024,8 +1024,7 @@ watch `truncation_rate`, which counts completions not ending in EOS and is not s
 For pure multi-turn GRPO, Flash gives each Flash-owned vLLM generation request a managed
 10-to-60-minute absolute deadline and at most two physical attempts. A timed-out request is
 aborted before retry. Enforcement is cooperative between engine polls, and there is no total
-episode elapsed-time cutoff. This policy does not time out OPD, TRL-native tool loops, or
-environment calls.
+episode elapsed-time cutoff. This policy does not time out OPD or environment calls.
 
 > **The reward-hacking signature:** a smoothed reward rising while mean generated
 > length collapses. Whenever any shortness or format pressure is active, verify the
@@ -1039,13 +1038,11 @@ environment calls.
 
 **First, check that per-turn credit is available to you at all.** It is supported on the
 pure multi-turn rollout path — an `EnvironmentMultiTurn` that drives its own turn loop. A
-multi-turn environment that exposes **tools** runs on TRL's native tool loop instead, and
-there `per_turn` is not implemented: the worker raises
-`credit_assignment='per_turn' is not supported for tool-calling multi-turn environments`
-and the run dies at startup. Nothing catches this earlier — `flash train --dry-run` accepts
-the config, because the trainer choice depends on the environment object, not the spec. If
-your environment exposes tools, stay on `per_episode`; emitting `per_turn_rewards` does not
-unlock it.
+multi-turn environment that exposes **tools** is not supported at all: the worker raises
+`verl grpo does not support openai function-calling tool environments; this env reports
+is_tool_env` and the run dies at startup. Nothing catches this earlier —
+`flash train --dry-run` accepts the config, because the check depends on the environment
+object, not the spec.
 
 On the pure multi-turn path, setting `credit_assignment = "per_turn"` is only _half_ the
 request. The trainer reads the
