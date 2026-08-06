@@ -1058,6 +1058,7 @@ def test_sft_profile_miss_starts_a_separate_profile_run(api, monkeypatch):
             run_id=profile_run_id,
             workload_profile_kind="sft",
             workload_profile_input_digest="a" * 64,
+            workload_profile_producer_version="1.2.3",
         )
         pending = runner.PreparedJob(
             public_spec=profile_spec,
@@ -1129,6 +1130,7 @@ def test_a_second_owner_needing_the_same_profile_is_not_blocked_by_the_first(api
             run_id=profile_run_id,
             workload_profile_kind="sft",
             workload_profile_input_digest="b" * 64,
+            workload_profile_producer_version="1.2.3",
         )
         raise runner.WorkloadProfilePending(
             profile_run_id,
@@ -1197,6 +1199,7 @@ def test_an_owner_retrying_its_own_pending_profile_is_not_billed_again(api, monk
             run_id=profile_run_id,
             workload_profile_kind="sft",
             workload_profile_input_digest="c" * 64,
+            workload_profile_producer_version="1.2.3",
         )
         raise runner.WorkloadProfilePending(
             profile_run_id,

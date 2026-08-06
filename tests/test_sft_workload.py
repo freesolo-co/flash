@@ -90,7 +90,11 @@ def _spec() -> JobSpec:
         tokenizer_revision=spec.model_revision,
         producer_version="1.2.3",
     )
-    return replace(spec, workload_profile_input_digest=digest)
+    return replace(
+        spec,
+        workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
+    )
 
 
 def _prepare(spec: JobSpec, *, packed: bool = True):
@@ -155,7 +159,11 @@ def _rebuild_digest(spec: JobSpec) -> JobSpec:
         tokenizer_revision=spec.model_revision,
         producer_version="1.2.3",
     )
-    return replace(spec, workload_profile_input_digest=digest)
+    return replace(
+        spec,
+        workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
+    )
 
 
 def _spec_with_max_steps(max_steps: int) -> JobSpec:

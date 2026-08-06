@@ -300,6 +300,7 @@ def _profile_spec(spec: JobSpec, digest: str) -> JobSpec:
         gpu=replace(spec.gpu, count=1, max_wall_seconds=600),
         workload_profile_kind=SFT_PROFILE_KIND,
         workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
         workload_profile={},
     )
 
@@ -418,9 +419,15 @@ def test_profile_provenance_is_covered_by_preparation_digest(tmp_path, monkeypat
         spec,
         run_id="training-run",
         workload_profile_input_digest=digest,
+        workload_profile_producer_version="1.2.3",
         workload_profile=profile,
     )
-    public = replace(worker, workload_profile_input_digest="", workload_profile={})
+    public = replace(
+        worker,
+        workload_profile_input_digest="",
+        workload_profile_producer_version="",
+        workload_profile={},
+    )
     snapshot = {
         "worker_spec": worker.to_internal_dict(),
         "workload_profile": profile,
