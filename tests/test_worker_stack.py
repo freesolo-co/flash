@@ -118,7 +118,7 @@ def test_model_revision_threads_through_config_probes(monkeypatch, revision):
 
     assert lora.is_vl_checkpoint("org/model", revision=revision)
     assert packing.model_is_gdn_hybrid("org/model", revision=revision)
-    assert not packing.model_is_pure_attention("org/model", revision=revision)
+    assert packing.gdn_model_type("org/model", revision=revision)
     assert sft._model_arch_dims("uncataloged/model", revision=revision) == (4096, 32)
     assert isinstance(liger._liger_default_for_model("org/model", revision=revision), bool)
 

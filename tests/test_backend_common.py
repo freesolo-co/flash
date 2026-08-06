@@ -348,7 +348,7 @@ def _fake_verl_venv(tmp_path, *, stamp: str | None):
 def _record_run(calls, *, keep_check: bool = False):
     """stand in for subprocess.run, creating the venv dir `uv venv` would have created."""
 
-    def fake_run(command, check):
+    def fake_run(command, check, env=None):
         calls.append((command, check) if keep_check else command)
         if command[:2] == ["uv", "venv"]:
             # the venv path is `uv venv`'s trailing positional, wherever the flags before it end.
@@ -382,10 +382,12 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "xgrammar==0.1.25" in install
     assert "tqdm" in install
     assert "pyarrow" in install
-    # venv, the resolve above, then the prebuilt flash_attn wheel on its own --no-build-isolation
-    # line. nothing else: a fourth call would be an unbudgeted install on a paid pod.
-    assert len(calls) == 3
+    # venv, the resolve above, the prebuilt flash_attn wheel on its own --no-build-isolation line,
+    # then causal_conv1d (also its own line: it source-builds against the venv's torch). nothing
+    # else: a fifth call would be an unbudgeted install on a paid pod.
+    assert len(calls) == 4
     assert calls[2][:3] == ["uv", "pip", "install"]
+    assert vc.CAUSAL_CONV1D_REQUIREMENT in calls[3]
     # the stamp is written only after a successful install, so a crashed install is never reused.
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_VENV_STAMP
@@ -395,12 +397,14 @@ def _flaky_wheel_install(calls, sleeps, *, failures: int):
     """subprocess.run stand-in whose flash-attn install fails the first `failures` attempts."""
     attempts = {"n": 0}
 
-    def fake_run(command, check):
+    def fake_run(command, check, env=None):
         calls.append(command)
         if command[:2] == ["uv", "venv"]:
             os.makedirs(os.path.join(command[-1], "bin"), exist_ok=True)
             return
-        if "--no-build-isolation" not in command:
+        # key on the SPEC, not on --no-build-isolation: causal_conv1d passes that flag too, and this
+        # helper models a flaky flash-attn download specifically.
+        if vc.FLASH_ATTN_SPEC not in command:
             return
         attempts["n"] += 1
         if attempts["n"] <= failures:
@@ -518,11 +522,11 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
 
 
 def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatch, tmp_path):
-    # all three backends hard-enable remove-padding (sft_train.py:164, rl_train.py:339,
-    # opd_train.py:1505) and verl's cuda remove-padding path imports flash_attn.bert_padding
+    # all three backends default remove-padding ON (only a gdn model whose child cannot reset packed
+    # boundaries turns it off) and verl's cuda remove-padding path imports flash_attn.bert_padding
     # UNGUARDED (verl/utils/attention_utils.py:30, torch_functional.py:627). there is no sdpa
     # fallback on that path, so a venv without the wheel dies at the first training batch on a paid
-    # gpu. Dockerfile.worker:288-297 already treats it as REQUIRED in /opt/verl-venv; this fallback
+    # gpu. Dockerfile.worker already treats it as REQUIRED in /opt/verl-venv; this fallback
     # provisions the same interpreter and must carry the same wheel.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
@@ -547,6 +551,159 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in dockerfile.read_text(), (
         "Dockerfile.worker's FLASH_ATTN_SPEC default drifted from backend_common.FLASH_ATTN_SPEC"
     )
+
+
+def test_the_gdn_boundary_probe_imports_nothing_from_flash():
+    # THE regression for a bug that shipped silently: the probe ran
+    # `from flash.engine.worker.packing import gdn_packing_available` in the VERL CHILD. flash is
+    # pip-installed into the worker interpreter at runtime and /opt/verl-venv is built without
+    # --system-site-packages, so that import raised ModuleNotFoundError in every child, the gate
+    # answered "cannot reset", and every gdn run pinned itself to the padded fallback forever. it
+    # fails closed, so nothing crashes and no output is wrong -- the boundary fix simply never
+    # engages, and nothing says so. assert on the parsed import graph rather than a substring: the
+    # probe legitimately mentions "flash" inside is_flash_linear_attention_available.
+    probe = vc._GDN_BOUNDARY_PROBE % {"module": "transformers.models.qwen3_5.modeling_qwen3_5"}
+    roots = set()
+    for node in ast.walk(ast.parse(probe)):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            roots.add((node.module or "").split(".")[0])
+    assert "flash" not in roots, (
+        f"the verl child cannot import flash; probe would always fail closed. imports: {sorted(roots)}"
+    )
+    assert roots <= {"causal_conv1d", "importlib", "inspect", "torch", "transformers"}, (
+        f"probe reaches for a package the verl child is not guaranteed to have: {sorted(roots)}"
+    )
+
+
+def test_the_gdn_boundary_probe_is_valid_python():
+    # the probe is a template string, so a syntax error in it would surface as a silent
+    # "cannot reset boundaries" on a paid gpu rather than at import time here.
+    probe = vc._GDN_BOUNDARY_PROBE % {"module": "transformers.models.qwen3_6.modeling_qwen3_6"}
+    ast.parse(probe)
+    assert "transformers.models.qwen3_6.modeling_qwen3_6" in probe
+
+
+def test_the_shim_patches_the_moe_arch_not_the_dense_one():
+    # THE regression for the second half of the same bug. the shim hardcoded
+    # `transformers.models.qwen3_5` while the gate resolved model_type from the checkpoint, and the
+    # 35B (qwen3_5_moe, whose Qwen3_5MoeGatedDeltaNet reads the same two kwargs off a SEPARATE
+    # Qwen3_5MoeTextModel) would pass the gate, enable remove-padding, and then run an unpatched
+    # forward -- packed, contaminated, and reported as resets-active. the shim must patch whatever
+    # arch it is handed.
+    moe = vc.render_gdn_varlen_shim("qwen3_5_moe")
+    ast.parse(moe)
+    assert "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe" in moe
+    assert "modeling_qwen3_5.py" not in moe.replace("modeling_qwen3_5_moe", "")
+    # and it must not name a class: TextModel is found by suffix, so Qwen3_5MoeTextModel and
+    # Qwen3_5TextModel both resolve without the renderer knowing either name.
+    assert "Qwen3_5TextModel" not in moe
+    assert "Qwen3_5MoeTextModel" not in moe
+    dense = vc.render_gdn_varlen_shim("qwen3_5")
+    ast.parse(dense)
+    assert "transformers.models.qwen3_5.modeling_qwen3_5" in dense
+    assert dense != moe
+
+
+def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
+    # the gate returns model_type rather than a bool so the caller physically cannot render the shim
+    # for a different architecture than the probe cleared. a second resolve at the call site would
+    # make that agreement a convention; this makes it structural.
+    monkeypatch.setattr("flash.engine.worker.packing.gdn_model_type", lambda *a, **k: "qwen3_5_moe")
+    monkeypatch.setattr(
+        vc.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="1", stderr=""),
+    )
+    arch = vc.verl_child_gdn_reset_arch("/any/python", "Qwen/Qwen3.6-35B-A3B")
+    assert arch == "qwen3_5_moe"
+    assert f"modeling_{arch}" in vc.render_gdn_varlen_shim(arch)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [
+        (1, ""),  # child missing transformers/fla: the probe raises
+        (0, "0"),  # child ran the probe and answered "kernels absent"
+        (0, ""),  # child produced nothing readable
+    ],
+)
+def test_the_gdn_boundary_gate_treats_an_unconvincing_probe_as_unavailable(
+    monkeypatch, returncode, stdout
+):
+    # fail-closed is the whole safety property: anything short of an explicit "1" must mean "train
+    # padded", never "assume the kernels are there". a nonzero exit is what a child missing fla
+    # actually produces, and only an affirmative answer may enable packing.
+    monkeypatch.setattr(
+        vc.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=returncode, stdout=stdout, stderr=""),
+    )
+    assert vc.verl_child_gdn_reset_arch("/nonexistent/python", "Qwen/Qwen3.5-4B") is None
+
+
+def test_fla_stays_in_lockstep_with_the_worker_image():
+    # the fallback venv and /opt/verl-venv must hold the SAME fla commit. gdn boundary resets are a
+    # correctness property, not a speed one: a child on a different fla could thread cu_seqlens
+    # differently, and the two paths would train the same config differently.
+    text = (pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker").read_text()
+    sha = vc.FLA_REQUIREMENT.rsplit("@", 1)[1]
+    assert text.count(sha) >= 2, (
+        "Dockerfile.worker must pin the same fla sha as backend_common.FLA_REQUIREMENT in BOTH the "
+        "main interpreter and the verl venv"
+    )
+    assert text.count(vc.CAUSAL_CONV1D_REQUIREMENT) >= 2, (
+        "causal_conv1d must be installed into the verl venv as well as the main interpreter; the "
+        "two have disjoint paths and the model trains in the verl one"
+    )
+
+
+def test_the_verl_venv_gets_the_gdn_kernels(monkeypatch, tmp_path):
+    # the model trains in THIS interpreter. without fla here, transformers binds
+    # chunk_gated_delta_rule to a pure-torch fallback that accepts cu_seqlens and discards it, so the
+    # boundary shim is inert and packed gdn training is contaminated while looking patched.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    flat = [arg for command in calls for arg in command]
+    assert vc.FLA_REQUIREMENT in flat, (
+        "the verl child must hold fla or boundary resets are discarded"
+    )
+
+
+def test_causal_conv1d_install_is_best_effort_and_leaves_no_env_residue(monkeypatch):
+    # best-effort on purpose: without the kernel the boundary gate answers False and the run trains
+    # padded, so failing the provisioning would turn a compiler hiccup into a dead paid run. and the
+    # build flag must not leak into the environment verl inherits from this process.
+    seen = {}
+
+    def fake_run(command, check, env=None):
+        seen["command"], seen["check"], seen["env"] = command, check, env
+
+    monkeypatch.delenv("CAUSAL_CONV1D_FORCE_BUILD", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+
+    vc._install_causal_conv1d("/venv/bin/python")
+
+    assert vc.CAUSAL_CONV1D_REQUIREMENT in seen["command"]
+    assert seen["check"] is False, "a failed conv build must degrade to padded, not kill the run"
+    # compiles against the venv's torch, so build isolation would resolve a different one.
+    assert "--no-build-isolation" in seen["command"]
+    assert seen["env"]["CAUSAL_CONV1D_FORCE_BUILD"] == "TRUE"
+    assert "CAUSAL_CONV1D_FORCE_BUILD" not in os.environ, (
+        "build flag leaked into verl's environment"
+    )
+
+
+def test_the_venv_stamp_covers_fla_so_a_prefla_venv_is_rebuilt(monkeypatch, tmp_path):
+    # a workdir provisioned by a release that predates the fla install holds no fla. if the stamp
+    # ignored fla, a retry would reuse that venv, skip provisioning, and train gdn models on the
+    # discarding fallback forever -- the exact bug this change exists to close.
+    assert vc.FLA_REQUIREMENT in vc.VERL_VENV_STAMP
 
 
 def test_verl_spec_stays_in_lockstep_with_the_worker_image():
@@ -625,7 +782,7 @@ def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
 
     vc.resolve_verl_python(str(tmp_path))
 
-    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"]]
+    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"], ["uv", "pip"]]
     assert not (venv / "marker").exists()
 
 
@@ -643,7 +800,7 @@ def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkey
     vc.resolve_verl_python(str(tmp_path))
 
     assert not (venv / "pyvenv.cfg").exists()
-    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"]]
+    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"], ["uv", "pip"]]
 
 
 def test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork():
@@ -681,9 +838,9 @@ def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypat
     vc.resolve_verl_python(str(tmp_path), install_wandb=True)
 
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1][0])
-    # wandb is the LAST call: it follows the flash_attn wheel install, and unlike every install
-    # before it, it is best-effort (check=False) so a wandb outage cannot fail a training run.
-    assert calls[3] == (
+    # wandb is the LAST call: it follows the kernel installs, and unlike the required ones before it
+    # it is best-effort (check=False) so a wandb outage cannot fail a training run.
+    assert calls[-1] == (
         ["uv", "pip", "install", "--python", str(tmp_path / "verl-venv/bin/python"), "wandb"],
         False,
     )

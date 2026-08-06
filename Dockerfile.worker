@@ -282,19 +282,39 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-o
         "TransferQueue==0.1.7" \
         liger-kernel "bitsandbytes>=0.49" qwen-vl-utils \
         "wandb>=0.17" \
+        "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \
+        "tilelang==0.1.11" \
+        "apache-tvm-ffi==0.1.11" \
     && rm -f /tmp/verl-overrides.txt \
     && uv cache clean
 
 # flash-attn is REQUIRED in here, not best-effort like it is in the main interpreter above. All three
-# backends hard-enable remove-padding (rl_train.py:336, sft_train.py:164, opd_train.py:1505), and verl's
-# CUDA remove-padding path imports flash_attn.bert_padding UNGUARDED
-# (verl/utils/attention_utils.py:30, torch_functional.py:627,657). There is no SDPA fallback on that
-# path: without the module the run dies at the first training batch, which the import-only assert
-# below would not catch. Reuses FLASH_ATTN_SPEC so the venv gets the same wheel as the main
-# interpreter instead of a second source build.
+# backends default remove-padding ON (rl_train.py, sft_train.py, opd_train.py; only a GDN model whose
+# child cannot reset packed boundaries turns it off), and verl's CUDA remove-padding path imports
+# flash_attn.bert_padding UNGUARDED (verl/utils/attention_utils.py:30, torch_functional.py:627,657).
+# There is no SDPA fallback on that path: without the module the run dies at the first training
+# batch, which the import-only assert below would not catch. Reuses FLASH_ATTN_SPEC so the venv gets
+# the same wheel as the main interpreter instead of a second source build.
 RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
     uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${FLASH_ATTN_SPEC}" \
     && uv cache clean
+
+# causal_conv1d in the VERL VENV, which is where the model actually trains. The main interpreter's
+# copy above does not reach here: /opt/verl-venv is built without --system-site-packages, so the two
+# have disjoint paths. Together with fla's cu_seqlens (installed above) this is what makes the packed
+# GDN boundary resets real rather than decorative: engine.worker.backend_common's boundary shim hands
+# the GDN layer cu_seq_lens_q + seq_idx, but transformers' pure-torch fallbacks take **kwargs and
+# silently DISCARD both, so a child missing these kernels trains across example boundaries while
+# looking patched. verl_child_can_reset_gdn_boundaries probes this venv for exactly that reason.
+# Best-effort with the same uninstall-on-broken-import guard as the main interpreter: a present but
+# ABI-broken package passes transformers' find_spec probe and then crashes at model load, and a
+# failed build must degrade to unpacked training (the gate returns False) rather than fail the image.
+RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+    uv pip install --python /opt/verl-venv/bin/python "causal-conv1d==1.6.2.post1" --no-build-isolation \
+    && /opt/verl-venv/bin/python -c "import causal_conv1d" \
+    && echo "causal_conv1d (verl venv): installed (GDN boundary resets enabled)" \
+    || { echo "causal_conv1d (verl venv): build/import failed -> GDN trains unpacked (padded fallback)"; \
+         uv pip uninstall --python /opt/verl-venv/bin/python causal-conv1d 2>/dev/null || true; }
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
@@ -303,6 +323,11 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
 # where a version mismatch would surface, and the fork-only rollout field the GRPO path emits as a
 # hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
 # venv carries 0.19.1 instead of 0.11.2.
+#
+# fla is asserted HARD here (causal_conv1d is not, matching its best-effort install above): without
+# it transformers binds chunk_gated_delta_rule to the pure-torch fallback, which accepts cu_seqlens
+# and discards it, so packed GDN runs would train across example boundaries. A silently fla-less
+# child is exactly the failure this assert exists to make loud at build time rather than on a paid GPU.
 RUN /opt/verl-venv/bin/python -c "import importlib.metadata as M; \
 import importlib; \
 [importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.main_ppo_sync','verl.trainer.sft_trainer')]; \
@@ -310,6 +335,8 @@ import importlib; \
 from verl.workers.config.rollout import RolloutConfig; \
 assert 'mask_truncated_completions' in RolloutConfig.__dataclass_fields__, 'verl is not the freesolo fork (no mask_truncated_completions)'; \
 importlib.import_module('flash_attn.bert_padding'); \
+from transformers.utils.import_utils import is_flash_linear_attention_available; \
+assert is_flash_linear_attention_available(), 'flash-linear-attention missing from the verl venv: packed GDN boundary resets would be silently discarded'; \
 assert M.version('verl') == '0.8.0', 'opd structured gate requires verl exactly 0.8.0, got ' + M.version('verl'); \
 assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
 from vllm import ModelRegistry; \
@@ -318,7 +345,9 @@ missing = {'Qwen3_5ForConditionalGeneration','Qwen3_5MoeForConditionalGeneration
 assert not missing, 'vllm cannot serve the default-model archs: ' + repr(sorted(missing)); \
 print('verl venv OK | verl', M.version('verl'), '| vllm', M.version('vllm'), '| torch', M.version('torch'), '| numpy', M.version('numpy'), '| xgrammar', M.version('xgrammar')); \
 print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)'); \
-print('  qwen3.5 archs registered; mask_truncated_completions present')"
+print('  qwen3.5 archs registered; mask_truncated_completions present'); \
+from transformers.utils.import_utils import is_causal_conv1d_available; \
+print('  gdn boundary resets: fla yes, causal_conv1d ' + ('yes' if is_causal_conv1d_available() else 'NO -> gdn trains padded'))"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
 # from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;
