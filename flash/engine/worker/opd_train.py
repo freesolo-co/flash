@@ -2889,6 +2889,13 @@ def run_opd_train(spec=None) -> None:
                 "verl_version": "0.8.0",
                 "verl_backend": "fsdp",
                 "ulysses_sequence_parallel_size": gpu_count,
+                # whether the child could reset gdn state at packed example boundaries. resolved per
+                # run by probing the child and announced only by a log line, and a successful run
+                # uploads no console -- so without this key a finished run gives no way to tell
+                # whether it packed with resets or took the padded fallback. for a gate whose failure
+                # mode is silent contamination that is the one thing worth recording. None for a
+                # non-gdn model, where the question does not arise.
+                "gdn_boundary_resets": gdn_boundary_resets if gdn_hybrid else None,
                 "peak_gpu_gb": peak_gpu_gb,
                 "warm_started": bool(warmstart_adapter),
                 "resumed": bool(resume_step),

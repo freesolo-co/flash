@@ -709,6 +709,7 @@ def _build_verl_train_notes(
     reward_profile=None,
     step_intervals: list[float] | None = None,
     reward_bridge_batching: bool = False,
+    gdn_boundary_resets: bool | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -740,6 +741,13 @@ def _build_verl_train_notes(
         # engaged. this is resolved per-card (cc>=8.9, and never for gdn hybrids), so it is a property
         # of the run rather than of the config.
         "vllm_kv_cache_dtype": "fp8" if fp8_kv else None,
+        # same reasoning as vllm_kv_cache_dtype, and it matters more: whether the child could reset
+        # gdn state at packed example boundaries is resolved per-run by probing the child, announced
+        # only by a log line, and a successful run uploads no console. without this key a finished
+        # run gives no way to tell whether it packed with resets or fell back to the padded path --
+        # for a gate whose failure mode is silent contamination, that is the one thing worth
+        # recording. None for a non-gdn model, where the question does not arise.
+        "gdn_boundary_resets": gdn_boundary_resets,
         # an explicit vllm prefill-batch pin is only needed when the caller hardcodes 4096; this path sets no
         # such override, so the engine keeps its own default. None records "not pinned by flash"
         # rather than asserting a number flash never chose.
@@ -3382,11 +3390,12 @@ def run_rl_train():
             _cc_ok = bool(
                 _torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9)
             )
-            fp8_kv = _cc_ok and not model_is_gdn_hybrid(
-                inp["model_id"], revision=inp["model_revision"]
-            )
         except Exception:  # no cuda / probe failure -> conservative bf16 kv
-            fp8_kv = False
+            _cc_ok = False
+        # reuse the gdn answer resolved above rather than re-probing: model_is_gdn_hybrid returns
+        # False when its own probe raises, so a second call can disagree with the first and turn
+        # fp8 kv ON for the very hybrid the comment above says it crashes.
+        fp8_kv = _cc_ok and not gdn_hybrid
         # one capability probe, both rollout decisions below. asked of the verl interpreter, whose
         # torch/vllm stack is the one that has to run the rollout.
         verl_cc = resolve_verl_device_capability(python_bin)
@@ -3729,5 +3738,6 @@ def run_rl_train():
             reward_profile=reward_profile,
             step_intervals=_step_intervals(step_line_times),
             reward_bridge_batching=not inp["multi_turn"],
+            gdn_boundary_resets=gdn_boundary_resets if gdn_hybrid else None,
         ),
     )

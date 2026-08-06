@@ -2006,3 +2006,61 @@ def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
                 "failure anywhere in that try -- including probes unrelated to the checkpoint -- "
                 "would report a gdn hybrid as not-hybrid and pack it without boundary resets."
             )
+
+
+def test_each_path_resolves_the_gdn_arch_question_exactly_once():
+    """`model_is_gdn_hybrid` may be called at most once per module. Two calls can disagree.
+
+    THE regression for a real defect: grpo asked the question twice -- once to decide packing, then
+    again inside the fp8-KV try to decide the kv dtype. The helper answers False when its OWN probe
+    raises (a hub blip, a revision fetch failure), so the second call could return False where the
+    first returned True. That turns fp8 kv ON for a GDN hybrid, which the code comment directly above
+    it says crashes vllm's wake path on the hybrid cache ('list' object has no attribute 'zero_').
+
+    Two calls with a swallowed exception between them are not one decision, they are two guesses that
+    happen to agree most of the time. Asserted structurally because the disagreeing case needs a
+    transient failure to reproduce and so will not show up in any deterministic test.
+    """
+    import ast
+    import inspect as _inspect
+
+    from flash.engine.worker import opd_train, rl_train, sft_train
+
+    for module in (sft_train, opd_train, rl_train):
+        tree = ast.parse(_inspect.getsource(module))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "model_is_gdn_hybrid"
+        ]
+        assert len(calls) <= 1, (
+            f"{module.__name__} calls model_is_gdn_hybrid {len(calls)} times (lines "
+            f"{[c.lineno for c in calls]}). it returns False on its own probe failure, so a second "
+            "call can contradict the first: resolve it once and reuse the value."
+        )
+
+
+def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
+    """All three verl paths must publish `gdn_boundary_resets` in their run metadata.
+
+    The gate is resolved per-run by probing the child, and it announces itself only with a log line.
+    A SUCCESSFUL run uploads no console, so without this key a finished GDN run gives no way to tell
+    whether it packed with boundary resets or fell back to the padded path. For a gate whose failure
+    mode is silent cross-example contamination, "which mode did this run actually train in" is the
+    one question the artifacts have to answer -- the same reasoning rl_train already applies to
+    `vllm_kv_cache_dtype`.
+
+    Asserted on the source rather than by invoking the builders, because opd's and grpo's metadata
+    dicts are constructed deep inside their run functions, behind a live bridge and a child process.
+    """
+    import inspect as _inspect
+
+    from flash.engine.worker import opd_train, rl_train, sft_train
+
+    for module in (sft_train, opd_train, rl_train):
+        assert '"gdn_boundary_resets"' in _inspect.getsource(module), (
+            f"{module.__name__} computes the gdn boundary-reset decision but never records it, so a "
+            "finished run cannot be checked for whether it trained packed-with-resets or padded."
+        )
