@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 
@@ -393,14 +393,15 @@ def test_sft_epochs_must_be_positive() -> None:
         spec_from_dict(raw)
 
 
-def test_sft_requires_positive_max_examples() -> None:
+def test_sft_max_examples_is_an_optional_prefix_cap() -> None:
+    # an sft quote is backed by a workload profile that materializes and tokenizes the real
+    # dataset, so an omitted or zero cap means "every row" and is measured. requiring a row count
+    # here would only be asking the user to supply the number the profile exists to measure.
     raw = _raw(algorithm="sft")
     raw["train"] = {"epochs": 1, "lora_rank": 8}
-    with pytest.raises(ConfigError, match=r"max_examples.*positive"):
-        spec_from_dict(raw)
+    assert spec_from_dict(raw).train.max_examples is None
     raw["train"]["max_examples"] = 0
-    with pytest.raises(ConfigError, match=r"max_examples.*positive"):
-        spec_from_dict(raw)
+    assert spec_from_dict(raw).train.max_examples == 0
     raw["train"]["max_examples"] = 8
     assert spec_from_dict(raw).train.max_examples == 8
 
@@ -868,18 +869,28 @@ def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
         orch.get_status("flash-000-nope")
 
 
-def test_programmatic_sft_submit_requires_max_examples(tmp_path, monkeypatch) -> None:
+def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
+    tmp_path, monkeypatch
+) -> None:
+    # sft is quoted from a workload profile that tokenizes the real dataset, so a spec with no
+    # environment to profile has no measurable workload. it must fail closed rather than fall back
+    # to an assumed row count -- including on the dry-run preview, which previews a real submit.
     from flash.spec import JobSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        orch, "_resolve_model_revision", lambda s, **_kw: replace(s, model_revision="a" * 40)
+    )
     spec = JobSpec(
-        run_id="sft-no-examples",
+        run_id="sft-no-environment",
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         project="11111111-1111-4111-8111-111111111111",
     )
-    with pytest.raises(ValueError, match=r"max_examples.*positive"):
+    with pytest.raises(orch.WorkloadProfileUnavailable, match="requires an environment id"):
         orch.submit_job(spec, dry_run=True)
+    with pytest.raises(FileNotFoundError):
+        orch.get_status(spec.run_id)
 
 
 def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypatch) -> None:

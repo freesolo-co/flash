@@ -373,12 +373,82 @@ def lookup_key(api_key: str) -> dict | None:
         return dict(row)
 
 
-def record_run(run_id: str, key_id: int) -> None:
+def record_run(run_id: str, key_id: int, *, kind: str = "train") -> None:
+    if kind not in {"train", "profile"}:
+        raise ValueError("run kind must be 'train' or 'profile'")
     with _connect() as conn:
         conn.execute(
             "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, ?, ?)",
-            (run_id, key_id, "train", time.time()),
+            (run_id, key_id, kind, time.time()),
         )
+
+
+def claim_profile_run(run_id: str, key_id: int) -> bool:
+    """Take ownership of a profile run, or report that someone already has it.
+
+    Profile run ids are deterministic in the workload, so two owners submitting the same config
+    arrive at the same id by design: that is the reuse the deterministic id exists for. Only the
+    first one records it. The insert has to decide that atomically rather than the caller reading
+    run_owner first, because two concurrent submissions would both read "absent" and the loser
+    would raise on a primary-key that is not actually a defect.
+
+    Returns True when this key now owns the row and is therefore the one that must launch the run.
+    Ownership never transfers on a conflict: run reads are owner-scoped, so the second submitter
+    waits for a run it cannot read, which is what the pending response tells it to do.
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, 'profile', ?) "
+            "ON CONFLICT(run_id) DO NOTHING",
+            (run_id, key_id, time.time()),
+        )
+        return cursor.rowcount == 1
+
+
+def reclaim_spent_profile_run(run_id: str, key_id: int, *, spent_at: float) -> bool:
+    """Take over a profile id whose previous run is spent, or report that someone else got there.
+
+    A profile that failed or was cancelled leaves its row behind, and the id is derived from the
+    workload rather than the account, so without a takeover the config becomes permanently
+    unquotable for every user with nothing in the system able to clear it.
+
+    The takeover is a compare-and-swap, not a plain update: an update matching only ``run_id``
+    succeeds for every caller, so two submitters watching the same failed profile would both be
+    told to launch and the workload would be profiled (and billed) twice. Deleting and re-claiming
+    has the mirror problem, since the loser's delete would remove the row the winner just took.
+
+    ``spent_at`` is the ``created_at`` of the spent run the caller actually observed, read from the
+    status store rather than from this table. That distinction is the whole mechanism: this table
+    holds no record of which attempt is spent, so a token re-read from here would be the *winner's*
+    fresh stamp and the next caller's swap would match it just as happily. Anchoring on the spent
+    run means the first takeover moves the row past it and every later attempt misses.
+
+    That comparison rests on one ordering, which the caller must preserve: a claim is always taken
+    before the run it authorizes is created, both here and on the relaunch below. So the claim
+    backing a spent run precedes it, and a claim taken to replace it follows it. Creating a profile
+    run without claiming it first would break the takeover for that id in both directions.
+
+    An unclaimed id is claimed outright rather than reported lost. A previous takeover whose launch
+    failed released its row, leaving the status store still showing the spent run: without the
+    insert every later submitter would keep arriving here, keep matching nothing, and the workload
+    would be wedged by the very path that exists to unwedge it.
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE runs SET key_id = ?, created_at = ? "
+            "WHERE run_id = ? AND kind = 'profile' AND created_at <= ?",
+            (key_id, time.time(), run_id, spent_at),
+        )
+        if cursor.rowcount == 1:
+            return True
+        # inline rather than delegating to claim_profile_run: that would open a nested transaction
+        # on this same pooled connection and commit the update above out from under this block.
+        inserted = conn.execute(
+            "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, 'profile', ?) "
+            "ON CONFLICT(run_id) DO NOTHING",
+            (run_id, key_id, time.time()),
+        )
+        return inserted.rowcount == 1
 
 
 def delete_run(run_id: str) -> None:

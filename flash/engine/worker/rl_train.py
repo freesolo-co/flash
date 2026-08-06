@@ -34,6 +34,10 @@ from math import gcd
 
 from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
 from flash.engine.recipe import RECIPE
+from flash.engine.sft_workload import (
+    _materialize_verl_images,
+    _multimodal_messages_with_images,
+)
 from flash.engine.steps import (
     final_save_due,
     on_policy_steps,
@@ -99,8 +103,6 @@ from flash.engine.worker.rollout_samples import (
 from flash.engine.worker.sft_train import (
     _cached_model_path,
     _hydra_val,
-    _materialize_verl_images,
-    _multimodal_messages_with_images,
     _NvidiaSmiPeakSampler,
     _verl_image_message_content,
 )

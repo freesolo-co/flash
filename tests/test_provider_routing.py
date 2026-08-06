@@ -8,22 +8,53 @@ import threading
 import pytest
 
 from flash.spec import JobSpec
+from tests._helpers.profile import (
+    attach_sft_profile,
+    record_sft_profile,
+    satisfy_sft_profile,
+    stub_revision_geometry,
+)
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
-def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
+def _spec(run_id="flash-1700000001-rt01", algorithm="sft", **gpu_kw) -> JobSpec:
+    """A spec in the shape the lifecycle actually receives: post-``prepare_job``.
+
+    Routing behaviour is algorithm-independent, but sft is the algorithm whose quote is
+    profile-backed, so an sft spec has to carry the attached profile its own submit path would have
+    resolved. Without it every routing test re-tests the profile gate instead of routing.
+    ``algorithm`` is for the few tests whose subject is a submit-path behaviour sft no longer
+    reaches; ``attach_sft_profile`` leaves those specs alone.
+    """
     gpu = {"type": "RTX 4090", "max_retries": 2}
     gpu.update(gpu_kw)
-    return JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "sft",
-            "run_id": run_id,
-            "train": {"epochs": 1, "max_examples": 8},
-            "gpu": gpu,
-        }
+    return attach_sft_profile(
+        JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": algorithm,
+                "run_id": run_id,
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "train": {"epochs": 1, "max_examples": 8},
+                "gpu": gpu,
+            }
+        )
     )
+
+
+def _public_spec(run_id="flash-1700000001-rt01", algorithm="sft") -> JobSpec:
+    """The user-authored shape ``submit_job`` receives: env unpinned, no attached profile.
+
+    ``_spec`` is deliberately post-``prepare_job``, which is the wrong input for a test whose
+    subject IS submission -- it would arrive already carrying the pins that submission is supposed
+    to resolve. Round-tripping through the public serializer drops exactly the platform-managed
+    fields (env sha, the profile carrier, managed gpu policy), so this stays one definition of the
+    spec instead of a second hand-written copy that could drift from it.
+    """
+    public = _spec(run_id=run_id, algorithm=algorithm).to_dict()
+    public.pop("model_revision", None)  # authored-optional; submission resolves it
+    return JobSpec.from_dict({**public, "run_id": run_id})
 
 
 def _alloc(gpu="RTX 4090", rate=0.69, candidates=None):
@@ -72,6 +103,10 @@ def orch(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    # _spec pins a model revision, which makes the lifecycle's post-allocation quote refresh
+    # revision-aware. Left unstubbed it reaches github, and the refresh treats any failure as an
+    # infra-shaped transient -- so the whole suite would sit in real retry backoff sleeps.
+    stub_revision_geometry(monkeypatch)
     return runner
 
 
@@ -87,7 +122,7 @@ def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persisten
     import flash.providers as providers
 
     persisted = []
-    spec = _spec(type="H200")
+    spec = satisfy_sft_profile(orch, monkeypatch, _spec(type="H200"))
     monkeypatch.setattr(providers, "available_providers", lambda: ("lambda", "vast"))
     monkeypatch.setattr(orch, "_save_status", lambda *args, **kwargs: persisted.append(args))
 
@@ -464,7 +499,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     monkeypatch.setattr(
         orch,
         "_resolve_model_revision",
-        lambda spec: replace(spec, model_revision=resolved_model_sha),
+        lambda spec, **_kwargs: replace(spec, model_revision=resolved_model_sha),
     )
     monkeypatch.setattr(
         orch,
@@ -507,12 +542,17 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
 
-    public = JobSpec.from_dict(
-        {
-            **_spec().to_internal_dict(),
-            "model_revision": resolved_model_sha,
-            "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        }
+    public = _public_spec()
+    # the profile job for this workload already ran, so preparation reads its record instead of
+    # queueing another one. it is keyed on the two shas submission itself resolves above, so it has
+    # to be recorded against those -- not against the helper's stand-ins.
+    record_sft_profile(
+        orch,
+        replace(
+            public,
+            model_revision=resolved_model_sha,
+            environment=replace(public.environment, resolved_sha=resolved_sha),
+        ),
     )
 
     status = orch.submit_job(public)
@@ -537,6 +577,41 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     assert worker["gpu"]["network_volume"] == "flash-weights"
 
 
+def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch, monkeypatch):
+    """sft never reaches the unpinned-at-submit state the lifecycle fallback below recovers.
+
+    Its workload profile is keyed on the immutable environment revision, so a GitHub blip at submit
+    has no pin to key on and no profile can be trusted. The run must not be created at all: pricing
+    it would freeze a quote against a ref that can move before the worker resolves it. grpo and opd
+    have no such key, so for them the best-effort pin plus lifecycle fallback stays correct.
+    """
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+
+    persisted = []
+
+    def blip(_parsed, *_args, **_kwargs):
+        raise RuntimeError("github rate limit at submit time")
+
+    from dataclasses import replace
+
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", blip)
+    monkeypatch.setattr(
+        orch,
+        "_resolve_model_revision",
+        lambda spec, **_kw: replace(spec, model_revision="b" * 40),
+    )
+    monkeypatch.setattr(orch, "_save_status", lambda *a, **k: persisted.append(a))
+    monkeypatch.setattr(
+        allocator, "allocate", lambda *a, **k: pytest.fail("allocated without a profile")
+    )
+
+    with pytest.raises(orch.WorkloadProfileUnavailable, match="immutable resolved environment"):
+        orch.submit_job(_public_spec())
+
+    assert persisted == []
+
+
 def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     """A pin the lifecycle fallback recovers must survive a control-plane restart.
 
@@ -547,6 +622,10 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     again. A pin held in the lifecycle's local `spec` alone would leave recovery unpinned, so a later
     attempt could resolve a moved ref to different code while resuming the first attempt's
     checkpoint (codex[bot]).
+
+    Exercised on grpo because sft can no longer reach this state at all: its profile gate rejects an
+    unpinned environment at submit instead of deferring the pin (the fail-closed test above). grpo
+    and opd keep the best-effort pin, so the fallback they depend on is still live.
     """
     from dataclasses import replace
 
@@ -571,7 +650,7 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
         return first_sha if len(resolutions) == 2 else moved_sha
 
     monkeypatch.setattr(
-        orch, "_resolve_model_revision", lambda spec: replace(spec, model_revision="b" * 40)
+        orch, "_resolve_model_revision", lambda spec, **_kw: replace(spec, model_revision="b" * 40)
     )
     monkeypatch.setattr(orch, "resolve_model", lambda model, *a, **k: catalog.MODELS[model])
 
@@ -593,14 +672,7 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
 
-    public = JobSpec.from_dict(
-        {
-            **_spec().to_internal_dict(),
-            "model_revision": "b" * 40,
-            "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        }
-    )
-
+    public = _public_spec(algorithm="grpo")
     orch.submit_job(public)
 
     # the pin must already be persisted when the provider is called, not written back afterwards:
@@ -1674,3 +1746,47 @@ def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     action = _retry_action_line(log.getvalue(), 0)
     assert "expecting to retry on H100 @ runpod again" in action, action
     assert "no untried GPU class fits this run" in action, action
+
+
+def test_workload_profile_mismatch_fails_fast_instead_of_retrying(orch, monkeypatch):
+    """A profile whose identity does not match the spec is terminal, not infrastructure.
+
+    The selected-quote refresh re-derives the profile digest from the effective spec, so a mismatch
+    resolves identically on every attempt. Classifying it as infra-shaped burns the run's whole
+    retry budget on real ``time.sleep`` backoffs before failing anyway -- the shape that wedged the
+    suite for 20 minutes on a single test."""
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.workload_profile import WorkloadProfileMismatch
+
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    submits = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        submits.append(attempt)
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+
+    import flash.cost.spec as cost_spec
+
+    def refuse(*_a, **_kw):
+        raise WorkloadProfileMismatch("workload profile input digest does not match")
+
+    monkeypatch.setattr(cost_spec, "estimate_for_spec", refuse)
+
+    # any sleep here means the failure was misclassified as a transient the run should wait out.
+    slept = []
+    monkeypatch.setattr(orch.lifecycle.time, "sleep", lambda s: slept.append(s))
+
+    spec = _spec(max_retries=2)
+    _seed_status(orch, spec)
+    with pytest.raises(WorkloadProfileMismatch):
+        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+
+    assert submits == []  # never reached a provider
+    assert slept == []  # and never backed off waiting for it to clear
