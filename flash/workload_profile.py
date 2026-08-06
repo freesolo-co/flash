@@ -21,6 +21,35 @@ _ROLLOUT_PROFILE_RUN_PREFIX = "profile-rollout-"
 # token counts, so the two carry different lifetimes and only one of them is keyed.
 ROLLOUT_LATENCY_MAX_AGE_S = 24 * 60 * 60
 
+# how many completed rollouts a profile needs before its mean may move a quote.
+#
+# MEASURED, not chosen: 16 rollouts of Qwen3.5-9B over 4 grade-school math prompts (2026-08-06,
+# hosted api, temperature 1.0, cap 2048) gave mean 661 tokens with sd 625, so cv = 0.946. the
+# standard error of a mean at that spread is 0.946/sqrt(n) of the mean itself:
+#
+#   n=8 -> +/-33%    n=24 -> +/-19%    n=32 -> +/-17%    n=90 -> +/-10%
+#
+# the sample also showed WHERE the variance lives, which sets the sampling shape rather than just
+# the count: between-prompt variance (304846) was 5x within-prompt (61082), because one word
+# problem ran a median 1642 tokens against ~290 for three arithmetic prompts. a profile that draws
+# many completions from few prompts therefore measures those prompts, not the environment. the
+# worker must spread its draws across DISTINCT prompts first and add repeats second.
+#
+# 32 is the floor: it holds +/-17% at the observed spread while staying cheap enough to run per
+# config (~$0.002 at 9B, ~$0.05 at 27B), and it admits 8 distinct prompts at the group size 4 that
+# grpo itself samples with. chasing +/-10% costs ~3x more rollouts to shave a sixth off an error
+# already far smaller than the cap error it replaces (3.10x on this same sample).
+MIN_TRUSTWORTHY_ROLLOUTS = 32
+
+# how much of the sample may be censored at the cap before the mean stops meaning anything.
+#
+# a truncated completion contributes the cap instead of its true length, so truncation biases the
+# measured mean DOWNWARD -- the direction that underbills. the same 16-rollout sample above hit
+# the 2048 cap twice (12.5%): real, but light enough that the mean still tracked the distribution.
+# a run where most completions are clipped is a different regime, where the cap IS the workload and
+# quoting it is correct; the profile refuses rather than reporting a censored mean as measurement.
+MAX_TRUSTWORTHY_TRUNCATION_RATE = 0.25
+
 # which rows the profile measured. sft is never sampled: it either measures every source row or the
 # deterministic max_examples prefix training will consume, so both policies are exact.
 SFT_SAMPLE_POLICY_FULL = "exact-full"
@@ -341,9 +370,7 @@ def rollout_profile_input_payload(
             # reading taken at one setting must never be reused for a run at another. None is
             # keyed distinctly from any float: it means "whatever the backend defaults to",
             # which is not knowably the same distribution as an explicit value.
-            "temperature": (
-                None if train.temperature is None else float(train.temperature)
-            ),
+            "temperature": (None if train.temperature is None else float(train.temperature)),
         },
     }
 
@@ -490,7 +517,9 @@ class RolloutWorkloadProfile:
             return 0.0
         return self.truncated_rollouts / self.completed_rollouts
 
-    def trustworthy(self, *, now: float, min_rollouts: int = 8) -> tuple[bool, str]:
+    def trustworthy(
+        self, *, now: float, min_rollouts: int = MIN_TRUSTWORTHY_ROLLOUTS
+    ) -> tuple[bool, str]:
         """Whether this reading may move a quote, and if not, why not.
 
         Returns a reason rather than a bare bool because every caller that refuses a profile has to
@@ -512,6 +541,19 @@ class RolloutWorkloadProfile:
             )
         if self.completion_tokens_max <= 0:
             return False, "every sampled completion was empty, so no generation was measured"
+        # a truncated completion was cut off mid-generation, so it reports the cap rather than the
+        # length the model would have produced. every such sample drags the mean DOWN, and a mean
+        # biased low underbills the quote -- the one direction that costs real money rather than
+        # merely over-reserving it. a light tail is tolerable (the cap is a real limit training
+        # will hit too, so those tokens genuinely are all that gets generated), but once a large
+        # share of the sample is censored the mean stops describing the distribution at all.
+        if self.truncation_rate > MAX_TRUSTWORTHY_TRUNCATION_RATE:
+            return False, (
+                f"{self.truncated_rollouts} of {self.completed_rollouts} sampled completions were "
+                f"truncated at the cap ({self.truncation_rate:.0%}, above the "
+                f"{MAX_TRUSTWORTHY_TRUNCATION_RATE:.0%} ceiling); the measured mean is censored "
+                "and would underbill generation"
+            )
         age = now - self.measured_at
         if self.measured_at <= 0 or age > ROLLOUT_LATENCY_MAX_AGE_S:
             return False, (

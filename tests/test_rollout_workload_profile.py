@@ -7,6 +7,7 @@ from typing import ClassVar
 import pytest
 
 from flash.workload_profile import (
+    MIN_TRUSTWORTHY_ROLLOUTS,
     ROLLOUT_LATENCY_MAX_AGE_S,
     RolloutWorkloadProfile,
     WorkloadProfileMismatch,
@@ -28,8 +29,10 @@ def _fields(**overrides) -> dict:
         "environment_id": "freesolo-co/autoslm-bench",
         "environment_revision": "env-sha",
         "kind": "grpo",
-        "sampled_prompts": 16,
-        "completed_rollouts": 16,
+        # 8 distinct prompts x group of 4 = 32 rollouts, the measured floor. between-prompt
+        # variance dominates, so the sample spreads across prompts before it repeats one.
+        "sampled_prompts": 8,
+        "completed_rollouts": 32,
         "failed_rollouts": 0,
         "completion_tokens_mean": 180.5,
         "completion_tokens_p50": 170,
@@ -37,7 +40,7 @@ def _fields(**overrides) -> dict:
         "completion_tokens_max": 256,
         "prompt_tokens_mean": 95.0,
         "truncated_rollouts": 2,
-        "eos_rollouts": 14,
+        "eos_rollouts": 30,
         "generation_seconds_per_completion": 0.42,
         "reward_seconds_per_completion": 0.0003,
         "reward_samples": 3,
@@ -167,12 +170,17 @@ def test_a_thin_sample_is_refused_even_though_nothing_failed():
         sampled_prompts=3, completed_rollouts=3, truncated_rollouts=0, eos_rollouts=3
     ).trustworthy(now=NOW)
     assert ok is False
-    assert "below the 8 needed" in reason
+    assert f"below the {MIN_TRUSTWORTHY_ROLLOUTS} needed" in reason
 
 
 def test_a_sample_dominated_by_failures_is_refused():
+    # the sample must clear the thin-sample floor, or this asserts on the wrong guard: a profile
+    # refused for being small proves nothing about how failures are treated.
     ok, reason = _profile(
-        completed_rollouts=9, failed_rollouts=9, truncated_rollouts=1, eos_rollouts=8
+        completed_rollouts=MIN_TRUSTWORTHY_ROLLOUTS,
+        failed_rollouts=MIN_TRUSTWORTHY_ROLLOUTS,
+        truncated_rollouts=1,
+        eos_rollouts=MIN_TRUSTWORTHY_ROLLOUTS - 1,
     ).trustworthy(now=NOW)
     assert ok is False
     assert "failure path" in reason
@@ -185,10 +193,35 @@ def test_all_empty_completions_are_refused():
         completion_tokens_p90=0,
         completion_tokens_max=0,
         truncated_rollouts=0,
-        eos_rollouts=16,
+        eos_rollouts=32,
     ).trustworthy(now=NOW)
     assert ok is False
     assert "empty" in reason
+
+
+def test_a_heavily_truncated_sample_is_refused():
+    """Censored completions bias the mean DOWN, which underbills. Measured on a real sample: 2 of
+    16 rollouts hit a 2048 cap, so this is a regime the profiler genuinely reaches."""
+    ok, reason = _profile(
+        completed_rollouts=32,
+        truncated_rollouts=16,
+        eos_rollouts=16,
+    ).trustworthy(now=NOW)
+    assert ok is False
+    assert "truncated" in reason
+    assert "underbill" in reason
+
+
+def test_light_truncation_is_tolerated():
+    """The cap is a real limit training hits too, so a light tail is measurement, not censorship.
+    12.5% is the rate the reference sample actually showed."""
+    ok, reason = _profile(
+        completed_rollouts=32,
+        truncated_rollouts=4,
+        eos_rollouts=28,
+    ).trustworthy(now=NOW)
+    assert ok is True
+    assert reason == ""
 
 
 def test_measured_latency_ages_out_but_the_shape_does_not():
