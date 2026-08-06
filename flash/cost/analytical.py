@@ -41,6 +41,75 @@ MFU_TRAIN = 0.35  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
 MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 
+# --- rollout step floor ------------------------------------------------------------------------
+# Per-step work that the FLOPs terms above do not model at all. verl's own timing_s/* keys
+# decompose a real grpo step to 100.0% (a2_revtext, Qwen3.5-0.8B, RTX 4090, 8 steps):
+#
+#   update_actor    62.1%  -> update_s
+#   old_log_prob    17.9%  -> NOTHING
+#   gen             15.5%  -> gen_s
+#   update_weights   3.0%  -> NOTHING
+#   save_checkpoint  1.5%  -> NOTHING
+#   reward           0.0%  -> reward_s
+#
+# ~22% of every step had no term. grpo recomputes log-probs under the current policy before each
+# update, and syncs trained weights into the vllm rollout engine to keep the next rollout
+# on-policy; both are real gpu work proportional to the step, not overhead.
+#
+# This was invisible for as long as it was because the fictitious reward wall stood in for it:
+# 32 completions x the old 1.0 s/completion default = 32.00s of a 32.88s prediction, against a
+# MEASURED reward phase of 0.000s. Two large errors in opposite directions, so the total looked
+# calibrated while both halves were wrong. Removing the fiction WITHOUT adding this term scores
+# 49.8x geometric bias -- far worse than leaving both alone.
+#
+# MEASURED per card as median(real_step - gpu_bound) over a 45-arm campaign, then scored on 11
+# held-out arms (ratio realized/predicted, band 0.70-1.43):
+#
+#   flash as-is                     geo 3.262x   0/11 in band
+#   measured reward only            geo 49.771x  0/11
+#   floor only                      geo 0.842x   9/11
+#   measured reward + floor         geo 1.050x   8/11   (44/56 on the full set vs 31/56 floor-only)
+#
+# ONE CONSTANT, not per card and not scaled, because every richer form was measured and lost:
+#
+#   form                                    held-out (11 arms)   note
+#   flat, one constant                      8/11                 shipped
+#   flat, per card (6 constants)            8/11                 ties, and INVERTS b200 vs h200
+#   flat per card * (completions / 32)      5/11
+#   linear in completions, per card         5/11
+#   a * completions * params_B + c          6/11                 R^2 0.64
+#   k * modelled_gpu_seconds                2/11
+#
+# The per-card table looks far better in aggregate (44/56 vs 36/56) but 45 of those 56 arms are
+# the ones its constants were fitted on. On arms it has never seen it only ties. It is fitting
+# each card's model and completion-count mix, not the hardware: H200's 152.5s comes from 4 arms,
+# and B200's 81.2s would quote B200 71s per step FASTER than H200 for an identical run, which is
+# backwards -- B200 training is H100/H200-class on portable kernels at a higher $/hr.
+#
+# The floor is not proportional to anything the model already computes: it is ~98x the modelled
+# gpu-bound seconds, so any proportional form amplifies a tiny noisy denominator (2/11).
+#
+# It does grow with completions (g32 77s, g64 147s, g256 231s) and model size (0.8B 71s, 2B 80s,
+# 4B 110s), which is old_log_prob's shape -- a forward pass over completions x parameters. But
+# the fit arms cluster at 32 and 256 completions while the held-out arms run 16-64, so a slope
+# fitted on a 32-vs-256 contrast is not evidence about the gap it would be extrapolating into,
+# and every form that tried scored worse than the constant.
+#
+# This is an empirical aggregate and will drift as hardware, verl, or the engine change. The
+# principled fix models old_log_prob and update_weights as real FLOPs terms.
+STEP_FLOOR_SECONDS = 78.8
+
+
+def step_floor_seconds(gpu: str) -> float:
+    """Unmodelled per-step work (old_log_prob, weight sync, checkpointing).
+
+    Takes ``gpu`` because the phases are real GPU work and a future FLOPs-based model will need
+    it, but returns one constant today: a per-card table was measured and does not beat this one
+    out of sample (see above).
+    """
+    return STEP_FLOOR_SECONDS
+
+
 # --- MoE (mixture-of-experts) per-step correction ----------------------------------------------
 # For an MoE model (active params << total, e.g. Qwen3.6-35B-A3B: ~3B active / 35B total) the wall
 # time per step is NOT the tiny active-param FLOPs the dense model predicts. Routing, all-expert
@@ -278,9 +347,13 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # the worker and broker enforce the same shared concurrency ceiling.
         teacher_waves = math.ceil(score_items / OPD_TEACHER_SCORING_CONCURRENCY)
         teacher_s = teacher_waves * teacher_lat
+        # opd samples on-policy and syncs weights to the rollout engine exactly as grpo does, so it
+        # pays the same unmodelled per-step floor. it has no frozen-reference forward, but
+        # old_log_prob and the weight sync are rollout properties, not grpo-specific ones.
+        floor_s = step_floor_seconds(gpu)
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
-        return gen_s + update_s, overhead + teacher_s
+        return gen_s + update_s + floor_s, overhead + teacher_s
 
     if not n.is_grpo:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
@@ -297,9 +370,13 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
     # every completion is scored, one at a time (see the serial-scoring note above).
     reward_s = completions * latency
+    # old_log_prob + weight sync + checkpointing: real gpu work with no flops term of its own.
+    # gpu-bound, not fixed -- it is compute on this card, so a faster card shortens it and
+    # sharding divides it, unlike reward grading which is a wait on off-gpu python.
+    floor_s = step_floor_seconds(gpu)
     # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
     # changes. a grpo step dominated by it is latency-bound, not compute-bound.
-    return gen_s + update_s, overhead + reward_s
+    return gen_s + update_s + floor_s, overhead + reward_s
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:

@@ -514,8 +514,12 @@ def test_b200_not_cheaper_or_faster_than_h200_for_grpo():
 
 
 def test_offline_unpinned_estimate_does_not_bill_the_ceiling():
-    single = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150))
-    wide = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=8))
+    # 40 steps, not 150: a 150-step 4B grpo run exceeds the 24h wall cap, and a clamped run
+    # reports the cap's runtime on every shape, so the assertions below would pass by collision
+    # rather than because the ceiling was not billed.
+    single = estimate_cost(RunConfig("Qwen/Qwen3.5-2B", "grpo", 40))
+    wide = estimate_cost(RunConfig("Qwen/Qwen3.5-2B", "grpo", 40, gpu_count=8))
+    assert not any("wall cap" in note for note in single.notes)
     assert single.gpu_count == 1
     assert wide.gpu_count == 1
     # pick_gpu returns a class that fits the whole run alone, so an offline estimate has no basis for
@@ -556,9 +560,13 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
 def test_allocator_selected_gpu_count_renders_and_applies_speedup():
     from flash.providers.base import Candidate
 
-    config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=8)
+    # 100 steps, not 150: at 150 both shapes exceed the 24h wall cap and clamp to the SAME
+    # train_seconds, so the speedup assertion below fails on equality even though sharding is
+    # working. the run has to fit under the cap for its runtime to be observable at all.
+    config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, gpu_count=8)
     one = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 1))
     two = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
+    assert not any("wall cap" in note for note in one.notes)
     # the breakdown surfaces the selected multi-gpu shape and the persisted timing credits the
     # measured sharding speedup instead of billing two cards for a one-card runtime.
     assert "2x" in two.breakdown()
