@@ -401,3 +401,100 @@ def test_the_artifact_carries_no_raw_content():
     for key, value in raw.items():
         assert not isinstance(value, (list, dict)), f"{key} carries a container"
     assert not any("prompt_text" in k or "completion_text" in k or "token_ids" in k for k in raw)
+
+
+# --- reward: what a profile with no reward samples is allowed to claim ------------------------
+
+
+class _QuotableTrain(_Train):
+    """`_Train` plus the fields the quote path reads. Kept separate so the digest tests above keep
+    exercising the minimal spec surface they were written against."""
+
+    batch_size = 8
+    lora_rank = 32
+    save_at_steps: ClassVar[list] = []
+
+
+def _spec_with_profile(**profile_overrides):
+    """A spec carrying a profile that matches it exactly, so `_rollout_profile` accepts it."""
+    from flash import __version__
+
+    class _WithProfile(_Spec):
+        train = _QuotableTrain()
+        workload_profile_kind = ""
+        gpu = type(
+            "G",
+            (),
+            {
+                "type": "H200",
+                "provider": "runpod",
+                "count": 1,
+                "disk_gb": 0,
+                "max_wall_seconds": 0,
+            },
+        )()
+
+    # the digest keys on generation settings, so it must be taken over the SAME spec the quote
+    # path will re-derive it from, or the profile is discarded as belonging to another run.
+    digest = rollout_profile_input_digest(
+        _WithProfile(), tokenizer_revision="main", producer_version=__version__
+    )
+    profile = _profile(
+        input_digest=digest,
+        producer_version=__version__,
+        tokenizer_revision="main",
+        **profile_overrides,
+    )
+    _WithProfile.workload_profile = profile.to_dict()
+    return _WithProfile()
+
+
+def test_measured_token_means_are_used_even_when_no_reward_was_sampled(monkeypatch):
+    """The two measurements are independent. A profile that sampled tokens but no rewards must
+    still price the tokens: discarding the whole profile would throw away the measurement it does
+    have."""
+    from flash.cost.spec import runconfig_from_spec
+
+    monkeypatch.setattr("time.time", lambda: NOW)
+    config = runconfig_from_spec(_spec_with_profile(reward_samples=0, reward_failures=0))
+    assert config.measured_completion_tokens == pytest.approx(180.5)
+    assert config.measured_prompt_tokens == pytest.approx(95.0)
+
+
+def test_a_profile_with_no_reward_samples_does_not_claim_reward_is_free(monkeypatch):
+    """Pricing reward at the profile's 0.0 would assert grading is free on the strength of zero
+    observations, which is a stronger claim than the documented default makes. So the reward term
+    falls back rather than being taken from an unsampled field.
+
+    The cost of that fallback is real and known: the default is 1.0s/completion against a measured
+    ~0.0004s on every campaign environment, so this path stacks the legacy reward wall on the
+    per-step floor and scores 27/56 in band where a measured reward scores 47/56. That is a
+    property of the DEFAULT, not of this guard (the same 27/56 applies to every quote with no
+    profile at all), and re-fitting it needs grader classes this campaign never covered: an LLM
+    judge is genuinely ~3s/completion, over half a step.
+    """
+    from flash.cost.spec import runconfig_from_spec
+
+    monkeypatch.setattr("time.time", lambda: NOW)
+    none_sampled = runconfig_from_spec(_spec_with_profile(reward_samples=0, reward_failures=0))
+    assert none_sampled.reward_seconds_per_completion is None
+
+    sampled = runconfig_from_spec(_spec_with_profile())
+    assert sampled.reward_seconds_per_completion == pytest.approx(0.0003)
+
+
+def test_the_reward_fallback_costs_a_whole_legacy_wall(monkeypatch):
+    """Quantifies what the guard above chooses, end to end, so the tradeoff cannot be silently
+    reversed: an unsampled profile pays 1.0s per completion that a sampled one does not."""
+    from flash.cost.analytical import seconds_per_step
+    from flash.cost.facts import AVG_REWARD_SECONDS_PER_COMPLETION
+    from flash.cost.spec import runconfig_from_spec
+
+    monkeypatch.setattr("time.time", lambda: NOW)
+    none_sampled = runconfig_from_spec(_spec_with_profile(reward_samples=0, reward_failures=0))
+    sampled = runconfig_from_spec(_spec_with_profile(reward_seconds_per_completion=0.0))
+    completions = _Train.group_size * (none_sampled.batch_size or 1)
+
+    extra = seconds_per_step(none_sampled, "H200") - seconds_per_step(sampled, "H200")
+    assert extra == pytest.approx(completions * AVG_REWARD_SECONDS_PER_COMPLETION)
+    assert extra > 0.0
