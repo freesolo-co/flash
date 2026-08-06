@@ -743,6 +743,18 @@ def test_cancel_run_bills_a_profile_on_started_not_on_optimizer_steps(tmp_path, 
     ``actual_steps_run`` every cancelled profile would price at 0 steps -- free even after it ran
     its whole wall. Both directions are asserted because a one-sided test passes under exactly
     that mistake.
+
+    The started case asserts the PERSISTED quote, not merely a nonzero number: re-deriving the
+    charge here prices against today's offline rate table, so a cancel could bill something other
+    than the figure the user was shown at submit and other than what the same profile bills on
+    success (measured: $23.76 re-derived against a $7.00 quote). ``lifecycle.py`` already settles a
+    completed profile through the persisted quote, so cancel agrees with success rather than
+    introducing a third number.
+
+    ``billing_state`` is asserted alongside every amount because pricing here fails CLOSED: any
+    exception inside ``charge_usd_for_spec`` becomes the nan fallback and lands on cost_usd 0.0
+    with billing_state "failed". Without that assertion a swallowed pricing failure is
+    indistinguishable from a correct $0, and the never-started case expects exactly $0.
     """
     import flash.runner as orch
     from flash.spec import JobSpec
@@ -750,12 +762,8 @@ def test_cancel_run_bills_a_profile_on_started_not_on_optimizer_steps(tmp_path, 
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
-    seen: list = []
-    monkeypatch.setattr(
-        orch, "charge_usd_for_spec", lambda _spec, **kw: seen.append(kw.get("steps")) or 7.0
-    )
 
-    def _cancel(run_id: str, heartbeat: dict | None) -> None:
+    def _cancel(run_id: str, heartbeat: dict | None, quote: float | None) -> tuple:
         spec = JobSpec.from_dict(
             {
                 "gpu": {"type": "RTX 5090"},
@@ -763,6 +771,9 @@ def test_cancel_run_bills_a_profile_on_started_not_on_optimizer_steps(tmp_path, 
                 "workload_profile_kind": SFT_PROFILE_KIND,
             }
         )
+        # built the way submit_job builds it: to_dict() strips workload_profile_kind as
+        # platform-managed, so the private snapshot (to_internal_dict, which retains it) is the
+        # only carrier of the kind into the rebuilt effective spec.
         orch._save_status(
             orch.RunStatus(
                 run_id=run_id,
@@ -771,19 +782,39 @@ def test_cancel_run_bills_a_profile_on_started_not_on_optimizer_steps(tmp_path, 
                 billing_context={"org_id": "org-a"},
                 last_heartbeat=heartbeat,
                 workload_profile_kind=SFT_PROFILE_KIND,
+                estimated_cost_usd=quote,
+                effective_preparation={
+                    "worker_spec": spec.to_internal_dict(),
+                    "workload_profile": spec.workload_profile or None,
+                    "adapter_identity": None,
+                    "preparation_digest": orch._preparation_digest(
+                        JobSpec.from_dict(spec.to_dict()), spec, None
+                    ),
+                    "backend": orch.TRAINER_BACKEND,
+                },
             )
         )
         assert orch.cancel_run(run_id).state == "cancelled"
+        final = orch.get_status(run_id)
+        return final.cost_usd, getattr(final, "billing_state", None)
 
-    # never started: no heartbeat at all -> 0 -> charge_usd_for_spec returns $0 for a profile.
-    _cancel("profile-sft-never", None)
-    # started: the profile worker's own first heartbeat, which is NOT a training stage.
-    _cancel("profile-sft-started", {"stage": "profile_start", "ts": 1.0})
-
-    assert seen == [0, 1], (
-        "a cancelled profile must be priced on whether it started, not on optimizer steps it "
-        f"never reports; got {seen}"
+    # asserted on the CHARGE, not on the internal steps kwarg: the charge is the contract, and
+    # pinning the call shape made this test fail on a change that preserved every billed amount.
+    #
+    # never started: no heartbeat at all -> nothing was rented -> $0, and priced successfully.
+    assert _cancel("profile-sft-never", None, 7.0) == (0.0, None)
+    # started: the profile worker's own first heartbeat, which is NOT a training stage. it owes the
+    # bounded wall it rented, priced at the quote it was submitted under -- not a fresh offline
+    # re-derivation, which could differ from both the number the user was shown and the number the
+    # same profile would bill on success.
+    assert _cancel("profile-sft-started", {"stage": "profile_start", "ts": 1.0}, 7.0) == (7.0, None)
+    # no persisted quote: it still must price, falling back to the spec estimate rather than
+    # collapsing to the swallowed-failure $0.
+    charged, billing_state = _cancel(
+        "profile-sft-noquote", {"stage": "profile_start", "ts": 1.0}, None
     )
+    assert billing_state is None, f"pricing must not fail closed to $0; got {billing_state!r}"
+    assert charged > 0.0, f"a started profile without a stored quote must still bill; got {charged}"
 
 
 def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path, monkeypatch):

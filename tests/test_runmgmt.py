@@ -3031,3 +3031,80 @@ def test_training_run_deadline_still_runs_from_submission(monkeypatch, tmp_path)
     raw = runner._load_status_json(spec.run_id)
     assert runner._PROFILE_WALL_ARMED_AT_KEY not in raw
     assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(created_at + 900.0)
+
+
+def test_a_long_queue_wait_does_not_shorten_the_granted_work_wall(monkeypatch, tmp_path):
+    """The provider must get the full work budget no matter how long capacity took.
+
+    The regression: the grant was min(remaining, work), and `remaining` counts down against a
+    deadline that still holds the unspent queue allowance. Past the allowance the min() truncates,
+    so at a 1900s wait the provider got 500s while the plane grants a full 600s the instant a
+    heartbeat arms -- the short number going to the side actually doing the measuring, on exactly
+    the slow-capacity days the queue allowance exists to survive.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    work = float(runner._WORKLOAD_PROFILE_WALL_SECONDS)
+    queue = float(runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS)
+    # capacity arrived only after the whole queue allowance had been spent waiting.
+    late = created_at + queue + 100.0
+    attempt_spec = runner._spec_with_remaining_wall(spec, require_provider_minimum=True, now=late)
+    assert attempt_spec.gpu.max_wall_seconds == int(work)
+
+    # and it is still capped -- an early arrival cannot claim the queue budget as work time.
+    early_spec = runner._spec_with_remaining_wall(
+        spec, require_provider_minimum=True, now=created_at + 1.0
+    )
+    assert early_spec.gpu.max_wall_seconds == int(work)
+
+
+def test_a_stale_attempts_heartbeat_cannot_arm_even_when_its_timestamp_is_recent(
+    monkeypatch, tmp_path
+):
+    """Timestamp freshness alone is not provenance.
+
+    A worker from a cancelled earlier lifecycle writes to the same workload-derived prefix and its
+    heartbeats are genuinely recent, so `ts >= created_at` passes. Without an attempt match it arms
+    the replacement's work budget while the replacement is still queueing for capacity.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 10_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+    # this lifecycle reserved attempt 1, so attempt 1 is the only one that may speak for it.
+    runner._save_status_unlocked(runner.get_status(spec.run_id), _next_attempt=2)
+
+    now = created_at + 30.0
+    monkeypatch.setattr(runner.time, "time", lambda: now)
+    # recent enough to pass the timestamp test, but stamped by the PREVIOUS attempt.
+    runner.record_heartbeat(spec.run_id, {"stage": "sft_pretokenizing", "attempt": 0, "ts": now})
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in runner._load_status_json(spec.run_id)
+
+    # the current attempt arms it normally.
+    runner.record_heartbeat(spec.run_id, {"stage": "sft_pretokenizing", "attempt": 1, "ts": now})
+    raw = runner._load_status_json(spec.run_id)
+    assert raw[runner._PROFILE_WALL_ARMED_AT_KEY] == pytest.approx(now)
