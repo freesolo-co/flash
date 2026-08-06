@@ -1090,7 +1090,11 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     evaluations_text = evaluations.read_text()
     assert "load_evaluations(environment=None)" in evaluations_text
     assert "self.environment.reward(response, example)" in evaluations_text
-    assert "flash env eval TARGET ." in evaluations_text
+    # the scaffold has to teach the invocation argparse actually accepts. it advertised
+    # `env eval TARGET .` back when a local directory was the input, which is now a usage error,
+    # so the header would have sent every new user's first evaluation into an exit-2.
+    assert "flash env eval TARGET`" in evaluations_text
+    assert "flash env eval TARGET ." not in evaluations_text
 
     class StarterEnvironment:
         def reward(self, response, example):

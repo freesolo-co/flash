@@ -1644,22 +1644,24 @@ def score_single_turn_batch(
     if not requests:
         return []
 
+    def score_one_serially(solution_str, ex):
+        # score_single_turn finalizes internally, so what it returns is already a FINAL row -- the
+        # trailing finalize loop must not touch it again.
+        breakdowns: list[dict[str, float] | None] = []
+        score = score_single_turn(
+            env,
+            solution_str,
+            ex,
+            tok=tok,
+            thinking=thinking,
+            prompt_opened_thinking=prompt_opened_thinking,
+            think_penalty=think_penalty,
+            breakdowns=breakdowns,
+        )
+        return score, breakdowns
+
     def score_serially():
-        results = []
-        for solution_str, ex in requests:
-            breakdowns: list[dict[str, float] | None] = []
-            score = score_single_turn(
-                env,
-                solution_str,
-                ex,
-                tok=tok,
-                thinking=thinking,
-                prompt_opened_thinking=prompt_opened_thinking,
-                think_penalty=think_penalty,
-                breakdowns=breakdowns,
-            )
-            results.append((score, breakdowns))
-        return results
+        return [score_one_serially(solution_str, ex) for solution_str, ex in requests]
 
     try:
         prepared = []
@@ -1678,42 +1680,77 @@ def score_single_turn_batch(
         reward_many = getattr(env, "reward_many", None)
         items = [(ex, state) for _, ex, state in prepared]
         if callable(scores_breakdown_many):
-            breakdown_values = list(scores_breakdown_many(items))
-            if len(breakdown_values) != len(prepared):
-                raise RuntimeError("env scores_breakdown_many returned the wrong length")
-            raw_results = [
-                (float(breakdown.get("total", 0.0)), [breakdown]) for breakdown in breakdown_values
-            ]
+            batch_values = list(scores_breakdown_many(items))
+            use_breakdown = True
         elif callable(reward_many):
-            reward_values = list(reward_many(items))
-            if len(reward_values) != len(prepared):
-                raise RuntimeError("env reward_many returned the wrong length")
-            raw_results = [(float(reward), []) for reward in reward_values]
+            batch_values = list(reward_many(items))
+            use_breakdown = False
         else:
             return score_serially()
     except Exception as exc:
+        # the batch call itself blew up, so NOTHING came back: no env work is credited and a full
+        # serial pass is the only way to score this batch.
         print(
             f"[rl-verl] env batch scoring raised ({type(exc).__name__}: {exc}); retrying serially",
             flush=True,
         )
         return score_serially()
 
-    results = []
-    for (solution_str, _, _), (score, breakdowns) in zip(prepared, raw_results, strict=True):
-        results.append(
-            (
-                _finalize_single_turn_reward(
-                    score,
-                    solution_str,
-                    tok=tok,
-                    thinking=thinking,
-                    prompt_opened_thinking=prompt_opened_thinking,
-                    think_penalty=think_penalty,
-                ),
-                breakdowns,
-            )
+    # the batch scorer RETURNED, so its env calls already happened -- and for a paid or
+    # side-effecting grader they are already billed. re-running every item (the old behaviour on any
+    # malformed payload) charged the whole batch twice to recover a single bad row. keep every
+    # well-formed row and repair only the rest serially.
+    results: list[tuple[float, list[dict[str, float] | None]] | None] = [None] * len(prepared)
+    repair: list[int] = []
+    # a wrong-length payload cannot be trusted to be positionally aligned even where it does have
+    # entries, so it condemns every row rather than just the missing tail.
+    aligned = len(batch_values) == len(prepared)
+    for idx, (solution_str, _, _) in enumerate(prepared):
+        if not aligned:
+            repair.append(idx)
+            continue
+        try:
+            value = batch_values[idx]
+            if use_breakdown:
+                score, breakdowns = float(value.get("total", 0.0)), [value]
+            else:
+                score, breakdowns = float(value), []
+        except Exception:
+            # unusable row: a non-mapping breakdown, a missing/unparseable `total`, or a reward that
+            # will not survive float(). recover this one item, not the batch.
+            repair.append(idx)
+            continue
+        results[idx] = (
+            _finalize_single_turn_reward(
+                score,
+                solution_str,
+                tok=tok,
+                thinking=thinking,
+                prompt_opened_thinking=prompt_opened_thinking,
+                think_penalty=think_penalty,
+            ),
+            breakdowns,
         )
-    return results
+
+    if repair:
+        detail = (
+            f"returned {len(repair)} unusable row(s)"
+            if aligned
+            else f"returned {len(batch_values)} rows for {len(prepared)} items"
+        )
+        print(
+            f"[rl-verl] env batch scoring {detail}; re-scoring {len(repair)} of {len(prepared)} "
+            f"serially",
+            flush=True,
+        )
+        for idx in repair:
+            solution_str, ex, _ = prepared[idx]
+            results[idx] = score_one_serially(solution_str, ex)
+
+    # every index is filled by one path or the other. return one row per request, in request order:
+    # the caller zips these back onto its completions, so dropping a row would silently misalign the
+    # whole batch rather than fail.
+    return [row if row is not None else (0.0, []) for row in results]
 
 
 # the total startup delay this hook is allowed to add, covering reference extraction AND timing.

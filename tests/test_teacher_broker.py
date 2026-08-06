@@ -205,6 +205,23 @@ def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
         lifecycle._submit_seed_supervised(spec, 42, io.StringIO())
 
 
+def test_broker_accepts_every_catalog_teacher(monkeypatch):
+    # the broker keeps its own alias set, so a catalog addition that is not mirrored here
+    # would be rejected at submit despite resolving fine.
+    from flash.engine.recipe import TEACHER_MODELS
+
+    monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
+    monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
+    for alias in TEACHER_MODELS:
+        spec = JobSpec(
+            model="Qwen/Qwen3.5-4B",
+            algorithm="opd",
+            train=TrainSpec(max_examples=8, max_steps=1, teacher_model=alias),
+            run_id=f"run-teacher-{alias}",
+        )
+        assert teacher_broker.require_teacher_broker_configuration(spec) == "https://broker.example"
+
+
 def test_deadline_contract_over_24_hours_is_rejected(monkeypatch):
     monkeypatch.setenv("FLASH_CONTROL_PANEL_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
