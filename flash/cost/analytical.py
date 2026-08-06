@@ -473,10 +473,20 @@ def _offline_gpu_shape(
     provider = config.provider if config.provider != "auto" else "auto"
     if config.gpu_type:
         names = (canonical_gpu(config.gpu_type),)
-    else:
+    elif provider == "auto":
+        # `auto` ranks the RunPod pool: it is the default substrate, and the allocator only reaches a
+        # lambda-only class after the cheaper runpod classes exhaust, so quoting one here would name
+        # hardware auto would not have picked. `enum_member` IS the runpod membership flag.
         names = tuple(
             info.name for info in GPU_INFO.values() if info.enum_member and info.validated
         )
+    else:
+        # a pinned provider must rank that provider's whole validated pool. filtering on
+        # `enum_member` silently means "on runpod", so lambda-only classes (A10, A100 SXM 40GB) never
+        # entered a `provider=lambda` quote and the estimate - and the submit-time affordability
+        # precheck - overstated cost against a cheaper shape `allocate()` would really pick. the
+        # `providers_for` filter below narrows this pool to the classes the provider can provision.
+        names = tuple(info.name for info in GPU_INFO.values() if info.validated)
     safe_gpu_count = geometry_safe_gpu_cap(
         config.model_id, config.gpu_count, model_revision=config.model_revision
     )
