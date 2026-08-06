@@ -22,7 +22,7 @@ def _wandb_importable() -> bool:
 
 
 def wandb_report_to() -> list[str]:
-    """TRL/HF ``report_to`` targets. Returns ["wandb"] when WANDB_API_KEY is set, else [].
+    """HF ``report_to`` targets. Returns ["wandb"] when WANDB_API_KEY is set, else [].
 
     Initializes the run directly (project from JOB_SPEC.wandb, not WANDB_PROJECT env) so the
     Trainer's WandbCallback reuses the already-initialized run. Best-effort; never aborts training."""

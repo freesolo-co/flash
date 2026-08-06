@@ -45,7 +45,6 @@ from flash.engine.worker.perf.liger import (
     _LIGER_MIN_PARAMS,
     _estimate_params,
     _liger_default_for_model,
-    liger_on,
 )
 from flash.engine.worker.perf.loraplus import loraplus_optimizer_cls
 from flash.engine.worker.perf.memory import (
@@ -483,7 +482,6 @@ __all__ = [
     "grad_checkpointing_on",
     "grpo_use_reentrant",
     "is_cuda_oom",
-    "liger_on",
     "loraplus_optimizer_cls",
     "make_multimodal_input_require_grads_callback",
     "optimal_attn_impl",

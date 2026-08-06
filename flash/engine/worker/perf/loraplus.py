@@ -7,7 +7,8 @@ def loraplus_optimizer_cls(optim_name: str):
     """Return ``(optimizer_cls, extra_kwargs)`` for PEFT's LoRA+ optimizer builder."""
     import torch as _torch
 
-    # str() + lower(): TRL normalizes optim to an OptimizerNames enum, str() gives "OptimizerNames.PAGED_ADAMW_8BIT"
+    # str() + lower(): the caller may pass a plain string or transformers' OptimizerNames enum,
+    # whose str() is "OptimizerNames.PAGED_ADAMW_8BIT" -- substring match handles both.
     if "8bit" in str(optim_name or "").lower():
         try:
             import bitsandbytes as bnb
