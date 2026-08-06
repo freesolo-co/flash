@@ -268,6 +268,15 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # flash's, so a job that sets WANDB_API_KEY loses its curves and run link unless wandb is importable
 # in here; resolve_verl_loggers() degrades to console when it is not, which is the right behaviour
 # for a foreign FLASH_VERL_PYTHON but silently drops W&B on the default image (codex[bot]).
+#
+# cachetools/uvicorn/fastapi/torchvision/tqdm/pyarrow are named for the same reason
+# resolve_verl_python names them: verl imports them at MODULE level on the launch path (main_ppo ->
+# ppo.ray_trainer -> rollout.llm_server imports cachetools; rollout.utils imports uvicorn + fastapi)
+# yet declares none of them. Some arrive as transitive vllm deps today, but that is vllm's dependency
+# choice, not a contract verl states. This image sets FLASH_VERL_PYTHON, so live workers never take
+# the resolve_verl_python path where that hardening lives -- letting the two lists drift means the
+# fallback protects nobody and a vllm respin breaks launch on the default image alone. Keep them in
+# lockstep with backend_common.py's install list.
 ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@1bea7d6825bbb9d2164e86e379b3680e7c53bb8a
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-overrides.txt \
@@ -282,6 +291,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" > /tmp/verl-o
         "TransferQueue==0.1.7" \
         liger-kernel "bitsandbytes>=0.49" qwen-vl-utils \
         "wandb>=0.17" \
+        cachetools uvicorn fastapi torchvision tqdm pyarrow \
     && rm -f /tmp/verl-overrides.txt \
     && uv cache clean
 
