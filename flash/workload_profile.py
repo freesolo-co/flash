@@ -9,9 +9,17 @@ from dataclasses import dataclass, field, fields
 from typing import Any
 
 SFT_PROFILE_KIND = "sft"
+ROLLOUT_PROFILE_KINDS = ("grpo", "opd")
 WORKLOAD_PROFILE_SCHEMA_VERSION = 1
 SFT_PACKING_POLICY_VERSION = 1
+ROLLOUT_SAMPLE_POLICY_VERSION = 1
 _PROFILE_RUN_PREFIX = "profile-sft-"
+_ROLLOUT_PROFILE_RUN_PREFIX = "profile-rollout-"
+
+# measured generation latency ages out; the shape it was measured from does not. a provider that
+# slows down, or a card whose neighbours change, invalidates the seconds without invalidating the
+# token counts, so the two carry different lifetimes and only one of them is keyed.
+ROLLOUT_LATENCY_MAX_AGE_S = 24 * 60 * 60
 
 # which rows the profile measured. sft is never sampled: it either measures every source row or the
 # deterministic max_examples prefix training will consume, so both policies are exact.
@@ -274,14 +282,266 @@ class SftWorkloadProfile:
         return profile
 
 
-def _measurement_field_names() -> tuple[str, ...]:
+def _measurement_field_names(cls: type | None = None) -> tuple[str, ...]:
     """Every field except provenance, taken from ``compare`` so the two can never drift apart.
 
     ``compare=False`` is what excludes a field from dataclass equality, which is exactly the
     training worker's parity check. Deriving the digest from the same flag keeps one definition of
     "this is measurement" instead of a hand-maintained list that a new field could silently miss.
     """
-    return tuple(f.name for f in fields(SftWorkloadProfile) if f.compare)
+    return tuple(f.name for f in fields(cls or SftWorkloadProfile) if f.compare)
+
+
+def rollout_profile_run_id(input_digest: str) -> str:
+    if len(input_digest) != 64 or any(c not in "0123456789abcdef" for c in input_digest):
+        raise ValueError("input_digest must be a lowercase sha256 hex digest")
+    return f"{_ROLLOUT_PROFILE_RUN_PREFIX}{input_digest}"
+
+
+def rollout_profile_input_payload(
+    spec: Any,
+    *,
+    tokenizer_revision: str,
+    producer_version: str,
+) -> dict[str, object]:
+    """Return the non-secret immutable inputs that determine one rollout workload profile.
+
+    Deliberately excludes the training horizon (``epochs``, ``max_steps``, ``max_examples``): a
+    short run and a long run over the same environment, model and generation settings draw
+    completions from the same distribution, so they share one profile and one charge. Anything that
+    changes what the model is asked or how much it may say is keyed, because that moves the
+    distribution rather than how many times it is sampled.
+    """
+    train = spec.train
+    environment = spec.environment
+    return {
+        "schema_version": WORKLOAD_PROFILE_SCHEMA_VERSION,
+        "kind": str(spec.algorithm),
+        "sample_policy_version": ROLLOUT_SAMPLE_POLICY_VERSION,
+        "producer_version": str(producer_version),
+        "environment": {
+            "id": str(environment.id),
+            "resolved_sha": str(environment.resolved_sha or ""),
+            "params_sha256": _digest_mapping(environment.params),
+        },
+        "model": {
+            "id": str(spec.model),
+            "revision": str(spec.model_revision or ""),
+            "tokenizer_revision": str(tokenizer_revision),
+        },
+        "seed": int(spec.seed),
+        "thinking": bool(spec.thinking),
+        "worker_env_sha256": _digest_mapping(spec.worker_env),
+        "generation": {
+            "max_completion_tokens": train.max_completion_tokens,
+            "max_context_tokens": train.max_context_tokens,
+            "group_size": train.group_size,
+            "teacher_model": str(getattr(train, "teacher_model", "") or ""),
+        },
+    }
+
+
+def rollout_profile_input_digest(
+    spec: Any,
+    *,
+    tokenizer_revision: str,
+    producer_version: str,
+) -> str:
+    return _sha256(
+        rollout_profile_input_payload(
+            spec,
+            tokenizer_revision=tokenizer_revision,
+            producer_version=producer_version,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class RolloutWorkloadProfile:
+    """Sampled description of what one grpo/opd step actually generates and grades.
+
+    Unlike the sft profile this is a SAMPLE, not a census, and that difference is the whole reason
+    the type carries a trust verdict. An sft profile either measures the exact rows training will
+    consume or the run fails; a rollout profile can finish, report numbers, and still be too thin,
+    too failure-ridden or too stale to move a quote. ``trustworthy`` is what the quote consults, and
+    it is deliberately not a single "did it run" flag.
+
+    Two clocks. The token distribution is structural: the same environment, model and generation
+    settings produce it again, so it is keyed by the input digest and never expires. The measured
+    seconds are not: they belong to one provider on one card at one moment, so they carry
+    ``measured_at`` and age out after ``ROLLOUT_LATENCY_MAX_AGE_S``. Mixing the two lifetimes is how
+    a profile silently starts quoting last week's throughput.
+
+    ``completion_tokens_*`` is the field this type exists for. The quote previously billed
+    ``max_completion_tokens``, a capacity knob, as though it were expected work; measured realized
+    generation runs 0.077-0.392x of it and the resulting bias tracks the knob rather than the
+    workload. Aggregates and provenance only: no prompts, no completions, no token ids, no
+    credentials.
+    """
+
+    input_digest: str
+    producer_version: str
+    tokenizer_revision: str
+    environment_id: str
+    environment_revision: str
+    kind: str
+    # what was sampled, and how much of it survived. a profile whose successes are mostly failures
+    # measured the failure path, not the workload.
+    sampled_prompts: int
+    completed_rollouts: int
+    failed_rollouts: int
+    # realized generation. the distribution, not a point estimate: a mean alone cannot tell a
+    # uniformly-short workload from a bimodal one whose long tail sets the step time.
+    completion_tokens_mean: float
+    completion_tokens_p50: int
+    completion_tokens_p90: int
+    completion_tokens_max: int
+    prompt_tokens_mean: float
+    # how many completions ended because the model stopped rather than because it ran out of room.
+    # a high truncation rate means the cap IS binding and the realized distribution is censored,
+    # which is the one case where billing the cap is not wrong.
+    truncated_rollouts: int
+    eos_rollouts: int
+    # measured seconds. these age.
+    generation_seconds_per_completion: float
+    reward_seconds_per_completion: float
+    reward_samples: int
+    reward_failures: int
+    reference_gpu: str
+    reference_provider: str
+    sample_policy: str
+    sample_policy_version: int = ROLLOUT_SAMPLE_POLICY_VERSION
+    schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
+    # provenance, outside the content digest for the same reason sft's created_at is: a worker
+    # re-deriving the measurement must reproduce the digest, and a timestamp never would.
+    created_at: float = field(default=0.0, compare=False)
+    measured_at: float = field(default=0.0, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.schema_version != WORKLOAD_PROFILE_SCHEMA_VERSION:
+            raise ValueError("unsupported workload profile schema version")
+        if self.sample_policy_version != ROLLOUT_SAMPLE_POLICY_VERSION:
+            raise ValueError("unsupported rollout sample policy version")
+        if self.kind not in ROLLOUT_PROFILE_KINDS:
+            raise ValueError("rollout workload profile kind must be 'grpo' or 'opd'")
+        if len(self.input_digest) != 64 or any(
+            c not in "0123456789abcdef" for c in self.input_digest
+        ):
+            raise ValueError("input_digest must be a lowercase sha256 hex digest")
+        for name in ("producer_version", "tokenizer_revision", "environment_id"):
+            if not getattr(self, name):
+                raise ValueError(f"{name} is required")
+        if not self.environment_revision:
+            raise ValueError("environment_revision is required")
+        if not self.sample_policy:
+            raise ValueError("sample_policy is required")
+        counts = {
+            "sampled_prompts": self.sampled_prompts,
+            "completed_rollouts": self.completed_rollouts,
+            "failed_rollouts": self.failed_rollouts,
+            "completion_tokens_p50": self.completion_tokens_p50,
+            "completion_tokens_p90": self.completion_tokens_p90,
+            "completion_tokens_max": self.completion_tokens_max,
+            "truncated_rollouts": self.truncated_rollouts,
+            "eos_rollouts": self.eos_rollouts,
+            "reward_samples": self.reward_samples,
+            "reward_failures": self.reward_failures,
+        }
+        for name, value in counts.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        rates = {
+            "completion_tokens_mean": self.completion_tokens_mean,
+            "prompt_tokens_mean": self.prompt_tokens_mean,
+            "generation_seconds_per_completion": self.generation_seconds_per_completion,
+            "reward_seconds_per_completion": self.reward_seconds_per_completion,
+        }
+        for name, value in rates.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number")
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.completion_tokens_p90 < self.completion_tokens_p50:
+            raise ValueError("p90 completion tokens cannot be below p50")
+        if self.completion_tokens_max < self.completion_tokens_p90:
+            raise ValueError("max completion tokens cannot be below p90")
+        if self.truncated_rollouts + self.eos_rollouts > self.completed_rollouts:
+            raise ValueError("truncated plus eos rollouts cannot exceed completed rollouts")
+        if self.reward_failures > self.reward_samples:
+            raise ValueError("reward failures cannot exceed reward samples")
+        for name in ("created_at", "measured_at"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number")
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a non-negative unix timestamp")
+
+    @property
+    def truncation_rate(self) -> float:
+        """Share of completions that hit the cap instead of stopping on their own."""
+        if self.completed_rollouts <= 0:
+            return 0.0
+        return self.truncated_rollouts / self.completed_rollouts
+
+    def trustworthy(self, *, now: float, min_rollouts: int = 8) -> tuple[bool, str]:
+        """Whether this reading may move a quote, and if not, why not.
+
+        Returns a reason rather than a bare bool because every caller that refuses a profile has to
+        tell a user what to do about it, and re-deriving the reason from the fields at each call
+        site is how two call sites end up disagreeing about what "untrustworthy" meant.
+
+        The bar is deliberately about *evidence*, not success: a profile that ran cleanly on two
+        prompts is not more quotable than one that failed, it is just quieter about it.
+        """
+        if self.completed_rollouts < min_rollouts:
+            return False, (
+                f"only {self.completed_rollouts} rollout(s) completed, "
+                f"below the {min_rollouts} needed to quote from"
+            )
+        if self.failed_rollouts >= self.completed_rollouts:
+            return False, (
+                f"{self.failed_rollouts} rollout(s) failed against "
+                f"{self.completed_rollouts} completed; the sample describes the failure path"
+            )
+        if self.completion_tokens_max <= 0:
+            return False, "every sampled completion was empty, so no generation was measured"
+        age = now - self.measured_at
+        if self.measured_at <= 0 or age > ROLLOUT_LATENCY_MAX_AGE_S:
+            return False, (
+                "measured generation latency is older than "
+                f"{ROLLOUT_LATENCY_MAX_AGE_S // 3600}h and must be re-measured"
+            )
+        return True, ""
+
+    def _content(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in _measurement_field_names(type(self))}
+
+    @property
+    def content_digest(self) -> str:
+        return _sha256(self._content())
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            **self._content(),
+            "created_at": float(self.created_at),
+            "measured_at": float(self.measured_at),
+            "content_digest": self.content_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> RolloutWorkloadProfile:
+        if not isinstance(raw, dict):
+            raise ValueError("workload profile must be an object")
+        data = dict(raw)
+        digest = data.pop("content_digest", None)
+        if not isinstance(digest, str):
+            raise ValueError("workload profile has no content digest")
+        if set(data) != set(cls.__dataclass_fields__):
+            raise ValueError("workload profile fields do not match the schema")
+        profile = cls(**data)
+        if profile.content_digest != digest:
+            raise ValueError("workload profile content digest does not match")
+        return profile
 
 
 class WorkloadProfileMismatch(ValueError):
@@ -310,4 +570,34 @@ def require_matching_sft_profile(
         raise WorkloadProfileMismatch("workload profile producer version does not match")
     if profile.tokenizer_revision != tokenizer_revision:
         raise WorkloadProfileMismatch("workload profile tokenizer revision does not match")
+    return profile
+
+
+def require_matching_rollout_profile(
+    raw: object,
+    *,
+    input_digest: str,
+    producer_version: str,
+    tokenizer_revision: str,
+    now: float,
+) -> RolloutWorkloadProfile:
+    """The rollout counterpart of ``require_matching_sft_profile``, plus the trust gate.
+
+    Identity and trust are checked in one place on purpose. A caller that verified the digest and
+    then forgot the verdict would quote from a profile that matches this spec exactly and measured
+    almost nothing, which is the failure this type was given a verdict to prevent.
+    """
+    try:
+        profile = RolloutWorkloadProfile.from_dict(raw)
+    except ValueError as exc:
+        raise WorkloadProfileMismatch(str(exc)) from exc
+    if profile.input_digest != input_digest:
+        raise WorkloadProfileMismatch("workload profile input digest does not match")
+    if profile.producer_version != producer_version:
+        raise WorkloadProfileMismatch("workload profile producer version does not match")
+    if profile.tokenizer_revision != tokenizer_revision:
+        raise WorkloadProfileMismatch("workload profile tokenizer revision does not match")
+    ok, reason = profile.trustworthy(now=now)
+    if not ok:
+        raise WorkloadProfileMismatch(f"rollout workload profile is not trustworthy: {reason}")
     return profile
