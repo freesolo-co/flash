@@ -1162,6 +1162,11 @@ def test_a_second_owner_needing_the_same_profile_is_not_blocked_by_the_first(api
     assert detail["owned"] is False
     # it lost the claim, so it launched nothing and is not the one paying for the profile.
     assert detail["launched"] is False
+    # but the profile IS running, started by the winner, so the loser must be told that and not the
+    # synthetic "required" this route invents for a cache miss. the CLI prints this word back at the
+    # user ("the profile run you already started is still ..."), and `required` reads as "nothing has
+    # started" for a run that is queued and billing.
+    assert detail["state"] == "queued"
     # ownership does not transfer, and the existing profile run is not launched a second time.
     assert db.run_owner(profile_run_id) == first_owner
     assert len(submitted) == 1
