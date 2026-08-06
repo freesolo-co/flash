@@ -463,11 +463,14 @@ def test_opd_selects_only_managed_parasail_aliases():
     assert _spec("kimi-k3").train.teacher_model == "kimi-k3"
     assert _spec("GLM 5.2").train.teacher_model == "glm-5.2"
     assert _spec("qwen3.5-397b-a17b").train.teacher_model == "qwen3.5-397b-a17b"
+    assert _spec("deepseek-v4-pro").train.teacher_model == "deepseek-v4-pro"
+    assert _spec("DeepSeek V4 Pro").train.teacher_model == "deepseek-v4-pro"
     assert _spec("").train.teacher_model == ""
 
     rejected = (
         "kimi-k2.6",
-        "deepseek-v4-pro",
+        "deepseek-ai/DeepSeek-V4-Pro",
+        "parasail-deepseek-v4-pro",
         "moonshotai/Kimi-K3",
         "nvidia/GLM-5.2-NVFP4",
         "Qwen/Qwen3.5-397B-A17B-FP8",
@@ -1265,8 +1268,9 @@ def test_opd_teacher_price_table_covers_exact_parasail_catalog():
         assert teacher_price_per_1m(alias) == info.usd_per_1m
     assert teacher_price_per_1m("kimi-k3") == (3.00, 15.00)
     assert teacher_price_per_1m("qwen3.5-397b-a17b") == (0.50, 3.60)
+    assert teacher_price_per_1m("deepseek-v4-pro") == (1.74, 3.48)
     with pytest.raises(ValueError, match="not a supported teacher"):
-        teacher_price_per_1m("deepseek-v4-pro")
+        teacher_price_per_1m("parasail-deepseek-v4-pro")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1329,11 +1333,12 @@ def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
 
     assert _knobs("kimi-k3").teacher_model == "parasail-kimi-k3-fast"
     assert _knobs("qwen3.5-397b-a17b").teacher_model == "parasail-qwen35-397b-a17b"
+    assert _knobs("deepseek-v4-pro").teacher_model == "parasail-deepseek-v4-pro"
     assert _knobs("").teacher_model == "parasail-glm-52"
     assert _knobs(None).teacher_model == "parasail-glm-52"
     for teacher in (
         "kimi-k2.6",
-        "deepseek-v4-pro",
+        "deepseek-ai/DeepSeek-V4-Pro",
         "Qwen/Qwen3.5-397B-A17B-FP8",
         "accounts/fireworks/models/deepseek-v4-pro",
     ):

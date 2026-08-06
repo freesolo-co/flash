@@ -86,27 +86,35 @@ def test_training_guide_lists_only_the_managed_teacher_aliases():
     guide = (Path(__file__).parents[1] / "flash" / "cli" / "TRAINING.md").read_text()
 
     assert "glm-5.2 (default) | kimi-k3 |" in guide
-    assert "qwen3.5-397b-a17b (key stays managed)" in guide
+    assert "qwen3.5-397b-a17b | deepseek-v4-pro" in guide
     assert "kimi-k2.6" not in guide
     assert "The control-plane broker owns `PARASAIL_API_KEY`" in guide
     assert "`FLASH_CONTROL_PANEL_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`" in guide
     assert "platform's Parasail key is used only inside the paid OPD worker" not in guide
 
 
-def test_catalog_contains_exactly_three_parasail_aliases():
-    assert set(TEACHER_MODELS) == {"kimi-k3", "glm-5.2", "qwen3.5-397b-a17b"}
+def test_catalog_contains_exactly_four_parasail_aliases():
+    assert set(TEACHER_MODELS) == {
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.5-397b-a17b",
+        "deepseek-v4-pro",
+    }
     assert resolve_teacher("").alias == "glm-5.2"
     assert {model.model_id for model in TEACHER_MODELS.values()} == {
         "parasail-kimi-k3-fast",
         "parasail-glm-52",
         "parasail-qwen35-397b-a17b",
+        "parasail-deepseek-v4-pro",
     }
     for rejected in (
         "kimi-k2.6",
-        "deepseek-v4-pro",
+        "deepseek-ai/DeepSeek-V4-Pro",
         "moonshotai/Kimi-K3",
         "Qwen/Qwen3.5-397B-A17B-FP8",
         "parasail-glm-52",
+        "parasail-deepseek-v4-pro",
+        "accounts/fireworks/models/deepseek-v4-pro",
         "accounts/fireworks/models/glm-5p2",
     ):
         with pytest.raises(ValueError, match="not a supported teacher"):
@@ -123,6 +131,9 @@ def test_pinned_tokenizer_hashes_are_complete():
     )
     assert dict(TEACHER_MODELS["qwen3.5-397b-a17b"].tokenizer_files)["tokenizer.json"] == (
         "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+    )
+    assert dict(TEACHER_MODELS["deepseek-v4-pro"].tokenizer_files)["tokenizer.json"] == (
+        "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
     )
 
 
