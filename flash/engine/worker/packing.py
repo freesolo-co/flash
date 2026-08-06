@@ -15,6 +15,37 @@ def _text_config(cfg):
     return getattr(cfg, "text_config", None) or cfg
 
 
+def model_is_pure_attention(model_id: str, revision: str = "") -> bool:
+    """True when every decoder layer is full softmax attention (safe for 4D block-diagonal mask).
+    Returns False for GDN hybrids, sliding-window arches, and on any config error.
+    """
+    try:
+        from transformers import AutoConfig
+
+        from flash.engine.worker.hf import model_revision_kwargs
+
+        cfg = _text_config(
+            AutoConfig.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                **model_revision_kwargs(revision),
+            )
+        )
+        layer_types = getattr(cfg, "layer_types", None)
+        if layer_types:
+            return all(t == "full_attention" for t in layer_types)
+        for attr in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim"):
+            if getattr(cfg, attr, None):
+                return False
+        # Qwen2.5 has sliding_window but disables it via use_sliding_window=False -> still packs.
+        # Mistral-style has no use_sliding_window flag -> assume window is active.
+        sliding = getattr(cfg, "sliding_window", None)
+        return not (sliding and getattr(cfg, "use_sliding_window", True))
+    except Exception as e:  # network/parse/arch failure -> do NOT pack (boundary-safe default)
+        print(f"[pack] pure-attention probe failed for {model_id!r} (treating as NOT pure): {e}")
+        return False
+
+
 def model_is_gdn_hybrid(model_id: str, revision: str = "") -> bool:
     """True for a GatedDeltaNet hybrid (Qwen3.5/3.6) that needs cu_seqlens + seq_idx to pack."""
     try:
@@ -89,10 +120,8 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None, revision: str = "") 
         return False
 
 
-def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bool:
-    """True when flash-linear-attention and causal_conv1d are both present, functional, and the
-    GDN forward actually threads cu_seq_lens_q + seq_idx (varies by transformers version).
-    """
+def gdn_packing_contract_available(model_id: str | None = None, revision: str = "") -> bool:
+    """True when the installed gdn stack exposes the boundary-reset contract without opening cuda."""
     try:
         import importlib
 
@@ -103,13 +132,19 @@ def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bo
 
         if not (is_flash_linear_attention_available() and is_causal_conv1d_available()):
             return False
-        importlib.import_module(
-            "causal_conv1d"
-        )  # fail a built-but-broken ABI here, not at model load
-        if not _gdn_forward_threads_reset_kwargs(model_id, revision=revision):
-            return False
-        # causal_conv1d compiled without the current GPU arch imports fine but raises at first forward;
-        # smoke it now so we fall back to unpacked rather than crashing mid-train.
+        importlib.import_module("causal_conv1d")
+        return _gdn_forward_threads_reset_kwargs(model_id, revision=revision)
+    except Exception:
+        return False
+
+
+def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bool:
+    """True when the gdn reset contract is installed and functional on the current device."""
+    if not gdn_packing_contract_available(model_id, revision=revision):
+        return False
+    try:
+        # causal_conv1d compiled without the current gpu arch imports fine but raises at first forward;
+        # smoke it now so training fails before optimizer work rather than at a packed boundary.
         import torch
 
         if torch.cuda.is_available():

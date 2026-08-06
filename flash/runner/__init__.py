@@ -30,7 +30,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, JobSpec, gpu_count_of
+from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, GpuSpec, JobSpec, gpu_count_of
 
 _STATE_DIR = str(data_dir())
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -66,6 +66,8 @@ _PRIVATE_STATUS_KEYS = frozenset(
 )
 _PRIVATE_VALUE_UNSET = object()
 MIN_PROVIDER_WALL_SECONDS = 60
+_WORKLOAD_PROFILE_WALL_SECONDS = 10 * 60
+_WORKLOAD_PROFILE_MAX_RETRIES = 1
 
 
 def artifacts_dir(spec: JobSpec) -> str:
@@ -124,7 +126,7 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
         # operational tolerance as _runstatus_from_json: the record stays readable, it just shows no
         # adapter ref (its spec cannot name one we could resolve).
         return None
-    if not spec.train.hf_repo:
+    if spec.workload_profile_kind or not spec.train.hf_repo:
         return None
     return status.run_id
 
@@ -164,6 +166,15 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
         from flash.cost.analytical import estimate_cost
         from flash.cost.spec import estimate_for_spec, runconfig_from_spec
 
+        if getattr(spec, "workload_profile_kind", ""):
+            # a profile job has no optimizer steps to prorate, so its charge is all-or-nothing: the
+            # bounded wall it rented, or zero if it never started. the caller passes steps=0 for the
+            # latter (see profile_steps_run), and honouring it matters because the id is derived
+            # from the workload rather than the account -- a profile cancelled before launch would
+            # otherwise bill the full wall cap to whichever submitter happened to win the claim.
+            if steps is not None and int(steps) <= 0:
+                return 0.0
+            return float(estimate_for_spec(spec).total_usd)
         if steps is None:
             return float(estimate_for_spec(spec).total_usd)
         n = max(0, int(steps))
@@ -185,14 +196,6 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
         return float(estimate_cost(cfg).total_usd)
     except Exception:
         return float(fallback)
-
-
-def _require_priced_sft_examples(spec: JobSpec) -> None:
-    if spec.algorithm == "sft" and int(spec.train.max_examples or 0) <= 0:
-        raise ValueError(
-            "train.max_examples must be set to a positive row count for SFT "
-            "(use the full dataset row count for an uncapped run)"
-        )
 
 
 def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
@@ -225,6 +228,24 @@ def actual_steps_run(status: RunStatus) -> int:
     if hb.get("stage") in _TRAINING_STAGES:
         return 1
     return 0
+
+
+def profile_steps_run(status: RunStatus) -> int:
+    """Whether a cancelled profile job rented anything: 1 if it started, 0 if it never did.
+
+    A profile has no optimizer steps, so ``actual_steps_run`` reads 0 for every one of them -- it
+    looks for training-stage heartbeats a profile never emits. Billing a cancel on that number
+    would hand back the rented wall of a profile that ran to completion. Billing the quote
+    unconditionally has the opposite failure: a profile cancelled while still queued would charge
+    the whole wall cap for work no gpu did, and because the id is derived from the workload rather
+    than the account, that charge lands on whichever submitter won the claim.
+
+    The distinguishing signal is simply whether the worker ever spoke. Any heartbeat means a
+    machine was rented and the bounded wall is owed; none means nothing ran and nothing is owed.
+    The charge is all-or-nothing rather than prorated because a profile is quoted as a wall cap,
+    not a per-step price -- see ``charge_usd_for_spec``."""
+    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
+    return 1 if hb.get("stage") else 0
 
 
 def _require_valid_deadline(value: object) -> float:
@@ -440,6 +461,9 @@ class RunStatus:
     platform_context: dict | None = None
     last_heartbeat: dict | None = None
     gpu_status: dict | None = None
+    workload_profile_kind: str | None = None
+    workload_profile_input_digest: str | None = None
+    workload_profile: dict | None = None
     effective_preparation: dict | None = None
 
     def to_dict(self) -> dict:
@@ -534,6 +558,35 @@ class WarmStartPreparationError(ValueError):
 
     Lets the submit route blame the adapter only for failures that really came from resolving it.
     """
+
+
+class WorkloadProfilePending(RuntimeError):
+    """Training preparation is blocked on a separately billed workload-profile run."""
+
+    def __init__(
+        self,
+        profile_run_id: str,
+        state: str,
+        *,
+        prepared_job: object | None = None,
+        spent_at: float | None = None,
+    ) -> None:
+        self.profile_run_id = profile_run_id
+        self.state = state
+        self.prepared_job = prepared_job
+        # set when the previous profile under this id is spent (failed/cancelled/dry_run) and its
+        # claim has to be taken over before a replacement can run. the value is that run's own
+        # created_at, which is what makes the takeover decidable: a claim stamp re-read at takeover
+        # time would already be the winner's, so every later caller would think it won too.
+        # None means no spent run was observed and the claim is taken by insert instead.
+        self.spent_at = spent_at
+        super().__init__(
+            f"workload profile {profile_run_id} is {state}; retry training preparation after it succeeds"
+        )
+
+
+class WorkloadProfileUnavailable(ValueError):
+    """The exact workload profile failed or cannot be trusted."""
 
 
 class _RunCancelled(RuntimeError):
@@ -1008,10 +1061,19 @@ def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
 def _preparation_digest(
     public_spec: JobSpec, worker_spec: JobSpec, adapter_identity: dict | None
 ) -> str:
+    worker_payload = worker_spec.to_internal_dict()
+    # omit empty fields so existing version-1 snapshots keep their historical digest.
+    for key in (
+        "workload_profile_kind",
+        "workload_profile_input_digest",
+        "workload_profile",
+    ):
+        if not worker_payload.get(key):
+            worker_payload.pop(key, None)
     payload = {
         "version": 1,
         "public_spec": public_spec.to_dict(),
-        "worker_spec": worker_spec.to_internal_dict(),
+        "worker_spec": worker_payload,
         "adapter_identity": adapter_identity,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -1025,7 +1087,13 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # the reconstructed public spec carries only their defaults ("local"/"catalog"). exclude them from
     # the structural check; their integrity is covered by the sha256 preparation digest, and the
     # worker spec is already keyed by run_id at the persist boundary.
-    for managed_top in ("run_id", "model_policy"):
+    for managed_top in (
+        "run_id",
+        "model_policy",
+        "workload_profile_kind",
+        "workload_profile_input_digest",
+        "workload_profile",
+    ):
         effective[managed_top] = public.get(managed_top)
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
@@ -1100,16 +1168,16 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         raise ValueError("persisted effective preparation has no pinned source revision")
 
 
-def _resolve_model_revision(spec: JobSpec) -> JobSpec:
+def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec:
     authored = spec.model_revision
-    if not authored:
+    if not authored and not required:
         return spec
     try:
         from huggingface_hub import HfApi
 
         info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(
             spec.model,
-            revision=authored,
+            revision=authored or None,
         )
         resolved = str(getattr(info, "sha", "") or "").strip().lower()
         if re.fullmatch(r"[0-9a-f]{40}", resolved) is None:
@@ -1130,6 +1198,145 @@ class PreparedJob:
     adapter_identity: dict | None = None
 
 
+def _profile_producer_version() -> str:
+    from flash import __version__
+
+    return str(__version__)
+
+
+def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
+    pinned = _assign_resolved_env_sha(spec)
+    if not pinned.environment.id:
+        raise WorkloadProfileUnavailable("sft workload profiling requires an environment id")
+    if not pinned.environment.resolved_sha:
+        raise WorkloadProfileUnavailable(
+            "sft workload profiling requires an immutable resolved environment revision"
+        )
+    return pinned
+
+
+def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJob:
+    """Prepare the cpu-only profile job that measures ``spec``'s exact sft workload.
+
+    Deliberately NOT ``prepare_job()``: that path prepares a *training* run, and every step of it
+    is about weights this job never loads. Running it here would resolve revision-specific model
+    geometry, reserve model-sized disk, attach the shared weight cache, prepare warm-start adapter
+    continuation, and finally price the training shape -- which needs the very profile this job
+    exists to produce. The profile loads a tokenizer and the pinned environment, then exits.
+
+    What it does keep is the small set of things the worker genuinely needs: the deterministic
+    run id, the immutable model/env revisions the caller already pinned, a bounded wall and retry
+    policy, and the managed artifact repo the worker downloads its code prefix from and uploads
+    metrics.json/DONE/console to. GPU type and provider pins are dropped: they describe where the
+    training run must land, and inheriting them would rent an H100 to tokenize on cpu.
+    """
+    from flash.workload_profile import SFT_PROFILE_KIND, sft_profile_run_id
+
+    profile_spec = replace(
+        spec,
+        run_id=sft_profile_run_id(input_digest),
+        gpu=replace(
+            spec.gpu,
+            type="",
+            provider="",
+            count=1,
+            disk_gb=GpuSpec.disk_gb,
+            network_volume=None,
+            max_wall_seconds=_WORKLOAD_PROFILE_WALL_SECONDS,
+            max_retries=_WORKLOAD_PROFILE_MAX_RETRIES,
+        ),
+        workload_profile_kind=SFT_PROFILE_KIND,
+        workload_profile_input_digest=input_digest,
+        workload_profile={},
+    )
+    profile_spec = _assign_managed_hf_repo(profile_spec)
+    from flash.cost.spec import estimate_for_spec
+
+    return PreparedJob(
+        public_spec=profile_spec,
+        worker_spec=profile_spec,
+        estimated_cost_usd=float(estimate_for_spec(profile_spec).total_usd),
+    )
+
+
+def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
+    """Attach the exact sft workload profile for ``spec``, or fail closed until one exists."""
+    from flash.workload_profile import (
+        SFT_PROFILE_KIND,
+        require_matching_sft_profile,
+        sft_profile_input_digest,
+        sft_profile_run_id,
+    )
+
+    producer_version = _profile_producer_version()
+    tokenizer_revision = spec.model_revision
+    input_digest = sft_profile_input_digest(
+        spec,
+        tokenizer_revision=tokenizer_revision,
+        producer_version=producer_version,
+    )
+    if spec.workload_profile:
+        profile = require_matching_sft_profile(
+            spec.workload_profile,
+            input_digest=input_digest,
+            producer_version=producer_version,
+            tokenizer_revision=tokenizer_revision,
+        )
+        return replace(
+            spec,
+            workload_profile_kind="",
+            workload_profile_input_digest=input_digest,
+            workload_profile=profile.to_dict(),
+        )
+
+    profile_run_id = sft_profile_run_id(input_digest)
+    try:
+        status = get_status(profile_run_id)
+    except FileNotFoundError as exc:
+        prepared = _prepared_sft_profile_job(spec, input_digest=input_digest)
+        raise WorkloadProfilePending(
+            profile_run_id,
+            "required",
+            prepared_job=prepared,
+        ) from exc
+
+    if (
+        status.workload_profile_kind != SFT_PROFILE_KIND
+        or status.workload_profile_input_digest != input_digest
+    ):
+        raise WorkloadProfileUnavailable("stored workload profile identity does not match")
+    if status.state == "done":
+        try:
+            profile = require_matching_sft_profile(
+                status.workload_profile,
+                input_digest=input_digest,
+                producer_version=producer_version,
+                tokenizer_revision=tokenizer_revision,
+            )
+        except ValueError as exc:
+            raise WorkloadProfileUnavailable(
+                "stored sft workload profile failed integrity validation"
+            ) from exc
+        return replace(
+            spec,
+            workload_profile_input_digest=input_digest,
+            workload_profile=profile.to_dict(),
+        )
+    if status.state in {"failed", "cancelled", "dry_run"}:
+        # a spent profile is not a verdict on the workload. the id is derived from the workload
+        # alone, so a preempted pod or a cancel would otherwise make this exact config unquotable
+        # for everyone, forever, with nothing in the system that could ever clear it. offer a fresh
+        # profile job the same way a missing one is offered; the claim decides who actually runs it.
+        prepared = _prepared_sft_profile_job(spec, input_digest=input_digest)
+        raise WorkloadProfilePending(
+            profile_run_id,
+            status.state,
+            prepared_job=prepared,
+            spent_at=status.created_at,
+        )
+    raise WorkloadProfilePending(profile_run_id, status.state)
+
+
 def prepare_job(
     spec: JobSpec,
     *,
@@ -1138,9 +1345,11 @@ def prepare_job(
     owner_key_id: int | None = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
-    spec = _resolve_model_revision(spec)
-    _require_priced_sft_examples(spec)
+    spec = _resolve_model_revision(spec, required=spec.algorithm == "sft")
     _require_supported_adapter_continuation(spec)
+    if spec.algorithm == "sft":
+        spec = _require_pinned_profile_environment(spec)
+        spec = _require_sft_workload_profile(spec)
     if spec.train.structured_outputs:
         from flash.serve.preflight import preflight_serving_path
 
@@ -1217,6 +1426,8 @@ def prepare_job(
     )
     from flash.cost.spec import estimate_for_spec
 
+    # profile jobs route to their bounded-wall charge inside estimate_for_spec; they cannot be priced
+    # through the training estimator, which requires the profile this job produces.
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
     return PreparedJob(
         public_spec=public_spec,
@@ -1263,6 +1474,7 @@ def _persist_effective_worker_spec(
     _validate_effective_spec(public_spec, worker_spec)
     effective_preparation = {
         "worker_spec": worker_spec.to_internal_dict(),
+        "workload_profile": worker_spec.workload_profile or None,
         "adapter_identity": adapter_identity,
         "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
         "backend": TRAINER_BACKEND,
@@ -1284,12 +1496,30 @@ def submit_job(
     prepared_job: PreparedJob | None = None,
 ) -> RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode."""
-    prepared = prepared_job or prepare_job(
-        spec,
-        billing_context=billing_context,
-        platform_context=platform_context,
-        owner_key_id=owner_key_id,
-    )
+    if prepared_job is not None:
+        prepared = prepared_job
+    else:
+        try:
+            prepared = prepare_job(
+                spec,
+                billing_context=billing_context,
+                platform_context=platform_context,
+                owner_key_id=owner_key_id,
+            )
+        except WorkloadProfilePending as exc:
+            pending = exc.prepared_job
+            if isinstance(pending, PreparedJob):
+                submit_job(
+                    pending.public_spec,
+                    background=True,
+                    runtime_secrets=runtime_secrets,
+                    billing_context=billing_context,
+                    platform_context=platform_context,
+                    owner_key_id=owner_key_id,
+                    prepared_job=pending,
+                )
+                raise WorkloadProfilePending(exc.profile_run_id, "queued") from exc
+            raise
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
@@ -1313,8 +1543,12 @@ def submit_job(
         billing_context=billing_context,
         billing_state="pending" if billing_context else None,
         platform_context=platform_context,
+        workload_profile_kind=worker_spec.workload_profile_kind or None,
+        workload_profile_input_digest=worker_spec.workload_profile_input_digest or None,
+        workload_profile=worker_spec.workload_profile or None,
         effective_preparation={
             "worker_spec": worker_spec.to_internal_dict(),
+            "workload_profile": worker_spec.workload_profile or None,
             "adapter_identity": prepared.adapter_identity,
             "preparation_digest": _preparation_digest(
                 public_spec, worker_spec, prepared.adapter_identity
@@ -1326,14 +1560,30 @@ def submit_job(
         # Creds-only check (available_providers -> is_configured), no network on the create path.
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
     )
-    _save_status(
-        status,
-        _run_deadline_at=status.created_at + float(public_spec.gpu.max_wall_seconds),
-        _next_attempt=0,
-        _opd_retry_contract_version=(
+    save_kwargs = {
+        "_run_deadline_at": status.created_at + float(public_spec.gpu.max_wall_seconds),
+        "_next_attempt": 0,
+        "_opd_retry_contract_version": (
             OPD_RETRY_CONTRACT_VERSION if public_spec.algorithm == "opd" else _PRIVATE_VALUE_UNSET
         ),
-    )
+    }
+    if worker_spec.workload_profile_kind:
+        with _status_guard(status.run_id):
+            existing = (
+                _runstatus_from_json(_load_status_json(status.run_id))
+                if os.path.exists(runs_file_path(status.run_id, ".json"))
+                else None
+            )
+            # a live profile under this id is joined, never restarted: the id is deterministic in
+            # the workload, so a concurrent submitter of the same config lands here and must wait
+            # on the running one rather than launch a second billed copy of identical work.
+            if existing is not None and existing.state not in _UNDEPLOYABLE_STATES:
+                return existing
+            # a spent one is replaced. the caller only reaches this after winning the takeover on
+            # that exact spent record, so overwriting it is the relaunch, not a lost update.
+            _save_status_unlocked(status, **save_kwargs)
+    else:
+        _save_status(status, **save_kwargs)
     _report_status(status)
     if dry_run:
         # A dry-run persists a state=dry_run record (retrievable, listable, and stageable for a
@@ -1403,6 +1653,18 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     _validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")
+    has_workload_profile = bool(
+        worker_spec.workload_profile_kind
+        or worker_spec.workload_profile_input_digest
+        or worker_spec.workload_profile
+    )
+    if has_workload_profile:
+        if snapshot.get("workload_profile") != (worker_spec.workload_profile or None):
+            raise ValueError("persisted workload profile does not match the worker spec")
+        if not isinstance(stored_digest, str) or stored_digest != _preparation_digest(
+            public_spec, worker_spec, expected
+        ):
+            raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
         if not isinstance(expected, dict) or not expected.get("digest"):
             raise ValueError(
@@ -1571,6 +1833,24 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     from flash.engine.accounting import sanitize_worker_metrics
 
     metrics = sanitize_worker_metrics(metrics)
+    if spec.workload_profile_kind:
+        from flash.workload_profile import require_matching_sft_profile
+
+        profile = require_matching_sft_profile(
+            metrics.get("workload_profile"),
+            input_digest=spec.workload_profile_input_digest,
+            producer_version=_profile_producer_version(),
+            tokenizer_revision=spec.model_revision,
+        )
+        metrics = {**metrics, "workload_profile": profile.to_dict()}
+        current = get_status(spec.run_id)
+        if current.state in TERMINAL_STATES:
+            raise ValueError("workload profile metrics arrived after the run became terminal")
+        _update(
+            spec.run_id,
+            current.state,
+            workload_profile=profile.to_dict(),
+        )
     dest = artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.

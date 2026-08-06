@@ -21,7 +21,11 @@ from flash.client import (
     save_credentials,
     verify_freesolo_key,
 )
-from flash.client.config import load_credentials, load_credentials_with_source
+from flash.client.config import (
+    load_credentials,
+    load_credentials_with_source,
+    shadowed_login_warning,
+)
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
@@ -29,7 +33,6 @@ from flash.runner import TERMINAL_STATES
 from flash.schema import (
     ConfigError,
     spec_and_train_keys_from_file,
-    spec_from_file,
     train_schema_metadata,
 )
 from flash.serve.urls import is_freesolo_hosted_url
@@ -320,12 +323,14 @@ def cmd_env_list(args) -> int:
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    Catalog-only and deterministic. SFT cost never imports the environment; it requires a positive
-    [train].max_examples row count instead of guessing or locally counting a dataset."""
-    from flash.cost import estimate_cost
+    grpo and opd quote offline from the catalog. sft has no offline quote at all: its cost is
+    derived from the exact tokenized dataset, and only a workload profile knows that, so sft asks
+    the server for the same profile-backed quote a real submit would freeze. There is deliberately
+    no analytical sft fallback -- a guessed row count is what this whole path exists to remove.
+    """
     from flash.lora_rank import preflight_train_context_within_serving
 
-    spec = spec_from_file(
+    spec, authored_train_keys = spec_and_train_keys_from_file(
         args.config,
         run_id=None,
         overrides=args.overrides,
@@ -333,6 +338,15 @@ def _cmd_train_cost(args) -> int:
         project_required=True,
     )
     preflight_train_context_within_serving(spec)
+    if spec.algorithm == "sft":
+        return _cmd_train_cost_sft(args, spec, authored_train_keys)
+    return _cmd_train_cost_offline(spec)
+
+
+def _cmd_train_cost_offline(spec) -> int:
+    """Catalog-only quote for the algorithms that do not need workload evidence yet (grpo, opd)."""
+    from flash.cost import estimate_cost
+
     if spec.train.init_from_adapter:
         # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
         # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank
@@ -350,6 +364,168 @@ def _cmd_train_cost(args) -> int:
     else:
         print(estimate.breakdown())
     return 0
+
+
+def _cmd_train_cost_sft(args, spec, authored_train_keys: frozenset[str]) -> int:
+    """Exact sft quote, served by the same authenticated path that freezes a real submit's quote."""
+    # cli._warn_if_login_shadowed() suppresses this warning for `--cost` because the catalog path
+    # never reaches an organization. the sft path does: it authenticates, resolves the project, and
+    # can start a billed profile run, so the warning has to fire here after all.
+    message = shadowed_login_warning()
+    if message:
+        print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+    client = client_from_config()
+    try:
+        status = client.create_run(
+            spec_payload(spec, authored_train_keys=authored_train_keys),
+            runtime_secrets=runtime_secrets_from_local_env(
+                args.config, keys=spec.environment.secrets
+            )
+            or None,
+            dry_run=True,
+            client_train_schema=_client_train_schema(authored_train_keys),
+        )
+    except ApiError as exc:
+        _raise_if_workload_profile_pending(client, exc)
+        detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
+        if detail is None:
+            raise
+        raise ApiError(exc.status, detail, detail=detail) from exc
+    _print_exact_sft_cost(status, spec)
+    return 0
+
+
+def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
+    return {
+        "version": __version__,
+        "fields": train_schema_metadata(),
+        "authored_keys": sorted(authored_train_keys),
+    }
+
+
+def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None:
+    """Explain a profile-pending rejection and fail, or return so the caller keeps handling `exc`.
+
+    A miss is not a validation error: the server started a real, separately billed profile run that
+    tokenizes the exact dataset. Saying only "409" would leave the user with a charge they cannot
+    see the reason for, and re-running blindly would look like the same request failing twice.
+    """
+    detail = exc.detail
+    if exc.code != "workload_profile_pending" or not isinstance(detail, dict):
+        return
+    profile_run_id = str(detail.get("profile_run_id") or "")
+    state = str(detail.get("state") or "unknown")
+    # the profile id is deterministic in the workload, so this config's profile may already be
+    # running under another key. that run is not readable here and is not billed here either, so
+    # both the follow-up command and the charge sentence have to change.
+    owned = detail.get("owned") is not False
+    charge = _profile_charge(client, profile_run_id) if owned else None
+    if owned:
+        lines = [
+            "no exact workload profile exists for this config yet, so there is no training quote "
+            "to print. the server started a separate profile run that loads your environment and "
+            "tokenizes the exact dataset this training would consume.",
+            "that profile run is real work and is billed on its own"
+            + (f" (estimated ${charge:.2f})" if charge is not None else "")
+            + "; no training run was created, no training gpu was allocated, and nothing was "
+            "charged for training.",
+            f"follow it with `{CLI_NAME} runs status {profile_run_id}`, then re-run this command "
+            "once it reports done."
+            if profile_run_id
+            else "re-run this command once the profile reports done.",
+        ]
+    else:
+        lines = [
+            "no exact workload profile exists for this config yet, so there is no training quote "
+            "to print. one is already being measured for this exact config and will be reused, so "
+            "nothing was started or charged here.",
+            "re-run this command in a few minutes.",
+        ]
+    for line in lines:
+        print(render.note(line) if render.styled() else line, file=sys.stderr)
+    raise ClientError(
+        f"workload profile {profile_run_id or '(unknown)'} is {state}; "
+        "the exact quote is available once it succeeds"
+    )
+
+
+def _profile_charge(client: ApiClient, profile_run_id: str) -> float | None:
+    """The profile run's own quote, or None when it cannot be read (not owned by this key, etc)."""
+    if not profile_run_id:
+        return None
+    try:
+        status = client.get_run(profile_run_id)
+    except (ApiError, ClientError):
+        return None
+    quote = status.get("estimated_cost_usd") if isinstance(status, dict) else None
+    # bool is an int subclass, so an unchecked isinstance would render a JSON `true` as "$1.00" --
+    # a charge the user is told to expect that no profile ever quoted.
+    if not isinstance(quote, (int, float)) or isinstance(quote, bool):
+        return None
+    return float(quote)
+
+
+def _exact_sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
+    """Rows describing the exact measured workload behind an sft quote.
+
+    Only aggregates the server actually returned are shown. A field that is absent is dropped
+    rather than defaulted, so the panel never reports a count the profile did not measure.
+    """
+
+    def count(key: str) -> int | None:
+        value = profile.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    steps = count("authoritative_steps")
+    retained, selected = count("retained_examples"), count("selected_examples")
+    dropped = count("dropped_examples")
+    compute, supervised = (
+        count("authoritative_compute_tokens"),
+        count("authoritative_supervised_tokens"),
+    )
+    packing = str(profile.get("packing_mode") or "")
+    architecture = str(profile.get("architecture_mode") or "")
+    digest = str(profile.get("content_digest") or "")
+    examples = None
+    if retained is not None and selected is not None:
+        examples = f"{retained:,} trained of {selected:,} selected"
+        if dropped:
+            examples += f" ({dropped:,} dropped)"
+    tokens = None
+    if compute is not None:
+        tokens = f"{compute:,} compute"
+        if supervised is not None:
+            tokens += f", {supervised:,} supervised"
+    return [
+        ("run", f"{spec.model}  [SFT{f', {steps} steps' if steps is not None else ''}]"),
+        ("workload", f"{packing} ({architecture})" if packing and architecture else None),
+        ("examples", examples),
+        ("tokens", tokens),
+        ("profile", digest[:12] or None),
+    ]
+
+
+def _print_exact_sft_cost(status: dict, spec) -> None:
+    total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
+    if not isinstance(total, (int, float)) or isinstance(total, bool):
+        raise ClientError(
+            "the server accepted this SFT config but returned no cost estimate; "
+            f"run `{CLI_NAME} train --dry-run` to see the full server response"
+        )
+    profile = status.get("workload_profile")
+    rows = _exact_sft_cost_rows(spec, profile if isinstance(profile, dict) else {})
+    if render.styled():
+        print(render.exact_cost_panel(rows, float(total)))
+    else:
+        for key, value in rows:
+            if value is not None:
+                print(f"{key.ljust(8)}: {value}")
+        print(f"{'TOTAL'.ljust(8)}: ${float(total):.2f}")
+    print(
+        "quoted from the exact tokenized workload, not an assumed row count. no training gpu was "
+        "allocated and nothing was charged for training.",
+        file=sys.stderr,
+    )
 
 
 def _legacy_train_key_rejection_detail(
@@ -443,18 +619,16 @@ def cmd_train(args) -> int:
     )
     payload = spec_payload(spec, authored_train_keys=authored_train_keys)
     client = client_from_config()
-    client_train_schema = {
-        "version": __version__,
-        "fields": train_schema_metadata(),
-        "authored_keys": sorted(authored_train_keys),
-    }
+    client_train_schema = _client_train_schema(authored_train_keys)
     runtime_secrets = (
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
     _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
     if args.dry_run:
-        # dry-run runs submit-time server preflights without importing user code, allocating a gpu,
-        # or charging anything. a rejection surfaces as the server's error with exit status 1.
+        # dry-run runs submit-time server preflights without allocating a training gpu or charging
+        # for training. a rejection surfaces as the server's error with exit status 1. for sft it
+        # also requires an exact workload profile, so a miss starts a separate billed profile run
+        # (see _raise_if_workload_profile_pending) instead of previewing anything.
         try:
             status = client.create_run(
                 payload,
@@ -463,10 +637,11 @@ def cmd_train(args) -> int:
                 client_train_schema=client_train_schema,
             )
         except ApiError as exc:
+            _raise_if_workload_profile_pending(client, exc)
             detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
             if detail is None:
                 raise
-            raise ApiError(exc.status, detail) from exc
+            raise ApiError(exc.status, detail, detail=detail) from exc
         compatibility = status.pop("train_schema_compatibility", None)
         _print_train_schema_compatibility(compatibility)
         # the server fails open on a billing-infra problem, so "cost" is only in the validated list
@@ -474,12 +649,22 @@ def cmd_train(args) -> int:
         # equally not a verification -- so treat anything but an explicit True as unverified.
         affordability_verified = status.pop("affordability_verified", None) is True
         cost = "and cost" if affordability_verified else "but NOT cost"
+        # sft additionally required a matching workload profile to get this far, and that profile
+        # run already imported environment.py and tokenized the dataset. claiming otherwise here
+        # would understate what has been checked -- and what has already been billed.
+        environment = (
+            "your environment.py and the exact dataset were already loaded and tokenized by the "
+            "workload profile this quote is built on; model load and gpu/training are first "
+            "exercised on the worker after cold-start."
+            if spec.algorithm == "sft"
+            else "it did NOT import or run your environment.py; dataset loading, "
+            "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
+            "gpu/training are first exercised on the worker after cold-start."
+        )
         print(
             "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
-            f"runtime-secret presence, warm-start source, serving context cap, {cost}. it did NOT "
-            "import or run your environment.py; dataset loading, start_episode/episode shapes, "
-            "reward/scorer, worker imports, model load, and gpu/training are first exercised on the "
-            "worker after cold-start.",
+            f"runtime-secret presence, warm-start source, serving context cap, {cost}. "
+            f"{environment}",
             file=sys.stderr,
         )
         if not affordability_verified:
@@ -497,11 +682,18 @@ def cmd_train(args) -> int:
         else:
             print(json.dumps(status, indent=2))
         return 0
-    status = client.create_run(
-        payload,
-        runtime_secrets=runtime_secrets,
-        client_train_schema=client_train_schema,
-    )
+    try:
+        status = client.create_run(
+            payload,
+            runtime_secrets=runtime_secrets,
+            client_train_schema=client_train_schema,
+        )
+    except ApiError as exc:
+        # a real submit misses the profile cache the same way a preview does, and the miss starts a
+        # separately billed profile run. without this the user sees a bare 409 for a charge they
+        # were never told about (see _raise_if_workload_profile_pending).
+        _raise_if_workload_profile_pending(client, exc)
+        raise
     run_id = status["run_id"]
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",

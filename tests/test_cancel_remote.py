@@ -735,6 +735,57 @@ def test_cancel_run_marks_billing_failed_when_pricing_falls_back(tmp_path, monke
     assert "pricing failed" in (status.billing_error or "")
 
 
+def test_cancel_run_bills_a_profile_on_started_not_on_optimizer_steps(tmp_path, monkeypatch):
+    """Cancelling a profile charges its bounded wall only if it started, and $0 if it never did.
+
+    The wiring is the point here, not the arithmetic (``test_charge_pricing`` covers that): a
+    profile emits no rl_step/sft_step/opd_step heartbeat, so if this path fed it through
+    ``actual_steps_run`` every cancelled profile would price at 0 steps -- free even after it ran
+    its whole wall. Both directions are asserted because a one-sided test passes under exactly
+    that mistake.
+    """
+    import flash.runner as orch
+    from flash.spec import JobSpec
+    from flash.workload_profile import SFT_PROFILE_KIND
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    seen: list = []
+    monkeypatch.setattr(
+        orch, "charge_usd_for_spec", lambda _spec, **kw: seen.append(kw.get("steps")) or 7.0
+    )
+
+    def _cancel(run_id: str, heartbeat: dict | None) -> None:
+        spec = JobSpec.from_dict(
+            {
+                "gpu": {"type": "RTX 5090"},
+                "run_id": run_id,
+                "workload_profile_kind": SFT_PROFILE_KIND,
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id=run_id,
+                state="running",
+                spec=spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                last_heartbeat=heartbeat,
+                workload_profile_kind=SFT_PROFILE_KIND,
+            )
+        )
+        assert orch.cancel_run(run_id).state == "cancelled"
+
+    # never started: no heartbeat at all -> 0 -> charge_usd_for_spec returns $0 for a profile.
+    _cancel("profile-sft-never", None)
+    # started: the profile worker's own first heartbeat, which is NOT a training stage.
+    _cancel("profile-sft-started", {"stage": "profile_start", "ts": 1.0})
+
+    assert seen == [0, 1], (
+        "a cancelled profile must be priced on whether it started, not on optimizer steps it "
+        f"never reports; got {seen}"
+    )
+
+
 def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path, monkeypatch):
     import flash.providers as providers
     import flash.runner as orch

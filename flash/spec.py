@@ -395,6 +395,10 @@ class JobSpec:
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_revision: str = ""
+    # platform-managed workload-profile carrier. public configs never author these fields.
+    workload_profile_kind: str = ""
+    workload_profile_input_digest: str = ""
+    workload_profile: dict[str, Any] = field(default_factory=dict)
     # canonical freesolo project uuid. every config, control-plane record, and worker round trip
     # carries the same explicit identity; there is no name/default/sole-project resolution.
     project: str = ""
@@ -402,10 +406,22 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
+        profile_kind = str(self.workload_profile_kind or "")
+        if profile_kind not in {"", "sft"}:
+            raise ValueError("unsupported workload profile kind")
+        profile_digest = str(self.workload_profile_input_digest or "")
+        if profile_digest and (
+            len(profile_digest) != 64 or any(c not in "0123456789abcdef" for c in profile_digest)
+        ):
+            raise ValueError("workload profile input digest must be lowercase sha256 hex")
+        if not isinstance(self.workload_profile, dict):
+            raise TypeError("workload_profile must be an object")
         validate_worker_env_reserved(self.worker_env)
 
     @property
     def phase(self) -> str:
+        if self.workload_profile_kind:
+            return "profile"
         return "rl" if self.algorithm == "grpo" else self.algorithm
 
     def to_dict(self) -> dict[str, Any]:
@@ -420,6 +436,9 @@ class JobSpec:
         # server-assigned identity and internal-only policy — never authored in a config.
         data.pop("run_id", None)
         data.pop("model_policy", None)
+        data.pop("workload_profile_kind", None)
+        data.pop("workload_profile_input_digest", None)
+        data.pop("workload_profile", None)
         train = data["train"]
         train.pop("init_from_adapter_revision", None)
         train.pop("hf_repo", None)  # control-plane-assigned artifact repo
@@ -557,6 +576,9 @@ class JobSpec:
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
+            workload_profile_kind=str(data.get("workload_profile_kind") or ""),
+            workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
+            workload_profile=dict(data.get("workload_profile") or {}),
             project=project,
         )
 

@@ -28,6 +28,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.spec import JobSpec
+from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
 # Infra-shaped failure categories the retry loop resumes on (see lifecycle._submit_seed_supervised).
 # Mirrors the literal tuple in the source; this test is the guard that the set doesn't silently drift.
@@ -478,7 +479,7 @@ def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(monkeypatch, res
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
     gpu = {"type": "RTX 4090", "max_retries": 2}
     gpu.update(gpu_kw)
-    return JobSpec.from_dict(
+    spec = JobSpec.from_dict(
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
@@ -489,6 +490,11 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
             "gpu": gpu,
         }
     )
+    # the relaunch path re-quotes from the spec it holds, and an sft quote reads the workload
+    # profile. these tests start *after* preparation, from the spec a prepared run already carries,
+    # so the profile is attached here rather than driven through submission: from_dict is the public
+    # shape and deliberately cannot carry one.
+    return attach_sft_profile(spec)
 
 
 def _alloc():
@@ -554,6 +560,10 @@ def orch(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+    # the spec carries a pinned model revision (the profile is keyed on one), which makes the
+    # post-allocation quote refresh resolve revision-specific geometry from the hub. these tests are
+    # about the retry loop, so read the catalog's numbers instead of the network.
+    stub_revision_geometry(monkeypatch)
     # The retry loop tears the prior attempt's endpoint down before relaunching; keep it off-network.
     monkeypatch.setattr(
         runpod_api,

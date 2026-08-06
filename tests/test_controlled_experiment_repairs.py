@@ -7,16 +7,29 @@ from types import SimpleNamespace
 import pytest
 
 
-def _prepared_spec(*, revision: str = "main"):
-    from flash.spec import JobSpec, TrainSpec
+def _prepared_spec(*, revision: str = "main", resolves_to: str = "a" * 40):
+    """An sft spec authored with a mutable ``revision``, ready for the profile-first gate.
 
-    return JobSpec(
+    ``resolves_to`` is the sha the stubbed hub returns. sft preparation profiles the workload before
+    it will quote, and the profile is keyed on the *resolved* revision, so the artifact has to be
+    built against the identity resolution will produce rather than the authored ref. The environment
+    is pinned for the same reason the model is: an unpinned env id would send preparation to github,
+    and an absent one fails the gate outright.
+    """
+    from dataclasses import replace
+
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from tests._helpers.profile import attach_sft_profile
+
+    spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        model_revision=revision,
+        model_revision=resolves_to,
         algorithm="sft",
+        environment=EnvironmentSpec(id="freesolo/gsm8k", resolved_sha="e" * 40),
         train=TrainSpec(epochs=1, max_examples=1),
         run_id="revision-preflight",
     )
+    return replace(attach_sft_profile(spec), model_revision=revision)
 
 
 def _stub_prepare_dependencies(monkeypatch):
@@ -162,7 +175,7 @@ def test_prepare_job_moving_ref_persists_first_resolved_commit(monkeypatch):
             return SimpleNamespace(sha=next(shas))
 
     monkeypatch.setattr(huggingface_hub, "HfApi", Api)
-    prepared = runner.prepare_job(_prepared_spec(revision="moving-tag"))
+    prepared = runner.prepare_job(_prepared_spec(revision="moving-tag", resolves_to="b" * 40))
 
     assert prepared.public_spec.model_revision == "b" * 40
     assert prepared.worker_spec.model_revision == "b" * 40
