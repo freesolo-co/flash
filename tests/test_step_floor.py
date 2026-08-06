@@ -12,7 +12,13 @@ on real hardware (Qwen3.5-0.8B, RTX 4090, 8 steps, 100.0% of the step accounted)
 
 ~22% of every step was missing, and the fake reward wall was numerically impersonating it -- both
 scale with completion count, which is why the model looked calibrated while both halves were
-wrong. These tests pin the properties that made a flat constant the right shape for the fix.
+wrong.
+
+Those three phases are the smaller half of the problem. On that arm the residual over the modelled
+gpu seconds is 44.74s: 11.62s is the unmodelled phases, and 33.12s is update_actor + gen running
+40.19s against a modelled 7.06s. Most of the floor is fixed per-step overhead the peak-FLOPs model
+misses at 0.8B-4B, which is why a CONSTANT fits and every scaled form loses. These tests pin the
+properties that make that constant the right shape.
 """
 
 from __future__ import annotations

@@ -52,9 +52,20 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 #   save_checkpoint  1.5%  -> NOTHING
 #   reward           0.0%  -> reward_s
 #
-# ~22% of every step had no term. grpo recomputes log-probs under the current policy before each
+# ~22% of every step had no term: grpo recomputes log-probs under the current policy before each
 # update, and syncs trained weights into the vllm rollout engine to keep the next rollout
-# on-policy; both are real gpu work proportional to the step, not overhead.
+# on-policy. But those three phases are the SMALLER half of what this constant absorbs. On that
+# same arm the residual (real step - modelled gpu seconds) is 44.74s, of which:
+#
+#   11.62s  the three phases above, which genuinely have no term
+#   33.12s  update_actor + gen running 40.19s against a modelled 7.06s -- 5.7x
+#
+# So the floor is mostly the FLOPs model under-predicting the phases it ALREADY models. At 0.8B-4B
+# a step is dominated by fixed per-step overhead (kernel launches, optimizer and dataloader work,
+# engine round-trips) that no peak-FLOPs term captures, which is why a constant fits and every
+# scaled form fails. Matched measurements confirm the cards do not rank by FLOPs at this size: at
+# 0.8B/gens=32 the RTX 5090 is the fastest card measured (44.6s) against H100 72.7s and H200
+# 152.7s.
 #
 # This was invisible for as long as it was because the fictitious reward wall stood in for it:
 # 32 completions x the old 1.0 s/completion default = 32.00s of a 32.88s prediction, against a
@@ -89,19 +100,24 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # The floor is not proportional to anything the model already computes: it is ~98x the modelled
 # gpu-bound seconds, so any proportional form amplifies a tiny noisy denominator (2/11).
 #
+# Scaling with the card's throughput is the instructive miss. ~82% of the floor is gpu work, so it
+# "should" be faster on a faster card -- but that form predicts RTX 5090 pays 169.8s where it
+# measurably pays 44.2s. update_weights is a weight COPY into the vllm engine (bandwidth, pcie)
+# and save_checkpoint is disk i/o; neither tracks tflops.
+#
 # It does grow with completions (g32 77s, g64 147s, g256 231s) and model size (0.8B 71s, 2B 80s,
-# 4B 110s), which is old_log_prob's shape -- a forward pass over completions x parameters. But
-# the fit arms cluster at 32 and 256 completions while the held-out arms run 16-64, so a slope
-# fitted on a 32-vs-256 contrast is not evidence about the gap it would be extrapolating into,
-# and every form that tried scored worse than the constant.
+# 4B 110s), so a term in completions x parameters is the obvious candidate -- but the fit arms
+# cluster at 32 and 256 completions while the held-out arms run 16-64, so a slope fitted on a
+# 32-vs-256 contrast is not evidence about the gap it would extrapolate into, and it scored 6/11.
 #
 # This is an empirical aggregate and will drift as hardware, verl, or the engine change. The
-# principled fix models old_log_prob and update_weights as real FLOPs terms.
+# principled fix is a per-step overhead term in the throughput model itself, since that is what
+# the bulk of this constant is really standing in for.
 STEP_FLOOR_SECONDS = 78.8
 
 
 def step_floor_seconds(gpu: str) -> float:
-    """Unmodelled per-step work (old_log_prob, weight sync, checkpointing).
+    """Per-step seconds the FLOPs terms do not account for.
 
     Takes ``gpu`` because the phases are real GPU work and a future FLOPs-based model will need
     it, but returns one constant today: a per-card table was measured and does not beat this one
