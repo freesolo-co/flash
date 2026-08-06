@@ -234,6 +234,7 @@ def test_profile_carrier_is_internal_and_round_trips_only_in_worker_specs() -> N
         _spec(),
         workload_profile_kind="sft",
         workload_profile_input_digest="c" * 64,
+        workload_profile_producer_version="1.2.3",
         workload_profile=profile,
     )
 
@@ -242,5 +243,6 @@ def test_profile_carrier_is_internal_and_round_trips_only_in_worker_specs() -> N
 
     assert "workload_profile_kind" not in public
     assert "workload_profile_input_digest" not in public
+    assert "workload_profile_producer_version" not in public
     assert "workload_profile" not in public
     assert JobSpec.from_dict(internal) == spec

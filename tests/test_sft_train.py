@@ -30,6 +30,11 @@ from flash.engine.worker.sft_train import (
     render_loraplus_shim,
 )
 
+# distinct from `flash.__version__` on purpose: the worker resolves that to "0+unknown" (no flash
+# distribution is installed there), so a fixture built from it could not catch a worker that
+# re-derives the producer version instead of reading the one carried on the spec.
+_PROFILE_PRODUCER_VERSION = "9.9.9"
+
 
 def _cfg(**over):
     base = {
@@ -960,6 +965,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
         thinking=False,
         worker_env={},
         workload_profile_input_digest="",
+        workload_profile_producer_version=_PROFILE_PRODUCER_VERSION,
         workload_profile={},
         environment=SimpleNamespace(
             id="owner/env",
@@ -1015,20 +1021,22 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
                 rendered += "<assistant>"
             return rendered
 
-    from flash import __version__
     from flash.engine.sft_workload import prepare_sft_workload
     from flash.workload_profile import sft_profile_input_digest
 
+    # deliberately NOT `flash.__version__`: the worker has no flash distribution installed and
+    # resolves that to "0+unknown", so building both sides from it would make this fixture agree
+    # with a worker that re-derives the version -- the defect it must instead be able to catch.
     spec.workload_profile_input_digest = sft_profile_input_digest(
         spec,
         tokenizer_revision=spec.model_revision,
-        producer_version=__version__,
+        producer_version=_PROFILE_PRODUCER_VERSION,
     )
     spec.workload_profile = prepare_sft_workload(
         spec,
         Env(),
         tokenizer_loader=lambda _model, _revision: Tokenizer(),
-        producer_version=__version__,
+        producer_version=_PROFILE_PRODUCER_VERSION,
         allow_packing=False,
         packing_support=lambda _model, _revision: ("unsupported", False),
     ).profile.to_dict()

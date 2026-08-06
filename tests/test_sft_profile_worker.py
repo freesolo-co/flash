@@ -91,6 +91,7 @@ def _profile_spec() -> JobSpec:
         spec,
         workload_profile_kind=SFT_PROFILE_KIND,
         workload_profile_input_digest=digest,
+        workload_profile_producer_version=_PRODUCER_VERSION,
     )
 
 
@@ -111,8 +112,11 @@ def profile_worker(monkeypatch):
         worker, "load_tokenizer", lambda _model, revision=None: _Tokenizer(), raising=False
     )
     monkeypatch.setattr(worker, "heartbeat", lambda *_a, **_kw: None, raising=False)
-    monkeypatch.setattr(sft_profile, "__version__", _PRODUCER_VERSION, raising=False)
-    monkeypatch.setattr("flash.__version__", _PRODUCER_VERSION, raising=False)
+    # `flash.__version__` is deliberately NOT pinned to the producer version here. On a real worker
+    # it is the "0+unknown" fallback (no flash distribution is installed there), and pinning it
+    # would make every assertion below pass for a worker that reads it -- the exact reason this
+    # class of defect shipped. The spec carries the producer version; the worker must use that.
+    monkeypatch.setattr("flash.__version__", "0+unknown", raising=False)
 
     finalized: list = []
     monkeypatch.setattr(
@@ -260,6 +264,33 @@ def test_profile_seeds_after_loading_the_environment_like_training_does(
     sft_profile.run_sft_profile()
 
     assert order == ["env", "seed"]
+
+
+def test_profile_keys_its_digest_off_the_carried_version_not_the_installed_one(
+    profile_worker,
+) -> None:
+    """The producer version must travel on the spec, because the worker cannot re-derive it.
+
+    `flash.__version__` reads `importlib.metadata.version("freesolo-flash")`, and a worker instance
+    has NO flash distribution installed: Dockerfile.worker ships dependencies only, and the flash
+    package arrives as the plane's own source snapshot on PYTHONPATH (`/runcode`). So on every real
+    instance that lookup raises and `__version__` is the "0+unknown" fallback, while the plane that
+    froze the digest resolved a real version like "1.0.88". A worker deriving the version locally
+    therefore computes a digest the plane can never produce, and the gate rejects 100% of profile
+    runs -- which is what took down both live runs before this was found.
+
+    The fixture pins `flash.__version__` to the fallback precisely so this test can fail: with the
+    worker reading it, `run_sft_profile` raises on the digest gate.
+    """
+    sft_profile, finalized = profile_worker
+    import flash
+
+    assert flash.__version__ != _PRODUCER_VERSION, "the fixture must not pin the installed version"
+
+    sft_profile.run_sft_profile()
+
+    metrics, _kwargs = finalized[0]
+    assert metrics.workload_profile["producer_version"] == _PRODUCER_VERSION
 
 
 def test_profile_measurement_is_reproducible_across_two_runs(profile_worker) -> None:

@@ -925,9 +925,12 @@ def run_sft_train(spec=None) -> None:
     os.makedirs(local_dir, exist_ok=True)
 
     with liveness_heartbeat("sft_data_loading"):
-        from flash import __version__
         from flash.workload_profile import require_matching_sft_profile
 
+        # carried on the spec, not read from `flash.__version__` here: the worker runs the plane's
+        # source snapshot off PYTHONPATH with no flash distribution installed, so a locally derived
+        # version is the "0+unknown" fallback and would reject every profile the plane ever froze.
+        producer_version = spec.workload_profile_producer_version
         prepared_workload = prepare_sft_workload(
             spec,
             env,
@@ -935,14 +938,14 @@ def run_sft_train(spec=None) -> None:
                 candidate,
                 revision=revision,
             ),
-            producer_version=__version__,
+            producer_version=producer_version,
             image_dir=image_dir,
             allow_packing=True,
         )
         expected_profile = require_matching_sft_profile(
             spec.workload_profile,
             input_digest=spec.workload_profile_input_digest,
-            producer_version=__version__,
+            producer_version=producer_version,
             tokenizer_revision=model_revision,
         )
         if prepared_workload.profile != expected_profile:
