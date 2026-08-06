@@ -60,6 +60,10 @@ _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
 # the wait for a machine to do it on, so its deadline runs from here rather than from submission --
 # see _canonical_run_deadline.
 _PROFILE_WALL_ARMED_AT_KEY = "profile_wall_armed_at"
+# the lowest attempt id belonging to THIS profile lifecycle. a relaunch reuses the run id and
+# carries the attempt counter, so without a floor `next_attempt - 1` still names the spent
+# lifecycle's attempt while the fresh one queues -- see _persist_profile_submission.
+_PROFILE_ATTEMPT_FLOOR_KEY = "profile_attempt_floor"
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
@@ -67,6 +71,7 @@ _PRIVATE_STATUS_KEYS = frozenset(
         _CLEANUP_REMOTES_KEY,
         _OPD_RETRY_CONTRACT_KEY,
         _PROFILE_WALL_ARMED_AT_KEY,
+        _PROFILE_ATTEMPT_FLOOR_KEY,
     }
 )
 _PRIVATE_VALUE_UNSET = object()
@@ -252,12 +257,26 @@ def profile_steps_run(status: RunStatus) -> int:
     the whole wall cap for work no gpu did, and because the id is derived from the workload rather
     than the account, that charge lands on whichever submitter won the claim.
 
-    The distinguishing signal is simply whether the worker ever spoke. Any heartbeat means a
-    machine was rented and the bounded wall is owed; none means nothing ran and nothing is owed.
+    The distinguishing signal is that a worker spoke, but on a RELAUNCH the stored word may not be
+    this lifecycle's: a profile's run id is derived from the workload, so a relaunch reuses it, and
+    ``record_heartbeat`` keeps whatever arrives under it for visibility while refusing to arm the
+    wall from a heartbeat whose provenance it rejected. Billing the stored stage there charges a
+    relaunch cancelled in the queue for a machine it never rented. So a relaunch -- and only a
+    relaunch, marked by the attempt floor its takeover records -- is billed on the arm, which is
+    written only for a heartbeat that passed ``_heartbeat_attempt_is_current``. A first lifecycle
+    has no earlier worker to be confused with and bills on the stored word as before.
     The charge is all-or-nothing rather than prorated because a profile is quoted as a wall cap,
     not a per-step price -- see ``charge_usd_for_spec``."""
     hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
-    return 1 if hb.get("stage") else 0
+    if not hb.get("stage"):
+        return 0
+    try:
+        raw = _load_status_json(status.run_id)
+    except (FileNotFoundError, ValueError):
+        return 1
+    if _PROFILE_ATTEMPT_FLOOR_KEY not in raw:
+        return 1
+    return 1 if _profile_wall_armed_at(raw) is not None else 0
 
 
 def _require_valid_deadline(value: object) -> float:
@@ -429,7 +448,14 @@ def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
     # the worker's first heartbeat can be read back in either order, and refusing to arm would hand
     # the run a budget measured from a moment before it started working.
     expected = next_attempt - 1 if next_attempt > 0 else 0
-    return _attempt_int(hb.get("attempt")) == expected
+    if _attempt_int(hb.get("attempt")) != expected:
+        return False
+    # ...and it must belong to THIS lifecycle. a relaunch reuses the run id and carries the counter,
+    # so until it reserves an attempt of its own, `expected` still names the SPENT lifecycle's --
+    # and a prior worker that outlived its record stamps exactly that, recently enough to pass every
+    # other check. the floor is that carried counter, so a heartbeat below it predates this run.
+    floor = _attempt_int(raw.get(_PROFILE_ATTEMPT_FLOOR_KEY))
+    return floor is None or expected >= floor
 
 
 def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
@@ -1627,7 +1653,15 @@ def _persist_profile_submission(status: RunStatus, save_kwargs: dict) -> RunStat
             # handle") -- sound only while an id never repeats. restarting at 0 hands the fresh run
             # the spent one's attempt-0 error file, and it dies job_failed seconds after launch,
             # deterministically, on hardware it never used.
-            save_kwargs["_next_attempt"] = _infer_next_attempt(raw_existing)
+            carried_attempt = _infer_next_attempt(raw_existing)
+            save_kwargs["_next_attempt"] = carried_attempt
+            # carrying the counter keeps the ids monotonic, but it also means that until THIS
+            # lifecycle reserves one, `next_attempt - 1` still names the SPENT lifecycle's attempt.
+            # a prior worker that outlived its record stamps exactly that id, and its heartbeats are
+            # genuinely recent, so the provenance check would accept one and arm this run's work
+            # budget while it is still queuing for a machine. record the carried counter as this
+            # lifecycle's floor: every attempt below it belongs to the run that already ended.
+            save_kwargs["_profile_attempt_floor"] = carried_attempt
             # the wall, by contrast, must NOT carry: an arm records that a worker spoke, and that
             # worker was the previous lifecycle's. inheriting it dates this run's budget to a
             # heartbeat predating its own submission -- and since _canonical_run_deadline rebuilds
@@ -2695,6 +2729,7 @@ def _save_status(
     _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
     _profile_wall_armed_at: float | object = _PRIVATE_VALUE_UNSET,
+    _profile_attempt_floor: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     with _status_guard(status.run_id):
         if _opd_retry_contract_version is not _PRIVATE_VALUE_UNSET:
@@ -2724,6 +2759,7 @@ def _save_status(
             _cleanup_remotes=_cleanup_remotes,
             _opd_retry_contract_version=_opd_retry_contract_version,
             _profile_wall_armed_at=_profile_wall_armed_at,
+            _profile_attempt_floor=_profile_attempt_floor,
         )
 
 
@@ -2735,6 +2771,7 @@ def _save_status_unlocked(
     _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
     _profile_wall_armed_at: float | object = _PRIVATE_VALUE_UNSET,
+    _profile_attempt_floor: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
     # write-then-rename so concurrent readers never see a half-written file.
@@ -2754,6 +2791,7 @@ def _save_status_unlocked(
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
         _PROFILE_WALL_ARMED_AT_KEY: _profile_wall_armed_at,
+        _PROFILE_ATTEMPT_FLOOR_KEY: _profile_attempt_floor,
     }
     data = _status_storage_dict(status)
     for key in _PRIVATE_STATUS_KEYS:

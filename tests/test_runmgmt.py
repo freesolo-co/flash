@@ -3021,6 +3021,108 @@ def _relaunch_profile(runner, spec, *, created_at):
     return status
 
 
+def _spend_one_lifecycle(runner, spec, *, created_at, attempts=1):
+    """A profile lifecycle that reserved `attempts` ids and then ended."""
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+    for expected in range(attempts):
+        assert runner._reserve_attempt(spec.run_id) == expected
+    runner._update(spec.run_id, "failed")
+
+
+def test_a_prior_lifecycles_live_worker_cannot_arm_the_relaunch(monkeypatch, tmp_path):
+    """A still-live worker from the spent lifecycle must not start the relaunch's work budget.
+
+    The timestamp test cannot catch this one: that worker outlived its record and its heartbeats
+    are genuinely recent, so they pass ``>= created_at``. Only attempt identity separates them --
+    and the relaunch CARRIES the counter (it must, or it inherits the spent lifecycle's
+    attempt-scoped error file), so ``next_attempt - 1`` still names the prior attempt until this
+    lifecycle reserves one of its own. Without the floor the prior worker armed the budget while
+    the relaunch was still queuing for a machine, billing it for hardware it never had.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    _spend_one_lifecycle(runner, spec, created_at=first_created)
+
+    second_created = first_created + 10_000.0
+    _relaunch_profile(runner, spec, created_at=second_created)
+
+    # the prior lifecycle's worker is still alive and still stamps ITS attempt (0).
+    monkeypatch.setattr(runner.time, "time", lambda: second_created + 6.0)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": second_created + 5.0}
+    )
+
+    raw = runner._load_status_json(spec.run_id)
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in raw
+    # unarmed, so the relaunch keeps its full queue allowance and untouched work budget.
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(
+        second_created
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+    # and this lifecycle's OWN worker still arms it: the floor rejects the past, not the present.
+    assert runner._reserve_attempt(spec.run_id) == 1
+    armed_at = second_created + 20.0
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 1, "ts": armed_at - 1.0}
+    )
+    assert runner._load_status_json(spec.run_id)[runner._PROFILE_WALL_ARMED_AT_KEY] == armed_at
+
+
+def test_a_cancelled_relaunch_is_not_billed_from_a_prior_lifecycles_heartbeat(
+    monkeypatch, tmp_path
+):
+    """Cancel bills the wall only when a worker of THIS lifecycle spoke.
+
+    ``record_heartbeat`` deliberately stores a leftover heartbeat for visibility while refusing to
+    arm from it, so ``last_heartbeat.stage`` alone reports "started" for a relaunch that never got
+    a machine -- and a profile is charged its whole bounded wall the moment it counts as started.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    _spend_one_lifecycle(runner, spec, created_at=first_created)
+
+    second_created = first_created + 10_000.0
+    _relaunch_profile(runner, spec, created_at=second_created)
+
+    monkeypatch.setattr(runner.time, "time", lambda: second_created + 6.0)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": second_created + 5.0}
+    )
+
+    status = runner.get_status(spec.run_id)
+    # the leftover is still visible -- that is intentional, and exactly why billing cannot read it.
+    assert (status.last_heartbeat or {}).get("stage") == "profile_start"
+    assert runner.profile_steps_run(status) == 0
+
+    # once this lifecycle's own worker speaks, the wall is owed again.
+    assert runner._reserve_attempt(spec.run_id) == 1
+    armed_at = second_created + 20.0
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 1, "ts": armed_at - 1.0}
+    )
+    assert runner.profile_steps_run(runner.get_status(spec.run_id)) == 1
+
+
 def test_profile_relaunch_does_not_reuse_the_spent_lifecycles_attempt_ids(monkeypatch, tmp_path):
     """Attempt identities stay globally monotonic across lifecycles of a reused run id.
 
