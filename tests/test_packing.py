@@ -12,6 +12,7 @@ import types
 
 import pytest
 
+from flash.engine.worker import packing
 from flash.engine.worker.packing import (
     completion_mask_from_ids,
     gdn_packing_available,
@@ -197,3 +198,51 @@ def test_pretokenize_drops_content_free_completion():
     kept2, _, dropped2 = _pretokenize_completion_only(texts, _FakeTok(eos="!"), max_length=100)
     assert dropped2 == 0
     assert [t["text"] for t in kept2] == ["AB", "ABx"]
+
+
+# ------------------------------------------------- raising probes vs the swallowing wrappers
+def _patch_cfg_raises(monkeypatch, exc):
+    transformers = pytest.importorskip("transformers")
+
+    def _boom(*_a, **_k):
+        raise exc
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", _boom)
+
+
+def test_swallowing_wrappers_keep_returning_false_on_probe_failure(monkeypatch):
+    """The runtime gates must keep their fail-closed-to-False contract.
+
+    sft_train/rl_train/opd_train only ever ask "may I pack"; answering False when the config cannot
+    be read is the safe answer there and must not become an exception.
+    """
+    _patch_cfg_raises(monkeypatch, OSError("hub read timed out"))
+    assert packing.model_is_gdn_hybrid("any/model") is False
+    assert packing.model_is_pure_attention("any/model") is False
+
+
+def test_raising_probes_propagate_so_a_digest_is_never_frozen_from_a_failure(monkeypatch):
+    """The profile path needs the opposite: a probe that could not answer must RAISE.
+
+    False-on-error is a wrong ANSWER, and a wrong answer frozen into a workload profile is compared
+    byte-for-byte against a later re-derivation that may have reached the config.
+    """
+    _patch_cfg_raises(monkeypatch, OSError("hub read timed out"))
+    with pytest.raises(OSError, match="hub read timed out"):
+        packing.probe_is_gdn_hybrid("any/model")
+    with pytest.raises(OSError, match="hub read timed out"):
+        packing.probe_is_pure_attention("any/model")
+
+
+def test_raising_and_swallowing_probes_agree_when_the_config_resolves(monkeypatch):
+    """Same answer on the happy path -- the wrapper only adds the except clause."""
+    _patch_cfg(
+        monkeypatch, types.SimpleNamespace(layer_types=["linear_attention", "full_attention"])
+    )
+    assert packing.probe_is_gdn_hybrid("any/gdn") is packing.model_is_gdn_hybrid("any/gdn") is True
+    _patch_cfg(monkeypatch, types.SimpleNamespace(layer_types=["full_attention"]))
+    assert (
+        packing.probe_is_pure_attention("any/dense")
+        is packing.model_is_pure_attention("any/dense")
+        is True
+    )

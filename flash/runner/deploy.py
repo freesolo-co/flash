@@ -168,6 +168,7 @@ def cancel_run(run_id: str) -> RunStatus:
         _report_status,
         _save_status_unlocked,
         _snapshot_cleanup_remotes,
+        _status_estimated_charge,
         _status_guard,
         _update,
         actual_steps_run,
@@ -571,11 +572,23 @@ def cancel_run(run_id: str) -> RunStatus:
                     if cancel_status.workload_profile_kind
                     else actual_steps_run(cancel_status)
                 )
-                estimated_charge = charge_usd_for_spec(
-                    effective_spec,
-                    steps=steps_billed,
-                    fallback=float("nan"),
-                )
+                if cancel_status.workload_profile_kind and steps_billed > 0:
+                    # a STARTED profile owes exactly the quote it was submitted under. re-deriving
+                    # it here would re-price against today's offline rate table, so a cancel could
+                    # bill a different number than the one the user was shown and than the same
+                    # profile would have billed on success. it never started -> steps_billed is 0
+                    # and the branch below correctly charges nothing.
+                    estimated_charge = _status_estimated_charge(
+                        cancel_status,
+                        effective_spec,
+                        fallback=float("nan"),
+                    )
+                else:
+                    estimated_charge = charge_usd_for_spec(
+                        effective_spec,
+                        steps=steps_billed,
+                        fallback=float("nan"),
+                    )
                 if math.isfinite(estimated_charge):
                     cancel_charge_usd = estimated_charge
                 else:

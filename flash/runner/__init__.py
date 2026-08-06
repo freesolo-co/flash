@@ -348,10 +348,15 @@ def _spec_with_remaining_wall(
         # an unarmed profile's remaining allowance still holds the queue budget, which exists to
         # outlast capacity waits -- not to be spent working. handing it to the worker would let a
         # profile that got capacity immediately run for the whole queue budget too, on a job billed
-        # for its wall alone (estimate_profile_cost prices wall x hourly). cap at the work budget;
-        # the queue allowance keeps protecting the WAIT because the run-global deadline still holds
-        # it, and once a heartbeat arms the run the two agree anyway.
-        remaining = min(remaining, float(_WORKLOAD_PROFILE_WALL_SECONDS))
+        # for its wall alone (estimate_profile_cost prices wall x hourly).
+        #
+        # grant the WORK budget flat rather than min(remaining, work): `remaining` is measured
+        # against a deadline that still contains the unspent queue allowance, so once the queue wait
+        # passes that allowance the min() starts truncating. at a 1900s wait the provider would get
+        # 500s while the plane grants a full 600s the moment a heartbeat arms -- the shorter number
+        # goes to the side actually doing the work, killing the profile mid-measurement on exactly
+        # the slow-capacity days the queue allowance exists to survive.
+        remaining = float(_WORKLOAD_PROFILE_WALL_SECONDS)
     if remaining <= 0:
         raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
     if require_provider_minimum and remaining < MIN_PROVIDER_WALL_SECONDS:
@@ -370,6 +375,33 @@ def _infer_next_attempt(raw: dict) -> int:
     if _attempt_int(stored) is None:
         raise RuntimeError("stored next attempt identity is invalid")
     return stored
+
+
+def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
+    """True when a heartbeat carries the attempt identity this run most recently reserved.
+
+    The plane-side half of ``_heartbeat_matches_attempt``. That one runs provider-side where the
+    launch timestamp is in hand; here the equivalent identity is the reserved attempt, which the
+    worker stamps on every heartbeat and ``_save_status`` already persists as ``next_attempt``
+    (the NEXT id to hand out, so the live attempt is one below it -- same arithmetic as
+    ``_latest_reserved_attempt``, computed from the caller's already-loaded record because this runs
+    inside the status guard and must not re-read it).
+    """
+    if not isinstance(hb, dict):
+        return False
+    try:
+        next_attempt = _attempt_int(_infer_next_attempt(raw))
+    except RuntimeError:
+        return False
+    if next_attempt is None:
+        return False
+    # `_reserve_attempt` runs before the provider launch (lifecycle.py), so a live worker's
+    # heartbeat always sits one below the stored counter. Zero means nothing has been reserved yet;
+    # accept attempt 0 there rather than rejecting, because the launch path writes the counter and
+    # the worker's first heartbeat can be read back in either order, and refusing to arm would hand
+    # the run a budget measured from a moment before it started working.
+    expected = next_attempt - 1 if next_attempt > 0 else 0
+    return _attempt_int(hb.get("attempt")) == expected
 
 
 def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
@@ -1911,6 +1943,11 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
                 and isinstance(hb_ts, (int, float))
                 and math.isfinite(float(hb_ts))
                 and float(hb_ts) >= _require_valid_deadline(status.created_at)
+                # ...and it must be THIS attempt. a timestamp test alone admits a still-live worker
+                # from a cancelled earlier lifecycle: it writes to the same workload-derived prefix
+                # and its heartbeats are genuinely recent, so they pass `>= created_at` and arm the
+                # replacement's work budget while it is still queuing for capacity.
+                and _heartbeat_attempt_is_current(hb, raw)
             )
             if fresh:
                 armed_at = time.time()
