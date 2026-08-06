@@ -175,6 +175,46 @@ def step_floor_seconds(gpu: str, completions: int) -> float:
     return max(0.0, floor + offset)
 
 
+# --- how much of the floor a second card actually removes ---------------------------------------
+# The floor is three phases and they do NOT respond to card count the same way. Measured
+# decomposition of verl's timing_s/* over the floor's own total (Qwen3.5-0.8B, RTX 4090, 8 steps):
+#
+#   phase             share    shards across cards?
+#   old_log_prob      79.9%    yes: a real forward pass, fsdp splits the batch
+#   update_weights    13.4%    no:  a weight COPY into each rank's vllm engine, every rank pays it
+#   save_checkpoint    6.7%    no:  disk i/o, written once no matter how wide the run
+#
+# Sharding the whole floor therefore credits a wide run with time it still pays. Left uncorrected it
+# under-quotes by ~+5% at 2 cards and ~+10% at 8 for grpo, and ~+12%/~+33% for opd, which carries a
+# much larger floor share (~94% of its gpu-bound half at 4B against ~88% for grpo).
+#
+# HOW MUCH OF THIS IS MEASURED: the composition is, on a single-card run. What is NOT measured is the
+# behaviour of each phase as cards are added -- no arm in the 56-arm fit varied card count. That the
+# two non-sharding phases stay flat is mechanical rather than fitted (a per-rank weight copy is per
+# rank by construction; one checkpoint is one checkpoint), and treating a measured decomposition as
+# the split is a far weaker assumption than the one it replaces, which was the flatly false "all of
+# it shards". It also errs in the conservative direction: quotes get longer, never shorter, so this
+# cannot make a wide combination win a ranking on scaling it does not deliver.
+#
+# save_checkpoint is disk i/o and a faster card does not speed it up either, so it arguably belongs
+# in the fixed half entirely. It is left in the gpu-bound half here because moving it would change
+# single-card latency-bound/compute-bound ranking, which is a separate decision from card-count
+# scaling. Superseded by matched multi-card arms whenever they exist.
+STEP_FLOOR_SHARDED_FRACTION = 0.799
+
+
+def _step_floor_seconds_for(config: RunConfig, gpu: str) -> float:
+    """Step-floor seconds ``config`` pays on ``gpu``; 0 for sft, which runs no rollout."""
+    n = config.normalized()
+    if n.is_opd:
+        completions, _seq_tokens = _opd_step_shape(n)
+    elif n.is_grpo:
+        completions = n.batch_size * n.group_size
+    else:
+        return 0.0
+    return step_floor_seconds(gpu, completions)
+
+
 # --- MoE (mixture-of-experts) per-step correction ----------------------------------------------
 # For an MoE model (active params << total, e.g. Qwen3.6-35B-A3B: ~3B active / 35B total) the wall
 # time per step is NOT the tiny active-param FLOPs the dense model predicts. Routing, all-expert
@@ -372,6 +412,24 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
     return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
 
 
+def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int) -> float:
+    """Wall seconds for one optimizer step on ``gpu_count`` cards of class ``gpu``.
+
+    The single source of the card-count math. ``step_seconds_split`` gives the single-card halves;
+    this is the only place that divides by :func:`multi_card_speedup`, because the gpu-bound half is
+    not uniformly shardable: it carries a step floor whose weight-copy and checkpoint phases every
+    rank pays in full (see STEP_FLOOR_SHARDED_FRACTION). Dividing the floor whole under-quotes any
+    run wider than one card.
+    """
+    gpu_bound, fixed = step_seconds_split(config, gpu)
+    speedup = multi_card_speedup(gpu_count, gpu)
+    floor_s = _step_floor_seconds_for(config, gpu)
+    # the floor is inside gpu_bound; split it so only the phases that actually shard get divided.
+    shardable = gpu_bound - floor_s * (1.0 - STEP_FLOOR_SHARDED_FRACTION)
+    unshardable = floor_s * (1.0 - STEP_FLOOR_SHARDED_FRACTION)
+    return shardable / speedup + unshardable + fixed
+
+
 def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     """(gpu-bound, gpu-independent) seconds for one optimizer step on ``gpu``.
 
@@ -421,7 +479,8 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         # checkpointing) but no OPD arm has confirmed the CONSTANTS transfer. The floor is a much
         # larger share of an opd step than a grpo one (~94% of the gpu-bound half at 4B vs ~88%),
         # so an error here is proportionally worse for opd. Treat opd quotes as carrying the floor's
-        # uncertainty un-measured until a matched opd campaign exists.
+        # uncertainty un-measured until a matched opd campaign exists. That larger share is also why
+        # opd feels the multi-card floor split hardest (see STEP_FLOOR_SHARDED_FRACTION).
         floor_s = step_floor_seconds(gpu, completions)
         # the teacher is a remote api: its latency is identical on every card, so it is the part of an
         # opd step that a faster or more numerous gpu cannot shorten.
@@ -446,14 +505,9 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     # gpu-bound, not fixed -- it is compute on this card, so a faster card shortens it, unlike
     # reward grading which is a wait on off-gpu python.
     #
-    # MULTI-CARD CAVEAT: being in the gpu-bound half means the whole floor is divided by
-    # multi_card_speedup(), and only ~80% of it should be. Within the floor, old_log_prob (79.9%)
-    # is a real forward pass that fsdp shards, but update_weights (13.4%) is a weight COPY into the
-    # vllm engine that every rank pays, and save_checkpoint (6.7%) is disk i/o. Sharding those two
-    # under-quotes a wide run: +5% at 2 cards, ~+10% at 8. Every arm the floor was fitted on is
-    # SINGLE-CARD, so splitting the floor into shardable and non-shardable parts would be a fit
-    # against no data. Tracked as a follow-up needing matched multi-card arms; the error is bounded
-    # and in the same direction the multi_card_speedup extrapolation already errs.
+    # Only ~80% of it SHARDS, though; sharded_step_seconds() re-splits it by card count using
+    # STEP_FLOOR_SHARDED_FRACTION. Anything dividing this half by multi_card_speedup() directly is
+    # wrong for grpo/opd -- call sharded_step_seconds() instead.
     floor_s = step_floor_seconds(gpu, completions)
     # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
     # changes. a grpo step dominated by it is latency-bound, not compute-bound.
@@ -577,8 +631,7 @@ def _offline_gpu_shape(
                 hourly = static_hourly_rate(gpu)
             else:
                 hourly = info.hourly_usd
-            gpu_bound, fixed = step_seconds_split(config, gpu)
-            step_seconds = gpu_bound / multi_card_speedup(count, gpu) + fixed
+            step_seconds = sharded_step_seconds(config, gpu, count)
             ranked.append(
                 (
                     hourly * count * step_seconds,
@@ -823,9 +876,8 @@ def estimate_cost(
         )
 
     setup = setup_seconds(config)
-    gpu_bound_s, fixed_s = step_seconds_split(config, gpu)
     speedup = multi_card_speedup(billed_gpu_count, gpu)
-    sps = gpu_bound_s / speedup + fixed_s
+    sps = sharded_step_seconds(config, gpu, billed_gpu_count)
     required_save_s = required_save_overhead_seconds(config)
     # A one-time kernel/graph compile is paid once on the first step (MoE-only; 0 for dense). It is
     # training GPU time, so it belongs in the (billed) train term, not setup. Required saves are also
