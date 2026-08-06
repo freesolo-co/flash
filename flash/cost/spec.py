@@ -5,13 +5,17 @@ runs from their persisted quote (``RunStatus.cost_usd``), not measured provider 
 
 from __future__ import annotations
 
+import time
+
 from flash.catalog import samples_on_policy
 from flash.cost.analytical import estimate_cost, estimate_profile_cost
 from flash.cost.types import CostEstimate, RunConfig
 from flash.engine.steps import on_policy_steps, resolve_update_horizon
 from flash.workload_profile import (
     WorkloadProfileMismatch,
+    require_matching_rollout_profile,
     require_matching_sft_profile,
+    rollout_profile_input_digest,
     sft_profile_input_digest,
 )
 
@@ -44,6 +48,45 @@ def _sft_profile(spec):
         producer_version=producer_version,
         tokenizer_revision=spec.model_revision,
     )
+
+
+def _rollout_profile(spec):
+    """The attached rollout profile when it describes THIS spec and is trustworthy, else None.
+
+    Fails OPEN, which is the opposite of ``_sft_profile`` and deliberate. An sft profile is a
+    census: it measures the exact rows training will consume, so a mismatch means the quote would
+    describe different work and refusing is correct. A rollout profile is a SAMPLE of a stochastic
+    process, and one cannot be taken for every model -- 3 of the 6 catalog models are too small for
+    any provider to host. Raising here would make those models unquotable to buy accuracy on the
+    others.
+
+    So a missing, stale, mismatched or thin profile silently returns the caller to the declared
+    cap, which is exactly today's pricing. The measured path is an improvement when available and
+    never a new way for a quote to fail.
+    """
+    raw = getattr(spec, "workload_profile", None)
+    if not raw:
+        return None
+    from flash import __version__
+
+    try:
+        input_digest = rollout_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version=__version__,
+        )
+        return require_matching_rollout_profile(
+            raw,
+            input_digest=input_digest,
+            producer_version=__version__,
+            tokenizer_revision=spec.model_revision,
+            now=time.time(),
+        )
+    except WorkloadProfileMismatch:
+        # the sft profile carried on the same field will not match a rollout digest, and neither
+        # will a profile taken at a different cap, temperature or environment revision. all of
+        # those mean "no measurement for this run", not "this run is unpriceable".
+        return None
 
 
 def _on_policy_example_count(spec) -> int:
@@ -156,6 +199,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         teacher_model = t.teacher_model or RECIPE.opd.teacher_model
         opd_multi_turn, opd_max_turns = configured_opd_turn_limit(spec.environment)
     profile = _sft_profile(spec) if spec.algorithm == "sft" else None
+    rollout = _rollout_profile(spec) if has_rollout else None
     return RunConfig(
         model_id=spec.model,
         method=spec.algorithm,
@@ -183,6 +227,15 @@ def runconfig_from_spec(spec) -> RunConfig:
         ),
         sft_packing_mode=profile.packing_mode if profile is not None else "",
         sft_packed_blocks=profile.packed_blocks if profile is not None else None,
+        measured_completion_tokens=(
+            rollout.completion_tokens_mean if rollout is not None else None
+        ),
+        measured_prompt_tokens=(rollout.prompt_tokens_mean if rollout is not None else None),
+        reward_seconds_per_completion=(
+            rollout.reward_seconds_per_completion
+            if rollout is not None and rollout.reward_samples > 0
+            else None
+        ),
     )
 
 

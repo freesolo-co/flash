@@ -373,6 +373,9 @@ def main():
                     "DONE present but metrics.json unreadable after retries "
                     f"(transient HF; {error_kind})"
                 )
+        # A profile run tokenizes or samples on cpu and never imports a model, so it exits BEFORE
+        # the kernel setup below: none of it would apply, and _ensure_fla_fastpath_on_hopper would
+        # pip-install into a process that is about to leave.
         if RUN_MODE == "profile":
             heartbeat("boot")
             handler()
