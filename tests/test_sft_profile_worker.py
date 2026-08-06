@@ -99,13 +99,24 @@ def _profile_spec() -> JobSpec:
 def profile_worker(monkeypatch):
     """The profile entrypoint with its worker-module boundary stubbed, nothing else.
 
-    Only the four things a worker cannot do inside a test are replaced: the job spec, the loaded
-    environment, the tokenizer, and the terminal upload. prepare_sft_workload runs for real, because
-    it is the measurement under test.
+    Only the things a worker cannot do inside a test are replaced: the job spec, the loaded
+    environment, the tokenizer, the architecture probe, and the terminal upload. prepare_sft_workload
+    runs for real, because it is the measurement under test.
+
+    The architecture probe is pinned rather than left live because it reads the model config off the
+    hub. Unpinned it makes the measurement depend on network reachability -- and since a probe that
+    cannot answer now fails the profile closed (it must not freeze a guessed label into a digest),
+    an offline run would fail these tests for a reason that has nothing to do with what they assert.
     """
     import flash.engine.worker as worker
+    from flash.engine import sft_workload
     from flash.engine.worker import sft_profile
 
+    monkeypatch.setattr(
+        sft_workload,
+        "probe_is_pure_attention",
+        lambda _model, revision="": True,
+    )
     monkeypatch.setattr(worker, "JOB_SPEC", _profile_spec(), raising=False)
     monkeypatch.setattr(worker, "require_active_env", lambda: _Environment(), raising=False)
     monkeypatch.setattr(

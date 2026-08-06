@@ -1040,6 +1040,14 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
         allow_packing=False,
         packing_support=lambda _model, _revision: ("unsupported", False),
     ).profile.to_dict()
+    # the fixture pins the architecture above, but the WORKER re-derives it through the live probes,
+    # which read the model config off the hub. pin them to the same answer so the parity check under
+    # test compares workloads rather than network reachability -- an unresolvable probe now fails
+    # closed instead of quietly labelling the model "unsupported".
+    from flash.engine import sft_workload as _sft_workload
+
+    monkeypatch.setattr(_sft_workload, "probe_is_pure_attention", lambda _m, revision="": False)
+    monkeypatch.setattr(_sft_workload, "probe_is_gdn_hybrid", lambda _m, revision="": False)
 
     class LoraConfig:
         r = 16
