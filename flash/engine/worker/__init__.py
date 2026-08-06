@@ -86,9 +86,7 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
-    disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
-    patch_grpo_mask_aware_lm_head,
 )
 from flash.engine.worker.opd import run_opd
 from flash.engine.worker.perf import (
@@ -115,7 +113,6 @@ from flash.engine.worker.perf import (
     grad_checkpointing_on,
     grpo_use_reentrant,
     is_cuda_oom,
-    liger_on,
     loraplus_optimizer_cls,
     optimal_attn_impl,
     setup_perf_backends,
@@ -371,6 +368,30 @@ def main():
                     "DONE present but metrics.json unreadable after retries "
                     f"(transient HF; {error_kind})"
                 )
+        # Four kernel setups, all running in THIS interpreter. verl trains in a child
+        # (FLASH_VERL_PYTHON), so what each one reaches was audited individually rather than
+        # assumed; the split is not uniform:
+        #
+        #   _force_fla_triton_gdn_on_sm100      -> ENV. Propagates: sft_train's _CHILD_ENV_PREFIXES
+        #                                          carries FLA_, and grpo passes os.environ wholesale.
+        #                                          It has to: FLA_TILELANG=0 is an sm100 correctness
+        #                                          floor, and the child is where the backward runs.
+        #   _ensure_fla_fastpath_on_hopper      -> pip install into sys.executable. Parent-only by
+        #                                          construction. The child gets its own pinned fla +
+        #                                          tilelang at image build (Dockerfile.worker's
+        #                                          verl-venv layer / backend_common.FLA_REQUIREMENT),
+        #                                          which is why that install is not optional.
+        #   _neutralize_tilelang_cudart_stub    -> repoints a symlink under the tilelang package
+        #                                          directory. Per-interpreter: it fixes whichever
+        #                                          site-packages this process imports, not the venv's.
+        #   _restrict_fla_gdn_autotune_on_blackwell -> in-process monkeypatch of an imported fla
+        #                                          module object. Cannot cross a process boundary at
+        #                                          all; a child would have to re-apply it itself.
+        #
+        # Only the first is an env var, so only the first can propagate. The other three are
+        # deliberately NOT forwarded: each mutates parent-process state that the child neither shares
+        # nor inherits, and pretending otherwise would be worse than the gap it papers over.
+        #
         # BEFORE any model import / fla dispatch: on sm100 the baked tilelang GDN backend
         # computes wrong gradients — opt out so fla uses its (correct-there) Triton path.
         _force_fla_triton_gdn_on_sm100()
@@ -512,7 +533,6 @@ __all__ = [
     "backend_seed",
     "build_grpo_prompt_dataset",
     # gpu/backend setup
-    "disable_liger_grpo_torch_compile",
     "error_artifact_name",
     "flush_optional_uploads",
     "free_gpu",
@@ -530,7 +550,6 @@ __all__ = [
     "hf_upload_file",
     "hf_upload_folder",
     "is_vl_checkpoint",
-    "liger_on",
     "load_mega_cache",
     "load_tokenizer",
     "lora_target_parameters",
@@ -541,7 +560,6 @@ __all__ = [
     "make_sft_heartbeat_callback",
     "model_revision_kwargs",
     "optimal_attn_impl",
-    "patch_grpo_mask_aware_lm_head",
     "prefetch_model",
     "prepare_fresh_lora_base",
     "prompt_opens_thinking",
