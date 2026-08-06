@@ -241,3 +241,69 @@ def test_score_single_turn_batch_isolates_a_preprocessing_failure(monkeypatch):
         [None],
         [{"success": 1.0, "total": 1.0}],
     ]
+
+
+def test_score_single_turn_batch_repairs_only_the_unusable_rows():
+    """A batch that RETURNED has already spent its env calls; only bad rows may be re-scored.
+
+    Re-running the whole batch to recover one malformed row double-charges a paid or
+    side-effecting grader for every completion that came back fine.
+    """
+
+    class _PartiallyBadBatchEnv:
+        def __init__(self):
+            self.scalar_calls = []
+
+        def scores_breakdown_many(self, items):
+            # row 1 is unusable (no parseable `total`); the neighbours are well-formed.
+            return [
+                {"success": 1.0, "total": 1.0},
+                {"success": 0.0, "total": "not-a-number"},
+                {"success": 1.0, "total": 3.0},
+            ]
+
+        def scores_breakdown(self, graded, ex, state):
+            self.scalar_calls.append(graded)
+            return {"success": 1.0, "total": 9.0}
+
+    env = _PartiallyBadBatchEnv()
+    results = rl_train.score_single_turn_batch(
+        env,
+        [("good-a", {}), ("bad", {}), ("good-b", {})],
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+    )
+
+    # only the malformed row is re-scored: the good rows keep their batch values.
+    assert env.scalar_calls == ["bad"]
+    assert [score for score, _ in results] == [1.0, 9.0, 3.0]
+
+
+def test_score_single_turn_batch_repairs_every_row_on_a_wrong_length_return():
+    """A wrong-length payload cannot be trusted to line up, so no row keeps its batch value."""
+
+    class _ShortBatchEnv:
+        def __init__(self):
+            self.scalar_calls = []
+
+        def scores_breakdown_many(self, items):
+            return [{"success": 1.0, "total": 1.0}]
+
+        def scores_breakdown(self, graded, ex, state):
+            self.scalar_calls.append(graded)
+            return {"success": 1.0, "total": 5.0}
+
+    env = _ShortBatchEnv()
+    results = rl_train.score_single_turn_batch(
+        env,
+        [("good-a", {}), ("good-b", {}), ("good-c", {})],
+        tok=None,
+        thinking=False,
+        prompt_opened_thinking=False,
+        think_penalty=0.0,
+    )
+
+    assert env.scalar_calls == ["good-a", "good-b", "good-c"]
+    assert [score for score, _ in results] == [5.0, 5.0, 5.0]
