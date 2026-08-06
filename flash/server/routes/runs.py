@@ -295,11 +295,14 @@ def create_run(
                     # charged nothing, so reporting it as launched would name a charge that was
                     # rolled back.
                     launched = True
-                if claimed or spent_at is not None:
-                    # launched here, or lost the takeover to a submitter who is launching it. either
-                    # way the id now belongs to a live attempt, and reporting the spent state the
-                    # loser happened to read would name a run that no longer exists under this id.
-                    state = "queued"
+                # launched here, lost the claim to a submitter who launched it, or lost a takeover
+                # to one who is relaunching it. in every case the id now belongs to a live attempt,
+                # so the state has to name that attempt: reporting the spent state a takeover loser
+                # read would name a run that no longer exists under this id, and leaving a plain
+                # claim loser on the synthetic "required" tells a user whose profile is queued and
+                # running that it has not started -- `required` is a marker this route invents, not
+                # a state any run is ever in.
+                state = "queued"
             raise HTTPException(
                 status_code=409,
                 detail={
