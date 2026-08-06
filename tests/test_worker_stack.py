@@ -1,4 +1,4 @@
-"""Worker stack selection + TRL config compat + LoRA exclusion unit tests (CPU-only)."""
+"""Worker stack selection + worker config compat + LoRA exclusion unit tests (CPU-only)."""
 
 from __future__ import annotations
 
@@ -1964,3 +1964,45 @@ def test_gpu_type_pin_still_rejects_underprovisioned_matching_card(monkeypatch):
 
     with pytest.raises(RetriableInfraError, match="does not match requested"):
         lifecycle.verify_gpu("H100", gpu_type="H100")
+
+
+def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
+    """No `except` may assign `gdn_hybrid`. A swallowed error must not answer the arch question.
+
+    THE regression for a real defect: opd computed `gdn_hybrid` in the SAME try block as its fp8-KV
+    `cuda.get_device_capability()` check, and that block's `except` set `gdn_hybrid = False`. The
+    capability call is evaluated FIRST, so any raise from it (no cuda, driver mismatch, a probe
+    failure with nothing to do with the checkpoint) skipped the classification entirely, reported a
+    genuine GDN hybrid as not-hybrid, skipped the boundary gate, and left `use_remove_padding` true
+    -- packing a GDN model with no boundary resets, exactly the contamination the gate prevents.
+
+    The hazard is specifically an `except` that SUPPLIES a value, because that is what converts an
+    unrelated failure into a confident wrong answer. A bare `try/finally` (grpo wraps its whole
+    training block in one) is fine: an exception propagates and the run dies rather than reaching the
+    packing decision with a fabricated `gdn_hybrid`. So this asserts on handler bodies, not on what
+    else shares the `try`.
+
+    `model_is_gdn_hybrid` already returns False on its own probe failure, so it needs no outer guard.
+    Asserted structurally, across all three algorithms, because the failure is invisible at runtime:
+    it fails toward "pack anyway", which logs nothing and moves no metric.
+    """
+    import ast
+    import inspect as _inspect
+
+    from flash.engine.worker import opd_train, rl_train, sft_train
+
+    for module in (sft_train, opd_train, rl_train):
+        tree = ast.parse(_inspect.getsource(module))
+        for handler in (n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)):
+            assigned = {
+                target.id
+                for node in ast.walk(handler)
+                if isinstance(node, ast.Assign)
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            }
+            assert "gdn_hybrid" not in assigned, (
+                f"{module.__name__}:{handler.lineno} an except handler assigns gdn_hybrid. a "
+                "failure anywhere in that try -- including probes unrelated to the checkpoint -- "
+                "would report a gdn hybrid as not-hybrid and pack it without boundary resets."
+            )

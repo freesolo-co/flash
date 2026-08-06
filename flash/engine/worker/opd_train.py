@@ -2444,19 +2444,23 @@ def run_opd_train(spec=None) -> None:
     # tensor and crashes on the hybrid cache under verl's sleep/wake, which opd leaves enabled.
     # the vram estimator applies an fp8 discount to opd above the non-fp8 card ceiling, so this must
     # stay in lockstep with it: bf16 here against an fp8-sized reservation OOMs at rollout init.
+    # the architecture question is asked on its OWN, not inside the cuda probe's try: it reads the
+    # checkpoint config and has nothing to do with device capability. sharing one try means a raise
+    # from get_device_capability() -- evaluated FIRST -- skips the classification entirely and reports
+    # a genuine gdn hybrid as not-hybrid, which then skips the boundary gate below and packs anyway.
+    # model_is_gdn_hybrid already returns False on its own probe failure, so it needs no guard here.
+    from flash.engine.worker.packing import model_is_gdn_hybrid
+
+    gdn_hybrid = model_is_gdn_hybrid(model_id, revision=model_revision)
     try:
         import torch as _torch_cc
-
-        from flash.engine.worker.packing import model_is_gdn_hybrid
 
         _cc_ok = bool(
             _torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9)
         )
-        gdn_hybrid = model_is_gdn_hybrid(model_id, revision=model_revision)
-        fp8_kv = _cc_ok and not gdn_hybrid
     except Exception:  # no cuda / probe failure -> conservative bf16 kv
-        gdn_hybrid = False
-        fp8_kv = False
+        _cc_ok = False
+    fp8_kv = _cc_ok and not gdn_hybrid
 
     # a gdn hybrid may only pack when the CHILD can honor seq_idx + cu_seqlens; the no-fla fallbacks
     # accept both and discard them, which silently bleeds state across packed example boundaries.
