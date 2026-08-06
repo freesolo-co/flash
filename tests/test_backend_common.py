@@ -610,7 +610,13 @@ def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
     # the gate returns model_type rather than a bool so the caller physically cannot render the shim
     # for a different architecture than the probe cleared. a second resolve at the call site would
     # make that agreement a convention; this makes it structural.
-    monkeypatch.setattr("flash.engine.worker.packing.gdn_model_type", lambda *a, **k: "qwen3_5_moe")
+    # patch the module object, not the dotted path: test_worker_stack pops `flash.engine.worker`
+    # from sys.modules, so by the time this runs the parent package can be a fresh module object
+    # with no `packing` attribute yet, and monkeypatch's dotted lookup fails on the PARENT rather
+    # than on anything this test cares about.
+    import flash.engine.worker.packing as _packing
+
+    monkeypatch.setattr(_packing, "gdn_model_type", lambda *a, **k: "qwen3_5_moe")
     monkeypatch.setattr(
         vc.subprocess,
         "run",
