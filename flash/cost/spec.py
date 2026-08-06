@@ -5,17 +5,19 @@ runs from their persisted quote (``RunStatus.cost_usd``), not measured provider 
 
 from __future__ import annotations
 
+import time
+
 from flash.catalog import samples_on_policy
-from flash.cost.analytical import estimate_cost
+from flash.cost.analytical import estimate_cost, estimate_profile_cost
 from flash.cost.types import CostEstimate, RunConfig
-from flash.engine.steps import on_policy_steps, resolve_update_horizon, sft_update_steps
-
-
-def _sft_epochs(spec) -> int:
-    from flash.engine.recipe import RECIPE
-
-    t = spec.train
-    return int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
+from flash.engine.steps import on_policy_steps, resolve_update_horizon
+from flash.workload_profile import (
+    WorkloadProfileMismatch,
+    require_matching_rollout_profile,
+    require_matching_sft_profile,
+    rollout_profile_input_digest,
+    sft_profile_input_digest,
+)
 
 
 def _on_policy_epochs(spec) -> int:
@@ -26,26 +28,63 @@ def _on_policy_epochs(spec) -> int:
     return int(t.epochs) if t.epochs is not None else default
 
 
-def _sft_seq_len(spec) -> int:
-    from flash.engine.recipe import RECIPE
+def _sft_profile(spec):
+    from flash import __version__
 
-    t = spec.train
-    return (
-        int(t.max_context_tokens)
-        if t.max_context_tokens is not None
-        else (RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
+    input_digest = sft_profile_input_digest(
+        spec,
+        tokenizer_revision=spec.model_revision,
+        producer_version=__version__,
+    )
+    if input_digest != spec.workload_profile_input_digest:
+        raise WorkloadProfileMismatch(
+            "sft workload profile input digest does not match the cost spec"
+        )
+    return require_matching_sft_profile(
+        spec.workload_profile,
+        input_digest=input_digest,
+        producer_version=__version__,
+        tokenizer_revision=spec.model_revision,
     )
 
 
-def _sft_example_count(spec) -> int:
-    t = spec.train
-    pinned_examples = int(t.max_examples) if t.max_examples else 0
-    if pinned_examples > 0:
-        return pinned_examples
-    raise ValueError(
-        "cannot estimate SFT cost without [train].max_examples; set it to the number "
-        "of rows to price (use the full dataset row count for an uncapped run)"
-    )
+def _rollout_profile(spec):
+    """The attached rollout profile when it describes THIS spec and is trustworthy, else None.
+
+    Fails OPEN, which is the opposite of ``_sft_profile`` and deliberate. An sft profile is a
+    census: it measures the exact rows training will consume, so a mismatch means the quote would
+    describe different work and refusing is correct. A rollout profile is a SAMPLE of a stochastic
+    process, and one cannot be taken for every model -- 3 of the 6 catalog models are too small for
+    any provider to host. Raising here would make those models unquotable to buy accuracy on the
+    others.
+
+    So a missing, stale, mismatched or thin profile silently returns the caller to the declared
+    cap, which is exactly today's pricing. The measured path is an improvement when available and
+    never a new way for a quote to fail.
+    """
+    raw = getattr(spec, "workload_profile", None)
+    if not raw:
+        return None
+    from flash import __version__
+
+    try:
+        input_digest = rollout_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version=__version__,
+        )
+        return require_matching_rollout_profile(
+            raw,
+            input_digest=input_digest,
+            producer_version=__version__,
+            tokenizer_revision=spec.model_revision,
+            now=time.time(),
+        )
+    except WorkloadProfileMismatch:
+        # the sft profile carried on the same field will not match a rollout digest, and neither
+        # will a profile taken at a different cap, temperature or environment revision. all of
+        # those mean "no measurement for this run", not "this run is unpriceable".
+        return None
 
 
 def _on_policy_example_count(spec) -> int:
@@ -85,33 +124,14 @@ def _on_policy_prompts_per_step(spec, examples: int) -> int:
     return min(requested, max(1, int(examples)))
 
 
-def _sft_realized_batch(spec) -> int:
-    from flash.catalog import resolve_vocab_size
-    from flash.engine.recipe import RECIPE
-    from flash.engine.vram import sft_chunked_nll_enabled, sft_realized_batch
-
-    t = spec.train
-    requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
-    sft_seq = _sft_seq_len(spec)
-    # mirror the worker's validated chunked-nll model set so pricing uses the same realized batch.
-    # every allowlisted model is a gdn hybrid; at packable context lengths the worker may force
-    # per-device=1, so price the requested batch rather than the larger chunked-nll rounded batch.
-    sft_fused = sft_chunked_nll_enabled(spec.model)
-    if sft_fused and sft_seq <= 16_384:
-        return requested_batch
-    return sft_realized_batch(
-        requested_batch,
-        seq_len=sft_seq,
-        vocab=resolve_vocab_size(spec.model, spec.model_revision),
-        fused=sft_fused,
-    )
-
-
 def spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 
-    SFT derives from examples and realized batch. GRPO/OPD derive passes over retained prompts.
-    For every algorithm, positive ``max_steps`` replaces the derived optimizer-update count.
+    sft reads the horizon its workload profile measured: the profile already resolved epochs,
+    retained rows, realized batch, and ``max_steps`` against the exact tokenized dataset, so
+    re-deriving it here from the config would reintroduce the guess the profile exists to replace.
+    grpo/opd still derive passes over retained prompts, and positive ``max_steps`` replaces that
+    derived count.
     """
     if spec.algorithm in ("grpo", "opd"):
         examples = _on_policy_example_count(spec)
@@ -121,15 +141,32 @@ def spec_steps(spec) -> int:
             prompts_per_step=_on_policy_prompts_per_step(spec, examples),
         )
         return resolve_update_horizon(derived, spec.train.max_steps)
-    # max_examples is a CAP; 0 (like None) means "no cap" (worker trains the full dataset), so
-    # don't let max_examples=0 price a single step.
-    examples = _sft_example_count(spec)
-    derived = sft_update_steps(
-        epochs=_sft_epochs(spec),
-        example_count=examples,
-        examples_per_update=_sft_realized_batch(spec),
+    return _sft_profile(spec).authoritative_steps
+
+
+def profile_runconfig_from_spec(spec) -> RunConfig:
+    """Map a workload-profile ``JobSpec`` to the ``RunConfig`` its bounded-wall quote reads.
+
+    Deliberately not the training shape: a profile job runs no optimizer steps and loads no weights,
+    so the only fields that survive are the ones a wall-cap charge needs (rate constraints and the
+    cap itself). ``steps=1`` satisfies ``RunConfig``'s positive-step invariant and is never priced.
+    """
+    if not spec.workload_profile_kind:
+        raise ValueError("profile_runconfig_from_spec requires a workload-profile spec")
+    g = spec.gpu
+    return RunConfig(
+        model_id=spec.model,
+        method=spec.algorithm,
+        steps=1,
+        thinking=spec.thinking,
+        provider=g.provider or "auto",
+        gpu_type=g.type,
+        model_revision=spec.model_revision,
+        disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
+        gpu_count=g.count,
+        max_wall_seconds=g.max_wall_seconds,
+        environment=spec.environment.id or None,
     )
-    return resolve_update_horizon(derived, spec.train.max_steps)
 
 
 def runconfig_from_spec(spec) -> RunConfig:
@@ -138,6 +175,11 @@ def runconfig_from_spec(spec) -> RunConfig:
     unconstrained runs retain cheapest-fit pricing; authored provider/exact-type constraints are
     preserved so the quote matches the allocatable hardware contract.
     """
+    if spec.workload_profile_kind:
+        raise ValueError(
+            "a workload-profile job cannot be priced as training; use estimate_for_spec, which "
+            "routes profile specs to their bounded-wall charge"
+        )
     t, g = spec.train, spec.gpu
     # Both grpo and opd sample on-policy student completions, so both carry the rollout
     # dimensions (completion length + group size) into the cost model.
@@ -154,13 +196,15 @@ def runconfig_from_spec(spec) -> RunConfig:
 
         teacher_model = t.teacher_model or RECIPE.opd.teacher_model
         opd_multi_turn, opd_max_turns = configured_opd_turn_limit(spec.environment)
+    profile = _sft_profile(spec) if spec.algorithm == "sft" else None
+    rollout = _rollout_profile(spec) if has_rollout else None
     return RunConfig(
         model_id=spec.model,
         method=spec.algorithm,
         steps=spec_steps(spec),
-        seq_len=t.max_context_tokens,
+        seq_len=profile.max_length if profile is not None else t.max_context_tokens,
         completion_len=t.max_completion_tokens if has_rollout else None,
-        batch_size=t.batch_size,
+        batch_size=profile.examples_per_update if profile is not None else t.batch_size,
         group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,
         thinking=spec.thinking,
@@ -175,9 +219,30 @@ def runconfig_from_spec(spec) -> RunConfig:
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
         save_at_steps=t.save_at_steps,
+        train_tokens=profile.authoritative_compute_tokens if profile is not None else None,
+        supervised_train_tokens=(
+            profile.authoritative_supervised_tokens if profile is not None else None
+        ),
+        sft_packing_mode=profile.packing_mode if profile is not None else "",
+        sft_packed_blocks=profile.packed_blocks if profile is not None else None,
+        measured_completion_tokens=(
+            rollout.completion_tokens_mean if rollout is not None else None
+        ),
+        measured_prompt_tokens=(rollout.prompt_tokens_mean if rollout is not None else None),
+        reward_seconds_per_completion=(
+            rollout.reward_seconds_per_completion
+            if rollout is not None and rollout.reward_samples > 0
+            else None
+        ),
     )
 
 
 def estimate_for_spec(spec, *, allocation=None) -> CostEstimate:
-    """Cost estimate for a parsed training spec, optionally pinned to the selected live candidate."""
+    """Cost estimate for a parsed spec, optionally pinned to the selected live candidate.
+
+    A workload-profile job is priced from its bounded wall cap rather than the workload it exists to
+    measure: routing it through the training estimator would require the very profile it produces.
+    """
+    if spec.workload_profile_kind:
+        return estimate_profile_cost(profile_runconfig_from_spec(spec), allocation=allocation)
     return estimate_cost(runconfig_from_spec(spec), allocation=allocation)

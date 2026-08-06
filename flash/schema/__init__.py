@@ -590,12 +590,12 @@ def spec_from_dict(
 
 
 def _validate_sft(spec: JobSpec) -> None:
-    """validate sft row-count and structured-output constraints."""
-    if int(spec.train.max_examples or 0) <= 0:
-        raise ConfigError(
-            "train.max_examples must be set to a positive row count for SFT "
-            "(use the full dataset row count for an uncapped run)"
-        )
+    """validate the sft structured-output constraint.
+
+    ``max_examples`` carries no row-count requirement: an sft quote is backed by a workload
+    profile that materializes and tokenizes the real dataset, so an omitted or zero cap means
+    "every row" and is measured rather than guessed.
+    """
     if spec.train.structured_outputs:
         # SFT never generates — a constraint here would silently do nothing; reject at parse time
         # like other no-op configs (see the opd kl_penalty_coef=0 guard).

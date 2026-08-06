@@ -513,7 +513,11 @@ def _train_body(input_data: dict) -> dict:
 
                 _require_deadline_allowance()
                 spec = json.loads(input_data["job_spec_json"])
-                phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
+                phase_ns = (
+                    "profile"
+                    if spec.get("workload_profile_kind")
+                    else ("rl" if spec.get("algorithm") == "grpo" else spec["algorithm"])
+                )
                 prefix = f"{phase_ns}/{spec['run_id']}"
                 # Keep the newest bytes only; the uploaded tail's end is never truncated.
                 tail_bytes = 64_000

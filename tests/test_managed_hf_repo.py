@@ -13,6 +13,7 @@ import re
 import tempfile
 
 from flash.spec import JobSpec
+from tests._helpers.profile import satisfy_sft_profile
 
 
 def _spec(**train) -> JobSpec:
@@ -35,6 +36,9 @@ def _submit_worker_spec(monkeypatch, spec: JobSpec) -> tuple[str, dict]:
 
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        # sft submission is profile-gated; the repo assignment under test is not, so seed the
+        # profile rather than exercising the hub round-trips a real submit performs.
+        satisfy_sft_profile(runner, monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         return status.run_id, status.effective_preparation["worker_spec"]
 
