@@ -2779,6 +2779,9 @@ def test_profile_attempt_allowance_never_exceeds_the_work_budget(monkeypatch, tm
         spec, require_provider_minimum=True, now=created_at + 1.0
     )
     assert attempt_spec.gpu.max_wall_seconds <= runner._WORKLOAD_PROFILE_WALL_SECONDS
+
+
+def test_first_profile_heartbeat_arms_the_work_budget(monkeypatch, tmp_path):
     """The wall starts when the worker first speaks, and the tamper guard accepts that pair."""
     import flash.runner as runner
 
@@ -2859,6 +2862,141 @@ def test_a_previous_lifecycles_heartbeat_cannot_arm_the_profile_wall(monkeypatch
         + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
         + runner._WORKLOAD_PROFILE_WALL_SECONDS
     )
+
+
+def _profile_save_kwargs(runner, status, spec):
+    """The private keys submit_job hands _persist_profile_submission for a profile."""
+    return {
+        "_run_deadline_at": (
+            status.created_at
+            + float(spec.gpu.max_wall_seconds)
+            + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        ),
+        "_next_attempt": 0,
+    }
+
+
+def _relaunch_profile(runner, spec, *, created_at):
+    """Submit a fresh lifecycle under an id whose previous run is spent."""
+    status = runner.RunStatus(
+        run_id=spec.run_id,
+        state="queued",
+        spec=spec.to_dict(),
+        created_at=created_at,
+        effective_preparation={"worker_spec": spec.to_internal_dict()},
+    )
+    joined = runner._persist_profile_submission(status, _profile_save_kwargs(runner, status, spec))
+    assert joined is None  # a spent record is replaced, not joined
+    return status
+
+
+def test_profile_relaunch_does_not_reuse_the_spent_lifecycles_attempt_ids(monkeypatch, tmp_path):
+    """Attempt identities stay globally monotonic across lifecycles of a reused run id.
+
+    The regression: the relaunch reset next_attempt to 0, so the fresh run reserved attempt 0 and
+    inherited the spent lifecycle's error_profile_attempt0.txt at the shared HF prefix.
+    _instance_poll reads a present attempt-scoped error file as this handle's own crash, so the
+    relaunch died job_failed within seconds of launch without profiling anything.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="failed",
+            spec=spec.to_dict(),
+            created_at=first_created,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+    # the spent lifecycle burned three attempts, so error_profile_attempt0..2.txt exist on HF.
+    for expected in range(3):
+        assert runner._reserve_attempt(spec.run_id) == expected
+
+    _relaunch_profile(runner, spec, created_at=first_created + 10_000.0)
+
+    # the relaunch's FIRST attempt must not collide with any file the spent one left behind.
+    assert runner._reserve_attempt(spec.run_id) == 3
+
+
+def test_profile_relaunch_clears_the_spent_lifecycles_armed_wall(monkeypatch, tmp_path):
+    """A new lifecycle starts unarmed, or its own deadline reads as tampered.
+
+    The arm records that a worker spoke, and on a reused id the stored one belongs to the previous
+    lifecycle. Carrying it forward dates the fresh run's budget to a heartbeat from before it was
+    created, and because _canonical_run_deadline rebuilds the deadline from that basis, the stored
+    pair stops matching: _load_run_deadline_at raises and the id is wedged for every submitter.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=first_created,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+    armed_at = first_created + 100.0
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": armed_at})
+    assert runner._load_status_json(spec.run_id)[runner._PROFILE_WALL_ARMED_AT_KEY] == armed_at
+    runner._update(spec.run_id, "failed")
+
+    second_created = first_created + 10_000.0
+    _relaunch_profile(runner, spec, created_at=second_created)
+
+    raw = runner._load_status_json(spec.run_id)
+    assert runner._PROFILE_WALL_ARMED_AT_KEY not in raw
+    # and the deadline still loads: unarmed, from THIS lifecycle's submission plus the queue
+    # allowance. before the fix this raised "does not match canonical submission deadline".
+    assert runner._load_run_deadline_at(spec.run_id) == pytest.approx(
+        second_created
+        + runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+    )
+
+
+def test_profile_submission_joins_a_live_run_under_the_same_id(monkeypatch, tmp_path):
+    """A live profile is joined, never overwritten -- the reuse the deterministic id exists for."""
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    first_created = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            created_at=first_created,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    status = runner.RunStatus(
+        run_id=spec.run_id,
+        state="queued",
+        spec=spec.to_dict(),
+        created_at=first_created + 50.0,
+        effective_preparation={"worker_spec": spec.to_internal_dict()},
+    )
+    joined = runner._persist_profile_submission(status, _profile_save_kwargs(runner, status, spec))
+
+    assert joined is not None
+    assert joined.state == "running"
+    # the live record is untouched: a second billed copy of identical work never starts.
+    assert runner._load_status_json(spec.run_id)["created_at"] == pytest.approx(first_created)
 
 
 def test_training_run_deadline_still_runs_from_submission(monkeypatch, tmp_path):
