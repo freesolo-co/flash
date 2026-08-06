@@ -2781,6 +2781,41 @@ def test_profile_attempt_allowance_never_exceeds_the_work_budget(monkeypatch, tm
     assert attempt_spec.gpu.max_wall_seconds <= runner._WORKLOAD_PROFILE_WALL_SECONDS
 
 
+def test_exhausted_profile_cannot_provision_on_its_flat_work_grant(monkeypatch, tmp_path):
+    """The exhaustion check reads the real remaining allowance, not the grant that replaces it.
+
+    A profile's wall is granted flat rather than derived from what is left, so judging exhaustion
+    after that assignment would make the check unreachable for profiles: a run past its own
+    deadline would still provision, and the first heartbeat would arm a fresh work window from
+    that moment, turning the bounded queue allowance into an unbounded one.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    deadline = runner._load_run_deadline_at(spec.run_id)
+    assert runner._remaining_run_wall_seconds(spec.run_id, now=deadline + 1.0) == 0.0
+    with pytest.raises(RuntimeError, match="run wall deadline exhausted"):
+        runner._spec_with_remaining_wall(spec, require_provider_minimum=True, now=deadline + 1.0)
+
+    # still provisions normally while allowance remains, with the flat work grant intact.
+    live = runner._spec_with_remaining_wall(
+        spec, require_provider_minimum=True, now=created_at + 1.0
+    )
+    assert live.gpu.max_wall_seconds == int(runner._WORKLOAD_PROFILE_WALL_SECONDS)
+
+
 def test_profile_worker_deadline_excludes_the_unspent_queue_allowance(monkeypatch, tmp_path):
     """The absolute deadline handed to the worker is bounded the same way its wall budget is.
 
