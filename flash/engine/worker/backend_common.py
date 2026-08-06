@@ -608,17 +608,18 @@ def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
     """whether this GPU must run the rollout eagerly instead of capturing cuda graphs.
 
     vllm 0.19.1 is pinned on BOTH the baked verl venv and the fallback interpreter, so its
-    graph-capture defects are the same ones the retired trl driver worked around: aot_compile on
-    Ampere sm86 and a triton slot-mapping illegal-memory-access during capture. That driver only
-    trusted graphs on the architectures it had validated -- ``{(8, 0), (9, 0)}`` plus Blackwell --
-    and forced eager everywhere else. Nothing about that is trl-specific: it is a property of the
-    vllm build and the card, and verl drives the same engine.
+    graph-capture defects are card properties, not trl-specific ones, and verl drives the same
+    engine. The retired trl driver handled that with an ALLOWLIST -- graphs only on ``{(8, 0),
+    (9, 0)}`` plus Blackwell, eager everywhere else -- which is the shape this function used to
+    inherit. An allowlist answers "has anyone run this?", not "does it break?", so it excluded cards
+    whose capture was never tested (see sm89 below). This function now excludes only what has been
+    measured to fail.
 
-    verl is strictly MORE aggressive than the default that crashed: ``rollout.enforce_eager``
-    defaults False (``workers/config/rollout.py:195``) and its async server hardcodes
-    ``cudagraph_mode=FULL_AND_PIECEWISE`` (``vllm_async_server.py:237-241``) where trl asked only for
-    ``FULL_DECODE_ONLY``. So an unvalidated card captures MORE graphs than the configuration already
-    known to fail on it.
+    Note that verl captures MORE aggressively than the configuration those defects were found in:
+    ``rollout.enforce_eager`` defaults False (``workers/config/rollout.py:195``) and its async server
+    hardcodes ``cudagraph_mode=FULL_AND_PIECEWISE`` (``vllm_async_server.py:237-241``) where trl
+    asked only for ``FULL_DECODE_ONLY``. That is why an arch that fails must be excluded outright
+    rather than tuned down.
 
     One knob is enough and cannot fight verl's: vllm 0.19.1 resolves ``enforce_eager`` LAST, forcing
     ``compilation_config.mode=NONE`` and ``cudagraph_mode=NONE`` regardless of what was requested
@@ -659,11 +660,10 @@ def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
     """
     if cc is None:
         return False
-    major, minor = cc
     # sm86 is the only measured graph-capture failure. everything else -- sm80/sm89/sm90 and
     # blackwell -- captures. an arch nobody has measured keeps verl's default rather than being
     # forced eager on the strength of one other Ampere minor version's defect.
-    if (major, minor) == (8, 6):
+    if cc == (8, 6):
         print(
             "[verl] sm86: enforce_eager=True for the rollout (vllm 0.19.1 graph capture degenerates "
             "on this arch: completions repeat to the token cap without emitting EOS)"
