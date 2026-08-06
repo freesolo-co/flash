@@ -1162,6 +1162,10 @@ def run_sft_train(spec=None) -> None:
         total_steps=update_horizon,
         reentrant_gradient_checkpointing=reentrant_gradient_checkpointing,
     )
+    # both shims, not either: this one patches DistributedSampler/StatefulDataLoader so the child's
+    # row order matches the profile's byte for byte, and the gdn one patches the model's text
+    # forward to reset linear-attention state at packed example boundaries. different objects,
+    # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
     shim_source += render_exact_sft_dataloader_shim()
     if gdn_reset_arch is not None:
         shim_source += render_gdn_varlen_shim(gdn_reset_arch)
