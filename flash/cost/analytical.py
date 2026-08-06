@@ -101,25 +101,69 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # worst 3.24x) loses the fixed overhead; completions x params (35/56) adds a parameter without
 # beating plain completions; scaling by the card's throughput predicts RTX 5090 pays 169.8s where
 # it measurably pays 44.2s, because update_weights is a weight COPY into the vllm engine
-# (bandwidth, pcie) and save_checkpoint is disk i/o -- neither tracks tflops. Matched measurements
-# agree the cards do not rank by FLOPs at this size: at 0.8B/gens=32 the RTX 5090 is the fastest
-# card measured (44.6s) against H100 72.7s and H200 152.7s.
+# (bandwidth, pcie) and save_checkpoint is disk i/o -- neither tracks tflops.
 #
 # This is an empirical aggregate and will drift as hardware, verl, or the engine change. The
 # principled fix is a per-step overhead term in the throughput model itself, since that is what the
 # bulk of this correction is really standing in for.
-STEP_FLOOR_BASE_SECONDS = 57.7
-STEP_FLOOR_SECONDS_PER_COMPLETION = 0.830
+STEP_FLOOR_BASE_SECONDS = 62.7
+STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
+
+# --- per-card offset ---------------------------------------------------------------------------
+# The intercept above is the pooled one; a card also has a measurable offset from it. On a matched
+# shape (0.8B, ascii-tree, 32 completions) 76% of the variance is BETWEEN cards and card means span
+# 3.48x, so the card signal is real and worth carrying.
+#
+# It is only an offset on the INTERCEPT: the slope stays shared. Per-card slopes were measured and
+# collapse (0/6 on gens=256), because 6 of 8 cards have fewer than 3 distinct completion counts, so
+# a two-parameter per-card fit is exactly determined with zero residual degrees of freedom -- it
+# reproduces its own training arms and predicts nothing.
+#
+# Each offset is SHRUNK toward zero by sample size, n/(n+2), and a card with fewer than
+# STEP_FLOOR_MIN_ARMS_FOR_OFFSET arms gets none at all. Validated by holding out every replicate of
+# a config together, so no sibling run of the held-out arm stays in training to leak its noise:
+#
+#   form                      in band   geo     worst
+#   pooled, no offsets        37/56     1.055   2.18x
+#   offsets, min 2 arms       41/56     1.045   2.11x
+#   offsets, min 3 arms       42/56     1.019   2.11x   <- shipped
+#   offsets, min 4 arms       41/56     1.003   2.18x
+#   offsets, min 10 arms      39/56     0.994   2.18x
+#
+# That leak is not hypothetical: under leave-one-ARM-out (siblings retained) the same offsets score
+# 48/56, so roughly two thirds of the apparent gain was replicate noise. Rerunning one identical
+# config on one card moves the step time up to 2.37x, which is the real noise floor here.
+#
+# A card with no entry falls back to exactly the pooled form, which is the correct behaviour for
+# every unmeasured and future card: leave-one-CARD-out scores 35/56 for offsets and pooled alike,
+# because a held-out card HAS no offset. These buy accuracy on cards already measured, nothing more.
+STEP_FLOOR_MIN_ARMS_FOR_OFFSET = 3
+STEP_FLOOR_CARD_OFFSET_SECONDS = {
+    "A100 PCIe": -12.6,  # n=6, completion counts 32/256
+    "B200": 42.5,  # n=4, 32/256 -- tied to H200, see below
+    "H100": -10.4,  # n=24, 16/32/256
+    "H200": 42.5,  # n=4, 32/256
+    "RTX 4090": 14.8,  # n=10, 16/32/64/96
+    "RTX 5090": -30.0,  # n=4, 32/96
+}
+# B200 and H200 share ONE offset (the slower of the two) so no member of a declared
+# throughput-equivalence class can ever be quoted faster than another. Flash models B200 at H200's
+# effective training throughput -- 550 of its 2250 peak TFLOPS -- because Flash's kernels are
+# portable rather than sm100-tuned, and at B200's higher $/hr it must never quote cheaper. The
+# campaign cannot overturn that: matched pairs give H200/B200 = 2.53x at 32 completions but 0.92x
+# at 256 (the ordering REVERSES), on n=2 replicates whose own spread is 1.29x. Tying them costs
+# nothing on honest validation (42/56 either way). Fitted independently they would invert it.
 
 
 def step_floor_seconds(gpu: str, completions: int) -> float:
     """Per-step seconds the FLOPs terms do not account for.
 
-    Takes ``gpu`` because the phases are real GPU work and a future FLOPs-based model will need it,
-    but does not use it: a per-card table was measured, does not beat this out of sample, and
-    inverts the required B200/H200 ranking (see above).
+    An unmeasured ``gpu`` gets the pooled floor, never a guess: the per-card offsets below are
+    measured corrections for cards the campaign covered, not a model of hardware.
     """
-    return STEP_FLOOR_BASE_SECONDS + STEP_FLOOR_SECONDS_PER_COMPLETION * max(0, completions)
+    offset = STEP_FLOOR_CARD_OFFSET_SECONDS.get(gpu, 0.0)
+    floor = STEP_FLOOR_BASE_SECONDS + STEP_FLOOR_SECONDS_PER_COMPLETION * max(0, completions)
+    return max(0.0, floor + offset)
 
 
 # --- MoE (mixture-of-experts) per-step correction ----------------------------------------------
