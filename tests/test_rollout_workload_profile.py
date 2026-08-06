@@ -61,6 +61,7 @@ class _Train:
     max_context_tokens = 2048
     group_size = 4
     teacher_model = ""
+    temperature = None
     # horizon fields exist on the real spec and must NOT reach the key
     epochs = 2
     max_steps = 40
@@ -231,6 +232,9 @@ def test_the_key_excludes_the_training_horizon():
         ("max_context_tokens", 4096),
         ("group_size", 8),
         ("teacher_model", "parasail-glm-52"),
+        # an unset temperature is not the same distribution as an explicitly chosen one, so
+        # both the None -> value transition and a value -> value change must rekey.
+        ("temperature", 0.7),
     ],
 )
 def test_generation_settings_change_the_key(attr, value):
@@ -262,6 +266,22 @@ def test_horizon_changes_do_not_change_the_key(horizon, value):
         _Changed(), tokenizer_revision="tok-rev", producer_version="1.0.87"
     )
     assert before == after
+
+
+def test_two_explicit_temperatures_do_not_share_a_profile():
+    """The None -> value case is covered above; this pins value -> value, which a naive
+    truthiness check on temperature would collapse into one key."""
+
+    def digest_at(temp):
+        class _At(_Spec):
+            train = type("T", (_Train,), {"temperature": temp})()
+
+        return rollout_profile_input_digest(
+            _At(), tokenizer_revision="tok-rev", producer_version="1.0.87"
+        )
+
+    assert digest_at(0.7) != digest_at(1.2)
+    assert digest_at(0.7) == digest_at(0.7)
 
 
 def test_run_id_requires_a_real_digest():

@@ -337,6 +337,13 @@ def rollout_profile_input_payload(
             "max_context_tokens": train.max_context_tokens,
             "group_size": train.group_size,
             "teacher_model": str(getattr(train, "teacher_model", "") or ""),
+            # temperature moves the length distribution this profile exists to measure, so a
+            # reading taken at one setting must never be reused for a run at another. None is
+            # keyed distinctly from any float: it means "whatever the backend defaults to",
+            # which is not knowably the same distribution as an explicit value.
+            "temperature": (
+                None if train.temperature is None else float(train.temperature)
+            ),
         },
     }
 
