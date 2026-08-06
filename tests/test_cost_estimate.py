@@ -560,10 +560,11 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
 def test_allocator_selected_gpu_count_renders_and_applies_speedup():
     from flash.providers.base import Candidate
 
-    # 100 steps, not 150: at 150 both shapes exceed the 24h wall cap and clamp to the SAME
-    # train_seconds, so the speedup assertion below fails on equality even though sharding is
-    # working. the run has to fit under the cap for its runtime to be observable at all.
-    config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, gpu_count=8)
+    # 50 steps, not 150: a long 4B grpo run exceeds the 24h wall cap, and a clamped run reports
+    # the cap's runtime on every shape, so the speedup assertion below would fail on equality even
+    # though sharding is working. the run has to fit under the cap for its runtime to be
+    # observable at all -- the guard on the next line keeps that true if step costs change again.
+    config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 50, gpu_count=8)
     one = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 1))
     two = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
     assert not any("wall cap" in note for note in one.notes)
