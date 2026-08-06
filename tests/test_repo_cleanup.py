@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from flash.runner import _DEFAULT_ARTIFACT_NAMESPACE
 from flash.server import repo_cleanup as rc
 
 # Real implementations captured before the offline conftest stub swaps in a no-op sweep.
@@ -21,7 +22,12 @@ _REAL_DEPLOYED = rc.deployed_prefixes
 _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
 _REAL_RUN_SCHEDULED_CLEANUP = rc.run_scheduled_cleanup
 
-NS = rc.artifact_namespace()
+# The DEFAULT managed namespace, not whatever the ambient env resolves to. This is read at IMPORT
+# time while `artifact_namespace()` reads FLASH_HF_NAMESPACE at CALL time, so deriving it from the
+# live env would bind it before the offline fixture scrubs that var -- every expectation built from
+# NS would then name a different namespace than the code under test. The `_frozen` fixture below
+# makes the two agree for real by forcing the env to this value for the duration of each test.
+NS = _DEFAULT_ARTIFACT_NAMESPACE
 NOW = 1_800_000_000.0
 DAY = 86400.0
 AGE_DAYS = rc.DELETE_AGE_SECONDS / DAY  # the fixed 7-day threshold, in days
@@ -39,6 +45,12 @@ def _managed(slug: str) -> str:
 
 @pytest.fixture(autouse=True)
 def _frozen(monkeypatch):
+    # Pin the namespace the code under test resolves to the same constant the expectations above
+    # were built from. `artifact_namespace()` reads FLASH_HF_NAMESPACE on every call, so without
+    # this an operator shell that exports it (per SELF_HOSTING.md) would make the sweep scan
+    # `<their-ns>/...` while every fixture repo id says `Freesolo-Co/...`, and the allowlist would
+    # match nothing -- failing locally while CI, whose env is clean, stayed green.
+    monkeypatch.setenv("FLASH_HF_NAMESPACE", NS)
     monkeypatch.setattr(rc, "_now", lambda: NOW)
     monkeypatch.setattr(rc, "_DELETE_SLEEP_S", 0)
     monkeypatch.setattr(rc, "run_scheduled_cleanup", _REAL_RUN_SCHEDULED_CLEANUP)
