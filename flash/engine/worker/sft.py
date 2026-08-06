@@ -128,10 +128,10 @@ def sft_completed_train_tokens(
 def sft_under_ran(final_step: int, update_horizon: int, max_steps: int) -> bool:
     """True when a max_steps-authoritative run completed fewer updates than requested.
 
-    with max_steps authoritative, trl's max_steps override lands a fresh run exactly on the horizon,
-    and a resume from a checkpoint past a lowered horizon does zero new steps yet holds a fully-trained
-    adapter (final_step >= horizon). fail loudly only on a genuine under-run, mirroring grpo
-    (steps_run < steps) and opd (opt_steps < steps).
+    with max_steps authoritative, the trainer's max_steps override lands a fresh run exactly on
+    the horizon, and a resume from a checkpoint past a lowered horizon does zero new steps yet
+    holds a fully-trained adapter (final_step >= horizon). fail loudly only on a genuine
+    under-run, mirroring grpo (steps_run < steps) and opd (opt_steps < steps).
     """
     return int(max_steps) > 0 and int(final_step) < int(update_horizon)
 

@@ -28,6 +28,7 @@ from flash.engine.worker.backend_common import (
     latest_global_step_dir,
     parse_verl_metric,
     parse_wandb_link,
+    render_gdn_varlen_shim,
     render_wandb_link_shim,
     resolve_checkpoint_actor_dir,
     resolve_verl_loggers,
@@ -35,9 +36,11 @@ from flash.engine.worker.backend_common import (
     run_verl_training,
     stage_verl_resume,
     stamp_adapter_dir_provenance,
+    verl_child_gdn_reset_arch,
     verl_step_number,
 )
 from flash.engine.worker.heartbeat import join_while_draining, liveness_heartbeat
+from flash.engine.worker.packing import model_is_gdn_hybrid
 from flash.engine.worker.rng import seed_training_rngs
 from flash.engine.worker.sft import _model_arch_dims, sft_under_ran
 
@@ -158,7 +161,11 @@ def build_sft_overrides(cfg: dict) -> list[str]:
             else []
         ),
         f"model.lora_adapter_path={_hydra_val(cfg.get('lora_adapter_path'))}",
-        "model.use_remove_padding=true",
+        # remove-padding concatenates the micro-batch into one (1, total_nnz) row -- real packing.
+        # a GDN hybrid may only take it when the child can reset linear-attention state at the
+        # example boundaries; otherwise state bleeds between packed examples and every example after
+        # the first trains on its neighbour's residue. see gdn_boundary_resets in the caller.
+        f"model.use_remove_padding={_hydra_val(cfg.get('use_remove_padding', True))}",
         # 32k contexts: the fused linear-CE forward never materializes the [tokens, vocab] logits
         # tensor (~130 GB at 32k on a 248k vocab), computing loss from hidden states + lm_head in
         # chunks instead. torch backend = numerically exact CE, no extra deps.
@@ -782,6 +789,12 @@ _CHILD_ENV_PREFIXES = (
     "MKL_",
     "OPENBLAS_",
     "LC_",
+    # the parent picks the gated-deltanet kernel backend before any model import (see
+    # perf._force_fla_triton_gdn_on_sm100), and on sm100 FLA_TILELANG=0 is a correctness floor, not
+    # a preference: tilelang's backward computed dq/dk at ~0.72 relative error there and training
+    # diverged to grad_norm ~1e8. the model runs in the CHILD, so a choice the child never sees is
+    # no choice at all -- grpo already passes the whole environment through and keeps it.
+    "FLA_",
 )
 
 
@@ -1070,6 +1083,33 @@ def run_sft_train(spec=None) -> None:
     os.makedirs(shim_dir, exist_ok=True)
     custom_dataset_path = os.path.join(shim_dir, "flash_verl_sft_dataset.py")
 
+    # remove-padding packs the micro-batch into one row, which is correct for softmax attention
+    # (transformers rebuilds its varlen boundaries from the restarting position ids) but NOT for a
+    # gated-deltanet hybrid: its conv and recurrent state only reset if the child can honor seq_idx
+    # and cu_seqlens, and the no-fla fallbacks accept both and discard them. so pack a gdn model
+    # only when the child proves it can reset, and otherwise fall back to verl's padded path, which
+    # carries a real attention_mask and is boundary-correct by construction.
+    gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
+    gdn_reset_arch = (
+        verl_child_gdn_reset_arch(python_bin, model_id, model_revision) if gdn_hybrid else None
+    )
+    gdn_boundary_resets = gdn_reset_arch is not None
+    # the PROFILE decides whether this run packs, and the child probe may only take that away.
+    # the profile was frozen before any worker existed and the step count the user was quoted was
+    # derived from it (examples_per_update is `effective_batch` when packed and 1 when not), so a
+    # worker that packs a run the profile priced as unpacked runs 1/batch of the quoted steps --
+    # and the parity gate above cannot catch it, because that gate compares two derivations of the
+    # PROFILE and never sees this decision. the probe stays because it can only fail closed: it
+    # withdraws packing the profile asked for when this specific child cannot honor the boundaries.
+    profile_packs = profile.packing_mode == "packed"
+    use_remove_padding = profile_packs and (not gdn_hybrid or gdn_boundary_resets)
+    if profile_packs and gdn_hybrid and not gdn_boundary_resets:
+        print(
+            "[sft] gdn hybrid without child-side boundary resets: disabling remove-padding so "
+            "packed examples cannot contaminate each other (slower, correct)",
+            flush=True,
+        )
+
     config = {
         "train_files": train_file,
         "val_files": val_file,
@@ -1108,6 +1148,7 @@ def run_sft_train(spec=None) -> None:
         "gradient_checkpointing": gradient_checkpointing and not reentrant_gradient_checkpointing,
         "total_training_steps": update_horizon if max_steps > 0 else None,
         "total_epochs": epochs if max_steps <= 0 else None,
+        "use_remove_padding": use_remove_padding,
     }
     overrides = build_sft_overrides(config)
 
@@ -1119,6 +1160,8 @@ def run_sft_train(spec=None) -> None:
         reentrant_gradient_checkpointing=reentrant_gradient_checkpointing,
     )
     shim_source += render_exact_sft_dataloader_shim()
+    if gdn_reset_arch is not None:
+        shim_source += render_gdn_varlen_shim(gdn_reset_arch)
     if "wandb" in loggers:
         shim_source += render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
@@ -1346,6 +1389,12 @@ def run_sft_train(spec=None) -> None:
             # example was allowed to share a concatenated batch, which is what a reader of these
             # metrics needs in order to compare a run's step count against its row count.
             "packing": profile.packing_mode,
+            # what the run ACTUALLY executed. this is the profile's mode narrowed by the child
+            # probe, so it can differ from `packing` above (packed -> none_padded) when a gdn
+            # child could not honor the boundaries; a reader comparing realized step time against
+            # the quote needs the executed mode, not the quoted one.
+            "realized_packing": "verl_remove_padding" if use_remove_padding else "none_padded",
+            "gdn_boundary_resets": gdn_boundary_resets if gdn_hybrid else None,
             "loss_curve": loss_curve[:400],
             "peak_gpu_gb": device_peak_gpu_gb,
             "device_peak_gpu_gb": device_peak_gpu_gb,
