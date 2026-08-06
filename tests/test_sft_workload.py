@@ -141,7 +141,9 @@ def test_exact_unpacked_mode_trains_one_example_per_update() -> None:
     assert prepared.profile.derived_steps == 4
     # the mode selects how examples are grouped into an update, not a different token layout: same
     # rows, same tokens, more updates. isolation here is bought by giving each example its own
-    # update instead of by boundary metadata, and that longer horizon is what the quote must price.
+    # update rather than by boundary metadata, because verl packs unconditionally and its fsdp
+    # engine never sends the gdn reset kwargs -- a batch of two would let the second example train
+    # on the first's carried state. that longer horizon is what the quote must price.
     assert prepared.rows == packed.rows
     assert prepared.profile.real_tokens_per_epoch == packed.profile.real_tokens_per_epoch
     assert prepared.profile.derived_steps > packed.profile.derived_steps
