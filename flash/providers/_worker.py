@@ -158,6 +158,12 @@ _REMOVED_OPTIMIZATION_ENV = frozenset(
         "FLASH_TRITON_LORA",
         "FLASH_WORKER_DEPS",
         "FLASH_WORKER_EXTRA_DEPS",
+        # chalk selected an install source for kernels that installed against an in-process
+        # trainer.model. verl runs the model in a child interpreter, so nothing could engage and the
+        # whole surface was deleted. the key is filtered rather than merely forgotten: an unfiltered
+        # key still reaches the worker, where it now configures nothing, and a run that sets it would
+        # otherwise get silence instead of the warning that says it stopped mattering.
+        "FLASH_CHALK_SPEC",
     }
 )
 

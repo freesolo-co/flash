@@ -322,6 +322,37 @@ def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
     assert env["MY_ENV_FLAG"] == "keep-me"
 
 
+def test_build_worker_env_strips_the_deleted_chalk_spec_override(monkeypatch, caplog):
+    """FLASH_CHALK_SPEC selected a chalk install source. Chalk installed against an in-process
+    trainer.model, which the verl child does not have, so the surface was deleted — and a deleted
+    key must be FILTERED, not merely unimplemented. Left unfiltered it still reaches the worker and
+    configures nothing, so a run that sets it gets silence rather than a warning that it stopped
+    mattering. Asserts through build_worker_env (not set membership) so the filter loop must
+    actually run, and asserts the operator-visible warning names the key."""
+    import logging
+
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.delenv("FLASH_CHALK_SPEC", raising=False)
+    spec = _spec_worker_env(
+        {
+            "FLASH_CHALK_SPEC": "freesolo-chalk==0.5.7",
+            # lower-cased too: the filter upper-cases before matching.
+            "flash_chalk_spec": "git+https://github.com/freesolo-co/chalk@main",
+            "MY_ENV_FLAG": "keep-me",
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        env = build_worker_env(spec, 0)
+    assert "FLASH_CHALK_SPEC" not in env
+    assert "flash_chalk_spec" not in env
+    # getMessage() renders lazy %-args; r.message alone is the unformatted template.
+    assert any("FLASH_CHALK_SPEC" in r.getMessage() for r in caplog.records), (
+        "setting a deleted key must warn, otherwise it fails silently"
+    )
+    assert env["MY_ENV_FLAG"] == "keep-me"
+
+
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
