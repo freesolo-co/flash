@@ -1495,31 +1495,26 @@ def submit_job(
     owner_key_id: int | None = None,
     prepared_job: PreparedJob | None = None,
 ) -> RunStatus:
-    """Submit a prepared job, allocating resources only outside dry-run mode."""
+    """Submit a prepared job, allocating resources only outside dry-run mode.
+
+    A missing sft workload profile propagates as ``WorkloadProfilePending`` rather than being
+    launched from here. Launching a profile requires claiming its deterministic id FIRST
+    (``db.claim_profile_run`` / ``db.reclaim_spent_profile_run``), because the id is derived from
+    the workload rather than the account: without the claim two submitters of the same config both
+    launch, the work is profiled and billed twice, and the takeover that unwedges a spent profile
+    loses the ordering it compares against. That claim lives in the server db, which this module
+    deliberately does not depend on, so the caller that owns the key performs it -- see
+    ``flash/server/routes/runs.py``, which claims and only then submits.
+    """
     if prepared_job is not None:
         prepared = prepared_job
     else:
-        try:
-            prepared = prepare_job(
-                spec,
-                billing_context=billing_context,
-                platform_context=platform_context,
-                owner_key_id=owner_key_id,
-            )
-        except WorkloadProfilePending as exc:
-            pending = exc.prepared_job
-            if isinstance(pending, PreparedJob):
-                submit_job(
-                    pending.public_spec,
-                    background=True,
-                    runtime_secrets=runtime_secrets,
-                    billing_context=billing_context,
-                    platform_context=platform_context,
-                    owner_key_id=owner_key_id,
-                    prepared_job=pending,
-                )
-                raise WorkloadProfilePending(exc.profile_run_id, "queued") from exc
-            raise
+        prepared = prepare_job(
+            spec,
+            billing_context=billing_context,
+            platform_context=platform_context,
+            owner_key_id=owner_key_id,
+        )
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd

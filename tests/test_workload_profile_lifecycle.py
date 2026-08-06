@@ -191,6 +191,55 @@ def test_spent_profile_blocks_training_and_offers_a_replacement(
     assert excinfo.value.prepared_job.public_spec.run_id == profile_run_id
 
 
+def test_submit_propagates_a_profile_miss_instead_of_launching_it_unclaimed(
+    tmp_path, monkeypatch
+) -> None:
+    """``submit_job`` must not launch the profile itself. Only a claim holder may launch one.
+
+    The profile run id is derived from the workload, not the account, so two submitters of the same
+    config collide on it by design. ``db.claim_profile_run`` / ``db.reclaim_spent_profile_run``
+    settle which one launches, and the ordering they compare against requires the claim to be taken
+    BEFORE the run it authorizes is created. A launch from here would take no claim at all: the
+    same workload would be profiled and billed twice, and the takeover that unwedges a spent
+    profile would lose the ordering in both directions. The claim lives in the server db, which
+    this module deliberately does not import, so the miss propagates to the caller that owns the
+    key and that caller claims first.
+    """
+    runner = fresh_runner(tmp_path, monkeypatch)
+    spec = _spec()
+    monkeypatch.setattr(runner, "_profile_producer_version", lambda: "1.2.3")
+    monkeypatch.setattr(runner, "_resolve_model_revision", lambda s, **_kw: s)
+    monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda s, **_kw: s)
+
+    real_submit = runner.submit_job
+    launched: list[object] = []
+    depth = {"n": 0}
+
+    def recording_submit(submitted_spec, **kwargs):
+        # only the NESTED call is a runner-internal launch; the outer one is this test's own.
+        if depth["n"]:
+            launched.append(kwargs.get("prepared_job"))
+        depth["n"] += 1
+        try:
+            return real_submit(submitted_spec, **kwargs)
+        finally:
+            depth["n"] -= 1
+
+    monkeypatch.setattr(runner, "submit_job", recording_submit)
+
+    with pytest.raises(runner.WorkloadProfilePending) as raised:
+        recording_submit(spec, dry_run=True)
+
+    # the caller is handed the prepared profile job to launch itself, AFTER claiming the id.
+    assert isinstance(raised.value.prepared_job, runner.PreparedJob)
+    assert raised.value.prepared_job.public_spec.run_id == sft_profile_run_id(_input_digest(spec))
+    # and nothing was launched from inside the runner.
+    assert launched == []
+    # no profile run row was written either, so no unclaimed run exists for a later caller to join.
+    with pytest.raises(FileNotFoundError):
+        runner.get_status(raised.value.profile_run_id)
+
+
 def test_relaunching_a_spent_profile_replaces_it_but_a_live_one_is_joined(
     tmp_path, monkeypatch
 ) -> None:
