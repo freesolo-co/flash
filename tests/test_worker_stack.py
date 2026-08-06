@@ -2058,21 +2058,35 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
         )
 
 
-def test_the_child_probe_may_only_withdraw_packing_the_profile_priced():
-    """sft's `use_remove_padding` must be ANDed with the profile's packing mode.
+def test_remove_padding_is_the_tensor_layout_not_the_step_contract():
+    """sft's `use_remove_padding` must NOT be ANDed with the profile's packing mode.
 
-    THE regression for a defect introduced by merging the gdn boundary-reset gate into the exact
-    workload profile. The two decide packing from different information and are allowed to disagree:
+    An earlier revision of this file asserted the opposite, on the theory that
+    `use_remove_padding = not gdn_hybrid or gdn_boundary_resets` would "pack a run the user was
+    quoted as unpacked" and run `1/effective_batch` of the quoted steps. That premise is false, and
+    verl says so directly:
 
-      profile (no gpu, pre-launch) -- `_packing_mode` fails closed on architecture alone, so a gdn
-        hybrid is priced `exact-unpacked`, which sets `examples_per_update = 1`.
-      worker (child in hand)       -- probes the actual interpreter and packs the same gdn hybrid
-        whenever that child honors `seq_idx` + `cu_seq_lens_q`.
+      sft_trainer.py:240  `global_batch_size = config.data.train_batch_size`
+      sft_trainer.py:181  `total_training_steps = config.trainer.total_training_steps`
+      sft_trainer.py:344  `use_remove_padding` appears ONLY as a logged field
 
-    So `use_remove_padding = not gdn_hybrid or gdn_boundary_resets` packs a run the user was quoted
-    as unpacked, and the run executes `1/effective_batch` of the quoted steps (8x at batch 8). The
-    profile parity gate cannot catch it: that gate compares two derivations of the PROFILE and
-    returns before this decision is made, so the divergence is silent in every artifact.
+    Examples-per-update and the step horizon come from config the worker copies straight off the
+    profile (`train_batch_size = profile.examples_per_update`, `total_training_steps =
+    profile.authoritative_steps`). `use_remove_padding` selects how that batch is laid out in
+    memory -- nested/concatenated vs padded -- and cannot change how many examples share an
+    optimizer step. With `examples_per_update = 1` there is nothing to co-locate either way.
+
+    Gating it on the profile is not merely redundant, it is a crash. verl leaves `pad_mode` at its
+    `no_padding` default, whose `sft_loss` reads `log_prob.values()` -- defined only on the nested
+    tensor the remove-padding branch builds (fsdp/transformer_impl.py:1178). The padded branch
+    (:1186) hands the loss a strided tensor and the first optimizer step dies with "values expected
+    sparse tensor layout but got Strided". Every gdn-hybrid catalog model profiles as
+    `exact-unpacked`, so the AND broke text sft on all of them while `dev` trained fine.
+
+    The boundary-contamination guard that motivated the original gate is still here and still
+    load-bearing: `not gdn_hybrid or gdn_boundary_resets` already refuses to pack a gdn hybrid whose
+    child cannot honor `seq_idx` + `cu_seq_lens_q`. `rl_train` and `opd_train` use this exact
+    derivation; sft was the outlier.
 
     Asserted on the source because reaching the real statement needs a live child probe and a
     checkpoint; the failure is a wrong boolean, not an exception, so nothing else would surface it.
@@ -2097,8 +2111,15 @@ def test_the_child_probe_may_only_withdraw_packing_the_profile_priced():
     names = {n.attr for n in ast.walk(assigns[0].value) if isinstance(n, ast.Attribute)} | {
         n.id for n in ast.walk(assigns[0].value) if isinstance(n, ast.Name)
     }
-    assert "packing_mode" in names or "profile_packs" in names, (
-        "use_remove_padding is computed without consulting the profile's packing mode, so the "
-        "child probe can pack a run the quote priced as one example per update. the probe must "
-        "only be able to WITHDRAW packing the profile asked for, never add it."
+    gate_msg = (
+        "use_remove_padding is gated on the profile's packing mode. that forces the padded verl "
+        "path for every gdn hybrid, and its no_padding sft_loss cannot read a strided tensor -- the "
+        "run dies on the first optimizer step. the step contract is already pinned by "
+        "profile.examples_per_update and profile.authoritative_steps; this flag is layout only."
+    )
+    assert "packing_mode" not in names, gate_msg
+    assert "profile_packs" not in names, gate_msg
+    assert {"gdn_hybrid", "gdn_boundary_resets"} <= names, (
+        "the gdn boundary-contamination guard is gone: a gdn hybrid whose child cannot honor "
+        f"seq_idx + cu_seq_lens_q must not pack. found {sorted(names)}"
     )

@@ -187,6 +187,38 @@ def test_verl_packs_every_batch_so_the_batch_size_is_the_isolation_boundary():
     assert overrides["data.train_batch_size"] == "1"
 
 
+def test_remove_padding_is_not_gated_on_the_profile_packing_mode():
+    """The profile's packing mode must not reach `use_remove_padding`.
+
+    verl leaves `data.pad_mode` at its `no_padding` default, and that loss path reads
+    ``log_prob.values()`` -- which only exists on the nested tensor the remove-padding branch
+    builds. Send `use_remove_padding=false` and the fsdp engine hands the loss a strided tensor
+    instead, so the first optimizer step dies with "values expected sparse tensor layout but got
+    Strided" before a single update lands.
+
+    A previous revision ANDed `packing_mode == "packed"` into this flag, reasoning that the child
+    probe may only narrow what the profile priced. That holds for the QUOTE, but narrowing this
+    flag also selects a verl code path the loss cannot consume -- and every gdn-hybrid catalog
+    model profiles as `exact-unpacked`, so it broke text sft on all of them while `dev` worked.
+
+    Read the source rather than the rendered overrides: `build_sft_overrides` takes the flag
+    already computed, so a test driving it through a cfg dict asserts on its own fixture and stays
+    green no matter what the derivation does.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train
+
+    src = inspect.getsource(sft_train.run_sft_train)
+    line = next(
+        ln.strip() for ln in src.splitlines() if ln.strip().startswith("use_remove_padding =")
+    )
+
+    assert line == "use_remove_padding = not gdn_hybrid or gdn_boundary_resets", line
+    assert "packing_mode" not in line
+    assert "profile" not in line
+
+
 def test_optimizer_eps_merges_into_override_config():
     overrides = _as_map(build_sft_overrides(_cfg(optimizer_kwargs={"amsgrad": True}, eps=1e-6)))
     assert overrides["optim.override_optimizer_config"] == "{amsgrad:true,eps:0.000001}"
