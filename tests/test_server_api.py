@@ -1105,6 +1105,65 @@ def test_sft_profile_miss_starts_a_separate_profile_run(api, monkeypatch):
     assert submitted[0][1]["prepared_job"].estimated_cost_usd == 0.25
 
 
+def test_the_route_never_makes_submit_job_launch_the_profile_itself(api, monkeypatch):
+    """The server must hand ``submit_job`` a prepared job, never let it re-prepare and self-launch.
+
+    ``submit_job`` has its own ``except WorkloadProfilePending`` branch that recursively launches the
+    profile. That branch bills a run WITHOUT ``claim_profile_run``, so nothing stops two submitters
+    of the same deterministic id from each paying for the same profile. The route is what prevents
+    it: it prepares, claims, and passes ``prepared_job``, which short-circuits ``submit_job`` before
+    the recursion is reachable.
+
+    That makes reachability the real invariant, and a grep proves it only for today. This drives the
+    actual route with the REAL ``submit_job`` and fails if a future refactor drops ``prepared_job``
+    from either call site -- the runner would then re-prepare, raise pending a second time, and take
+    the unclaimed path.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    profile_run_id = "profile-sft-" + "b" * 64
+    prepare_calls = []
+
+    def prepare(spec, **_kwargs):
+        prepare_calls.append(spec.run_id)
+        profile_spec = replace(
+            spec,
+            run_id=profile_run_id,
+            workload_profile_kind="sft",
+            workload_profile_input_digest="b" * 64,
+        )
+        raise runner.WorkloadProfilePending(
+            profile_run_id,
+            "required",
+            prepared_job=runner.PreparedJob(
+                public_spec=profile_spec,
+                worker_spec=profile_spec,
+                estimated_cost_usd=0.25,
+            ),
+        )
+
+    # only the PREPARE half is stubbed. submit_job stays real, so if the route stopped passing
+    # prepared_job this would re-enter prepare() and the count below would catch it. the route
+    # submits with background=True, so stubbing the thread body is what keeps this offline -- the
+    # whole of submit_job up to and including the profile branch still runs for real.
+    monkeypatch.setattr(app_mod, "prepare_job", prepare)
+    launched = []
+    monkeypatch.setattr(runner, "_run_job_background", lambda *a, **k: launched.append(a))
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 8}}},
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "workload_profile_pending"
+    # exactly once. a second entry means submit_job re-prepared, i.e. it took the recursive branch
+    # that skips the ownership claim.
+    assert len(prepare_calls) == 1
+
+
 def test_a_second_owner_needing_the_same_profile_is_not_blocked_by_the_first(api, monkeypatch):
     """The profile run id is deterministic in the workload, so two owners collide on it by design.
 
