@@ -260,47 +260,6 @@ def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
         assert "_force_console" not in src
 
 
-def _clear_chalk_flags(monkeypatch):
-    monkeypatch.delenv("FLASH_CHALK_SPEC", raising=False)
-
-
-def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
-    """chalk is always selected (fixed gap-fillers), so a set FLASH_CHALK_SPEC IS appended to
-    extra_pip (chalk installs + auto-applies)."""
-    from flash.providers.runpod.train import chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")
-    assert chalk_extra_pip() == ["freesolo-chalk"]
-
-
-def test_chalk_extra_pip_defaults_to_latest_main_without_spec(monkeypatch):
-    """With FLASH_CHALK_SPEC unset, flash auto-installs the pinned PUBLIC PyPI chalk version by
-    default. A public version pin (not a git+https SHA against the INTERNAL chalk repo) lets
-    tokenless bake/worker pods install it, while still pinning the exact kernel surface."""
-    from flash.providers._worker import DEFAULT_CHALK_VERSION
-    from flash.providers.runpod.train import (
-        DEFAULT_CHALK_SPEC,
-        chalk_extra_pip,
-    )
-
-    _clear_chalk_flags(monkeypatch)
-    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
-    # public PyPI pin so tokenless bake/worker pods can pip-install (chalk repo is internal)
-    assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk==")
-    assert f"freesolo-chalk=={DEFAULT_CHALK_VERSION}" == DEFAULT_CHALK_SPEC
-
-
-def test_chalk_extra_pip_adds_spec_when_set(monkeypatch):
-    """FLASH_CHALK_SPEC -> the chalk spec is appended to extra_pip, which the worker installs for
-    EVERY job (the durable baked-image path that bypasses resolve_worker_deps)."""
-    from flash.providers.runpod.train import chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_CHALK_SPEC", "git+https://github.com/freesolo-co/chalk@main")
-    assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
-
-
 def _spec_worker_env(worker_env: dict):
     """A grpo JobSpec carrying a per-run [worker_env] block (the TOML override map)."""
     from flash.spec import JobSpec, TrainSpec
@@ -312,19 +271,6 @@ def _spec_worker_env(worker_env: dict):
         seed=0,
         worker_env=dict(worker_env),
     )
-
-
-def test_chalk_extra_pip_per_run_worker_env_spec_override(monkeypatch):
-    """A per-run [worker_env] FLASH_CHALK_SPEC overrides the PyPI default install SOURCE for THAT
-    run — resolved against the effective worker env (worker_env merged over os.environ)."""
-    from flash.providers.runpod.train import DEFAULT_CHALK_SPEC, chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)  # nothing in os.environ
-    spec = _spec_worker_env({"FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main"})
-    # bare env: the version-pinned PyPI default installs
-    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
-    # the per-run [worker_env] spec overrides the source for that run
-    assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
 
 
 def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
@@ -374,6 +320,78 @@ def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
         assert stripped not in env, f"{stripped} should have been filtered from worker_env"
     # A non-removed per-run key is honored — the filter is targeted, not a blanket block.
     assert env["MY_ENV_FLAG"] == "keep-me"
+
+
+def test_build_worker_env_strips_the_deleted_chalk_spec_override(monkeypatch, caplog):
+    """FLASH_CHALK_SPEC selected a chalk install source. Chalk installed against an in-process
+    trainer.model, which the verl child does not have, so the surface was deleted — and a deleted
+    key must be FILTERED, not merely unimplemented. Left unfiltered it still reaches the worker and
+    configures nothing, so a run that sets it gets silence rather than a warning that it stopped
+    mattering. Asserts through build_worker_env (not set membership) so the filter loop must
+    actually run, and asserts the operator-visible warning names the key."""
+    import logging
+
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.delenv("FLASH_CHALK_SPEC", raising=False)
+    spec = _spec_worker_env(
+        {
+            "FLASH_CHALK_SPEC": "freesolo-chalk==0.5.7",
+            # lower-cased too: the filter upper-cases before matching.
+            "flash_chalk_spec": "git+https://github.com/freesolo-co/chalk@main",
+            "MY_ENV_FLAG": "keep-me",
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        env = build_worker_env(spec, 0)
+    assert "FLASH_CHALK_SPEC" not in env
+    assert "flash_chalk_spec" not in env
+    # getMessage() renders lazy %-args; r.message alone is the unformatted template.
+    assert any("FLASH_CHALK_SPEC" in r.getMessage() for r in caplog.records), (
+        "setting a deleted key must warn, otherwise it fails silently"
+    )
+    assert env["MY_ENV_FLAG"] == "keep-me"
+
+
+def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
+    """[environment].secrets is a second door into the worker env, and it must honor the same
+    removal filter as [worker_env].
+
+    the two filters answer different questions and are deliberately disjoint:
+    RESERVED_WORKER_ENV_KEYS is control-plane ownership (a caller may not override SEED), while
+    _REMOVED_OPTIMIZATION_ENV is deadness (the key configures nothing now). the runtime-secret merge
+    only consulted the ownership set, so declaring a removed key under [environment].secrets
+    delivered it to the worker with no warning -- exactly the silence the worker_env filter exists
+    to prevent."""
+    from flash.providers._worker import _REMOVED_OPTIMIZATION_ENV
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    # every removed key, not a chalk special case. FLASH_TRITON_LORA stands in for the rest.
+    declared = ["FLASH_CHALK_SPEC", "FLASH_TRITON_LORA", "MY_TOKEN"]
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+        environment=EnvironmentSpec(id="owner/env", secrets=declared),
+    )
+    supplied = {
+        "FLASH_CHALK_SPEC": "freesolo-chalk==0.5.7",
+        "FLASH_TRITON_LORA": "1",
+        "MY_TOKEN": "keep-me",
+    }
+    env = build_worker_env(spec, 0, runtime_secrets=supplied)
+
+    # assert on the values this call supplied, not on key presence: some removed names (e.g.
+    # PYTORCH_ALLOC_CONF) are legitimately set by flash itself downstream, so "key absent from env"
+    # would be asserting something the fix never promised.
+    for key in set(supplied) & _REMOVED_OPTIMIZATION_ENV:
+        assert env.get(key) != supplied[key], (
+            f"{key} reached the worker through [environment].secrets"
+        )
+    # a live secret still gets through: this blocks dead keys, not runtime secrets generally.
+    assert env["MY_TOKEN"] == "keep-me"
 
 
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
@@ -551,7 +569,7 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
                 "hf_repo": "owner/runs",
                 "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
                 "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+                "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
                 "code_prefix": "../code/flash",
                 **_run_deadline_fields(),
             }
@@ -595,7 +613,7 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
                     "hf_repo": "owner/runs",
                     "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
                     "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                    "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+                    "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
                     "code_prefix": "../code/flash",
                     **_run_deadline_fields(),
                 }
@@ -613,7 +631,7 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     The previous version of this test read run_sft's source. That body was trl's and is deleted:
     run_sft now delegates to run_sft_train. Rather than drop the coverage, assert against the module
-    that really runs. Three of the old assertions are intentionally NOT reproduced -- chalk kernel
+    that really runs. Three of the old assertions are intentionally NOT reproduced -- kernel
     installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
     properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
 

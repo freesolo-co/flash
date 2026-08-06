@@ -42,7 +42,7 @@ ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
 RUN mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor \
     /opt/flash/kernelcache/flashinfer_cubin /opt/flash/kernelcache/flashinfer
 
-# build-essential for Triton/Inductor/chalk + any source builds; git for pip VCS installs.
+# build-essential for Triton/Inductor + any source builds; git for pip VCS installs.
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -154,7 +154,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # tenant. the redirect cannot be a static image environment variable: the volume mounts at a fixed
 # path only at runtime and only when attached, so a baked redirect would break cache-less cold runs.
 #
-# Compiled-kernel cache: OPT-IN bake, JIT fallback. The fused Triton (fla/chalk),
+# Compiled-kernel cache: OPT-IN bake, JIT fallback. The fused Triton (fla),
 # TorchInductor, and Hopper tilelang kernels the trainer builds on first use are content-addressed
 # by GPU ARCH + toolchain version, so they can only be compiled on a real GPU of each catalog arch
 # (8.0/8.6/8.9/9.0/12.0) — which the CI image builder normally lacks (the FA2 *source* path above

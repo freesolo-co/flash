@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from flash.providers._worker import (  # noqa: F401
-    DEFAULT_CHALK_SPEC,
     DEFAULT_EXECUTION_TIMEOUT_MS,
     WORKER_DEPS,
     WORKER_IMAGE,
     WORKER_SYSTEM_DEPS,
     _hf_call,
     build_worker_env,
-    chalk_extra_pip,
     logger,
     resolve_worker_deps,
     upload_code,
