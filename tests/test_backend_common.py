@@ -970,6 +970,57 @@ def test_causal_conv1d_install_is_best_effort_and_leaves_no_env_residue(monkeypa
     )
 
 
+class _Completed:
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+
+def _record_run_with_conv_exit(calls, conv_exit):
+    """``_record_run``, but the causal-conv1d install exits with ``conv_exit``."""
+    inner = _record_run(calls)
+
+    def fake_run(command, check, env=None):
+        inner(command, check, env)
+        if vc.CAUSAL_CONV1D_REQUIREMENT in command:
+            return _Completed(conv_exit)
+        return _Completed(0)
+
+    return fake_run
+
+
+def test_a_missed_conv_build_leaves_the_venv_unstamped_so_the_next_attempt_rebuilds(
+    monkeypatch, tmp_path
+):
+    """A best-effort install may fail; it may not be recorded as a complete provisioning.
+
+    grpo and opd pack, so ``require_gdn_boundary_resets`` raises for a gdn model whose child lacks
+    the kernel. the stamp is what makes a venv reusable, so stamping after a missed build hands
+    every later attempt on this pod the same unrunnable interpreter with no reinstall path.
+    """
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 1))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert not stamp.exists(), "a venv missing the conv kernel was stamped as fully provisioned"
+    # the build was still attempted, and still best-effort: provisioning did not raise
+    assert any(vc.CAUSAL_CONV1D_REQUIREMENT in command for command in calls)
+
+
+def test_a_successful_conv_build_still_stamps_the_venv(monkeypatch, tmp_path):
+    """The guard must key on the build outcome, not stop stamping altogether."""
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert stamp.read_text() == vc.VERL_VENV_STAMP
+
+
 def test_the_venv_stamp_covers_fla_so_a_prefla_venv_is_rebuilt(monkeypatch, tmp_path):
     # a workdir provisioned by a release that predates the fla install holds no fla. if the stamp
     # ignored fla, a retry would reuse that venv, skip provisioning, and train gdn models on the
