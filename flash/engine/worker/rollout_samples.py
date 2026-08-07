@@ -22,6 +22,22 @@ _SAMPLE_LIMIT = 3
 _SAMPLE_SCALARS = ("reward", "loss")
 
 
+def sampled_completion_scalar(sample: dict) -> tuple[str, float] | None:
+    """Read back the (key, finite value) of a sample's scalar, or ``None`` when it carries none.
+
+    The inverse of what ``select_rollout_samples`` writes, and keyed off the same
+    ``_SAMPLE_SCALARS``, so a reader can never go looking for a key the writer would not emit."""
+    for key in _SAMPLE_SCALARS:
+        if key not in sample:
+            continue
+        try:
+            value = float(sample.get(key))
+        except (TypeError, ValueError):
+            return None
+        return (key, value) if math.isfinite(value) else None
+    return None
+
+
 def _content_part_text(value: Any) -> str:
     if isinstance(value, str):
         return value
