@@ -67,6 +67,13 @@ def test_thinking_capability_values_are_valid():
 
 
 def test_serving_capacity_matches_validated_matrix():
+    # NB: `expected` is a literal in this file, so this asserts the catalog matches a SECOND COPY of
+    # the numbers, not that it matches the serving app. It fails only when someone edits the catalog
+    # and forgets the copy -- it cannot see freesolo `serving/src/model_config.py` drifting away,
+    # which is exactly what happened to the 4B/9B rank between 2026-07-22 and 2026-08-07. The
+    # cross-repo check belongs where both repos are checked out (freesolo-co/tests pins each as a
+    # submodule); flash CI has no freesolo tree to compare against. Keep this as the transcription
+    # guard it is and do not mistake it for a lockstep guarantee.
     expected = {
         "Qwen/Qwen3.5-0.8B": {
             "gpu": "L4",
@@ -86,19 +93,19 @@ def test_serving_capacity_matches_validated_matrix():
             "gpu": "L4",
             "serve_model_id": "Freesolo-Co/Qwen3.5-4B-FP8",
             "max_loras": 16,
-            "max_lora_rank": 64,
+            "max_lora_rank": 128,
             "max_model_len": 32768,
             "max_num_seqs": 8,
             "gpu_memory_utilization": 0.98,
         },
         "Qwen/Qwen3.5-9B": {
-            "gpu": "H100",
+            "gpu": "L40S",
             "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
             "max_loras": 16,
-            "max_lora_rank": 64,
+            "max_lora_rank": 128,
             "max_model_len": 32768,
             "max_num_seqs": 8,
-            "gpu_memory_utilization": 0.98,
+            "gpu_memory_utilization": 0.90,
         },
         "Qwen/Qwen3.6-27B": {
             "gpu": "H100",
@@ -107,7 +114,7 @@ def test_serving_capacity_matches_validated_matrix():
             "max_lora_rank": 64,
             "max_model_len": 32768,
             "max_num_seqs": 8,
-            "gpu_memory_utilization": 0.98,
+            "gpu_memory_utilization": 0.90,
         },
         "Qwen/Qwen3.6-35B-A3B": {
             "gpu": "H200",
@@ -131,7 +138,7 @@ def test_public_rows_include_serving_capacity():
     row = get_model("Qwen/Qwen3.5-4B").to_dict()
     assert row["serving"]["gpu"] == "L4"
     assert row["serving"]["max_loras"] == 16
-    assert row["serving"]["max_lora_rank"] == 64
+    assert row["serving"]["max_lora_rank"] == 128
     assert row["serving"]["serve_model_id"] == "Freesolo-Co/Qwen3.5-4B-FP8"
 
 
