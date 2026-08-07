@@ -918,9 +918,21 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "gdn boundary resets",
                 flush=True,
             )
-        if install_wandb:
-            # verl does not pull wandb; install it best-effort so logger setup can fall back to console.
-            subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
+    if install_wandb:
+        # verl does not pull wandb; install it best-effort so logger setup can fall back to console.
+        #
+        # OUTSIDE the rebuild branch, and it must stay there. wandb is not in the stamp -- the stamp
+        # identifies the verl a venv holds -- so a venv built by an earlier run that had no
+        # WANDB_API_KEY stamps as fully provisioned without it. a later run on the same pod with the
+        # same seed reuses that venv, and gating the install on a rebuild would skip it: the
+        # capability probe then reports wandb unavailable, resolve_verl_loggers falls back to
+        # console, and the requested W&B run is silently never created. a transient failure of this
+        # best-effort install had the same permanent effect, because the stamp is already written by
+        # then (codex[bot]). running it unconditionally re-attempts on the next run instead.
+        #
+        # cheap to repeat: `uv pip install` on an already-satisfied wandb is a no-op resolve, which
+        # is why this can be unconditional rather than gated on a second probe.
+        subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
     return py
 
 

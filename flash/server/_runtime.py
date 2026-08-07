@@ -496,6 +496,35 @@ def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
     return _latest_worker_artifact_name(repo, prefix, phase, "error")
 
 
+def _attempt_of(name: str) -> int | None:
+    """The attempt an artifact filename is scoped to, or None for a legacy unscoped name."""
+    import re
+
+    m = re.search(r"_attempt(\d+)\.txt$", name)
+    return int(m.group(1)) if m else None
+
+
+def _ray_log_name_for_attempt(phase: str, error_name: str) -> str | None:
+    """The ray session logs belonging to the SAME attempt as ``error_name``, if that is knowable.
+
+    Not "the newest raylogs". Ray logs are uploaded only when ray actually failed, so on a retried
+    run they can belong to an earlier attempt than the traceback: attempt 0 dies to a raylet, attempt
+    1 fails for an unrelated reason and uploads none, and resolving the two independently surfaces
+    attempt 0's raylet death beside attempt 1's traceback -- misattributing a non-ray failure to a
+    raylet that died an attempt ago (codex[bot]). Pinning to the traceback's attempt means the pair
+    always describes one attempt, and the fetch simply misses when this attempt produced no ray logs.
+
+    Returns None for a legacy unscoped traceback: there is no attempt to pin to, and guessing would
+    reintroduce exactly the mismatch this exists to prevent.
+
+    Built the same way ``ray_log_artifact_name`` builds it worker-side, so the two cannot drift.
+    """
+    attempt = _attempt_of(error_name)
+    if attempt is None:
+        return None
+    return f"raylogs_{phase}_attempt{attempt}.txt"
+
+
 def _worker_artifacts(spec) -> dict[str, str]:
     """The run's train-subprocess stdout + traceback, fetched from its HF artifact repo.
 
@@ -515,15 +544,18 @@ def _worker_artifacts(spec) -> dict[str, str]:
         return {}
     prefix = adapter_prefix(spec)
     out: dict[str, str] = {}
+    error_name = _latest_error_artifact_name(repo, prefix, spec.phase)
+    # ray's own session logs. the traceback beside them records only the downstream symptom of a
+    # raylet death ("Failed to register worker to Raylet: ... End of file"), so without this the
+    # collector that exists to disambiguate it uploads a diagnosis nothing ever reads back
+    # (VERL-115, codex[bot]). pinned to the TRACEBACK's attempt rather than resolved independently:
+    # they are uploaded only when ray failed, so the newest pair can straddle two attempts. absent
+    # for every non-ray failure, and the loop below skips it.
+    ray_name = _ray_log_name_for_attempt(spec.phase, error_name)
     for name in (
         _latest_worker_artifact_name(repo, prefix, spec.phase, "console"),
-        _latest_error_artifact_name(repo, prefix, spec.phase),
-        # ray's own session logs. the traceback beside them records only the downstream symptom of a
-        # raylet death ("Failed to register worker to Raylet: ... End of file"), so without this the
-        # collector that exists to disambiguate it uploads a diagnosis nothing ever reads back
-        # (VERL-115, codex[bot]). uploaded only when ray actually failed, so it is absent for every
-        # other failure and the loop below skips it.
-        _latest_worker_artifact_name(repo, prefix, spec.phase, "raylogs"),
+        error_name,
+        *([ray_name] if ray_name else []),
     ):
         try:
             path = hf_hub_download(
