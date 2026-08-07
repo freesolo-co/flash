@@ -938,9 +938,12 @@ def run_sft_train(spec=None) -> None:
     os.makedirs(local_dir, exist_ok=True)
 
     with liveness_heartbeat("sft_data_loading"):
-        from flash import __version__
         from flash.workload_profile import require_matching_sft_profile
 
+        # carried on the spec, not read from `flash.__version__` here: the worker runs the plane's
+        # source snapshot off PYTHONPATH with no flash distribution installed, so a locally derived
+        # version is the "0+unknown" fallback and would reject every profile the plane ever froze.
+        producer_version = spec.workload_profile_producer_version
         prepared_workload = prepare_sft_workload(
             spec,
             env,
@@ -948,14 +951,14 @@ def run_sft_train(spec=None) -> None:
                 candidate,
                 revision=revision,
             ),
-            producer_version=__version__,
+            producer_version=producer_version,
             image_dir=image_dir,
             allow_packing=True,
         )
         expected_profile = require_matching_sft_profile(
             spec.workload_profile,
             input_digest=spec.workload_profile_input_digest,
-            producer_version=__version__,
+            producer_version=producer_version,
             tokenizer_revision=model_revision,
         )
         if prepared_workload.profile != expected_profile:
@@ -1091,6 +1094,17 @@ def run_sft_train(spec=None) -> None:
         verl_child_gdn_reset_arch(python_bin, model_id, model_revision) if gdn_hybrid else None
     )
     gdn_boundary_resets = gdn_reset_arch is not None
+    # remove-padding is verl's TENSOR LAYOUT switch, not this run's packing/step contract, so the
+    # profile must not gate it. verl defaults to `pad_mode: no_padding`, whose sft_loss reads
+    # `log_prob.values()` -- valid only on the nested tensor built by the remove-padding path. the
+    # padded path hands it a strided tensor and the first optimizer step dies with "values expected
+    # sparse tensor layout but got Strided". an earlier revision ANDed in `packing_mode == "packed"`
+    # here, reasoning that the probe may only narrow what the profile priced; that is true of the
+    # QUOTE but narrowing this flag also selects a verl code path the loss cannot consume, and every
+    # gdn-hybrid catalog model profiles as exact-unpacked, so it broke text sft on all of them.
+    # the step contract is already pinned to the profile independently: train_batch_size is
+    # profile.examples_per_update and total_training_steps is profile.authoritative_steps, neither of
+    # which reads this flag -- so a layout choice here cannot move the quoted horizon.
     use_remove_padding = not gdn_hybrid or gdn_boundary_resets
     if gdn_hybrid and not gdn_boundary_resets:
         print(
@@ -1378,7 +1392,15 @@ def run_sft_train(spec=None) -> None:
             "runtime_max_length": realized_max_length,
             "per_device_train_batch_size": micro_batch,
             "gradient_accumulation_steps": math.ceil(train_batch_size / micro_batch),
-            "packing": "verl_remove_padding" if use_remove_padding else "none_padded",
+            # verl concatenates either way; the profile's mode records whether more than one
+            # example was allowed to share a concatenated batch, which is what a reader of these
+            # metrics needs in order to compare a run's step count against its row count.
+            "packing": profile.packing_mode,
+            # what the run ACTUALLY executed. this is the profile's mode narrowed by the child
+            # probe, so it can differ from `packing` above (packed -> none_padded) when a gdn
+            # child could not honor the boundaries; a reader comparing realized step time against
+            # the quote needs the executed mode, not the quoted one.
+            "realized_packing": "verl_remove_padding" if use_remove_padding else "none_padded",
             "gdn_boundary_resets": gdn_boundary_resets if gdn_hybrid else None,
             "loss_curve": loss_curve[:400],
             "peak_gpu_gb": device_peak_gpu_gb,

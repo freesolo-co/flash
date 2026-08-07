@@ -15,58 +15,79 @@ def _text_config(cfg):
     return getattr(cfg, "text_config", None) or cfg
 
 
+def _load_text_config(model_id: str, revision: str):
+    """The checkpoint's decoder config. Raises when the config cannot be resolved."""
+    from transformers import AutoConfig
+
+    from flash.engine.worker.hf import model_revision_kwargs
+
+    return _text_config(
+        AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            **model_revision_kwargs(revision),
+        )
+    )
+
+
+def probe_is_pure_attention(model_id: str, revision: str = "") -> bool:
+    """``model_is_pure_attention`` without the swallow: a failed probe RAISES.
+
+    Callers that freeze the answer into a digest must use this. Returning False for "the hub timed
+    out" is fine for a runtime gate that only has to avoid packing, but it is a wrong ANSWER, and a
+    wrong answer written into a profile is compared byte-for-byte against a later re-derivation
+    that may have gotten the config just fine.
+    """
+    cfg = _load_text_config(model_id, revision)
+    layer_types = getattr(cfg, "layer_types", None)
+    if layer_types:
+        return all(t == "full_attention" for t in layer_types)
+    for attr in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim"):
+        if getattr(cfg, attr, None):
+            return False
+    # Qwen2.5 has sliding_window but disables it via use_sliding_window=False -> still packs.
+    # Mistral-style has no use_sliding_window flag -> assume window is active.
+    sliding = getattr(cfg, "sliding_window", None)
+    return not (sliding and getattr(cfg, "use_sliding_window", True))
+
+
 def model_is_pure_attention(model_id: str, revision: str = "") -> bool:
-    """True when every decoder layer is full softmax attention (safe for 4D block-diagonal mask).
+    """True when every decoder layer is full softmax attention (safe to pack unconditionally).
+
     Returns False for GDN hybrids, sliding-window arches, and on any config error.
+
+    the profile needs this and the runtime gate does not: the runtime asks the narrower question
+    "is this a gdn hybrid whose child can reset boundaries", which it answers on the worker with the
+    checkpoint in hand. the profile runs BEFORE any worker exists and has to commit to a packing
+    mode for the quote, so it can only fail closed -- pack when the architecture is provably safe
+    for every backend, otherwise price the unpacked path.
     """
     try:
-        from transformers import AutoConfig
-
-        from flash.engine.worker.hf import model_revision_kwargs
-
-        cfg = _text_config(
-            AutoConfig.from_pretrained(
-                model_id,
-                trust_remote_code=True,
-                **model_revision_kwargs(revision),
-            )
-        )
-        layer_types = getattr(cfg, "layer_types", None)
-        if layer_types:
-            return all(t == "full_attention" for t in layer_types)
-        for attr in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim"):
-            if getattr(cfg, attr, None):
-                return False
-        # Qwen2.5 has sliding_window but disables it via use_sliding_window=False -> still packs.
-        # Mistral-style has no use_sliding_window flag -> assume window is active.
-        sliding = getattr(cfg, "sliding_window", None)
-        return not (sliding and getattr(cfg, "use_sliding_window", True))
+        return probe_is_pure_attention(model_id, revision)
     except Exception as e:  # network/parse/arch failure -> do NOT pack (boundary-safe default)
         print(f"[pack] pure-attention probe failed for {model_id!r} (treating as NOT pure): {e}")
         return False
 
 
+def probe_is_gdn_hybrid(model_id: str, revision: str = "") -> bool:
+    """``model_is_gdn_hybrid`` without the swallow: a failed probe RAISES.
+
+    See ``probe_is_pure_attention`` for why a digest-freezing caller needs the distinction.
+    """
+    cfg = _load_text_config(model_id, revision)
+    layer_types = getattr(cfg, "layer_types", None)
+    if layer_types and any(t == "linear_attention" for t in layer_types):
+        return True
+    return any(
+        getattr(cfg, a, None)
+        for a in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim")
+    )
+
+
 def model_is_gdn_hybrid(model_id: str, revision: str = "") -> bool:
     """True for a GatedDeltaNet hybrid (Qwen3.5/3.6) that needs cu_seqlens + seq_idx to pack."""
     try:
-        from transformers import AutoConfig
-
-        from flash.engine.worker.hf import model_revision_kwargs
-
-        cfg = _text_config(
-            AutoConfig.from_pretrained(
-                model_id,
-                trust_remote_code=True,
-                **model_revision_kwargs(revision),
-            )
-        )
-        layer_types = getattr(cfg, "layer_types", None)
-        if layer_types and any(t == "linear_attention" for t in layer_types):
-            return True
-        return any(
-            getattr(cfg, a, None)
-            for a in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim")
-        )
+        return probe_is_gdn_hybrid(model_id, revision)
     except Exception as e:
         print(f"[pack] gdn-hybrid probe failed for {model_id!r} (treating as NOT gdn): {e}")
         return False

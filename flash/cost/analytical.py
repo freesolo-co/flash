@@ -412,17 +412,87 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
     return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
 
 
+# --- sft shards by SEQUENCE, not by data ---------------------------------------------------------
+# MULTI_CARD_SCALING_{NVLINK,PCIE} are measured on an FSDP *data-parallel* benchmark, and grpo/opd
+# earn them: those run data-parallel. SFT does not. Flash pins ulysses_sp_size to the card count
+# (sft_train.py "ulysses_sp_size": gpu_count) and verl derives dp_size = world_size //
+# ulysses_sequence_parallel_size (workers/engine/fsdp/transformer_impl.py get_data_parallel_size),
+# so a multi-card sft run is dp_size == 1: pure Ulysses sequence parallelism, never data parallelism.
+#
+# The two shard different things and pay different collectives:
+#   fsdp dp    splits the BATCH.    per layer/step: all-gather params (fwd), all-gather params (bwd),
+#                                   reduce-scatter grads. Volume tracks MODEL size, flat in seq/batch.
+#   ulysses sp splits the SEQUENCE. per layer/step: all-to-all on q, k, v and on the attention out,
+#                                   forward AND backward. Volume tracks ACTIVATION size, so it grows
+#                                   with batch * seq.
+# At 9B-class hidden the ratio of ulysses to fsdp bytes runs 0.04x at seq 1024 batch 1 up to 4.9x at
+# seq 16384 batch 8. One scalar keyed only on interconnect cannot track that, so reusing the dp
+# constant for sft is a category error rather than an imprecision.
+#
+# WHAT REPLACES IT, AND WHAT IS AND IS NOT MEASURED. No matched multi-card sft arm exists, and none
+# can be manufactured cheaply: sft has no step floor, so its whole gpu-bound half is the compute
+# term, but that term is a small share of a realized sft wall (~3% on the measured H100 2-card arm).
+# Sweeping the sharding factor across its entire physically possible range (1.0x to 2.0x) moves the
+# TOTAL wall by 1.03x there, against a 1.563x same-wave sft noise floor -- and no catalog shape
+# closes that gap: the largest tested (27B, 2000 steps, 200M tokens) still only reaches 1.55x. A
+# matched n=1/n=2 wall-clock comparison is therefore an unfailable experiment for this constant, so
+# the honest basis is the mechanical one, exactly as STEP_FLOOR_SHARDED_FRACTION above.
+#
+# The bound below is compute-over-communication for the collectives Ulysses actually issues:
+#   per card: compute/n + 8 * (batch*seq*hidden*2 bytes / n) * (n-1) / effective_bandwidth
+# evaluated on a 9B-class shape it gives ~1.94x at 2 cards on nvlink and ~1.54-1.73x on pcie (rising
+# with seq, because attention compute grows as seq^2 while the all-to-all grows as seq). Those are
+# CEILINGS -- they assume peak bandwidth and perfect overlap -- so real sp lands below them.
+#
+# Set to the dp constants' own values. That is deliberate and it is not a no-op: it makes sft stop
+# borrowing a number whose derivation does not apply to it, pins the reachable behaviour under test,
+# and gives the sp assumption its own name and its own place to be corrected when a matched arm
+# finally exists. The values coincide because the mechanical ceiling brackets them (1.42 shipped
+# against a 1.54-1.73 pcie ceiling; 1.76 against a 1.94 nvlink ceiling), so moving them without
+# evidence would trade a defensible number for an invented one. Any future change belongs here, and
+# affects only sft.
+MULTI_CARD_SCALING_SP_NVLINK = 0.88
+MULTI_CARD_SCALING_SP_PCIE = 0.71
+
+
+def sequence_parallel_speedup(gpu_count: int, gpu: str) -> float:
+    """Throughput multiplier for sharding an sft step over ``gpu_count`` cards by SEQUENCE.
+
+    The sft counterpart of :func:`multi_card_speedup`. Same geometric form and the same
+    non-decreasing clamp; a separate constant because sft runs Ulysses sequence parallelism while
+    grpo/opd run fsdp data parallelism (see MULTI_CARD_SCALING_SP_NVLINK).
+    """
+    n = max(1, int(gpu_count))
+    scaling = MULTI_CARD_SCALING_SP_NVLINK if has_nvlink(gpu) else MULTI_CARD_SCALING_SP_PCIE
+    return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
+
+
+def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str) -> float:
+    """Card-count throughput multiplier for ``config``'s parallelism strategy.
+
+    sft shards by sequence, grpo/opd by data; they do not scale the same way and must not share a
+    constant. Every caller that divides sft work by a card count goes through here.
+    """
+    if config.normalized().method == "sft":
+        return sequence_parallel_speedup(gpu_count, gpu)
+    return multi_card_speedup(gpu_count, gpu)
+
+
 def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int) -> float:
     """Wall seconds for one optimizer step on ``gpu_count`` cards of class ``gpu``.
 
     The single source of the card-count math. ``step_seconds_split`` gives the single-card halves;
-    this is the only place that divides by :func:`multi_card_speedup`, because the gpu-bound half is
+    this is the only place a STEP divides by a card-count multiplier, because the gpu-bound half is
     not uniformly shardable: it carries a step floor whose weight-copy and checkpoint phases every
     rank pays in full (see STEP_FLOOR_SHARDED_FRACTION). Dividing the floor whole under-quotes any
     run wider than one card.
+
+    The multiplier itself comes from :func:`method_card_speedup`, because sft shards by sequence and
+    grpo/opd by data. The floor split above is grpo/opd-only in practice -- an sft step runs no
+    rollout, so its floor is 0 and its whole gpu-bound half shards.
     """
     gpu_bound, fixed = step_seconds_split(config, gpu)
-    speedup = multi_card_speedup(gpu_count, gpu)
+    speedup = method_card_speedup(config, gpu_count, gpu)
     floor_s = _step_floor_seconds_for(config, gpu)
     # the floor is inside gpu_bound; split it so only the phases that actually shard get divided.
     shardable = gpu_bound - floor_s * (1.0 - STEP_FLOOR_SHARDED_FRACTION)
@@ -876,7 +946,8 @@ def estimate_cost(
         )
 
     setup = setup_seconds(config)
-    speedup = multi_card_speedup(billed_gpu_count, gpu)
+    # sft shards by sequence and grpo/opd by data, so the multiplier is method-specific.
+    speedup = method_card_speedup(config, billed_gpu_count, gpu)
     sps = sharded_step_seconds(config, gpu, billed_gpu_count)
     required_save_s = required_save_overhead_seconds(config)
     # A one-time kernel/graph compile is paid once on the first step (MoE-only; 0 for dense). It is
