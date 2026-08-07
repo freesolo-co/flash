@@ -2300,6 +2300,112 @@ def test_worker_artifacts_surfaces_the_ray_failure_logs(monkeypatch, tmp_path):
     assert "End of file" in out["error_rl_attempt1.txt"]
 
 
+def test_worker_artifacts_does_not_pair_a_prior_attempts_ray_logs_with_this_traceback(
+    monkeypatch, tmp_path
+):
+    """Ray logs must describe the SAME attempt as the traceback they appear beside.
+
+    They are uploaded only when ray actually failed, so on a retried run the newest raylogs and the
+    newest traceback can belong to different attempts: attempt 0 dies to a raylet, attempt 1 fails
+    for an unrelated reason and uploads none. Resolving the two independently then shows attempt 0's
+    raylet death next to attempt 1's ValueError, and the reader diagnoses a raylet that died an
+    attempt ago -- worse than showing nothing, because it looks like corroboration.
+    """
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl", run_id="r1", train=types.SimpleNamespace(hf_repo="org/repo")
+    )
+    content = {
+        "rl/r1/console_rl.txt": "worker console\n",
+        "rl/r1/error_rl_attempt1.txt": "ValueError: dataset row 3 is malformed\n",
+        "rl/r1/raylogs_rl_attempt0.txt": "RAYLET died in the FIRST attempt\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert not [k for k in out if k.startswith("raylogs")], (
+        "a prior attempt's ray logs were paired with this attempt's unrelated traceback"
+    )
+    # the real evidence for this attempt is untouched -- suppressing the mismatch must not cost the
+    # traceback that actually explains the failure.
+    assert out["error_rl_attempt1.txt"] == "ValueError: dataset row 3 is malformed\n"
+    assert out["console_rl.txt"] == "worker console\n"
+
+
+def test_worker_artifacts_skips_ray_logs_when_the_traceback_is_unscoped(monkeypatch, tmp_path):
+    # a legacy unscoped traceback names no attempt, so there is nothing to pin raylogs to. guessing
+    # the newest would reintroduce exactly the mismatch above, on the one artifact shape that cannot
+    # be checked.
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl", run_id="r1", train=types.SimpleNamespace(hf_repo="org/repo")
+    )
+    content = {
+        "rl/r1/error_rl.txt": "legacy unscoped traceback\n",
+        "rl/r1/raylogs_rl_attempt0.txt": "ray logs from some attempt\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert not [k for k in out if k.startswith("raylogs")]
+    assert out["error_rl.txt"] == "legacy unscoped traceback\n"
+
+
+def test_ray_log_name_is_built_the_same_way_the_worker_builds_it():
+    # the control plane derives this name; the worker writes it. they are in different processes with
+    # no shared constant, so pin the two spellings against each other rather than against a literal.
+    from flash.engine.worker.hf import ray_log_artifact_name
+    from flash.server._runtime import _ray_log_name_for_attempt
+
+    for phase in ("rl", "sft", "opd"):
+        for attempt in (0, 1, 7):
+            assert _ray_log_name_for_attempt(
+                phase, f"error_{phase}_attempt{attempt}.txt"
+            ) == ray_log_artifact_name(phase, attempt)
+
+
 def test_worker_artifacts_is_unaffected_when_ray_never_failed(monkeypatch, tmp_path):
     """The ray artifact is uploaded only when ray actually failed, so it is usually absent.
 
