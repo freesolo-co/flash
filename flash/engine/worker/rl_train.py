@@ -72,6 +72,7 @@ from flash.engine.worker.backend_common import (
     ray_num_cpus,
     reap_stragglers,
     render_gdn_varlen_shim,
+    render_tf32_shim,
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
@@ -96,7 +97,7 @@ from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.multiturn_glue import validate_glue_template
 from flash.engine.worker.opd_gkd import generation_eos_from_cached_config
 from flash.engine.worker.packing import model_is_gdn_hybrid
-from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
+from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import (
     sample_completion_text,
@@ -3223,7 +3224,9 @@ def run_rl_train():
         _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
         gpu_type=_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else "",
     )
-    setup_perf_backends()
+    # no setup_perf_backends() here: torch's tf32 flags are per-process state that a subprocess does
+    # not inherit, and this process trains nothing -- verl does, out of process. the child opts in
+    # from its own sitecustomize instead (render_tf32_shim, wired into shim_source below).
 
     # env load, prompt render and tokenization run for minutes on a large split and emit nothing of
     # their own; without the wrap the provider sees silence from rl_start until rl_train_start.
@@ -3297,17 +3300,21 @@ def run_rl_train():
     with open(reward_py, "w") as f:
         f.write(render_reward_module())
 
-    # runtime patches for the verl interpreter. only written when something needs patching, so the
-    # default path puts nothing on the child's import path. a stale shim from a prior attempt would
-    # otherwise keep patching this one, so the file is removed when no patch is wanted.
+    # runtime patches for the verl interpreter. a stale shim from a prior attempt would otherwise
+    # keep patching this one, so the file is rewritten every time.
     shim_dir = os.path.join(workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
     shim_py = os.path.join(shim_dir, "sitecustomize.py")
     # one sitecustomize holds every patch: python imports it once, so a second file would never be
-    # loaded. each renderer returns "" when its feature is off, so the default path writes nothing.
+    # loaded. each feature renderer returns "" when its feature is off; the tf32 fragment is
+    # unconditional, so this source is never empty.
     shim_source = "".join(
         part
         for part in (
+            # first: torch's matmul flags are process-wide state, and reading them back is how the
+            # rest of the child sees the choice. nothing below depends on it, but a later fragment
+            # that raised would otherwise cost the whole run its tensor-core throughput.
+            render_tf32_shim(),
             render_reentrant_checkpointing_shim(
                 inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"])
             ),
@@ -3327,11 +3334,8 @@ def run_rl_train():
         )
         if part
     )
-    if shim_source:
-        with open(shim_py, "w") as f:
-            f.write(shim_source)
-    elif os.path.exists(shim_py):
-        os.remove(shim_py)
+    with open(shim_py, "w") as f:
+        f.write(shim_source)
 
     # multi-turn: copy the child-side agent loop next to the shim so the verl interpreter can
     # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
@@ -3586,14 +3590,14 @@ def run_rl_train():
             env_for_verl.update(
                 multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
             )
-        if shim_source or inp["multi_turn"] or gdn_boundary_resets:
-            # python imports sitecustomize automatically at startup, so the shim patches verl before
-            # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
-            # install itself, and ray workers inherit this env so every actor gets the same patch.
-            # multi-turn needs the same entry for its copied-in agent loop modules.
-            env_for_verl["PYTHONPATH"] = os.pathsep.join(
-                item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
-            )
+        # python imports sitecustomize automatically at startup, so the shim patches verl before
+        # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
+        # install itself, and ray workers inherit this env so every actor gets the same patch.
+        # multi-turn needs the same entry for its copied-in agent loop modules. unconditional: the
+        # shim always carries at least the tf32 fragment, so a skipped entry would silently drop it.
+        env_for_verl["PYTHONPATH"] = os.pathsep.join(
+            item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
+        )
         step_re = re.compile(r"step:\s*(\d+)")
         reward_history: list[float] = []
         resp_len_history: list[float] = []

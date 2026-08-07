@@ -115,7 +115,6 @@ from flash.engine.worker.perf import (
     is_cuda_oom,
     loraplus_optimizer_cls,
     optimal_attn_impl,
-    setup_perf_backends,
     wait_for_gpu,
 )
 from flash.engine.worker.rl import run_rl
@@ -589,7 +588,6 @@ __all__ = [
     "run_rl",
     "run_sft",
     "seed_training_rngs",
-    "setup_perf_backends",
     "stamp_adapter_provenance",
     "strip_think",
     "think_token_count",
