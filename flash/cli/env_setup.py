@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tomllib
 from pathlib import Path
@@ -472,18 +471,12 @@ def _warn(msg: str) -> None:
 def _setup_interactive(args) -> bool:
     """Whether to ask the setup questions interactively.
 
-    Prompt only on a real terminal a human can answer from. Fall back to defaults (no prompt) when
-    --yes is passed, under CI, or when stdin is closed/redirected, so automation never blocks on an
-    unanswered prompt. A pseudo-TTY in CI can report isatty()=True, so CI is checked explicitly; a
-    closed fd 0 can make sys.stdin None, so that is guarded before .isatty()."""
+    Fall back to defaults (no prompt) when --yes is passed, and otherwise defer to the shared
+    can-a-human-answer check. --yes lives here rather than in `render` because it is this command's
+    own flag; the terminal/CI half is identical for every prompting command and is defined once."""
     if getattr(args, "yes", False):
         return False
-    if os.environ.get("CI", "").strip().lower() not in ("", "0", "false", "no"):
-        return False
-    stdin = sys.stdin
-    if stdin is None or not stdin.isatty():
-        return False
-    return render.styled()
+    return render.can_prompt()
 
 
 def cmd_env_setup(args) -> int:

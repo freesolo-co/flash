@@ -7,6 +7,7 @@ client calls and drive main() in-process: no server, no stored credentials.
 from __future__ import annotations
 
 import json
+import types
 from pathlib import Path
 
 import pytest
@@ -144,12 +145,18 @@ def test_traces_export_refuses_to_clobber_without_force(fake_traces, monkeypatch
     assert _rows(existing) == _RECORDS
 
 
+def _no_terminal(monkeypatch) -> None:
+    """A redirected stdin, the ordinary scripted case."""
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: False))
+
+
 def test_traces_export_without_project_is_actionable_when_scripted(
     fake_traces, monkeypatch, tmp_path, capsys
 ) -> None:
     """Non-interactive and ambiguous: name the projects instead of hanging on a prompt."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(traces, "_interactive", lambda: False)
+    _no_terminal(monkeypatch)
 
     assert cli.main(["traces", "export"]) == 1
     err = capsys.readouterr().err
@@ -163,10 +170,30 @@ def test_traces_export_requires_the_only_project_explicitly(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(traces, "list_trace_projects", lambda *a, **k: [_PROJECTS[0]])
-    monkeypatch.setattr(traces, "_interactive", lambda: False)
+    _no_terminal(monkeypatch)
 
     assert cli.main(["traces", "export"]) == 1
 
+    assert "--project" in capsys.readouterr().err
+    assert fake_traces["records"] == []
+
+
+def test_traces_export_under_ci_never_prompts(fake_traces, monkeypatch, tmp_path, capsys) -> None:
+    # CI runners hand out a pseudo-tty, so isatty() is True in exactly the case that must not
+    # prompt -- and `traces export` has no --yes to escape a prompt with, so a picker here hangs
+    # the job until the runner's timeout kills it. input() raises so prompting fails loudly
+    # instead of blocking this test forever.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
+
+    def _boom(*a, **k):
+        raise AssertionError("prompted under CI")
+
+    monkeypatch.setattr("builtins.input", _boom)
+
+    assert cli.main(["traces", "export"]) == 1
     assert "--project" in capsys.readouterr().err
     assert fake_traces["records"] == []
 

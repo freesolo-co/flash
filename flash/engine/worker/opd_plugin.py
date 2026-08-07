@@ -440,19 +440,6 @@ def _exit_for_score_failure(error: FlashTeacherBridgeError) -> None:
     os._exit(exit_code)
 
 
-def _exit_for_mutation_failure(
-    error: FlashTeacherBridgeError,
-    *,
-    write_fallback: bool = True,
-) -> None:
-    if write_fallback:
-        _write_mutation_failure_fallback(error.classification, str(error))
-    exit_code = (
-        _PERMANENT_TEACHER_EXIT if error.classification == "permanent" else _TRANSIENT_TEACHER_EXIT
-    )
-    os._exit(exit_code)
-
-
 def _unexpected_mutation_bridge_error(error: Exception) -> FlashTeacherBridgeError:
     return FlashTeacherBridgeError(
         f"unexpected mutation bridge failure: {type(error).__name__}",
@@ -489,13 +476,6 @@ def _publish_mutation_notice(url: str, token: str) -> None:
             str(bridge_error),
         )
         raise bridge_error from error
-
-
-def _post_mutation_notice(url: str, token: str) -> None:
-    try:
-        _publish_mutation_notice(url, token)
-    except FlashTeacherBridgeError as error:
-        _exit_for_mutation_failure(error, write_fallback=False)
 
 
 def _post_no_signal_resample(url: str, token: str) -> None:

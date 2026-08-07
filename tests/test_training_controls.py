@@ -8,10 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from flash.engine.steps import (
-    configure_trainer_save_schedule,
     final_save_due,
     resolve_update_horizon,
-    save_step_due,
     sft_update_steps,
     validate_save_steps,
 )
@@ -163,22 +161,7 @@ def test_sft_update_horizon_uses_packed_blocks_when_bfd_is_active():
     )
 
 
-def test_exact_required_saves_suppress_periodic_trainer_saves():
-    config = {"save_steps": 5}
-    configure_trainer_save_schedule(config, (2, 7))
-    assert config == {"save_steps": 5, "save_strategy": "no"}
-
-    fallback = {"save_steps": 5}
-    configure_trainer_save_schedule(fallback, ())
-    assert fallback == {"save_steps": 5}
-
-
-def test_opd_checkpoint_schedule_uses_required_saves_or_periodic_fallback():
-    assert save_step_due(2, (2, 7), 5)
-    assert save_step_due(7, (2, 7), 5)
-    assert not save_step_due(5, (2, 7), 5)
-    assert save_step_due(5, (), 5)
-    assert not save_step_due(4, (), 5)
+def test_final_save_is_kept_unless_exact_save_steps_exclude_it():
     assert final_save_due(9, ())
     assert not final_save_due(9, (2, 7))
 

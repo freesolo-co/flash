@@ -21,7 +21,6 @@ trace export gets its rows, so both produce the same file.
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 from flash.client import ClientError, export_trace_records, list_trace_projects
@@ -104,18 +103,10 @@ def _resolve_project_id(args, api_key: str) -> str:
             "SDK first, then export them here"
         )
     options = project_options(projects)
-    if not _interactive():
+    if not render.can_prompt():
         listing = ", ".join(f"{name} ({value})" for value, name, _hint in options)
         raise ClientError(f"pass --project <id> to choose a project; available: {listing}")
     return render.select_required("Which project's traces?", options)
-
-
-def _interactive() -> bool:
-    """Whether a project picker can be answered. Mirrors env setup's guard."""
-    stdin = sys.stdin
-    if stdin is None or not stdin.isatty():
-        return False
-    return render.styled()
 
 
 # what each shape is called in the summary line. `records` and `prompts` are
