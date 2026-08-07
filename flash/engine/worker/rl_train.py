@@ -2475,9 +2475,12 @@ class _GrpoSubprocessStream:
             self._proc, process_group_id=self._process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
         ) as watchdog:
             for line in self._proc.stdout:
-                watchdog.note_line()
-                self._tail.record(line)
-                yield line
+                # held ACROSS the yield. this is a generator, so the consumer's work for a line runs
+                # while suspended here -- counting only the arrival would make a consumer inside one
+                # long step look exactly like a reader blocked on a dead pipe (cursor).
+                with watchdog.handling_line():
+                    self._tail.record(line)
+                    yield line
         if watchdog.tore_down:
             self._orphaned_pipe = True
             # the group is already gone, so teardown must not be attempted a second time.
