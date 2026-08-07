@@ -781,6 +781,44 @@ def test_a_profile_that_cannot_be_launched_releases_its_claim(api, monkeypatch):
     assert db.all_runs() == []
 
 
+def test_a_profile_that_failed_after_persisting_its_run_keeps_its_claim(api, monkeypatch, tmp_path):
+    """The other half: a launch that already wrote a run must NOT have its claim deleted.
+
+    ``submit_job`` persists the queued status before the steps that can still raise (reporting it,
+    and starting the background thread). Dropping the claim after that point is the worse of the
+    two wedges: ownership answers 404 for the key that launched it, while later submitters read a
+    live queued record under the deterministic id and wait forever, with no reclaim path -- the
+    spent-takeover route only fires on a run that reached a terminal state.
+    """
+    import os
+
+    import flash.server.app as app_mod
+    from flash.runner import runs_file_path
+    from flash.server import db
+
+    profile_run_id = "profile-sft-" + "c" * 64
+    _pending_profile(monkeypatch, profile_run_id=profile_run_id)
+
+    def submit_then_fail(*_a, **_k):
+        # stand in for submit_job's real ordering: status on disk, then a raise from _report_status
+        # or the thread start below it.
+        path = runs_file_path(profile_run_id, ".json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"run_id": profile_run_id, "state": "queued"}, f)
+        raise RuntimeError("status reporter unreachable")
+
+    monkeypatch.setattr(app_mod, "submit_job", submit_then_fail)
+
+    res = api.post("/v1/runs", json={"spec": _SFT_SPEC}, headers=_bearer("fslo-user-1"))
+
+    assert res.status_code == 400, res.text
+    assert [r["run_id"] for r in db.all_runs()] == [profile_run_id], (
+        "the claim was deleted for a run that exists, so its owner reads 404 while later "
+        "submitters wait on it forever"
+    )
+
+
 def test_a_profile_miss_creates_no_training_run_and_no_training_charge(api, monkeypatch):
     """The user asked to train and was not charged for training: no run, no billing context.
 
