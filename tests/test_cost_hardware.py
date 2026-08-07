@@ -349,3 +349,77 @@ def test_a_vast_sharded_quote_reads_the_provider_off_the_run_config():
         )
         # `auto` is not a provider; it must not be read as one and must keep the class answer.
         assert method_card_speedup(cfg("auto", method), 2, "H100") == runpod
+        # an explicit provider argument outranks the config, which is what the ranking and
+        # re-quote paths rely on -- their config carries no provider at all.
+        assert method_card_speedup(cfg("auto", method), 2, "H100", "vast") == vast
+
+
+def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
+    """The ranking config carries NO provider, so reading it off the config alone was inert.
+
+    `run_config_for_ranking` builds a bare one-step config -- provider defaults to `auto` -- and the
+    allocator then prices every candidate against it. Before this fix a vast pair was ranked on the
+    nvlink curve, which is precisely the direction the module warns about: it lets a pcie
+    combination win on scaling it does not deliver, then bills both cards for the longer wall.
+    """
+    from flash.providers.allocator import _step_cost_ranker
+    from flash.providers.base import Candidate, run_config_for_ranking
+
+    # the defect's root: the config the allocator ranks with never names a provider.
+    assert run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo").normalized().provider == "auto"
+
+    key = _step_cost_ranker("Qwen/Qwen3.5-4B", "grpo", None, False, "")
+    assert key is not None, "this model must be priceable, or the assertions below prove nothing"
+
+    def at(provider, hourly=2.0):
+        return key(
+            Candidate(provider=provider, gpu="H100", hourly_usd=hourly, vram_gb=80, gpu_count=2)
+        )
+
+    assert at("vast") > at("runpod"), (
+        "a vast pair was ranked on nvlink scaling it may not deliver, so it can win a ranking on "
+        "throughput it cannot reach and then bill both cards for the longer wall"
+    )
+    # a single card has no interconnect, so the narrowing must not touch it: that path is shared
+    # with the preview and estimate, and they must agree exactly whenever one card is enough.
+    single = {
+        p: key(Candidate(provider=p, gpu="H100", hourly_usd=2.0, vram_gb=80, gpu_count=1))
+        for p in ("vast", "runpod")
+    }
+    assert single["vast"] == single["runpod"]
+    # not a blanket penalty: a genuinely cheaper vast pair still wins, it is just priced honestly.
+    assert at("vast", hourly=1.70) < at("runpod", hourly=1.95)
+
+
+def test_a_live_vast_allocation_is_requoted_without_nvlink_credit():
+    """The re-quote before provisioning is what the run is actually billed against.
+
+    `estimate_cost` takes the exact selected candidate, so this is the last point where the wrong
+    interconnect assumption can reach a persisted quote -- and its config is the user's, which for
+    an auto run names no provider.
+    """
+    from types import SimpleNamespace
+
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.types import RunConfig
+
+    config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="grpo", steps=20)
+    assert config.normalized().provider == "auto", "an auto run is the case that was mispriced"
+
+    def quote(provider, gpu_count=2):
+        return estimate_cost(
+            config,
+            allocation=SimpleNamespace(
+                gpu="H100",
+                provider=provider,
+                hourly_usd=2.0,
+                min_vram_gb=80,
+                gpu_count=gpu_count,
+            ),
+        )
+
+    assert quote("vast").train_seconds > quote("runpod").train_seconds, (
+        "a vast allocation was re-quoted on the nvlink curve, so the persisted quote understates "
+        "the wall the run is billed for"
+    )
+    assert quote("vast", gpu_count=1).train_seconds == quote("runpod", gpu_count=1).train_seconds

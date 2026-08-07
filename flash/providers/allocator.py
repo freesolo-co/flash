@@ -100,8 +100,12 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
             return cost_key(candidate.gpu, candidate.hourly_usd)
         # scaling is per-class (an nvlink pair keeps ~0.88 of linear per card, a pcie pair ~0.71),
         # and for grpo/opd the step floor is only ~80% shardable -- sharded_step_seconds owns both,
-        # so ranking cannot drift from the quote the run is actually billed against.
-        seconds = sharded_step_seconds(config, candidate.gpu, candidate.gpu_count)
+        # so ranking cannot drift from the quote the run is actually billed against. the candidate's
+        # provider is part of that: it is what decides whether the combination gets nvlink credit,
+        # and `config` here is the ranking config, which carries no provider at all.
+        seconds = sharded_step_seconds(
+            config, candidate.gpu, candidate.gpu_count, candidate.provider
+        )
         return candidate.total_hourly_usd * seconds / 3600.0
 
     return cost_per_step
