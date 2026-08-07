@@ -648,6 +648,48 @@ def test_no_worker_at_all_is_still_reported_as_missing_capacity(monkeypatch):
     assert "no RunPod capacity" in res.detail
 
 
+def test_a_worker_arriving_inside_the_probe_gap_is_not_abandoned(monkeypatch):
+    """A worker that appears between the last probe and the grace boundary must be seen.
+
+    `worker_coming_up_at` is only as fresh as the last health probe, and those run every 90s. A
+    worker RunPod allocates inside that window is invisible to the capacity check, so the attempt is
+    abandoned and the endpoint torn down -- discarding a GPU already granted and paying a fresh cold
+    start to get back to the same place. Worse, it is self-perpetuating: the replacement endpoint
+    (workersMin=0) pulls the same multi-GB image cold again.
+
+    Here health reports nothing until the boundary is in sight, then a worker appears. Without a
+    probe AT the boundary the run is failed no_capacity on a reading taken before the worker
+    existed (codex[bot]).
+    """
+
+    probes = {"n": 0}
+    # every SCHEDULED probe answers "no worker". The 8th read is the extra one taken at the grace
+    # boundary itself, and only that one can see the worker -- which is exactly the gap being closed:
+    # with the boundary probe removed there is no 8th read at all, and the run is failed on the 7th.
+    scheduled_probes_before_boundary = 7
+
+    def health(_eid, _fp, **_kw):
+        probes["n"] += 1
+        if probes["n"] <= scheduled_probes_before_boundary:
+            return {"workers": {}}
+        return {"workers": {"initializing": 1}}
+
+    res = _queued_forever(monkeypatch, health)
+
+    assert probes["n"] > scheduled_probes_before_boundary, (
+        "no health read happened at the grace boundary, so the worker was never observable; the "
+        "attempt was abandoned on a reading taken up to 90s earlier"
+    )
+    assert not res.ok
+    # the worker was found, so this is a cold start, not starvation: the verdict must come from the
+    # much larger setup grace rather than the capacity timer.
+    assert res.failure == "stalled", (
+        f"reported {res.failure!r} for a worker RunPod had already allocated; the attempt was "
+        "abandoned on health read up to 90s before the boundary"
+    )
+    assert "setup (pre-training)" in res.detail
+
+
 def test_capacity_grace_scales_with_gpu_walk_position():
     # The two no-capacity backstops — IN_QUEUE with no worker (queue_grace_s) and a worker stuck
     # THROTTLED (throttled_grace_s) — are tuned to the gpu-walk position. While a next-best class
