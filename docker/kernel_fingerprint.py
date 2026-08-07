@@ -74,44 +74,6 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _python_string_constant(text: str, name: str, what: str) -> str:
-    """Resolve a simple module-level string constant, including f-strings using prior constants."""
-    values: dict[str, str] = {}
-
-    def _eval(node: ast.AST) -> str | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
-        if isinstance(node, ast.JoinedStr):
-            parts: list[str] = []
-            for value in node.values:
-                if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                    parts.append(value.value)
-                elif (
-                    isinstance(value, ast.FormattedValue)
-                    and isinstance(value.value, ast.Name)
-                    and value.value.id in values
-                ):
-                    parts.append(values[value.value.id])
-                else:
-                    return None
-            return "".join(parts)
-        return None
-
-    tree = ast.parse(text)
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        value = _eval(node.value)
-        if value is None:
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                values[target.id] = value
-    if name not in values:
-        raise ValueError(f"kernel_fingerprint: could not parse {what}")
-    return values[name]
-
-
 def parse_baked_per_sm_arches(text: str, *, source: str = "_worker.py") -> list[str]:
     """Parse the canonical baked-architecture frozenset without importing flash."""
     tree = ast.parse(text, filename=source)
