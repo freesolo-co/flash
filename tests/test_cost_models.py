@@ -84,6 +84,26 @@ def test_an_open_policy_model_is_priced_from_huggingface(monkeypatch):
     assert download_weight_gb("meta-llama/Llama-3.1-8B") == pytest.approx(16.06)
 
 
+def test_an_open_model_is_sized_over_the_network_once(monkeypatch):
+    """A quote asks for the model size ~30 times (every FLOPs/memory/disk/save term, and _is_moe
+    twice per call). Unmemoized that is ~30 sequential HF round trips per submit, with the estimate
+    hostage to hub latency. Weights at a given id+revision are immutable, so one lookup is enough."""
+    import flash.engine.vram as vram
+
+    calls: list[str] = []
+
+    def _probe(model_id, **_kwargs):
+        calls.append(model_id)
+        return 8.03
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", _probe, raising=False)
+    for _ in range(12):
+        total_params_b("meta-llama/Llama-3.1-8B")
+        active_params_b("meta-llama/Llama-3.1-8B")
+        download_weight_gb("meta-llama/Llama-3.1-8B")
+    assert len(calls) == 1
+
+
 def test_a_catalog_model_is_never_sized_over_the_network(monkeypatch):
     """The curated entry answers first: adding the HF fallback must not put a network call on the
     managed path, where every model is cataloged."""

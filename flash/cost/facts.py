@@ -260,9 +260,12 @@ def total_params_b(model_id: str, revision: str = "") -> float:
     big a model is. It raises on its own when HF cannot answer, which keeps the quote fail-closed
     rather than silently pricing an unknown model as free.
     """
-    from flash.engine.vram import resolve_params_b
+    info = MODELS.get(model_id)
+    if info is not None and info.params_b > 0 and not revision:
+        # The managed path answers here and never touches the network.
+        return info.params_b
 
-    params_b = resolve_params_b(model_id, revision=revision)
+    params_b = _sized_from_hf(model_id, revision)
     if not params_b:
         raise ValueError(
             f"could not size model {model_id!r}: it is not in the catalog "
@@ -270,6 +273,24 @@ def total_params_b(model_id: str, revision: str = "") -> float:
             f"for it, so the run cannot be priced"
         )
     return params_b
+
+
+# One quote asks "how big is this model" ~30 times (every FLOPs, memory, disk and save term, plus
+# _is_moe asking twice per call). For a catalog model those are dict reads; for an open-policy model
+# each one would be an HF round trip, turning a submit into ~30 sequential network calls and making
+# the estimate hostage to hub latency. Memoized per process: a model id and revision name immutable
+# weights, so the answer cannot change under us. Not on `fetch_hf_params_b` itself, which tests
+# monkeypatch -- caching there would leak a stubbed size across tests.
+_SIZE_MEMO: dict[tuple[str, str], float | None] = {}
+
+
+def _sized_from_hf(model_id: str, revision: str) -> float | None:
+    key = (model_id, revision)
+    if key not in _SIZE_MEMO:
+        from flash.engine.vram import resolve_params_b
+
+        _SIZE_MEMO[key] = resolve_params_b(model_id, revision=revision)
+    return _SIZE_MEMO[key]
 
 
 def active_params_b(model_id: str) -> float:
