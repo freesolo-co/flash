@@ -251,29 +251,38 @@ def test_deploy_27b_rejects_lora_rank_above_serving_cap():
 
 
 def test_deploy_rejects_lora_rank_above_serving_cap():
+    from flash.catalog import serving_lora_rank_cap
     from flash.serve.deploy import deploy_adapter
 
-    # Qwen3.5-4B serving cap is now max_lora_rank=64 (doubled from 32); a rank-65 adapter exceeds it.
-    with pytest.raises(ValueError, match="max_lora_rank=64"):
+    # derive the over-cap rank from the catalog rather than hardcoding it: the 4B cap has moved
+    # twice (32 -> 64 -> 128), and a literal here silently stops testing the boundary each time.
+    cap = serving_lora_rank_cap("Qwen/Qwen3.5-4B")
+    assert cap is not None
+    with pytest.raises(ValueError, match=f"max_lora_rank={cap}"):
         deploy_adapter(
-            run_id="r65",
+            run_id="r-over-cap",
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
-            adapter_prefix="sft/r65/seed0",
+            adapter_prefix="sft/r-over-cap/seed0",
             dry_run=True,
-            lora_rank=65,
+            lora_rank=cap + 1,
         )
 
 
 def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, tmp_path):
     """Deploy validates the effective artifact rank, not only spec.train.lora_rank."""
+    from flash.catalog import serving_lora_rank_cap
     from flash.serve.deploy import deploy_adapter
 
-    # 4B serving cap is now 64; the artifact's effective rank 65 exceeds it even though spec
-    # lora_rank (32) fits — deploy must catch the artifact rank, not just the spec rank.
-    seen = _stub_adapter_config(monkeypatch, tmp_path, rank=65)
+    # the artifact's effective rank exceeds the cap even though the spec lora_rank (32) fits, so
+    # deploy must catch the ARTIFACT rank. derived from the catalog: pinned to a literal, this stops
+    # exercising the over-cap branch the moment the cap rises past it (as it just did, 64 -> 128).
+    cap = serving_lora_rank_cap("Qwen/Qwen3.5-4B")
+    assert cap is not None
+    over_cap = cap + 1
+    seen = _stub_adapter_config(monkeypatch, tmp_path, rank=over_cap)
 
-    with pytest.raises(ValueError, match="adapter artifact has rank 65"):
+    with pytest.raises(ValueError, match=f"adapter artifact has rank {over_cap}"):
         deploy_adapter(
             run_id="r-recombined",
             model="Qwen/Qwen3.5-4B",
