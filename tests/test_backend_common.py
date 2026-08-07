@@ -2147,6 +2147,38 @@ def test_child_exit_watchdog_does_not_kill_a_reader_still_draining_a_backlog(mon
 
 
 @_needs_process_teardown
+def test_child_exit_watchdog_does_not_kill_a_reader_inside_one_long_callback(monkeypatch):
+    """Progress is counted around the callback, not before it.
+
+    The test above proves MANY FAST callbacks keep the reader alive, which is a weaker claim than it
+    looks: the counter advances between each pair, so no grace window ever spans a single one. The
+    real shape is ONE SLOW callback -- an `on_step` checkpoint upload runs for minutes, and while it
+    does, a counter bumped only on entry cannot move. That reader is indistinguishable from one
+    blocked on a pipe nobody will close, so the group is torn down mid-upload and a run that
+    succeeded is reported as failed (cursor).
+    """
+    monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 0.2)
+    # the child exits immediately, so the callback below runs with the watchdog already armed.
+    script = "import sys\nprint('step: 1', flush=True)\nsys.exit(0)"
+    finished = []
+
+    def one_slow_step(step: int) -> None:
+        # a single callback several graces long: the case the backlog test cannot reach.
+        time.sleep(1.2)
+        finished.append(step)
+
+    code = vc.run_verl_training(
+        [sys.executable, "-c", script], env=dict(os.environ), on_step=one_slow_step
+    )
+
+    assert finished == [1], "the reader was killed inside a single long callback"
+    assert code == 0, (
+        "a successful run was reported as failed because one callback outlasted the grace; the "
+        "reader was working the whole time"
+    )
+
+
+@_needs_process_teardown
 def test_child_exit_watchdog_leaves_a_healthy_quiet_child_alone(quick_teardown_grace):
     """The watchdog arms on the child's EXIT, never on silence.
 
