@@ -187,8 +187,8 @@ def test_verl_packs_every_batch_so_the_batch_size_is_the_isolation_boundary():
     assert overrides["data.train_batch_size"] == "1"
 
 
-def test_remove_padding_is_not_gated_on_the_profile_packing_mode():
-    """The profile's packing mode must not reach `use_remove_padding`.
+def test_remove_padding_is_unconditional():
+    """Nothing may gate `use_remove_padding`: it is the only layout verl's sft_loss can consume.
 
     verl leaves `data.pad_mode` at its `no_padding` default, and that loss path reads
     ``log_prob.values()`` -- which only exists on the nested tensor the remove-padding branch
@@ -196,10 +196,18 @@ def test_remove_padding_is_not_gated_on_the_profile_packing_mode():
     instead, so the first optimizer step dies with "values expected sparse tensor layout but got
     Strided" before a single update lands.
 
-    A previous revision ANDed `packing_mode == "packed"` into this flag, reasoning that the child
-    probe may only narrow what the profile priced. That holds for the QUOTE, but narrowing this
-    flag also selects a verl code path the loss cannot consume -- and every gdn-hybrid catalog
-    model profiles as `exact-unpacked`, so it broke text sft on all of them while `dev` worked.
+    Switching to verl's padded mode is not an escape either: `pad_mode: right` collates with
+    ``default_collate`` (uniform rows only) and its loss branch reads ``response_mask``, and
+    ``FlashTokenizedSFTDataset`` emits neither -- it yields variable-length rows carrying
+    input_ids/position_ids/loss_mask. So `no_padding` + remove-padding is the only combination
+    this dataset fits, and the flag has no legitimate false case.
+
+    Two revisions learned this the hard way, each gating the flag on something real but
+    irrelevant: first `packing_mode == "packed"` (the profile), then `not gdn_hybrid or
+    gdn_boundary_resets` (the child probe). Both reasoned that a gdn hybrid without child-side
+    resets must not pack -- true, but it never does: `_packing_mode` answers "exact-unpacked" for
+    every gdn model, which pins `examples_per_update` to 1, so a gdn run has no packed neighbour
+    to be contaminated by. Batch size is the isolation lever; this flag never was.
 
     Read the source rather than the rendered overrides: `build_sft_overrides` takes the flag
     already computed, so a test driving it through a cfg dict asserts on its own fixture and stays
@@ -214,9 +222,44 @@ def test_remove_padding_is_not_gated_on_the_profile_packing_mode():
         ln.strip() for ln in src.splitlines() if ln.strip().startswith("use_remove_padding =")
     )
 
-    assert line == "use_remove_padding = not gdn_hybrid or gdn_boundary_resets", line
-    assert "packing_mode" not in line
-    assert "profile" not in line
+    assert line == "use_remove_padding = True", line
+
+
+@pytest.mark.parametrize(
+    ("support", "expected_mode"),
+    [
+        (("gdn-hybrid", False), "exact-unpacked"),
+        (("unsupported", False), "exact-unpacked"),
+        (("pure-attention", True), "packed"),
+    ],
+)
+def test_batch_is_the_isolation_lever_that_replaces_the_removed_flag(support, expected_mode):
+    """Deleting the gate is only safe because no unsupported architecture ever packs.
+
+    `use_remove_padding` used to be the (broken) isolation lever. The real one is the batch size,
+    and it holds one step earlier: an architecture that cannot reset state at packed boundaries
+    profiles as `exact-unpacked`, which pins `examples_per_update` to 1, so the run has no packed
+    neighbour whose residue could bleed across. Pin the chain at its source -- if a future change
+    let a gdn hybrid profile as "packed", the deleted flag would no longer be there to catch it.
+
+    Read `_packing_mode` and the `examples_per_update` derivation directly rather than asserting
+    on rendered overrides: `build_sft_overrides` defaults `use_remove_padding` to True when the key
+    is absent, so an override-level assertion reads that default and passes no matter what the
+    worker computed.
+    """
+    from flash.engine.sft_workload import _packing_mode
+
+    packing_mode, architecture_mode = _packing_mode(
+        "Qwen/Qwen3.5-4B",
+        "rev",
+        multimodal=False,
+        allow_packing=True,
+        packing_support=lambda _m, _r: support,
+    )
+
+    assert (packing_mode, architecture_mode) == (expected_mode, support[0])
+    # an architecture that cannot pack must not be able to reach a batch > 1
+    assert (expected_mode == "packed") is support[1]
 
 
 def test_optimizer_eps_merges_into_override_config():
