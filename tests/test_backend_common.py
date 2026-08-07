@@ -1338,6 +1338,84 @@ def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypat
     )
 
 
+def _wandb_installs(calls, tmp_path):
+    """The wandb install commands in a recorded run list, whatever else ran around them."""
+    py = str(tmp_path / "verl-venv/bin/python")
+    return [c for c, _check in calls if c == ["uv", "pip", "install", "--python", py, "wandb"]]
+
+
+def test_resolve_verl_python_installs_wandb_into_a_venv_it_is_reusing(monkeypatch, tmp_path):
+    """A reused venv still gets wandb, because the stamp cannot say whether it has it.
+
+    The stamp identifies the verl a venv holds, so a venv built by an earlier run with no
+    WANDB_API_KEY stamps as fully provisioned without wandb. Gating the install on a rebuild skips
+    it for every later run on that pod: the capability probe reports wandb unavailable,
+    resolve_verl_loggers falls back to console, and the requested W&B run is never created --
+    silently, since falling back to console is the designed behavior for a genuinely absent wandb.
+    """
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
+    # exactly what an earlier run without WANDB_API_KEY leaves on the pod.
+    _fake_verl_venv(tmp_path, stamp=vc.VERL_VENV_STAMP)
+
+    vc.resolve_verl_python(str(tmp_path), install_wandb=True)
+
+    assert _wandb_installs(calls, tmp_path), (
+        "a reused venv was never offered wandb, so this run logs to console only"
+    )
+    # and nothing else ran: reinstalling verl's torch/vllm on every retry would cost many minutes of
+    # paid gpu time, which is the reason the reuse path exists at all.
+    assert [c for c, _ in calls] == _wandb_installs(calls, tmp_path)
+
+
+def test_resolve_verl_python_retries_wandb_after_an_install_that_failed(monkeypatch, tmp_path):
+    # the install is best-effort (check=False), so a transient failure leaves a stamped venv with no
+    # wandb. that must not be permanent for the life of the pod -- the next run has to try again.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
+
+    vc.resolve_verl_python(str(tmp_path), install_wandb=True)
+    assert len(_wandb_installs(calls, tmp_path)) == 1
+    # the fake `uv venv` makes bin/ but not the interpreter inside it, and resolve checks for the
+    # file. materialize it, or the second call rebuilds and the reuse path is never reached -- the
+    # assertion below would then hold against the very gating this test exists to reject.
+    (tmp_path / "verl-venv/bin/python").write_text("")
+    assert (tmp_path / "verl-venv/flash-verl-requirement").read_text() == vc.VERL_VENV_STAMP
+    reused_from = len(calls)
+
+    vc.resolve_verl_python(str(tmp_path), install_wandb=True)
+    assert len(_wandb_installs(calls, tmp_path)) == 2, "a failed install was never retried"
+    # and the retry cost exactly the wandb install: the second call reused the venv rather than
+    # reprovisioning it, which is what makes an unconditional retry affordable.
+    assert [c for c, _ in calls[reused_from:]] == _wandb_installs(calls, tmp_path)[1:]
+
+
+def test_resolve_verl_python_does_not_install_wandb_when_it_was_not_asked(monkeypatch, tmp_path):
+    # unconditional means unconditional on the REBUILD, not on the caller's request. a run with no
+    # WANDB_API_KEY must not pay an install it cannot use.
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
+    _fake_verl_venv(tmp_path, stamp=vc.VERL_VENV_STAMP)
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    assert calls == []
+
+
+def test_resolve_verl_python_never_installs_wandb_into_a_preset_interpreter(monkeypatch, tmp_path):
+    # flash does not own a preset interpreter and must not mutate it -- that is why the preset is
+    # returned as-is. moving the wandb install later in the function must not reach past that return.
+    calls = []
+    monkeypatch.setenv("FLASH_VERL_PYTHON", "/opt/verl/bin/python")
+    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
+
+    assert vc.resolve_verl_python(str(tmp_path), install_wandb=True) == "/opt/verl/bin/python"
+    assert calls == []
+
+
 def _probe_interpreter(tmp_path, name, body):
     """write a stub interpreter that answers the capability probe like a real python would."""
     stub = tmp_path / name
