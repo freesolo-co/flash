@@ -603,10 +603,6 @@ class RunStatus:
     gpu_status: dict | None = None
     workload_profile_kind: str | None = None
     workload_profile_input_digest: str | None = None
-    # the flash version that keyed the digest. persisted because the spec's copy is stripped from
-    # the public representation, and a profile record read back has to be validated against the
-    # version that produced it rather than whatever the reading process happens to resolve.
-    workload_profile_producer_version: str | None = None
     workload_profile: dict | None = None
     effective_preparation: dict | None = None
 
