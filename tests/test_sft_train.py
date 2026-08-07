@@ -30,6 +30,11 @@ from flash.engine.worker.sft_train import (
     render_loraplus_shim,
 )
 
+# distinct from `flash.__version__` on purpose: the worker resolves that to "0+unknown" (no flash
+# distribution is installed there), so a fixture built from it could not catch a worker that
+# re-derives the producer version instead of reading the one carried on the spec.
+_PROFILE_PRODUCER_VERSION = "9.9.9"
+
 
 def _cfg(**over):
     base = {
@@ -160,6 +165,58 @@ def test_sft_engine_strategy_stays_fsdp2():
     above must not be "fixed" by downgrading the strategy.
     """
     assert _as_map(build_sft_overrides(_cfg()))["engine.strategy"] == "fsdp2"
+
+
+def test_verl_packs_every_batch_so_the_batch_size_is_the_isolation_boundary():
+    """verl concatenates a batch into one sequence, so `train_batch_size` decides what shares it.
+
+    The worker sends `model.use_remove_padding=true` and leaves `data.pad_mode` at verl's
+    `no_padding` default, which together make the fsdp engine hand the model a single
+    ``(1, total_nnz)`` row with ``attention_mask=None`` and per-example ``position_ids`` restarts.
+    Attention recovers its boundaries from those restarts; GatedDeltaNet layers do not, because
+    they read ``seq_idx`` and ``cu_seq_lens_q`` out of kwargs the fsdp engine never sends. So on a
+    gdn hybrid -- which every catalog model is -- the batch size is the only thing standing between
+    one example and the next example's carried state, and a profile that grouped examples for
+    costing convenience would silently corrupt training. Pin both halves of that coupling: neither
+    override may drift without this failing.
+    """
+    overrides = _as_map(build_sft_overrides(_cfg(train_batch_size=1)))
+
+    assert overrides["model.use_remove_padding"] == "true"
+    assert "data.pad_mode" not in overrides
+    assert overrides["data.train_batch_size"] == "1"
+
+
+def test_remove_padding_is_not_gated_on_the_profile_packing_mode():
+    """The profile's packing mode must not reach `use_remove_padding`.
+
+    verl leaves `data.pad_mode` at its `no_padding` default, and that loss path reads
+    ``log_prob.values()`` -- which only exists on the nested tensor the remove-padding branch
+    builds. Send `use_remove_padding=false` and the fsdp engine hands the loss a strided tensor
+    instead, so the first optimizer step dies with "values expected sparse tensor layout but got
+    Strided" before a single update lands.
+
+    A previous revision ANDed `packing_mode == "packed"` into this flag, reasoning that the child
+    probe may only narrow what the profile priced. That holds for the QUOTE, but narrowing this
+    flag also selects a verl code path the loss cannot consume -- and every gdn-hybrid catalog
+    model profiles as `exact-unpacked`, so it broke text sft on all of them while `dev` worked.
+
+    Read the source rather than the rendered overrides: `build_sft_overrides` takes the flag
+    already computed, so a test driving it through a cfg dict asserts on its own fixture and stays
+    green no matter what the derivation does.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train
+
+    src = inspect.getsource(sft_train.run_sft_train)
+    line = next(
+        ln.strip() for ln in src.splitlines() if ln.strip().startswith("use_remove_padding =")
+    )
+
+    assert line == "use_remove_padding = not gdn_hybrid or gdn_boundary_resets", line
+    assert "packing_mode" not in line
+    assert "profile" not in line
 
 
 def test_optimizer_eps_merges_into_override_config():
@@ -940,6 +997,7 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
         thinking=False,
         worker_env={},
         workload_profile_input_digest="",
+        workload_profile_producer_version=_PROFILE_PRODUCER_VERSION,
         workload_profile={},
         environment=SimpleNamespace(
             id="owner/env",
@@ -995,23 +1053,33 @@ def _stub_sft_run(monkeypatch, *, save_at_steps=(), watcher_cls=None):
                 rendered += "<assistant>"
             return rendered
 
-    from flash import __version__
     from flash.engine.sft_workload import prepare_sft_workload
     from flash.workload_profile import sft_profile_input_digest
 
+    # deliberately NOT `flash.__version__`: the worker has no flash distribution installed and
+    # resolves that to "0+unknown", so building both sides from it would make this fixture agree
+    # with a worker that re-derives the version -- the defect it must instead be able to catch.
     spec.workload_profile_input_digest = sft_profile_input_digest(
         spec,
         tokenizer_revision=spec.model_revision,
-        producer_version=__version__,
+        producer_version=_PROFILE_PRODUCER_VERSION,
     )
     spec.workload_profile = prepare_sft_workload(
         spec,
         Env(),
         tokenizer_loader=lambda _model, _revision: Tokenizer(),
-        producer_version=__version__,
+        producer_version=_PROFILE_PRODUCER_VERSION,
         allow_packing=False,
         packing_support=lambda _model, _revision: ("unsupported", False),
     ).profile.to_dict()
+    # the fixture pins the architecture above, but the WORKER re-derives it through the live probes,
+    # which read the model config off the hub. pin them to the same answer so the parity check under
+    # test compares workloads rather than network reachability -- an unresolvable probe now fails
+    # closed instead of quietly labelling the model "unsupported".
+    from flash.engine import sft_workload as _sft_workload
+
+    monkeypatch.setattr(_sft_workload, "probe_is_pure_attention", lambda _m, revision="": False)
+    monkeypatch.setattr(_sft_workload, "probe_is_gdn_hybrid", lambda _m, revision="": False)
 
     class LoraConfig:
         r = 16

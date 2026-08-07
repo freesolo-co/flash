@@ -419,8 +419,14 @@ def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None
     # running under another key. that run is not readable here and is not billed here either, so
     # both the follow-up command and the charge sentence have to change.
     owned = detail.get("owned") is not False
-    charge = _profile_charge(client, profile_run_id) if owned else None
-    if owned:
+    # only a request that WON the claim started and billed a profile. an owner re-running `train`,
+    # `--cost` or `--dry-run` while its own profile is still queued/running joins that run: nothing
+    # is launched and nothing is charged again, so the start-and-bill wording would name a second
+    # charge that does not exist. absent reads as launched, matching `owned` above: an older server
+    # omits the field, and telling a user who WAS charged that nothing happened is the worse error.
+    launched = detail.get("launched") is not False
+    charge = _profile_charge(client, profile_run_id) if owned and launched else None
+    if owned and launched:
         lines = [
             "no exact workload profile exists for this config yet, so there is no training quote "
             "to print. the server started a separate profile run that loads your environment and "
@@ -429,6 +435,16 @@ def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None
             + (f" (estimated ${charge:.2f})" if charge is not None else "")
             + "; no training run was created, no training gpu was allocated, and nothing was "
             "charged for training.",
+            f"follow it with `{CLI_NAME} runs status {profile_run_id}`, then re-run this command "
+            "once it reports done."
+            if profile_run_id
+            else "re-run this command once the profile reports done.",
+        ]
+    elif owned:
+        lines = [
+            "no exact workload profile exists for this config yet, so there is no training quote "
+            f"to print. the profile run you already started is still {state}; this command "
+            "launched nothing and charged nothing.",
             f"follow it with `{CLI_NAME} runs status {profile_run_id}`, then re-run this command "
             "once it reports done."
             if profile_run_id
