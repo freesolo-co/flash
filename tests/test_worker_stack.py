@@ -2056,3 +2056,70 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
             f"{module.__name__} computes the gdn boundary-reset decision but never records it, so a "
             "finished run cannot be checked for whether it trained packed-with-resets or padded."
         )
+
+
+def test_remove_padding_is_the_tensor_layout_not_the_step_contract():
+    """sft's `use_remove_padding` must NOT be ANDed with the profile's packing mode.
+
+    An earlier revision of this file asserted the opposite, on the theory that
+    `use_remove_padding = not gdn_hybrid or gdn_boundary_resets` would "pack a run the user was
+    quoted as unpacked" and run `1/effective_batch` of the quoted steps. That premise is false, and
+    verl says so directly:
+
+      sft_trainer.py:240  `global_batch_size = config.data.train_batch_size`
+      sft_trainer.py:181  `total_training_steps = config.trainer.total_training_steps`
+      sft_trainer.py:344  `use_remove_padding` appears ONLY as a logged field
+
+    Examples-per-update and the step horizon come from config the worker copies straight off the
+    profile (`train_batch_size = profile.examples_per_update`, `total_training_steps =
+    profile.authoritative_steps`). `use_remove_padding` selects how that batch is laid out in
+    memory -- nested/concatenated vs padded -- and cannot change how many examples share an
+    optimizer step. With `examples_per_update = 1` there is nothing to co-locate either way.
+
+    Gating it on the profile is not merely redundant, it is a crash. verl leaves `pad_mode` at its
+    `no_padding` default, whose `sft_loss` reads `log_prob.values()` -- defined only on the nested
+    tensor the remove-padding branch builds (fsdp/transformer_impl.py:1178). The padded branch
+    (:1186) hands the loss a strided tensor and the first optimizer step dies with "values expected
+    sparse tensor layout but got Strided". Every gdn-hybrid catalog model profiles as
+    `exact-unpacked`, so the AND broke text sft on all of them while `dev` trained fine.
+
+    The boundary-contamination guard that motivated the original gate is still here and still
+    load-bearing: `not gdn_hybrid or gdn_boundary_resets` already refuses to pack a gdn hybrid whose
+    child cannot honor `seq_idx` + `cu_seq_lens_q`. `rl_train` and `opd_train` use this exact
+    derivation; sft was the outlier.
+
+    Asserted on the source because reaching the real statement needs a live child probe and a
+    checkpoint; the failure is a wrong boolean, not an exception, so nothing else would surface it.
+    """
+    import ast
+    import inspect as _inspect
+
+    from flash.engine.worker import sft_train
+
+    tree = ast.parse(_inspect.getsource(sft_train))
+    assigns = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id == "use_remove_padding"
+    ]
+    assert len(assigns) == 1, (
+        f"expected exactly one `use_remove_padding` assignment, found {len(assigns)} "
+        f"(lines {[a.lineno for a in assigns]})"
+    )
+    names = {n.attr for n in ast.walk(assigns[0].value) if isinstance(n, ast.Attribute)} | {
+        n.id for n in ast.walk(assigns[0].value) if isinstance(n, ast.Name)
+    }
+    gate_msg = (
+        "use_remove_padding is gated on the profile's packing mode. that forces the padded verl "
+        "path for every gdn hybrid, and its no_padding sft_loss cannot read a strided tensor -- the "
+        "run dies on the first optimizer step. the step contract is already pinned by "
+        "profile.examples_per_update and profile.authoritative_steps; this flag is layout only."
+    )
+    assert "packing_mode" not in names, gate_msg
+    assert "profile_packs" not in names, gate_msg
+    assert {"gdn_hybrid", "gdn_boundary_resets"} <= names, (
+        "the gdn boundary-contamination guard is gone: a gdn hybrid whose child cannot honor "
+        f"seq_idx + cu_seq_lens_q must not pack. found {sorted(names)}"
+    )
