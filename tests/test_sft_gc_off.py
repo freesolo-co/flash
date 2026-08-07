@@ -72,6 +72,53 @@ def test_gc_off_peak_scales_linearly_with_seq():
     assert p2k > 70.0
 
 
+def test_dense_activation_constant_matches_the_live_rtx5090_peak():
+    """The dense K is a live measurement, not the MoE's safety pad.
+
+    Measured on an RTX 5090 (31.37 GB usable), Qwen3.5-0.8B (hidden 1024, 24 layers), LoRA rank 32
+    all-linear, bs 4, bf16, chunked dense-logit-free CE matching ``model.use_fused_kernels=true``:
+    seq 1024 -> 15.09 GB, seq 2048 -> 28.18 GB, seq 4096 -> OOM. The shared 18.0 predicted 9.89 GB at
+    seq 1024 and 20.76 GB at seq 4096 -- it called a run that OOMs a FIT, which is the failure this
+    pins. A safety gate must over-reserve, so the estimate has to sit ABOVE each live peak.
+    """
+    dense = {"active_params_b": None, "hidden": 1024, "num_layers": 24, "batch": 4, "lora_rank": 32}
+    for seq, live_peak in ((1024, 15.09), (2048, 28.18)):
+        est = sft_gc_off_peak_gb(0.8, seq_len=seq, **dense)
+        assert est > live_peak, f"seq {seq}: estimate {est:.2f} under-reserves vs live {live_peak}"
+        # ...but not so far above that the gate becomes useless -- 2x the live peak is the ceiling.
+        assert est < 2.0 * live_peak, f"seq {seq}: estimate {est:.2f} wildly over-reserves"
+    # seq 4096 OOMed a 31.37 GB card, so the estimate must exceed the card and keep GC ON.
+    assert sft_gc_off_peak_gb(0.8, seq_len=4096, **dense) > 31.37
+    assert sft_grad_checkpoint_can_disable(0.8, seq_len=4096, card_vram_gb=31.37, **dense) is False
+    # the 18 GB margin is what blocks the seq lengths that DO fit bare (15.09 GB at seq 1024 leaves
+    # only 16.28 GB), so a 32 GB card never disables GC for this model at any production context.
+    for seq in (1024, 2048):
+        assert (
+            sft_grad_checkpoint_can_disable(0.8, seq_len=seq, card_vram_gb=31.37, **dense) is False
+        )
+
+
+def test_dense_and_moe_activation_constants_are_separate():
+    """One constant cannot describe both geometries.
+
+    K is the per-layer activation cost relative to hidden, and a dense FFN intermediate (4 x 2048)
+    stores far more of it than the MoE's active 8 x 512. Sharing the dense 65.0 would flip the
+    35B-A3B -- the only model whose truthy ``active_params_b`` reaches this gate -- from GC-off to
+    GC-on at seq >= 2048 and pay ~+33% compute per step on evidence from a different architecture.
+    """
+    from flash.engine.vram import _GC_OFF_ACT_K_DENSE, _GC_OFF_ACT_K_MOE
+
+    assert _GC_OFF_ACT_K_DENSE > _GC_OFF_ACT_K_MOE
+    # same geometry, same params: only the MoE signal differs -> the dense estimate must be larger.
+    geom = {"hidden": 2048, "num_layers": 40, "batch": 4, "lora_rank": 16, "seq_len": 2368}
+    as_moe = sft_gc_off_peak_gb(35.0, active_params_b=3.0, **geom)
+    as_dense = sft_gc_off_peak_gb(35.0, active_params_b=None, **geom)
+    assert as_dense > as_moe
+    # the MoE decision on its real card is UNCHANGED by introducing the dense constant.
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=2368, card_vram_gb=141.0, **_MOE) is True
+    assert sft_grad_checkpoint_can_disable(35.0, seq_len=8192, card_vram_gb=141.0, **_MOE) is False
+
+
 def test_gc_off_unknown_dims_is_inf():
     assert sft_gc_off_peak_gb(
         35.0, active_params_b=3.0, seq_len=2368, hidden=0, num_layers=40
