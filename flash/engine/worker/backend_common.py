@@ -1704,19 +1704,21 @@ def run_verl_training(
         ) as watchdog:
             assert proc.stdout is not None
             for line in proc.stdout:
-                watchdog.note_line()
-                print(line, end="", flush=True)
-                child_tail.record(line)
-                if on_line is not None:
-                    on_line(line)
-                m = step_re.search(line)
-                if m and on_step is not None:
-                    on_step(int(m.group(1)))
-                if heartbeat is not None:
-                    now = time.monotonic()
-                    if now - last_hb >= heartbeat_interval_s:
-                        heartbeat()
-                        last_hb = now
+                # held across the callbacks, not just the arrival: on_step uploads a checkpoint, and
+                # a reader inside one is working, not stuck.
+                with watchdog.handling_line():
+                    print(line, end="", flush=True)
+                    child_tail.record(line)
+                    if on_line is not None:
+                        on_line(line)
+                    m = step_re.search(line)
+                    if m and on_step is not None:
+                        on_step(int(m.group(1)))
+                    if heartbeat is not None:
+                        now = time.monotonic()
+                        if now - last_hb >= heartbeat_interval_s:
+                            heartbeat()
+                            last_hb = now
     except BaseException:
         kill_process_group(proc, process_group_id=process_group_id)
         raise
@@ -1810,13 +1812,31 @@ class _ChildExitWatchdog:
         # minutes -- would otherwise be killed mid-upload and its successful run reported as failed.
         # a stuck reader cannot advance this; a busy one does, which is exactly the distinction.
         self._lines_read = 0
+        # how many lines are being HANDLED right now, not merely taken off the pipe. counting only
+        # arrivals makes one long callback look identical to a stuck reader -- the counter cannot
+        # advance while an upload runs, because the next line is not read until it returns (cursor).
+        # so progress is "a line arrived OR one is still in hand", and the two together mean the
+        # watchdog only ever fires on a reader that is neither receiving nor working.
+        self._lines_in_flight = 0
         # read by the caller after the loop ends, to distinguish "the child closed its own pipe" from
         # "we closed it by killing the group out from under a survivor".
         self.tore_down = False
 
-    def note_line(self) -> None:
-        """Called by the reader per line. A plain int store, so no lock is needed."""
+    @contextlib.contextmanager
+    def handling_line(self):
+        """Wraps the reader's whole per-line body, not just the moment the line arrives.
+
+        Entered once per line and held until that line's callbacks return, so an `on_step` upload
+        that outlasts the grace still reads as progress. Plain int stores, so no lock is needed: the
+        watchdog only ever compares them, and either order of the two writes below leaves the reader
+        looking busy rather than idle.
+        """
         self._lines_read += 1
+        self._lines_in_flight += 1
+        try:
+            yield
+        finally:
+            self._lines_in_flight -= 1
 
     def __enter__(self) -> Self:
         self._thread = threading.Thread(
@@ -1844,8 +1864,9 @@ class _ChildExitWatchdog:
             before = self._lines_read
             if self._done.wait(self._grace_s):
                 return
-            if self._lines_read != before:
-                # the reader is still draining real output. keep watching rather than tearing down.
+            if self._lines_read != before or self._lines_in_flight:
+                # the reader is still draining real output, or is inside a callback for a line it
+                # already took. either way it is working, so keep watching rather than tearing down.
                 continue
             self.tore_down = True
             kill_process_group(self._proc, process_group_id=self._process_group_id)

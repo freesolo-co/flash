@@ -429,6 +429,52 @@ def test_explicit_schema_and_custom_dataset_read_text_image_orders(
     assert image_item["multi_modal_inputs"]["image_grid_thw"].tolist() == [[1, 2, 3]]
 
 
+def test_mrope_processor_check_matches_every_image_training_model():
+    """The mRoPE branch is selected by processor class NAME, so it must match the real classes.
+
+    The dataset picks grid-aligned multi-axis positions only when the processor's image_processor
+    class name contains a literal; anything else falls through to a 1-D `arange`, which a
+    vision-language forward cannot use. The test above supplies a fake it names itself, so it
+    proves the branch works but NOT that the literal matches what transformers actually builds --
+    a reviewer read the Qwen3.5/3.6 catalog as using a distinct Qwen3 processor for exactly this
+    reason.
+
+    They do not: transformers maps the whole qwen3_5 family onto the Qwen2VL processor. This reads
+    the real mapping rather than restating it, so a future transformers pin that introduces a
+    genuine Qwen3 processor class fails here instead of silently training images at wrong
+    positions.
+    """
+    from transformers.models.auto.image_processing_auto import IMAGE_PROCESSOR_MAPPING_NAMES
+
+    from flash.catalog import _IMAGE_TRAINING_MODELS
+
+    # take the literal from the shipped source, so the guard cannot drift from the branch it guards.
+    rendered = _render_sft_dataset_module()
+    match = re.search(r'"([A-Za-z0-9_]+)" in self\.processor\.image_processor', rendered)
+    assert match, "the mRoPE branch no longer selects on an image_processor class name"
+    literal = match.group(1)
+
+    # config model_type for the catalog's image-training models. Qwen3.6-* ship as qwen3_5 configs
+    # (the product version is not the architecture), and the -A3B moe variant is a separate one.
+    model_types = {"qwen3_5", "qwen3_5_moe"}
+    assert len(_IMAGE_TRAINING_MODELS) == 6, (
+        "the image-training catalog changed; confirm the new models' config model_type is covered"
+    )
+
+    for model_type in sorted(model_types):
+        entry = IMAGE_PROCESSOR_MAPPING_NAMES.get(model_type)
+        assert entry, f"transformers has no image processor mapped for {model_type}"
+        # every variant is checked, not just the default: the substring test is what makes the
+        # branch tolerate the Fast/Pil suffixes, and a real model advertises the suffixed name
+        # (Qwen3.5-0.8B's preprocessor_config.json says Qwen2VLImageProcessorFast).
+        names = list(entry.values()) if isinstance(entry, dict) else [entry]
+        for name in names:
+            assert literal in name, (
+                f"{model_type} builds {name}, which the mRoPE check ({literal!r}) does not match; "
+                "image SFT would fall through to 1-D arange positions on a paid run"
+            )
+
+
 @pytest.mark.parametrize("shape", ["listconfig", "list", "str"])
 def test_custom_dataset_accepts_every_parquet_files_shape(tmp_path, shape):
     """verl passes data.train_files through from hydra, so the dataset sees a ListConfig."""
