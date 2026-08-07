@@ -59,7 +59,7 @@ VERL_VENV_PYTHON = "3.12"
 # causal_conv1d resets the short causal conv (seq_idx); WITHOUT them transformers falls back to
 # implementations that accept both arguments and silently discard them, so packed GDN training is
 # contaminated across example boundaries while appearing patched. fla is required; causal_conv1d is
-# best-effort (a failed build makes verl_child_gdn_reset_arch answer None, which turns
+# best-effort (a failed build makes the gdn capability answer False, which turns
 # remove-padding off and trains padded rather than wrong).
 FLA_REQUIREMENT = (
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git"
@@ -119,7 +119,7 @@ def _install_causal_conv1d(py: str) -> None:
     """Install the causal conv kernel that resets GDN conv state at packed example boundaries.
 
     Best-effort, deliberately: unlike flash-attn this cannot fail the provisioning. Without it
-    ``verl_child_gdn_reset_arch`` answers None, the caller turns remove-padding off, and
+    ``gdn_reset_arch_from_caps`` answers None, the caller turns remove-padding off, and
     the model trains on verl's padded path -- slower, but boundary-correct. Dying here instead would
     turn a compiler hiccup into a dead paid run.
 
@@ -343,7 +343,7 @@ def ray_num_cpus(gpu_count: int = 1, *, cap: int = 16) -> int:
 # causal_conv1d, flashinfer) and never `flash`, which is not installed in the verl venv -- an
 # `import flash` here would raise in every child and silently answer "no" to everything. anything
 # needing flash code or a hub read is resolved by the PARENT and interpolated in as a literal (see
-# verl_child_gdn_reset_arch's docstring for the full reasoning).
+# gdn_reset_arch_from_caps's docstring for the full reasoning).
 #
 # EVERY question is answered independently inside its own try/except and defaults to the same
 # fail-closed answer the individual probe returned, so one unavailable capability cannot suppress
@@ -580,7 +580,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
 
     the preset is returned as-is: flash does not own that interpreter and must not mutate it. it can
     hold a verl without the fork's rollout fields, so callers emitting a fork-only override gate it
-    on verl_supports_rollout_field.
+    on verl_declares_rollout_field.
 
     a self-provisioned venv is flash's own, and is rebuilt whenever it does not record the current
     VERL_REQUIREMENT, so an empty/absent FLASH_VERL_PYTHON always yields the pinned verl.
@@ -1842,7 +1842,7 @@ def render_gdn_varlen_shim(model_type: str) -> str:
     labelled fixed. the class is then found by ``TextModel`` suffix rather than by name, for the same
     reason the probe finds ``GatedDeltaNet`` that way. deliberately has NO default: the only sensible
     one would be ``qwen3_5``, which is exactly the wrong answer for the MoE, and a caller that
-    forgot the argument would silently get it. pass ``verl_child_gdn_reset_arch``'s return value.
+    forgot the argument would silently get it. pass ``gdn_reset_arch_from_caps``'s return value.
 
     note that the model NAME does not predict the module: the 27B is Qwen3.6 by name but reports
     ``model_type: qwen3_5``, while the 35B reports ``qwen3_5_moe``. only the config is authoritative.

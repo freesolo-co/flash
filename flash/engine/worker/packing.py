@@ -98,7 +98,7 @@ def gdn_model_type(model_id: str | None, revision: str = "") -> str:
 
     Read from the checkpoint's config, so the answer is a property of the weights rather than of
     whichever transformers is installed -- which is what lets the parent resolve it on behalf of the
-    verl child (see backend_common.verl_child_gdn_reset_arch).
+    verl child (see backend_common.gdn_probe_module).
     """
     if not model_id:
         return "qwen3_5"
