@@ -1753,6 +1753,12 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
         "as a single card"
     )
     assert adopted["allocated_gpu"] == "RTX 4090"
+    # and the substrate that billed it. _gpu_rate falls back to whichever configured provider
+    # offers the class, so without this the run is priced on a provider that never ran it.
+    assert adopted["allocated_provider"] == "vast", (
+        "an adopted vast run reached persistence with no provider, so it is priced on whichever "
+        "provider the plane happens to try first"
+    )
 
 
 def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, tmp_path):
