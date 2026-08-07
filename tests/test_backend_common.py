@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2786,3 +2787,140 @@ def test_both_verl_bridges_use_the_bounded_server():
                     f"{mod.__name__}.{node.name} still subclasses the unbounded "
                     "ThreadingHTTPServer; it will spawn a thread per request"
                 )
+
+
+def _exec_tf32_fragment_against(fake_torch):
+    """run the rendered tf32 fragment with ``fake_torch`` standing in for torch."""
+    with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+        exec(compile(vc.render_tf32_shim(), "sitecustomize.py", "exec"), {})
+
+
+def _tf32_off_torch():
+    """a torch stub at torch's real defaults: matmul tf32 OFF, precision 'highest'."""
+    precision = []
+
+    return SimpleNamespace(
+        set_float32_matmul_precision=precision.append,
+        backends=SimpleNamespace(
+            cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=False)),
+            cudnn=SimpleNamespace(allow_tf32=False),
+        ),
+        _precision_calls=precision,
+    )
+
+
+def test_the_tf32_fragment_actually_enables_tf32():
+    """THE regression: torch defaults cuda.matmul.allow_tf32 to False, so an fp32 matmul runs at
+    full fp32 rate unless something opts in. assert on the flags AFTER executing the fragment --
+    a substring match on the rendered source would pass on a fragment that never runs."""
+    fake = _tf32_off_torch()
+    _exec_tf32_fragment_against(fake)
+    assert fake.backends.cuda.matmul.allow_tf32 is True
+    assert fake.backends.cudnn.allow_tf32 is True
+    assert fake._precision_calls == ["high"]
+
+
+def test_the_tf32_fragment_never_aborts_a_paid_run():
+    """tf32 is a throughput optimization, so a torch that cannot take these flags must leave
+    training running rather than kill the child at sitecustomize time."""
+
+    class _Exploding:
+        def __getattr__(self, name):
+            raise RuntimeError("torch backends unavailable")
+
+    _exec_tf32_fragment_against(_Exploding())  # must not raise
+
+    # and an absent torch is the same story: sitecustomize runs before verl imports anything.
+    with mock.patch.dict(sys.modules, {"torch": None}):
+        exec(compile(vc.render_tf32_shim(), "sitecustomize.py", "exec"), {})
+
+
+@pytest.mark.parametrize("backend", ["grpo", "opd", "sft"])
+def test_every_verl_backend_enables_tf32_in_the_child(backend, monkeypatch):
+    """the model runs in the verl CHILD, and torch's tf32 flags are per-process state no subprocess
+    inherits. setting them in the flash parent (which trains nothing) leaves the trainer on the slow
+    path, so each backend must carry the fragment in the sitecustomize its child imports.
+
+    execute the rendered shim rather than grepping it: that is what the child does, and it is the
+    only check that fails when a backend renders the fragment but never reaches it.
+    """
+    from flash.engine.worker import opd_train, sft_train
+
+    if backend == "grpo":
+        # grpo assembles shim_source inside run_rl_train, past the subprocess launch, so there is no
+        # renderer to call. rebuild the join from the ast instead: calling render_tf32_shim() here
+        # would test the renderer this test already covers and stay green if run_rl_train stopped
+        # joining it in -- the exact regression, with grpo back on fp32 matmuls.
+        assign = next(
+            node
+            for node in ast.walk(
+                ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+            )
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "id", "") == "shim_source" for t in node.targets)
+        )
+        rendered = [
+            ast.unparse(node.func)
+            for node in ast.walk(assign.value)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert "render_tf32_shim" in rendered, (
+            "run_rl_train no longer joins render_tf32_shim() into shim_source; the grpo child gets "
+            f"no tf32 fragment and trains fp32. joined renderers were: {rendered!r}"
+        )
+        # and the fragment must be unconditional -- a renderer that returns "" for some config
+        # would drop it. `part for part in (...) if part` filters empties, so an inert render is
+        # indistinguishable from an absent one at runtime.
+        source = vc.render_tf32_shim()
+        assert source.strip(), "render_tf32_shim() returned nothing to join"
+    elif backend == "opd":
+        source = opd_train._render_opd_sitecustomize(save_at_steps=(3,), total_steps=3)
+    else:
+        source = sft_train._render_sft_sitecustomize(
+            seed=1,
+            loraplus_ratio=16.0,
+            save_at_steps=(3,),
+            total_steps=3,
+            reentrant_gradient_checkpointing=False,
+        )
+
+    # the fragment sits above each backend's verl imports on purpose, so stop the exec once the
+    # flags are set: the rest of the shim needs a real verl/transformers stack this test has not.
+    # BaseException, not Exception -- the fragment swallows Exception by design, so an ordinary
+    # subclass would be caught by the very code under test and the exec would run on into verl.
+    class _Stop(BaseException):
+        pass
+
+    # trip on the LAST of the three flags, so reaching it proves all three ran.
+    class _StopOnCudnn:
+        allow_tf32 = False
+
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value)
+            raise _Stop
+
+    fake = _tf32_off_torch()
+    fake.backends.cudnn = _StopOnCudnn()
+    with mock.patch.dict(sys.modules, {"torch": fake}), contextlib.suppress(_Stop):
+        exec(compile(source, "sitecustomize.py", "exec"), {})
+
+    assert fake._precision_calls == ["high"], (
+        f"{backend}'s child shim never reached the tf32 fragment; its trainer runs fp32 matmuls"
+    )
+    assert fake.backends.cuda.matmul.allow_tf32 is True
+    assert fake.backends.cudnn.allow_tf32 is True
+
+
+def test_grpo_does_not_enable_tf32_in_the_parent():
+    """the grpo parent holds a cuda context (wait_for_gpu touches the device) but runs no matmuls --
+    verl does, out of process. a setup_perf_backends() call here sets flags on the wrong process and
+    reads as 'tf32 enabled' in the logs while the trainer runs full fp32."""
+    tree = ast.parse(pathlib.Path(inspect.getfile(rl_train)).read_text())
+    called = [
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert "setup_perf_backends" not in called, (
+        "rl_train calls setup_perf_backends in the parent; the trainer child inherits none of it"
+    )
