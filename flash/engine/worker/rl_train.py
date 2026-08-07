@@ -611,7 +611,15 @@ def resolve_gpu_mem_util(
         info = None if revision else catalog_info
         # the ONE way the worker, the preflight and the cost estimator agree on a model's size:
         # curated catalog params_b, else the real HF parameter count for an open-policy model.
-        params_b = float(resolve_params_b(model_id, revision=revision) or 0.0)
+        # the catalog is consulted FIRST and answers locally, so the common path adds no network
+        # call to launch; resolve_params_b's HF lookup is reached only for an uncataloged or
+        # pinned-revision model, where the config for this same model was already fetched upstream
+        # (model_max_position_embeddings) and is warm in the hub cache.
+        params_b = float(
+            (getattr(catalog_info, "params_b", 0.0) or 0.0)
+            if (catalog_info is not None and not revision)
+            else (resolve_params_b(model_id, revision=revision) or 0.0)
+        )
         if params_b <= 0:
             return _DEFAULT_GPU_MEM_UTIL
         return colocate_kv_util(
