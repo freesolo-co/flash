@@ -29,12 +29,14 @@ def _on_policy_epochs(spec) -> int:
 
 
 def _sft_profile(spec):
-    from flash import __version__
-
+    # the version that keyed the digest travels on the spec. re-deriving it from
+    # `flash.__version__` would make this quote depend on which process is doing the arithmetic:
+    # a worker has no flash distribution installed and resolves the "0+unknown" fallback.
+    producer_version = spec.workload_profile_producer_version
     input_digest = sft_profile_input_digest(
         spec,
         tokenizer_revision=spec.model_revision,
-        producer_version=__version__,
+        producer_version=producer_version,
     )
     if input_digest != spec.workload_profile_input_digest:
         raise WorkloadProfileMismatch(
@@ -43,7 +45,7 @@ def _sft_profile(spec):
     return require_matching_sft_profile(
         spec.workload_profile,
         input_digest=input_digest,
-        producer_version=__version__,
+        producer_version=producer_version,
         tokenizer_revision=spec.model_revision,
     )
 

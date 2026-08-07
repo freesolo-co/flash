@@ -12,7 +12,7 @@ from typing import Any
 
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import resolve_update_horizon, sft_update_steps
-from flash.engine.worker.packing import model_is_gdn_hybrid, model_is_pure_attention
+from flash.engine.worker.packing import probe_is_gdn_hybrid, probe_is_pure_attention
 from flash.engine.worker.sft import (
     _pretokenize_completion_only,
     _reject_image_completion,
@@ -173,12 +173,26 @@ def _packing_mode(
         return "exact-unpacked", "multimodal"
     if packing_support is not None:
         architecture_mode, supported = packing_support(model_id, revision)
-    elif model_is_pure_attention(model_id, revision=revision):
-        architecture_mode, supported = "pure-attention", True
-    elif model_is_gdn_hybrid(model_id, revision=revision):
-        architecture_mode, supported = "gdn-hybrid", False
     else:
-        architecture_mode, supported = "unsupported", False
+        # the RAISING probes, not the swallowing ones. both labels below are frozen into the
+        # profile and compared byte-for-byte by the training worker (sft_train.py), so a probe that
+        # answered False because the hub timed out would freeze "unsupported", and a later
+        # re-derivation that reached the config would produce "gdn-hybrid" and fail the run with
+        # "sft workload changed after the quote was frozen" -- while every token, step and packing
+        # decision was in fact identical. a probe that could not answer must fail the PROFILE, which
+        # is retryable, rather than mint a label that poisons every training run built on it.
+        try:
+            if probe_is_pure_attention(model_id, revision=revision):
+                architecture_mode, supported = "pure-attention", True
+            elif probe_is_gdn_hybrid(model_id, revision=revision):
+                architecture_mode, supported = "gdn-hybrid", False
+            else:
+                architecture_mode, supported = "unsupported", False
+        except Exception as e:
+            raise RuntimeError(
+                f"architecture probe for {model_id!r} could not resolve the model config, so the "
+                "packing mode cannot be frozen into a workload profile"
+            ) from e
     return ("packed" if allow_packing and supported else "exact-unpacked"), architecture_mode
 
 
@@ -379,6 +393,20 @@ def prepare_sft_workload(
     supervised_tokens = sum(sum(int(item) for item in row["loss_mask"]) for row in rows)
     padded_compute_tokens = real_tokens
     realized_max_length = max(len(row["input_ids"]) for row in rows)
+    # one example per update is this layer's isolation lever for an architecture it cannot pack.
+    # a micro-batch reaches the model as one (1, total_nnz) row with `attention_mask=None`: softmax
+    # layers recover their boundaries from the per-example `position_ids` restarts, but
+    # GatedDeltaNet layers read theirs out of `seq_idx` (causal conv) and `cu_seq_lens_q`
+    # (recurrence), so on a gdn hybrid every example after the first would train on state carried
+    # over from its predecessor -- silently, with no error and no metric. keeping one example per
+    # batch leaves nothing to carry.
+    #
+    # this decision is made WITHOUT a gpu, so it can only go on the architecture, and it is the one
+    # that binds: `examples_per_update` feeds the quoted step count below, and the worker replays it
+    # verbatim (sft_train reads `profile.examples_per_update` and `profile.authoritative_steps`), so
+    # the horizon the user was quoted is the horizon that runs. the worker's child probe decides
+    # something ELSE -- verl's tensor layout, `use_remove_padding` -- which is why that flag must not
+    # be gated on this mode: it selects a code path, not a batch size.
     examples_per_update = min(effective_batch, len(rows)) if packing_mode == "packed" else 1
     # packed_blocks is already the optimizer batches verl runs per epoch, so the horizon is one
     # update per block per epoch. do not divide by examples_per_update again.
