@@ -5017,6 +5017,66 @@ def test_attach_reconciler_rate_limits_failed_terminal_cas_past_grace(monkeypatc
         assert "could not be adopted" in orch.get_status(spec.run_id).error
 
 
+def test_an_adopted_instance_run_is_still_priced_for_every_card_it_occupied(monkeypatch):
+    # _completed_attempt_metrics returns the WORKER's metrics.json verbatim, and the worker never
+    # knew how many cards the allocator gave it -- the plane stamped that onto the persisted remote
+    # at launch. so an adopted multi-card vast/lambda run reaches _persist_metrics with no count
+    # and prices its whole wall as ONE card, silently understating a 4-card run 4x.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.deploy as deploy_mod
+        import flash.runner.lifecycle as lifecycle_mod
+
+        remote = _vast_recovery_remote()
+        remote["allocated_gpu"] = "RTX 4090"
+        remote["allocated_gpu_count"] = 4
+        spec = _spec("vast-adopt-multicard")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+        deadline = 1_000.0
+        monkeypatch.setattr(orch, "_load_run_deadline_at", lambda _run_id: deadline)
+        monkeypatch.setattr(deploy_mod.time, "time", lambda: deadline)
+        monkeypatch.setattr(deploy_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(lifecycle_mod, "_runpod_completed_metrics", lambda *_a, **_k: None)
+        # what the worker actually wrote: a wall, and nothing about the allocation.
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_completed_attempt_metrics",
+            lambda *_a, **_k: {"wall_seconds": 3600.0},
+        )
+        monkeypatch.setattr(orch, "_record_cleanup_remote", lambda *_a, **_k: True)
+
+        adopted = {}
+
+        def capture(_run_id, _spec, _expected, metrics, **_kwargs):
+            adopted.update(metrics)
+            return True
+
+        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", capture)
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        assert adopted["allocated_gpu_count"] == 4, (
+            "an adopted multi-card run reached persistence with no card count, so its wall "
+            "prices as a single card"
+        )
+        assert adopted["allocated_gpu"] == "RTX 4090"
+
+
 def test_attach_reconciler_does_not_clobber_newer_remote(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
