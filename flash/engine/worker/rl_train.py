@@ -59,12 +59,15 @@ from flash.engine.worker.backend_common import (
     append_step_metrics,
     clamp_engine_len,
     export_peft_adapter,
+    gdn_probe_module,
+    gdn_reset_arch_from_caps,
     kill_process_group,
     latest_global_step_dir,
     model_max_position_embeddings,
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    probe_verl_capabilities,
     raise_for_classified_verl_exit,
     ray_num_cpus,
     reap_stragglers,
@@ -73,7 +76,6 @@ from flash.engine.worker.backend_common import (
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
-    resolve_verl_device_capability,
     resolve_verl_loggers,
     resolve_verl_python,
     rollout_resident_overrides,
@@ -81,8 +83,8 @@ from flash.engine.worker.backend_common import (
     stage_verl_resume,
     stamp_adapter_dir_provenance,
     trainer_dtype_overrides,
-    verl_child_gdn_reset_arch,
-    verl_supports_rollout_field,
+    verl_declares_rollout_field,
+    verl_device_capability,
 )
 from flash.engine.worker.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
@@ -3431,14 +3433,32 @@ def run_rl_train():
     gpu_sampler = _NvidiaSmiPeakSampler().start()
     device_peak_gpu_gb: float | None = None
     try:
-        python_bin = resolve_verl_python(
-            workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
-        )
+        # provisioning the verl interpreter builds a venv and installs the whole training stack when
+        # the run has no prebuilt worker image, and the batched capability probe that follows pays a
+        # cold torch/verl import. that is minutes of silence with no training step to report and no
+        # liveness thread otherwise running here -- long enough for the stall watchdog to fail a
+        # healthy run. sft and opd have wrapped this since #442; grpo never did.
+        # no progress= : there is no monotonic counter to read, only the keepalive.
+        with liveness_heartbeat("rl_configuring"):
+            python_bin = resolve_verl_python(
+                workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+            )
+            # gdn boundary resets need the CHILD to have fla + causal_conv1d: without them the
+            # kwargs are accepted and discarded, so packed examples bleed state into each other.
+            # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read
+            # the child must not repeat; "" skips the question for a non-hybrid.
+            gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
+            gdn_module = (
+                gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
+            )
+            # ONE child answers every independent capability question. each used to cost its own
+            # interpreter, and the torch/verl import -- not the question -- was the price.
+            caps = probe_verl_capabilities(python_bin, gdn_module)
         # masking truncated completions is a fork-only rollout field. FLASH_VERL_PYTHON can point at a
         # stock verl, and hydra would compose the unknown key only to abort in dataclass conversion.
         # fail here with the cause instead, and never silently train on truncated completions.
-        if inp["mask_truncated_completions"] and not verl_supports_rollout_field(
-            python_bin, "mask_truncated_completions"
+        if inp["mask_truncated_completions"] and not verl_declares_rollout_field(
+            caps, "mask_truncated_completions"
         ):
             raise RuntimeError(
                 f"grpo requested mask_truncated_completions but the verl at {python_bin} does not "
@@ -3446,16 +3466,10 @@ def run_rl_train():
                 f"interpreter with '{VERL_REQUIREMENT}' installed, or set it EMPTY under "
                 '[worker_env] as FLASH_VERL_PYTHON = "" to provision one.'
             )
-        # gdn boundary resets need the CHILD to have fla + causal_conv1d: without them the kwargs
-        # are accepted and discarded, so packed examples bleed state into each other. appended here
-        # rather than with the shims above because the probe needs python_bin, which is resolved in
-        # this block; sitecustomize is imported by the child, which has not started yet.
-        gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
-        gdn_reset_arch = (
-            verl_child_gdn_reset_arch(python_bin, inp["model_id"], inp["model_revision"])
-            if gdn_hybrid
-            else None
-        )
+        # the shim is appended here rather than with the shims above because the answer needs
+        # python_bin, resolved in the block above; sitecustomize is imported by the child, which has
+        # not started yet.
+        gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
         gdn_boundary_resets = gdn_reset_arch is not None
         use_remove_padding = not gdn_hybrid or gdn_boundary_resets
         if gdn_reset_arch is not None:
@@ -3470,7 +3484,7 @@ def run_rl_train():
 
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see resolve_verl_loggers).
-        loggers = resolve_verl_loggers(python_bin)
+        loggers = resolve_verl_loggers(caps)
         _spec = _w.JOB_SPEC
         project_name = (_spec.wandb.project if _spec and _spec.wandb else None) or "flash"
         experiment_name = _w.wandb_run_name()
@@ -3491,12 +3505,12 @@ def run_rl_train():
         fp8_kv = _cc_ok and not gdn_hybrid
         # one capability probe, both rollout decisions below. asked of the verl interpreter, whose
         # torch/vllm stack is the one that has to run the rollout.
-        verl_cc = resolve_verl_device_capability(python_bin)
+        verl_cc = verl_device_capability(caps)
         # blackwell needs both rollout attention backends pinned; vllm 0.19.1's own defaults pick
         # flash-attn, which is PTX-unreliable on sm120 (silent empty rollouts) and routes the ViT
         # into an unimportable CUTE kernel on sm100/sm120. no-op off blackwell.
         attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(
-            python_bin, verl_cc
+            caps, verl_cc
         )
         # sm86 is the one arch whose vllm 0.19.1 graph capture is a measured failure (completions
         # repeat to the token cap without emitting EOS), so only it runs the rollout eagerly. see
