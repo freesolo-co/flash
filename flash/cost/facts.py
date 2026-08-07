@@ -279,17 +279,28 @@ def total_params_b(model_id: str, revision: str = "") -> float:
 # _is_moe asking twice per call). For a catalog model those are dict reads; for an open-policy model
 # each one would be an HF round trip, turning a submit into ~30 sequential network calls and making
 # the estimate hostage to hub latency. Memoized per process: a model id and revision name immutable
-# weights, so the answer cannot change under us. Not on `fetch_hf_params_b` itself, which tests
-# monkeypatch -- caching there would leak a stubbed size across tests.
-_SIZE_MEMO: dict[tuple[str, str], float | None] = {}
+# weights, so a SUCCESSFUL answer cannot change under us. Not on `fetch_hf_params_b` itself, which
+# tests monkeypatch -- caching there would leak a stubbed size across tests.
+_SIZE_MEMO: dict[tuple[str, str], float] = {}
 
 
 def _sized_from_hf(model_id: str, revision: str) -> float | None:
+    """Resolve an uncataloged model's size, caching only a real answer.
+
+    A miss is NOT cached. A failed lookup is a transient hub error, a rate limit, or an HF_TOKEN
+    that has not been granted access yet -- not a fact about the model. Caching it would make the
+    first failure permanent for the life of the process, so on a long-lived self-hosted plane one
+    blip would keep rejecting that model until the operator restarted the plane, with no way to
+    tell that from a genuinely unsizeable model.
+    """
     key = (model_id, revision)
     if key not in _SIZE_MEMO:
         from flash.engine.vram import resolve_params_b
 
-        _SIZE_MEMO[key] = resolve_params_b(model_id, revision=revision)
+        params_b = resolve_params_b(model_id, revision=revision)
+        if not params_b:
+            return None
+        _SIZE_MEMO[key] = params_b
     return _SIZE_MEMO[key]
 
 

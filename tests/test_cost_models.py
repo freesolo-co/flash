@@ -104,6 +104,25 @@ def test_an_open_model_is_sized_over_the_network_once(monkeypatch):
     assert len(calls) == 1
 
 
+def test_a_failed_lookup_is_retried_not_remembered(monkeypatch):
+    """A miss is a transient hub error, a rate limit, or an HF_TOKEN without access yet -- not a
+    fact about the model. Memoizing it made the first blip permanent: on a long-lived self-hosted
+    plane every later submit for that model kept failing until the operator restarted the plane."""
+    import flash.engine.vram as vram
+
+    healthy = False
+
+    def _flaky(_model_id, **_kwargs):
+        return 8.03 if healthy else None
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", _flaky, raising=False)
+    with pytest.raises(ValueError, match="could not size model"):
+        total_params_b("meta-llama/Llama-3.1-8B")
+
+    healthy = True
+    assert total_params_b("meta-llama/Llama-3.1-8B") == pytest.approx(8.03)
+
+
 def test_a_catalog_model_is_never_sized_over_the_network(monkeypatch):
     """The curated entry answers first: adding the HF fallback must not put a network call on the
     managed path, where every model is cataloged."""
