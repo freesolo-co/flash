@@ -3921,24 +3921,51 @@ def test_multi_turn_child_modules_do_not_import_flash(tmp_path):
                 )
 
 
-def test_the_run_body_puts_the_shim_dir_on_the_child_path_for_multi_turn():
+def test_the_run_body_always_puts_the_shim_dir_on_the_child_path():
     # the copies above are useless unless shim_dir is importable. the condition used to be
     # `if shim_source:` -- true only when some OTHER feature wanted a sitecustomize patch, so a
     # plain multi-turn job copied three modules the child could never import. source-level because
     # the assignment sits inside run_rl_train, past the subprocess launch.
     src = inspect.getsource(rl_train.run_rl_train)
-    # matched on the guard's TERMS rather than its exact text: the condition legitimately grows a
-    # disjunct whenever another feature writes into shim_dir (the gdn boundary shim did), and an
-    # exact-string assertion fails on that without anything being wrong. what must stay true is that
-    # a multi-turn job reaches the PYTHONPATH assignment on its own.
-    lines = src.splitlines()
-    assign = next(i for i, line in enumerate(lines) if 'env_for_verl["PYTHONPATH"]' in line)
-    guard = next(
-        line for line in reversed(lines[:assign]) if line.strip().startswith("if shim_source")
-    )
-    assert 'inp["multi_turn"]' in guard, (
-        f"PYTHONPATH is not extended for a multi-turn job with no other shim; guard was: {guard!r}"
-    )
+    # the assignment is now unconditional (the tf32 fragment means the shim is never empty), which
+    # satisfies this invariant strictly more than any guard could. assert THAT rather than the terms
+    # of a guard: re-introducing one is the regression, since every disjunct it could carry is a
+    # feature that might be off while multi-turn is on -- and the tf32 fragment needs the entry on
+    # EVERY run, so there is no longer a condition under which skipping it is correct.
+    #
+    # walk the ast rather than matching indentation: an earlier `if` block that has already closed
+    # is not a guard on this assignment, and only the tree knows which blocks actually enclose it.
+    tree = ast.parse(textwrap.dedent(src))
+
+    def _assigns_pythonpath(node):
+        return any(
+            isinstance(sub, ast.Subscript)
+            and isinstance(sub.slice, ast.Constant)
+            and sub.slice.value == "PYTHONPATH"
+            for target in getattr(node, "targets", [])
+            for sub in ast.walk(target)
+        )
+
+    def _guards(node, stack):
+        if isinstance(node, ast.Assign) and _assigns_pythonpath(node):
+            found.append(list(stack))
+        if isinstance(node, ast.If):
+            for sub in node.body:
+                _guards(sub, [*stack, ast.unparse(node.test)])
+            for sub in node.orelse:
+                _guards(sub, [*stack, f"not ({ast.unparse(node.test)})"])
+            return
+        for child in ast.iter_child_nodes(node):
+            _guards(child, stack)
+
+    found: list[list[str]] = []
+    _guards(tree, [])
+    assert found, "run_rl_train no longer assigns env_for_verl['PYTHONPATH']"
+    for stack in found:
+        assert not stack, (
+            "PYTHONPATH is conditionally extended again; a multi-turn job (or the tf32 fragment) "
+            f"can miss shim_dir. enclosing conditions were: {stack!r}"
+        )
     assert 'if inp["multi_turn"]:\n        copy_multi_turn_child_modules(shim_dir)' in src
 
 

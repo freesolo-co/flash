@@ -29,6 +29,7 @@ from flash.engine.worker.backend_common import (
     parse_verl_metric,
     parse_wandb_link,
     render_gdn_varlen_shim,
+    render_tf32_shim,
     render_wandb_link_shim,
     resolve_checkpoint_actor_dir,
     resolve_verl_loggers,
@@ -400,7 +401,10 @@ def _render_sft_sitecustomize(
     reentrant_gradient_checkpointing: bool,
 ) -> str:
     required_steps = tuple(int(step) for step in save_at_steps)
+    # the tf32 fragment goes first, above the verl imports: grpo and opd share the same renderer,
+    # and putting it ahead of them means an import that raises cannot cost the run its throughput.
     source = f"""# generated flash sft runtime patches for verl 0.8
+{render_tf32_shim()}
 import random as _flash_random
 
 import numpy as _flash_numpy
@@ -414,9 +418,6 @@ _flash_seed = {int(seed)}
 _flash_random.seed(_flash_seed)
 _flash_numpy.random.seed(_flash_seed % (2**32))
 _flash_torch.manual_seed(_flash_seed)
-_flash_torch.set_float32_matmul_precision("high")
-_flash_torch.backends.cuda.matmul.allow_tf32 = True
-_flash_torch.backends.cudnn.allow_tf32 = True
 
 _flash_original_loader = _flash_sft_trainer.StatefulDataLoader
 
