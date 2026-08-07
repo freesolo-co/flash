@@ -67,16 +67,21 @@ jobs:
       # dev-channel package (publish-dev.yml) already flips it via the same script before its
       # own build. The Docker image build never did, so `:dev` shipped with CHANNEL="prod" and
       # every channel-derived default (serving URL, control-plane URL, CLI/dist names) resolved
-      # to prod instead of dev. Flip it here too, dev branch only -- :main must ship as checked in.
+      # to prod instead of dev. Apply the same full transform here, dev branch only -- :main must
+      # ship as checked in. --no-build applies the pyproject + channel rewrites together (they
+      # must move in lockstep: flash/__init__.py's __version__ resolves via
+      # importlib.metadata.version(DIST_NAME), so flipping CHANNEL alone leaves that lookup
+      # pointed at a distribution name nothing installed) and skips `uv build`, which this image
+      # doesn't need.
       - name: Set up Python
         if: github.ref_name == 'dev'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Flip release channel for the dev image
+      - name: Apply dev-channel source transform for the dev image
         if: github.ref_name == 'dev'
-        run: python3 scripts/build_dev_dist.py --channel-only
+        run: python3 scripts/build_dev_dist.py --no-build
 
       - name: Build and push
         uses: docker/build-push-action@v6
