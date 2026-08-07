@@ -1,9 +1,13 @@
-"""Cost estimator: model-size facts (catalog-only). No network.
+"""Cost estimator: model-size facts. No network on the managed path.
 
-The cost model supports the curated catalog only: six dense models plus one MoE, with no
-open-model or unlisted sizing. The numeric size is the catalog's ``params_b`` stat, read directly
-(no parsing of the ``params`` display string). For the MoE the per-token FLOPs/step-time term reads
-the smaller ``active_params_b`` while memory/size terms (VRAM, disk, download) keep total ``params_b``.
+A curated model is sized from the catalog's ``params_b`` stat, read directly (no parsing of the
+``params`` display string) and with no network call. For the MoE the per-token FLOPs/step-time term
+reads the smaller ``active_params_b`` while memory/size terms (VRAM, disk, download) keep total
+``params_b``.
+
+An UNCATALOGED model reaches the estimator only under ``model_policy="allow"`` (self-hosted planes),
+and is sized from HF safetensors metadata via the same ``resolve_params_b`` the VRAM path uses, so
+cost and sizing cannot disagree. Unsizeable by both = rejected; the quote never guesses.
 """
 
 from __future__ import annotations
@@ -55,10 +59,38 @@ def test_download_weight_gb_is_total_params_bf16():
     assert download_weight_gb(nine) == pytest.approx(total_params_b(nine) * 2.0)
 
 
-def test_unknown_model_is_rejected():
-    # Catalog-only: an unknown model raises (ValueError, like catalog.get_model) rather than
-    # guessing a size.
-    with pytest.raises(ValueError, match="catalog models only"):
+def test_an_unsizeable_model_is_rejected():
+    # Fail closed: uncataloged AND unsizeable by HF (the autouse _offline fixture returns None)
+    # raises rather than pricing an unknown model as free.
+    with pytest.raises(ValueError, match="could not size model"):
         total_params_b("nobody/never-heard-of-it")
-    with pytest.raises(ValueError, match="catalog models only"):
+    with pytest.raises(ValueError, match="could not size model"):
         active_params_b("nobody/never-heard-of-it")
+
+
+def test_an_open_policy_model_is_priced_from_huggingface(monkeypatch):
+    """An authorized open-model run must be PRICEABLE, not just parseable.
+
+    Regression: `model_policy="allow"` parsed and authorized, then died in prepare_job ->
+    estimate_for_spec -> total_params_b, which was catalog-only. The open-model path was
+    reachable and unusable -- a quoting error, not a policy one.
+    """
+    import flash.engine.vram as vram
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda _m, **_k: 8.03, raising=False)
+    assert total_params_b("meta-llama/Llama-3.1-8B") == pytest.approx(8.03)
+    # No curated MoE routing data for an unlisted model, so it prices as dense (active == total).
+    assert active_params_b("meta-llama/Llama-3.1-8B") == pytest.approx(8.03)
+    assert download_weight_gb("meta-llama/Llama-3.1-8B") == pytest.approx(16.06)
+
+
+def test_a_catalog_model_is_never_sized_over_the_network(monkeypatch):
+    """The curated entry answers first: adding the HF fallback must not put a network call on the
+    managed path, where every model is cataloged."""
+    import flash.engine.vram as vram
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("a catalog model must be sized from the catalog, with no HF call")
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", _boom, raising=False)
+    assert total_params_b("Qwen/Qwen3.5-9B") == pytest.approx(MODELS["Qwen/Qwen3.5-9B"].params_b)

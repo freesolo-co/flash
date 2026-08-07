@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flash.catalog import MODELS, ModelInfo
+from flash.catalog import MODELS
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
@@ -246,34 +246,42 @@ def pick_gpu(
     return best.name
 
 
-def _catalog_model_info(model_id: str) -> ModelInfo:
-    info = MODELS.get(model_id)
-    if info is None:
-        raise ValueError(
-            f"unknown model {model_id!r}; cost estimation supports catalog models only "
-            f"({', '.join(MODELS)})"
-        )
-    return info
-
-
 def total_params_b(model_id: str, revision: str = "") -> float:
-    """Total parameter count (billions) for a catalog model.
+    """Total parameter count (billions), curated entry first and HF safetensors otherwise.
 
     when a revision is pinned, size the pinned commit (validated against the catalog, fail-closed)
     so setup/save cost tracks the weights the worker actually loads, not the default-revision count.
-    """
-    info = _catalog_model_info(model_id)
-    if revision:
-        from flash.engine.vram import _validated_revision_geometry
 
-        params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
-        return params_b
-    return info.params_b
+    An uncataloged model reaches here only under ``model_policy="allow"`` on a self-hosted plane,
+    and every quote on that path runs through this function -- so raising for "not in the catalog"
+    made an authorized open-model run unsubmittable (it failed at quoting, after parsing and
+    authorizing). ``resolve_params_b`` is the single source of truth VRAM sizing already uses for
+    exactly this question; using it here is what stops cost and sizing from disagreeing about how
+    big a model is. It raises on its own when HF cannot answer, which keeps the quote fail-closed
+    rather than silently pricing an unknown model as free.
+    """
+    from flash.engine.vram import resolve_params_b
+
+    params_b = resolve_params_b(model_id, revision=revision)
+    if not params_b:
+        raise ValueError(
+            f"could not size model {model_id!r}: it is not in the catalog "
+            f"({', '.join(MODELS)}) and HuggingFace returned no safetensors parameter metadata "
+            f"for it, so the run cannot be priced"
+        )
+    return params_b
 
 
 def active_params_b(model_id: str) -> float:
-    """Active params per token (billions); falls back to total for dense models. Use for FLOPs, not VRAM."""
-    info = _catalog_model_info(model_id)
+    """Active params per token (billions); falls back to total for dense models. Use for FLOPs, not VRAM.
+
+    An uncataloged model has no curated MoE routing data, so it is priced as dense (active ==
+    total). That is the honest default: over-pricing a sparse model is safe, and inventing an
+    active-param count for an unvalidated architecture is not.
+    """
+    info = MODELS.get(model_id)
+    if info is None:
+        return total_params_b(model_id)
     return info.active_params_b or info.params_b
 
 
