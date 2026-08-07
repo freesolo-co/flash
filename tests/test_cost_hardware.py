@@ -286,3 +286,66 @@ def test_multi_card_sft_quote_moves_with_the_sequence_parallel_constant(monkeypa
     monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_PCIE", 0.4)
     unchanged = analytical.estimate_cost(spec)
     assert unchanged.train_seconds == pytest.approx(after.train_seconds)
+
+
+def test_a_vast_multi_card_run_is_not_credited_with_nvlink_scaling():
+    """Vast sells a canonical class as a market, so its nvlink membership cannot be trusted.
+
+    `providers/base.py` normalizes the explicit pcie aliases into nvlink-classed entries -- `H100
+    PCIE` -> H100 and `A100 PCIE` -> A100 SXM 40GB -- and a Vast offer carries no interconnect
+    field, so a multi-card combination can land on pcie boards while the class says nvlink. Vast
+    does search multi-card (`rentable_gpu_counts` with `num_gpus=count`), so these combinations are
+    real candidates, and crediting them with the measured nvlink curve prices them on bandwidth
+    they may not have.
+    """
+    from flash.cost.analytical import multi_card_speedup, sequence_parallel_speedup
+    from flash.cost.facts import has_nvlink
+
+    for ambiguous in ("H100", "A100 SXM 40GB"):
+        assert has_nvlink(ambiguous, "runpod"), (
+            "runpod pins an exact gpu id per class, so its nvlink classification still holds"
+        )
+        assert not has_nvlink(ambiguous, "vast"), (
+            f"a vast {ambiguous} combination was credited with nvlink scaling, but vast lists the "
+            "pcie board under this same class and its offers carry no topology"
+        )
+        # and the credit is large enough to change a ranking: ~24% at 2 cards, ~80% at 4.
+        assert multi_card_speedup(2, ambiguous, "vast") < multi_card_speedup(2, ambiguous, "runpod")
+        assert multi_card_speedup(4, ambiguous, "vast") < multi_card_speedup(4, ambiguous, "runpod")
+        # sft shards by sequence and reads the same classification, so it must narrow too.
+        assert sequence_parallel_speedup(2, ambiguous, "vast") < sequence_parallel_speedup(
+            2, ambiguous, "runpod"
+        )
+
+    # an unpinned/unknown provider keeps the class answer: this narrows a known-ambiguous market,
+    # it does not downgrade everything that fails to name a provider.
+    assert has_nvlink("H100", "")
+    assert has_nvlink("H100", "lambda"), "lambda has no multi-card path, so nothing to narrow"
+    # and a pcie class is unaffected in either direction.
+    assert not has_nvlink("RTX 4090", "runpod")
+    assert not has_nvlink("RTX 4090", "vast")
+
+
+def test_a_vast_sharded_quote_reads_the_provider_off_the_run_config():
+    """The narrowing is only real if it reaches the quote, not just the classifier.
+
+    `method_card_speedup` is the one point where the card count and the run's provider are both in
+    hand, and every sharded quote goes through it.
+    """
+    from flash.cost.analytical import method_card_speedup
+    from flash.cost.types import RunConfig
+
+    def cfg(provider, method="grpo"):
+        return RunConfig(
+            model_id="Qwen/Qwen3.5-4B", method=method, steps=10, provider=provider, gpu_count=2
+        )
+
+    for method in ("grpo", "sft"):
+        vast = method_card_speedup(cfg("vast", method), 2, "H100")
+        runpod = method_card_speedup(cfg("runpod", method), 2, "H100")
+        assert vast < runpod, (
+            f"a {method} quote on vast still divided by the nvlink multiplier, so a pcie box is "
+            "quoted on scaling it may not deliver and can win the ranking on it"
+        )
+        # `auto` is not a provider; it must not be read as one and must keep the class answer.
+        assert method_card_speedup(cfg("auto", method), 2, "H100") == runpod
