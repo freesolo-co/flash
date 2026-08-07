@@ -25,9 +25,12 @@ from flash.engine.steps import final_save_due, validate_save_steps
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
     export_peft_adapter,
+    gdn_probe_module,
+    gdn_reset_arch_from_caps,
     latest_global_step_dir,
     parse_verl_metric,
     parse_wandb_link,
+    probe_verl_capabilities,
     render_gdn_varlen_shim,
     render_wandb_link_shim,
     resolve_checkpoint_actor_dir,
@@ -36,7 +39,6 @@ from flash.engine.worker.backend_common import (
     run_verl_training,
     stage_verl_resume,
     stamp_adapter_dir_provenance,
-    verl_child_gdn_reset_arch,
     verl_step_number,
 )
 from flash.engine.worker.heartbeat import join_while_draining, liveness_heartbeat
@@ -1071,25 +1073,29 @@ def run_sft_train(spec=None) -> None:
         python_bin = resolve_verl_python(
             workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
         )
+        # remove-padding packs the micro-batch into one row, which is correct for softmax attention
+        # (transformers rebuilds its varlen boundaries from the restarting position ids) but NOT for
+        # a gated-deltanet hybrid: its conv and recurrent state only reset if the child can honor
+        # seq_idx and cu_seqlens, and the no-fla fallbacks accept both and discard them. so pack a
+        # gdn model only when the child proves it can reset, and otherwise fall back to verl's
+        # padded path, which carries a real attention_mask and is boundary-correct by construction.
+        # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read the
+        # child must not repeat; "" skips the question for a non-hybrid.
+        gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
+        gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
+        # ONE child answers every independent capability question. each used to cost its own
+        # interpreter, and the torch/verl import -- not the question -- was the price.
+        caps = probe_verl_capabilities(python_bin, gdn_module)
     model_path = _cached_model_path(model_id, model_revision)
-    # verl logs from python_bin, so gate wandb on THAT interpreter (see resolve_verl_loggers).
-    loggers = resolve_verl_loggers(python_bin)
+    # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
+    loggers = resolve_verl_loggers(caps)
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
     shim_dir = os.path.join(workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
     custom_dataset_path = os.path.join(shim_dir, "flash_verl_sft_dataset.py")
 
-    # remove-padding packs the micro-batch into one row, which is correct for softmax attention
-    # (transformers rebuilds its varlen boundaries from the restarting position ids) but NOT for a
-    # gated-deltanet hybrid: its conv and recurrent state only reset if the child can honor seq_idx
-    # and cu_seqlens, and the no-fla fallbacks accept both and discard them. so pack a gdn model
-    # only when the child proves it can reset, and otherwise fall back to verl's padded path, which
-    # carries a real attention_mask and is boundary-correct by construction.
-    gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
-    gdn_reset_arch = (
-        verl_child_gdn_reset_arch(python_bin, model_id, model_revision) if gdn_hybrid else None
-    )
+    gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
     gdn_boundary_resets = gdn_reset_arch is not None
     use_remove_padding = not gdn_hybrid or gdn_boundary_resets
     if gdn_hybrid and not gdn_boundary_resets:

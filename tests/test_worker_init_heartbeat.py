@@ -19,10 +19,12 @@ A source/AST wiring check pins the call sites so the regression can't silently r
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import re
 import sys
+import textwrap
 import threading
 import time
 import types
@@ -1048,7 +1050,7 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
         (
             "flash.engine.worker.rl_train",
             "run_rl_train",
-            ("rl_data_loading", "rl_finalizing"),
+            ("rl_data_loading", "rl_configuring", "rl_finalizing"),
         ),
     ],
 )
@@ -1063,6 +1065,59 @@ def test_quiet_phases_are_wrapped_in_liveness_heartbeat(modname, outer, stages):
         assert re.search(rf'liveness_heartbeat\(\s*"{re.escape(stage)}"', src), (
             f"{outer} must wrap the {stage} phase"
         )
+
+
+@pytest.mark.parametrize(
+    ("modname", "outer", "stage"),
+    [
+        ("flash.engine.worker.sft_train", "run_sft_train", "sft_configuring"),
+        ("flash.engine.worker.rl_train", "run_rl_train", "rl_configuring"),
+        ("flash.engine.worker.opd_train", "run_opd_train", "opd_configuring"),
+    ],
+)
+def test_venv_provisioning_and_the_capability_probe_run_under_one_wrap(modname, outer, stage):
+    """All THREE trainers must wrap the verl-interpreter setup, not just sft and opd.
+
+    With no prebuilt worker image `resolve_verl_python` builds a venv and installs the whole
+    training stack, and the batched capability probe that follows pays a cold torch/verl import.
+    That is minutes of silence with no training step to report and no liveness thread otherwise
+    running -- long enough for the stall watchdog to fail a healthy run on a paid GPU. sft and opd
+    have wrapped it since dev #442; grpo called it bare, which is the gap this pins shut.
+
+    Both calls must be INSIDE the same wrap: provisioning the interpreter and then importing torch
+    in it are one silent span, and a wrap that closed in between would leave the probe uncovered.
+    """
+    mod = importlib.import_module(modname)
+    src = inspect.getsource(getattr(mod, outer))
+    tree = ast.parse(textwrap.dedent(src))
+    wraps = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "liveness_heartbeat"
+            and item.context_expr.args
+            and isinstance(item.context_expr.args[0], ast.Constant)
+            and item.context_expr.args[0].value == stage
+            for item in node.items
+        )
+    ]
+    assert len(wraps) == 1, (
+        f"{outer} must wrap its cold verl setup in liveness_heartbeat({stage!r})"
+    )
+    called = {
+        node.func.id
+        for node in ast.walk(wraps[0])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "resolve_verl_python" in called, (
+        f"{outer}: the venv build is the silent span -- it must be INSIDE the {stage} wrap"
+    )
+    assert "probe_verl_capabilities" in called, (
+        f"{outer}: the child probe pays a cold torch import and must share the {stage} wrap"
+    )
 
 
 def test_rl_warmstart_adapter_download_is_wrapped_in_liveness_heartbeat():

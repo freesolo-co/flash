@@ -10,7 +10,6 @@ on top.
 
 from __future__ import annotations
 
-import ast
 import atexit
 import collections
 import contextlib
@@ -328,67 +327,205 @@ def ray_num_cpus(gpu_count: int = 1, *, cap: int = 16) -> int:
     return max(floor, min(affinity, cap))
 
 
-def verl_supports_rollout_field(python_bin: str, field: str) -> bool:
-    """report whether python_bin's verl declares `field` on RolloutConfig.
+# ---------------------------------------------------------------------------
+# batched child-interpreter capability probe
+#
+# every launch used to ask the verl interpreter the same handful of independent questions in
+# SEPARATE `python -c` subprocesses -- rollout field, gdn boundary kernels, device capability,
+# flashinfer, wandb -- and each one paid the full torch/verl import before answering. the imports
+# dominate: the questions themselves are attribute lookups and an import check.
+#
+# they are also genuinely independent, so one child can answer all of them and print a single JSON
+# blob. that collapses N torch imports into 1 on the critical path of every run, before any
+# training starts and while the gpu is already rented.
+#
+# the child still names only packages it is guaranteed to have (verl, torch, transformers,
+# causal_conv1d, flashinfer) and never `flash`, which is not installed in the verl venv -- an
+# `import flash` here would raise in every child and silently answer "no" to everything. anything
+# needing flash code or a hub read is resolved by the PARENT and interpolated in as a literal (see
+# verl_child_gdn_reset_arch's docstring for the full reasoning).
+#
+# EVERY question is answered independently inside its own try/except and defaults to the same
+# fail-closed answer the individual probe returned, so one unavailable capability cannot suppress
+# the others. a child that dies outright leaves every answer at its fail-closed default, exactly as
+# five dead subprocesses would have.
+_CAPABILITY_PROBE = """
+import json
+
+out = {}
+
+try:
+    from verl.workers.config.rollout import RolloutConfig
+
+    out["rollout_fields"] = sorted(RolloutConfig.__dataclass_fields__)
+except Exception:
+    out["rollout_fields"] = None
+
+try:
+    import torch
+
+    out["capability"] = (
+        list(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else None
+    )
+except Exception:
+    out["capability"] = None
+
+try:
+    import flashinfer  # noqa: F401
+
+    out["flashinfer"] = True
+except Exception:
+    out["flashinfer"] = False
+
+try:
+    import wandb  # noqa: F401
+
+    out["wandb"] = True
+except Exception:
+    out["wandb"] = False
+
+# gdn is asked only when the parent resolved a model_type to ask about (a gdn hybrid). the module
+# name is a parent-resolved literal: it comes from the checkpoint config, which needs a hub/cache
+# read the child must not repeat.
+out["gdn_boundary_resets"] = None
+if %(gdn_module)r:
+    try:
+        import importlib
+        import inspect
+
+        from transformers.utils.import_utils import (
+            is_causal_conv1d_available,
+            is_flash_linear_attention_available,
+        )
+
+        ok = is_flash_linear_attention_available() and is_causal_conv1d_available()
+        if ok:
+            import causal_conv1d  # noqa: F401  -- fail a built-but-broken ABI here, not at model load
+
+            mod = importlib.import_module(%(gdn_module)r)
+            gdn = next(
+                (
+                    c
+                    for n, c in vars(mod).items()
+                    if isinstance(c, type) and n.endswith("GatedDeltaNet")
+                ),
+                None,
+            )
+            src = inspect.getsource(gdn.forward) if gdn is not None else ""
+            ok = ("cu_seq_lens_q" in src) and ("seq_idx" in src)
+        if ok:
+            import torch
+
+            # a causal_conv1d compiled without this arch imports fine and raises at the first
+            # forward, so smoke it now: the answer decides whether we pack, and being wrong means
+            # training contaminated.
+            if torch.cuda.is_available():
+                from causal_conv1d import causal_conv1d_fn
+
+                causal_conv1d_fn(
+                    torch.zeros(1, 4, 8, device="cuda", dtype=torch.bfloat16),
+                    torch.zeros(4, 3, device="cuda", dtype=torch.bfloat16),
+                )
+                torch.cuda.synchronize()
+        out["gdn_boundary_resets"] = bool(ok)
+    except Exception:
+        out["gdn_boundary_resets"] = False
+
+print("FLASH_VERL_CAPS=" + json.dumps(out), flush=True)
+"""
+
+# every answer's fail-closed default, used when the child dies, times out, or prints nothing
+# readable. `None` means "could not answer" for the two callers that must distinguish that from a
+# negative answer: rollout_fields (unknown verl -> do not claim a fork field is missing) and
+# capability (unknown card -> leave the library default alone rather than guessing a workaround).
+_CAPABILITIES_UNAVAILABLE: dict = {
+    "rollout_fields": None,
+    "capability": None,
+    "flashinfer": False,
+    "wandb": False,
+    "gdn_boundary_resets": None,
+}
+
+# the child pays one torch/verl import (tens of seconds cold) and may run a live CUDA kernel for the
+# gdn smoke. the old per-probe timeouts were 300s (rollout field) and 600s (gdn); keep the larger,
+# since this child does the union of that work in one process.
+_CAPABILITY_PROBE_TIMEOUT_S = 600
+
+
+def probe_verl_capabilities(python_bin: str, gdn_module: str = "") -> dict:
+    """ask the VERL CHILD every independent capability question in ONE subprocess.
+
+    each question used to cost its own interpreter, and the torch/verl import -- not the question --
+    is what they were paying for. batching them collapses that import onto one child per run.
+
+    ``gdn_module`` is the checkpoint's ``transformers.models.*`` modeling module, resolved by the
+    parent because it needs a hub/cache read. pass ``""`` to skip the gdn question entirely, which
+    is what a non-hybrid model does: nothing consumes the answer, and the smoke runs a live CUDA
+    kernel.
+
+    the returned dict always has every key. an unanswerable question holds its fail-closed default
+    (see ``_CAPABILITIES_UNAVAILABLE``) rather than being absent, so callers read a value rather
+    than testing for membership.
+    """
+    probe = _CAPABILITY_PROBE % {"gdn_module": gdn_module}
+    caps = dict(_CAPABILITIES_UNAVAILABLE)
+    try:
+        done = subprocess.run(
+            [python_bin, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=_CAPABILITY_PROBE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[verl] capability probe failed ({e}); treating every capability as unavailable")
+        return caps
+    for line in (done.stdout or "").splitlines():
+        if line.startswith("FLASH_VERL_CAPS="):
+            with contextlib.suppress(Exception):
+                answered = json.loads(line.split("=", 1)[1])
+                if isinstance(answered, dict):
+                    # merge rather than replace: a child from a future/older flash that omits a key
+                    # must leave that key at its fail-closed default, not drop it from the dict.
+                    caps.update({k: v for k, v in answered.items() if k in caps})
+            return caps
+    print(
+        "[verl] capability probe returned no readable answer "
+        f"(exit {done.returncode}); treating every capability as unavailable"
+    )
+    if done.stderr:
+        print(f"[verl] capability probe stderr: {done.stderr.strip()[:800]}")
+    return caps
+
+
+def verl_declares_rollout_field(caps: dict, field: str) -> bool:
+    """report whether the probed verl declares `field` on RolloutConfig.
 
     the fork adds rollout fields stock verl does not have. hydra composes an unknown key happily and
     only fails later in omega_conf_to_dataclass, so callers ask here before emitting a fork-only
     override rather than letting the run abort at dataclass conversion.
+
+    an unanswerable probe reads as "not declared", which is what the subprocess version returned
+    when the child could not be reached: the caller raises with the cause instead of composing a key
+    that would abort in dataclass conversion on a paid gpu.
     """
-    probe = (
-        "from verl.workers.config.rollout import RolloutConfig;"
-        f"print('1' if {field!r} in RolloutConfig.__dataclass_fields__ else '0')"
-    )
-    try:
-        done = subprocess.run(
-            [python_bin, "-c", probe], capture_output=True, text=True, timeout=300
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return done.returncode == 0 and done.stdout.strip().endswith("1")
+    fields = caps.get("rollout_fields")
+    return bool(fields) and field in fields
 
 
-# run in the VERL CHILD by verl_child_gdn_reset_arch. %(module)s is the checkpoint's
-# transformers modeling module, resolved by the parent. imports only transformers / causal_conv1d /
-# torch -- never flash, which is not installed in the verl venv (see the function's docstring).
-_GDN_BOUNDARY_PROBE = """
-import importlib
-import inspect
+def gdn_probe_module(model_id: str, revision: str = "") -> str:
+    """the ``transformers.models.*`` modeling module the gdn question must inspect.
 
-from transformers.utils.import_utils import (
-    is_causal_conv1d_available,
-    is_flash_linear_attention_available,
-)
+    resolved by the PARENT and handed to the child as a literal, because it comes from the
+    checkpoint config -- a hub/cache read the child should not repeat. pair every call with
+    ``gdn_reset_arch_from_caps`` below so the shim is rendered for the SAME arch the child cleared.
+    """
+    from flash.engine.worker.packing import gdn_model_type
 
-ok = is_flash_linear_attention_available() and is_causal_conv1d_available()
-if ok:
-    import causal_conv1d  # noqa: F401  -- fail a built-but-broken ABI here, not at model load
-
-    mod = importlib.import_module("%(module)s")
-    gdn = next(
-        (c for n, c in vars(mod).items() if isinstance(c, type) and n.endswith("GatedDeltaNet")),
-        None,
-    )
-    src = inspect.getsource(gdn.forward) if gdn is not None else ""
-    ok = ("cu_seq_lens_q" in src) and ("seq_idx" in src)
-if ok:
-    import torch
-
-    # a causal_conv1d compiled without this arch imports fine and raises at the first forward, so
-    # smoke it now: the answer decides whether we pack, and being wrong means training contaminated.
-    if torch.cuda.is_available():
-        from causal_conv1d import causal_conv1d_fn
-
-        causal_conv1d_fn(
-            torch.zeros(1, 4, 8, device="cuda", dtype=torch.bfloat16),
-            torch.zeros(4, 3, device="cuda", dtype=torch.bfloat16),
-        )
-        torch.cuda.synchronize()
-print("1" if ok else "0")
-"""
+    model_type = gdn_model_type(model_id, revision=revision)
+    return f"transformers.models.{model_type}.modeling_{model_type}"
 
 
-def verl_child_gdn_reset_arch(python_bin: str, model_id: str, revision: str = "") -> str | None:
+def gdn_reset_arch_from_caps(caps: dict, gdn_module: str) -> str | None:
     """the architecture to patch when the VERL CHILD can honor packed GDN boundary resets, else None.
 
     the boundary shim derives ``cu_seq_lens_q`` and ``seq_idx`` and hands them to the GDN layer, but
@@ -415,33 +552,23 @@ def verl_child_gdn_reset_arch(python_bin: str, model_id: str, revision: str = ""
     venv's path, so a probe that imported ``flash.engine.worker.packing`` would raise
     ModuleNotFoundError in every child, report "cannot reset", and silently pin every gdn run to the
     padded fallback forever. that fails closed, so it trains correctly -- but the boundary fix would
-    never actually engage, and nothing would say so. ``verl_supports_rollout_field`` above sets the
+    never actually engage, and nothing would say so. ``_CAPABILITY_PROBE`` above holds the
     convention: a child probe names only packages the child is guaranteed to have.
-
-    ``model_type`` is resolved by the PARENT (packing.gdn_model_type) and interpolated in, because it
-    comes from the checkpoint config -- which needs a hub/cache read the child should not repeat.
 
     the checks mirror ``packing.gdn_packing_available``: fla present, causal_conv1d imports (catching
     a built-but-broken ABI that find_spec would pass), the kernel actually runs on the live GPU
     (catching a wheel compiled without this arch), and this transformers version's GDN forward really
     threads both kwarg names.
-    """
-    from flash.engine.worker.packing import gdn_model_type
 
-    model_type = gdn_model_type(model_id, revision=revision)
-    probe = _GDN_BOUNDARY_PROBE % {
-        "module": f"transformers.models.{model_type}.modeling_{model_type}"
-    }
-    try:
-        done = subprocess.run(
-            [python_bin, "-c", probe], capture_output=True, text=True, timeout=600
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        print(f"[verl] gdn boundary-reset probe failed ({e}); treating as unavailable")
+    the arch is recovered from ``gdn_module`` -- the same literal the child was asked about -- so the
+    shim still cannot be rendered for a different architecture than the one just verified. an
+    unanswerable or negative probe returns None and the caller trains padded.
+    """
+    if not caps.get("gdn_boundary_resets"):
         return None
-    if done.returncode == 0 and done.stdout.strip().endswith("1"):
-        return model_type
-    return None
+    # "transformers.models.<arch>.modeling_<arch>" -> "<arch>", read from the string the CHILD was
+    # handed rather than re-resolved here: a second resolve could disagree with what was cleared.
+    return gdn_module.split(".")[2]
 
 
 def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
@@ -557,7 +684,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     return py
 
 
-def resolve_verl_loggers(python_bin: str) -> list[str]:
+def resolve_verl_loggers(caps: dict) -> list[str]:
     """verl's ``trainer.logger`` list, gated on the interpreter that actually logs.
 
     verl logs from its own interpreter, so wandb must be importable THERE, not in flash's env. The
@@ -571,10 +698,7 @@ def resolve_verl_loggers(python_bin: str) -> list[str]:
     """
     if not os.environ.get("WANDB_API_KEY"):
         return ["console"]
-    has_wandb = (
-        subprocess.run([python_bin, "-c", "import wandb"], capture_output=True).returncode == 0
-    )
-    if not has_wandb:
+    if not caps.get("wandb"):
         print(
             "[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; "
             "using console logger only"
@@ -583,7 +707,7 @@ def resolve_verl_loggers(python_bin: str) -> list[str]:
     return ["console", "wandb"]
 
 
-def resolve_verl_device_capability(python_bin: str) -> tuple[int, int] | None:
+def verl_device_capability(caps: dict) -> tuple[int, int] | None:
     """device 0's ``(major, minor)`` cuda capability as the VERL interpreter sees it, or None.
 
     probed in verl's interpreter rather than flash's because verl owns the rollout engine and pins
@@ -591,16 +715,12 @@ def resolve_verl_device_capability(python_bin: str) -> tuple[int, int] | None:
     the probe could not answer -- no cuda, no torch, a hung import -- and every caller must read it
     as "leave the default alone" rather than guessing a workaround onto an unknown card.
     """
-    probe = (
-        "import torch;"
-        "print(tuple(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else ())"
-    )
+    cc = caps.get("capability")
+    if not cc:
+        return None
     try:
-        out = subprocess.run([python_bin, "-c", probe], capture_output=True, text=True, timeout=120)
-        cc = ast.literal_eval((out.stdout or "").strip().splitlines()[-1])
         return (int(cc[0]), int(cc[1]))
-    except Exception as e:
-        print(f"[verl] device capability probe skipped: {e}")
+    except (TypeError, ValueError, IndexError):
         return None
 
 
@@ -756,7 +876,7 @@ def trainer_dtype_overrides() -> list[str]:
 
 
 def resolve_blackwell_attention_backends(
-    python_bin: str, cc: tuple[int, int] | None
+    caps: dict, cc: tuple[int, int] | None
 ) -> tuple[str | None, str | None]:
     """the rollout ``(attention_backend, mm_encoder_attn_backend)`` this GPU needs, or ``(None, None)``.
 
@@ -781,10 +901,11 @@ def resolve_blackwell_attention_backends(
       TORCH_SDPA is a supported ViT backend on cc>=8.0, so pinning it sidesteps the CUTE import. The
       decoder attention is unaffected -- that is chosen separately, above.
 
-    The flashinfer probe runs in the VERL interpreter, not flash's: verl owns the rollout engine and
-    pins its own vllm stack, so flash's ``import flashinfer`` would answer for the wrong
-    environment. A failed flashinfer probe degrades to TRITON_ATTN rather than leaving the fragile
+    The flashinfer answer comes from the VERL interpreter, not flash's: verl owns the rollout engine
+    and pins its own vllm stack, so flash's ``import flashinfer`` would answer for the wrong
+    environment. A failed flashinfer import degrades to TRITON_ATTN rather than leaving the fragile
     default in place; an unanswerable capability probe (``cc is None``) leaves vllm's defaults alone.
+    Both answers ride the one batched child probe, so this asks the interpreter nothing itself.
 
     Returns ``(None, None)`` off Blackwell, where vLLM's own defaults are correct.
     """
@@ -793,16 +914,7 @@ def resolve_blackwell_attention_backends(
     major = cc[0]
     if major not in (10, 12):
         return (None, None)
-    try:
-        has_flashinfer = (
-            subprocess.run(
-                [python_bin, "-c", "import flashinfer"], capture_output=True, timeout=120
-            ).returncode
-            == 0
-        )
-    except Exception as e:  # a hung/failed import must not wedge the launch -> treat as unavailable
-        print(f"[verl] flashinfer probe failed ({e}); treating it as unavailable")
-        has_flashinfer = False
+    has_flashinfer = bool(caps.get("flashinfer"))
     decoder = "FLASHINFER" if has_flashinfer else "TRITON_ATTN"
     if not has_flashinfer:
         print(
