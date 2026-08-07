@@ -300,23 +300,23 @@ def test_a_row_whose_completion_truncated_away_is_dropped_not_trained_on():
     learned nothing.
 
     This was `filter_vlm_sft_rows`, which measured the same thing off the vision collator's labels.
-    verl pre-tokenizes to `input_ids`/`loss_mask` instead, so the check moved to `_has_real_target`
+    verl pre-tokenizes to `input_ids`/`loss_mask` instead, so the check moved to `has_real_target`
     -- same invariant, different representation, and nothing covered it after the move.
     """
-    from flash.engine.sft_workload import _has_real_target
+    from flash.engine.worker.sft import has_real_target
 
     eos = 2
     special = {eos}
     # a real target: one unmasked token that is not a special.
-    assert _has_real_target({"input_ids": [9, 9, 7, eos], "loss_mask": [0, 0, 1, 1]}, special)
+    assert has_real_target([9, 9, 7, eos], [0, 0, 1, 1], special)
     # completion truncated away: every unmasked position is prompt.
-    assert not _has_real_target({"input_ids": [9, 9, 7, eos], "loss_mask": [0, 0, 0, 0]}, special)
+    assert not has_real_target([9, 9, 7, eos], [0, 0, 0, 0], special)
     # content-free completion: unmasked, but only the structural end token.
-    assert not _has_real_target({"input_ids": [9, eos], "loss_mask": [0, 1]}, special)
+    assert not has_real_target([9, eos], [0, 1], special)
     # the mask -- not the token -- decides: the same ids masked as prompt are not a target.
-    assert not _has_real_target({"input_ids": [7, 7], "loss_mask": [0, 0]}, special)
+    assert not has_real_target([7, 7], [0, 0], special)
     # and a special id that is NOT registered special still counts as real content.
-    assert _has_real_target({"input_ids": [9, eos], "loss_mask": [0, 1]}, set())
+    assert has_real_target([9, eos], [0, 1], set())
 
 
 def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
