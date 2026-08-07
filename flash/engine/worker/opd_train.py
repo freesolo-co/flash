@@ -43,6 +43,7 @@ from flash.engine.worker.backend_common import (
     parse_wandb_link,
     ray_num_cpus,
     render_gdn_varlen_shim,
+    render_tf32_shim,
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
@@ -1719,7 +1720,10 @@ def build_opd_overrides(config: dict) -> list[str]:
 
 def _render_opd_sitecustomize(*, save_at_steps: tuple[int, ...], total_steps: int) -> str:
     required_steps = tuple(int(step) for step in save_at_steps)
+    # the tf32 fragment goes first, and above the verl import: it is the child's only opt-in to
+    # tensor-core fp32 matmul, and an import that raises here must not cost the run its throughput.
     return f"""# generated flash opd runtime patches for verl 0.8
+{render_tf32_shim()}
 from verl.utils.checkpoint.checkpoint_handler import CheckpointHandler as _FlashCheckpointHandler
 
 _flash_required_save_steps = frozenset({required_steps!r})

@@ -1651,6 +1651,39 @@ def kill_process_group(proc: subprocess.Popen, *, process_group_id: int | None =
     _reap_group_zombies(pgid, skip=proc.pid)
 
 
+# --------------------------- tf32 matmul (all three verl backends) ---------------------------
+# torch defaults ``cuda.matmul.allow_tf32`` to False, so an fp32 matmul runs at full fp32 rate
+# unless something opts in. the model runs in the verl CHILD, and these flags are per-process
+# torch state that no child inherits -- setting them in the flash parent (which trains nothing)
+# leaves the trainer on the slow path. sft already opts in from inside its own sitecustomize;
+# this is that same fragment, shared so grpo and opd get it from the one place.
+#
+# bf16 params are unaffected: this only changes the reduction precision of matmuls that are
+# genuinely fp32 (the fsdp optimizer/grad-norm math and any fp32-autocast region), where tf32
+# keeps fp32 range and trades mantissa bits for tensor-core throughput.
+FLASH_TF32_MARKER = "[flash-verl] tf32 matmul/cuDNN enabled"
+
+
+def render_tf32_shim() -> str:
+    """child-side sitecustomize fragment that enables TF32 matmul/cuDNN in the verl interpreter.
+
+    never raises. tf32 is a throughput optimization, so a torch that cannot take these flags must
+    leave training running on the default path rather than abort a paid run.
+    """
+    return f"""
+# --- flash: enable tf32 in the trainer process (see backend_common.render_tf32_shim) ---
+try:
+    import torch as _flash_tf32_torch
+
+    _flash_tf32_torch.set_float32_matmul_precision("high")
+    _flash_tf32_torch.backends.cuda.matmul.allow_tf32 = True
+    _flash_tf32_torch.backends.cudnn.allow_tf32 = True
+    print({FLASH_TF32_MARKER!r}, flush=True)
+except Exception:
+    pass
+"""
+
+
 # --------------------------- w&b run link (all three verl backends) ---------------------------
 # trl spreads wandb_run_info() into its notes, giving the sdk's link_wandb a clickable
 # notes["wandb_url"]. verl calls wandb.init INSIDE the training subprocess, so the flash parent's
