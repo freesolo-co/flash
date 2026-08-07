@@ -843,6 +843,49 @@ def test_an_unavailable_gdn_gate_says_why():
     )
 
 
+def test_child_diagnostics_survive_the_answered_early_return(monkeypatch, capsys):
+    """A child `[verl] ...` line must reach the parent log EVEN WHEN the probe answered.
+
+    THE regression for a defect that shipped inside this same change. The gdn question prints why it
+    answered no, but `probe_verl_capabilities` returned as soon as any answer parsed, and the gdn
+    question is asked LAST. So on every real run something earlier answered, the early return fired,
+    and the diagnostic was discarded -- while `require_gdn_boundary_resets` raised telling operators
+    to read a line that was never printed.
+
+    The stdout capture is what makes this invisible without a test: the child's print goes into
+    `subprocess.run(capture_output=True)`, so it exists, it is just never forwarded. Nothing crashes.
+
+    Note the fixture answers `flashinfer` AND emits the diagnostic. A fixture that answered nothing
+    would pass against the broken code too, because the no-answer path already reported stderr --
+    the bug lived exclusively on the answered path, so the test has to take it.
+    """
+    monkeypatch.setattr(
+        vc.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "[verl] gdn boundary resets unavailable in the child: fla=True causal_conv1d=False\n"
+                'FLASH_VERL_CAPS={"flashinfer": true}\n'
+            ),
+            stderr="",
+        ),
+    )
+    caps = vc.probe_verl_capabilities(
+        "/verl/bin/python", "transformers.models.qwen3_5.modeling_qwen3_5"
+    )
+    # the early return still happens -- this is not asking the probe to stop short-circuiting.
+    assert caps["flashinfer"] is True
+    out = capsys.readouterr().out
+    assert "gdn boundary resets unavailable" in out, (
+        "the child's diagnostic was swallowed by the answered-early-return. the gate's raise points "
+        "operators at that line, so losing it makes a kernel-less child indistinguishable from a "
+        "broken probe -- exactly the silence this change set out to remove."
+    )
+    # and the CAUSE has to survive, not just the verdict.
+    assert "causal_conv1d=False" in out
+
+
 def test_the_gdn_gate_has_exactly_three_outcomes():
     """None for non-gdn, an arch for a resettable hybrid, a raise for everything else.
 

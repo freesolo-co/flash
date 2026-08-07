@@ -453,7 +453,9 @@ if %(gdn_module)r:
         # a bare False here is what made this invisible. the caller raises on a hybrid that cannot
         # reset, and an operator reading only that has no way back to which check fell over --
         # a missing wheel, a broken ABI, or a conv kernel compiled without this arch all look
-        # identical from the parent. stderr is captured and surfaced with the raise.
+        # identical from the parent. printed to STDOUT, which probe_verl_capabilities forwards
+        # on the '[verl] ' prefix -- stderr would be dropped, it is only reported when the
+        # child answers nothing at all.
         import traceback
 
         print(
@@ -544,6 +546,14 @@ def probe_verl_capabilities(python_bin: str, gdn_module: str = "") -> dict:
                 # fail-closed default rather than vanishing from the dict.
                 caps.update({k: v for k, v in answered.items() if k in caps})
                 answered_any = True
+    # the child's own diagnostics, forwarded BEFORE the early return. the gdn question prints why it
+    # answered no, and it is answered LAST -- so every real run answers something earlier, and a
+    # bare `return caps` here would discard the one line the gate's raise tells operators to read.
+    # matched on the prefix rather than forwarded wholesale: the child's stdout also carries verl's
+    # own import chatter, which is not worth a parent log line.
+    for line in (stdout or "").splitlines():
+        if line.startswith("[verl] "):
+            print(line, flush=True)
     if answered_any:
         return caps
     if not timed_out:
