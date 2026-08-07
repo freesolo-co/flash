@@ -582,8 +582,11 @@ class _VerlCheckpointWatcher:
     def _completed_step(self) -> int:
         return completed_checkpoint_step(self.local_dir)
 
-    def _step_dirs(self, completed_step: int) -> list[tuple[int, str]]:
-        return unprocessed_checkpoint_dirs(self.local_dir, completed_step, self.processed_steps)
+    def _pending(self) -> list[tuple[int, str]]:
+        """the completed checkpoint dirs this uploader has not handled yet, oldest first."""
+        return unprocessed_checkpoint_dirs(
+            self.local_dir, self._completed_step(), self.processed_steps
+        )
 
     def _should_publish(self, step: int) -> bool:
         return not self.required_steps or step in self.required_steps
@@ -622,14 +625,12 @@ class _VerlCheckpointWatcher:
     def _run(self) -> None:
         try:
             while True:
-                completed_step = self._completed_step()
-                for step, checkpoint_dir in self._step_dirs(completed_step):
+                for step, checkpoint_dir in self._pending():
                     self._publish(step, checkpoint_dir)
-                if self._stop.is_set():
-                    final_completed = self._completed_step()
-                    remaining = self._step_dirs(final_completed)
-                    if not remaining:
-                        return
+                # re-read rather than reusing the sweep above: verl advances the tracker right up to
+                # the moment the child exits, so a step can become visible during that sweep.
+                if self._stop.is_set() and not self._pending():
+                    return
                 time.sleep(0.5)
         except BaseException as error:
             self._error = error
