@@ -6371,24 +6371,39 @@ def test_a_truncated_final_turn_still_earns_per_turn_credit_for_the_turns_before
     assert out["extra_fields"]["flash_turn_rewards"] == [0.5], (
         "per-turn credit was dropped: the span count disagreed with the env's reward count"
     )
-    # the truncated tokens are still trained on, they just carry no turn coordinate: the transcript
-    # is turn "ab", the env's "next" glue, then the aborted "cd".
+    # the truncated tokens stay in the transcript -- it is what the model actually generated and what
+    # a later turn would have conditioned on -- but they are masked OUT of the loss, because the env
+    # never saw or scored them. transcript: turn "ab", the env's "next" glue, then the aborted "cd".
     assert out["num_turns"] == 2
     assert out["response_ids"] == [ord(c) for c in "abnextcd"]
-    assert out["response_mask"] == [1, 1, 0, 0, 0, 0, 1, 1]
+    assert out["response_mask"] == [1, 1, 0, 0, 0, 0, 0, 0]
 
 
-def test_an_unspanned_truncated_turns_tokens_are_still_generated_and_masked_as_model_output(
+def test_an_unspanned_truncated_turns_tokens_stay_in_the_transcript_but_out_of_the_loss(
     monkeypatch,
 ):
     # the control for the fix above: dropping the SPAN must not drop the TOKENS. if the fix had
     # skipped the turn entirely, the child would train on a transcript that never contained it.
+    #
+    # keeping the tokens and keeping them in the LOSS are separate decisions, and they resolve
+    # opposite ways. the transcript must contain the turn -- it is what the model emitted and what a
+    # further turn would condition on. the loss must not: the bridge returns before record_model_turn
+    # for an aborted turn, so the env never saw or scored it, and response_mask is what excludes a
+    # position (the env glue beside it relies on exactly that). leaving it at 1 trains a cut-off
+    # generation on credit earned by the turns before it, which teaches the policy to stop early --
+    # the failure verl's own mask_truncated_completions exists to prevent, and which cannot reach
+    # this custom AgentLoopOutput because it carries no stop reason for that handling to read.
     env = _SpanEnv()
     out = _drive_multi_turn_episode(
         stop_reasons=[("ab", "completed"), ("cd", "aborted")], env=env, monkeypatch=monkeypatch
     )
     assert out["response_ids"][-2:] == [ord("c"), ord("d")], "the truncated turn's tokens were lost"
-    assert out["response_mask"][-2:] == [1, 1], "the truncated turn's tokens were not model-masked"
+    assert out["response_mask"][-2:] == [0, 0], (
+        "the truncated turn is still in the loss, so it trains on the previous turn's credit"
+    )
+    # and the masking must not have cost the episode its span/reward alignment: those are separate
+    # fields, so excluding the turn from the loss leaves the surviving turn's credit intact.
+    assert out["extra_fields"]["flash_turn_rewards"] == [0.5]
 
 
 def test_multi_turn_rollout_carries_the_prompts_images_into_every_turn(monkeypatch):
