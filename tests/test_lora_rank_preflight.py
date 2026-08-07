@@ -71,15 +71,16 @@ def test_preflight_accepts_child_rank_and_alpha_mismatches():
     assert metadata.alpha == 128
 
 
-@pytest.mark.parametrize(
-    ("model", "adapter_rank"),
-    [
-        ("Qwen/Qwen3.5-4B", 96),
-        ("Qwen/Qwen3.6-27B", 65),
-    ],
-)
-def test_preflight_rejects_adapter_rank_above_serving_cap(model, adapter_rank):
-    with pytest.raises(ValueError, match=rf"rank {adapter_rank}.*serving max_lora_rank=64"):
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"])
+def test_preflight_rejects_adapter_rank_above_serving_cap(model):
+    from flash.catalog import serving_lora_rank_cap
+
+    # each tier's own cap, read from the catalog. these were pinned to a shared literal 64, which
+    # silently stopped testing the 4B once its cap rose to 128 -- rank 96 then FITS.
+    cap = serving_lora_rank_cap(model)
+    assert cap is not None
+    adapter_rank = cap + 1
+    with pytest.raises(ValueError, match=rf"rank {adapter_rank}.*serving max_lora_rank={cap}"):
         preflight_init_adapter_lora_rank(
             _spec(model=model),
             config_loader=lambda _ref, _token, _revision: _config(
