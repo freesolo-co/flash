@@ -187,6 +187,12 @@ HOSTED_SERVING_URL_SPELLINGS = [
     "serve.freesolo.co",
     "https://api.freesolo.co",
     "https://freesolo.co",
+    # The dev-channel serving plane is Freesolo-operated too, so a standalone plane must be
+    # refused it on exactly the same grounds. Listed explicitly because the dev default became
+    # reachable when `default_serving_url` started deriving from CHANNEL: the guard matches on the
+    # parsed host and needed no change, and this pins that it did not need one.
+    "https://serve-dev.freesolo.co",
+    "https://serve-dev.freesolo.co/v1",
 ]
 
 
