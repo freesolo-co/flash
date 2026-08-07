@@ -1301,6 +1301,99 @@ def test_env_setup_reasoning_conflict_names_every_stale_config(
         assert "thinking" not in parsed, f"{name} kept reasoning after a --no-reasoning re-scaffold"
 
 
+def _drop_thinking(path) -> None:
+    """Rewrite a config the way the pre-#824 release left opd.toml: no `thinking` key at all."""
+    path.write_text(path.read_text().replace("thinking = true\n", ""))
+
+
+def test_env_setup_refuses_a_scaffold_whose_configs_disagree_about_reasoning(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Anchoring on the first config found accepts a project whose configs contradict each other.
+
+    This is the exact shape a scaffold from before #824 has: that release wrote `thinking` into rl
+    and sft but never into opd. `configs/rl.toml` is visited first, reports reasoning, and the stale
+    opd config is neither reported nor rewritten -- configs are only written when absent, so the
+    rerun leaves the project training GRPO with reasoning and OPD without it, silently.
+
+    There is no anchor to pick here: either side leaves a mismatch, so setup has to refuse.
+    """
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    assert _run(["env", "setup", *project, "--reasoning"]) == 0
+    _drop_thinking(tmp_path / "configs/opd.toml")
+    capsys.readouterr()
+
+    # a user upgrading re-runs setup with no flag at all -- the case that used to pass silently.
+    assert _run(["env", "setup", *project]) == 1
+    err = capsys.readouterr().err
+    assert "disagree about reasoning" in err
+    # the message has to name which side is which, or the user cannot tell what state they are in.
+    assert "configs/rl.toml" in err, err
+    assert "configs/sft.toml" in err, err
+    assert "configs/opd.toml" in err, err
+    # and it must name every config to delete, so following it literally cannot leave one behind.
+    named = {w.strip(" ,.`") for w in err.split() if w.startswith("configs/")}
+    assert named == {"configs/rl.toml", "configs/sft.toml", "configs/opd.toml"}, err
+
+    # refusing must not have half-written anything: the disagreeing scaffold is left exactly as it
+    # was, so the user's own files are still theirs to inspect before deleting.
+    assert "thinking" not in tomllib.loads((tmp_path / "configs/opd.toml").read_text())
+    assert tomllib.loads((tmp_path / "configs/rl.toml").read_text())["thinking"] is True
+
+
+def test_env_setup_refusal_is_not_dodged_by_an_explicit_reasoning_flag(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    # a flag cannot repair the mismatch either: existing configs are never rewritten, so
+    # `--no-reasoning` over a disagreeing scaffold would warn about ignoring the flag and then leave
+    # the same split state. the refusal has to come first, whatever the user asked for.
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    assert _run(["env", "setup", *project, "--reasoning"]) == 0
+    _drop_thinking(tmp_path / "configs/opd.toml")
+    capsys.readouterr()
+
+    for flag in ("--reasoning", "--no-reasoning"):
+        assert _run(["env", "setup", *project, flag]) == 1, flag
+        assert "disagree about reasoning" in capsys.readouterr().err, flag
+
+
+def test_env_setup_still_accepts_a_scaffold_whose_configs_agree(monkeypatch, tmp_path) -> None:
+    # the guard must fire on disagreement only. a consistent rerun is the overwhelmingly common
+    # case, and a check that rejects it would break every re-scaffold rather than the broken ones.
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    for flag in ("--reasoning", "--no-reasoning"):
+        target = tmp_path / flag.strip("-")
+        target.mkdir()
+        monkeypatch.chdir(target)
+        assert _run(["env", "setup", *project, flag]) == 0
+        assert _run(["env", "setup", *project]) == 0, f"a consistent {flag} rerun was rejected"
+        expected = True if flag == "--reasoning" else None
+        for name in ("configs/rl.toml", "configs/sft.toml", "configs/opd.toml"):
+            parsed = tomllib.loads((target / name).read_text())
+            assert parsed.get("thinking") is expected, name
+
+
+def test_env_setup_reasoning_anchor_survives_a_partially_scaffolded_directory(
+    monkeypatch, tmp_path
+) -> None:
+    # only some configs existing is NOT a disagreement -- a config that is absent is about to be
+    # written from the anchor. treating "missing" as "reasoning off" would reject a directory whose
+    # single existing config is perfectly coherent, which is a normal partial scaffold.
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", "11111111-1111-4111-8111-111111111111"]
+    assert _run(["env", "setup", *project, "--reasoning"]) == 0
+    (tmp_path / "configs/opd.toml").unlink()
+    (tmp_path / "configs/sft.toml").unlink()
+
+    assert _run(["env", "setup", *project]) == 0
+    for name in ("configs/rl.toml", "configs/sft.toml", "configs/opd.toml"):
+        parsed = tomllib.loads((tmp_path / name).read_text())
+        assert parsed["thinking"] is True, f"{name} was rewritten off the surviving anchor"
+
+
 def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
     # Non-interactive (pytest stdin is not a tty) with no flags stays on today's scaffold: no
     # reasoning knobs land in either config.
