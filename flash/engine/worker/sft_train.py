@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +23,7 @@ from flash.engine.sft_workload import prepare_sft_workload, sft_tokens_for_updat
 from flash.engine.steps import final_save_due, validate_save_steps
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
+    completed_checkpoint_step,
     export_peft_adapter,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
@@ -40,6 +40,7 @@ from flash.engine.worker.backend_common import (
     run_verl_training,
     stage_verl_resume,
     stamp_adapter_dir_provenance,
+    unprocessed_checkpoint_dirs,
     verl_step_number,
 )
 from flash.engine.worker.heartbeat import join_while_draining, liveness_heartbeat
@@ -579,28 +580,10 @@ class _VerlCheckpointWatcher:
                 raise RuntimeError(f"required saves were not durably published: {missing}")
 
     def _completed_step(self) -> int:
-        tracker = os.path.join(self.local_dir, "latest_checkpointed_iteration.txt")
-        try:
-            with open(tracker) as file:
-                return int(file.read().strip())
-        except (FileNotFoundError, OSError, ValueError):
-            return 0
+        return completed_checkpoint_step(self.local_dir)
 
     def _step_dirs(self, completed_step: int) -> list[tuple[int, str]]:
-        found: list[tuple[int, str]] = []
-        try:
-            names = os.listdir(self.local_dir)
-        except OSError:
-            return found
-        for name in names:
-            match = re.fullmatch(r"global_step_(\d+)", name)
-            if match is None:
-                continue
-            step = int(match.group(1))
-            path = os.path.join(self.local_dir, name)
-            if step <= completed_step and step not in self.processed_steps and os.path.isdir(path):
-                found.append((step, path))
-        return sorted(found)
+        return unprocessed_checkpoint_dirs(self.local_dir, completed_step, self.processed_steps)
 
     def _should_publish(self, step: int) -> bool:
         return not self.required_steps or step in self.required_steps

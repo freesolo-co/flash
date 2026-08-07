@@ -1014,6 +1014,47 @@ def latest_global_step_dir(local_dir: str) -> tuple[str, int]:
     return best, best_step
 
 
+def completed_checkpoint_step(local_dir: str) -> int:
+    """read verl's completion marker; 0 when it is absent or unreadable.
+
+    verl writes ``global_step_N`` in full and only THEN advances
+    ``latest_checkpointed_iteration.txt`` (the file ``stage_verl_resume`` writes above), so gating a
+    publish on this marker never reads a half-written checkpoint dir. an unreadable marker reads as
+    "nothing completed yet" rather than raising: the watchers poll this on a loop, and a torn read
+    mid-write must retry on the next tick, not fail the run.
+    """
+    tracker = os.path.join(local_dir, "latest_checkpointed_iteration.txt")
+    try:
+        with open(tracker) as file:
+            return int(file.read().strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return 0
+
+
+def unprocessed_checkpoint_dirs(
+    local_dir: str, completed_step: int, processed_steps: set[int]
+) -> list[tuple[int, str]]:
+    """``(step, dir)`` for every completed ``global_step_N`` not yet in ``processed_steps``, ascending.
+
+    Bounded by ``completed_step`` so a directory verl is still writing is never handed to a
+    publisher, and by ``processed_steps`` so each checkpoint is published exactly once.
+    """
+    found: list[tuple[int, str]] = []
+    try:
+        names = os.listdir(local_dir)
+    except OSError:
+        return found
+    for name in names:
+        match = re.fullmatch(r"global_step_(\d+)", name)
+        if match is None:
+            continue
+        step = int(match.group(1))
+        path = os.path.join(local_dir, name)
+        if step <= completed_step and step not in processed_steps and os.path.isdir(path):
+            found.append((step, path))
+    return sorted(found)
+
+
 def stage_verl_resume(resume_dir: str, local_dir: str, *, job_label: str) -> int:
     """stage a downloaded ``checkpoint-N`` into local_dir where verl looks; return its step.
 
