@@ -4169,6 +4169,36 @@ def test_the_child_puts_no_deadline_on_a_bridge_call():
     )
 
 
+def test_the_child_puts_no_deadline_or_retry_on_a_generation_call():
+    # TRAINING.md documents the request policy users are told to reason about, so the two have to
+    # move together. a deadline here cannot be reinstated the way the retired trl driver had it:
+    # that driver held vLLM in-process and aborted by id, while verl's LLMServerClient.generate
+    # mints its OWN uuid4 for the remote call, so the caller cannot name the engine request it
+    # started. retrying without aborting leaves the wedged generation occupying kv cache and
+    # doubles the load on an engine that is already struggling.
+    from flash.engine.worker import grpo_multiturn
+
+    body = " ".join(inspect.getsource(grpo_multiturn).split())
+    # checked before the anchor below, because the usual way to add a deadline is to wrap the call
+    # -- which moves the anchor and would otherwise report as "the call vanished".
+    assert "asyncio.wait_for" not in body, (
+        "a deadline wrapper is back around generation; without an abort primitive the timed-out "
+        "request keeps running, so TRAINING.md's request-policy paragraph must be rewritten"
+    )
+    assert "generated = await self.server_manager.generate(" in body, (
+        "the generation call moved; re-point this guard so a deadline cannot slip in unnoticed"
+    )
+    call = body.split("generated = await self.server_manager.generate(")[1].split(")")[0]
+    assert "timeout" not in call, (
+        "a per-request timeout is back on the generation call; TRAINING.md's request-policy "
+        "paragraph says there is none and has to be rewritten alongside it"
+    )
+    assert "deadline" not in call, (
+        "a per-request deadline is back on the generation call; TRAINING.md's request-policy "
+        "paragraph says there is none and has to be rewritten alongside it"
+    )
+
+
 def test_the_parent_sends_the_per_turn_cap_from_the_configured_completion_budget():
     # the cap is only real if the parent actually exports it; the child KeyErrors mid-rollout
     # otherwise, after the engine is already up and paid for.
