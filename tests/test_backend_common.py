@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2846,7 +2847,32 @@ def test_every_verl_backend_enables_tf32_in_the_child(backend, monkeypatch):
     from flash.engine.worker import opd_train, sft_train
 
     if backend == "grpo":
+        # grpo assembles shim_source inside run_rl_train, past the subprocess launch, so there is no
+        # renderer to call. rebuild the join from the ast instead: calling render_tf32_shim() here
+        # would test the renderer this test already covers and stay green if run_rl_train stopped
+        # joining it in -- the exact regression, with grpo back on fp32 matmuls.
+        assign = next(
+            node
+            for node in ast.walk(
+                ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+            )
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "id", "") == "shim_source" for t in node.targets)
+        )
+        rendered = [
+            ast.unparse(node.func)
+            for node in ast.walk(assign.value)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert "render_tf32_shim" in rendered, (
+            "run_rl_train no longer joins render_tf32_shim() into shim_source; the grpo child gets "
+            f"no tf32 fragment and trains fp32. joined renderers were: {rendered!r}"
+        )
+        # and the fragment must be unconditional -- a renderer that returns "" for some config
+        # would drop it. `part for part in (...) if part` filters empties, so an inert render is
+        # indistinguishable from an absent one at runtime.
         source = vc.render_tf32_shim()
+        assert source.strip(), "render_tf32_shim() returned nothing to join"
     elif backend == "opd":
         source = opd_train._render_opd_sitecustomize(save_at_steps=(3,), total_steps=3)
     else:
