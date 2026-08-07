@@ -300,20 +300,34 @@ def _urlopen(
     import random
 
     _RATE_LIMIT_BASE_DELAY = 10.0
+
+    def backoff_delay(attempt: int) -> float:
+        return max(
+            _RATE_LIMIT_BASE_DELAY,
+            min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
+        )
+
+    def drain(resp) -> bytes:
+        """Consume the response, honouring the byte cap and the caller's sink.
+
+        Returns ``b""`` whenever ``out`` is given: the bytes went to the file, and also returning
+        them would hold the whole download in memory, which is the thing streaming to ``out`` avoids.
+        """
+        chunks = _iter_capped_chunks(resp, max_bytes) if max_bytes is not None else None
+        if out is None:
+            return b"".join(chunks) if chunks is not None else resp.read()
+        if chunks is not None:
+            for chunk in chunks:
+                out.write(chunk)
+        else:
+            shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
+        return b""
+
     attempt = 0
     while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if max_bytes is not None:
-                    if out is not None:
-                        for chunk in _iter_capped_chunks(resp, max_bytes):
-                            out.write(chunk)
-                        return b""
-                    return b"".join(_iter_capped_chunks(resp, max_bytes))
-                if out is not None:
-                    shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
-                    return b""
-                return resp.read()
+                return drain(resp)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
             remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
@@ -322,11 +336,7 @@ def _urlopen(
             )
             is_transient = is_rate_limit or exc.code >= 500
             if is_transient and attempt < max_rate_limit_retries:
-                delay = max(
-                    _RATE_LIMIT_BASE_DELAY,
-                    min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
-                )
-                time.sleep(delay)
+                time.sleep(backoff_delay(attempt))
                 attempt += 1
                 continue
             if is_rate_limit:
@@ -342,11 +352,7 @@ def _urlopen(
             ) from exc
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             if attempt < max_rate_limit_retries:
-                delay = max(
-                    _RATE_LIMIT_BASE_DELAY,
-                    min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
-                )
-                time.sleep(delay)
+                time.sleep(backoff_delay(attempt))
                 attempt += 1
                 continue
             reason = getattr(exc, "reason", exc)
