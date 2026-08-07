@@ -2243,6 +2243,108 @@ def test_worker_artifacts_fetches_console_and_latest_attempt_error(monkeypatch, 
     assert "error_rl_attempt0.txt" not in out
 
 
+def test_worker_artifacts_surfaces_the_ray_failure_logs(monkeypatch, tmp_path):
+    """The ray collector's whole purpose is defeated if nothing fetches what it uploads.
+
+    A raylet death shows up in the traceback only as its downstream symptom ("Failed to register
+    worker to Raylet: ... End of file"). The worker collects ray's own session logs to disambiguate
+    that, but they live in a PRIVATE repo -- so if the control plane does not fetch them with the
+    operator token, `flash runs log` still shows only the EOF traceback and the artifact is written
+    for nobody (codex[bot]).
+
+    Attempt-scoped like the traceback beside it: on a retry only the highest attempt reproduced the
+    failure, and a stale one would misdirect the diagnosis it exists to give.
+    """
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    content = {
+        "rl/r1/console_rl.txt": "worker console\n",
+        "rl/r1/error_rl_attempt1.txt": "Failed to register worker to Raylet: ... End of file\n",
+        "rl/r1/raylogs_rl_attempt0.txt": "stale first-attempt ray logs\n",
+        "rl/r1/raylogs_rl_attempt1.txt": "RAYLET died: /tmp/ray/session_x/logs/raylet.err\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert out["raylogs_rl_attempt1.txt"] == (
+        "RAYLET died: /tmp/ray/session_x/logs/raylet.err\n"
+    ), "the ray failure logs never reach the user, so a raylet death stays undiagnosable"
+    assert "raylogs_rl_attempt0.txt" not in out, "a superseded attempt's ray logs must not surface"
+    # the artifacts it already carried are unaffected.
+    assert out["console_rl.txt"] == "worker console\n"
+    assert "End of file" in out["error_rl_attempt1.txt"]
+
+
+def test_worker_artifacts_is_unaffected_when_ray_never_failed(monkeypatch, tmp_path):
+    """The ray artifact is uploaded only when ray actually failed, so it is usually absent.
+
+    Its absence must stay a non-event: the fetch is best-effort per file, and a missing raylogs
+    file cannot suppress the console and traceback that every failure has.
+    """
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="sft",
+        run_id="r2",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    content = {
+        "sft/r2/console_sft.txt": "worker console\n",
+        "sft/r2/error_sft_attempt0.txt": "ordinary traceback\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert out["console_sft.txt"] == "worker console\n"
+    assert out["error_sft_attempt0.txt"] == "ordinary traceback\n"
+    assert not [k for k in out if k.startswith("raylogs")]
+
+
 def test_worker_artifacts_prefers_latest_attempt_console(monkeypatch, tmp_path):
     """When console output is attempt-scoped, /worker should show the current attempt's tail."""
     import types
