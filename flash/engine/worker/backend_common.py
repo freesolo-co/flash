@@ -28,6 +28,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _thread_module
 from http.server import ThreadingHTTPServer
+from typing import Self
 
 from flash.diagnostics import sanitize_diagnostic
 
@@ -1654,41 +1655,160 @@ def run_verl_training(
     process_group_id = proc.pid
     last_hb = 0.0
     try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            print(line, end="", flush=True)
-            child_tail.record(line)
-            if on_line is not None:
-                on_line(line)
-            m = step_re.search(line)
-            if m and on_step is not None:
-                on_step(int(m.group(1)))
-            if heartbeat is not None:
-                now = time.monotonic()
-                if now - last_hb >= heartbeat_interval_s:
-                    heartbeat()
-                    last_hb = now
+        # the child's exit is watched independently of pipe EOF. a grandchild holding the inherited
+        # pipe open after the trainer dies would otherwise keep the loop below running forever, on a
+        # paid gpu, having already lost the process whose output it is waiting for.
+        with _ChildExitWatchdog(
+            proc, process_group_id=process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
+        ) as watchdog:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                watchdog.note_line()
+                print(line, end="", flush=True)
+                child_tail.record(line)
+                if on_line is not None:
+                    on_line(line)
+                m = step_re.search(line)
+                if m and on_step is not None:
+                    on_step(int(m.group(1)))
+                if heartbeat is not None:
+                    now = time.monotonic()
+                    if now - last_hb >= heartbeat_interval_s:
+                        heartbeat()
+                        last_hb = now
     except BaseException:
         kill_process_group(proc, process_group_id=process_group_id)
         raise
     finally:
         if proc.poll() is None:
-            proc.wait()
+            # BOUNDED. EOF is not the child's exit, so a child that outlives its own stdout would
+            # park the attempt here. one that has not exited within the grace after its stdout closed
+            # is not going to, so tear the group down and let the wait inside that call collect it.
+            try:
+                proc.wait(timeout=_TEARDOWN_GRACE_S)
+            except subprocess.TimeoutExpired:
+                kill_process_group(proc, process_group_id=process_group_id)
         # every job boundary, not just the failing ones. a straggler an earlier teardown SIGKILLed
         # but could not drain in time exits shortly after, and `kill_process_group` -- the only other
         # caller of this -- runs on exceptions alone: a worker whose later jobs all succeed would
         # hold that zombie for its whole life, as pid 1 with nothing else to reap it (codex[bot]).
         reap_stragglers()
-    return_code = int(proc.returncode)
+    collected = proc.returncode
+    if collected is None:
+        # the bounded wait above can end with nothing collected, which the unbounded one it replaced
+        # could not: a group member wedged in uninterruptible io outlives even the SIGKILL inside
+        # teardown. `int(None)` would replace that diagnosis with a TypeError, so name the survivor
+        # instead -- callers already handle a RuntimeError from here.
+        raise RuntimeError(
+            f"verl subprocess {proc.pid} did not exit after teardown; its process group is still "
+            "holding the gpu"
+        )
+    return_code = int(collected)
+    if watchdog.tore_down and return_code == 0:
+        # the child exited 0 but a descendant held the pipe open past the grace, so the group was
+        # killed to release it. reporting success here would upload whatever partial artifacts exist
+        # as a completed run: the trainer's own exit status says nothing about the descendant that
+        # was still running, and that descendant is why the pipe never closed.
+        raise RuntimeError(
+            f"verl subprocess {proc.pid} exited 0 but a descendant held its output pipe open for "
+            f"{_ORPHANED_PIPE_GRACE_S:.0f}s; the process group was torn down to release the gpu"
+        )
     try:
         raise_for_classified_verl_exit(return_code, child_tail)
     except BaseException:
         kill_process_group(proc, process_group_id=process_group_id)
         raise
+    if return_code != 0:
+        # a nonzero exit that carried no recognized signature RETURNS from the classifier rather
+        # than raising, so this is the one failing path that reached neither teardown above. the
+        # direct child is gone but its group need not be: a surviving EngineCore keeps its cuda
+        # context, and a reusable worker then hands the next attempt an occupied gpu.
+        kill_process_group(proc, process_group_id=process_group_id)
     return return_code
 
 
 _TEARDOWN_GRACE_S = 10.0
+
+# how long a descendant may hold the merged stdout pipe open after the direct child has already
+# exited. the read loop cannot distinguish "the trainer is still working" from "the trainer is dead
+# and only its EngineCore is still attached", because both present an open pipe with no new lines --
+# so the child's exit has to be observed independently of EOF, and this is the grace between the two.
+# generous on purpose: a descendant that is genuinely finishing a flush is not the failure, and the
+# only cost of waiting is a few seconds at the end of an attempt that is already over.
+_ORPHANED_PIPE_GRACE_S = 30.0
+
+
+class _ChildExitWatchdog:
+    """Tears the group down when the direct child exits but a descendant holds the pipe open.
+
+    The read loops in this module all end on stdout EOF, and EOF is not the child's exit: verl
+    spawns vllm's EngineCore as a grandchild that INHERITS the merged pipe, so a trainer that dies
+    while the EngineCore lives leaves a pipe nobody will close. The loop then blocks forever on a
+    paid gpu with nothing left to report, and no teardown below it is ever reached -- the reviewers
+    on PR #730 flagged this at both call sites.
+
+    So the child's exit is watched here instead, on its own thread, independent of the pipe. Once the
+    child is gone and the grace has passed with the pipe still open, the group is torn down: that
+    both frees the cuda context the survivor is holding and closes the pipe, which is what lets the
+    reader reach the exit path it was already going to take.
+
+    Deliberately NOT a timeout on the run. It arms only after the direct child has exited, so a
+    healthy trainer that is simply quiet for a while is untouched -- silence is the staleness
+    detector's job (see ``ChildTailStaleness``), not this one.
+    """
+
+    def __init__(self, proc: subprocess.Popen, *, process_group_id: int, grace_s: float) -> None:
+        self._proc = proc
+        self._process_group_id = process_group_id
+        self._grace_s = grace_s
+        self._done = threading.Event()
+        self._thread: threading.Thread | None = None
+        # bumped by the reader for every line it takes off the pipe. the exit of the child alone is
+        # NOT sufficient evidence of a leak: a child can exit having left a full pipe behind, and a
+        # reader working through that backlog -- an on_step callback uploading a checkpoint takes
+        # minutes -- would otherwise be killed mid-upload and its successful run reported as failed.
+        # a stuck reader cannot advance this; a busy one does, which is exactly the distinction.
+        self._lines_read = 0
+        # read by the caller after the loop ends, to distinguish "the child closed its own pipe" from
+        # "we closed it by killing the group out from under a survivor".
+        self.tore_down = False
+
+    def note_line(self) -> None:
+        """Called by the reader per line. A plain int store, so no lock is needed."""
+        self._lines_read += 1
+
+    def __enter__(self) -> Self:
+        self._thread = threading.Thread(
+            target=self._watch, name="verl-child-exit-watchdog", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._done.set()
+        if self._thread is not None:
+            # bounded: the thread only ever sleeps on `_done`, so this is a handoff, not a wait on
+            # the child. the thread is a daemon regardless, so it can never hold the worker open.
+            self._thread.join(timeout=_TEARDOWN_GRACE_S)
+
+    def _watch(self) -> None:
+        # `poll` rather than `wait`: this thread must stay responsive to `_done` instead of blocking
+        # on the child. both collect the status, and CPython guards that with `_waitpid_lock`, so
+        # whichever of the two threads gets there first is the one that sets `returncode`.
+        while not self._done.wait(0.5):
+            if self._proc.poll() is None:
+                continue
+            # the child is gone. that is necessary but not sufficient: require the reader to also be
+            # making no progress across the grace, so a backlog being worked through is never killed.
+            before = self._lines_read
+            if self._done.wait(self._grace_s):
+                return
+            if self._lines_read != before:
+                # the reader is still draining real output. keep watching rather than tearing down.
+                continue
+            self.tore_down = True
+            kill_process_group(self._proc, process_group_id=self._process_group_id)
+            return
 
 
 def _process_is_zombie(pid: int) -> bool:
