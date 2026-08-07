@@ -466,6 +466,8 @@ def _setup_interactive(args) -> bool:
 
 
 def cmd_env_setup(args) -> int:
+    from flash.client import ClientError
+
     project_id = _require_setup_project(args)
     _validate_existing_config_projects(project_id)
     starter_env = Path("environment.py")
@@ -524,11 +526,29 @@ def cmd_env_setup(args) -> int:
     # exactly what it names, and end up with the deleted configs rewritten one way and the unnamed one
     # still holding the old setting -- the same silent cross-algorithm mismatch, just relocated.
     reasoning_configs = (rl, opd, sft)
-    existing_reasoning: bool | None = None
-    for cfg in reasoning_configs:
-        if cfg.exists():
-            existing_reasoning = "thinking = true" in cfg.read_text(encoding="utf-8")
-            break
+    # read EVERY existing config, not just the first. stopping at the first one anchors on whichever
+    # file happens to sort earliest and silently accepts a project whose configs disagree -- exactly
+    # what a scaffold from before #824 looks like, since that release wrote `thinking` into rl and
+    # sft but never into opd. rl is visited first, reports reasoning, and the stale opd config is
+    # neither reported nor rewritten (codex[bot]).
+    found_reasoning = {
+        cfg: "thinking = true" in cfg.read_text(encoding="utf-8")
+        for cfg in reasoning_configs
+        if cfg.exists()
+    }
+    if len(set(found_reasoning.values())) > 1:
+        # no anchor exists: the configs disagree, so there is no "existing state" to keep. picking a
+        # side would rewrite nothing (configs are only written when absent) and leave the project
+        # training one algorithm with reasoning and another without. refusing is the only outcome
+        # that cannot end in a silent cross-algorithm mismatch.
+        on = ", ".join(str(cfg) for cfg, has in found_reasoning.items() if has)
+        off = ", ".join(str(cfg) for cfg, has in found_reasoning.items() if not has)
+        raise ClientError(
+            f"existing configs disagree about reasoning: {on} set `thinking = true`, "
+            f"{off} do not. Delete {', '.join(str(cfg) for cfg in found_reasoning)} and re-run "
+            "`flash env setup` with --reasoning or --no-reasoning to scaffold them together."
+        )
+    existing_reasoning = next(iter(found_reasoning.values()), None)
     flag_reason = getattr(args, "reasoning", None)
     if existing_reasoning is not None:
         if flag_reason is not None and flag_reason != existing_reasoning:
