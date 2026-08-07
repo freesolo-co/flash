@@ -25,30 +25,6 @@ def sft_update_steps(
     return max(1, math.ceil(training_rows / max(1, int(examples_per_update))) * int(epochs))
 
 
-def save_step_due(
-    step: int,
-    save_at_steps: tuple[int, ...] | list[int],
-    save_every: int | None,
-) -> bool:
-    """Select exact save steps when configured, otherwise preserve periodic saves."""
-    step = int(step)
-    if step <= 0:
-        return False
-    required_steps = tuple(int(item) for item in save_at_steps)
-    if required_steps:
-        return step in required_steps
-    interval = int(save_every or 0)
-    return interval > 0 and step % interval == 0
-
-
-def configure_trainer_save_schedule(
-    config: dict, save_at_steps: tuple[int, ...] | list[int]
-) -> None:
-    """Disable periodic trainer saves when exact save steps are configured."""
-    if save_at_steps:
-        config["save_strategy"] = "no"
-
-
 def final_save_due(step: int, save_at_steps: tuple[int, ...] | list[int]) -> bool:
     """Preserve the final checkpoint unless exact save steps exclude it."""
     step = int(step)
