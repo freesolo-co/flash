@@ -435,9 +435,15 @@ def test_lora_rank_must_fit_small_serving_cap() -> None:
 
 
 def test_lora_rank_must_fit_large_serving_cap() -> None:
-    # The 4B tier serving cap doubled 32 -> 64; rank 65 exceeds it.
-    with pytest.raises(ConfigError, match="serving max_lora_rank=64"):
-        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", **{"train.lora_rank": 65}))
+    from flash.catalog import serving_lora_rank_cap
+
+    # the 27B is the rank-64 tier. this case used the 4B, which was rank-64 when it was written and
+    # is now rank-128 -- leaving it there would have made this a duplicate of the small-cap test
+    # above rather than coverage of the lower cap. derived from the catalog so it tracks the tier.
+    cap = serving_lora_rank_cap("Qwen/Qwen3.6-27B")
+    assert cap is not None
+    with pytest.raises(ConfigError, match=f"serving max_lora_rank={cap}"):
+        spec_from_dict(_raw(model="Qwen/Qwen3.6-27B", **{"train.lora_rank": cap + 1}))
 
 
 def test_bare_environment_id_is_rejected() -> None:
