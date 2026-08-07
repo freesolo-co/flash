@@ -2000,9 +2000,9 @@ def test_a_scalar_reward_env_contributes_no_breakdown_at_all():
 @pytest.mark.usefixtures("_identity_graded")
 def test_a_scalar_reward_env_contributes_nothing_when_its_grading_fails_either():
     # the failure path is where the scores_breakdown gate actually bites: without it, a run whose
-    # env has no named components at all would still append None per failed completion, and
-    # _latest_named_reward_metrics' outage branch would then republish the LAST run's names as a
-    # flat 0 for an env that never reported them.
+    # env has no named components at all would still append None per failed completion, and the
+    # buffer's outage branch would then republish the LAST run's names as a flat 0 for an env that
+    # never reported them.
     breakdowns: list[dict | None] = []
     score = rl_train.score_single_turn(
         _RaisingRewardOnlyEnv(),
@@ -5891,6 +5891,24 @@ def test_a_generation_that_reports_no_components_at_all_leaves_the_metrics_stand
     buffer.close_generation(2)
 
     assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}, "read as an outage"
+
+
+def test_a_generation_whose_every_grading_failed_publishes_the_known_names_as_zero():
+    """The opposite case to the test above, and the two are only distinguishable by whether any
+    breakdown was attempted. Here the env DOES report components and every completion failed to
+    score, so the names are known and their true value this generation is 0. Leaving the previous
+    generation's numbers standing would show a healthy reward through a total scoring outage --
+    the metric would keep reading 1.0 while nothing was being graded at all."""
+    buffer = RewardObservabilityBuffer()
+    buffer.record("p", "a", 1.0, [{"success": 1.0, "total": 1.0}])
+    buffer.close_generation(1)
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}
+
+    # a breakdown slot per failed grading: attempted, produced nothing
+    buffer.record("p", "b", 0.0, [None])
+    buffer.close_generation(2)
+
+    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 0.0}
 
 
 @pytest.mark.usefixtures("_identity_graded")
