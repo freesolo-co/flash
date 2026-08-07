@@ -1021,10 +1021,12 @@ watch `truncation_rate`, which counts completions not ending in EOS and is not s
 > noisier per-step gradients. Compare concrete `--cost` estimates before and after the
 > change and let those numbers, not the ratio, decide.
 
-For pure multi-turn GRPO, Flash gives each Flash-owned vLLM generation request a managed
-10-to-60-minute absolute deadline and at most two physical attempts. A timed-out request is
-aborted before retry. Enforcement is cooperative between engine polls, and there is no total
-episode elapsed-time cutoff. This policy does not time out OPD or environment calls.
+Multi-turn generation requests carry no per-request deadline or retry. Neither GRPO nor OPD
+times out an individual generation, an environment call, or a teacher call, and there is no
+episode elapsed-time cutoff. A wedged generation is caught by the training stall watchdog,
+which tears the run down after 25 minutes without progress. That watchdog measures whether
+training is advancing rather than how long one request has taken, so a slow-but-live engine
+is never killed for being slow.
 
 > **The reward-hacking signature:** a smoothed reward rising while mean generated
 > length collapses. Whenever any shortness or format pressure is active, verify the
