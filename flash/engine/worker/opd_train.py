@@ -37,17 +37,19 @@ from flash.engine.worker.backend_common import (
     ChildTailStaleness,
     agent_loop_workers,
     clamp_engine_len,
+    gdn_probe_module,
+    gdn_reset_arch_from_caps,
     latest_global_step_dir,
     model_max_position_embeddings,
     parse_verl_metric,
     parse_wandb_link,
+    probe_verl_capabilities,
     ray_num_cpus,
     render_gdn_varlen_shim,
     render_tf32_shim,
     render_wandb_link_shim,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
-    resolve_verl_device_capability,
     resolve_verl_loggers,
     resolve_verl_python,
     rollout_resident_overrides,
@@ -55,7 +57,7 @@ from flash.engine.worker.backend_common import (
     run_verl_training,
     stall_tail_fields,
     trainer_dtype_overrides,
-    verl_child_gdn_reset_arch,
+    verl_device_capability,
     verl_step_number,
 )
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -2438,11 +2440,23 @@ def run_opd_train(spec=None) -> None:
         python_bin = resolve_verl_python(
             workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
         )
+        # the architecture question is asked on its OWN, before the batched probe, because it reads
+        # the checkpoint config and has nothing to do with the child's capabilities.
+        # model_is_gdn_hybrid already returns False on its own probe failure, so it needs no guard.
+        # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read the
+        # child must not repeat; "" skips the gdn question for a non-hybrid.
+        from flash.engine.worker.packing import model_is_gdn_hybrid
+
+        gdn_hybrid = model_is_gdn_hybrid(model_id, revision=model_revision)
+        gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
+        # ONE child answers every independent capability question. each used to cost its own
+        # interpreter, and the torch/verl import -- not the question -- was the price.
+        caps = probe_verl_capabilities(python_bin, gdn_module)
     model_path = _cached_model_path(model_id, model_revision)
     gpu_count = int(getattr(spec.gpu, "count", 1) or 1)
     save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else knobs.save_every
-    # verl logs from python_bin, so gate wandb on THAT interpreter (see resolve_verl_loggers).
-    loggers = resolve_verl_loggers(python_bin)
+    # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
+    loggers = resolve_verl_loggers(caps)
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
     # fp8 kv cache on ada/hopper+ (cc >= 8.9), matching rl_train's grpo gate -- but NOT for hybrid
@@ -2450,14 +2464,10 @@ def run_opd_train(spec=None) -> None:
     # tensor and crashes on the hybrid cache under verl's sleep/wake, which opd leaves enabled.
     # the vram estimator applies an fp8 discount to opd above the non-fp8 card ceiling, so this must
     # stay in lockstep with it: bf16 here against an fp8-sized reservation OOMs at rollout init.
-    # the architecture question is asked on its OWN, not inside the cuda probe's try: it reads the
-    # checkpoint config and has nothing to do with device capability. sharing one try means a raise
-    # from get_device_capability() -- evaluated FIRST -- skips the classification entirely and reports
-    # a genuine gdn hybrid as not-hybrid, which then skips the boundary gate below and packs anyway.
-    # model_is_gdn_hybrid already returns False on its own probe failure, so it needs no guard here.
-    from flash.engine.worker.packing import model_is_gdn_hybrid
-
-    gdn_hybrid = model_is_gdn_hybrid(model_id, revision=model_revision)
+    # NOT inside gdn_hybrid's resolution above: that reads the checkpoint config and has nothing to
+    # do with device capability. sharing one try would mean a raise from get_device_capability() --
+    # evaluated FIRST -- skips the classification entirely and reports a genuine gdn hybrid as
+    # not-hybrid, which then skips the boundary gate below and packs anyway.
     try:
         import torch as _torch_cc
 
@@ -2470,9 +2480,7 @@ def run_opd_train(spec=None) -> None:
 
     # a gdn hybrid may only pack when the CHILD can honor seq_idx + cu_seqlens; the no-fla fallbacks
     # accept both and discard them, which silently bleeds state across packed example boundaries.
-    gdn_reset_arch = (
-        verl_child_gdn_reset_arch(python_bin, model_id, model_revision) if gdn_hybrid else None
-    )
+    gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
     gdn_boundary_resets = gdn_reset_arch is not None
     use_remove_padding = not gdn_hybrid or gdn_boundary_resets
     if gdn_hybrid and not gdn_boundary_resets:
@@ -2499,7 +2507,7 @@ def run_opd_train(spec=None) -> None:
     # (config/vllm.py:1024), after the async server has set cudagraph_mode, and forces both
     # compilation mode and cudagraph_mode to NONE.
     # one capability probe feeds both rollout decisions, as it does on the grpo path.
-    verl_cc = resolve_verl_device_capability(python_bin)
+    verl_cc = verl_device_capability(caps)
     enforce_eager = resolve_rollout_enforce_eager(verl_cc)
     # the same grpo/opd divergence as enforce_eager above, one knob over: blackwell needs both
     # rollout attention backends pinned because vllm 0.19.1's defaults are wrong there, and opd
@@ -2508,9 +2516,7 @@ def run_opd_train(spec=None) -> None:
     # `RuntimeError: Worker failed with error 'module 'cutlass.cute.core' has no attribute
     # 'ThrMma''` -- and a VL model builds its vision tower even for a text-only rollout, so this
     # reaches text-only opd too. no-op off blackwell. see resolve_blackwell_attention_backends.
-    attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(
-        python_bin, verl_cc
-    )
+    attention_backend, mm_encoder_attn_backend = resolve_blackwell_attention_backends(caps, verl_cc)
 
     plugin_path = os.path.join(shim_dir, "flash_opd_plugin.py")
     shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_plugin.py"), plugin_path)

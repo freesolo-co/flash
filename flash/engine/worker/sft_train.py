@@ -25,9 +25,12 @@ from flash.engine.steps import final_save_due, validate_save_steps
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.backend_common import (
     export_peft_adapter,
+    gdn_probe_module,
+    gdn_reset_arch_from_caps,
     latest_global_step_dir,
     parse_verl_metric,
     parse_wandb_link,
+    probe_verl_capabilities,
     render_gdn_varlen_shim,
     render_tf32_shim,
     render_wandb_link_shim,
@@ -37,7 +40,6 @@ from flash.engine.worker.backend_common import (
     run_verl_training,
     stage_verl_resume,
     stamp_adapter_dir_provenance,
-    verl_child_gdn_reset_arch,
     verl_step_number,
 )
 from flash.engine.worker.heartbeat import join_while_draining, liveness_heartbeat
@@ -1076,9 +1078,22 @@ def run_sft_train(spec=None) -> None:
         python_bin = resolve_verl_python(
             workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
         )
+        # remove-padding packs the micro-batch into one row, which is correct for softmax attention
+        # (transformers rebuilds its varlen boundaries from the restarting position ids) but NOT for
+        # a gated-deltanet hybrid: its conv and recurrent state only reset if the child can honor
+        # seq_idx and cu_seqlens, and the no-fla fallbacks accept both and discard them. so pack a
+        # gdn model only when the child proves it can reset, and otherwise fall back to verl's
+        # padded path, which carries a real attention_mask and is boundary-correct by construction.
+        # the modeling module is resolved HERE, in the parent, because it needs a hub/cache read the
+        # child must not repeat; "" skips the question for a non-hybrid.
+        gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
+        gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
+        # ONE child answers every independent capability question. each used to cost its own
+        # interpreter, and the torch/verl import -- not the question -- was the price.
+        caps = probe_verl_capabilities(python_bin, gdn_module)
     model_path = _cached_model_path(model_id, model_revision)
-    # verl logs from python_bin, so gate wandb on THAT interpreter (see resolve_verl_loggers).
-    loggers = resolve_verl_loggers(python_bin)
+    # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
+    loggers = resolve_verl_loggers(caps)
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _w.wandb_run_name()
     shim_dir = os.path.join(workdir, "shim")
@@ -1088,10 +1103,9 @@ def run_sft_train(spec=None) -> None:
     # the gdn boundary shim resets conv and recurrent state at packed example boundaries, but only
     # when the verl child has the kernels that read seq_idx and cu_seqlens; the no-fla fallbacks
     # accept both and discard them. so the shim is installed only when the child proves it can reset.
-    gdn_hybrid = model_is_gdn_hybrid(model_id, model_revision)
-    gdn_reset_arch = (
-        verl_child_gdn_reset_arch(python_bin, model_id, model_revision) if gdn_hybrid else None
-    )
+    # `gdn_hybrid`/`gdn_module` and the child's answer are resolved above, inside the configuring
+    # liveness wrap, because the probe is part of the setup silence that wrap exists to cover.
+    gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
     # remove-padding is verl's TENSOR LAYOUT switch, not this run's packing/step contract, so nothing
     # here may gate it. verl defaults to `pad_mode: no_padding`, whose sft_loss reads
     # `log_prob.values()` -- valid only on the nested tensor the remove-padding path builds. turning
