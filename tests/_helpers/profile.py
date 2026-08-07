@@ -134,6 +134,7 @@ def attach_sft_profile(spec: Any) -> Any:
     return _replace(
         pinned,
         workload_profile_input_digest=digest,
+        workload_profile_producer_version=__version__,
         workload_profile=profile.to_dict(),
     )
 

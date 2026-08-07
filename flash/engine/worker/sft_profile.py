@@ -16,30 +16,38 @@ def run_sft_profile() -> None:
     spec = _w.JOB_SPEC
     if spec is None or spec.workload_profile_kind != SFT_PROFILE_KIND:
         raise RuntimeError("sft profile worker requires an internal profile job spec")
-    from flash import __version__
+    # the producer version travels on the spec; see JobSpec.workload_profile_producer_version for
+    # why deriving it here from `flash.__version__` would key a digest no plane can ever match.
+    producer_version = spec.workload_profile_producer_version
 
     expected = sft_profile_input_digest(
         spec,
         tokenizer_revision=spec.model_revision,
-        producer_version=__version__,
+        producer_version=producer_version,
     )
     if expected != spec.workload_profile_input_digest:
         raise ValueError("sft workload profile input digest does not match the worker spec")
 
+    started_at = time.time()
+    _w.heartbeat("profile_start")
+    # load the environment BEFORE seeding, exactly as the training worker does. both sides reseed
+    # python and numpy, so what has to match is not that they seed but WHERE: anything that draws on
+    # the global generators during env load (the loader's retry jitter, a user module consuming
+    # random/numpy at import) lands on the opposite side of the seed otherwise, the two workers build
+    # different rows, and the drift guard rejects a profile the user already paid for.
+    env = _w.require_active_env()
     # host generators only: environment code may consume them while building its dataset, so the
     # profile must reach the same rows training will. seeding torch would import it, and a job that
     # is quoted as cpu-only has no business pulling in the model stack.
     seed_host_rngs(spec.seed)
-    started_at = time.time()
-    _w.heartbeat("profile_start")
     prepared = prepare_sft_workload(
         spec,
-        _w.require_active_env(),
+        env,
         tokenizer_loader=lambda model_id, revision: _w.load_tokenizer(
             model_id,
             revision=revision,
         ),
-        producer_version=__version__,
+        producer_version=producer_version,
         allow_packing=True,
     )
     finished_at = time.time()
