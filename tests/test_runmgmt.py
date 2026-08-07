@@ -1684,6 +1684,77 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     assert "adopted a completed attempt at the wall deadline" in log.getvalue()
 
 
+def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp_path):
+    # same gap as the reconciler's, on the OTHER adoption path: attach_run pops the allocation
+    # stamp off the persisted remote before building the handle, and only restores it on the
+    # poll-success return. an adopted run leaves through _completed_attempt_metrics instead, whose
+    # payload is the worker's own metrics.json -- and the worker never knew the card count. without
+    # the carry, a 4-card vast run recovered after a control-plane restart prices its wall as one.
+    import io
+
+    import flash.providers._hf_artifacts as hf_artifacts
+    import flash.runner as runner
+    import flash.runner.lifecycle as lifecycle
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(
+        run_id="attach-adopt-multicard",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(max_wall_seconds=120),
+    )
+    remote = _vast_remote(
+        instance_id=7,
+        attempt=0,
+        started_ts=101.0,
+        allocated_gpu="RTX 4090",
+        allocated_gpu_count=4,
+    )
+    runner._save_status(
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
+        _run_deadline_at=220.0,
+        _next_attempt=1,
+    )
+    monkeypatch.setattr(runner.time, "time", lambda: 221.0)
+
+    def artifact_reader(_repo, path):
+        def read(force=False):
+            if path.endswith("/vast_attempt0.json"):
+                return (
+                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
+                    '"run_id":"attach-adopt-multicard","ts":219.0}'
+                )
+            if path.endswith("/metrics.json"):
+                # exactly what the worker writes: a wall, and nothing about the allocation.
+                return '{"wall_seconds":3600.0}'
+            return None
+
+        return read
+
+    adopted = {}
+    real_adopt = lifecycle._adopt_completed_attempt
+
+    def capture_adopt(run_id, adopt_spec, expected_remote, metrics, **kwargs):
+        adopted.update(metrics)
+        return real_adopt(run_id, adopt_spec, expected_remote, metrics, **kwargs)
+
+    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+    monkeypatch.setattr(lifecycle, "_adopt_completed_attempt", capture_adopt)
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+
+    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert status.state == "done"
+    assert adopted["allocated_gpu_count"] == 4, (
+        "an adopted multi-card run reached persistence with no card count, so its wall prices "
+        "as a single card"
+    )
+    assert adopted["allocated_gpu"] == "RTX 4090"
+
+
 def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, tmp_path):
     import io
 
