@@ -398,7 +398,12 @@ class _PendingClient:
     """Server with no matching profile: it starts one and rejects the quote with 409."""
 
     def __init__(
-        self, *, state: str = "queued", profile_quote: object = 0.25, owned: bool | None = True
+        self,
+        *,
+        state: str = "queued",
+        profile_quote: object = 0.25,
+        owned: bool | None = True,
+        launched: bool | None = True,
     ):
         from flash.client import ApiError
 
@@ -409,6 +414,8 @@ class _PendingClient:
         }
         if owned is not None:
             detail["owned"] = owned
+        if launched is not None:
+            detail["launched"] = launched
         self.error = ApiError(409, "workload profile pending", detail=detail)
         self.profile_quote = profile_quote
         self.get_run_calls: list[str] = []
@@ -591,6 +598,55 @@ def test_sft_cost_pending_without_an_ownership_flag_keeps_the_owner_wording(
     err = capsys.readouterr().err
     assert "billed on its own" in err
     assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert client.get_run_calls == [PROFILE_RUN_ID]
+
+
+def test_sft_cost_pending_on_your_own_running_profile_names_no_second_charge(
+    tmp_path, monkeypatch, capsys
+):
+    """Re-running against your own in-flight profile joins it. It does not start or bill another.
+
+    The profile id is deterministic in the workload, so the natural thing to do after a miss is to
+    re-run the same command. Only the request that won the claim launched anything; every later one
+    returns the same 409. Repeating the start-and-bill wording there would name a charge per retry
+    that the account never sees, and would read as the profile being relaunched each time.
+    """
+    from flash.client import ClientError
+
+    client = _use_client(monkeypatch, _PendingClient(state="running", launched=False))
+
+    with pytest.raises(ClientError, match=f"workload profile {PROFILE_RUN_ID} is running"):
+        cmd_train(_sft_args(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "launched nothing and charged nothing" in err
+    assert "the server started a separate profile run" not in err
+    assert "billed on its own" not in err
+    # still the owner's run, so the poll instruction stays.
+    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    # no charge is quoted for a launch that did not happen, so the run is never priced.
+    assert "$" not in err
+    assert client.get_run_calls == []
+
+
+def test_sft_cost_pending_without_a_launched_flag_keeps_the_charge_warning(
+    tmp_path, monkeypatch, capsys
+):
+    """An older server omits ``launched``. Absent must mean "you were charged", not "you weren't".
+
+    The two errors are not symmetric. Warning about a charge that did not happen costs a re-read;
+    staying silent about one that did leaves the user paying for a run they were never told about.
+    """
+    from flash.client import ClientError
+
+    client = _use_client(monkeypatch, _PendingClient(launched=None))
+
+    with pytest.raises(ClientError):
+        cmd_train(_sft_args(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "billed on its own" in err
+    assert "$0.25" in err
     assert client.get_run_calls == [PROFILE_RUN_ID]
 
 
