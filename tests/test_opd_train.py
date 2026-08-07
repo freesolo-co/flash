@@ -4872,7 +4872,7 @@ def test_the_resolved_eager_flag_reaches_the_opd_verl_config():
     built = inspect.getsource(opd_train.run_opd_train)
     # one probe now feeds both eager and the attention pins, so the call is bound to a name rather
     # than nested inline. assert the resolver still consumes THAT probe, not a second one.
-    assert "verl_cc = resolve_verl_device_capability(python_bin)" in built
+    assert "verl_cc = verl_device_capability(caps)" in built
     assert "resolve_rollout_enforce_eager(verl_cc)" in built
     assert '"enforce_eager": enforce_eager,' in built
 
@@ -4932,7 +4932,10 @@ def test_both_ray_rollouts_resolve_eager_from_the_same_hardware_probe():
         ("opd_train", inspect.getsource(opd_train.run_opd_train)),
     ):
         assert "resolve_rollout_enforce_eager(" in source, module
-        assert "resolve_verl_device_capability(python_bin)" in source, module
+        # every capability question rides ONE child probe per run; the eager decision reads that
+        # blob rather than spawning a torch import of its own.
+        assert "caps = probe_verl_capabilities(python_bin, gdn_module)" in source, module
+        assert "verl_cc = verl_device_capability(caps)" in source, module
 
 
 def test_overrides_pin_the_rollout_resident_for_sleep_unsupported_models():

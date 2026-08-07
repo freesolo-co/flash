@@ -1337,11 +1337,10 @@ def test_the_resolved_eager_flag_reaches_the_verl_config():
     built = inspect.getsource(rl_train.run_rl_train)
     assert "enforce_eager = resolve_rollout_enforce_eager(verl_cc)" in built
     assert "enforce_eager=enforce_eager," in built
-    # and the capability it decides from is the one probe both rollout decisions share.
-    assert "verl_cc = resolve_verl_device_capability(python_bin)" in built
-    assert (
-        "resolve_blackwell_attention_backends(\n            python_bin, verl_cc\n        )" in built
-    )
+    # and the capability it decides from is the one batched child probe every question shares.
+    assert "caps = probe_verl_capabilities(python_bin, gdn_module)" in built
+    assert "verl_cc = verl_device_capability(caps)" in built
+    assert "resolve_blackwell_attention_backends(\n            caps, verl_cc\n        )" in built
     cfg = inspect.getsource(rl_train._build_verl_training_cfg)
     assert '"enforce_eager": enforce_eager,' in cfg
 
