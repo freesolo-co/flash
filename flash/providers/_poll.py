@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from flash.adapter_artifacts import MAX_ATTEMPT_ID
 from flash.diagnostics import neutralize_control_chars
 from flash.engine.rollout_samples import sampled_completion_scalar
 from flash.providers._deadline import remaining_seconds
@@ -420,14 +421,11 @@ def surface_heartbeat(
     return key, stage
 
 
-_MAX_ATTEMPT_ID = (1 << 63) - 1
-
-
 def _attempt_int(value: Any) -> int | None:
     """Validate a bounded nonnegative integer attempt identity."""
     if isinstance(value, bool) or not isinstance(value, int):
         return None
-    return value if 0 <= value <= _MAX_ATTEMPT_ID else None
+    return value if 0 <= value <= MAX_ATTEMPT_ID else None
 
 
 def heartbeat_oom_for_attempt(hb: Any, current_attempt: int | None) -> bool:
