@@ -2274,19 +2274,35 @@ def test_the_capability_is_probed_once_for_both_rollout_decisions(monkeypatch):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("cc", [(8, 6), (8, 9), (7, 5), (11, 0)])
-def test_unvalidated_arches_force_the_rollout_eager(cc):
-    # vllm 0.19.1's graph capture dies in aot_compile (sm86) / triton slot-mapping on the arches the
-    # retired trl driver never validated. verl defaults enforce_eager False AND asks for
-    # FULL_AND_PIECEWISE, so without this an sm89 rtx 4090 -- the catalog's recommended_gpu for the
-    # small models, i.e. the DEFAULT grpo route -- captures more graphs than the config known to fail.
-    assert vc.resolve_rollout_enforce_eager(cc) is True
+def test_sm86_forces_the_rollout_eager():
+    # the ONLY measured graph-capture failure. under graphs an A10G repeated a prompt to the token
+    # cap without ever emitting EOS, where its own eager arm answered in 19 tokens; reproduced on a
+    # second prompt with sm90 and sm86-eager both normal on the identical input. degeneration, not
+    # the wording drift capture is entitled to.
+    assert vc.resolve_rollout_enforce_eager((8, 6)) is True
 
 
-@pytest.mark.parametrize("cc", [(8, 0), (9, 0), (10, 0), (12, 0)])
-def test_validated_arches_keep_verl_graph_capture(cc):
-    # a100/h100 were validated with graphs, and blackwell (incl. the b200 rollout work) depends on
-    # them. forcing eager here would be a silent throughput regression, not a safety net.
+@pytest.mark.parametrize("cc", [(8, 0), (8, 9), (9, 0), (10, 0), (12, 0)])
+def test_arches_without_a_measured_capture_defect_keep_graphs(cc):
+    # a100/h100 shipped with graphs, and blackwell (incl. the b200 rollout work) depends on them.
+    #
+    # sm89 (rtx 4090 / L40S) is here because it was MEASURED, not because it was assumed: judged
+    # against sm90-with-graphs -- the configuration flash already ships -- its graph arm introduced
+    # no non-termination, no repetition loop, and lost no decidable answer, and graph capture costs
+    # it 453 MB of host ram (0.8B) / 426 MB (2B) across the whole process tree, LESS than sm90's
+    # 551 MB. the ~29 GB once blamed on capture in an OPD OOM was a residual of ray's accounting,
+    # which cannot see the EngineCore child where the graphs live.
+    #
+    # sm89 is the catalog's recommended_gpu for Qwen3.5-0.8B and 2B, so forcing it eager cost both
+    # cuda graphs and torch.compile on the default small-model route.
+    assert vc.resolve_rollout_enforce_eager(cc) is False
+
+
+@pytest.mark.parametrize("cc", [(7, 5), (11, 0)])
+def test_an_unmeasured_arch_is_not_forced_eager_by_another_arch_defect(cc):
+    # sm86's defect is sm86's. an arch nobody has run must not inherit eager from it -- that is how
+    # sm89 ended up excluded on an allowlist it was never measured against. an unmeasured card keeps
+    # verl's own default, exactly as an unanswerable probe does below.
     assert vc.resolve_rollout_enforce_eager(cc) is False
 
 

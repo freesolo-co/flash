@@ -330,7 +330,7 @@ def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch
     lb.install_extra_pip(
         {
             "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-            "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+            "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
         }
     )
 
@@ -366,7 +366,7 @@ def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
         lb.install_extra_pip(
             {
                 "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+                "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
             }
         )
     finally:
