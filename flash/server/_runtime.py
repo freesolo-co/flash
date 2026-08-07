@@ -507,6 +507,12 @@ def _worker_artifacts(spec) -> dict[str, str]:
     for name in (
         _latest_worker_artifact_name(repo, prefix, spec.phase, "console"),
         _latest_error_artifact_name(repo, prefix, spec.phase),
+        # ray's own session logs. the traceback beside them records only the downstream symptom of a
+        # raylet death ("Failed to register worker to Raylet: ... End of file"), so without this the
+        # collector that exists to disambiguate it uploads a diagnosis nothing ever reads back
+        # (VERL-115, codex[bot]). uploaded only when ray actually failed, so it is absent for every
+        # other failure and the loop below skips it.
+        _latest_worker_artifact_name(repo, prefix, spec.phase, "raylogs"),
     ):
         try:
             path = hf_hub_download(
