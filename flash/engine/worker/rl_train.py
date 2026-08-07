@@ -60,7 +60,6 @@ from flash.engine.worker.backend_common import (
     clamp_engine_len,
     export_peft_adapter,
     gdn_probe_module,
-    gdn_reset_arch_from_caps,
     kill_process_group,
     latest_global_step_dir,
     model_max_position_embeddings,
@@ -74,6 +73,7 @@ from flash.engine.worker.backend_common import (
     render_gdn_varlen_shim,
     render_tf32_shim,
     render_wandb_link_shim,
+    require_gdn_boundary_resets,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
     resolve_verl_loggers,
@@ -387,8 +387,10 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # chunks (FusedLinearForPPO), never materializing the [tokens, vocab] logits tensor
         # (~130 GB at 32k on a 248k vocab). torch backend = numerically exact, no extra deps.
         # packing the micro-batch into one row is only boundary-safe for a gdn hybrid when the child
-        # can honor seq_idx + cu_seqlens; see the gdn gate in run_rl_train.
-        f"actor_rollout_ref.model.use_remove_padding={cfg.get('use_remove_padding', True)}",
+        # can honor seq_idx + cu_seqlens -- and run_rl_train now RAISES when it cannot, because the
+        # padded alternative cannot complete a step alongside the fused kernels below. so this is
+        # always true by the time we get here; there is no longer a configuration that turns it off.
+        "actor_rollout_ref.model.use_remove_padding=True",
         "actor_rollout_ref.model.use_fused_kernels=True",
         "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
         *(
@@ -665,12 +667,10 @@ def _build_verl_training_cfg(
     experiment_name: str,
     gpu_type: str = "",
     n_gpus: int = 1,
-    use_remove_padding: bool = True,
 ) -> dict:
     engine_len = int(inp["engine_len"])
     sleep_unsupported = rollout_sleep_unsupported(inp["model_id"])
     return {
-        "use_remove_padding": use_remove_padding,
         "train_files": train_files,
         "val_files": val_files,
         "model_id": model_id,
@@ -3470,18 +3470,12 @@ def run_rl_train():
         # the shim is appended here rather than with the shims above because the answer needs
         # python_bin, resolved in the block above; sitecustomize is imported by the child, which has
         # not started yet.
-        gdn_reset_arch = gdn_reset_arch_from_caps(caps, gdn_module) if gdn_hybrid else None
-        gdn_boundary_resets = gdn_reset_arch is not None
-        use_remove_padding = not gdn_hybrid or gdn_boundary_resets
+        # raises when a gdn child cannot honor resets: the padded fallback that used to handle that
+        # case cannot complete a step on verl's fsdp engine. see require_gdn_boundary_resets.
+        gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
         if gdn_reset_arch is not None:
             with open(shim_py, "a") as f:
                 f.write(render_gdn_varlen_shim(gdn_reset_arch))
-        elif gdn_hybrid:
-            print(
-                "[grpo] gdn hybrid without child-side boundary resets: disabling remove-padding so "
-                "packed examples cannot contaminate each other (slower, correct)",
-                flush=True,
-            )
 
         expected_steps = int(inp["steps"])
         # verl logs from its own interpreter; gate wandb on that env (see resolve_verl_loggers).
@@ -3500,9 +3494,7 @@ def run_rl_train():
             )
         except Exception:  # no cuda / probe failure -> conservative bf16 kv
             _cc_ok = False
-        # reuse the gdn answer resolved above rather than re-probing: model_is_gdn_hybrid returns
-        # False when its own probe raises, so a second call can disagree with the first and turn
-        # fp8 kv ON for the very hybrid the comment above says it crashes.
+        # reuse the gdn answer resolved above rather than re-probing; see gdn_hybrid.
         fp8_kv = _cc_ok and not gdn_hybrid
         # one capability probe, both rollout decisions below. asked of the verl interpreter, whose
         # torch/vllm stack is the one that has to run the rollout.
@@ -3528,7 +3520,6 @@ def run_rl_train():
             enforce_eager=enforce_eager,
             attention_backend=attention_backend,
             mm_encoder_attn_backend=mm_encoder_attn_backend,
-            use_remove_padding=use_remove_padding,
             reward_path=reward_py,
             local_dir=local_dir,
             project_name=project_name,
@@ -3865,6 +3856,6 @@ def run_rl_train():
             reward_profile=reward_profile,
             step_intervals=_step_intervals(step_line_times),
             reward_bridge_batching=not inp["multi_turn"],
-            gdn_boundary_resets=gdn_boundary_resets if gdn_hybrid else None,
+            gdn_boundary_resets=gdn_hybrid or None,
         ),
     )

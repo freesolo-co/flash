@@ -2001,7 +2001,7 @@ def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
 
 
 def test_each_path_resolves_the_gdn_arch_question_exactly_once():
-    """`model_is_gdn_hybrid` may be called at most once per module. Two calls can disagree.
+    """The gdn arch question may be asked at most once per module. Two calls can disagree.
 
     THE regression for a real defect: grpo asked the question twice -- once to decide packing, then
     again inside the fp8-KV try to decide the kv dtype. The helper answers False when its OWN probe
@@ -2012,6 +2012,7 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
     Two calls with a swallowed exception between them are not one decision, they are two guesses that
     happen to agree most of the time. Asserted structurally because the disagreeing case needs a
     transient failure to reproduce and so will not show up in any deterministic test.
+
     """
     import ast
     import inspect as _inspect
@@ -2027,10 +2028,10 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
             and isinstance(node.func, ast.Name)
             and node.func.id == "model_is_gdn_hybrid"
         ]
-        assert len(calls) <= 1, (
-            f"{module.__name__} calls model_is_gdn_hybrid {len(calls)} times (lines "
-            f"{[c.lineno for c in calls]}). it returns False on its own probe failure, so a second "
-            "call can contradict the first: resolve it once and reuse the value."
+        assert len(calls) == 1, (
+            f"{module.__name__} resolves the gdn arch question {len(calls)} times (lines "
+            f"{[c.lineno for c in calls]}). the probe answers False on its own failure, so a "
+            "second ask can contradict the first: resolve it once and reuse the value."
         )
 
 
@@ -2097,8 +2098,10 @@ def test_sft_remove_padding_is_ungated_tensor_layout():
     contaminated by. Batch size is the isolation lever; this flag never was. See
     `test_batch_is_the_isolation_lever_that_replaces_the_removed_flag` in test_sft_train.py.
 
-    `rl_train` and `opd_train` keep the probe-based derivation and must not be changed to match:
-    `sft_loss` is reached only from verl's sft trainers, so the padded path is survivable there.
+    `rl_train` and `opd_train` do NOT get this treatment: they carry no packing profile at all
+    (their batch size is the user's `prompts_per_step`, routinely > 1), so they genuinely pack and
+    a kernel-less child really does contaminate them. Their gate raises instead -- see
+    `test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback` below.
 
     Asserted on the source because reaching the real statement needs a live child probe and a
     checkpoint; the failure is a wrong boolean, not an exception, so nothing else would surface it.
@@ -2132,3 +2135,64 @@ def test_sft_remove_padding_is_ungated_tensor_layout():
         "and profile.authoritative_steps, and boundary isolation by the batch size that follows "
         "from the packing mode; this flag is layout only and has no legitimate false case."
     )
+
+
+def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
+    """A gdn hybrid whose child cannot reset boundaries must fail AT THE GATE, not mid-run.
+
+    The padded fallback (`use_remove_padding=False`) is boundary-correct but cannot complete a step
+    on verl's fsdp engine: flash sets `use_fused_kernels=True` unconditionally, and that pair walks
+    into `prepare_model_outputs`' fused padded branch, which returns a dense `[bsz, response_len]`
+    where every sibling path re-nests via `cu_seqlens`. Grpo and opd then assert in
+    `no_padding_2_padding` -- `sequence_offsets[-1] == values.shape[0]` compares total tokens against
+    batch size, so it fails at EVERY batch size. Verl's megatron engine guards this pair explicitly
+    (`megatron/transformer_impl.py:869-874`); its fsdp engine does not.
+
+    Measured on four matched real-gpu arms: all four died at `padding.py:144`, treatment and control
+    alike. Every catalog model is gdn, so a kernel-less child means no grpo or opd run can finish --
+    and the assert names neither gdn nor the gate, so letting it launch spends a full rental on an
+    untraceable shape error.
+
+    SFT is excluded deliberately, not by oversight: it reaches the same branch but is safe without
+    resets, because every gdn model profiles as exact-unpacked and that pins `examples_per_update`
+    to 1, leaving no packed neighbour to contaminate. Raising there would fail runs that train
+    correctly. See `test_sft_remove_padding_is_ungated_tensor_layout` above.
+
+    Asserted on source because these gates sit deep inside the run functions, behind a live bridge
+    and a child process.
+    """
+    import ast
+    import inspect as _inspect
+
+    from flash.engine.worker import backend_common, opd_train, rl_train
+
+    # the gate lives in one shared helper, so the assertions split: the helper must raise, and each
+    # affected algorithm must route through it rather than re-deriving a decision of its own.
+    gate = _inspect.getsource(backend_common.require_gdn_boundary_resets)
+    assert "raise RuntimeError(" in gate, (
+        "require_gdn_boundary_resets no longer raises, so a gdn hybrid whose child cannot reset "
+        "boundaries would again launch into use_remove_padding=False, which cannot complete a "
+        "training step on verl's fsdp engine."
+    )
+    # and it must be a hard gate, not a warn-and-continue: nothing may follow the raise on a path
+    # that could still return None for a hybrid. two returns exactly -- the non-gdn None and the
+    # arch -- means the raise is the only other exit.
+    returns = [n for n in ast.walk(ast.parse(gate.lstrip())) if isinstance(n, ast.Return)]
+    assert len(returns) == 2, (
+        f"require_gdn_boundary_resets grew to {len(returns)} return paths. it must have exactly "
+        "two -- None for a non-gdn model and the arch for a resettable one -- so that a hybrid "
+        "without resets has no exit but the raise."
+    )
+
+    for module in (opd_train, rl_train):
+        src = _inspect.getsource(module)
+        assert "require_gdn_boundary_resets(" in src, (
+            f"{module.__name__} no longer routes its gdn decision through the raising gate, so it "
+            "can reach use_remove_padding=False again."
+        )
+        # and it must not have grown its own escape hatch: the override is hardcoded true, so any
+        # reappearance of the conditional plumbing is a regression back to the unrunnable config.
+        assert "use_remove_padding=False" not in src.replace(" ", ""), (
+            f"{module.__name__} sets use_remove_padding=False, which verl's fsdp engine cannot run "
+            "alongside the use_fused_kernels=True this recipe also sets."
+        )

@@ -438,8 +438,31 @@ if %(gdn_module)r:
                     torch.zeros(4, 3, device="cuda", dtype=torch.bfloat16),
                 )
                 torch.cuda.synchronize()
+        if not ok:
+            # say WHY on a clean negative too: which of the three checks failed is the difference
+            # between "install fla" and "rebuild causal_conv1d for this arch".
+            print(
+                "[verl] gdn boundary resets unavailable in the child: fla="
+                + str(is_flash_linear_attention_available())
+                + " causal_conv1d="
+                + str(is_causal_conv1d_available()),
+                flush=True,
+            )
         emit("gdn_boundary_resets", bool(ok))
-    except Exception:
+    except Exception as e:
+        # a bare False here is what made this invisible. the caller raises on a hybrid that cannot
+        # reset, and an operator reading only that has no way back to which check fell over --
+        # a missing wheel, a broken ABI, or a conv kernel compiled without this arch all look
+        # identical from the parent. printed to STDOUT, which probe_verl_capabilities forwards
+        # on the '[verl] ' prefix -- stderr would be dropped, it is only reported when the
+        # child answers nothing at all.
+        import traceback
+
+        print(
+            "[verl] gdn boundary resets unavailable in the child: "
+            + " | ".join(traceback.format_exc(limit=3).strip().splitlines()),
+            flush=True,
+        )
         emit("gdn_boundary_resets", False)
 """
 
@@ -523,6 +546,14 @@ def probe_verl_capabilities(python_bin: str, gdn_module: str = "") -> dict:
                 # fail-closed default rather than vanishing from the dict.
                 caps.update({k: v for k, v in answered.items() if k in caps})
                 answered_any = True
+    # the child's own diagnostics, forwarded BEFORE the early return. the gdn question prints why it
+    # answered no, and it is answered LAST -- so every real run answers something earlier, and a
+    # bare `return caps` here would discard the one line the gate's raise tells operators to read.
+    # matched on the prefix rather than forwarded wholesale: the child's stdout also carries verl's
+    # own import chatter, which is not worth a parent log line.
+    for line in (stdout or "").splitlines():
+        if line.startswith("[verl] "):
+            print(line, flush=True)
     if answered_any:
         return caps
     if not timed_out:
@@ -607,6 +638,52 @@ def gdn_reset_arch_from_caps(caps: dict, gdn_module: str) -> str | None:
     # "transformers.models.<arch>.modeling_<arch>" -> "<arch>", read from the string the CHILD was
     # handed rather than re-resolved here: a second resolve could disagree with what was cleared.
     return gdn_module.split(".")[2]
+
+
+def require_gdn_boundary_resets(caps: dict, gdn_module: str) -> str | None:
+    """The arch to patch for a gdn hybrid, raising if the child cannot honor boundary resets.
+
+    A thin gate over ``gdn_reset_arch_from_caps``: same answer for the two cases that have one, but
+    a raise where that returns None for a gdn model. Returns None only for a NON-gdn model, which
+    is what an empty ``gdn_module`` means -- the parent never asked the child, because there was
+    nothing to ask about.
+
+    There is no third outcome for a gdn hybrid. One whose child lacks fla/causal_conv1d used to fall
+    back to verl's padded path (``use_remove_padding=False``), which is boundary-correct but cannot
+    complete a single training step on grpo or opd: flash sets ``use_fused_kernels=True``
+    unconditionally, and verl's fsdp engine has no guard for that pair (its megatron engine does,
+    ``megatron/transformer_impl.py:869-874``). The padded+fused branch returns a dense
+    ``[bsz, response_len]`` where every sibling path re-nests via ``cu_seqlens``, so
+    ``no_padding_2_padding`` asserts ``sequence_offsets[-1] == values.shape[0]`` -- total tokens
+    against batch size, which fails at EVERY batch size. Measured on four matched real-gpu arms, all
+    four dead at ``padding.py:144``.
+
+    So the run cannot finish, and the failure names neither gdn nor this decision -- letting it
+    launch spends the full gpu rental on an untraceable shape error. Raise here instead. Dropping
+    ``use_fused_kernels`` is NOT the alternative fix: ``engine/vram.py:386-392`` sizes on the
+    assumption that no dense ``[b, s, vocab]`` logits tensor exists (~130 GB at 32k on a 248k
+    vocab), so that would trade this crash for an OOM. The fix is to give the child the kernels.
+
+    SFT is deliberately not a caller. It reaches the same padded+fused branch but is safe without
+    resets for a different reason: every gdn model profiles as exact-unpacked, which pins
+    ``examples_per_update`` to 1 (``sft_workload.py:410``), so there are no packed neighbours to
+    contaminate -- and its remove-padding flag stays on regardless, because that is the only tensor
+    layout ``FlashTokenizedSFTDataset`` fits. Grpo and opd have no such profile: their batch size is
+    the user's ``prompts_per_step``, routinely greater than 1, so they genuinely pack.
+    """
+    if not gdn_module:
+        return None
+    arch = gdn_reset_arch_from_caps(caps, gdn_module)
+    if arch is None:
+        raise RuntimeError(
+            "gdn hybrid without child-side boundary resets: the padded fallback "
+            "(use_remove_padding=False) is incompatible with the use_fused_kernels=True this "
+            "recipe sets, and cannot complete a training step on verl's fsdp engine. see the "
+            "'[verl] gdn boundary resets unavailable' line above for why the child could not "
+            "honor resets -- installing fla + causal_conv1d in the verl interpreter is the fix, "
+            "not disabling fused kernels."
+        )
+    return arch
 
 
 def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
