@@ -99,7 +99,7 @@ def test_prepare_job_pinned_open_model_uses_pinned_type(monkeypatch):
     assert captured["gpu"] == "H200"
 
 
-def _persist_effective(runner, public: JobSpec, effective_type: str):
+def _persist_effective(runner, public: JobSpec, effective_type: str, effective_count: int = 0):
     runner._save_status(
         runner.RunStatus(
             run_id=public.run_id,
@@ -109,6 +109,8 @@ def _persist_effective(runner, public: JobSpec, effective_type: str):
     )
     selected_dict = public.to_internal_dict()
     selected_dict["gpu"]["type"] = effective_type
+    if effective_count:
+        selected_dict["gpu"]["count"] = effective_count
     selected = JobSpec.from_dict(selected_dict)
     assert runner._persist_effective_worker_spec(selected)
     return runner.get_status(public.run_id)
@@ -152,3 +154,66 @@ def test_reallocation_spec_keeps_pin_for_pinned(monkeypatch):
         # a pinned run's public and effective type match, so re-allocation keeps the pin.
         assert runner.reallocation_spec_from_status(stored).gpu.type == "H100"
         assert runner.effective_spec_from_status(stored).gpu.type == "H100"
+
+
+def test_reallocation_spec_restores_the_authored_card_ceiling_for_an_auto_run(monkeypatch):
+    """A narrowed auto run recovers with its authored ceiling, not the count it was given.
+
+    gpu.count is a CEILING the allocator may satisfy with fewer cards. _spec_with_gpu writes the
+    SELECTED count onto the worker spec, so handing that snapshot back to allocate() would lower the
+    ceiling to the single shape that already failed -- the retry could no longer consider any of the
+    multi-card shapes the run authorized.
+    """
+    from tests._helpers.runner import fresh_runner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = fresh_runner(tmp, monkeypatch)
+        public = JobSpec(
+            run_id="realloc-auto-count",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(epochs=1, max_examples=1),
+            gpu=GpuSpec(type="", count=4, max_retries=2),
+        )
+        stored = _persist_effective(runner, public, effective_type="H100", effective_count=1)
+
+        # polling and cleanup keep the concrete allocation: one H100.
+        live = runner.effective_spec_from_status(stored)
+        assert live.gpu.type == "H100"
+        assert live.gpu.count == 1
+
+        recovered = runner.reallocation_spec_from_status(stored)
+        assert recovered.gpu.type == ""
+        assert recovered.gpu.count == 4, (
+            "recovery re-entered allocation with the narrowed count as its ceiling, so a run "
+            "authored for up to 4 cards can never be offered a multi-card shape again"
+        )
+
+
+def test_reallocation_spec_restores_the_authored_card_ceiling_for_a_pinned_run(monkeypatch):
+    """The pinned case needs its own guard: matching gpu.type used to short-circuit the restore.
+
+    A pinned run's public and effective types are equal, so an early return on type alone handed
+    back the snapshot untouched -- narrowed count included.
+    """
+    from tests._helpers.runner import fresh_runner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = fresh_runner(tmp, monkeypatch)
+        public = JobSpec(
+            run_id="realloc-pinned-count",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(epochs=1, max_examples=1),
+            gpu=GpuSpec(type="H100", count=4, max_retries=2),
+        )
+        stored = _persist_effective(runner, public, effective_type="H100", effective_count=2)
+
+        assert runner.effective_spec_from_status(stored).gpu.count == 2
+
+        recovered = runner.reallocation_spec_from_status(stored)
+        assert recovered.gpu.type == "H100"
+        assert recovered.gpu.count == 4, (
+            "the pinned early return handed back the snapshot with its narrowed count, so a "
+            "recovered 4-card run re-allocates against a ceiling of 2"
+        )
