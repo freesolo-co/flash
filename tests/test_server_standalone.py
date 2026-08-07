@@ -537,6 +537,44 @@ def test_standalone_startup_requires_a_writable_artifact_namespace(monkeypatch) 
     check_run_preflight()
 
 
+def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkeypatch) -> None:
+    """Presence was the whole check, so a malformed namespace boots and then fails every submit.
+
+    `owner/repo` is the natural spelling for anyone used to HuggingFace ids, and
+    `managed_hf_repo_for_environment` appends the repo name to it -- producing a three-segment id
+    HuggingFace rejects while creating the artifact repo, long after preflight called the plane
+    healthy.
+    """
+    from flash.providers.preflight import PreflightError, check_run_preflight
+
+    monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
+    monkeypatch.setenv("VAST_API_KEY", "vast-key")
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+
+    monkeypatch.setenv("FLASH_HF_NAMESPACE", "owner/repo")
+    with pytest.raises(PreflightError, match="FLASH_HF_NAMESPACE"):
+        check_run_preflight()
+
+    # not just the slash: anything HuggingFace will not accept as an id segment.
+    monkeypatch.setenv("FLASH_HF_NAMESPACE", "bad name")
+    with pytest.raises(PreflightError, match="FLASH_HF_NAMESPACE"):
+        check_run_preflight()
+
+    # a real namespace still boots -- the guard must reject malformed values, not all of them.
+    monkeypatch.setenv("FLASH_HF_NAMESPACE", "self-hoster")
+    check_run_preflight()
+
+    # and the value it accepts must actually build a valid id, which is the property that failed.
+    from huggingface_hub.utils import validate_repo_id
+
+    from flash.runner import managed_hf_repo_for_environment
+
+    validate_repo_id(managed_hf_repo_for_environment("github:owner/envs@main:gsm8k"))
+
+
 def test_the_env_template_does_not_preset_the_hosted_serving_url() -> None:
     """`.env.example` is the documented starting point, and the standalone serving guard only
     rejects an UNSET value. An active assignment in the template would satisfy that guard and ship
