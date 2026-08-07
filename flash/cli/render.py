@@ -43,6 +43,26 @@ def styled() -> bool:
     return sys.stdout.isatty()
 
 
+def can_prompt() -> bool:
+    """Whether a question can actually be answered by a human right now.
+
+    Stricter than ``styled()``, which only asks whether to draw the themed layout: a prompt that
+    nobody answers blocks the process forever, so CI is refused explicitly. A pseudo-TTY in CI
+    reports ``isatty()`` true, which is exactly the case that hangs, and a closed fd 0 can make
+    ``sys.stdin`` None, so that is guarded before ``.isatty()``.
+
+    One definition, because the two callers had drifted: env setup checked CI and traces export did
+    not, so `flash traces export` with no --project hung on a picker under CI -- and traces export
+    has no --yes to escape with.
+    """
+    if os.environ.get("CI", "").strip().lower() not in ("", "0", "false", "no"):
+        return False
+    stdin = sys.stdin
+    if stdin is None or not stdin.isatty():
+        return False
+    return styled()
+
+
 def _color() -> bool:
     """Themed layout minus NO_COLOR / dumb-terminal opt-outs."""
     return styled() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"

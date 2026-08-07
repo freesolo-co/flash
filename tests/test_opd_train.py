@@ -4097,23 +4097,14 @@ def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_statu
             classification="transient",
         )
 
-    class ChildExit(RuntimeError):
-        def __init__(self, code):
-            super().__init__(code)
-            self.code = code
-
-    def child_exit(code):
-        raise ChildExit(code)
-
     monkeypatch.setenv("FLASH_OPD_MUTATION_FAILURE_PATH", failure_path)
     monkeypatch.setattr(plugin, "_post_json", fail_post)
-    monkeypatch.setattr(plugin.os, "_exit", child_exit)
 
-    with pytest.raises(ChildExit) as actor_exit:
-        plugin._post_mutation_notice("http://bridge", "token")
+    with pytest.raises(FlashTeacherBridgeError) as actor_error:
+        plugin._publish_mutation_notice("http://bridge", "token")
 
     mutation_failure = _read_classified_failure_fallback(failure_path)
-    assert actor_exit.value.code == 87
+    assert actor_error.value.classification == "transient"
     assert mutation_failure == (
         "transient",
         "flash OPD bridge transport failed: ConnectionRefusedError",
@@ -4230,15 +4221,20 @@ def test_repeated_mutation_notice_maps_later_bridge_failure_to_child_exit(
     monkeypatch.setattr(plugin, "_post_json", post_json)
     monkeypatch.setattr(plugin.os, "_exit", child_exit)
 
-    plugin._post_mutation_notice("http://bridge", "token")
-    with pytest.raises(ChildExit) as exit_error:
-        plugin._post_mutation_notice("http://bridge", "token")
+    plugin._publish_mutation_notice("http://bridge", "token")
+    with pytest.raises(FlashTeacherBridgeError) as bridge_error:
+        plugin._publish_mutation_notice("http://bridge", "token")
 
     expected_payload = {"process_id": os.getpid()}
     assert posts == [
         ("http://bridge", "token", "/mutation", expected_payload),
         ("http://bridge", "token", "/mutation", expected_payload),
     ]
+    # the notice raises rather than exiting: the caller is inside optimizer.step, so the error
+    # travels up to the trainer. the classification is what survives that trip and picks the exit
+    # code, so exercise the same handler the score path uses to turn one into the other.
+    with pytest.raises(ChildExit) as exit_error:
+        plugin._exit_for_score_failure(bridge_error.value)
     assert exit_error.value.code == expected_exit
     if classification == "transient":
         with pytest.raises(RetriableInfraError, match="transient teacher bridge failure"):
@@ -4556,12 +4552,14 @@ def test_mutation_marker_failure_preserves_bridge_classification(
     monkeypatch.setattr(plugin.os, "_exit", child_exit)
     bridge.start()
     try:
-        with pytest.raises(ChildExit) as exit_error:
-            plugin._post_mutation_notice(bridge.url, bridge.token)
+        with pytest.raises(FlashTeacherBridgeError) as bridge_error:
+            plugin._publish_mutation_notice(bridge.url, bridge.token)
     finally:
         bridge.close()
 
     assert callback_calls == [True]
+    with pytest.raises(ChildExit) as exit_error:
+        plugin._exit_for_score_failure(bridge_error.value)
     assert exit_error.value.code == expected_exit
     if retriable:
         with pytest.raises(RetriableInfraError, match="transient teacher bridge failure"):
@@ -4640,7 +4638,7 @@ def test_mutation_lost_success_response_retries_once_without_republishing_marker
 
     handler._send_json = lose_first_response
     try:
-        plugin._post_mutation_notice(bridge.url, bridge.token)
+        plugin._publish_mutation_notice(bridge.url, bridge.token)
         optimizer_steps.append(True)
     finally:
         bridge.close()
@@ -4683,7 +4681,7 @@ def test_incomplete_mutation_response_retries_once_without_republishing_marker(
 
     handler._send_json = truncate_first_response
     try:
-        plugin._post_mutation_notice(bridge.url, bridge.token)
+        plugin._publish_mutation_notice(bridge.url, bridge.token)
         optimizer_steps.append(True)
     finally:
         bridge.close()
@@ -4725,11 +4723,14 @@ def test_persistent_incomplete_mutation_response_fails_closed_after_one_retry(
     handler._send_json = truncate_response
     monkeypatch.setattr(plugin.os, "_exit", child_exit)
     try:
-        with pytest.raises(ChildExit) as exit_error:
-            plugin._post_mutation_notice(bridge.url, bridge.token)
+        with pytest.raises(FlashTeacherBridgeError) as bridge_error:
+            plugin._publish_mutation_notice(bridge.url, bridge.token)
         fallback = _read_classified_failure_fallback(failure_path)
     finally:
         bridge.close()
+
+    with pytest.raises(ChildExit) as exit_error:
+        plugin._exit_for_score_failure(bridge_error.value)
 
     assert callback_calls == [True]
     assert optimizer_steps == []
@@ -4766,8 +4767,8 @@ def test_persistent_mutation_response_loss_writes_fallback_without_optimizer_ste
     handler._send_json = disconnect_during_response
     monkeypatch.setattr(plugin.os, "_exit", child_exit)
     try:
-        with pytest.raises(ChildExit):
-            plugin._post_mutation_notice(bridge.url, bridge.token)
+        with pytest.raises(FlashTeacherBridgeError):
+            plugin._publish_mutation_notice(bridge.url, bridge.token)
         fallback = _read_classified_failure_fallback(failure_path)
         assert fallback is not None
         bridge._record_mutation_failure(*fallback)

@@ -151,6 +151,29 @@ def sft_profile_run_id(input_digest: str) -> str:
     return _profile_run_id(_PROFILE_RUN_PREFIX, input_digest)
 
 
+def _profile_from_dict(cls, raw: object):
+    """Rebuild a profile from its serialized form, verifying the digest it arrived with.
+
+    Shared by both profile classes because the check is about the envelope, not the fields: the
+    schema comparison reads ``cls.__dataclass_fields__`` and the digest comparison reads the
+    class's own ``content_digest``, so each class validates against itself. Written once so the
+    two can never drift into accepting different things -- an artifact that survives one reader
+    and is rejected by the other is the failure this prevents.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("workload profile must be an object")
+    data = dict(raw)
+    digest = data.pop("content_digest", None)
+    if not isinstance(digest, str):
+        raise ValueError("workload profile has no content digest")
+    if set(data) != set(cls.__dataclass_fields__):
+        raise ValueError("workload profile fields do not match the schema")
+    profile = cls(**data)
+    if profile.content_digest != digest:
+        raise ValueError("workload profile content digest does not match")
+    return profile
+
+
 @dataclass(frozen=True)
 class SftWorkloadProfile:
     """Aggregate-only description of the exact sft workload consumed by training.
@@ -307,18 +330,7 @@ class SftWorkloadProfile:
 
     @classmethod
     def from_dict(cls, raw: object) -> SftWorkloadProfile:
-        if not isinstance(raw, dict):
-            raise ValueError("workload profile must be an object")
-        data = dict(raw)
-        digest = data.pop("content_digest", None)
-        if not isinstance(digest, str):
-            raise ValueError("workload profile has no content digest")
-        if set(data) != set(cls.__dataclass_fields__):
-            raise ValueError("workload profile fields do not match the schema")
-        profile = cls(**data)
-        if profile.content_digest != digest:
-            raise ValueError("workload profile content digest does not match")
-        return profile
+        return _profile_from_dict(cls, raw)
 
 
 def _measurement_field_names(cls: type | None = None) -> tuple[str, ...]:
@@ -587,18 +599,7 @@ class RolloutWorkloadProfile:
 
     @classmethod
     def from_dict(cls, raw: object) -> RolloutWorkloadProfile:
-        if not isinstance(raw, dict):
-            raise ValueError("workload profile must be an object")
-        data = dict(raw)
-        digest = data.pop("content_digest", None)
-        if not isinstance(digest, str):
-            raise ValueError("workload profile has no content digest")
-        if set(data) != set(cls.__dataclass_fields__):
-            raise ValueError("workload profile fields do not match the schema")
-        profile = cls(**data)
-        if profile.content_digest != digest:
-            raise ValueError("workload profile content digest does not match")
-        return profile
+        return _profile_from_dict(cls, raw)
 
 
 class WorkloadProfileMismatch(ValueError):
