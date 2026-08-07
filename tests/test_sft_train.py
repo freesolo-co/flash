@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import os
+import pathlib
 import re
+import shutil
 import sys
 import types
 from dataclasses import replace
@@ -959,10 +961,13 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
 
     watcher._publish(5, str(checkpoint_dir))
 
-    assert exported[0][0] == str(actor_dir)
+    # both read the STAGED copy rather than verl's directory (see _staged_source); what matters is
+    # that they agree on one source and that it carries the `actor/` level this layout puts there.
+    assert os.path.basename(exported[0][0]) == "actor"
+    assert exported[0][0] == os.path.join(uploaded[0][1], "actor")
     assert published[0][1] == 5
     assert published[0][2]["required"] is True
-    assert uploaded == [(5, str(checkpoint_dir))]
+    assert [step for step, _ in uploaded] == [5]
     assert watcher.processed_steps == {5}
 
 
@@ -1002,7 +1007,72 @@ def test_checkpoint_watcher_exports_the_sft_layout(monkeypatch, tmp_path):
 
     watcher._publish(5, str(checkpoint_dir))
 
-    assert exported == [str(checkpoint_dir)]
+    # the export reads a STAGED copy, not verl's own directory (see _staged_source), so assert the
+    # layout this test is about -- global_step_N itself, no `actor/` level -- rather than the path.
+    assert [os.path.basename(path) for path in exported] == ["global_step_5"]
+
+
+def test_a_required_save_survives_verl_pruning_it_mid_publish(monkeypatch, tmp_path):
+    """verl deleting global_step_N while it is being published must not fail the run.
+
+    the watcher publishes on its own thread, so the merge and the multi-GB upload overlap training.
+    under `trainer.max_ckpt_to_keep=1` verl's `register_checkpoint` rmtree's global_step_N from the
+    CHILD process the moment N+1 finishes saving, and the parent has no way to pin it. with close
+    `save_at_steps` (here [2, 3]) that lands squarely inside the publish window.
+
+    this reproduces the interleave rather than asserting on the staging mechanism: the fake upload
+    deletes verl's directory the way verl would, then reads the source it was handed. before staging,
+    that read fails and takes the whole paid run down with a required-save error.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    checkpoint_dir = local_dir / "global_step_2"
+    (checkpoint_dir / "actor" / "huggingface").mkdir(parents=True)
+    (checkpoint_dir / "actor" / "model.safetensors").write_bytes(b"weights")
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+    )
+    read_back = {}
+
+    def fake_upload(step, checkpoint, **kwargs):
+        kwargs["before_upload"]()
+        # verl prunes global_step_2 because global_step_3 just landed. this is the whole race.
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+        # the upload streams the folder AFTER that, so it must still have something to read.
+        read_back["payload"] = (
+            pathlib.Path(checkpoint, "actor", "model.safetensors").read_bytes()
+            if os.path.isdir(checkpoint)
+            else None
+        )
+        return True
+
+    monkeypatch.setattr(worker, "upload_resume_checkpoint", fake_upload)
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(2, 3),
+    )
+
+    watcher._publish(2, str(checkpoint_dir))
+
+    assert read_back["payload"] == b"weights", (
+        "the upload lost its source when verl pruned the checkpoint, so a required save would fail "
+        "an otherwise successful paid run"
+    )
+    assert watcher.processed_steps == {2}
+    # the staging links are transient: they must not outlive the publish and accumulate on the pod.
+    assert not os.path.exists(os.path.join(str(tmp_path / "exports"), "_staging", "global_step_2"))
 
 
 def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
