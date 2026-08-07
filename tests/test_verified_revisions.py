@@ -110,7 +110,10 @@ def test_stale_generation_cannot_commit_ready_revision(monkeypatch, tmp_path):
     revision = f"{run_id}@final." + "e" * 40
     stale_generation = runner.verified_adapter_revision_generation(run_id)
 
-    assert runner.clear_verified_adapter_revisions(run_id) == stale_generation + 1
+    assert (
+        runner.invalidate_verified_adapter_revisions(run_id, commit=lambda: None)
+        == stale_generation + 1
+    )
     status = runner.mark_checkpoint_deployed(
         run_id,
         {

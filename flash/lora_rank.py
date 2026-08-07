@@ -223,28 +223,40 @@ def _pattern_values(config: Mapping[str, Any], *, field: str, source: str) -> li
     return [_positive_int(item, source=source, field=field) for item in value.values()]
 
 
-def rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
-    """Return the maximum LoRA rank across default and per-module metadata."""
+def _max_adapter_value(
+    config: Mapping[str, Any], *, scalar: str, pattern: str, label: str, source: str
+) -> int:
+    """The largest value PEFT records for one adapter dimension, across both places it writes it.
+
+    Rank and alpha are the same shape of question -- a default scalar (``r``, ``lora_alpha``) plus an
+    optional per-module override map -- and the answer is the maximum, because that is what serving
+    has to be able to hold. Sharing the walk keeps the two from drifting: an adapter whose rank came
+    from ``rank_pattern`` but whose alpha came from the scalar must still be read the same way.
+    """
     if not isinstance(config, Mapping):
         raise ValueError(f"could not verify adapter metadata: {source} is not a JSON object")
-    ranks = _pattern_values(config, field="rank_pattern", source=source)
-    if config.get("r") is not None:
-        ranks.append(_positive_int(config["r"], source=source, field="r"))
-    if not ranks:
-        raise ValueError(f"could not verify adapter metadata: {source} has no LoRA rank metadata")
-    return max(ranks)
+    values = _pattern_values(config, field=pattern, source=source)
+    if config.get(scalar) is not None:
+        values.append(_positive_int(config[scalar], source=source, field=scalar))
+    if not values:
+        raise ValueError(
+            f"could not verify adapter metadata: {source} has no LoRA {label} metadata"
+        )
+    return max(values)
+
+
+def rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
+    """Return the maximum LoRA rank across default and per-module metadata."""
+    return _max_adapter_value(
+        config, scalar="r", pattern="rank_pattern", label="rank", source=source
+    )
 
 
 def alpha_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
     """Return the maximum LoRA alpha across default and per-module metadata."""
-    if not isinstance(config, Mapping):
-        raise ValueError(f"could not verify adapter metadata: {source} is not a JSON object")
-    alphas = _pattern_values(config, field="alpha_pattern", source=source)
-    if config.get("lora_alpha") is not None:
-        alphas.append(_positive_int(config["lora_alpha"], source=source, field="lora_alpha"))
-    if not alphas:
-        raise ValueError(f"could not verify adapter metadata: {source} has no LoRA alpha metadata")
-    return max(alphas)
+    return _max_adapter_value(
+        config, scalar="lora_alpha", pattern="alpha_pattern", label="alpha", source=source
+    )
 
 
 def _normalized_model(value: Any) -> str:

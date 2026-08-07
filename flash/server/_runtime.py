@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 
+from flash.adapter_artifacts import attempt_scoped_artifact_name
 from flash.runner import adapter_prefix, get_status, runs_file_path
 from flash.spec import JobSpec
 
@@ -451,13 +452,21 @@ def _deferred_resubmit_loop(spec) -> None:
 def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) -> str:
     """Newest worker artifact file under prefix.
 
-    Workers historically wrote stable files (``console_rl.txt``), and newer workers may write
-    attempt-scoped files (e.g. ``console_rl_attempt2.txt`` / ``error_rl_attempt2.txt``). On a retried run only the highest attempt is
-    the real current evidence. Falls back to the legacy/default name when the repo can't be listed.
+    ``console`` is uploaded under one stable name that each attempt overwrites; ``error`` and
+    ``raylogs`` are attempt-scoped, so on a retried run only the highest attempt is the real
+    current evidence. Falls back to the default name when the repo can't be listed.
+
+    The attempt-scoped name comes from the writer's own definition rather than being spelled
+    again here: this is the read half of a name the worker chose, and a reader that formats it
+    independently agrees only by coincidence. The failure is silent -- a name that disagrees
+    finds no file, which is indistinguishable from "the worker uploaded nothing", exactly the
+    case these artifacts exist to explain.
     """
     import re
 
-    default = f"{kind}_{phase}.txt" if kind == "console" else f"{kind}_{phase}_attempt0.txt"
+    default = (
+        f"{kind}_{phase}.txt" if kind == "console" else attempt_scoped_artifact_name(kind, phase, 0)
+    )
     try:
         from huggingface_hub import HfApi
 
@@ -503,15 +512,16 @@ def _ray_log_name_for_attempt(phase: str, error_name: str) -> str | None:
     raylet that died an attempt ago (codex[bot]). Pinning to the traceback's attempt means the pair
     always describes one attempt, and the fetch simply misses when this attempt produced no ray logs.
 
-    Returns None for a legacy unscoped traceback: there is no attempt to pin to, and guessing would
+    Returns None for an unscoped traceback: there is no attempt to pin to, and guessing would
     reintroduce exactly the mismatch this exists to prevent.
 
-    Built the same way ``ray_log_artifact_name`` builds it worker-side, so the two cannot drift.
+    Built from the writer's own definition, so the two cannot drift: restating the format here
+    would make worker and reader agree only for as long as nobody edits one of them.
     """
     attempt = _attempt_of(error_name)
     if attempt is None:
         return None
-    return f"raylogs_{phase}_attempt{attempt}.txt"
+    return attempt_scoped_artifact_name("raylogs", phase, attempt)
 
 
 def _worker_artifacts(spec) -> dict[str, str]:

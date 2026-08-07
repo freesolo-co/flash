@@ -17,6 +17,7 @@ import math
 import os
 import time
 
+from flash.adapter_artifacts import attempt_scoped_artifact_name
 from flash.opd_retry_contract import (
     decode_opd_optimizer_start_json,
     opd_optimizer_start_marker_path,
@@ -277,11 +278,12 @@ def heartbeat_reader_for(spec, *, deadline_at: float | None = None):
 
 
 def error_artifact_name(phase: str, attempt) -> str:
-    """Worker error-artifact filename for one exact bounded attempt identity."""
-    attempt_id = _attempt_int(attempt)
-    if attempt_id is None:
-        raise ValueError("worker error artifact attempt identity is invalid")
-    return f"error_{phase}_attempt{attempt_id}.txt"
+    """Worker error-artifact filename for one exact bounded attempt identity.
+
+    Shares the writer's definition rather than restating the format: this is the read half of a
+    name the worker chose, and the two agreeing is the whole point of the artifact.
+    """
+    return attempt_scoped_artifact_name("error", phase, attempt)
 
 
 def make_hf_failure_detail_reader(

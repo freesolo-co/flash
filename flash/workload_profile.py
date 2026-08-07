@@ -135,10 +135,20 @@ def sft_profile_input_digest(
     )
 
 
-def sft_profile_run_id(input_digest: str) -> str:
+def _profile_run_id(prefix: str, input_digest: str) -> str:
+    """A profile's run id: its kind prefix and the input digest that keys it.
+
+    The digest is validated rather than trusted because this id becomes a directory name and a
+    lookup key, so a caller that passed a raw path or a truncated hash must fail here rather than
+    silently create a second profile that no reader will find.
+    """
     if len(input_digest) != 64 or any(c not in "0123456789abcdef" for c in input_digest):
         raise ValueError("input_digest must be a lowercase sha256 hex digest")
-    return f"{_PROFILE_RUN_PREFIX}{input_digest}"
+    return f"{prefix}{input_digest}"
+
+
+def sft_profile_run_id(input_digest: str) -> str:
+    return _profile_run_id(_PROFILE_RUN_PREFIX, input_digest)
 
 
 @dataclass(frozen=True)
@@ -322,9 +332,7 @@ def _measurement_field_names(cls: type | None = None) -> tuple[str, ...]:
 
 
 def rollout_profile_run_id(input_digest: str) -> str:
-    if len(input_digest) != 64 or any(c not in "0123456789abcdef" for c in input_digest):
-        raise ValueError("input_digest must be a lowercase sha256 hex digest")
-    return f"{_ROLLOUT_PROFILE_RUN_PREFIX}{input_digest}"
+    return _profile_run_id(_ROLLOUT_PROFILE_RUN_PREFIX, input_digest)
 
 
 def rollout_profile_input_payload(

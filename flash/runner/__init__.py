@@ -23,13 +23,14 @@ except ImportError:  # pragma: no cover - linux production fails closed below
     fcntl = None
 
 from flash._paths import data_dir
+from flash.adapter_artifacts import MAX_ATTEMPT_ID
 from flash.catalog import ModelInfo, resolve_model
 from flash.opd_retry_contract import (
     OPD_RETRY_CONTRACT_STATUS_KEY,
     OPD_RETRY_CONTRACT_VERSION,
     require_opd_retry_contract_version,
 )
-from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
+from flash.providers._poll import _attempt_int
 from flash.spec import MANAGED_GPU_KEYS, TRAINER_BACKEND, GpuSpec, JobSpec, gpu_count_of
 
 _STATE_DIR = str(data_dir())
@@ -546,7 +547,7 @@ def _reserve_attempt(
             attempt = expected
         else:
             attempt = max(current, minimum)
-        if attempt >= _MAX_ATTEMPT_ID:
+        if attempt >= MAX_ATTEMPT_ID:
             raise RuntimeError("run attempt identity is exhausted")
         _save_status_unlocked(status, _next_attempt=attempt + 1)
         return attempt
@@ -2876,7 +2877,7 @@ from flash.runner.lifecycle import (  # noqa: E402,F401
 )
 from flash.runner.verified_revisions import (  # noqa: E402,F401
     add_verified_adapter_revision,
-    clear_verified_adapter_revisions,
+    invalidate_verified_adapter_revisions,
     read_verified_adapter_revisions,
     verified_adapter_revision_generation,
 )
