@@ -508,6 +508,31 @@ def test_ray_log_artifact_name_is_scoped_exactly_like_the_traceback_beside_it():
             ray_log_artifact_name("sft", invalid)
 
 
+def test_worker_and_control_plane_agree_on_the_error_artifact_name():
+    """The process that WRITES the error artifact and the one that READS it must spell it the same.
+
+    These live on opposite sides of a machine boundary -- the worker uploads to HF, the pollers fetch
+    from it -- and nothing at runtime ever compares the two names. A disagreement surfaces only as a
+    missing artifact, which is indistinguishable from "the worker crashed before uploading": exactly
+    the situation the file exists to explain, so the failure erases its own evidence.
+
+    They now share one definition, and this pins that. A literal on each side would make the two
+    agree by coincidence of two assertions rather than by construction -- so the assertion is
+    writer-against-reader, not either against a string.
+    """
+    from flash.engine.worker import error_artifact_name as worker_name
+    from flash.providers._hf_artifacts import error_artifact_name as plane_name
+
+    for phase in ("sft", "rl", "opd"):
+        for attempt in (0, 1, 7):
+            assert worker_name(phase, attempt) == plane_name(phase, attempt)
+
+    # and the reader rejects what the writer would refuse to produce, rather than formatting it
+    for invalid in ("3", "", True, 1.5, -1, 1 << 63):
+        with pytest.raises(ValueError, match="attempt must be"):
+            plane_name("sft", invalid)
+
+
 def test_train_body_imports_every_name_it_uses():
     """Flash ships only _train_body's source to the worker, where module-level
     imports are out of scope, so every stdlib/3p name it references must be
