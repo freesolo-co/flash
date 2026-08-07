@@ -2270,6 +2270,97 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
     assert seen["temperature"] == 1.0
 
 
+def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
+    """the shims must tolerate the signature verl ACTUALLY calls, not a convenient stub.
+
+    every other shim test writes its own ``_run_agent_loop(self, sampling_params, *args, **kwargs)``
+    stub, so it can only prove the shim works against a signature the test itself chose. verl is a
+    worker-image dependency and is not installed here (``import verl`` -> ModuleNotFoundError), so
+    nothing offline was checking the shim against the real one.
+
+    at the pinned verl commit (backend_common.VERL_REQUIREMENT,
+    freesolo-co/verl@1bea7d68) ``AgentLoopWorker._run_agent_loop`` is::
+
+        async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs)
+
+    ``agent_name`` is keyword-only AND required, and ``trajectory`` is a second positional. a wrapper
+    that forgot ``**kwargs`` would raise TypeError on the first rollout of every run; one that
+    swallowed the extra positional would drop the trajectory. this mirrors that signature exactly so
+    the failure shows up here instead of on a paid pod.
+    """
+    import asyncio
+    import sys
+    from types import ModuleType
+
+    seen: dict = {}
+
+    class _AgentLoopWorker:
+        async def _run_agent_loop(
+            self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs
+        ):
+            seen["params"] = dict(sampling_params)
+            seen["trajectory"] = trajectory
+            seen["agent_name"] = agent_name
+            seen["trace"] = trace
+            return "ok"
+
+    agent_loop_module = ModuleType("verl.experimental.agent_loop.agent_loop")
+    agent_loop_module.AgentLoopWorker = _AgentLoopWorker
+    package = ModuleType("verl.experimental.agent_loop")
+    package.agent_loop = agent_loop_module
+
+    # vllm is a worker-image dep too. stand in a recorder so the assertion below can prove the
+    # constraint was WRAPPED: vllm accepts a raw dict, passes _verify_args(), then constrains
+    # nothing -- silently, which is the whole reason render_structured_outputs_shim wraps it.
+    class _StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    sampling_params_module = ModuleType("vllm.sampling_params")
+    sampling_params_module.StructuredOutputsParams = _StructuredOutputsParams
+    vllm_module = ModuleType("vllm")
+    vllm_module.sampling_params = sampling_params_module
+
+    stubs = {
+        "verl": ModuleType("verl"),
+        "verl.experimental": ModuleType("verl.experimental"),
+        "verl.experimental.agent_loop": package,
+        "verl.experimental.agent_loop.agent_loop": agent_loop_module,
+        "vllm": vllm_module,
+        "vllm.sampling_params": sampling_params_module,
+    }
+    source = (
+        rl_train.render_stop_sequences_shim(("</answer>",))
+        + rl_train.render_image_pad_ban_shim(151655)
+        + rl_train.render_structured_outputs_shim({"json": {"type": "object"}})
+    )
+    for name, module in stubs.items():
+        sys.modules[name] = module
+    try:
+        exec(compile(source, "sitecustomize.py", "exec"), {})
+        # called exactly as verl calls it (agent_loop.py:583): two positionals plus keywords.
+        asyncio.run(
+            _AgentLoopWorker()._run_agent_loop(
+                {"temperature": 1.0}, {"step": 0}, agent_name="tool_agent", trace=False
+            )
+        )
+    finally:
+        for name in stubs:
+            sys.modules.pop(name, None)
+
+    # the arguments the shims do not own must arrive untouched.
+    assert seen["trajectory"] == {"step": 0}
+    assert seen["agent_name"] == "tool_agent"
+    assert seen["trace"] is False
+    assert seen["params"]["temperature"] == 1.0
+    # and all three shims still applied.
+    assert seen["params"]["stop"] == ["</answer>"]
+    assert seen["params"]["logit_bias"] == {151655: -100.0}
+    constraint = seen["params"]["structured_outputs"]
+    assert isinstance(constraint, _StructuredOutputsParams)
+    assert constraint.kwargs == {"json": {"type": "object"}}
+
+
 def test_image_pad_ban_shim_is_composed_into_the_sitecustomize(monkeypatch):
     source = inspect.getsource(rl_train.run_rl_train)
     assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in source
