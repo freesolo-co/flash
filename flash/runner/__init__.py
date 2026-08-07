@@ -1909,20 +1909,23 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
 def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
     """Effective worker spec for RE-ALLOCATING a recovered run.
 
-    Identical to effective_spec_from_status, except gpu.type is restored to the run's original
-    public value: empty for an auto run, the pinned class for a pinned run. The persisted effective
-    snapshot bakes the *allocated* class into gpu.type via _spec_with_gpu, so feeding it straight
-    back to allocate() would hard-pin an originally-unpinned run to the prior attempt's class after a
-    control-plane restart or attach -- blocking OOM escalation and retries on other providers/classes.
+    Identical to effective_spec_from_status, except gpu.type and gpu.count are restored to the run's
+    original public values. Both are narrowed by allocation: _spec_with_gpu bakes the *allocated*
+    class into gpu.type and the *selected* count into gpu.count. Feeding that straight back to
+    allocate() would re-enter recovery with the prior attempt's answer as its input -- hard-pinning
+    an originally-unpinned run to one class (blocking OOM escalation and retries on other
+    providers/classes), and lowering the ceiling to the one shape that already failed, so a run
+    authored for up to 4 cards can never again be offered a 4-card shape. gpu.count is a CEILING, so
+    restoring it re-widens the search rather than forcing a size.
     Use this only where recovery re-enters allocate(); polling a live attempt and endpoint cleanup
     keep the concrete effective spec.
     """
     worker_spec = effective_spec_from_status(status, verify_source=verify_source)
-    public_type = JobSpec.from_dict(status.spec).gpu.type
-    if worker_spec.gpu.type == public_type:
+    public_gpu = JobSpec.from_dict(status.spec).gpu
+    if worker_spec.gpu.type == public_gpu.type and worker_spec.gpu.count == public_gpu.count:
         return worker_spec
     restored = worker_spec.to_internal_dict()
-    restored["gpu"] = {**restored["gpu"], "type": public_type}
+    restored["gpu"] = {**restored["gpu"], "type": public_gpu.type, "count": public_gpu.count}
     return JobSpec.from_dict(restored)
 
 
