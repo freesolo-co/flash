@@ -541,9 +541,9 @@ def get_model(model_id: str) -> ModelInfo:
     except KeyError as exc:
         allowed = ", ".join(MODELS)
         raise ValueError(
-            f"unsupported model {model_id!r}; choose one of: {allowed} — or set "
-            f'model_policy = "allow" in the config to run any HF model that fits the GPU '
-            f"(open-model policy)"
+            f"unsupported model {model_id!r}; choose one of: {allowed} — or, on a SELF-HOSTED "
+            f'control plane, set model_policy = "allow" in the config to run any HF model that '
+            f"fits the GPU (open-model policy; rejected by the managed service)"
         ) from exc
 
 

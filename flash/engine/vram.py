@@ -1209,8 +1209,8 @@ def resolve_params_b(model_id: str, revision: str = "") -> float | None:
     param count for an open-policy (uncataloged) model. Best-effort: returns None only
     when the model is uncataloged AND HF metadata is unavailable, so callers degrade to the
     size-unknown path (e.g. the fused-CE gate stays memory-safe, the colocate cap stays loose).
-    The single source of truth for "how big is this model" -- run_sft, run_rl and cost.spec all
-    call this so they can never drift."""
+    The single source of truth for "how big is this model" -- run_sft, run_rl and the cost
+    estimator (via ``cost.facts.total_params_b``) all call this so they can never drift."""
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)
