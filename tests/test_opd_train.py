@@ -6109,6 +6109,55 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
         opd_mod.run_opd_train()
 
 
+def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice():
+    """`prompt_messages` is user code, and it was called once to classify and again to build.
+
+    Two consequences, and the second costs a paid run. The environment observes every prompt twice,
+    so a stateful or seeded implementation advances its state on a pass whose output is discarded.
+    And the two passes can DISAGREE: if the classifying pass is text-only for a record whose second
+    rendering carries an image, `multimodal` is already latched false, no processor was built, and
+    the build pass reaches a bare `assert processor is not None` (codex[bot]).
+
+    Asserted on the source rather than by driving `run_opd_train`, because the build loop sits
+    behind a gpu probe, a teacher client and a tokenizer load: a fixture that stubs its way there
+    stops testing this and starts testing the stubs. What makes the mismatch UNCONSTRUCTIBLE is
+    structural -- one call site, and the shuffle applied to the cached rows so the build pass has no
+    reason to re-render -- and that is what this reads.
+    """
+    import ast
+    import textwrap
+
+    from flash.engine.worker import opd_train as opd_mod
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_mod.run_opd_train)))
+    renders = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "prompt_messages"
+    ]
+    assert len(renders) == 1, (
+        f"run_opd_train calls env.prompt_messages() {len(renders)} times; each extra call re-runs "
+        "user environment code on every example, and a second rendering that differs from the "
+        "first reaches the build loop with multimodal already latched from the first"
+    )
+
+    shuffles = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "shuffle"
+    ]
+    assert len(shuffles) == 1, f"expected exactly one dataset shuffle, found {len(shuffles)}"
+    # shuffling the raw examples is what forces the second rendering: the cached rows would no
+    # longer line up with the training order, so the build pass has to ask the environment again.
+    assert [a.id for a in shuffles[0].args if isinstance(a, ast.Name)] == ["prompt_rows"], (
+        "the shuffle must reorder the already-rendered rows, not the raw examples"
+    )
+
+
 def test_the_opd_trainer_stores_the_frozen_base_in_bf16():
     """VERL-150: verl's fsdp.yaml default is fp32, which doubles the trainer's resident base.
 
