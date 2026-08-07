@@ -3368,10 +3368,25 @@ def run_rl_train():
             with open(shim_py, "a") as f:
                 f.write(render_gdn_varlen_shim(gdn_reset_arch))
         elif gdn_hybrid:
-            print(
-                "[grpo] gdn hybrid without child-side boundary resets: disabling remove-padding so "
-                "packed examples cannot contaminate each other (slower, correct)",
-                flush=True,
+            # the padded fallback is CORRECT but currently unreachable: verl's fsdp engine has no
+            # guard for use_remove_padding=False + use_fused_kernels=True (its megatron engine does,
+            # transformer_impl.py:869-874), and flash sets the fused flag unconditionally above. the
+            # padded+fused branch returns [bsz, response_len] while every sibling re-nests via
+            # cu_seqlens, so no_padding_2_padding's `sequence_offsets[-1] == values.shape[0]`
+            # compares total tokens against batch size and fails at EVERY batch size.
+            #
+            # die here rather than at the first log-prob pass. the run cannot complete either way,
+            # and the assert names neither gdn nor this decision, so letting it launch spends the
+            # full rental on a shape error nobody can trace back. dropping use_fused_kernels instead
+            # is NOT a safe local fix: engine/vram.py sizes on the assumption that no dense
+            # [b, s, vocab] logits tensor exists, so it would trade this crash for an OOM.
+            raise RuntimeError(
+                "gdn hybrid without child-side boundary resets: the padded fallback "
+                "(use_remove_padding=False) is incompatible with use_fused_kernels=True on verl's "
+                "fsdp engine and asserts in no_padding_2_padding on the first log-prob pass. see "
+                "the '[verl] gdn boundary resets unavailable' line above for why the child could "
+                "not honor resets -- installing fla + causal_conv1d in the verl interpreter is the "
+                "fix, not disabling fused kernels."
             )
 
         expected_steps = int(inp["steps"])

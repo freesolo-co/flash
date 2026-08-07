@@ -1093,10 +1093,19 @@ def run_sft_train(spec=None) -> None:
     gdn_boundary_resets = gdn_reset_arch is not None
     use_remove_padding = not gdn_hybrid or gdn_boundary_resets
     if gdn_hybrid and not gdn_boundary_resets:
-        print(
-            "[sft] gdn hybrid without child-side boundary resets: disabling remove-padding so "
-            "packed examples cannot contaminate each other (slower, correct)",
-            flush=True,
+        # sft dies on this combination too, just further along and with a stranger message than the
+        # grpo/opd assert. verl's sft_loss (workers/utils/losses.py:40) calls `log_prob.values()`
+        # under pad_mode=NO_PADDING, which flash always uses -- and `.values()` is a nested-tensor
+        # method. the padded+fused branch (fsdp/transformer_impl.py:1190-1194) hands it a DENSE
+        # [bsz, response_len], so it raises "values expected sparse tensor layout but got Strided".
+        # same root cause as grpo/opd: verl's fsdp engine does not support use_remove_padding=False
+        # with the use_fused_kernels=True set below, and only its megatron engine guards the pair.
+        raise RuntimeError(
+            "gdn hybrid without child-side boundary resets: the padded fallback "
+            "(use_remove_padding=False) is incompatible with use_fused_kernels=True on verl's fsdp "
+            "engine and dies in sft_loss on the first batch. see the '[verl] gdn boundary resets "
+            "unavailable' line above for why the child could not honor resets -- installing fla + "
+            "causal_conv1d in the verl interpreter is the fix, not disabling fused kernels."
         )
 
     config = {

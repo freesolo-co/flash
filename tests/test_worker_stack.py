@@ -2056,3 +2056,39 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
             f"{module.__name__} computes the gdn boundary-reset decision but never records it, so a "
             "finished run cannot be checked for whether it trained packed-with-resets or padded."
         )
+
+
+def test_no_algorithm_launches_into_the_unrunnable_padded_fallback():
+    """A gdn hybrid whose child cannot reset boundaries must fail AT THE GATE, not mid-run.
+
+    The padded fallback (`use_remove_padding=False`) is boundary-correct but cannot complete a step
+    on verl's fsdp engine: flash sets `use_fused_kernels=True` unconditionally, and that pair walks
+    into `prepare_model_outputs`' fused padded branch, which returns a dense `[bsz, response_len]`
+    where every sibling path re-nests via `cu_seqlens`. Grpo and opd then assert in
+    `no_padding_2_padding` (`sequence_offsets[-1] == values.shape[0]` compares total tokens against
+    batch size); sft dies slightly later in `sft_loss`, which calls `.values()` on what is no longer
+    a nested tensor. Verl's megatron engine guards this pair explicitly; its fsdp engine does not.
+
+    Measured on four matched real-gpu arms: all four died at `padding.py:144`, treatment and control
+    alike. Every catalog model is gdn, so a kernel-less child means no run of any algorithm can
+    finish -- and the assert names neither gdn nor the gate, so letting it launch spends a full
+    rental on an untraceable shape error.
+
+    Asserted on source for the same reason as the test above: these gates sit deep inside the run
+    functions, behind a live bridge and a child process.
+    """
+    import inspect as _inspect
+
+    from flash.engine.worker import opd_train, rl_train, sft_train
+
+    for module in (sft_train, opd_train, rl_train):
+        src = _inspect.getsource(module)
+        # anchor on the DECISION, not on the message text -- the message itself contains the same
+        # phrase, so anchoring there matches inside the raise and would pass on any wording.
+        _, _, tail = src.partition("use_remove_padding = not gdn_hybrid or gdn_boundary_resets")
+        assert tail, f"{module.__name__} no longer computes the gdn boundary-reset decision"
+        # the gate must RAISE. printing and carrying on is what burned the gpu time.
+        assert "raise RuntimeError(" in tail[:2000], (
+            f"{module.__name__} still continues past the gdn gate into use_remove_padding=False, "
+            "which cannot complete a training step on verl's fsdp engine."
+        )

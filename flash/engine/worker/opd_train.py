@@ -2472,10 +2472,17 @@ def run_opd_train(spec=None) -> None:
     gdn_boundary_resets = gdn_reset_arch is not None
     use_remove_padding = not gdn_hybrid or gdn_boundary_resets
     if gdn_hybrid and not gdn_boundary_resets:
-        print(
-            "[opd] gdn hybrid without child-side boundary resets: disabling remove-padding so "
-            "packed examples cannot contaminate each other (slower, correct)",
-            flush=True,
+        # same dead end as the grpo path: verl's fsdp engine does not support
+        # use_remove_padding=False alongside the use_fused_kernels=True set below, and opd reaches
+        # no_padding_2_padding through trainer/distillation/losses.py exactly as grpo reaches it
+        # through ray_trainer. fail here rather than renting the gpu for a run that asserts on its
+        # first log-prob pass. see the grpo gate for why dropping fused kernels is not the fix.
+        raise RuntimeError(
+            "gdn hybrid without child-side boundary resets: the padded fallback "
+            "(use_remove_padding=False) is incompatible with use_fused_kernels=True on verl's fsdp "
+            "engine and asserts in no_padding_2_padding on the first log-prob pass. see the "
+            "'[verl] gdn boundary resets unavailable' line above for why the child could not honor "
+            "resets -- installing fla + causal_conv1d in the verl interpreter is the fix."
         )
 
     # sm86's vllm 0.19.1 graph capture degenerates, so only that arch runs the rollout eagerly. grpo

@@ -441,6 +441,19 @@ def verl_child_gdn_reset_arch(python_bin: str, model_id: str, revision: str = ""
         return None
     if done.returncode == 0 and done.stdout.strip().endswith("1"):
         return model_type
+    # say WHY, or the padded fallback is invisible. a bare None here sends the run down
+    # use_remove_padding=False with nothing in the log naming this probe, and that fallback is not
+    # free: on the verl fsdp engine it composes with the unconditional use_fused_kernels into a
+    # combination that asserts in no_padding_2_padding on the first log-prob pass. an operator
+    # reading only the crash has no way back to this decision. the probe prints a bare "0" on a
+    # clean negative and raises on a broken kernel, so returncode + stderr distinguish
+    # "checked, unavailable" from "the probe itself fell over".
+    detail = (done.stderr or "").strip().replace("\n", " ")
+    print(
+        f"[verl] gdn boundary resets unavailable in the child (rc={done.returncode}, "
+        f"stdout={done.stdout.strip()!r}){f': {detail[-400:]}' if detail else ''}",
+        flush=True,
+    )
     return None
 
 

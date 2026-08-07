@@ -649,6 +649,30 @@ def test_the_gdn_boundary_gate_treats_an_unconvincing_probe_as_unavailable(
     assert vc.verl_child_gdn_reset_arch("/nonexistent/python", "Qwen/Qwen3.5-4B") is None
 
 
+def test_an_unavailable_gdn_gate_says_why(monkeypatch, capsys):
+    # failing closed silently is what made this expensive to diagnose. the fallback the gate selects
+    # is use_remove_padding=False, which on verl's fsdp engine composes with the unconditional
+    # use_fused_kernels into a combination that asserts in no_padding_2_padding on the first
+    # log-prob pass -- so a run that hits it dies with a shape error naming neither this probe nor
+    # gdn. the child's stderr is the only thing that distinguishes "kernels genuinely absent" from
+    # "the probe itself fell over", and it was being captured and discarded.
+    monkeypatch.setattr(
+        vc.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="ImportError: causal_conv1d built without sm120 support",
+        ),
+    )
+    assert vc.verl_child_gdn_reset_arch("/any/python", "Qwen/Qwen3.5-4B") is None
+    out = capsys.readouterr().out
+    assert "gdn boundary resets unavailable" in out
+    # the CAUSE has to survive, not just the verdict -- that is the whole point.
+    assert "sm120" in out
+    assert "rc=1" in out
+
+
 def test_fla_stays_in_lockstep_with_the_worker_image():
     # the fallback venv and /opt/verl-venv must hold the SAME fla commit. gdn boundary resets are a
     # correctness property, not a speed one: a child on a different fla could thread cu_seqlens
