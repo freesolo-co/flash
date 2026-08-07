@@ -349,7 +349,7 @@ def _fake_verl_venv(tmp_path, *, stamp: str | None):
 def _record_run(calls, *, keep_check: bool = False):
     """stand in for subprocess.run, creating the venv dir `uv venv` would have created."""
 
-    def fake_run(command, check, env=None):
+    def fake_run(command, check, env=None, capture_output=False):
         calls.append((command, check) if keep_check else command)
         if command[:2] == ["uv", "venv"]:
             # the venv path is `uv venv`'s trailing positional, wherever the flags before it end.
@@ -384,11 +384,16 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "tqdm" in install
     assert "pyarrow" in install
     # venv, the resolve above, the prebuilt flash_attn wheel on its own --no-build-isolation line,
-    # then causal_conv1d (also its own line: it source-builds against the venv's torch). nothing
-    # else: a fifth call would be an unbudgeted install on a paid pod.
-    assert len(calls) == 4
+    # then causal_conv1d (also its own line: it source-builds against the venv's torch), and last
+    # the import probe that proves the conv extension actually loaded. nothing else: another INSTALL
+    # would be unbudgeted work on a paid pod.
+    assert len(calls) == 5
     assert calls[2][:3] == ["uv", "pip", "install"]
     assert vc.CAUSAL_CONV1D_REQUIREMENT in calls[3]
+    assert calls[4][-1] == "import causal_conv1d"
+    assert [c for c in calls if c[:3] == ["uv", "pip", "install"]] == calls[1:4], (
+        "the probe must be a check, not an install"
+    )
     # the stamp is written only after a successful install, so a crashed install is never reused.
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_VENV_STAMP
@@ -398,7 +403,7 @@ def _flaky_wheel_install(calls, sleeps, *, failures: int):
     """subprocess.run stand-in whose flash-attn install fails the first `failures` attempts."""
     attempts = {"n": 0}
 
-    def fake_run(command, check, env=None):
+    def fake_run(command, check, env=None, capture_output=False):
         calls.append(command)
         if command[:2] == ["uv", "venv"]:
             os.makedirs(os.path.join(command[-1], "bin"), exist_ok=True)
@@ -1057,8 +1062,11 @@ def test_causal_conv1d_install_is_best_effort_and_leaves_no_env_residue(monkeypa
     # it. and the build flag must not leak into the environment verl inherits from this process.
     seen = {}
 
-    def fake_run(command, check, env=None):
-        seen["command"], seen["check"], seen["env"] = command, check, env
+    def fake_run(command, check, env=None, capture_output=False):
+        # the install is the call carrying the requirement; the later call is the import probe.
+        if vc.CAUSAL_CONV1D_REQUIREMENT in command:
+            seen["command"], seen["check"], seen["env"] = command, check, env
+        return _Completed(0)
 
     monkeypatch.delenv("CAUSAL_CONV1D_FORCE_BUILD", raising=False)
     monkeypatch.setattr(vc.subprocess, "run", fake_run)
@@ -1080,14 +1088,20 @@ class _Completed:
         self.returncode = returncode
 
 
-def _record_run_with_conv_exit(calls, conv_exit):
-    """``_record_run``, but the causal-conv1d install exits with ``conv_exit``."""
+def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0):
+    """``_record_run``, but the causal-conv1d install exits with ``conv_exit``.
+
+    ``import_exit`` drives the separate ``import causal_conv1d`` probe, because a compiled cuda
+    extension can install cleanly (exit 0) and still fail to import on an ABI mismatch.
+    """
     inner = _record_run(calls)
 
-    def fake_run(command, check, env=None):
-        inner(command, check, env)
+    def fake_run(command, check, env=None, capture_output=False):
+        inner(command, check, env, capture_output)
         if vc.CAUSAL_CONV1D_REQUIREMENT in command:
             return _Completed(conv_exit)
+        if command[-1] == "import causal_conv1d":
+            return _Completed(import_exit)
         return _Completed(0)
 
     return fake_run
@@ -1124,6 +1138,44 @@ def test_a_successful_conv_build_still_stamps_the_venv(monkeypatch, tmp_path):
 
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_VENV_STAMP
+
+
+def test_a_conv_build_that_installs_but_cannot_import_leaves_the_venv_unstamped(
+    monkeypatch, tmp_path
+):
+    """A zero pip exit is not the kernel landing.
+
+    causal_conv1d is a compiled cuda extension: an ABI or symbol mismatch installs cleanly and then
+    fails at import. transformers' is_causal_conv1d_available() is only a find_spec probe, so a
+    present-but-broken package passes it and the run crashes at model load instead of training
+    unpacked. Dockerfile.worker gates the same package on the same import for the same reason.
+    """
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, import_exit=1))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert not stamp.exists(), (
+        "a venv whose conv kernel installed but cannot import was stamped as fully provisioned, so "
+        "every later attempt on this pod reuses it and grpo/opd stay unrunnable"
+    )
+    # and the broken build must not be left importable-looking for the next find_spec probe.
+    assert any(c[:3] == ["uv", "pip", "uninstall"] for c in calls), (
+        "a conv build that cannot import was left installed"
+    )
+
+
+def test_the_venv_stamp_covers_the_conv_kernel_so_an_older_venv_is_rebuilt():
+    """The stricter half of the fla argument.
+
+    Before the install outcome gated stamping, a venv was stamped whether or not the conv kernel
+    landed. Those venvs still exist on reused pod workdirs; if the stamp does not name the conv
+    requirement they keep matching, provisioning is skipped, and require_gdn_boundary_resets goes on
+    raising for grpo/opd with no path to a rebuild.
+    """
+    assert vc.CAUSAL_CONV1D_REQUIREMENT in vc.VERL_VENV_STAMP
 
 
 def test_the_venv_stamp_covers_fla_so_a_prefla_venv_is_rebuilt(monkeypatch, tmp_path):
@@ -1209,7 +1261,14 @@ def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
 
     vc.resolve_verl_python(str(tmp_path))
 
-    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"], ["uv", "pip"]]
+    # three installs, then the conv import probe (which runs the venv's python, not uv).
+    assert [c[:2] for c in calls] == [
+        ["uv", "venv"],
+        ["uv", "pip"],
+        ["uv", "pip"],
+        ["uv", "pip"],
+        [str(venv / "bin" / "python"), "-c"],
+    ]
     assert not (venv / "marker").exists()
 
 
@@ -1227,7 +1286,13 @@ def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkey
     vc.resolve_verl_python(str(tmp_path))
 
     assert not (venv / "pyvenv.cfg").exists()
-    assert [c[:2] for c in calls] == [["uv", "venv"], ["uv", "pip"], ["uv", "pip"], ["uv", "pip"]]
+    assert [c[:2] for c in calls] == [
+        ["uv", "venv"],
+        ["uv", "pip"],
+        ["uv", "pip"],
+        ["uv", "pip"],
+        [str(venv / "bin" / "python"), "-c"],
+    ]
 
 
 def test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork():
