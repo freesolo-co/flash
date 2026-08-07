@@ -1466,9 +1466,31 @@ def test_sft_chunked_nll_model_gate_mirrors_worker():
 
     assert sft_chunked_nll_enabled("Qwen/Qwen3.5-0.8B") is True
     assert sft_chunked_nll_enabled("Qwen/Qwen3.5-9B") is True
+    assert sft_chunked_nll_enabled("Qwen/Qwen3.6-27B") is True
     assert sft_chunked_nll_enabled("Qwen/Qwen3.6-35B-A3B") is True
     assert sft_chunked_nll_enabled("meta-llama/Llama-3.2-1B") is False
     assert sft_chunked_nll_enabled("org/unknown") is False
+
+
+def test_every_sft_catalog_model_is_sized_for_the_fused_loss():
+    """sizing must mirror the worker, which sets use_fused_kernels=true for EVERY model.
+
+    the enumerated gate above cannot fail when a NEW catalog model is added and left out of the
+    set, which is exactly how Qwen3.6-27B came to be sized for dense logits it never allocates.
+    every catalog model is a qwen3_5/qwen3_5_moe checkpoint, and verl dispatches both to the fused
+    torch backend, so the sft-capable catalog and the set must stay identical.
+    """
+    from flash.catalog import MODELS
+    from flash.engine.vram import sft_chunked_nll_enabled
+
+    missing = sorted(
+        mid
+        for mid, info in MODELS.items()
+        if "sft" in info.algos and not sft_chunked_nll_enabled(mid)
+    )
+    assert not missing, (
+        f"sft-capable catalog models sized for dense logits the fused worker never builds: {missing}"
+    )
 
 
 def test_sft_estimate_includes_capped_logits_term():
