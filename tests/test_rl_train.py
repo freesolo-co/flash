@@ -2000,9 +2000,9 @@ def test_a_scalar_reward_env_contributes_no_breakdown_at_all():
 @pytest.mark.usefixtures("_identity_graded")
 def test_a_scalar_reward_env_contributes_nothing_when_its_grading_fails_either():
     # the failure path is where the scores_breakdown gate actually bites: without it, a run whose
-    # env has no named components at all would still append None per failed completion, and
-    # _latest_named_reward_metrics' outage branch would then republish the LAST run's names as a
-    # flat 0 for an env that never reported them.
+    # env has no named components at all would still append None per failed completion, and the
+    # buffer's outage branch would then republish the LAST run's names as a flat 0 for an env that
+    # never reported them.
     breakdowns: list[dict | None] = []
     score = rl_train.score_single_turn(
         _RaisingRewardOnlyEnv(),
