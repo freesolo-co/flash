@@ -81,12 +81,11 @@ BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100
 
 @dataclass(frozen=True)
 class WorkerImageOverride:
-    """A worker-image override plus the deploy constraints the image itself demands.
+    """A worker-image override and the registry credential needed to pull it.
 
-    An override image is not just a name: a private registry needs an auth id, a cu13 image
-    crashes on cu12 driver hosts, and a large image cannot extract into the default container
-    disk. Carrying these together keeps every deploy site consistent (an override can never be
-    scheduled onto a host that cannot boot it).
+    The CUDA and disk floors this used to carry were removed with their env vars in #906: the GPU
+    class floor already encodes the driver requirement, and container disk belongs in the run's own
+    ``[gpu] disk_gb``. Only the auth id is left, because it cannot be derived from the image ref.
     """
 
     image: str
