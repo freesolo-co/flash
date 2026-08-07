@@ -843,6 +843,34 @@ def test_an_unavailable_gdn_gate_says_why():
     )
 
 
+def test_the_gdn_gate_has_exactly_three_outcomes():
+    """None for non-gdn, an arch for a resettable hybrid, a raise for everything else.
+
+    Both callers (`rl_train`, `opd_train`) treat `arch is not None` as interchangeable with "is this
+    a gdn hybrid" -- rl_train renders the shim on it, and both record it as run metadata. That is
+    only sound because the gate cannot return None for a hybrid: if it ever did, a gdn run would
+    skip the boundary shim while the metadata still said the question did not arise, which is the
+    packed-and-contaminated-but-labelled-fine case the shim exists to prevent.
+
+    The `caps` variants matter as much as the happy path. `_CAPABILITIES_UNAVAILABLE` seeds
+    `gdn_boundary_resets` as None (child died / timed out / printed nothing readable), and a partial
+    read can drop the key entirely. Both are "could not answer", and for THIS question that must
+    fail closed into the raise -- not into None, which the callers would read as "not a hybrid".
+    """
+    module = "transformers.models.qwen3_5.modeling_qwen3_5"
+
+    # non-gdn: the parent passes "" and never asked the child, so there is nothing to check.
+    assert vc.require_gdn_boundary_resets({"gdn_boundary_resets": None}, "") is None
+
+    # gdn + child cleared: the arch, recovered from the literal the child was handed.
+    assert vc.require_gdn_boundary_resets({"gdn_boundary_resets": True}, module) == "qwen3_5"
+
+    # gdn + any non-affirmative answer: raise. never None.
+    for caps in ({"gdn_boundary_resets": False}, {"gdn_boundary_resets": None}, {}):
+        with pytest.raises(RuntimeError, match="without child-side boundary resets"):
+            vc.require_gdn_boundary_resets(caps, module)
+
+
 def test_fla_stays_in_lockstep_with_the_worker_image():
     # the fallback venv and /opt/verl-venv must hold the SAME fla commit. gdn boundary resets are a
     # correctness property, not a speed one: a child on a different fla could thread cu_seqlens

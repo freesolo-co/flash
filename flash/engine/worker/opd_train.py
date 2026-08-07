@@ -2548,7 +2548,7 @@ def run_opd_train(spec=None) -> None:
         save_at_steps=knobs.save_at_steps,
         total_steps=update_horizon,
     )
-    if gdn_hybrid:
+    if gdn_reset_arch is not None:
         opd_shim_source += render_gdn_varlen_shim(gdn_reset_arch)
     if "wandb" in loggers:
         opd_shim_source += render_wandb_link_shim()
