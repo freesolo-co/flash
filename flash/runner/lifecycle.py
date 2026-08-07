@@ -558,13 +558,31 @@ def _projected_retry_class(
     )
 
 
-def _oom_escalated(candidates, oom_vram_floor: int):
+def _candidate_usable_vram_gb(candidate) -> float:
+    """Run-usable VRAM for a candidate, under the same fit model the allocator selected it with.
+
+    `combined_vram_gb` is documented as THE single fit model, and every sizing path calls it. The raw
+    `gpu_count * vram_gb` product is NOT interchangeable with it for a sharded shape: it ignores the
+    replicated-per-card floor and the shard efficiency, so it overstates a multi-card box. Comparing
+    the two measures is what let an OOM retry move SIDEWAYS or DOWNWARDS -- 2x80 raw-counts as 160 GB
+    against a 141 GB single card that just OOM'd, but the allocator models that pair as 130.4 GB
+    usable, i.e. smaller than the shape that already failed.
+    """
+    from flash.providers.base import combined_vram_gb
+
+    return combined_vram_gb(candidate.vram_gb, int(getattr(candidate, "gpu_count", 1) or 1))
+
+
+def _oom_escalated(candidates, oom_vram_floor: float):
     """Candidates strictly LARGER than the VRAM that just OOM'd. ``oom_vram_floor == 0`` (no prior OOM)
     leaves the list unchanged; otherwise an 80GB OOM leaves only the >80GB classes (a same-size retry
-    would just OOM again). EMPTY means the run already OOM'd the largest available class."""
+    would just OOM again). EMPTY means the run already OOM'd the largest available class.
+
+    Both sides are measured with `_candidate_usable_vram_gb`, and the floor recorded on OOM uses it
+    too -- the filter is only meaningful if the floor and the candidates are on one scale."""
     if not oom_vram_floor:
         return list(candidates)
-    return [c for c in candidates if getattr(c, "gpu_count", 1) * c.vram_gb > oom_vram_floor]
+    return [c for c in candidates if _candidate_usable_vram_gb(c) > oom_vram_floor]
 
 
 def _await_runpod_completed_metrics(
@@ -743,7 +761,7 @@ def _submit_seed_supervised(
     # Grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str, int]] = set()
-    oom_vram_floor = 0
+    oom_vram_floor = 0.0
     # Pin the environment ref ONCE, here, before any attempt runs -- not per attempt. Submit's pin
     # is best-effort, so a GitHub blip there leaves resolved_sha empty, and a managed slug points at
     # environment-hub@main, which moves. attempt_start > 0 means a previous invocation already ran an
@@ -906,9 +924,9 @@ def _submit_seed_supervised(
                     raise _cancel()
             cands = _oom_escalated(alloc.candidates, oom_vram_floor)
             if not cands:
-                last_detail = f"oom: exceeded the largest available GPU ({oom_vram_floor} GB)"
+                last_detail = f"oom: exceeded the largest available GPU ({oom_vram_floor:g} GB)"
                 print(
-                    f"seed={seed} OOM on the largest GPU class ({oom_vram_floor} GB); not retrying",
+                    f"seed={seed} OOM on the largest GPU class ({oom_vram_floor:g} GB); not retrying",
                     file=log,
                     flush=True,
                 )
@@ -1112,7 +1130,8 @@ def _submit_seed_supervised(
         last_detail = f"{res.failure}: {res.detail}"
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
-            oom_vram_floor = max(oom_vram_floor, getattr(chosen, "gpu_count", 1) * chosen.vram_gb)
+            # same measure the filter compares against, see _candidate_usable_vram_gb
+            oom_vram_floor = max(oom_vram_floor, _candidate_usable_vram_gb(chosen))
         run_had_cache = bool(
             chosen is not None
             and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
@@ -1166,7 +1185,7 @@ def _submit_seed_supervised(
         else:
             retry_target = "retrying (resume from last checkpoint)"
         action = (
-            f"retrying on a larger GPU (> {oom_vram_floor} GB)"
+            f"retrying on a larger GPU (> {oom_vram_floor:g} GB)"
             if (will_retry and oom_mode)
             else retry_target
             if will_retry
