@@ -154,6 +154,18 @@ def validate_opd_resume_state_metadata(
             _nonnegative_integer(state[field], field=field)
         else:
             _finite_number(state[field], field=field, nonnegative=True)
+    # present-together or absent-together, checked AFTER the per-field validation above so a corrupt
+    # value still reports its own field rather than this. verl writes both (its accounting snapshot
+    # emits the pair) and trl writes neither, so a state carrying exactly one is corrupt: the reader
+    # defaults the absent one to 0 independently, and the published mean_align_granularity then
+    # divides a real sum by a zeroed count, or reports 0.0 for a run that measured every group.
+    present = [field for field in _OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA if field in state]
+    if present and len(present) != len(_OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA):
+        missing = sorted(set(_OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA) - set(present))
+        raise ValueError(
+            "opd resume state alignment accumulators must be present as a pair; missing "
+            + ", ".join(missing)
+        )
 
     for field in ("loss_curve", "coverage_curve"):
         curve = state[field]
