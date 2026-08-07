@@ -412,6 +412,38 @@ def _validate_existing_config_projects(project_id: str) -> None:
             )
 
 
+def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
+    """The `thinking` state the generated configs already agree on, or None if none exist.
+
+    Reads EVERY config rather than anchoring on the first one found. Stopping at the first accepts a
+    project whose configs contradict each other -- exactly what a scaffold from before #824 looks
+    like, since that release wrote `thinking` into rl and sft but never into opd. rl is visited
+    first, reports reasoning, and the stale opd config is neither reported nor rewritten
+    (codex[bot]).
+
+    A config that is absent is not a disagreement: it is about to be written from whatever this
+    returns.
+    """
+    from flash.client import ClientError
+
+    found = {
+        cfg: "thinking = true" in cfg.read_text(encoding="utf-8") for cfg in configs if cfg.exists()
+    }
+    if len(set(found.values())) > 1:
+        # no anchor exists: the configs disagree, so there is no "existing state" to keep. picking a
+        # side would rewrite nothing (configs are only written when absent) and leave the project
+        # training one algorithm with reasoning and another without. refusing is the only outcome
+        # that cannot end in a silent cross-algorithm mismatch.
+        on = ", ".join(str(cfg) for cfg, has in found.items() if has)
+        off = ", ".join(str(cfg) for cfg, has in found.items() if not has)
+        raise ClientError(
+            f"existing configs disagree about reasoning: {on} set `thinking = true`, "
+            f"{off} do not. Delete {', '.join(str(cfg) for cfg in found)} and re-run "
+            "`flash env setup` with --reasoning or --no-reasoning to scaffold them together."
+        )
+    return next(iter(found.values()), None)
+
+
 def _traces_dataset(args, project_id: str) -> str | None:
     """Optionally export traces from the already-selected project."""
     if not _setup_interactive(args):
@@ -524,11 +556,7 @@ def cmd_env_setup(args) -> int:
     # exactly what it names, and end up with the deleted configs rewritten one way and the unnamed one
     # still holding the old setting -- the same silent cross-algorithm mismatch, just relocated.
     reasoning_configs = (rl, opd, sft)
-    existing_reasoning: bool | None = None
-    for cfg in reasoning_configs:
-        if cfg.exists():
-            existing_reasoning = "thinking = true" in cfg.read_text(encoding="utf-8")
-            break
+    existing_reasoning = _existing_reasoning(reasoning_configs)
     flag_reason = getattr(args, "reasoning", None)
     if existing_reasoning is not None:
         if flag_reason is not None and flag_reason != existing_reasoning:
