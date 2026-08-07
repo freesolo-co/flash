@@ -170,23 +170,28 @@ def test_read_dev_version():
     assert build.read_dev_version(src) == "2.3.4"
 
 
-def test_channel_only_flips_channel_without_touching_pyproject(tmp_path):
-    """--channel-only (publish-image.yml, before the `:dev` Docker build) touches only
-    flash/_channel.py. The Docker image ships the checked-in package name/scripts unchanged and
-    has no PyPI dist step, so pyproject.toml must be left exactly as checked in."""
+def test_no_build_flips_channel_and_pyproject_together(tmp_path):
+    """--no-build (publish-image.yml, before the `:dev` Docker build) must apply the FULL
+    transform, not just the channel flip. flash/__init__.py resolves __version__ via
+    importlib.metadata.version(DIST_NAME), and DIST_NAME derives from CHANNEL -- so a
+    channel-only flip would point that lookup at a distribution name nothing installed,
+    silently downgrading __version__ to "0+unknown" in the built image."""
     build = _load_build_module()
     (tmp_path / "flash").mkdir()
     channel_path = tmp_path / "flash" / "_channel.py"
     channel_path.write_text('CHANNEL = "prod"\n')
-    pyproject_text = '[project]\nname = "freesolo-flash"\nversion = "1.0.0"\n'
     pyproject_path = tmp_path / "pyproject.toml"
-    pyproject_path.write_text(pyproject_text)
+    pyproject_path.write_text(
+        '[project]\nname = "freesolo-flash"\nversion = "1.0.0"\n'
+        '[tool.flash-dev]\nversion = "1.0.0"\n'
+    )
 
-    rc = build.main(["--root", str(tmp_path), "--channel-only"])
+    rc = build.main(["--root", str(tmp_path), "--no-build"])
 
     assert rc == 0
     assert channel_path.read_text() == 'CHANNEL = "dev"\n'
-    assert pyproject_path.read_text() == pyproject_text
+    # The installed package name must move in lockstep with CHANNEL/DIST_NAME.
+    assert 'name = "freesolo-flash-dev"' in pyproject_path.read_text()
 
 
 def test_channels_are_at_the_same_version():
