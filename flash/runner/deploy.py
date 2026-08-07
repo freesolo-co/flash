@@ -1110,6 +1110,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             raise ValueError("persisted attempt identity is missing or invalid")
         next_attempt = recovered_attempt + 1
         allocated_gpu = remote.pop("allocated_gpu", None)
+        allocated_gpu_count = remote.pop("allocated_gpu_count", None)
         handle = JobHandle.from_dict(remote)
         try:
             poll_spec = _spec_with_remaining_wall(worker_spec, require_provider_minimum=False)
@@ -1256,6 +1257,8 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             return status_for_return()
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
+        if allocated_gpu_count and isinstance(res.metrics, dict):
+            res.metrics.setdefault("allocated_gpu_count", int(allocated_gpu_count))
         if not _adopt_completed_attempt(
             run_id,
             worker_spec,
