@@ -167,8 +167,3 @@ def invalidate_verified_adapter_revisions(
         _write_unlocked(runs_dir, path, generation, [])
         commit()
         return generation
-
-
-def clear_verified_adapter_revisions(run_id: str) -> int:
-    """Atomically clear membership and advance the undeploy generation."""
-    return invalidate_verified_adapter_revisions(run_id, commit=lambda: None)

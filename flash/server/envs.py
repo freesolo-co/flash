@@ -23,6 +23,7 @@ from flash.envs.archive_policy import (
     archive_stream_limit,
     tar_member_segments,
 )
+from flash.envs.loader import _github_token
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
@@ -164,16 +165,6 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
         raise EnvPublishError(f"env package is not a valid .tar.gz archive: {exc}") from exc
     except OSError as exc:
         raise EnvPublishError(f"env package could not be extracted: {exc}") from exc
-
-
-def _github_token() -> str | None:
-    """The GitHub token, or ``None`` when unset OR blank.
-
-    Blank collapses to ``None`` so the ``if not token`` guards below report a missing credential
-    instead of pushing a malformed one, and so ``_redact`` is never handed a whitespace needle it
-    would substitute across every space in the message.
-    """
-    return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
 
 
 def _redact(value: str, token: str) -> str:
