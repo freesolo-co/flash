@@ -47,14 +47,6 @@ def sft_grad_accum(
     return per_device, grad_accum
 
 
-def sft_realized_batch(
-    batch_size: int, *, seq_len: int = 0, vocab: int = 0, fused: bool = True
-) -> int:
-    """Realized SFT global batch (per_device x grad_accum) for a requested batch_size."""
-    per_device, grad_accum = sft_grad_accum(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
-    return per_device * grad_accum
-
-
 _KV_COEF = 2.0
 _KV_CAP = 8.0
 _KV_BLOCK_TOKENS = 16

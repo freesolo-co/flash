@@ -516,13 +516,6 @@ def _decode_image_bytes(data: bytes):
         raise ValueError("image source is not a valid image") from exc
 
 
-def decode_image_descriptor(descriptor: str, package_root: str | Path | None):
-    """Decode and validate one descriptor at batch access time."""
-    data = _read_descriptor_source(descriptor, package_root)
-    decoded_bytes = _inspect_image_bytes(data)
-    return _decode_image_bytes(data), len(data), decoded_bytes
-
-
 def decode_image_descriptors(
     descriptors: list[str], package_root: str | Path | None
 ) -> list[object]:

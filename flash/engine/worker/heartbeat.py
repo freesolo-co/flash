@@ -19,7 +19,11 @@ from typing import Any
 
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
-from flash.engine.worker.rollout_samples import sanitize_rollout_text, select_rollout_samples
+from flash.engine.worker.rollout_samples import (
+    sampled_completion_scalar,
+    sanitize_rollout_text,
+    select_rollout_samples,
+)
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
@@ -629,19 +633,6 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
 _SAMPLE_LIMIT = 3
 
 
-def _sampled_completion_scalar(sample: dict) -> tuple[str, float] | None:
-    """Return the (key, finite value) of a sample's scalar: GRPO ``reward`` or OPD ``loss``."""
-    for key in ("reward", "loss"):
-        if key not in sample:
-            continue
-        try:
-            value = float(sample.get(key))
-        except (TypeError, ValueError):
-            return None
-        return (key, value) if math.isfinite(value) else None
-    return None
-
-
 def _bounded_sampled_completions(samples) -> list[dict]:
     if not isinstance(samples, (list, tuple)):
         return []
@@ -653,7 +644,7 @@ def _bounded_sampled_completions(samples) -> list[dict]:
         completion = sample.get("completion")
         if not isinstance(prompt_tail, str) or not isinstance(completion, str):
             continue
-        scalar = _sampled_completion_scalar(sample)
+        scalar = sampled_completion_scalar(sample)
         if scalar is None:
             continue
         generated_at_step = sample.get("generated_at_step")

@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import Any
 
 from flash.diagnostics import neutralize_control_chars
+from flash.engine.worker.rollout_samples import sampled_completion_scalar
 from flash.providers._deadline import remaining_seconds
 
 # Generous grace past embedded deadline before orphan sweep reaps a driver-lost warm box.
@@ -195,19 +196,6 @@ def format_gpu_status(gpu: Any) -> str:
     return " gpu[" + " ".join(parts) + "]" if parts else ""
 
 
-def _sampled_completion_scalar(sample: dict) -> tuple[str, float] | None:
-    """Return a sample's scalar as (label, finite value): GRPO ``reward`` or OPD ``loss``."""
-    for key in ("reward", "loss"):
-        if key not in sample:
-            continue
-        try:
-            value = float(sample.get(key))
-        except (TypeError, ValueError):
-            return None
-        return (key, value) if math.isfinite(value) else None
-    return None
-
-
 def _format_child_tail(tail: object, silent_ticks: object = None) -> str:
     """Render a stalled worker's retained child output, or "" when there is none.
 
@@ -295,7 +283,7 @@ def _format_heartbeat(hb: dict) -> str:
             if not isinstance(prompt_tail, str) or not isinstance(completion, str):
                 continue
             # A sample carries exactly one scalar: GRPO reward (3dp) or OPD distillation loss (4dp).
-            scalar = _sampled_completion_scalar(sample)
+            scalar = sampled_completion_scalar(sample)
             if scalar is None:
                 continue
             scalar_label, scalar_value = scalar
