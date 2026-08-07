@@ -111,6 +111,40 @@ def test_oom_escalated_keeps_only_strictly_larger_cards():
     assert _oom_escalated(cands, 180) == []  # OOM'd the biggest -> nowhere larger
 
 
+def _shape(gpu, vram, count):
+    return types.SimpleNamespace(
+        gpu=gpu, vram_gb=vram, gpu_count=count, provider="runpod", hourly_usd=1.0
+    )
+
+
+def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
+    """The escalation filter must measure candidates the way the allocator sized them.
+
+    the raw `gpu_count * vram_gb` product is not the allocator's fit model: `combined_vram_gb`
+    subtracts a replicated-per-card floor and applies a shard efficiency, so a sharded pair is worth
+    materially less than its card count suggests. mixing the two scales let a retry go BACKWARDS --
+    2x80 raw-counts as 160 GB against a 141 GB card that just OOM'd, but the same pair is modelled as
+    130.4 GB usable, so the "larger" retry is smaller than the shape that already failed and burns a
+    paid attempt to reach the same OOM.
+    """
+    from flash.providers.base import combined_vram_gb
+    from flash.runner.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+
+    single_h200 = _shape("H200", 141, 1)
+    pair_h100 = _shape("H100x2", 80, 2)
+    assert combined_vram_gb(80, 2) < 141  # the premise: the pair is the smaller shape
+
+    floor = _candidate_usable_vram_gb(single_h200)
+    assert pair_h100 not in _oom_escalated([pair_h100], floor)
+
+    # and the floor is recorded on the same scale: a sharded shape that OOMs must not write a floor
+    # so inflated that genuinely larger single cards get filtered out. 3x40 raw-counts as 120 GB,
+    # which would wrongly exclude a 96 GB card that the fit model rates higher (89.6 GB usable).
+    triple_40 = _shape("L40Sx3", 40, 3)
+    single_96 = _shape("Pro6000", 96, 1)
+    assert single_96 in _oom_escalated([single_96], _candidate_usable_vram_gb(triple_40))
+
+
 def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
     from flash.providers.runpod.jobs import surfaced_worker_flags
 
