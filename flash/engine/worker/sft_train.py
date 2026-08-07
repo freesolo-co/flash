@@ -1221,6 +1221,11 @@ def run_sft_train(spec=None) -> None:
     # consecutive steps seen with grad_norm == 0.0 at a nonzero lr. one step can legitimately be
     # zero (a fully-masked micro-batch), so require a short run of them before failing.
     zero_grad_steps: list[int] = []
+    # every grad_norm this session observed, so a horizon too short to trip the consecutive-run
+    # guard above can still be rejected at the end. a one-update run appends exactly one zero and
+    # never reaches _MAX_ZERO_GRAD_STEPS, which shipped the GRAD-001 failure the guard exists to
+    # stop: done, billed, and an adapter identical to the base weights.
+    observed_grad_norms: list[float] = []
     loss_curve: list[float] = []
     train_tokens = (
         sft_tokens_for_updates(
@@ -1263,6 +1268,7 @@ def run_sft_train(spec=None) -> None:
             progress["loss"] = loss
         if grad_norm is not None:
             progress["grad_norm"] = grad_norm
+            observed_grad_norms.append(grad_norm)
             # a grad norm of exactly 0.0 means the backward pass produced nothing for every
             # trainable parameter. that is never legitimate: it is a broken graph, not a small
             # update. GRAD-001 shipped four runs that reported done and billed while training
@@ -1346,6 +1352,18 @@ def run_sft_train(spec=None) -> None:
     if sft_under_ran(final_step, update_horizon, max_steps):
         raise RuntimeError(
             f"sft completed {final_step}/{update_horizon} requested optimizer updates"
+        )
+    # the consecutive-run guard in on_line needs _MAX_ZERO_GRAD_STEPS steps to fire, so a horizon
+    # shorter than that (one update is ordinary when the retained rows fit a single batch) could
+    # report done having trained nothing. an isolated zero inside a longer run stays tolerated --
+    # this only rejects a session in which EVERY observed update had a dead gradient. a resumed run
+    # abstains: its restored weights carry earlier updates this session never saw, which is the same
+    # abstention _check_grpo_had_a_gradient makes.
+    if not resume_step and observed_grad_norms and not any(observed_grad_norms):
+        raise RuntimeError(
+            f"verl reported train/grad_norm=0.0 on every one of {len(observed_grad_norms)} "
+            "observed optimizer updates: no gradient is reaching the lora parameters, so this "
+            "run would train nothing. see GRAD-001"
         )
     train_tokens = sft_tokens_for_updates(
         rows,

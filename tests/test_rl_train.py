@@ -6476,3 +6476,76 @@ def test_the_rl_trainer_stores_the_frozen_base_in_bf16():
     # would free nothing. this asserts the absence so a future reader has to re-derive the above
     # rather than pattern-match it back in.
     assert not [o for o in overrides if "ref.fsdp_config.model_dtype" in o]
+
+
+def test_grpo_builds_its_verl_child_env_from_the_allowlist():
+    """Regression (codex[bot], rl_train.py): the grpo driver built the child env with
+    `dict(os.environ)`, so the platform HF_TOKEN, the GITHUB_TOKEN and every user-declared
+    environment secret reached the verl subprocess -- and verl fans that env out to each ray actor.
+    scoring never happens there: it stays in this process behind the localhost reward bridge, so the
+    child needs runtime settings and the bridge url, not credentials. sft and opd already build
+    theirs through the shared allowlist.
+
+    asserted on the source rather than by running the driver because reaching that line needs a gpu,
+    a prefetched checkpoint and a live verl install.
+    """
+    source = inspect.getsource(rl_train.run_rl_train)
+    assert "env_for_verl = _build_verl_child_env(" in source
+    assert "env_for_verl = dict(os.environ)" not in source, (
+        "grpo must not copy the whole parent environment into the verl child"
+    )
+
+
+def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(tmp_path):
+    """The grpo child still needs the FLA_ kernel backend the parent picked (on sm100 FLA_TILELANG=0
+    is a correctness floor, not a preference), so the allowlist must carry it while excluding the
+    credentials. This pins both halves of that split for the path grpo now shares with sft/opd."""
+    from flash.engine.worker.sft_train import _build_verl_child_env
+
+    keep = {"FLA_TILELANG": "0", "CUDA_VISIBLE_DEVICES": "0", "HF_HOME": "/cache/hf"}
+    drop = {"HF_TOKEN": "hub-secret", "GITHUB_TOKEN": "gh-secret", "RUNPOD_API_KEY": "prov-secret"}
+    saved = {k: os.environ.get(k) for k in (*keep, *drop)}
+    try:
+        os.environ.update(keep)
+        os.environ.update(drop)
+        child = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    for key, value in keep.items():
+        assert child[key] == value
+    for key in drop:
+        assert key not in child
+
+
+def test_grpo_finalization_carries_the_completed_step():
+    """Regression (codex[bot], rl_train.py): write_train_meta emits `<phase>_train_done` and then the
+    terminal `done`. Called without `step`, both land stepless and overwrite the stepped `rl_trained`
+    heartbeat above them, and actual_steps_run() deliberately returns 0 for a non-training stage with
+    no step -- so a cancel arriving between finalization and DONE reprices a fully trained run at
+    zero steps and bills $0. The sft and opd finalizers already pass their final step; grpo was the
+    only one that did not.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "write_train_meta"
+    ]
+    assert len(calls) == 1, "expected exactly one grpo finalization call"
+    keywords = {kw.arg: kw.value for kw in calls[0].keywords}
+    assert "step" in keywords, "grpo finalization must pass the completed step"
+    step_arg = keywords["step"]
+    assert isinstance(step_arg, ast.Name)
+    assert step_arg.id == "steps_run"
+
+    # finalize only forwards a positive int, so a stepless spelling would silently no-op.
+    from flash.engine.worker import finalize
+
+    forwarding = inspect.getsource(finalize.write_train_meta)
+    assert '"step": int(step)' in forwarding
