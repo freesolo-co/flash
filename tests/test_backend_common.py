@@ -732,6 +732,65 @@ def test_an_unconvincing_child_leaves_every_capability_fail_closed(monkeypatch, 
     assert vc.verl_device_capability(caps) is None
 
 
+def test_a_slow_gdn_smoke_cannot_retract_the_answers_already_flushed(monkeypatch):
+    # the regression the batching introduced: five subprocesses each had their own timeout, so a
+    # wedged gdn smoke could not touch the cheap answers. one shared child re-couples them unless
+    # answers are flushed incrementally AND the parent keeps what a killed child already sent.
+    # losing rollout_fields here is not a soft degrade -- grpo raises on it and the paid run dies.
+    early = "".join(
+        "FLASH_VERL_CAPS=" + json.dumps({k: v}) + "\n"
+        for k, v in (
+            ("rollout_fields", ["mask_truncated_completions"]),
+            ("capability", [9, 0]),
+            ("flashinfer", True),
+            ("wandb", True),
+        )
+    )
+
+    def _timeout(*a, **k):
+        # the gdn question never answered: the child was killed inside the live cuda kernel.
+        raise vc.subprocess.TimeoutExpired(cmd="python", timeout=1, output=early, stderr="")
+
+    monkeypatch.setattr(vc.subprocess, "run", _timeout)
+    caps = vc.probe_verl_capabilities("/verl/bin/python", "m.o.d")
+
+    assert vc.verl_declares_rollout_field(caps, "mask_truncated_completions") is True
+    assert vc.verl_device_capability(caps) == (9, 0)
+    assert caps["flashinfer"] is True
+    assert caps["wandb"] is True
+    # only the unreached question fails closed, and it fails to the safe answer: train padded.
+    assert caps["gdn_boundary_resets"] is None
+    assert vc.gdn_reset_arch_from_caps(caps, "m.o.d") is None
+
+
+def test_a_timed_out_child_that_answered_nothing_still_fails_every_capability_closed(monkeypatch):
+    # keeping partial answers must not weaken the total-failure path: a child killed before it
+    # flushed anything is indistinguishable from a dead one and must fail closed everywhere.
+    def _timeout(*a, **k):
+        raise vc.subprocess.TimeoutExpired(cmd="python", timeout=1, output="", stderr="")
+
+    monkeypatch.setattr(vc.subprocess, "run", _timeout)
+    assert vc.probe_verl_capabilities("/verl/bin/python", "m.o.d") == vc._CAPABILITIES_UNAVAILABLE
+
+
+def test_the_probe_budget_covers_the_union_of_the_probes_it_replaced():
+    # the batched child does serially what five children did in parallel processes, so its budget is
+    # the SUM of theirs. the gdn smoke used to get a full 600s with no torch/verl import ahead of
+    # it; a 600s shared bound would hand it strictly less wall-clock than before on a cold cache.
+    assert vc._CAPABILITY_PROBE_TIMEOUT_S == 300 + 600 + 120 + 120 + 120
+
+
+def test_the_gdn_answer_is_flushed_after_the_cheap_ones():
+    # ordering is the contract that makes incremental flushing worth anything: if the expensive
+    # question ran first, a timeout inside it would still take every cheap answer with it.
+    probe = vc._CAPABILITY_PROBE % {"gdn_module": "transformers.models.qwen3_5.modeling_qwen3_5"}
+    gdn_at = probe.index('emit("gdn_boundary_resets"')
+    for key in ("rollout_fields", "capability", "flashinfer", "wandb"):
+        assert probe.index(f'emit("{key}"') < gdn_at, (
+            f"{key} must be flushed before the gdn smoke, which is the question that can hang"
+        )
+
+
 def test_a_child_that_omits_a_key_leaves_it_fail_closed(monkeypatch):
     # a child from a different flash build can answer a subset. the missing key must keep its
     # fail-closed default rather than vanishing from the dict and turning every caller's
@@ -962,10 +1021,15 @@ def _probe_interpreter(tmp_path, name, body):
 
 
 def _caps_blob(**answers):
-    """a shell body printing the capability blob a child with `answers` would emit."""
+    """a shell body printing the capability lines a child with `answers` would emit.
+
+    one line per question, like the real probe: it flushes each answer as it is known so a kill
+    partway through cannot retract the ones already sent.
+    """
     payload = dict(vc._CAPABILITIES_UNAVAILABLE)
     payload.update(answers)
-    return "cat <<'EOF'\nFLASH_VERL_CAPS=" + json.dumps(payload) + "\nEOF"
+    lines = "\n".join("FLASH_VERL_CAPS=" + json.dumps({k: v}) for k, v in payload.items())
+    return "cat <<'EOF'\n" + lines + "\nEOF"
 
 
 def test_verl_declares_rollout_field_true_when_field_declared(tmp_path):

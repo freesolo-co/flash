@@ -349,45 +349,56 @@ def ray_num_cpus(gpu_count: int = 1, *, cap: int = 16) -> int:
 # fail-closed answer the individual probe returned, so one unavailable capability cannot suppress
 # the others. a child that dies outright leaves every answer at its fail-closed default, exactly as
 # five dead subprocesses would have.
+#
+# each answer is FLUSHED THE MOMENT IT IS KNOWN, one line per question, and the parent merges the
+# lines it received. five separate subprocesses each had their own timeout, so a slow gdn smoke
+# could not cost the cheap answers; one shared child would re-couple them if it printed a single
+# blob at the end -- a kill during the last question would take every earlier answer with it, and
+# the empty rollout_fields that leaves behind aborts grpo outright. answering incrementally keeps
+# the cheap questions safe from the expensive one. ORDER IS THE CONTRACT: cheap and fast first, the
+# gdn smoke (transformers import + a live cuda kernel) last.
 _CAPABILITY_PROBE = """
 import json
 
-out = {}
+
+def emit(key, value):
+    print("FLASH_VERL_CAPS=" + json.dumps({key: value}), flush=True)
+
 
 try:
     from verl.workers.config.rollout import RolloutConfig
 
-    out["rollout_fields"] = sorted(RolloutConfig.__dataclass_fields__)
+    emit("rollout_fields", sorted(RolloutConfig.__dataclass_fields__))
 except Exception:
-    out["rollout_fields"] = None
+    emit("rollout_fields", None)
 
 try:
     import torch
 
-    out["capability"] = (
-        list(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else None
+    emit(
+        "capability",
+        list(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else None,
     )
 except Exception:
-    out["capability"] = None
+    emit("capability", None)
 
 try:
     import flashinfer  # noqa: F401
 
-    out["flashinfer"] = True
+    emit("flashinfer", True)
 except Exception:
-    out["flashinfer"] = False
+    emit("flashinfer", False)
 
 try:
     import wandb  # noqa: F401
 
-    out["wandb"] = True
+    emit("wandb", True)
 except Exception:
-    out["wandb"] = False
+    emit("wandb", False)
 
 # gdn is asked only when the parent resolved a model_type to ask about (a gdn hybrid). the module
 # name is a parent-resolved literal: it comes from the checkpoint config, which needs a hub/cache
 # read the child must not repeat.
-out["gdn_boundary_resets"] = None
 if %(gdn_module)r:
     try:
         import importlib
@@ -427,11 +438,9 @@ if %(gdn_module)r:
                     torch.zeros(4, 3, device="cuda", dtype=torch.bfloat16),
                 )
                 torch.cuda.synchronize()
-        out["gdn_boundary_resets"] = bool(ok)
+        emit("gdn_boundary_resets", bool(ok))
     except Exception:
-        out["gdn_boundary_resets"] = False
-
-print("FLASH_VERL_CAPS=" + json.dumps(out), flush=True)
+        emit("gdn_boundary_resets", False)
 """
 
 # every answer's fail-closed default, used when the child dies, times out, or prints nothing
@@ -446,10 +455,14 @@ _CAPABILITIES_UNAVAILABLE: dict = {
     "gdn_boundary_resets": None,
 }
 
-# the child pays one torch/verl import (tens of seconds cold) and may run a live CUDA kernel for the
-# gdn smoke. the old per-probe timeouts were 300s (rollout field) and 600s (gdn); keep the larger,
-# since this child does the union of that work in one process.
-_CAPABILITY_PROBE_TIMEOUT_S = 600
+# this child does in ONE process what five did serially, so its budget is the UNION of theirs, not
+# the largest of them. the old per-probe timeouts were 300 (rollout field) + 600 (gdn) + 120
+# (capability) + 120 (flashinfer) + 120 (wandb); each paid its own cold torch/verl import, and the
+# gdn probe got its full 600s without one of those imports in front of it. keeping 600 here would
+# hand the gdn smoke strictly LESS wall-clock than it used to have, on a cold cache, on the run
+# where it matters most. the sum is the honest bound, and it is only ever reached by a child that
+# is genuinely wedged: the timeout is a backstop, not the expected duration.
+_CAPABILITY_PROBE_TIMEOUT_S = 300 + 600 + 120 + 120 + 120
 
 
 def probe_verl_capabilities(python_bin: str, gdn_module: str = "") -> dict:
@@ -465,10 +478,12 @@ def probe_verl_capabilities(python_bin: str, gdn_module: str = "") -> dict:
 
     the returned dict always has every key. an unanswerable question holds its fail-closed default
     (see ``_CAPABILITIES_UNAVAILABLE``) rather than being absent, so callers read a value rather
-    than testing for membership.
+    than testing for membership. a child killed partway through keeps the answers it already
+    flushed: it is the questions it never reached that fail closed, not all of them.
     """
     probe = _CAPABILITY_PROBE % {"gdn_module": gdn_module}
     caps = dict(_CAPABILITIES_UNAVAILABLE)
+    timed_out = False
     try:
         done = subprocess.run(
             [python_bin, "-c", probe],
@@ -476,24 +491,47 @@ def probe_verl_capabilities(python_bin: str, gdn_module: str = "") -> dict:
             text=True,
             timeout=_CAPABILITY_PROBE_TIMEOUT_S,
         )
+        stdout, stderr, returncode = done.stdout, done.stderr, done.returncode
+    except subprocess.TimeoutExpired as e:
+        # the killed child still flushed every answer it reached, and TimeoutExpired carries that
+        # output. a slow gdn smoke must not retract the cheap answers that already landed -- an
+        # empty rollout_fields aborts grpo, which is a worse outcome than training padded.
+        timed_out = True
+        stdout = (
+            e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        )
+        stderr = (
+            e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        )
+        returncode = None
+        print(
+            f"[verl] capability probe timed out after {_CAPABILITY_PROBE_TIMEOUT_S}s; "
+            "keeping the answers it flushed, failing the rest closed"
+        )
     except (OSError, subprocess.SubprocessError) as e:
         print(f"[verl] capability probe failed ({e}); treating every capability as unavailable")
         return caps
-    for line in (done.stdout or "").splitlines():
-        if line.startswith("FLASH_VERL_CAPS="):
-            with contextlib.suppress(Exception):
-                answered = json.loads(line.split("=", 1)[1])
-                if isinstance(answered, dict):
-                    # merge rather than replace: a child from a future/older flash that omits a key
-                    # must leave that key at its fail-closed default, not drop it from the dict.
-                    caps.update({k: v for k, v in answered.items() if k in caps})
-            return caps
-    print(
-        "[verl] capability probe returned no readable answer "
-        f"(exit {done.returncode}); treating every capability as unavailable"
-    )
-    if done.stderr:
-        print(f"[verl] capability probe stderr: {done.stderr.strip()[:800]}")
+    answered_any = False
+    for line in (stdout or "").splitlines():
+        if not line.startswith("FLASH_VERL_CAPS="):
+            continue
+        with contextlib.suppress(Exception):
+            answered = json.loads(line.split("=", 1)[1])
+            if isinstance(answered, dict):
+                # merge rather than replace: a child from a future/older flash that answers a key
+                # this build does not know must not add it, and one it never reached must keep its
+                # fail-closed default rather than vanishing from the dict.
+                caps.update({k: v for k, v in answered.items() if k in caps})
+                answered_any = True
+    if answered_any:
+        return caps
+    if not timed_out:
+        print(
+            "[verl] capability probe returned no readable answer "
+            f"(exit {returncode}); treating every capability as unavailable"
+        )
+    if stderr:
+        print(f"[verl] capability probe stderr: {stderr.strip()[:800]}")
     return caps
 
 
