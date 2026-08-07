@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
-from flash.engine.worker.rollout_samples import build_rollout_sample, select_rollout_samples
+from flash.engine.rollout_samples import build_rollout_sample, select_rollout_samples
 from flash.providers._poll import _format_heartbeat
 
 
@@ -401,3 +404,32 @@ def test_format_heartbeat_defensively_neutralizes_control_characters() -> None:
     assert "\r" not in rendered
     assert "\x1b" not in rendered
     assert "\t" not in rendered
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["flash.providers._poll", "flash.runner", "flash.cli.commands"],
+)
+def test_control_plane_modules_import_without_running_worker_init(module: str) -> None:
+    """The control plane must not execute worker startup just by being imported.
+
+    ``flash.engine.worker.__init__`` parses ``ATTEMPT`` at module scope and RAISES on a malformed
+    value, which is correct inside a managed worker and wrong everywhere else: the CLI and the
+    provider pollers run in processes that never set it. Importing any submodule of that package
+    runs the package ``__init__`` on the way in, so a single ``from flash.engine.worker.x import y``
+    in shared code is enough to make every one of these modules fail to import.
+
+    A malformed ``ATTEMPT`` is the cheapest way to arm that: it turns an invisible side effect into
+    a loud one. The subprocess is the point -- an in-process import would find the module already in
+    ``sys.modules`` from collection and prove nothing.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        env={**os.environ, "ATTEMPT": "not-a-number"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, (
+        f"importing {module} ran worker init: {result.stderr.strip().splitlines()[-1:]}"
+    )
