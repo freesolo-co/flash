@@ -1558,6 +1558,23 @@ def prepare_job(
         # allocation would have accepted.
         gpu_count=preflight_gpu_count,
     )
+    if spec.algorithm == "opd" and spec.train.structured_outputs:
+        # the generic serving preflight above validates the schema's SHAPE, but the constraint can
+        # still be one verl OPD deterministically refuses: a guidance-only json feature (format,
+        # multipleOf, uniqueItems) or a vllm MistralTokenizer model. that check lived only on the
+        # worker, so the user rented a gpu to receive a permanent validation failure (codex[bot]).
+        #
+        # only the allocation-independent half runs here. the vocab-size comparison needs the
+        # ALLOCATED card count -- judging a shardable run on one card would reject a shape the
+        # allocator would have placed -- so it stays on the worker, which also keeps that check as
+        # defense in depth for any path that reaches training without passing through here.
+        from flash.opd_validation import preflight_opd_structured_outputs
+
+        preflight_opd_structured_outputs(
+            spec.train.structured_outputs,
+            model_id=spec.model,
+            model_revision=spec.model_revision,
+        )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     spec = _assign_managed_hf_repo(spec)
