@@ -764,6 +764,14 @@ def grpo_fits_resident(
 # check the fit never saw: it predicts 54.4 GB at seq 4096 -> must OOM, and the card OOMed at
 # 30.97 GB. The old shared 18.0 predicted 20.76 GB there, i.e. it would have called that run a FIT.
 #
+# SCOPE of that measurement: fit on ONE dense geometry (1024 hidden x 24 layers) and assumed
+# invariant across dense sizes, which is what K being a per-layer-relative-to-hidden factor asserts.
+# 130 bytes per (token, hidden-unit, layer) is ~3.8x the fused-Megatron figure, which is the expected
+# direction for all-linear LoRA on HF -- every wrapped linear retains its input for the adapter
+# backward, on top of HF's unfused per-block intermediates -- but the SIZE-invariance is untested.
+# Anyone loosening the >= 120 GB card gate should re-measure at the geometry they are enabling rather
+# than trust this extrapolation; at 27B it implies ~410 GB at seq 2048, far outside what was observed.
+#
 # MOE: 18.0 is UNVALIDATED against a live peak -- it is the pre-existing value, kept deliberately.
 # It sits just above the Megatron FlashAttention factor (~34 bytes/(s.b.h) == K 17) so we over-reserve
 # and keep GC ON rather than risk an OOM. The dense 65.0 must NOT be applied here: it would flip the
