@@ -78,6 +78,25 @@ class DeploymentStatePersistenceError(RuntimeError):
         self.retryable = True
 
 
+def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
+    """Carry the allocation stamp from a persisted remote onto adopted metrics.
+
+    `_completed_attempt_metrics` returns the worker's own metrics.json verbatim, and the worker
+    does not know which card or how many of them the allocator picked -- the plane stamps that at
+    launch. Without this, a multi-card vast/lambda run recovered after a control-plane restart is
+    priced as ONE card, because `_persist_metrics` reads the count from the metrics it is handed.
+    `setdefault`, so a stamp the worker somehow did carry always wins over the persisted copy.
+    """
+    if not isinstance(metrics, dict) or not isinstance(remote, dict):
+        return
+    allocated_gpu = remote.get("allocated_gpu")
+    if allocated_gpu:
+        metrics.setdefault("allocated_gpu", allocated_gpu)
+    allocated_count = remote.get("allocated_gpu_count")
+    if allocated_count:
+        metrics.setdefault("allocated_gpu_count", int(allocated_count))
+
+
 def _deployment_state_and_requires_revocation(
     deployment: object,
 ) -> tuple[str | None, bool]:
@@ -873,6 +892,7 @@ def _reconcile_attached_remote(
                 time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
                 continue
             if metrics is not None:
+                _carry_allocation_stamp(metrics, expected_remote)
                 try:
                     cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
                     adopted = cleanup_preserved and _adopt_completed_attempt(
@@ -1131,6 +1151,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                     log=log,
                 )
             if metrics is not None:
+                _carry_allocation_stamp(metrics, persisted_remote)
                 try:
                     adopted = _adopt_completed_attempt(
                         run_id,
