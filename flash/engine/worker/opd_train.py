@@ -1252,6 +1252,81 @@ class _TeacherAlignmentBridge:
                 self._mutation_callback_succeeded = True
             self._mutation_notified = True
 
+    def _routes(self, recovered: list[tuple[str, str]]) -> dict:
+        """The bridge's routing table: path -> handler taking the decoded payload.
+
+        Built per request so ``/score`` can hand its recovered-failure list to the scorer, and built
+        from ``self`` attributes at call time so a test that swaps a bound method on the instance is
+        the method this dispatches to.
+        """
+
+        def score(payload: dict) -> dict:
+            return self.score(
+                payload["index"],
+                payload["prompt_length"],
+                payload["sequence_ids"],
+                payload.get("image_count", 0),
+                payload.get("forced"),
+                recovered_failure=recovered,
+            )
+
+        def mutation(_payload: dict) -> dict:
+            self.notify_mutation()
+            return {"ok": True}
+
+        return {
+            "/score": score,
+            "/multiturn/start": lambda payload: self.start_multiturn(
+                index=payload["index"],
+                session_id=payload["session_id"],
+                prompt_ids=payload["prompt_ids"],
+                raw_prompt=payload["raw_prompt"],
+            ),
+            "/multiturn/step": self.step_multiturn,
+            "/multiturn/score": lambda payload: self.score_multiturn(payload["session_id"]),
+            "/multiturn/close": lambda payload: self.close_multiturn(payload["session_id"]),
+            "/no-signal/resample": lambda _payload: self.record_no_signal_resample(),
+            "/no-signal/abandoned": lambda _payload: self.record_no_signal_abandoned(),
+            "/teacher-cycle/committed": lambda _payload: self.commit_teacher_cycle(),
+            "/mutation": mutation,
+        }
+
+    def _classify_failure(self, error: BaseException, *, delivery: bool) -> str:
+        """Whether ``error`` should make the child retry (``transient``) or give up (``permanent``)."""
+        if delivery:
+            return "transient"
+        if isinstance(error, _RecordedMutationCallbackFailure):
+            return error.classification
+        retriable = isinstance(error, _w.RetriableInfraError) or (
+            isinstance(error, TeacherError) and not error.permanent
+        )
+        return "transient" if retriable else "permanent"
+
+    def _record_route_failure(
+        self,
+        path: str,
+        error: BaseException,
+        classification: str,
+        *,
+        delivery: bool,
+        recovered: tuple[str, str] | None,
+    ) -> None:
+        """Attribute a failed request to the teacher when the route speaks for the teacher.
+
+        A recovered failure always wins: the scorer already knows which upstream call went wrong, so
+        promoting it keeps the run's diagnosis pointed at the original fault rather than the delivery
+        error that surfaced it.
+        """
+        if delivery or path == "/score":
+            if recovered is not None:
+                self._promote_recovered_teacher_failure(recovered)
+            elif delivery:
+                self._record_teacher_delivery_failure(error)
+            else:
+                self._record_teacher_failure(classification, str(error))
+        elif path == "/multiturn/score":
+            self._record_teacher_failure(classification, str(error), terminal=True)
+
     def start(self) -> None:
         bridge = self
 
@@ -1268,84 +1343,35 @@ class _TeacherAlignmentBridge:
                 self.wfile.write(encoded)
 
             def do_POST(self):
-                recovered_teacher_failure = None
+                recovered_failures: list[tuple[str, str]] = []
                 request_succeeded = False
                 try:
                     if self.headers.get("Authorization") != f"Bearer {bridge.token}":
                         raise PermissionError("flash OPD bridge authorization failed")
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                    if self.path == "/score":
-                        recovered_failures: list[tuple[str, str]] = []
-                        result = bridge.score(
-                            payload["index"],
-                            payload["prompt_length"],
-                            payload["sequence_ids"],
-                            payload.get("image_count", 0),
-                            payload.get("forced"),
-                            recovered_failure=recovered_failures,
-                        )
-                        if recovered_failures:
-                            recovered_teacher_failure = recovered_failures[0]
-                    elif self.path == "/multiturn/start":
-                        result = bridge.start_multiturn(
-                            index=payload["index"],
-                            session_id=payload["session_id"],
-                            prompt_ids=payload["prompt_ids"],
-                            raw_prompt=payload["raw_prompt"],
-                        )
-                    elif self.path == "/multiturn/step":
-                        result = bridge.step_multiturn(payload)
-                    elif self.path == "/multiturn/score":
-                        result = bridge.score_multiturn(payload["session_id"])
-                    elif self.path == "/multiturn/close":
-                        result = bridge.close_multiturn(payload["session_id"])
-                    elif self.path == "/no-signal/resample":
-                        result = bridge.record_no_signal_resample()
-                    elif self.path == "/no-signal/abandoned":
-                        result = bridge.record_no_signal_abandoned()
-                    elif self.path == "/teacher-cycle/committed":
-                        result = bridge.commit_teacher_cycle()
-                    elif self.path == "/mutation":
-                        bridge.notify_mutation()
-                        result = {"ok": True}
-                    else:
+                    route = bridge._routes(recovered_failures).get(self.path)
+                    if route is None:
                         raise ValueError("flash OPD bridge path is unknown")
+                    result = route(payload)
                     request_succeeded = True
                     self._send_json(200, result)
                 except Exception as error:
-                    teacher_delivery_failure = (
+                    # only a route that already answered can be failing on DELIVERY; before that, an
+                    # OSError is the teacher call itself.
+                    delivery = (
                         request_succeeded
                         and self.path in {"/score", "/multiturn/score"}
                         and isinstance(error, (OSError, http.client.HTTPException))
                     )
-                    if teacher_delivery_failure:
-                        classification = "transient"
-                    elif isinstance(error, _RecordedMutationCallbackFailure):
-                        classification = error.classification
-                    else:
-                        classification = (
-                            "transient"
-                            if isinstance(error, _w.RetriableInfraError)
-                            or (isinstance(error, TeacherError) and not error.permanent)
-                            else "permanent"
-                        )
-                    if teacher_delivery_failure:
-                        if recovered_teacher_failure is not None:
-                            bridge._promote_recovered_teacher_failure(recovered_teacher_failure)
-                        else:
-                            bridge._record_teacher_delivery_failure(error)
-                    elif self.path == "/score":
-                        if recovered_teacher_failure is not None:
-                            bridge._promote_recovered_teacher_failure(recovered_teacher_failure)
-                        else:
-                            bridge._record_teacher_failure(classification, str(error))
-                    elif self.path == "/multiturn/score":
-                        bridge._record_teacher_failure(
-                            classification,
-                            str(error),
-                            terminal=True,
-                        )
+                    classification = bridge._classify_failure(error, delivery=delivery)
+                    bridge._record_route_failure(
+                        self.path,
+                        error,
+                        classification,
+                        delivery=delivery,
+                        recovered=recovered_failures[0] if recovered_failures else None,
+                    )
                     self._send_json(
                         503 if classification == "transient" else 422,
                         {

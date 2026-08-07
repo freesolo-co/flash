@@ -21,7 +21,7 @@ try:
 except ImportError:
     fcntl = None
 
-from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
+from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES, attempt_scoped_artifact_name
 from flash.diagnostics import sanitize_diagnostic
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
@@ -30,25 +30,15 @@ from flash.opd_retry_contract import (
     opd_optimizer_start_marker_path,
 )
 
-_MAX_ATTEMPT_ID = (1 << 63) - 1
-
 
 class RequiredSaveError(RuntimeError):
     """permanent exact-save contract failure."""
 
 
-def _attempt_scoped_name(kind: str, mode: str, attempt: int) -> str:
-    if isinstance(attempt, bool) or not isinstance(attempt, int):
-        raise ValueError("attempt must be a nonnegative integer")
-    if attempt < 0 or attempt > _MAX_ATTEMPT_ID:
-        raise ValueError("attempt must be a bounded nonnegative integer")
-    return f"{kind}_{mode}_attempt{attempt}.txt"
-
-
 def error_artifact_name(mode: str, attempt: int = 0) -> str:
     """Per-mode, per-attempt error filename (e.g. error_sft_attempt0.txt). Attempt-scoped so a prior
     attempt's stale traceback can't be mistaken for the current attempt's crash on a retry host-loss."""
-    return _attempt_scoped_name("error", mode, attempt)
+    return attempt_scoped_artifact_name("error", mode, attempt)
 
 
 def ray_log_artifact_name(mode: str, attempt: int = 0) -> str:
@@ -57,7 +47,7 @@ def ray_log_artifact_name(mode: str, attempt: int = 0) -> str:
     Attempt-scoped for the same reason the traceback beside it is: ``hf_prefix()`` is per-RUN, not
     per-attempt, so an unscoped name would let a retry's ray logs overwrite the attempt that actually
     reproduced the raylet failure -- the one case this artifact exists to explain."""
-    return _attempt_scoped_name("raylogs", mode, attempt)
+    return attempt_scoped_artifact_name("raylogs", mode, attempt)
 
 
 def hf_api():

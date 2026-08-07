@@ -516,13 +516,6 @@ def _decode_image_bytes(data: bytes):
         raise ValueError("image source is not a valid image") from exc
 
 
-def decode_image_descriptor(descriptor: str, package_root: str | Path | None):
-    """Decode and validate one descriptor at batch access time."""
-    data = _read_descriptor_source(descriptor, package_root)
-    decoded_bytes = _inspect_image_bytes(data)
-    return _decode_image_bytes(data), len(data), decoded_bytes
-
-
 def decode_image_descriptors(
     descriptors: list[str], package_root: str | Path | None
 ) -> list[object]:
@@ -590,20 +583,34 @@ def validate_multimodal_training(model_id: str, algorithm: str) -> None:
         raise ValueError("image-bearing opd is not supported")
 
 
+def message_content_text(content: object) -> str:
+    """The text of one message's ``content``: the string itself, or its openai-style text blocks.
+
+    Any other shape (null tool-call content, image-only blocks) yields ``""``. This is the single
+    definition of "what the text of a message is" -- graders, replay, and reward all read a
+    completion through it, so an image-only or tool-call turn cannot mean one thing in one path and
+    something else in another."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
 def assistant_completion_text(completion: object) -> str:
     if not isinstance(completion, list):
         return str(completion or "")
     for message in reversed(completion):
         if isinstance(message, dict) and message.get("role") == "assistant":
             content = message.get("content", "")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                return "".join(
-                    str(block.get("text") or "")
-                    for block in content
-                    if isinstance(block, dict) and block.get("type") == "text"
-                )
+            # a content shape with no text at all (null tool-call content) keeps scanning earlier
+            # assistant turns rather than resolving to "" here.
+            if isinstance(content, (str, list)):
+                return message_content_text(content)
     return ""
 
 
