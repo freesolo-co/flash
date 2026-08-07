@@ -125,9 +125,30 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
             "by the returned environment id",
         )
     try:
-        return spec_from_dict(spec_raw, run_id=run_id, project_required=True)
+        spec = spec_from_dict(spec_raw, run_id=run_id, project_required=True)
     except (ConfigError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _authorize_model_policy(spec)
+    return spec
+
+
+def _authorize_model_policy(spec: JobSpec) -> None:
+    """Reject an open-model run unless THIS plane is self-hosted.
+
+    The parser accepts ``model_policy`` from any caller because it also runs client-side, where
+    ``FLASH_STANDALONE`` is invisible. This is the authorization half, and it runs only on the
+    control plane: a managed run trains curated models on Freesolo's billing, so `allow` -- which
+    accepts any HuggingFace model -- must not be reachable by asking for it in a config.
+    """
+    if spec.model_policy != "allow" or auth.standalone():
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            'model_policy = "allow" is available on self-hosted control planes only. This managed '
+            "plane trains the curated catalog; choose a listed model (`flash models list`)."
+        ),
+    )
 
 
 def _runtime_secrets(payload: dict, spec: JobSpec) -> dict[str, str]:
