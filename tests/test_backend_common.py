@@ -1351,14 +1351,35 @@ def test_run_verl_training_does_not_reclassify_a_zero_exit():
     assert code == 0
 
 
-@pytest.mark.parametrize("message", ["CUDA out of memory", "unrelated child failure"])
-def test_run_verl_training_leaves_other_nonzero_exits_terminal(message):
+def test_run_verl_training_leaves_an_unclassified_nonzero_exit_terminal():
     code = vc.run_verl_training(
-        ["bash", "-c", "printf '%s\\n' \"$TEST_MESSAGE\" >&2; exit 9"],
-        env={**os.environ, "TEST_MESSAGE": message},
+        ["bash", "-c", "printf '%s\\n' 'unrelated child failure' >&2; exit 9"],
+        env=dict(os.environ),
     )
 
     assert code == 9
+
+
+def test_run_verl_training_classifies_a_child_cuda_oom_rather_than_returning_it():
+    """A child's torch OOM must raise classified, not return a bare status.
+
+    this case used to sit in the parametrize above as a foil for `cudaErrorDevicesUnavailable`,
+    asserting `code == 9`. that was only ever true because a torch-allocator OOM went unrecognized:
+    the two signatures `cuda_oom_message_evidence` knew are both vLLM STARTUP shapes, so the one OOM
+    that happens during training fell through to a status-only return and the lifecycle read it as a
+    permanent job_failed instead of retrying on a larger gpu. the distinction the original test was
+    protecting still holds and is asserted here: an OOM is NOT a RetriableInfraError (that class means
+    the card itself is unusable and the retry is a fresh worker), it is a classified RuntimeError
+    carrying the evidence, which is what routes it to a gpu escalation.
+    """
+    with pytest.raises(RuntimeError) as exc_info:
+        vc.run_verl_training(
+            ["bash", "-c", "printf '%s\\n' 'CUDA out of memory' >&2; exit 9"],
+            env=dict(os.environ),
+        )
+
+    assert not isinstance(exc_info.value, RetriableInfraError)
+    assert "cuda out of memory" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("oom_first", [False, True])
@@ -3102,6 +3123,76 @@ def test_both_verl_bridges_use_the_bounded_server():
                     f"{mod.__name__}.{node.name} still subclasses the unbounded "
                     "ThreadingHTTPServer; it will spawn a thread per request"
                 )
+
+
+def _exit_delay_with_pool(pool_expr: str) -> float:
+    """Seconds a fresh interpreter takes to exit while ``pool_expr``'s worker is still running.
+
+    Measured in a SUBPROCESS because the thing under test is interpreter shutdown itself: the
+    stdlib joins pool workers from an exit hook, which cannot be observed from inside a test that
+    is not exiting. The handler sleeps far longer than the measurement, so a delay near the sleep
+    means exit waited for it.
+    """
+    program = textwrap.dedent(f"""
+        import sys, time
+        sys.path.insert(0, {str(pathlib.Path(vc.__file__).parents[3])!r})
+        from flash.engine.worker.backend_common import _DaemonBridgeThreadPool  # noqa: F401
+        from concurrent.futures import ThreadPoolExecutor  # noqa: F401
+
+        pool = {pool_expr}
+        pool.submit(lambda: time.sleep({_EXIT_PROBE_HANDLER_S}))
+        time.sleep(0.3)  # let the handler actually start; a queued future would just be cancelled
+        pool.shutdown(wait=False, cancel_futures=True)
+        sys.exit(0)
+    """)
+    start = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=60
+    )
+    elapsed = time.monotonic() - start
+    assert proc.returncode == 0, f"probe failed: {proc.stderr[-800:]}"
+    return elapsed
+
+
+_EXIT_PROBE_HANDLER_S = 10.0
+
+
+def test_a_hung_bridge_handler_cannot_hold_the_worker_process_open():
+    """A wedged reward/teacher callback must not delay worker exit.
+
+    The bridge moved from a daemon ``ThreadingHTTPServer`` to a pool, and `daemon_threads = True`
+    does not carry over: it is a ThreadingMixIn flag, unread once `process_request` is overridden.
+    A stock ThreadPoolExecutor registers its workers with an interpreter-exit hook that joins them,
+    and `shutdown(wait=False, cancel_futures=True)` does not release an ALREADY-RUNNING handler --
+    so a hung grader could block the worker from publishing its terminal result and releasing a
+    paid GPU.
+
+    The control arm is the point: a stock executor must FAIL this bound, otherwise the assertion
+    would pass just as well on the defect it exists to catch.
+    """
+    control = _exit_delay_with_pool("ThreadPoolExecutor(max_workers=2)")
+    assert control > _EXIT_PROBE_HANDLER_S * 0.5, (
+        f"control exited in {control:.1f}s, so a stock pool did NOT block on its running handler "
+        "here and this test cannot tell the fix from the defect"
+    )
+
+    delay = _exit_delay_with_pool("_DaemonBridgeThreadPool(max_workers=2)")
+    assert delay < _EXIT_PROBE_HANDLER_S * 0.5, (
+        f"exit took {delay:.1f}s with a {_EXIT_PROBE_HANDLER_S}s handler running "
+        f"(control: {control:.1f}s): pool workers still hold the interpreter open"
+    )
+
+
+def test_the_bridge_server_uses_the_daemon_pool():
+    """The pool class is only a fix if the server actually instantiates it.
+
+    The exit-delay test above measures the pool directly, so without this a correct pool wired to
+    nothing would still pass.
+    """
+    source = inspect.getsource(vc.BoundedThreadingHTTPServer.__init__)
+    assert "_DaemonBridgeThreadPool(" in source, (
+        "the bridge server still builds a stock ThreadPoolExecutor"
+    )
 
 
 def _exec_tf32_fragment_against(fake_torch):

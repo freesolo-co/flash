@@ -35,6 +35,53 @@ def test_is_cuda_oom_is_structured(monkeypatch):
     assert lc.is_cuda_oom(MemoryError("host ram: out of memory")) is False
 
 
+def test_a_child_process_oom_is_classified_from_its_output():
+    """A verl child's OOM must reach the lifecycle as an OOM, not a permanent job_failed.
+
+    The parent classifies an in-process OOM from `torch.cuda.OutOfMemoryError` and the allocator
+    counter. Neither crosses a process boundary: the verl child is a separate interpreter, its
+    `num_ooms` is its own, and the terminal raise carries only "subprocess exited with status N".
+    So the child's own output is the only evidence, and without it the one OOM shape that happens
+    DURING training (rather than at vllm startup) is never retried on a larger card.
+    """
+    from flash.engine.worker.backend_common import ChildOutputTail, raise_for_classified_verl_exit
+    from flash.engine.worker.perf.lifecycle import is_cuda_oom
+
+    tail = ChildOutputTail()
+    tail.record(
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB "
+        "(GPU 0; 79.15 GiB total capacity)\n"
+    )
+    assert tail.cuda_oom_evidence is not None, "the child's torch OOM left no evidence on the tail"
+    with pytest.raises(RuntimeError, match="outofmemoryerror") as raised:
+        raise_for_classified_verl_exit(1, tail)
+    # the raised error is what the lifecycle classifies, so the evidence has to survive into it
+    assert is_cuda_oom(raised.value) is True, (
+        "the classified error does not read back as an oom, so the run would not be retried "
+        "on a larger card"
+    )
+
+
+def test_child_output_that_merely_mentions_memory_is_not_an_oom():
+    """The widened matcher must not escalate the GPU for a failure a bigger card cannot fix.
+
+    Pairs with the test above: matching a bare "out of memory" would classify a host-RAM OOM, an
+    environment's own error text, or a Triton message as a CUDA OOM and burn a retry on a larger
+    card for a run that would fail there identically.
+    """
+    from flash.engine.worker.backend_common import ChildOutputTail, raise_for_classified_verl_exit
+
+    for line in (
+        "MemoryError: host ram: out of memory",
+        "Triton Error [CUDA]: out of memory",
+        "ValueError: the grader ran out of memory budget",
+    ):
+        tail = ChildOutputTail()
+        tail.record(line + "\n")
+        assert tail.cuda_oom_evidence is None, f"{line!r} was wrongly read as a cuda oom"
+        raise_for_classified_verl_exit(1, tail)  # must not raise
+
+
 def test_is_cuda_oom_typed_torch_error():
     torch = pytest.importorskip("torch")  # skipped on the torch-less offline CI image
     from flash.engine.worker.perf.lifecycle import is_cuda_oom
