@@ -469,24 +469,30 @@ def sequence_parallel_speedup(gpu_count: int, gpu: str, provider: str = "") -> f
     return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
 
 
-def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str) -> float:
+def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: str = "") -> float:
     """Card-count throughput multiplier for ``config``'s parallelism strategy.
 
     sft shards by sequence, grpo/opd by data; they do not scale the same way and must not share a
     constant. Every caller that divides sft work by a card count goes through here.
 
-    The provider comes off ``config`` rather than a new parameter at every layer: this is the one
-    point where both the card count and the run's provider are already in hand, and it is on the
-    path of every sharded quote.
+    ``provider`` is the substrate the cards will actually be rented on, and it changes the answer:
+    a vast combination has no establishable interconnect, so it must not be credited with nvlink
+    scaling. It is a parameter rather than only a ``config`` field because the two paths that
+    matter -- allocator ranking and the re-quote from a live allocation -- both build the config
+    WITHOUT a provider and learn the real one only from the candidate they are pricing. Reading it
+    off ``config`` alone left `auto` there and silently kept the nvlink curve (Cursor Bugbot).
+    ``config.provider`` remains the fallback for a run that pinned one explicitly.
     """
     n = config.normalized()
-    provider = n.provider if n.provider != "auto" else ""
+    resolved = (provider or "").strip().lower()
+    if not resolved:
+        resolved = n.provider if n.provider != "auto" else ""
     if n.method == "sft":
-        return sequence_parallel_speedup(gpu_count, gpu, provider)
-    return multi_card_speedup(gpu_count, gpu, provider)
+        return sequence_parallel_speedup(gpu_count, gpu, resolved)
+    return multi_card_speedup(gpu_count, gpu, resolved)
 
 
-def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int) -> float:
+def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int, provider: str = "") -> float:
     """Wall seconds for one optimizer step on ``gpu_count`` cards of class ``gpu``.
 
     The single source of the card-count math. ``step_seconds_split`` gives the single-card halves;
@@ -498,9 +504,12 @@ def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int) -> float:
     The multiplier itself comes from :func:`method_card_speedup`, because sft shards by sequence and
     grpo/opd by data. The floor split above is grpo/opd-only in practice -- an sft step runs no
     rollout, so its floor is 0 and its whole gpu-bound half shards.
+
+    ``provider`` is passed through to that multiplier: the caller ranking candidates knows which
+    substrate each one is on, and the interconnect credit depends on it.
     """
     gpu_bound, fixed = step_seconds_split(config, gpu)
-    speedup = method_card_speedup(config, gpu_count, gpu)
+    speedup = method_card_speedup(config, gpu_count, gpu, provider)
     floor_s = _step_floor_seconds_for(config, gpu)
     # the floor is inside gpu_bound; split it so only the phases that actually shard get divided.
     shardable = gpu_bound - floor_s * (1.0 - STEP_FLOOR_SHARDED_FRACTION)
@@ -709,7 +718,12 @@ def _offline_gpu_shape(
                 hourly = static_hourly_rate(gpu)
             else:
                 hourly = info.hourly_usd
-            step_seconds = sharded_step_seconds(config, gpu, count)
+            # `provider` is "auto" here only when the pool being ranked IS the runpod pool (see the
+            # name selection above), so an empty provider never reaches the multiplier as a
+            # substrate whose interconnect is unknown.
+            step_seconds = sharded_step_seconds(
+                config, gpu, count, "" if provider == "auto" else provider
+            )
             ranked.append(
                 (
                     hourly * count * step_seconds,
@@ -954,9 +968,12 @@ def estimate_cost(
         )
 
     setup = setup_seconds(config)
-    # sft shards by sequence and grpo/opd by data, so the multiplier is method-specific.
-    speedup = method_card_speedup(config, billed_gpu_count, gpu)
-    sps = sharded_step_seconds(config, gpu, billed_gpu_count)
+    # sft shards by sequence and grpo/opd by data, so the multiplier is method-specific. the quote
+    # provider is passed explicitly: with a live allocation it is the substrate actually selected,
+    # which `config` does not carry -- an auto run reaches here with provider "auto" and would
+    # otherwise be credited nvlink scaling on a vast combination that cannot deliver it.
+    speedup = method_card_speedup(config, billed_gpu_count, gpu, quote_provider)
+    sps = sharded_step_seconds(config, gpu, billed_gpu_count, quote_provider)
     required_save_s = required_save_overhead_seconds(config)
     # A one-time kernel/graph compile is paid once on the first step (MoE-only; 0 for dense). It is
     # training GPU time, so it belongs in the (billed) train term, not setup. Required saves are also
