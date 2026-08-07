@@ -86,6 +86,18 @@ _WORKLOAD_PROFILE_MAX_RETRIES = 1
 # separate explicit allowance and the wall itself starts at the first heartbeat, so the quote stays
 # wall x hourly (see estimate_profile_cost) rather than paying for the queue.
 _WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS = 30 * 60
+# provisioning a rented box is not work, and not queue either: the plane arms the work budget at the
+# first heartbeat, but the box self-enforces the absolute deadline it was handed AT RENT TIME (see
+# _worker_deadline_at -> payload deadline_at -> _instance_bootstrap._canonical_deadline_at). Between
+# those two clocks sits everything cloud-init does before the worker can speak -- waiting for
+# docker+gpu (itself budgeted up to ~600s), image pull with retries, extra_pip install and the HF
+# code fetch. Charging that to a 600s work budget kills healthy profiles that never got to measure
+# anything: a real run rented at 19:38:15, reached `running` at 19:46:51 and self-terminated at
+# 19:48:15 -- rent + exactly 600s -- with no heartbeat, so the plane never armed. Its retry survived
+# with 22s to spare, which is why this reads as flaky rather than broken. The box timer is only a
+# backstop against a silent box: the plane re-reads the run deadline every poll, tightens it the
+# moment arming happens, and tears the box down when it gives up.
+_WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS = 20 * 60
 
 
 def artifacts_dir(spec: JobSpec) -> str:
@@ -377,6 +389,14 @@ def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None)
     heartbeat expands the plane's own deadline to armed_at + work. The worker never learns of that
     expansion, so it would die mid-measurement on exactly the slow-capacity day the allowance
     exists to survive. Unarmed, the work budget from launch is the authority.
+
+    That launch, though, is when the box is RENTED, not when its worker starts: the deadline handed
+    over here is absolute and the box enforces it from cloud-init onward. So an unarmed profile also
+    carries the provisioning allowance -- otherwise docker+gpu waits, the image pull, pip install and
+    the code fetch all come out of the work budget, and a slow-to-boot box self-terminates before it
+    can emit the first heartbeat that would have armed the plane's own clock. Arming discards the
+    remainder exactly like the queue allowance: once the worker speaks, `stored` is
+    armed_at + work and the min() below makes it binding again.
     """
     stored = _load_run_deadline_at(run_id)
     if not spec.workload_profile_kind:
@@ -384,7 +404,7 @@ def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None)
     current = time.time() if now is None else now
     work_budget_at = float(current) + float(_WORKLOAD_PROFILE_WALL_SECONDS)
     if _profile_wall_armed_at(_load_status_json(run_id)) is None:
-        return work_budget_at
+        return work_budget_at + float(_WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS)
     return min(stored, work_budget_at)
 
 

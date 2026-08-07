@@ -2927,11 +2927,20 @@ def test_profile_worker_deadline_excludes_the_unspent_queue_allowance(monkeypatc
     )
 
     worker_deadline = runner._worker_deadline_at(spec.run_id, spec, now=launched_at)
-    assert worker_deadline == pytest.approx(launched_at + runner._WORKLOAD_PROFILE_WALL_SECONDS)
-    # the whole point: strictly earlier than the run-global deadline, by the unspent allowance.
+    # work budget plus the provisioning allowance: the deadline runs from RENT, and the box spends
+    # the front of it booting rather than working (see _WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS).
+    assert worker_deadline == pytest.approx(
+        launched_at
+        + runner._WORKLOAD_PROFILE_WALL_SECONDS
+        + runner._WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS
+    )
+    # the whole point: strictly earlier than the run-global deadline, by the unspent queue allowance
+    # that provisioning does not reclaim.
     assert worker_deadline < stored
     assert stored - worker_deadline == pytest.approx(
-        runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS - 1.0
+        runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
+        - runner._WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS
+        - 1.0
     )
 
     # a training run is unaffected -- its deadline is submission-to-terminal by contract.
@@ -3231,7 +3240,9 @@ def test_a_late_launched_profile_worker_still_gets_its_whole_work_budget(monkeyp
     launched_at = created_at + allowance + work / 2.0
     assert runner._load_run_deadline_at(spec.run_id) - launched_at < work
     handed = runner._worker_deadline_at(spec.run_id, spec, now=launched_at)
-    assert handed == pytest.approx(launched_at + work)
+    assert handed == pytest.approx(
+        launched_at + work + runner._WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS
+    )
 
     # and once armed the stored deadline is work-from-arm and remains the authority: a worker that
     # speaks late cannot use this to run past it.
@@ -3245,6 +3256,52 @@ def test_a_late_launched_profile_worker_still_gets_its_whole_work_budget(monkeyp
     assert runner._worker_deadline_at(spec.run_id, spec, now=later) == pytest.approx(
         armed_at + work
     )
+
+
+def test_profile_worker_deadline_outlasts_a_slow_box_provisioning(monkeypatch, tmp_path):
+    """A profile must survive a slow boot: provisioning is not the work its wall bounds.
+
+    The regression, from a real run. The deadline handed to the box is absolute and enforced from
+    cloud-init onward, but it was minted as rent + work. That box took 8m36s to reach `running`
+    (docker+gpu wait, image pull, pip install, code fetch) and self-terminated at rent + exactly
+    600s having never emitted the heartbeat that arms the plane's clock -- so the plane's
+    arming-based budget never got the chance to apply. The retry survived with 22s to spare, which
+    is the only reason this looked flaky rather than broken.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 1000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            effective_preparation={"worker_spec": spec.to_internal_dict()},
+        )
+    )
+
+    rented_at = created_at + 30.0
+    handed = runner._worker_deadline_at(spec.run_id, spec, now=rented_at)
+    # the observed boot: the worker's first heartbeat lands 8m36s after the box is rented.
+    boot_seconds = 8 * 60 + 36.0
+    first_heartbeat_at = rented_at + boot_seconds
+    assert handed > first_heartbeat_at, "the box would self-terminate before it could ever speak"
+    # and it does not merely reach the heartbeat -- a full work budget remains to measure in.
+    assert handed - first_heartbeat_at >= float(runner._WORKLOAD_PROFILE_WALL_SECONDS)
+
+    # arming then discards the unspent provisioning allowance exactly like the queue allowance:
+    # the stored deadline becomes work-from-arm and is binding again.
+    monkeypatch.setattr(runner.time, "time", lambda: first_heartbeat_at)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": first_heartbeat_at - 1.0}
+    )
+    armed = runner._worker_deadline_at(spec.run_id, spec, now=first_heartbeat_at)
+    assert armed == pytest.approx(first_heartbeat_at + runner._WORKLOAD_PROFILE_WALL_SECONDS)
+    assert armed < handed
 
 
 def test_profile_relaunch_does_not_reuse_the_spent_lifecycles_attempt_ids(monkeypatch, tmp_path):
