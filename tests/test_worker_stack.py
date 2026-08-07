@@ -2058,8 +2058,8 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
         )
 
 
-def test_remove_padding_is_the_tensor_layout_not_the_step_contract():
-    """sft's `use_remove_padding` must NOT be ANDed with the profile's packing mode.
+def test_sft_remove_padding_is_ungated_tensor_layout():
+    """sft's `use_remove_padding` must not be gated on ANYTHING.
 
     An earlier revision of this file asserted the opposite, on the theory that
     `use_remove_padding = not gdn_hybrid or gdn_boundary_resets` would "pack a run the user was
@@ -2076,20 +2076,34 @@ def test_remove_padding_is_the_tensor_layout_not_the_step_contract():
     memory -- nested/concatenated vs padded -- and cannot change how many examples share an
     optimizer step. With `examples_per_update = 1` there is nothing to co-locate either way.
 
-    Gating it on the profile is not merely redundant, it is a crash. verl leaves `pad_mode` at its
-    `no_padding` default, whose `sft_loss` reads `log_prob.values()` -- defined only on the nested
-    tensor the remove-padding branch builds (fsdp/transformer_impl.py:1178). The padded branch
-    (:1186) hands the loss a strided tensor and the first optimizer step dies with "values expected
-    sparse tensor layout but got Strided". Every gdn-hybrid catalog model profiles as
-    `exact-unpacked`, so the AND broke text sft on all of them while `dev` trained fine.
+    Gating it is not merely redundant, it is a crash. verl leaves `pad_mode` at its `no_padding`
+    default, whose `sft_loss` reads `log_prob.values()` -- defined only on the nested tensor the
+    remove-padding branch builds (fsdp/transformer_impl.py:1178). The padded branch (:1186) hands
+    the loss a strided tensor and the first optimizer step dies with "values expected sparse tensor
+    layout but got Strided". Every gdn-hybrid catalog model profiles as `exact-unpacked`, so the
+    AND broke text sft on all of them while `dev` trained fine.
 
-    The boundary-contamination guard that motivated the original gate is still here and still
-    load-bearing: `not gdn_hybrid or gdn_boundary_resets` already refuses to pack a gdn hybrid whose
-    child cannot honor `seq_idx` + `cu_seq_lens_q`. `rl_train` and `opd_train` use this exact
-    derivation; sft was the outlier.
+    The `not gdn_hybrid or gdn_boundary_resets` derivation that replaced it fails the same way and
+    for the same reason: a gdn hybrid whose verl child lacks the fla/causal-conv1d kernels answers
+    `gdn_boundary_resets = False`, which turns the flag off and reaches the identical strided-tensor
+    death. So NOTHING may gate this flag in sft -- there is no false case the loss can consume, and
+    verl's padded alternative does not fit `FlashTokenizedSFTDataset` either (`pad_mode: right`
+    collates with `default_collate`, requiring uniform rows, and reads a `response_mask` the dataset
+    never emits).
+
+    The boundary-contamination guard did not go away, it moved one layer earlier and one layer
+    stronger: `sft_workload._packing_mode` answers "exact-unpacked" for every architecture it cannot
+    pack, which pins `examples_per_update` to 1, so a gdn run has no packed NEIGHBOUR to be
+    contaminated by. Batch size is the isolation lever; this flag never was. See
+    `test_batch_is_the_isolation_lever_that_replaces_the_removed_flag` in test_sft_train.py.
+
+    `rl_train` and `opd_train` keep the probe-based derivation and must not be changed to match:
+    `sft_loss` is reached only from verl's sft trainers, so the padded path is survivable there.
 
     Asserted on the source because reaching the real statement needs a live child probe and a
     checkpoint; the failure is a wrong boolean, not an exception, so nothing else would surface it.
+    The AST walk (rather than a string match) is what catches a SECOND assignment being introduced
+    further down the function, which would silently re-gate the flag after this one set it.
     """
     import ast
     import inspect as _inspect
@@ -2111,15 +2125,10 @@ def test_remove_padding_is_the_tensor_layout_not_the_step_contract():
     names = {n.attr for n in ast.walk(assigns[0].value) if isinstance(n, ast.Attribute)} | {
         n.id for n in ast.walk(assigns[0].value) if isinstance(n, ast.Name)
     }
-    gate_msg = (
-        "use_remove_padding is gated on the profile's packing mode. that forces the padded verl "
-        "path for every gdn hybrid, and its no_padding sft_loss cannot read a strided tensor -- the "
-        "run dies on the first optimizer step. the step contract is already pinned by "
-        "profile.examples_per_update and profile.authoritative_steps; this flag is layout only."
-    )
-    assert "packing_mode" not in names, gate_msg
-    assert "profile_packs" not in names, gate_msg
-    assert {"gdn_hybrid", "gdn_boundary_resets"} <= names, (
-        "the gdn boundary-contamination guard is gone: a gdn hybrid whose child cannot honor "
-        f"seq_idx + cu_seq_lens_q must not pack. found {sorted(names)}"
+    assert not names, (
+        f"use_remove_padding is gated on {sorted(names)}. any false case forces the padded verl "
+        "path, and its no_padding sft_loss cannot read a strided tensor -- the run dies on the "
+        "first optimizer step. the step contract is already pinned by profile.examples_per_update "
+        "and profile.authoritative_steps, and boundary isolation by the batch size that follows "
+        "from the packing mode; this flag is layout only and has no legitimate false case."
     )
