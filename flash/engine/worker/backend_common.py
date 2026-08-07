@@ -457,6 +457,47 @@ def verl_child_gdn_reset_arch(python_bin: str, model_id: str, revision: str = ""
     return None
 
 
+def require_gdn_boundary_resets(python_bin: str, model_id: str, revision: str = "") -> str | None:
+    """The arch to patch for a gdn hybrid, raising if the child cannot honor boundary resets.
+
+    Returns None for a non-gdn model (nothing to patch, nothing to check).
+
+    There is no third outcome. A gdn hybrid whose child lacks fla/causal_conv1d used to fall back to
+    verl's padded path (``use_remove_padding=False``), which is boundary-correct but cannot complete
+    a single training step: flash sets ``use_fused_kernels=True`` unconditionally, and verl's fsdp
+    engine has no guard for that pair (its megatron engine does, ``megatron/transformer_impl.py``).
+    The padded+fused branch returns a dense ``[bsz, response_len]`` where every sibling path
+    re-nests via ``cu_seqlens``, so grpo and opd assert in ``no_padding_2_padding``
+    (``sequence_offsets[-1] == values.shape[0]`` compares total tokens against batch size, which
+    fails at EVERY batch size) and sft dies in ``sft_loss`` calling ``.values()`` on a tensor that is
+    no longer nested.
+
+    So the run cannot finish either way, and the failure it produces names neither gdn nor this
+    decision -- letting it launch spends the full gpu rental on an untraceable shape error. Raise
+    here instead. Dropping ``use_fused_kernels`` is NOT the alternative fix: ``engine/vram.py`` sizes
+    on the assumption that no dense ``[b, s, vocab]`` logits tensor exists, so that would trade this
+    crash for an OOM. The fix is to give the child the kernels.
+    """
+    # imported in-body, matching verl_child_gdn_reset_arch below: test_worker_stack pops
+    # `flash.engine.worker` from sys.modules, so a module-level import here can bind against a
+    # half-built parent package.
+    from flash.engine.worker.packing import model_is_gdn_hybrid
+
+    if not model_is_gdn_hybrid(model_id, revision):
+        return None
+    arch = verl_child_gdn_reset_arch(python_bin, model_id, revision)
+    if arch is None:
+        raise RuntimeError(
+            "gdn hybrid without child-side boundary resets: the padded fallback "
+            "(use_remove_padding=False) is incompatible with the use_fused_kernels=True this "
+            "recipe sets, and cannot complete a training step on verl's fsdp engine. see the "
+            "'[verl] gdn boundary resets unavailable' line above for why the child could not "
+            "honor resets -- installing fla + causal_conv1d in the verl interpreter is the fix, "
+            "not disabling fused kernels."
+        )
+    return arch
+
+
 def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
     """return an interpreter that can import verl.
 

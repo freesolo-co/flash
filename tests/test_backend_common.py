@@ -522,8 +522,10 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
 
 
 def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatch, tmp_path):
-    # all three backends default remove-padding ON (only a gdn model whose child cannot reset packed
-    # boundaries turns it off) and verl's cuda remove-padding path imports flash_attn.bert_padding
+    # all three backends hardcode remove-padding ON (a gdn model whose child cannot reset packed
+    # boundaries now raises rather than switching it off, because verl's fsdp engine cannot run the
+    # padded path alongside the fused kernels flash sets) and verl's cuda remove-padding path
+    # imports flash_attn.bert_padding
     # UNGUARDED (verl/utils/attention_utils.py:30, torch_functional.py:627). there is no sdpa
     # fallback on that path, so a venv without the wheel dies at the first training batch on a paid
     # gpu. Dockerfile.worker already treats it as REQUIRED in /opt/verl-venv; this fallback

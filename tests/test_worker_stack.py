@@ -2001,7 +2001,7 @@ def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
 
 
 def test_each_path_resolves_the_gdn_arch_question_exactly_once():
-    """`model_is_gdn_hybrid` may be called at most once per module. Two calls can disagree.
+    """The gdn arch question may be asked at most once per module. Two calls can disagree.
 
     THE regression for a real defect: grpo asked the question twice -- once to decide packing, then
     again inside the fp8-KV try to decide the kv dtype. The helper answers False when its OWN probe
@@ -2012,12 +2012,18 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
     Two calls with a swallowed exception between them are not one decision, they are two guesses that
     happen to agree most of the time. Asserted structurally because the disagreeing case needs a
     transient failure to reproduce and so will not show up in any deterministic test.
+
+    Counts BOTH spellings of the question. `require_gdn_boundary_resets` answers it as a side effect
+    (it returns an arch for a hybrid and raises for a hybrid that cannot reset), so counting only
+    the old `model_is_gdn_hybrid` would leave this unable to fail now that the modules derive from
+    the gate instead.
     """
     import ast
     import inspect as _inspect
 
     from flash.engine.worker import opd_train, rl_train, sft_train
 
+    asks_the_question = {"model_is_gdn_hybrid", "require_gdn_boundary_resets"}
     for module in (sft_train, opd_train, rl_train):
         tree = ast.parse(_inspect.getsource(module))
         calls = [
@@ -2025,12 +2031,13 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "model_is_gdn_hybrid"
+            and node.func.id in asks_the_question
         ]
-        assert len(calls) <= 1, (
-            f"{module.__name__} calls model_is_gdn_hybrid {len(calls)} times (lines "
-            f"{[c.lineno for c in calls]}). it returns False on its own probe failure, so a second "
-            "call can contradict the first: resolve it once and reuse the value."
+        assert len(calls) == 1, (
+            f"{module.__name__} resolves the gdn arch question {len(calls)} times (lines "
+            f"{[c.lineno for c in calls]}, via {sorted({c.func.id for c in calls})}). the probe "
+            "answers False on its own failure, so a second ask can contradict the first: resolve "
+            "it once and reuse the value."
         )
 
 
@@ -2077,18 +2084,38 @@ def test_no_algorithm_launches_into_the_unrunnable_padded_fallback():
     Asserted on source for the same reason as the test above: these gates sit deep inside the run
     functions, behind a live bridge and a child process.
     """
+    import ast
     import inspect as _inspect
 
-    from flash.engine.worker import opd_train, rl_train, sft_train
+    from flash.engine.worker import backend_common, opd_train, rl_train, sft_train
+
+    # the gate lives in one shared helper, so the assertions split: the helper must raise, and each
+    # algorithm must route through it rather than re-deriving a decision of its own.
+    gate = _inspect.getsource(backend_common.require_gdn_boundary_resets)
+    assert "raise RuntimeError(" in gate, (
+        "require_gdn_boundary_resets no longer raises, so a gdn hybrid whose child cannot reset "
+        "boundaries would again launch into use_remove_padding=False, which cannot complete a "
+        "training step on verl's fsdp engine."
+    )
+    # and it must be a hard gate, not a warn-and-continue: nothing may follow the raise on a path
+    # that could still return None for a hybrid. two returns exactly -- the non-gdn None and the
+    # arch -- means the raise is the only other exit.
+    returns = [n for n in ast.walk(ast.parse(gate.lstrip())) if isinstance(n, ast.Return)]
+    assert len(returns) == 2, (
+        f"require_gdn_boundary_resets grew to {len(returns)} return paths. it must have exactly "
+        "two -- None for a non-gdn model and the arch for a resettable one -- so that a hybrid "
+        "without resets has no exit but the raise."
+    )
 
     for module in (sft_train, opd_train, rl_train):
         src = _inspect.getsource(module)
-        # anchor on the DECISION, not on the message text -- the message itself contains the same
-        # phrase, so anchoring there matches inside the raise and would pass on any wording.
-        _, _, tail = src.partition("use_remove_padding = not gdn_hybrid or gdn_boundary_resets")
-        assert tail, f"{module.__name__} no longer computes the gdn boundary-reset decision"
-        # the gate must RAISE. printing and carrying on is what burned the gpu time.
-        assert "raise RuntimeError(" in tail[:2000], (
-            f"{module.__name__} still continues past the gdn gate into use_remove_padding=False, "
-            "which cannot complete a training step on verl's fsdp engine."
+        assert "require_gdn_boundary_resets(" in src, (
+            f"{module.__name__} no longer routes its gdn decision through the raising gate, so it "
+            "can reach use_remove_padding=False again."
+        )
+        # and it must not have grown its own escape hatch: the override is hardcoded true, so any
+        # reappearance of the conditional plumbing is a regression back to the unrunnable config.
+        assert "use_remove_padding=False" not in src.replace(" ", ""), (
+            f"{module.__name__} sets use_remove_padding=False, which verl's fsdp engine cannot run "
+            "alongside the use_fused_kernels=True this recipe also sets."
         )

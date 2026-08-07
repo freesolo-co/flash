@@ -1151,7 +1151,12 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
     from flash.engine.worker import opd_train
 
     src = inspect.getsource(opd_train.run_opd_train)
-    assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
+    # the arch answer comes from the boundary gate, which raises rather than returning None for a
+    # hybrid -- so `arch is not None` IS "is it gdn", resolved once, with no probe-failure path that
+    # could answer False for a genuine hybrid and hand it an fp8 pool.
+    assert "gdn_reset_arch = require_gdn_boundary_resets(" in src
+    assert "gdn_hybrid = gdn_reset_arch is not None" in src
+    assert "fp8_kv = _cc_ok and not gdn_hybrid" in src
     assert "get_device_capability() >= (8, 9)" in src
 
     # and the override is emitted only when the resolved flag is true, so a bf16 worker never sends
