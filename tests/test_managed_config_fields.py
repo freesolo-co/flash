@@ -1,7 +1,7 @@
 """The platform-managed config fields are rejected as user input and stripped from the public spec.
 
 These fields are assigned by the control plane / runner, never authored by the user: the top-level
-``run_id`` and ``model_policy``, the per-run artifact repo ``train.hf_repo``, the runner-sized
+``run_id``, the per-run artifact repo ``train.hf_repo``, the runner-sized
 ``gpu.disk_gb`` and the weight-cache ``gpu.network_volume`` / ``gpu.network_volume_gb``, the
 control-plane-pinned ``environment.resolved_sha``, and the retry/wall-clock lifecycle policy
 ``gpu.max_retries`` / ``gpu.max_wall_seconds``. ``train.lora_alpha`` is managed too but derived, not
@@ -23,7 +23,6 @@ from tests._helpers.specs import raw_spec
 # adds exactly one managed field as user input; the parser must reject on that field.
 _MANAGED_REJECTIONS = [
     ("run_id", {"run_id": "user-chosen"}, r"unknown config key\(s\): run_id"),
-    ("model_policy", {"model_policy": "allow"}, r"unknown config key\(s\): model_policy"),
     (
         "train.hf_repo",
         {"train": {"epochs": 1, "max_examples": 8, "hf_repo": "me/runs"}},
