@@ -367,12 +367,24 @@ def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None)
 
     Once armed, the persisted deadline is already work-budget-from-arm, and it is the authority:
     taking the min keeps a relaunched or slow-to-speak worker from extending past it.
+
+    While UNARMED the stored deadline is not a ceiling on the work, because it still carries the
+    queue allowance that arming discards: it runs to created_at + queue + work, so once the wait
+    passes the allowance the remainder is SHORTER than the work budget. Taking the min there hands
+    the worker whatever is left of a window measured from submission -- at a 2100s wait, 300s of a
+    600s budget -- while `_spec_with_remaining_wall` grants the provider a full one and the first
+    heartbeat expands the plane's own deadline to armed_at + work. The worker never learns of that
+    expansion, so it would die mid-measurement on exactly the slow-capacity day the allowance
+    exists to survive. Unarmed, the work budget from launch is the authority.
     """
     stored = _load_run_deadline_at(run_id)
     if not spec.workload_profile_kind:
         return stored
     current = time.time() if now is None else now
-    return min(stored, float(current) + float(_WORKLOAD_PROFILE_WALL_SECONDS))
+    work_budget_at = float(current) + float(_WORKLOAD_PROFILE_WALL_SECONDS)
+    if _profile_wall_armed_at(_load_status_json(run_id)) is None:
+        return work_budget_at
+    return min(stored, work_budget_at)
 
 
 def _spec_with_remaining_wall(

@@ -3122,6 +3122,54 @@ def test_a_cancelled_relaunch_is_not_billed_from_a_prior_lifecycles_heartbeat(
     assert runner.profile_steps_run(runner.get_status(spec.run_id)) == 1
 
 
+def test_a_late_launched_profile_worker_still_gets_its_whole_work_budget(monkeypatch, tmp_path):
+    """A profile that waited out its queue allowance must still be handed a full work budget.
+
+    The stored deadline is created_at + queue + work while UNARMED, so past the allowance its
+    remainder is SHORTER than the work budget. Taking min(stored, now + work) there freezes the
+    worker to what is left of a window measured from submission, while the provider is granted a
+    full wall and arming expands the plane's deadline to armed_at + work -- an expansion the worker
+    is never told about. It would die mid-measurement on exactly the slow-capacity day the queue
+    allowance exists to survive.
+    """
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_report_status", lambda *a, **k: None)
+    spec = _profile_spec()
+    created_at = 1000.0
+    status = runner.RunStatus(
+        run_id=spec.run_id,
+        state="queued",
+        spec=spec.to_dict(),
+        created_at=created_at,
+        effective_preparation={"worker_spec": spec.to_internal_dict()},
+    )
+    runner._persist_profile_submission(status, _profile_save_kwargs(runner, status, spec))
+
+    work = float(runner._WORKLOAD_PROFILE_WALL_SECONDS)
+    allowance = float(runner._WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS)
+    # capacity lands AFTER the queue allowance is spent: the stored deadline has less than one
+    # work budget left, which is precisely when the old min() started truncating.
+    launched_at = created_at + allowance + work / 2.0
+    assert runner._load_run_deadline_at(spec.run_id) - launched_at < work
+    handed = runner._worker_deadline_at(spec.run_id, spec, now=launched_at)
+    assert handed == pytest.approx(launched_at + work)
+
+    # and once armed the stored deadline is work-from-arm and remains the authority: a worker that
+    # speaks late cannot use this to run past it.
+    armed_at = launched_at + 5.0
+    monkeypatch.setattr(runner.time, "time", lambda: armed_at)
+    runner.record_heartbeat(
+        spec.run_id, {"stage": "profile_start", "attempt": 0, "ts": armed_at - 1.0}
+    )
+    assert runner._load_status_json(spec.run_id)[runner._PROFILE_WALL_ARMED_AT_KEY] == armed_at
+    later = armed_at + work / 2.0
+    assert runner._worker_deadline_at(spec.run_id, spec, now=later) == pytest.approx(
+        armed_at + work
+    )
+
+
 def test_profile_relaunch_does_not_reuse_the_spent_lifecycles_attempt_ids(monkeypatch, tmp_path):
     """Attempt identities stay globally monotonic across lifecycles of a reused run id.
 
