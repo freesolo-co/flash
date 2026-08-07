@@ -796,6 +796,57 @@ def test_runpod_cost_projection_flows_into_run_status(orch, monkeypatch):
     assert cost == pytest.approx(0.345)  # 0.5 hr x $0.69/hr (RTX 4090)
 
 
+def test_a_multi_card_run_is_costed_for_every_card_it_occupied(orch):
+    """`hourly_rate` is per CARD, so the measured cost must multiply by the allocated count.
+
+    without it a 4-card run records a quarter of its real spend, and the cost analytics that compare
+    estimates against actuals are corrupted by exactly that factor. the count has to come from the
+    metrics stamp rather than `spec.gpu.count`, which is only a ceiling -- allocation routinely picks
+    fewer cards than authored.
+    """
+    spec = _spec()
+    _seed_status(orch, spec)
+    base = {"train_tokens": 4096, "wall_seconds": 1800, "allocated_gpu": "RTX 4090"}
+
+    four_card = orch._persist_metrics(spec, {**base, "allocated_gpu_count": 4})
+
+    assert four_card == pytest.approx(0.345 * 4), "a 4-card run was priced as one card"
+    # a record predating the stamp still reads as one card rather than zero or a crash
+    assert orch._persist_metrics(spec, dict(base)) == pytest.approx(0.345)
+
+
+def test_the_allocated_card_count_reaches_the_metrics_the_cost_is_read_from(orch, monkeypatch):
+    """The multiply above is inert unless allocation actually stamps the count it chose.
+
+    this drives the real submit path rather than handing `_persist_metrics` a literal, because the
+    two halves fail independently: pricing can multiply correctly by a count that is never recorded.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: _alloc(candidates=(Candidate("runpod", "RTX 4090", 0.69, 24, 4),)),
+    )
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        if on_handle:
+            on_handle(_runpod_handle(attempt=attempt))
+        return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1800})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(provider="runpod", type="RTX 4090", count=4)
+    _seed_status(orch, spec)
+
+    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+
+    assert metrics["allocated_gpu_count"] == 4
+    # and the stamp is what pricing then reads, so the two halves compose
+    assert orch._persist_metrics(spec, metrics) == pytest.approx(0.345 * 4)
+
+
 def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult

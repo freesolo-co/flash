@@ -2080,18 +2080,24 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     # case _gpu_rate prices off whichever configured provider offers the class.
     provider = str(metrics.get("allocated_provider") or "")
     rate = _gpu_rate(gpu_type, provider)
+    # `hourly_rate` is per CARD, so a sharded run costs the wall times the rate times the number of
+    # cards it actually occupied. `allocated_gpu_count` is worker/lifecycle-stamped for the same
+    # reason `allocated_gpu` is: the spec's gpu.count is only a ceiling and allocation may pick
+    # fewer. Absent on records predating the stamp, where one card is the correct reading.
+    gpu_count = max(1, int(metrics.get("allocated_gpu_count") or 1))
     cost = metrics.get("cost_usd")
     if cost:
         cost = float(cost or 0.0)
     else:
         wall = float(metrics.get("wall_seconds") or 0.0)
-        cost = wall / 3600.0 * rate
+        cost = wall / 3600.0 * rate * gpu_count
         metrics = {**metrics, "cost_usd": cost}
         metrics.setdefault("notes", {})
         if isinstance(metrics["notes"], dict):
             metrics["notes"]["provider"] = provider or "unknown"
             metrics["notes"]["gpu_rate_usd_hr"] = rate
             metrics["notes"]["gpu"] = gpu_type
+            metrics["notes"]["gpu_count"] = gpu_count
     with open(os.path.join(dest, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     with contextlib.suppress(Exception):

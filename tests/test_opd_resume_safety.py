@@ -656,6 +656,8 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
         # stamped alongside the gpu so cost attribution prices the class on the substrate
         # that actually billed it.
         "allocated_provider": "runpod",
+        # and the card count, since the hourly rate is per card.
+        "allocated_gpu_count": 1,
     }
     assert provider.attempts == [0, 1]
     retry_submit = provider.events.index(("submit", 1))
@@ -744,6 +746,8 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
         # stamped alongside the gpu so cost attribution prices the class on the substrate
         # that actually billed it.
         "allocated_provider": "runpod",
+        # and the card count, since the hourly rate is per card.
+        "allocated_gpu_count": 1,
     }
     broker_transport = {
         "FLASH_CONTROL_PANEL_URL": "https://broker.example",
