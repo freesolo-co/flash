@@ -43,6 +43,35 @@ def _present(var: str) -> bool:
     return bool((os.environ.get(var) or "").strip())
 
 
+def _artifact_namespace_problem(value: str) -> str:
+    """Why ``value`` cannot serve as an artifact namespace, or "" if it can.
+
+    A namespace is ONE hugging face id segment. ``managed_hf_repo_for_environment`` appends the
+    repo name to it, so an operator who writes the natural-looking ``owner/repo`` produces a
+    three-segment id that hugging face rejects -- and rejects at the first submit, long after
+    preflight called the plane healthy. Validating the assembled id rather than the segment alone
+    keeps this honest about what actually gets created.
+    """
+    if "/" in value:
+        return (
+            f"{value!r} contains '/', but this is a single namespace (a HuggingFace user or org), "
+            "not a repo id. Flash appends the repo name itself, so this would build "
+            f"'{value}/flashrun-...', which HuggingFace rejects as an id"
+        )
+    from huggingface_hub.utils import validate_repo_id
+
+    from flash.runner import _environment_artifact_repo_name
+
+    # validate the id that WILL be created, not the segment in isolation: the repo half is
+    # generated and already known-good, so anything rejected here is the operator's namespace.
+    candidate = f"{value}/{_environment_artifact_repo_name('preflight-probe')}"
+    try:
+        validate_repo_id(candidate)
+    except Exception as exc:
+        return f"{value!r} is not a usable HuggingFace namespace: {exc}"
+    return ""
+
+
 # Credentials the plane reads straight from ``os.environ`` at many call sites rather than through
 # one accessor. Normalized in place at startup so the value consumers read is the value preflight
 # accepted -- see ``_normalize_operator_credentials``.
@@ -119,6 +148,15 @@ def check_run_preflight() -> None:
             "artifact upload before training starts. Set it to a namespace your HF_TOKEN "
             "owns, e.g. `export FLASH_HF_NAMESPACE=your-hf-username`"
         )
+    elif _present("FLASH_HF_NAMESPACE"):
+        # set, but not necessarily usable. presence alone was the whole check, so `owner/repo` --
+        # the natural spelling for anyone used to HF ids -- passed preflight and then failed every
+        # submit while creating the artifact repo, with the plane reported healthy.
+        namespace_problem = _artifact_namespace_problem(
+            (os.environ.get("FLASH_HF_NAMESPACE") or "").strip()
+        )
+        if namespace_problem:
+            problems.append(f"  - FLASH_HF_NAMESPACE: {namespace_problem}")
     if not _present("FREESOLO_INTERNAL_KEY"):
         problems.append(
             "  - FREESOLO_INTERNAL_KEY: the control plane's own auth key. On a self-hosted "
