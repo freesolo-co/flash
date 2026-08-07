@@ -274,6 +274,12 @@ def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> Non
     from flash.cli import env_setup
     from flash.client import ApiError, ClientError
 
+    # pinned to a HOSTED url and a key: ownership is only resolved against the backend when the
+    # plane is Freesolo's, so leaving this to ambient config would let a self-hosted `~/.flash`
+    # take the shape-only branch and pass without ever reaching `get_project`.
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "key-1")
+    )
     monkeypatch.setattr(
         "flash.client.get_project",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ApiError(403, "forbidden")),
@@ -282,6 +288,49 @@ def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> Non
     with pytest.raises(ClientError, match="not accessible") as excinfo:
         env_setup._require_setup_project(Namespace(project="11111111-1111-4111-8111-111111111111"))
     assert type(excinfo.value) is ClientError
+
+
+def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypatch) -> None:
+    """A self-hosted plane has no org directory, so the id is validated for shape and accepted.
+
+    Resolving it against ``api.freesolo.co`` sent the operator's plane-root key to a service with
+    no relationship to it, which answered 401 -- so `flash env setup`, the first command in the
+    SELF_HOSTING.md quickstart, died before writing a file. The plane exposes no project routes at
+    all, so there is nothing else to ask; ``flash/server/projects.py`` performs exactly this
+    shape-only check under ``standalone()`` when the same run is later submitted.
+    """
+    from argparse import Namespace
+
+    from flash.cli import env_setup
+
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not reach the hosted backend from a self-hosted plane")
+        ),
+    )
+
+    resolved = env_setup._require_setup_project(
+        Namespace(project="11111111-1111-4111-8111-111111111111")
+    )
+    assert resolved == "11111111-1111-4111-8111-111111111111"
+
+
+def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatch) -> None:
+    """Skipping the ownership lookup must not skip the shape check that stands in for it."""
+    from argparse import Namespace
+
+    from flash.cli import env_setup
+
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
+    )
+
+    with pytest.raises(ValueError, match="valid UUID"):
+        env_setup._require_setup_project(Namespace(project="not-a-uuid"))
 
 
 def test_login_shows_who_you_are(monkeypatch, capsys) -> None:

@@ -51,7 +51,10 @@ auth backend, pass `--freesolo-url` and verification happens against it.)
 
 Every run config needs a top-level `project` uuid - it groups runs and is required in
 standalone mode too (see [project ids](#what-flashstandalone1-does)). Any uuid works
-on a standalone plane, so you can pick one once and reuse it:
+on a standalone plane, so you can pick one once and reuse it. `flash projects create` and
+`flash projects list` are **hosted-only** - they talk to the Freesolo org directory, which
+a standalone plane does not have - so generate one yourself (`python -c "import uuid;
+print(uuid.uuid4())"`) and pass it explicitly to `flash env setup --project <uuid>`:
 
 ```toml
 project = "11111111-1111-4111-8111-111111111111"

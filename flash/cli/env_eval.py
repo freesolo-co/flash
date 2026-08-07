@@ -494,12 +494,12 @@ def _require_accessible_project(project_id: object) -> str:
     except (TypeError, ValueError) as exc:
         raise ClientError(str(exc)) from exc
 
-    _, api_key = load_credentials()
+    api_url, api_key = load_credentials()
     if not api_key:
         raise ClientError(
             "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
-    return resolve_project_id(project_id, api_key)
+    return resolve_project_id(project_id, api_key, api_url)
 
 
 def _upload_report(
