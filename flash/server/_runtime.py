@@ -465,9 +465,7 @@ def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) 
     import re
 
     default = (
-        f"{kind}_{phase}.txt"
-        if kind == "console"
-        else attempt_scoped_artifact_name(kind, phase, 0)
+        f"{kind}_{phase}.txt" if kind == "console" else attempt_scoped_artifact_name(kind, phase, 0)
     )
     try:
         from huggingface_hub import HfApi
