@@ -37,6 +37,7 @@ try:  # inside the verl child, copied in beside this file
         prepare_assistant_turn,
         run_executor_call,
         sum_preemptions,
+        turn_is_unusable,
         validate_transcript_messages,
     )
 except ImportError:  # in-tree (tests, lint)
@@ -46,6 +47,7 @@ except ImportError:  # in-tree (tests, lint)
         prepare_assistant_turn,
         run_executor_call,
         sum_preemptions,
+        turn_is_unusable,
         validate_transcript_messages,
     )
 
@@ -227,17 +229,23 @@ def build_flash_grpo_multi_turn_agent_loop(
                     )
                     turn_ids = turn["response_ids"]
                     turn_start = len(response_ids)
+                    unusable_turn = turn_is_unusable(turn)
                     response_ids.extend(turn_ids)
-                    response_mask.extend([1] * len(turn_ids))
-                    # a truncated or unusable turn is NOT recorded into env state by the bridge
+                    # an unusable turn is NOT recorded into env state by the bridge
                     # (MultiTurnBridge.step returns before record_model_turn), so the environment
-                    # never sees it and returns no reward for it. spanning it here would leave one
-                    # more span than there are rewards, which score_rollouts rejects as a count
-                    # mismatch -- dropping the row, and with it its whole group, to episode credit.
-                    # the tokens stay in response_ids and stay trained on; they just carry no turn
-                    # coordinate. this is the same identity the retired trl driver scored on, where
-                    # the turn was recorded and so was spanned.
-                    if not (turn["truncated"] or turn["skip_reason"]):
+                    # never saw it and never scored it. its tokens must therefore stay OUT of the
+                    # loss, exactly as the environment glue below does -- the zeroed mask is what
+                    # keeps a position out. leaving them at 1 trains a cut-off turn on credit earned
+                    # by the turns BEFORE it, which teaches the policy to stop early: the same
+                    # failure `mask_truncated_completions` (default True) exists to prevent, and
+                    # which cannot reach here because this custom AgentLoopOutput carries no stop
+                    # reason for verl's single-turn handling to act on.
+                    response_mask.extend([0 if unusable_turn else 1] * len(turn_ids))
+                    # spanning it would also leave one more span than there are rewards, which
+                    # score_rollouts rejects as a count mismatch -- dropping the row, and with it its
+                    # whole group, to episode credit. the span list and the mask are independent
+                    # fields on the output, so zeroing above does not change this count.
+                    if not unusable_turn:
                         turn_spans.append((turn_start, len(response_ids)))
                     if have_logprobs and generated.log_probs is not None:
                         response_logprobs.extend(list(generated.log_probs[: len(turn_ids)]))
