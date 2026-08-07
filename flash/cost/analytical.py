@@ -389,12 +389,12 @@ MULTI_CARD_SCALING_NVLINK = 0.88
 MULTI_CARD_SCALING_PCIE = 0.71
 
 
-def multi_card_scaling(gpu: str) -> float:
+def multi_card_scaling(gpu: str, provider: str = "") -> float:
     """Realized fraction of linear scaling per added card of class ``gpu``."""
-    return MULTI_CARD_SCALING_NVLINK if has_nvlink(gpu) else MULTI_CARD_SCALING_PCIE
+    return MULTI_CARD_SCALING_NVLINK if has_nvlink(gpu, provider) else MULTI_CARD_SCALING_PCIE
 
 
-def multi_card_speedup(gpu_count: int, gpu: str) -> float:
+def multi_card_speedup(gpu_count: int, gpu: str, provider: str = "") -> float:
     """Throughput multiplier for sharding the gpu-bound half of a step over ``gpu_count`` cards.
 
     Both measurements are 2-card. Beyond that the geometric form is an extrapolation, and it errs
@@ -408,7 +408,7 @@ def multi_card_speedup(gpu_count: int, gpu: str) -> float:
     honest reading of the extrapolation is that scaling FLATTENS, not that it reverses.
     """
     n = max(1, int(gpu_count))
-    scaling = multi_card_scaling(gpu)
+    scaling = multi_card_scaling(gpu, provider)
     return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
 
 
@@ -455,7 +455,7 @@ MULTI_CARD_SCALING_SP_NVLINK = 0.88
 MULTI_CARD_SCALING_SP_PCIE = 0.71
 
 
-def sequence_parallel_speedup(gpu_count: int, gpu: str) -> float:
+def sequence_parallel_speedup(gpu_count: int, gpu: str, provider: str = "") -> float:
     """Throughput multiplier for sharding an sft step over ``gpu_count`` cards by SEQUENCE.
 
     The sft counterpart of :func:`multi_card_speedup`. Same geometric form and the same
@@ -463,7 +463,9 @@ def sequence_parallel_speedup(gpu_count: int, gpu: str) -> float:
     grpo/opd run fsdp data parallelism (see MULTI_CARD_SCALING_SP_NVLINK).
     """
     n = max(1, int(gpu_count))
-    scaling = MULTI_CARD_SCALING_SP_NVLINK if has_nvlink(gpu) else MULTI_CARD_SCALING_SP_PCIE
+    scaling = (
+        MULTI_CARD_SCALING_SP_NVLINK if has_nvlink(gpu, provider) else MULTI_CARD_SCALING_SP_PCIE
+    )
     return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
 
 
@@ -472,10 +474,16 @@ def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str) -> float:
 
     sft shards by sequence, grpo/opd by data; they do not scale the same way and must not share a
     constant. Every caller that divides sft work by a card count goes through here.
+
+    The provider comes off ``config`` rather than a new parameter at every layer: this is the one
+    point where both the card count and the run's provider are already in hand, and it is on the
+    path of every sharded quote.
     """
-    if config.normalized().method == "sft":
-        return sequence_parallel_speedup(gpu_count, gpu)
-    return multi_card_speedup(gpu_count, gpu)
+    n = config.normalized()
+    provider = n.provider if n.provider != "auto" else ""
+    if n.method == "sft":
+        return sequence_parallel_speedup(gpu_count, gpu, provider)
+    return multi_card_speedup(gpu_count, gpu, provider)
 
 
 def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int) -> float:
